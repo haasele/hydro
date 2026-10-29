@@ -35,9 +35,11 @@
 use hydro_ir::{stdlib, Builtin};
 
 use crate::builtins as core_builtins;
+use crate::container;
 use crate::core::globals;
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, IMPORT_ERROR, NOT_IMPLEMENTED_ERROR, RUNTIME_ERROR, TYPE_ERROR,
+    self, ATTRIBUTE_ERROR, IMPORT_ERROR, KEY_ERROR, NOT_IMPLEMENTED_ERROR, RUNTIME_ERROR,
+    TYPE_ERROR,
 };
 use crate::methods;
 use crate::modules;
@@ -176,11 +178,377 @@ pub(crate) fn constant(name: &str) -> i64 {
         // exact identities.
         "complex" => core_builtins::complex_class(),
         "slice" => core_builtins::slice_class(),
+        // Python 3.15's immutable mapping, provided for pydantic 2.14's
+        // version-gated import and its handler tables.
+        "frozendict" => frozendict_class(),
         _ => match exception_tag(name) {
             Some(tag) => exc::exception_class(tag),
             None => missing_attribute(name),
         },
     }
+}
+
+// frozendict
+
+/// Instance attribute holding the immutable entry table.
+///
+/// The value is a flat tuple of alternating keys and values, not a dict:
+/// tuples cannot be mutated through the leaked attribute, so the mapping
+/// really is immutable once it has been allocated. The attribute name is
+/// private by convention; like every Hydro instance, a frozendict still has a
+/// normal `__dict__`, but the mapping operations below never write to it.
+const FROZENDICT_ITEMS: &str = "__frozendict_items__";
+
+fn native_method(entry: extern "C" fn(*const i64) -> i64, arity: usize, name: &str) -> i64 {
+    value::function_new(entry as *const () as usize, arity, name.to_string())
+}
+
+/// The cached `frozendict` class value.
+///
+/// Python 3.15 added `frozendict` as a builtin immutable mapping (pydantic
+/// 2.14 imports it behind a version guard). Hydro exposes it as a real native
+/// class: instances carry the entries as an immutable tuple, reads and
+/// equality work, and every mutating mapping method raises `TypeError`.
+///
+/// Documented limitations: the constructor accepts one mapping (or `None`)
+/// plus keyword entries (no iterable-of-pairs source), the backing tuple is
+/// reachable through the private instance attribute, and `hash()`/dict-key
+/// use the runtime's identity hash rather than a content hash.
+pub(crate) fn frozendict_class() -> i64 {
+    if let Some(class) = globals::registry_get("builtins.frozendict") {
+        return class;
+    }
+    let class = value::class_new(
+        "frozendict".to_string(),
+        NONE,
+        vec![
+            (
+                "__len__".to_string(),
+                native_method(frozendict_len, 1, "__len__"),
+            ),
+            (
+                "__getitem__".to_string(),
+                native_method(frozendict_getitem, 2, "__getitem__"),
+            ),
+            (
+                "__contains__".to_string(),
+                native_method(frozendict_contains, 2, "__contains__"),
+            ),
+            (
+                "__iter__".to_string(),
+                native_method(frozendict_iter, 1, "__iter__"),
+            ),
+            (
+                "__eq__".to_string(),
+                native_method(frozendict_eq, 2, "__eq__"),
+            ),
+            (
+                "__repr__".to_string(),
+                native_method(frozendict_repr, 1, "__repr__"),
+            ),
+            (
+                "__str__".to_string(),
+                native_method(frozendict_repr, 1, "__str__"),
+            ),
+            ("get".to_string(), native_method(frozendict_get, 2, "get")),
+            (
+                "keys".to_string(),
+                native_method(frozendict_keys, 1, "keys"),
+            ),
+            (
+                "values".to_string(),
+                native_method(frozendict_values, 1, "values"),
+            ),
+            (
+                "items".to_string(),
+                native_method(frozendict_items, 1, "items"),
+            ),
+            // Mutation is rejected: a frozendict is immutable.
+            (
+                "__setitem__".to_string(),
+                native_method(frozendict_setitem, 3, "__setitem__"),
+            ),
+            (
+                "__delitem__".to_string(),
+                native_method(frozendict_immutable, 2, "__delitem__"),
+            ),
+            (
+                "update".to_string(),
+                native_method(frozendict_immutable, 2, "update"),
+            ),
+            (
+                "pop".to_string(),
+                native_method(frozendict_immutable, 2, "pop"),
+            ),
+            (
+                "popitem".to_string(),
+                native_method(frozendict_immutable, 1, "popitem"),
+            ),
+            (
+                "clear".to_string(),
+                native_method(frozendict_immutable, 1, "clear"),
+            ),
+        ],
+    );
+    globals::registry_set("builtins.frozendict", class);
+    class
+}
+
+/// Builds a frozendict from an optional mapping source and keyword entries.
+///
+/// Called by the core class-call paths (positional and keyword forms) before
+/// generic instantiation. Keyword entries layer over the positional source,
+/// exactly like `dict(mapping, **entries)`.
+pub(crate) fn frozendict_instantiate(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if args.len() > 1 {
+        return type_error(&format!(
+            "frozendict expected at most 1 argument, got {}",
+            args.len()
+        ));
+    }
+    let source = args.first().copied().unwrap_or(NONE);
+    let entries = if source == NONE {
+        Vec::new()
+    } else {
+        match frozendict_source_pairs(source) {
+            Some(entries) => entries,
+            None => {
+                return type_error(&format!(
+                    "frozendict() argument must be a mapping, not {}",
+                    value::type_name_of(source)
+                ))
+            }
+        }
+    };
+    // A temporary dict gives the constructor dict semantics (duplicate keys
+    // keep their first position, keywords override the source).
+    let data = value::dict_new(entries);
+    let roots = crate::heap::root_values(&[data]);
+    for (name, item) in keywords {
+        let key = value::str_alloc(name.clone());
+        container::dict_set(data, key, *item);
+    }
+    let flat: Vec<i64> = value::as_dict(data)
+        .map(|pairs| pairs.iter().flat_map(|(key, item)| [*key, *item]).collect())
+        .unwrap_or_default();
+    let items = value::tuple_new(flat);
+    crate::heap::release_roots(roots);
+
+    // Keep the entries rooted while the cached class (first call) and the
+    // instance are allocated.
+    let roots = crate::heap::root_values(&[items]);
+    let class = frozendict_class();
+    let instance = value::instance_new(class);
+    let _live = crate::heap::root_values(&[instance]);
+    value::instance_setattr(instance, FROZENDICT_ITEMS.to_string(), items);
+    crate::heap::release_roots(roots);
+    instance
+}
+
+/// Copies a mapping source into constructor entries.
+fn frozendict_source_pairs(source: i64) -> Option<Vec<(i64, i64)>> {
+    if let Some(pairs) = value::as_dict(source) {
+        return Some(pairs.to_vec());
+    }
+    if let Some((pairs, _)) = value::as_defaultdict(source) {
+        return Some(pairs.to_vec());
+    }
+    frozendict_entries(source).map(|items| {
+        items
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| (pair[0], pair[1]))
+            .collect()
+    })
+}
+
+/// Borrows the immutable entry table of a frozendict instance.
+fn frozendict_entries(obj: i64) -> Option<&'static [i64]> {
+    value::instance_attr(obj, FROZENDICT_ITEMS).and_then(value::as_tuple)
+}
+
+/// Position of `key` in a flat entry table.
+fn frozendict_find(items: &[i64], key: i64) -> Option<usize> {
+    items
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .position(|pair| container::equals(pair[0], key))
+}
+
+fn frozendict_flat_equal(left: &[i64], right: &[i64]) -> bool {
+    left.len() == right.len()
+        && left.as_chunks::<2>().0.iter().all(|pair| {
+            frozendict_find(right, pair[0])
+                .map(|pos| container::equals(pair[1], right[pos * 2 + 1]))
+                .unwrap_or(false)
+        })
+}
+
+fn frozendict_pairs_equal(items: &[i64], right: &[(i64, i64)]) -> bool {
+    items.len() == right.len() * 2
+        && items.as_chunks::<2>().0.iter().all(|pair| {
+            container::dict_find(right, pair[0])
+                .map(|pos| container::equals(pair[1], right[pos].1))
+                .unwrap_or(false)
+        })
+}
+
+fn frozendict_repr_text(items: &[i64]) -> String {
+    let mut text = String::from("frozendict({");
+    for (index, pair) in items.as_chunks::<2>().0.iter().enumerate() {
+        if index > 0 {
+            text.push_str(", ");
+        }
+        text.push_str(&value::repr(pair[0]));
+        text.push_str(": ");
+        text.push_str(&value::repr(pair[1]));
+    }
+    text.push_str("})");
+    text
+}
+
+extern "C" fn frozendict_len(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes `self` first.
+    let this = unsafe { *argv };
+    let length = frozendict_entries(this).map_or(0, |items| items.len() / 2);
+    ops::int_result(length as i64)
+}
+
+extern "C" fn frozendict_getitem(argv: *const i64) -> i64 {
+    // SAFETY: `__getitem__` receives `self` and the key.
+    let this = unsafe { *argv };
+    let key = unsafe { *argv.add(1) };
+    let Some(items) = frozendict_entries(this) else {
+        return type_error("frozendict receiver is not initialized");
+    };
+    match frozendict_find(items, key) {
+        Some(pos) => items[pos * 2 + 1],
+        None => exc::raise_with_message(KEY_ERROR, &value::repr(key)),
+    }
+}
+
+extern "C" fn frozendict_get(argv: *const i64) -> i64 {
+    // SAFETY: `get` receives `self` and the key.
+    let this = unsafe { *argv };
+    let key = unsafe { *argv.add(1) };
+    frozendict_entries(this)
+        .and_then(|items| frozendict_find(items, key).map(|pos| items[pos * 2 + 1]))
+        .unwrap_or(NONE)
+}
+
+extern "C" fn frozendict_contains(argv: *const i64) -> i64 {
+    // SAFETY: `__contains__` receives `self` and the key.
+    let this = unsafe { *argv };
+    let key = unsafe { *argv.add(1) };
+    let present = frozendict_entries(this)
+        .map(|items| frozendict_find(items, key).is_some())
+        .unwrap_or(false);
+    value::bool_value(present)
+}
+
+extern "C" fn frozendict_iter(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes `self` first.
+    let this = unsafe { *argv };
+    let Some(items) = frozendict_entries(this) else {
+        return type_error("frozendict receiver is not initialized");
+    };
+    let keys: Vec<i64> = items
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| pair[0])
+        .collect();
+    let keys = value::list_new(keys);
+    let roots = crate::heap::root_values(&[keys]);
+    let iterator = crate::iter::iter_new(keys);
+    crate::heap::release_roots(roots);
+    iterator
+}
+
+extern "C" fn frozendict_keys(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes `self` first.
+    let this = unsafe { *argv };
+    let Some(items) = frozendict_entries(this) else {
+        return type_error("frozendict receiver is not initialized");
+    };
+    let keys: Vec<i64> = items
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| pair[0])
+        .collect();
+    value::list_new(keys)
+}
+
+extern "C" fn frozendict_values(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes `self` first.
+    let this = unsafe { *argv };
+    let Some(items) = frozendict_entries(this) else {
+        return type_error("frozendict receiver is not initialized");
+    };
+    let values: Vec<i64> = items
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| pair[1])
+        .collect();
+    value::list_new(values)
+}
+
+extern "C" fn frozendict_items(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes `self` first.
+    let this = unsafe { *argv };
+    let Some(items) = frozendict_entries(this) else {
+        return type_error("frozendict receiver is not initialized");
+    };
+    let result = value::list_new(Vec::new());
+    let roots = crate::heap::root_values(&[result]);
+    for pair in items.as_chunks::<2>().0 {
+        let entry = value::tuple_new(vec![pair[0], pair[1]]);
+        let entry_roots = crate::heap::root_values(&[entry]);
+        if let Some(mut entries) = value::list_items_mut(result) {
+            entries.push(entry);
+            crate::heap::write_barrier_edge(result, entry);
+        }
+        crate::heap::release_roots(entry_roots);
+    }
+    crate::heap::release_roots(roots);
+    result
+}
+
+extern "C" fn frozendict_eq(argv: *const i64) -> i64 {
+    // SAFETY: `__eq__` receives `self` and the other operand.
+    let left = unsafe { *argv };
+    let right = unsafe { *argv.add(1) };
+    let Some(items) = frozendict_entries(left) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    if let Some(other) = frozendict_entries(right) {
+        return value::bool_value(frozendict_flat_equal(items, other));
+    }
+    if let Some(other) = value::as_dict(right) {
+        return value::bool_value(frozendict_pairs_equal(items, other));
+    }
+    value::NOT_IMPLEMENTED
+}
+
+extern "C" fn frozendict_repr(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes `self` first.
+    let this = unsafe { *argv };
+    let Some(items) = frozendict_entries(this) else {
+        return value::str_alloc("frozendict({})".to_string());
+    };
+    value::str_alloc(frozendict_repr_text(items))
+}
+
+extern "C" fn frozendict_setitem(_argv: *const i64) -> i64 {
+    type_error("'frozendict' object does not support item assignment")
+}
+
+extern "C" fn frozendict_immutable(_argv: *const i64) -> i64 {
+    type_error("'frozendict' object is immutable")
 }
 
 fn missing_attribute(name: &str) -> i64 {

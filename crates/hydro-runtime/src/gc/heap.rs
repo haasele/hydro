@@ -2255,6 +2255,9 @@ pub(crate) fn reset() {
     HEAP.with(|cell| cell.borrow_mut().free_all());
     // A fresh program run must not resolve functions from the previous one.
     crate::spawn::reset();
+    // HNA modules cache tagged values and persistent roots in a process-wide
+    // registry; the heap that backed them is gone.
+    crate::native::reset();
     // The registered unittest classes lived in the freed heap; drop the
     // stale tagged values before user code runs.
     crate::modules::unittest::reset();
@@ -3613,6 +3616,13 @@ unsafe fn trace(addr: usize) {
                         FunctionBody::BoundMethod { receiver, .. } => {
                             mark_value(*receiver);
                         }
+                        // Exec-compiled functions resolve their check names
+                        // against these mappings at call time, so both stay
+                        // alive with the function.
+                        FunctionBody::Exec { globals, locals, .. } => {
+                            mark_value(*globals);
+                            mark_value(*locals);
+                        }
                         // Interpreter functions own their closure captures.
                         FunctionBody::Host { captures, .. } => {
                             for &capture in captures {
@@ -3622,7 +3632,10 @@ unsafe fn trace(addr: usize) {
                         FunctionBody::AttributeGetter { .. }
                         | FunctionBody::Identity
                         | FunctionBody::Native { .. }
-                        | FunctionBody::Builtin(_) => {}
+                        | FunctionBody::Builtin(_)
+                        // HNA functions own no Hydro values: the native
+                        // registry roots the module value and its constants.
+                        | FunctionBody::Hna { .. } => {}
                     }
                 }
                 // The explicit cause (`raise X from Y`) and the implicit

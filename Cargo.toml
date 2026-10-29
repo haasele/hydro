@@ -7,6 +7,10 @@ members = [
     "crates/hydro-interp",
     "crates/hydro-codegen",
     "crates/hydro-python-parser",
+    "crates/hydro-hna",
+    "crates/hydro-hna-fixture",
+    "crates/hydro-bindgen",
+    "crates/hydro-sqlite-hna",
 ]
 
 [workspace.package]

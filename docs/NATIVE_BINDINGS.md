@@ -1,9 +1,11 @@
 # Hydro — Native Bindings and Compatibility Tiers
 
-Status: **design + roadmap, 2026-10-29.** This document is normative for
-*new* native interfaces and descriptive for existing ones. It does not
-implement anything and claims no tier that has no acceptance evidence.
-Contract changes to the runtime ABI still require [`ARCHITECTURE.md`](ARCHITECTURE.md) §3.
+Status: **HNA v1, bindgen, packaging and the sidecar pilot implemented and
+tested, 2026-10-29.** This document is normative for *new* native interfaces
+and descriptive for existing ones. It claims only the slices listed with
+acceptance evidence in §3.7 and §8; Tier 3 (full CPython ABI) and NB-4 remain
+partial. Contract changes to the runtime ABI still require
+[`ARCHITECTURE.md`](ARCHITECTURE.md) §3.
 
 Scope: how Python code, Rust-native modules, newly compiled libraries,
 unmodified CPython C-extension wheels and foreign-language runtimes reach the
@@ -40,11 +42,11 @@ Compatibility target: **CPython 3.14.9**, defined once in
 
 | Tier | Input | Mechanism | Status (2026-10-29) |
 |---|---|---|---|
-| **0** | Pure-Python source (CPython `Lib`, site-packages, project `.py`) | Frontend importer compiles the source through the normal pipeline; search path includes `HYDRO_SITE_PACKAGES`, venv/conda site-packages, `PYTHONPATH`, `HYDRO_STDLIB` and the vendored `stdlib/` tree | **Partial.** Importer, packages and site-packages work; 130/297 stdlib modules import (88 pure, 30 builtin/frozen, 12 extension), 167 fail. See [`COMPATIBILITY.md`](COMPATIBILITY.md) |
+| **0** | Pure-Python source (CPython `Lib`, site-packages, project `.py`) | Frontend importer compiles the source through the normal pipeline; search path includes `HYDRO_SITE_PACKAGES`, venv/conda site-packages, `PYTHONPATH`, `HYDRO_STDLIB` and the vendored `stdlib/` tree | **Partial.** Importer, packages and site-packages work; 145/297 stdlib modules import (102 pure, 31 builtin/frozen, 12 extension), 152 fail. See [`COMPATIBILITY.md`](COMPATIBILITY.md) |
 | **1** | Hydro's own stdlib/native modules | Rust inside `hydro-runtime`, described by `ModuleSpec`, dispatched by `hydro_module_call`/`hydro_module_get`; **no C ABI, no `dlopen`** | **Implemented for the modules listed in `MODULES`** (Batch A plus selected later modules, e.g. `math`, `json`, `csv`, `re`, `socket`, `zlib`, `datetime`); per-module surface coverage and tests remain P7 work |
-| **2** | New compiled bindings (Rust-first; C/C++/Zig/Go via C ABI) | **HNA** — Hydro Native ABI: C symbol table, tagged `i64` values, explicit root/error/unwind contract, versioned manifest | **Planned.** No loader, no symbols, no fixtures exist |
+| **2** | New compiled bindings (Rust-first; C/C++/Zig/Go via C ABI) | **HNA** — Hydro Native ABI: C symbol table, tagged `i64` values, explicit root/error/unwind contract, versioned manifest | **Implemented (HNA v1).** Header, crate, loader, root/projection services, `.hna.so` discovery with ambiguity diagnostics, Rust/C/Go fixtures, JIT+AOT, strict GC; see §3.7 |
 | **3** | Unmodified CPython C-extension wheels | Option-B shim in `hydro-runtime/src/capi/`; extensions are ordinary `.so` files whose undefined CPython symbols resolve from the Hydro process | **Partial.** abi3 slice, extension loader, full-ABI symbol surface (link-time complete for the pinned wheels); pydantic imports, NumPy/pandas semantic gates open; 12 extension modules import |
-| **4** | JVM/.NET/Node and other foreign runtimes | Tier-2 adapter over the runtime's C ABI, or an explicit sidecar protocol; no automatic cross-language source translation | **None.** Design only |
+| **4** | JVM/.NET/Node and other foreign runtimes | Tier-2 adapter over the runtime's C ABI, or an explicit sidecar protocol; no automatic cross-language source translation | **Tested pilot.** `_hydro_sidecar` protocol v1 (spawn/call/restart/close/alive) with a CPython worker, plus a C HNA adapter fixture; no JVM/.NET/Node adapter yet |
 
 The tiers are alternatives for *different inputs*, not a migration ladder. A
 stdlib module MUST NOT be implemented through Tier 3 when Tier 1 can express
@@ -86,7 +88,7 @@ strategy.
   `Lib/test` status. Unsupported surface is a diagnostic, not a partial
   function.
 
-### 2.3 Tier 2 — HNA (planned)
+### 2.3 Tier 2 — HNA (implemented, v1)
 
 See §3. This is the only supported way for a **new** compiled library to
 enter Hydro. A library that needs CPython objects, `PyObject*` layouts or
@@ -120,7 +122,7 @@ enter Hydro. A library that needs CPython objects, `PyObject*` layouts or
 - Policy: Tier 3 is never used for Hydro-native stdlib modules, never for
   new Hydro bindings and never as a way to import `libpython`.
 
-### 2.5 Tier 4 — foreign runtimes (none implemented)
+### 2.5 Tier 4 — foreign runtimes (sidecar pilot implemented)
 
 Two supported shapes only:
 
@@ -139,7 +141,7 @@ Neither shape translates source between languages. A Python module is not
 rewritten in Java, a JVM class is not rewritten in Python; the boundary is
 explicit messages or C calls.
 
-## 3. HNA v1 — Hydro Native ABI (planned, not implemented)
+## 3. HNA v1 — Hydro Native ABI (implemented)
 
 HNA is the stable contract for compiled modules written for Hydro. It reuses
 the tagged-value model of `ARCHITECTURE.md` §3 but adds a module descriptor,
@@ -223,9 +225,12 @@ storage owned by the module and valid for the process lifetime.
 - Values passed as arguments are rooted by the runtime for the duration of
   the call. A binding that stores a value (module state, cached callback,
   container element it created) MUST root it with the process-lifetime root
-  API. HNA v1 will export `hydro_root_hold(HydroValue) -> uint64_t` and
-  `hydro_root_release(uint64_t)`; these do not exist yet and are part of the
-  HNA implementation, not a current claim.
+  API. HNA v1 exports `hydro_root_hold(HydroValue) -> uint64_t` and
+  `hydro_root_release(uint64_t)` (implemented in `hydro-runtime/src/native.rs`
+  and declared in `include/hydro_native.h`). A token roots the value for the
+  life of the token on the calling Hydro thread, so hold and release must
+  happen on the same thread; the token table itself is process-wide, and
+  repeated/unknown tokens are ignored.
 - A binding that holds a derived value across a call which may allocate,
   block or hit a safepoint MUST register a precise scope
   (`hydro_gc_scope_push`/`hydro_gc_scope_pop`, already exported) or use a
@@ -269,16 +274,84 @@ storage owned by the module and valid for the process lifetime.
   symbols with a new suffix, new reserved flag bits only after being defined.
   A semantic or layout change requires HNA 2 (`hydro_native_module_v2`) and a
   migration window.
-- The runtime exposes its supported range; the loader refuses a module whose
-  `hna_version` or `runtime_abi_min` is outside it, and names both sides in
-  the diagnostic. The numeric runtime ABI revision is introduced with HNA
-  and does not exist today (the current `hydro_runtime` library is linked,
-  not version-negotiated).
+- The runtime exposes its supported range (`hydro_hna_runtime_abi()`,
+  `HYDRO_HNA_RUNTIME_ABI`); the loader refuses a module whose `hna_version`
+  or `runtime_abi_min` is outside it, and names both sides in the diagnostic.
 - The module name in the descriptor MUST equal the dotted name being
   imported; a mismatch is a load error. This prevents a package from
   accidentally satisfying a different import.
 - `platform` MUST equal the host target as reported by the runtime; no
   "compatible enough" guesses.
+
+### 3.7 Implementation status (2026-10-29)
+
+- **Contract and crate.** `include/hydro_native.h` is the C99 v1 header;
+  `crates/hydro-hna` mirrors the descriptor (`HydroNativeModule`,
+  `HydroFunction`, `HydroConstant`), `HNA_VERSION = 1` and
+  `RUNTIME_ABI = 1`. The header declares the three binding entry points
+  (`hydro_native_abi`, `hydro_native_abi_build`, `hydro_native_module_v1`) and
+  the runtime services, including `hydro_hna_runtime_abi`,
+  `hydro_root_hold`/`hydro_root_release`, tagged constructors (`hydro_int`,
+  `hydro_str_new`, `hydro_list_new`, `hydro_tuple_new`, `hydro_dict_new`, …),
+  `hydro_getattr`/`hydro_setattr`/`hydro_call`, `hydro_binop`,
+  `hydro_exc_pending`/`hydro_exc_tag`/`hydro_raise_msg`,
+  `hydro_gc_scope_push`/`hydro_gc_scope_pop` and the typed projections.
+  Projections accept int/bool and float/int where CPython does, copy strings
+  and bytes exactly, and raise `TypeError`/`OverflowError` instead of
+  truncating.
+- **Loader (`hydro-runtime/src/native.rs`).** Discovery finds `<name>.hna.so`
+  in the normal import roots, rejects duplicate/ambiguous artifacts at
+  compile time, `dlopen`s the artifact, validates `struct_size`,
+  `hna_version`, `runtime_abi_min`, module name, platform, flags and the
+  descriptor tail, then runs `init` once at first module load, caches and
+  roots constants, and caches the module object. `load_new` reads
+  `hydro-manifest.toml` first when present and verifies module name, HNA
+  version, ABI minimum, platform, provider and `thread_safe` against the
+  embedded descriptor; a distribution without a manifest keeps working
+  (pre-manifest behaviour). Panics are caught at the boundary and abort the
+  process; no unwinding crosses HNA.
+- **Fixtures.** `crates/hydro-hna-fixture` is a Rust `cdylib` exercising
+  `add`, `greet`, `make_list`, `fail`, `boom` (deliberate abort), the `MAGIC`
+  constant, typed projections and strict rooting; `crates/hydro-sqlite-hna`
+  is a handwritten sqlite HNA binding. C (`cc -shared`) and Go
+  (`-buildmode=c-shared`) fixtures are in the Tea test suite
+  (`tea/tests/hna.rs`) alongside the Rust fixture; all load under `tea infuse`
+  and `tea build` (JIT and AOT), strict GC (`HYDRO_GC_PRECISE=1`) passes, and
+  `ldd` shows no `libpython`.
+- **Bindgen.** `crates/hydro-bindgen` is the `generate`/`check` CLI: it
+  ingests a C header through libclang, maps the supported C subset, and emits
+  a deterministic crate (`bindings.rs`, descriptor, `hydro-manifest.toml`,
+  type-mapping/JSON report); `--check`/`check` regenerates into a temporary
+  directory and compares byte-for-byte, publishing atomically. The generated
+  libm binding passes the CPython differential under JIT and AOT; the
+  handwritten sqlite HNA binding passes the `sqlite3` differential under JIT
+  and AOT. A deliberately panicking HNA fixture aborts under the loader
+  (SIGABRT, no unwind into Hydro), and the generated/Tier-2 boundary cost is
+  measured at **677.5 ns/call (JIT)** and **680.9 ns/call (AOT)** for
+  1,000,000 `hna_rust.add(1,1)` calls in the release build (debug build
+  1.77 us/call; process startup excluded).
+- **Packaging.** The Tea wheel path emits the `hydro1_0` ABI tag, preserves
+  the upstream `RECORD` verbatim for unmodified wheels, and the mixed
+  `.py` + `.hna.so` + CPython-extension artifact tests pass.
+- **Foreign-runtime sidecar.** `_hydro_sidecar` protocol v1 (`spawn`, `call`,
+  `restart`, `close`, `alive`) speaks length-prefixed little-endian frames on
+  stdin/stdout with version/ID/kind validation, frame/depth/method caps,
+  typed value projections and remote exception mapping. A CPython worker
+  round-trips spawn/call/error/restart, and a C HNA adapter fixture
+  initializes and shuts down cleanly.
+- **Remaining limits.** `init` is lazy until the module is first imported;
+  a hold token roots its value on the calling thread and must be released on
+  that thread (the token table is process-wide); the manifest is optional when
+  absent; `thread_safe = false` serializes calls per module. HNA v1 is
+  leaf-module only. Bindgen supports a bounded C
+  declaration subset and rejects variadics, function pointers, `long double`,
+  struct-by-value, mutable output pointers and length-less byte pointers.
+  There is no general `exec`/`eval`: only a bounded source subset (including
+  simple function definitions) is accepted and there is no full runtime Python
+  compiler, so string-source evaluation cannot be delegated to the host.
+  Boundary cost has not been benchmarked, and no JVM/.NET/Node adapter exists
+  (Tier 4 is a pilot, not a generalized bridge). Tier 3/NB-4 remains partial:
+  pydantic imports but model validation, NumPy and pandas do not pass.
 
 ## 4. Loader, discovery and manifests
 
@@ -315,7 +388,7 @@ Rules:
 
 A Hydro-native distribution ships `hydro-manifest.toml` next to its modules.
 The embedded descriptor is authoritative at load time; the manifest exists so
-installers and `hydro-bindgen --check` can inspect a distribution without
+installers and `hydro-bindgen check` can inspect a distribution without
 `dlopen` and can select the right platform artifact.
 
 Required keys (unknown keys are rejected, missing keys are an error):
@@ -339,7 +412,8 @@ thread_safe = false
   loader verifies `module_name`, `hna_version`, `platform`, `provider` and
   `thread_safe` against the embedded descriptor. Any mismatch is a load
   error, never a warning.
-- `hydro-bindgen --check` regenerates and compares both the descriptor and
+- `hydro-bindgen check` (or `generate --check`) regenerates and compares both
+  the descriptor and
   the manifest in CI, so a rebuilt binary cannot silently disagree with a
   checked-in manifest.
 
@@ -350,11 +424,12 @@ thread_safe = false
   installed tree; installation belongs to Tea/`uv` (P4-05).
 - A single distribution MAY contain Python source, HNA artifacts and CPython
   extensions, but not for the same import name (see §4.1).
-- Hydro-native distributions use a Hydro ABI tag in the wheel name (proposal:
-  `py3-none-hydro1_0_<platform>`). For HNA artifacts the loader does not read
-  wheel tags; it keys off the `.hna.so` file name and the descriptor. The
-  Tier 3 extension loader keeps its existing `.cpython-314-*` tag validation.
-  Packaging and tag emission are Tea work and are not claimed here.
+- Hydro-native distributions use the Hydro ABI wheel tag emitted by Tea
+  (`hydro1_0`, e.g. `py3-none-hydro1_0-linux_x86_64`); the Tea wheel tests
+  preserve the upstream `RECORD` verbatim. For HNA artifacts the loader does
+  not read wheel tags; it keys off the `.hna.so` file name and the descriptor.
+  The Tier 3 extension loader keeps its existing `.cpython-314-*` tag
+  validation.
 - CPython extension discovery and HNA discovery must not change each other's
   caching: each caches by canonical artifact path, and a failed HNA load
   never silently falls back to a CPython artifact or vice versa.
@@ -372,10 +447,14 @@ thread_safe = false
   must document it and pass the threaded-callback gate; deadlock is a defect,
   not a supported mode.
 
-## 5. Binding-generation workflow (planned)
+## 5. Binding-generation workflow (implemented, bounded subset)
 
-No `hydro-bindgen` crate exists in the workspace today. The workflow below is
-the accepted target; all steps are roadmap items.
+`crates/hydro-bindgen` implements the workflow below as `hydro-bindgen
+generate`/`hydro-bindgen check`. Generation is deterministic and network-free,
+publishes atomically, and the same options reproduce checked-in output. The
+input language is the bounded C subset of §5.3; this is not a general C
+parser. A handwritten HNA wrapper remains the supported path for Rust C-ABI
+libraries.
 
 ### 5.1 Inputs
 
@@ -449,12 +528,14 @@ it as hand-audited.
 ### 5.4 First targets
 
 1. `libm`-style scalar functions as the end-to-end smoke (arity, floats,
-   errors, AOT).
+   errors, AOT). **Delivered:** generated from the header; matches CPython
+   under JIT and AOT.
 2. `libsqlite3` as the real pilot: opaque handles, callbacks with context,
    string/bytes lifetimes, error codes. It matches the `_sqlite3` work in
    P7-04 and forces the root/lifetime rules to be real.
-   Acceptance compares outputs against CPython's `sqlite3` module on the same
-   database operations.
+   **Delivered as a handwritten HNA binding** (`crates/hydro-sqlite-hna`),
+   compared against CPython's `sqlite3` module under JIT and AOT; generating
+   this binding from the sqlite3 headers is not claimed.
 
 ## 6. Pure-Python package strategy
 
@@ -485,9 +566,10 @@ source. The response is:
    (P7-02). `stdlib/enum.py` is the only vendored adaptation today; the tree
    is not a place to fork packages.
 
-Current state: 130/297 stdlib modules import; pydantic/pydantic-core import
-through the Tier 3 extension; NumPy and pandas do not import yet; the pinned
-ecosystem tree is installed and reported by [`ECOSYSTEM.md`](ECOSYSTEM.md).
+Current state: 145/297 stdlib modules import; pydantic/pydantic-core import
+through the Tier 3 extension; pydantic model smoke, NumPy and pandas fail on
+semantic/dynamic gaps; the pinned ecosystem tree is installed and reported by
+[`ECOSYSTEM.md`](ECOSYSTEM.md).
 
 ## 7. Automatic Python→Rust conversion
 
@@ -535,20 +617,21 @@ transpiled Python.
 
 ## 8. Roadmap and acceptance gates
 
-Phases are ordered by dependency. Tier 1/P7 work continues in parallel with
-NB-2..NB-4. No phase is marked done without the listed evidence; the status
+Phases are ordered by dependency. Tier 1/P7 work (NB-1/NB-7) and the Tier 3
+completion work (NB-4) continue in parallel with the implemented NB-2/3/5/6
+slices. No phase is marked done without the listed evidence; the status
 column is the authoritative claim.
 
 | Phase | Scope | Status | Acceptance gate |
 |---|---|---|---|
 | **NB-0** Baseline | Tier 0 importer, Tier 1 module table, Tier 3 abi3 slice + loader, no `libpython` | **done (baseline slice)**; Tier 3 remains partial | `scripts/verify.sh` green; import matrix and ABI inventory regenerated from real runs; `ldd` shows no `libpython` |
 | **NB-1** Tier 1 completeness | P7-03/P7-04 native modules; one spec entry per module | **in progress** (Batch A and selected modules done) | every Tier 1 module has a spec entry, an implementation and a differential test; no C shim in Tier 1; matrix regenerated |
-| **NB-2** HNA v1 | Descriptor, loader, root-hold API, panic containment, version negotiation, C fixture | **planned** | one Rust cdylib and one C `cc -shared` module (plus a Zig or Go `c-shared` fixture) load under `tea infuse` and `tea build`; version-mismatch and platform-mismatch fixtures fail with the documented diagnostic; strict-GC loop test passes; boundary cost measured; `ldd` clean; no libpython |
-| **NB-3** Bindgen | Header ingestion, type table, generated specs/manifests, `--check`, sqlite3 pilot | **planned** (no crate) | `hydro-bindgen --check` reproduces checked-in output in CI; unsupported-type fixture fails naming each symbol; `libm` smoke and `libsqlite3` differential vs CPython `sqlite3` pass under JIT/AOT; panic fixture aborts cleanly |
-| **NB-4** Tier 3 completion | P4-04c/d full ABI, NumPy/pandas semantics, GIL/threads, P4-05 wheel install | **partial** (symbol surface + pydantic import) | NumPy 2.5 array create/dtype/ops smoke matches the oracle; pydantic model validation matches; pandas import and basic DataFrame smoke pass; threaded extension callbacks + GC stress show no deadlock/race; an abi3 wheel installs and imports under JIT/AOT; `ldd` clean |
-| **NB-5** Packaging and coexistence | `hydro-manifest.toml`, Hydro wheel tag, ambiguity diagnostics, mixed packages | **planned** | an unmodified CPython wheel installed via Tea/uv imports with `RECORD` unchanged; a distribution with `.py` + HNA loads the right artifact; a duplicate-name distribution fails at compile time; manifest/descriptor mismatch fails at load |
-| **NB-6** Foreign runtime bridge | One sidecar pilot, one C-ABI adapter, versioned protocol | **none** | sidecar echo/call/error round-trip matches the CPython oracle and survives a worker restart; adapter fixture initializes and shuts down cleanly; unknown protocol version is rejected with a diagnostic; no source translation anywhere |
-| **NB-7** Stdlib parity | P7 batches, 297 modules accounted | **in progress** (130/297 importable; official suite 3/398) | 297/297 accounted for: importable and green in the mapped `Lib/test` subset, or listed as unsupported with a reason; both generated reports agree |
+| **NB-2** HNA v1 | Descriptor, loader, root-hold API, panic containment, version negotiation, C fixture | **done (HNA v1)** | one Rust cdylib and one C `cc -shared` module (plus a Zig or Go `c-shared` fixture) load under `tea infuse` and `tea build`; version-mismatch and platform-mismatch fixtures fail with the documented diagnostic; strict-GC loop test passes; boundary cost measured (677.5 ns/call JIT, 680.9 ns/call AOT for 1M calls, release); `ldd` clean; no libpython |
+| **NB-3** Bindgen | Header ingestion, type table, generated specs/manifests, `--check`, sqlite3 pilot | **done (generate/check + generated libm; sqlite pilot handwritten; panicking HNA fixture aborts)** | `hydro-bindgen check` reproduces checked-in output in CI; unsupported-type fixture fails naming each symbol; `libm` smoke and `libsqlite3` differential vs CPython `sqlite3` pass under JIT/AOT; panic fixture aborts cleanly |
+| **NB-4** Tier 3 completion | P4-04c/d full ABI, NumPy/pandas semantics, GIL/threads, P4-05 wheel install | **partial**: link-time symbol surface, CPython handle/tuple/list layout, pydantic import; pydantic model/NumPy/pandas and full traverse/GIL open | NumPy 2.5 array create/dtype/ops smoke matches the oracle; pydantic model validation matches; pandas import and basic DataFrame smoke pass; threaded extension callbacks + GC stress show no deadlock/race; an abi3 wheel installs and imports under JIT/AOT; `ldd` clean |
+| **NB-5** Packaging and coexistence | `hydro-manifest.toml`, Hydro wheel tag, ambiguity diagnostics, mixed packages | **done (tested slice)**: manifest parsing/verification, `hydro1_0` wheel tag, ambiguity diagnostics, mixed-artifact tests | an unmodified CPython wheel installed via Tea/uv imports with `RECORD` unchanged; a distribution with `.py` + HNA loads the right artifact; a duplicate-name distribution fails at compile time; manifest/descriptor mismatch fails at load |
+| **NB-6** Foreign runtime bridge | One sidecar pilot, one C-ABI adapter, versioned protocol | **done (pilots)**: `_hydro_sidecar` protocol v1 with a CPython worker and a C HNA adapter; no JVM/.NET/Node adapter | sidecar echo/call/error round-trip matches the CPython oracle and survives a worker restart; adapter fixture initializes and shuts down cleanly; unknown protocol version is rejected with a diagnostic; no source translation anywhere |
+| **NB-7** Stdlib parity | P7 batches, 297 modules accounted | **in progress** (145/297 importable; official suite 3/398) | 297/297 accounted for: importable and green in the mapped `Lib/test` subset, or listed as unsupported with a reason; both generated reports agree |
 
 Dependencies: NB-3 → NB-2; NB-5 → NB-2 and NB-4; NB-6 → NB-2. NB-1 and NB-7
 share the P7 work list; NB-4 follows P4-04c/d. A later phase MUST NOT start
@@ -558,8 +641,10 @@ root contract is enforced).
 ### Status discipline
 
 - "Implemented" means the listed slice runs under JIT and AOT with tests in
-  the repository. Tier 3 is **partial**, Tier 2 is **planned**, Tier 4 is
-  **none**; nothing in this document upgrades those words.
+  the repository. Tier 2 (HNA v1) is **implemented** for the slice in §3.7;
+  Tier 3 is **partial** and NB-4 remains open; Tier 4 is a **tested pilot**
+  (sidecar and C adapter), not a general foreign-runtime bridge. Nothing in
+  this document upgrades those words.
 - A tier is not "supported" because a fixture imports. Each gate above names
   the observable behavior that must agree with CPython or with the documented
   contract.

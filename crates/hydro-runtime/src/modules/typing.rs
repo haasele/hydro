@@ -834,11 +834,19 @@ fn class_chain_contains(class: i64, name: &str) -> bool {
 
 /// `typing.is_typeddict(tp)`: a class whose ancestry reaches the TypedDict
 /// placeholder. Non-classes are always false, like `isinstance(tp, _TypedDictMeta)`.
+pub(crate) fn is_typeddict_class(tp: i64) -> bool {
+    is_typeddict(tp)
+}
+
 fn is_typeddict(tp: i64) -> bool {
     let Some(state) = value::as_class(tp) else {
         return false;
     };
-    state.name != "TypedDict" && class_chain_contains(tp, "TypedDict")
+    state.name != "TypedDict"
+        && (class_chain_contains(tp, "TypedDict")
+            || class_chain_contains(tp, "_TypedDict")
+            || value::class_lookup(tp, "__required_keys__").is_some()
+            || value::class_lookup(tp, "__optional_keys__").is_some())
 }
 
 /// `typing.is_protocol(tp)`: a class marked `_is_protocol` (typing_extensions

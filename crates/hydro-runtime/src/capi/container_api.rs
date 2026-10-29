@@ -252,6 +252,7 @@ pub unsafe extern "C" fn PyList_Insert(
     };
     inc_ref(item);
     items.insert(position as usize, item as usize);
+    super::sync_list_prefix(object);
     0
 }
 
@@ -296,6 +297,7 @@ fn list_ass_slice_handles(
     rebuilt.extend_from_slice(&items[high..]);
     removed.extend_from_slice(&items[low..high]);
     *items = rebuilt;
+    super::sync_list_prefix(object);
     Ok(removed)
 }
 
@@ -435,11 +437,15 @@ pub unsafe extern "C" fn PyList_Sort(object: *mut ShimObject) -> c_int {
             return -1;
         }
     };
+    // The list is empty while comparisons run (CPython's contract); publish
+    // that to extension code reading the inline macros.
+    super::sync_list_prefix(object);
     let sorted = sort_handles(&mut working);
     let stale = match list_slots_mut(object) {
         Ok(items) => std::mem::replace(items, working),
         Err(_) => Vec::new(),
     };
+    super::sync_list_prefix(object);
     // Handles appended by a re-entrant comparison are not part of the sort.
     for handle in stale {
         dec_ref(handle as *mut ShimObject);

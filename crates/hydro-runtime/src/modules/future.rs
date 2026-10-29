@@ -3,9 +3,10 @@
 //! Python's `from __future__ import ...` statements are handled by the parser
 //! and never re-exported at runtime, so the constants here exist to make the
 //! module importable and to answer `__future__.annotations` style lookups. All
-//! optional features that Python 3 enables by default are `True`;
-//! `barry_as_FLUFL` is the one disabled flag. `all_feature_names` lists every
-//! feature name in CPython's declaration order.
+//! optional features that Python 3 enables by default are `True`, and the
+//! mandatory features (`nested_scopes`, `generators`, `with_statement`) are
+//! also `True`; `barry_as_FLUFL` is the one disabled flag. `all_feature_names`
+//! lists every feature name in CPython's declaration order.
 
 use crate::container;
 use crate::exc::{self, ATTRIBUTE_ERROR};
@@ -26,7 +27,12 @@ const ALL_FEATURE_NAMES: &[&str] = &[
     "annotations",
 ];
 
-/// Enabled-by-default feature booleans.
+/// Feature booleans that are `True`.
+///
+/// The first block holds the optional features Python 3 enables by default.
+/// `nested_scopes`, `generators` and `with_statement` are the mandatory
+/// features whose `_Feature` objects have `mandatory != None`, so they are
+/// true for every supported version as well.
 const ENABLED: &[&str] = &[
     "annotations",
     "generator_stop",
@@ -34,6 +40,9 @@ const ENABLED: &[&str] = &[
     "absolute_import",
     "print_function",
     "unicode_literals",
+    "nested_scopes",
+    "generators",
+    "with_statement",
 ];
 
 /// `__future__.all_feature_names`: a fresh list of every feature name.
@@ -77,6 +86,17 @@ mod tests {
     fn optional_features_are_enabled() {
         exc::init();
         for name in ENABLED {
+            assert_eq!(constant(name), TRUE, "{name}");
+        }
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn mandatory_features_are_enabled() {
+        exc::init();
+        // `_Feature(..., mandatory=...)` objects are truthy for every version
+        // that already has the feature; Hydro models features as booleans.
+        for name in ["nested_scopes", "generators", "with_statement"] {
             assert_eq!(constant(name), TRUE, "{name}");
         }
         assert!(!exc::pending());

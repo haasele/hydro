@@ -519,10 +519,13 @@ fn binary_mode_rejects_text_options() {
         clear_error();
     }
 
-    call("io", "open", &[temp.value(), text("r+b")]);
-    assert_eq!(error_tag(), 0);
-    assert_error_text(error_message(), "read/write mode is not supported");
-    clear_error();
+    // `r+`/`w+`/`a+`/`x+` and their binary forms are real update modes.
+    std::fs::write(&temp.path, b"data").expect("write r+b fixture");
+    let plus = open(temp.value(), "r+b");
+    close(plus);
+
+    let created = open(temp.value(), "w+b");
+    close(created);
 
     call("io", "open", &[temp.value(), text("q")]);
     assert_eq!(error_tag(), 0);

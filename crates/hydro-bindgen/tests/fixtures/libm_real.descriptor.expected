@@ -1,0 +1,13 @@
+// Expected descriptor-table fragment for tests/fixtures/libm_real.h.
+// Each non-empty, non-comment line must appear verbatim in the generated
+// src/lib.rs (checked by `tea/tests/bindgen.rs`).
+name: b"sqrt\0".as_ptr() as *const c_char,
+min_args: 1,
+max_args: 1,
+params: b"x\0".as_ptr() as *const c_char,
+call: Some(hydro_bg_fn_0_call as HydroCallFn),
+name: b"hypot\0".as_ptr() as *const c_char,
+min_args: 2,
+max_args: 2,
+params: b"x,y\0".as_ptr() as *const c_char,
+call: Some(hydro_bg_fn_1_call as HydroCallFn),

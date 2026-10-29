@@ -23,6 +23,10 @@ pub static MATH: ModuleSpec = ModuleSpec {
         f("ceil", 1, 1, Type::Int),
         f("trunc", 1, 1, Type::Int),
         f("fabs", 1, 1, Type::Float),
+        // `copysign(x, y)`: magnitude of `x` with the sign of `y`.
+        f("copysign", 2, 2, Type::Float),
+        // `isqrt(n)`: integer square root of a non-negative integer.
+        f("isqrt", 1, 1, Type::Int),
         // Classification predicates accept any real number and return `bool`.
         f("isfinite", 1, 1, Type::Bool),
         f("isnan", 1, 1, Type::Bool),
@@ -118,6 +122,9 @@ const FUNCTOOLS_FUNCTIONS: &[FunctionSpec] = &[
     // the partial binds the source operation's name and the installed method
     // name, so the call supplies `(self, other)`.
     f("_total_ordering_compare", 4, 4, Type::Any),
+    // `cmp_to_key(mycmp)`: wraps an old-style two-argument comparison
+    // function into a key function object.
+    f("cmp_to_key", 1, 1, Type::Any),
 ];
 
 pub static FUNCTOOLS: ModuleSpec = ModuleSpec {
@@ -174,6 +181,9 @@ const OPERATOR_FUNCTIONS: &[FunctionSpec] = &[
     f("delitem", 2, 2, Type::None),
     f("attrgetter", 1, usize::MAX, Type::Function),
     f("itemgetter", 1, usize::MAX, Type::Function),
+    // `_compare_digest(a, b)`: the timing-safe comparison `hmac`/`secrets`
+    // import from `_operator`.
+    f("_compare_digest", 2, 2, Type::Bool),
 ];
 
 pub static OPERATOR: ModuleSpec = ModuleSpec {
@@ -198,9 +208,28 @@ pub static TIME: ModuleSpec = ModuleSpec {
         f("time_ns", 0, 0, Type::Int),
         f("perf_counter_ns", 0, 0, Type::Int),
         f("monotonic_ns", 0, 0, Type::Int),
+        // `process_time()`: consumed CPU time of the current process.
+        f("process_time", 0, 0, Type::Float),
         f("sleep", 1, 1, Type::None),
+        // Broken-down local/UTC time as a `struct_time` sequence; both take an
+        // optional epoch-seconds argument.
+        f("localtime", 0, 1, Type::Any),
+        f("gmtime", 0, 1, Type::Any),
+        // `strftime(format[, t])`: formats either the given `struct_time` or
+        // the current local time. Both parameters may be passed by name.
+        kw("strftime", 1, 2, Type::Str, &["format", "t"]),
+        f("tzset", 0, 0, Type::None),
     ],
-    constants: &[],
+    constants: &[
+        // `struct_time`: the nine-field broken-down time sequence.
+        c("struct_time", Type::Any),
+        // `tzname`: the `(std, dst)` timezone name pair.
+        c("tzname", Type::Any),
+        // Non-zero when daylight saving time is in effect.
+        c("daylight", Type::Int),
+        // The nine `struct_time` field names (`['tm_year', ...]`), not a count.
+        c("_STRUCT_TM_ITEMS", Type::List),
+    ],
 };
 
 pub static THREAD: ModuleSpec = ModuleSpec {
@@ -210,6 +239,8 @@ pub static THREAD: ModuleSpec = ModuleSpec {
         f("join", 1, 1, Type::None),
         f("get_ident", 0, 0, Type::Int),
         f("allocate_lock", 0, 0, Type::Any),
+        // `_thread.RLock`: the reentrant lock class used by `threading`.
+        f("RLock", 0, 0, Type::Any),
     ],
     constants: &[],
 };
@@ -244,7 +275,18 @@ pub static PATHLIB: ModuleSpec = ModuleSpec {
         f("cwd", 0, 0, Type::Any),
         f("home", 0, 0, Type::Any),
     ],
-    constants: &[],
+    constants: &[
+        // The pure-path class family. Pydantic 2.14 looks every one of these
+        // up by identity (its `_handlers`/`_generic_handlers` tables) and may
+        // instantiate them as `os.PathLike` constructors, so they are class
+        // values rather than module functions. `Path` itself stays a function:
+        // it is the concrete, filesystem-capable constructor.
+        c("PurePath", Type::Any),
+        c("PosixPath", Type::Any),
+        c("WindowsPath", Type::Any),
+        c("PurePosixPath", Type::Any),
+        c("PureWindowsPath", Type::Any),
+    ],
 };
 
 pub static PLATFORM: ModuleSpec = ModuleSpec {
@@ -316,7 +358,7 @@ pub static JSON: ModuleSpec = ModuleSpec {
         ),
         kw("load", 1, 1, Type::Any, &["file"]),
     ],
-    constants: &[],
+    constants: &[c("JSONDecodeError", Type::Any)],
 };
 
 pub static CSV: ModuleSpec = ModuleSpec {
@@ -340,6 +382,10 @@ pub static OS_PATH: ModuleSpec = ModuleSpec {
         f("isfile", 1, 1, Type::Bool),
         f("isdir", 1, 1, Type::Bool),
         f("isabs", 1, 1, Type::Bool),
+        // `islink(path)`: whether the final path component is a symlink.
+        f("islink", 1, 1, Type::Bool),
+        // `expanduser(path)`: `~`/`~user` expanded against the home directory.
+        f("expanduser", 1, 1, Type::Str),
         f("abspath", 1, 1, Type::Str),
         f("splitext", 1, 1, Type::Tuple),
         f("split", 1, 1, Type::Tuple),
@@ -414,6 +460,22 @@ pub static OS: ModuleSpec = ModuleSpec {
         // `os.makedirs(name, mode=0o777, exist_ok=False)`: recursive directory
         // creation. `exist_ok` tolerates only an existing directory.
         kw("makedirs", 1, 3, Type::None, &["name", "mode", "exist_ok"]),
+        // `os.system(command)`: runs a shell command and returns its wait
+        // status.
+        f("system", 1, 1, Type::Any),
+        // `fsencode`/`fsdecode`: UTF-8 encoding under the surrogateescape
+        // error handler; the result is `bytes` and `str` respectively.
+        f("fsencode", 1, 1, Type::Any),
+        f("fsdecode", 1, 1, Type::Any),
+        // Process credentials; every one is positional-only in CPython.
+        f("getuid", 0, 0, Type::Int),
+        f("geteuid", 0, 0, Type::Int),
+        f("getgid", 0, 0, Type::Int),
+        f("getegid", 0, 0, Type::Int),
+        // `os.close(fd)` and `os.fstat(fd)`: the latter returns an
+        // `os.stat_result`-shaped namespace.
+        f("close", 1, 1, Type::None),
+        f("fstat", 1, 1, Type::Any),
     ],
     constants: &[
         c("name", Type::Str),
@@ -424,6 +486,12 @@ pub static OS: ModuleSpec = ModuleSpec {
         c("environ", Type::Dict),
         c("PathLike", Type::Any),
         c("devnull", Type::Str),
+        // `altsep` is `None` on POSIX; `defpath` is the default executable
+        // search path.
+        c("altsep", Type::Any),
+        c("defpath", Type::Str),
+        // `os.WNOHANG`: the non-blocking flag for the `waitpid` family.
+        c("WNOHANG", Type::Int),
         c("F_OK", Type::Int),
         c("X_OK", Type::Int),
         c("W_OK", Type::Int),
@@ -449,6 +517,10 @@ pub static THREADING: ModuleSpec = ModuleSpec {
         f("Event", 0, 0, Type::Any),
         f("get_ident", 0, 0, Type::Int),
         f("active_count", 0, 0, Type::Int),
+        // `current_thread()`/`main_thread()`: `Thread` objects representing the
+        // running and the interpreter's main thread.
+        f("current_thread", 0, 0, Type::Any),
+        f("main_thread", 0, 0, Type::Any),
         f("_threadbase_init", 1, 4, Type::None),
         f("_threadbase_start", 1, 1, Type::None),
         f("_threadbase_join", 1, 2, Type::None),
@@ -552,8 +624,16 @@ pub static PICKLE: ModuleSpec = ModuleSpec {
             Type::Any,
             &["file", "fix_imports", "encoding", "errors", "buffers"],
         ),
+        // `decode_long(data, bytes=None)`: the `pickletools` helper that
+        // rebuilds a little-endian two's-complement integer. `bytes` is a
+        // keyword-only compatibility slot.
+        f("decode_long", 1, 2, Type::Any),
     ],
-    constants: &[],
+    constants: &[
+        // `pickle.DEFAULT_PROTOCOL`: the protocol `dump`/`dumps` use when none
+        // is given.
+        c("DEFAULT_PROTOCOL", Type::Int),
+    ],
 };
 
 pub static SYS: ModuleSpec = ModuleSpec {
@@ -580,7 +660,17 @@ pub static SYS: ModuleSpec = ModuleSpec {
         // this stays positional-only.
         f("_getframe", 0, 1, Type::Any),
         f("getdefaultencoding", 0, 0, Type::Str),
+        // `sys.audit(event, *args)`: raises if a hook vetoes the event; the
+        // trailing arguments are event-specific.
+        f("audit", 1, usize::MAX, Type::None),
+        // `sys.addaudithook(hook)`: appends a callable audit hook.
+        f("addaudithook", 1, 1, Type::None),
         f("getfilesystemencoding", 0, 0, Type::Str),
+        // Name of the filesystem error handler (`surrogateescape` on POSIX).
+        f("getfilesystemencodeerrors", 0, 0, Type::Str),
+        // Maximum number of decimal digits used when converting an int to
+        // text (`sys.set_int_max_str_digits`'s companion).
+        f("get_int_max_str_digits", 0, 0, Type::Int),
         f("getswitchinterval", 0, 0, Type::Float),
         f("setswitchinterval", 1, 1, Type::None),
     ],
@@ -622,6 +712,12 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("path", Type::List),
         c("modules", Type::Dict),
         c("builtin_module_names", Type::Tuple),
+        // `sys.flags`: the interpreter's command-line flag namespace.
+        c("flags", Type::Any),
+        // `sys.monitoring`/`sys.meta_path`: the monitor tool registry and the
+        // ordered list of meta path finders.
+        c("monitoring", Type::Any),
+        c("meta_path", Type::Any),
         // Installation prefixes: `base_prefix`/`exec_prefix` describe the
         // Hydro installation, `prefix` the active virtual environment.
         c("prefix", Type::Str),
@@ -844,6 +940,12 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         // and as constructors. The runtime serves the class values.
         c("complex", Type::Any),
         c("slice", Type::Any),
+        // Python 3.15's immutable mapping. Pydantic 2.14 imports the name
+        // behind a `sys.version_info >= (3, 15)` guard and keeps it in its
+        // handler tables; the runtime provides a real constructible class so
+        // the import and identity comparisons resolve (see the runtime's
+        // `frozendict` implementation for the documented limitations).
+        c("frozendict", Type::Any),
         // `object` is CPython's universal base class. It is a class value, not
         // a native function: `class C(object)`, `isinstance(x, object)` and
         // `object()` all need the runtime class. The bare name resolves like
@@ -895,6 +997,11 @@ const IO_FUNCTIONS: &[FunctionSpec] = &[
             "write_through",
         ],
     ),
+    // `text_encoding(encoding, stacklevel=2)`: reports the encoding a call
+    // would use, falling back to the locale when `encoding` is `None`.
+    kw("text_encoding", 1, 2, Type::Str, &["encoding"]),
+    // `open_code(path)`: opens a binary source file for the import system.
+    f("open_code", 1, 1, Type::Any),
 ];
 
 pub static IO: ModuleSpec = ModuleSpec {
@@ -914,6 +1021,10 @@ pub static IO: ModuleSpec = ModuleSpec {
         c("SEEK_SET", Type::Int),
         c("SEEK_CUR", Type::Int),
         c("SEEK_END", Type::Int),
+        // The exported name list and the default `BufferedReader`/Writer
+        // buffer size.
+        c("__all__", Type::List),
+        c("DEFAULT_BUFFER_SIZE", Type::Int),
     ],
 };
 
@@ -976,7 +1087,12 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
 pub static COLLECTIONS: ModuleSpec = ModuleSpec {
     name: "collections",
     functions: &[
-        kw("defaultdict", 1, 1, Type::Any, &["default_factory"]),
+        // `defaultdict(default_factory=None, /, initial=(), **kwargs)`: the
+        // factory is positional-only and the trailing keywords are data keys,
+        // so every keyword name is dynamic. A second positional argument
+        // initialises the mapping; CPython rejects a third with "dict expected
+        // at most 1 argument".
+        kw_dynamic("defaultdict", 0, 2, Type::Any, &[]),
         // `OrderedDict(iterable_or_mapping=(), /, **kwargs)`: the parameter is
         // positional-only in CPython, so the keywords are data keys and the
         // dynamic-keyword flag preserves them.
@@ -1051,6 +1167,9 @@ const SOCKET_CONSTANTS: &[ConstantSpec] = &[
     c("MSG_WAITALL", Type::Int),
     c("MSG_NOSIGNAL", Type::Int),
     c("SocketType", Type::Any),
+    // `socket._GLOBAL_DEFAULT_TIMEOUT`: the sentinel socket wrappers treat as
+    // "use the global default".
+    c("_GLOBAL_DEFAULT_TIMEOUT", Type::Any),
     c("error", Type::Any),
     c("gaierror", Type::Any),
     c("timeout", Type::Any),
@@ -1589,7 +1708,7 @@ pub static BASE64: ModuleSpec = ModuleSpec {
         f("standard_b64encode", 1, 1, Type::Bytes),
         f("standard_b64decode", 1, 1, Type::Bytes),
         f("urlsafe_b64encode", 1, 1, Type::Bytes),
-        f("urlsafe_b64decode", 1, 1, Type::Bytes),
+        kw("urlsafe_b64decode", 1, 2, Type::Bytes, &["s", "padded"]),
         f("encodebytes", 1, 1, Type::Bytes),
         f("decodebytes", 1, 1, Type::Bytes),
         f("encodestring", 1, 1, Type::Bytes),
@@ -1658,7 +1777,12 @@ pub static GETOPT: ModuleSpec = ModuleSpec {
             &["args", "shortopts", "longopts"],
         ),
     ],
-    constants: &[],
+    constants: &[
+        // `GetoptError`: the `Exception` subclass `getopt` raises; `error` is
+        // CPython's additional module-level alias for the same class.
+        c("GetoptError", Type::Any),
+        c("error", Type::Any),
+    ],
 };
 
 /// `mimetypes`: mapping between filenames and MIME types.
@@ -1764,6 +1888,26 @@ pub static TMPFILE: ModuleSpec = ModuleSpec {
         f("_tempdir_enter", 1, 1, Type::Str),
         f("_tempdir_exit", 4, 4, Type::None),
         f("_tempdir_cleanup", 1, 1, Type::None),
+        // `NamedTemporaryFile(mode='w+b', buffering=-1, encoding=None,
+        // newline=None, suffix=None, prefix=None, dir=None, delete=True,
+        // errors=None)`: the file object is deleted when it is closed.
+        kw(
+            "NamedTemporaryFile",
+            0,
+            9,
+            Type::Any,
+            &[
+                "mode",
+                "buffering",
+                "encoding",
+                "newline",
+                "suffix",
+                "prefix",
+                "dir",
+                "delete",
+                "errors",
+            ],
+        ),
     ],
     constants: &[],
 };
@@ -1847,20 +1991,39 @@ pub static TIMEIT: ModuleSpec = ModuleSpec {
 };
 
 /// `dataclasses`: the decorator is expanded by the frontend, which reads a
-/// field's `field(...)` call from the class-body AST. Both names still need a
-/// runtime value: `dataclass` is inert, while `field` returns a marker
-/// namespace so executing the class body succeeds.
+/// field's `field(...)` call from the class-body AST. The names still need a
+/// runtime value: `dataclass` is inert, `field` returns a real `Field`
+/// instance so executing the class body succeeds, and `MISSING` is the shared
+/// sentinel the omitted field settings carry.
 ///
 /// `replace(obj, **changes)` takes its single positional argument plus
 /// arbitrary keyword names, so it forwards every keyword to the runtime
 /// ([`kw_dynamic`]); the runtime shallow-copies the instance attributes.
+/// `fields(class_or_instance)` returns the declared `Field` objects as a
+/// tuple.
 pub static DATACLASSES: ModuleSpec = ModuleSpec {
     name: "dataclasses",
     functions: &[
-        kw("field", 0, 2, Type::Any, &["default", "default_factory"]),
+        // `field(*, default=MISSING, default_factory=MISSING, init=True, ...)`:
+        // CPython takes no positional arguments; all names are keyword-only,
+        // so the generic binder must not shift `default_factory` into a
+        // `default` slot.
+        kw_dynamic("field", 0, 0, Type::Any, &[]),
         kw_dynamic("replace", 1, 1, Type::Any, &["obj"]),
+        // `is_dataclass(obj)`: true for a dataclass or one of its instances.
+        f("is_dataclass", 1, 1, Type::Bool),
+        // `fields(class_or_instance)`: tuple of the declared `Field` objects.
+        f("fields", 1, 1, Type::Tuple),
     ],
-    constants: &[c("dataclass", Type::Any), c("InitVar", Type::Any)],
+    constants: &[
+        c("dataclass", Type::Any),
+        c("InitVar", Type::Any),
+        // `Field`: the descriptor `field()` builds.
+        c("Field", Type::Any),
+        // `MISSING`: the sentinel omitted `field()` settings carry.
+        c("MISSING", Type::Any),
+        c("_HAS_DEFAULT_FACTORY", Type::Any),
+    ],
 };
 
 /// `datetime`: the `date`/`time`/`datetime`/`timedelta`/`tzinfo` classes plus
@@ -1909,6 +2072,12 @@ pub static DATETIME: ModuleSpec = ModuleSpec {
         f("_datetime_add", 2, 2, Type::Any),
         f("_datetime_radd", 2, 2, Type::Any),
         f("_datetime_sub", 2, 2, Type::Any),
+        // `datetime.timezone` instance methods (receiver first).
+        f("_datetime_timezone_utcoffset", 2, 2, Type::Any),
+        f("_datetime_timezone_dst", 2, 2, Type::Any),
+        f("_datetime_timezone_tzname", 2, 2, Type::Any),
+        f("_datetime_timezone_fromutc", 2, 2, Type::Any),
+        f("_datetime_timezone_eq", 2, 2, Type::Any),
     ],
     constants: &[
         c("date", Type::Any),
@@ -1916,6 +2085,11 @@ pub static DATETIME: ModuleSpec = ModuleSpec {
         c("datetime", Type::Any),
         c("timedelta", Type::Any),
         c("tzinfo", Type::Any),
+        // `datetime.timezone`: the fixed-offset `tzinfo` subclass.
+        c("timezone", Type::Any),
+        // `datetime.UTC` (PEP 615): the very same object as
+        // `datetime.timezone.utc`, so `UTC is timezone.utc` holds.
+        c("UTC", Type::Any),
         c("MINYEAR", Type::Int),
         c("MAXYEAR", Type::Int),
         c("datetime_CAPI", Type::Any),
@@ -2219,6 +2393,10 @@ pub static FUTURE: ModuleSpec = ModuleSpec {
         c("print_function", Type::Bool),
         c("generator_stop", Type::Bool),
         c("unicode_literals", Type::Bool),
+        // Legacy features retained for `__future__` compatibility.
+        c("nested_scopes", Type::Bool),
+        c("generators", Type::Bool),
+        c("with_statement", Type::Bool),
     ],
 };
 
@@ -2263,7 +2441,14 @@ pub static TYPES: ModuleSpec = ModuleSpec {
         // present, else its real bases (Hydro records the declared bases, so
         // generic aliases stay visible).
         f("get_original_bases", 1, 1, Type::Tuple),
-        f("prepare_class", 2, 2, Type::Tuple),
+        kw(
+            "prepare_class",
+            2,
+            3,
+            Type::Tuple,
+            &["name", "bases", "kwds"],
+        ),
+        f("resolve_bases", 1, 1, Type::Any),
     ],
     constants: &[
         c("CodeType", Type::Any),
@@ -2512,8 +2697,15 @@ pub static IMPORTLIB_UTIL: ModuleSpec = ModuleSpec {
         f("_lazy_init", 2, 2, Type::None),
         f("_lazy_create_module", 2, 2, Type::Any),
         f("_lazy_exec_module", 2, 2, Type::None),
+        // `_find_spec_from_path(name, path=None)`: the internal helper
+        // `pyclbr` calls with the two positional arguments.
+        f("_find_spec_from_path", 2, 2, Type::Any),
     ],
-    constants: &[c("LazyLoader", Type::Any)],
+    constants: &[
+        c("LazyLoader", Type::Any),
+        // `MAGIC_NUMBER`: the four-byte pyc magic of the running interpreter.
+        c("MAGIC_NUMBER", Type::Bytes),
+    ],
 };
 
 /// `importlib.machinery`: loaders and `ModuleSpec`.
@@ -2688,7 +2880,7 @@ pub static CONTEXTLIB: ModuleSpec = ModuleSpec {
 pub static _COLLECTIONS: ModuleSpec = ModuleSpec {
     name: "_collections",
     functions: &[
-        kw("defaultdict", 1, 1, Type::Any, &["default_factory"]),
+        kw_dynamic("defaultdict", 0, 2, Type::Any, &[]),
         kw_dynamic("OrderedDict", 0, 1, Type::Any, &[]),
         kw_dynamic("Counter", 0, 1, Type::Any, &[]),
     ],
@@ -3586,8 +3778,28 @@ pub static UNICODEDATA: ModuleSpec = ModuleSpec {
         f("numeric", 1, 2, Type::Float),
         f("digit", 1, 2, Type::Int),
         f("decimal", 1, 2, Type::Int),
+        // Native method bodies of the frozen `ucd_3_2_0` database; the
+        // receiver is the first argument.
+        f("_ucd32_category", 2, 2, Type::Str),
+        f("_ucd32_bidirectional", 2, 2, Type::Str),
+        f("_ucd32_combining", 2, 2, Type::Int),
+        f("_ucd32_decomposition", 2, 2, Type::Str),
+        f("_ucd32_east_asian_width", 2, 2, Type::Str),
+        f("_ucd32_mirrored", 2, 2, Type::Int),
+        f("_ucd32_name", 2, 3, Type::Str),
+        f("_ucd32_lookup", 2, 2, Type::Str),
+        f("_ucd32_normalize", 3, 3, Type::Str),
+        f("_ucd32_is_normalized", 3, 3, Type::Bool),
+        f("_ucd32_numeric", 2, 3, Type::Float),
+        f("_ucd32_digit", 2, 3, Type::Int),
+        f("_ucd32_decimal", 2, 3, Type::Int),
     ],
-    constants: &[c("unidata_version", Type::Str)],
+    constants: &[
+        c("unidata_version", Type::Str),
+        // `ucd_3_2_0`: the frozen Unicode 3.2 database used by the `idna`
+        // codec.
+        c("ucd_3_2_0", Type::Any),
+    ],
 };
 
 /// `zlib`: real zlib-format compression through the system `libz`.
@@ -3763,6 +3975,26 @@ pub static MEMCACHED: ModuleSpec = ModuleSpec {
     constants: &[],
 };
 
+/// `_hydro_sidecar`: native transport for foreign-runtime sidecar workers.
+///
+/// A sidecar is a child process speaking a length-prefixed binary protocol on
+/// stdin/stdout. `spawn(program, args=None)` launches it and performs the
+/// protocol handshake; the returned handle is a capsule-backed worker reused by
+/// `call(handle, method, *args)`. `restart` relaunches a worker, `close`
+/// terminates it and `alive` reports whether it is still running. The protocol
+/// constants are exposed as module constants.
+pub static HYDRO_SIDECAR: ModuleSpec = ModuleSpec {
+    name: "_hydro_sidecar",
+    functions: &[
+        f("spawn", 1, 2, Type::Any),
+        f("call", 2, usize::MAX, Type::Any),
+        f("restart", 1, 1, Type::None),
+        f("close", 1, 1, Type::None),
+        f("alive", 1, 1, Type::Bool),
+    ],
+    constants: &[c("PROTOCOL_VERSION", Type::Int), c("MAX_FRAME", Type::Int)],
+};
+
 /// `inspect`: native introspection over the runtime's function/class/module
 /// representations.
 ///
@@ -3925,11 +4157,14 @@ mod tests {
         );
         assert_eq!(constant("dataclasses", "dataclass").unwrap().ty, Type::Any);
         let field = function("dataclasses", "field").expect("dataclasses.field");
-        assert_eq!((field.min_args, field.max_args), (0, 2));
-        assert_eq!(
-            field.params,
-            &["default", "default_factory"][..],
-            "field() accepts both marker attributes by name"
+        assert_eq!((field.min_args, field.max_args), (0, 0));
+        assert!(
+            field.params.is_empty(),
+            "field() is keyword-only: no positional slots"
+        );
+        assert!(
+            field.dynamic_keywords,
+            "field() accepts its CPython keyword names dynamically"
         );
         let replace = function("dataclasses", "replace").expect("dataclasses.replace");
         assert_eq!((replace.min_args, replace.max_args), (1, 1));
@@ -3937,6 +4172,14 @@ mod tests {
         assert!(
             replace.dynamic_keywords,
             "replace() forwards arbitrary keyword names to the runtime"
+        );
+        assert_eq!(constant("dataclasses", "MISSING").unwrap().ty, Type::Any);
+        let fields = function("dataclasses", "fields").expect("dataclasses.fields");
+        assert_eq!((fields.min_args, fields.max_args), (1, 1));
+        assert_eq!(fields.ret, Type::Tuple);
+        assert!(
+            !fields.dynamic_keywords,
+            "fields() takes one positional argument and no keywords"
         );
     }
 
@@ -5396,5 +5639,35 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn frozendict_and_pathlib_class_constants_are_registered() {
+        // Pydantic 2.14 imports `frozendict` from `builtins` and looks up the
+        // whole pure-path family on `pathlib`; both are class values.
+        assert_eq!(
+            constant("builtins", "frozendict").expect("frozendict").ty,
+            Type::Any
+        );
+        for name in [
+            "PurePath",
+            "PosixPath",
+            "WindowsPath",
+            "PurePosixPath",
+            "PureWindowsPath",
+        ] {
+            assert_eq!(
+                constant("pathlib", name).expect(name).ty,
+                Type::Any,
+                "pathlib.{name} is a class constant"
+            );
+        }
+
+        // `Path` remains a constructor function with its optional `path`
+        // keyword; the class constants do not shadow it.
+        let path = function("pathlib", "Path").expect("pathlib.Path");
+        assert_eq!((path.min_args, path.max_args), (0, 1));
+        assert_eq!(path.params, &["path"][..]);
+        assert!(function("pathlib", "PurePath").is_none());
     }
 }

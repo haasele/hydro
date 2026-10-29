@@ -30,28 +30,30 @@ Machine-readable results are written to `benchmarks/compat/latest.json`.
 
 <!-- BEGIN GENERATED TABLE -->
 
-Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` · binary `/mnt/Vault/GitHub/tea/target/release/tea`
+Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` · binary `/mnt/Vault/GitHub/tea/target/debug/tea`
 
 ## Summary
 
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
-| builtin/frozen | 52 | 30 | 22 |
-| pure | 174 | 88 | 86 |
+| builtin/frozen | 52 | 31 | 21 |
+| pure | 174 | 102 | 72 |
 | extension | 63 | 12 | 51 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 130 | 167 |
+| **Total** | 297 | 145 | 152 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
 | compile_error:HYD0002 | 85 |
-| compile_error:HYD0201 | 60 |
+| compile_error:HYD0201 | 34 |
 | cpython_failed | 9 |
+| compile_error:HYD0101 | 8 |
+| compile_error:HYD0103 | 7 |
 | runtime_error | 6 |
-| compile_error:HYD0101 | 5 |
 | compile_error:HYD0102 | 1 |
+| compile_error:HYD0202 | 1 |
 | compile_error:HYD0301 | 1 |
 
 ## Modules by layer
@@ -97,16 +99,16 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `errno` | ok | ok | ok | - |
 | `faulthandler` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'faulthandler' not found: not supported on the import search path |
 | `gc` | ok | ok | ok | - |
-| `genericpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'fstat' |
+| `genericpath` | ok | ok | ok | - |
 | `io` | ok | ok | ok | - |
 | `itertools` | ok | ok | ok | - |
 | `marshal` | ok | ok | ok | - |
-| `ntpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'fstat' |
+| `ntpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'getcwdb' |
 | `os` | ok | ok | ok | - |
 | `posix` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'posix' not found: not supported on the import search path |
-| `posixpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'fstat' |
+| `posixpath` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'getcwdb' |
 | `pwd` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pwd' not found: not supported on the import search path |
-| `runpy` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'io' has no attribute 'open_code' |
+| `runpy` | ok | exit 1 | compile_error:HYD0103 | error[HYD0103]: format() takes 2 arguments (1 given) |
 | `site` | ok | ok | ok | - |
 | `stat` | ok | ok | ok | - |
 | `sys` | ok | ok | ok | - |
@@ -118,79 +120,79 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Module | CPython | Hydro | Status | Error |
 | --- | --- | --- | --- | --- |
 | `__future__` | ok | ok | ok | - |
-| `_aix_support` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'system' |
+| `_aix_support` | ok | ok | ok | - |
 | `_android_support` | ok | ok | ok | - |
 | `_apple_support` | ok | ok | ok | - |
 | `_ast_unparse` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_ast' not found: not supported on the import search path |
-| `_colorize` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
+| `_colorize` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'isatty' |
 | `_compat_pickle` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'WindowsError' is not defined |
 | `_ios_support` | ok | ok | ok | - |
 | `_markupbase` | ok | ok | ok | - |
 | `_opcode_metadata` | ok | ok | ok | - |
-| `_osx_support` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'tempfile' has no attribute 'NamedTemporaryFile' |
+| `_osx_support` | ok | exit 1 | compile_error:HYD0103 | error[HYD0103]: sub() does not accept keyword arguments |
 | `_py_abc` | ok | ok | ok | - |
-| `_py_warnings` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_thread' has no attribute 'RLock' |
-| `_pydatetime` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'time' has no attribute 'struct_time' |
-| `_pydecimal` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'math' has no attribute 'copysign' |
-| `_pyio` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'io' has no attribute '__all__' |
+| `_py_warnings` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: type 'None' has no method 'getline' |
+| `_pydatetime` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'math' has no attribute 'modf' |
+| `_pydecimal` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'pow' is not defined |
+| `_pyio` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'EncodingWarning' is not defined |
 | `_pylong` | ok | exit 1 | compile_error:HYD0102 | error[HYD0102]: unsupported operand type(s) for <=: 'set' and 'list' |
 | `_pyrepl` | ok | ok | ok | - |
 | `_strptime` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'FEBRUARY' is not defined |
-| `_threading_local` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'threading' has no attribute 'current_thread' |
+| `_threading_local` | ok | ok | ok | - |
 | `_weakrefset` | ok | ok | ok | - |
 | `annotationlib` | ok | ok | ok | - |
-| `antigravity` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'audit' |
+| `antigravity` | ok | exit 1 | compile_error:HYD0103 | error[HYD0103]: Popen() got an unexpected keyword argument 'close_fds' |
 | `argparse` | ok | ok | ok | - |
 | `ast` | ok | ok | ok | - |
 | `asyncio` | ok | ok | ok | - |
 | `base64` | ok | ok | ok | - |
-| `bdb` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'monitoring' |
+| `bdb` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'settrace' |
 | `bisect` | ok | ok | ok | - |
 | `bz2` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_bz2' not found: not supported on the import search path |
 | `cProfile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
 | `calendar` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'FEBRUARY' is not defined |
 | `cmd` | ok | ok | ok | - |
-| `code` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
-| `codeop` | ok | exit 1 | runtime_error | AttributeError: module '__future__' has no attribute 'nested_scopes' |
+| `code` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'isatty' |
+| `codeop` | ok | ok | ok | - |
 | `collections` | ok | ok | ok | - |
 | `colorsys` | ok | ok | ok | - |
-| `compileall` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'meta_path' |
+| `compileall` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'importlib.metadata' has no attribute 'MetadataPathFinder' |
 | `compression` | ok | ok | ok | - |
 | `concurrent` | ok | ok | ok | - |
-| `configparser` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'io' has no attribute 'text_encoding' |
+| `configparser` | ok | exit 1 | compile_error:HYD0103 | error[HYD0103]: enumerate() does not accept the keyword argument 'start' |
 | `contextlib` | ok | ok | ok | - |
 | `contextvars` | ok | ok | ok | - |
-| `copy` | ok | exit 1 | runtime_error | NotImplementedError: ABC.register() is not implemented: Hydro's isinstance/issubclass onl… |
-| `copyreg` | ok | exit 1 | runtime_error | AttributeError: 'function' object has no attribute '__new__' |
+| `copy` | ok | ok | ok | - |
+| `copyreg` | ok | ok | ok | - |
 | `csv` | ok | ok | ok | - |
 | `ctypes` | ok | ok | ok | - |
 | `curses` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_curses' not found: not supported on the import search path |
 | `dataclasses` | ok | ok | ok | - |
 | `datetime` | ok | ok | ok | - |
-| `dbm` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'fsencode' |
+| `dbm` | ok | ok | ok | - |
 | `decimal` | ok | ok | ok | - |
 | `difflib` | ok | ok | ok | - |
 | `dis` | ok | ok | ok | - |
 | `doctest` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_signal' not found: not supported on the import search path |
 | `email` | ok | ok | ok | - |
 | `encodings` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'codecs' has no attribute 'code_page_encode' |
-| `ensurepip` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'flags' |
+| `ensurepip` | ok | ok | ok | - |
 | `enum` | ok | ok | ok | - |
-| `filecmp` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'getopt' has no attribute 'GetoptError' |
-| `fileinput` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'flags' |
+| `filecmp` | ok | ok | ok | - |
+| `fileinput` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'EncodingWarning' is not defined |
 | `fnmatch` | ok | ok | ok | - |
 | `fractions` | ok | ok | ok | - |
-| `ftplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'socket' has no attribute '_GLOBAL_DEFAULT_TIMEOUT' |
+| `ftplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'socket' has no attribute 'create_server' |
 | `functools` | ok | ok | ok | - |
 | `getopt` | ok | ok | ok | - |
-| `getpass` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'getuid' |
+| `getpass` | ok | ok | ok | - |
 | `gettext` | ok | ok | ok | - |
-| `glob` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'audit' |
+| `glob` | ok | exit 1 | compile_error:HYD0103 | error[HYD0103]: open() does not accept keyword arguments |
 | `graphlib` | ok | ok | ok | - |
-| `gzip` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'io' has no attribute 'DEFAULT_BUFFER_SIZE' |
-| `hashlib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
+| `gzip` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'zlib' has no attribute '_ZlibDecompressor' |
+| `hashlib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'isatty' |
 | `heapq` | ok | ok | ok | - |
-| `hmac` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_operator' has no attribute '_compare_digest' |
+| `hmac` | ok | exit 1 | runtime_error | TypeError: cannot convert 'generator' object to bytes |
 | `html` | ok | ok | ok | - |
 | `http` | ok | ok | ok | - |
 | `idlelib` | ok | ok | ok | - |
@@ -202,14 +204,14 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `keyword` | ok | ok | ok | - |
 | `linecache` | ok | ok | ok | - |
 | `locale` | ok | ok | ok | - |
-| `logging` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
+| `logging` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'isatty' |
 | `lzma` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lzma' not found: not supported on the import search path |
 | `mailbox` | ok | exit 1 | compile_error:HYD0101 | error[HYD0101]: name 'FEBRUARY' is not defined |
 | `mimetypes` | ok | ok | ok | - |
-| `modulefinder` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'meta_path' |
+| `modulefinder` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'importlib.metadata' has no attribute 'MetadataPathFinder' |
 | `multiprocessing` | ok | ok | ok | - |
-| `netrc` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os.path' has no attribute 'expanduser' |
-| `nturl2path` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'getfilesystemencodeerrors' |
+| `netrc` | ok | ok | ok | - |
+| `nturl2path` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'warnings' has no attribute '_DEPRECATED_MSG' |
 | `numbers` | ok | ok | ok | - |
 | `opcode` | ok | ok | ok | - |
 | `operator` | ok | ok | ok | - |
@@ -217,35 +219,35 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `pathlib` | ok | ok | ok | - |
 | `pdb` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_signal' not found: not supported on the import search path |
 | `pickle` | ok | ok | ok | - |
-| `pickletools` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'pickle' has no attribute 'decode_long' |
-| `pkgutil` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'importlib.util' has no attribute 'MAGIC_NUMBER' |
+| `pickletools` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'codecs' has no attribute 'escape_decode' |
+| `pkgutil` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'inspect' has no attribute 'getmodulename' |
 | `platform` | ok | ok | ok | - |
 | `plistlib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
-| `poplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'audit' |
-| `pprint` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'is_dataclass' |
-| `profile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'time' has no attribute 'process_time' |
-| `pstats` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'functools' has no attribute 'cmp_to_key' |
+| `poplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'errno' has no attribute 'ENOTCONN' |
+| `pprint` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'collections' has no attribute 'UserDict' |
+| `profile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'setprofile' |
+| `pstats` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'time' has no attribute 'ctime' |
 | `pty` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'termios' not found: not supported on the import search path |
-| `py_compile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'meta_path' |
-| `pyclbr` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'importlib.util' has no attribute '_find_spec_from_path' |
-| `pydoc` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'meta_path' |
+| `py_compile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'importlib.metadata' has no attribute 'MetadataPathFinder' |
+| `pyclbr` | ok | ok | ok | - |
+| `pydoc` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'importlib.metadata' has no attribute 'MetadataPathFinder' |
 | `pydoc_data` | ok | ok | ok | - |
 | `queue` | ok | ok | ok | - |
 | `quopri` | ok | ok | ok | - |
 | `random` | ok | ok | ok | - |
 | `re` | ok | ok | ok | - |
-| `reprlib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'get_int_max_str_digits' |
+| `reprlib` | ok | ok | ok | - |
 | `rlcompleter` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '__main__' not found: not supported on the import search path |
 | `sched` | ok | ok | ok | - |
-| `secrets` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_operator' has no attribute '_compare_digest' |
+| `secrets` | ok | exit 1 | runtime_error | TypeError: cannot convert 'generator' object to bytes |
 | `selectors` | ok | ok | ok | - |
-| `shelve` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'pickle' has no attribute 'DEFAULT_PROTOCOL' |
+| `shelve` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'pickle' has no attribute 'Pickler' |
 | `shlex` | ok | ok | ok | - |
 | `shutil` | ok | ok | ok | - |
 | `signal` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_signal' not found: not supported on the import search path |
-| `smtplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'math' has no attribute 'isqrt' |
+| `smtplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'time' has no attribute 'mktime' |
 | `socket` | ok | ok | ok | - |
-| `socketserver` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'WNOHANG' |
+| `socketserver` | ok | exit 1 | compile_error:HYD0202 | error[HYD0202]: slice assignment is not supported in an unpacking target |
 | `sqlite3` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sqlite3' not found: not supported on the import search path |
 | `sre_compile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 're' has no attribute '_compiler' |
 | `sre_constants` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 're' has no attribute '_constants' |
@@ -253,13 +255,13 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `ssl` | ok | ok | ok | - |
 | `statistics` | ok | ok | ok | - |
 | `string` | ok | ok | ok | - |
-| `stringprep` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'unicodedata' has no attribute 'ucd_3_2_0' |
+| `stringprep` | ok | ok | ok | - |
 | `struct` | ok | ok | ok | - |
 | `subprocess` | ok | ok | ok | - |
 | `symtable` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_symtable' not found: not supported on the import search path |
 | `sysconfig` | ok | ok | ok | - |
-| `tabnanny` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os.path' has no attribute 'islink' |
-| `tarfile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'close' |
+| `tabnanny` | ok | exit 1 | runtime_error | NameError: name '_prefix' is not defined |
+| `tarfile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'read' |
 | `tempfile` | ok | ok | ok | - |
 | `textwrap` | ok | ok | ok | - |
 | `this` | ok | ok | ok | - |
@@ -267,10 +269,10 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `timeit` | ok | ok | ok | - |
 | `tkinter` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
 | `token` | ok | ok | ok | - |
-| `tokenize` | ok | exit 1 | runtime_error | TypeError: first argument must be str or Pattern, not bytes |
-| `tomllib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'datetime' has no attribute 'timezone' |
-| `trace` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'altsep' |
-| `traceback` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
+| `tokenize` | ok | exit 1 | runtime_error | NameError: name '_prefix' is not defined |
+| `tomllib` | ok | exit 1 | compile_error:HYD0103 | error[HYD0103]: compile() does not accept keyword arguments |
+| `trace` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'threading' has no attribute 'settrace' |
+| `traceback` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'isatty' |
 | `tracemalloc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path |
 | `tty` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'termios' not found: not supported on the import search path |
 | `turtle` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
@@ -279,17 +281,17 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `typing` | ok | ok | ok | - |
 | `unittest` | ok | ok | ok | - |
 | `urllib` | ok | ok | ok | - |
-| `uuid` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'defpath' |
-| `venv` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'dataclasses' has no attribute 'Field' |
+| `uuid` | ok | exit 1 | runtime_error | AttributeError: 'super' object has no attribute '__setitem__' |
+| `venv` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'isatty' |
 | `warnings` | ok | ok | ok | - |
 | `wave` | ok | ok | ok | - |
-| `weakref` | ok | exit 1 | runtime_error | NotImplementedError: ABC.register() is not implemented: Hydro's isinstance/issubclass onl… |
-| `webbrowser` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute 'audit' |
+| `weakref` | ok | ok | ok | - |
+| `webbrowser` | ok | exit 1 | compile_error:HYD0103 | error[HYD0103]: Popen() got an unexpected keyword argument 'close_fds' |
 | `wsgiref` | ok | ok | ok | - |
 | `xml` | ok | ok | ok | - |
 | `xmlrpc` | ok | ok | ok | - |
-| `zipapp` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'fstat' |
-| `zipfile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'fstat' |
+| `zipapp` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'getcwdb' |
+| `zipfile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'getcwdb' |
 | `zoneinfo` | ok | ok | ok | - |
 
 ### extension (63)

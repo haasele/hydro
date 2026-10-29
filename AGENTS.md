@@ -23,31 +23,42 @@ tiers, HNA, roadmap), `docs/DIAGNOSTICS.md` (diagnostics) and
 | P1 Minimal compiler | **done & verified** | `scripts/verify.sh` ALL GREEN |
 | P2 Runtime | **done & verified**: containers/classes/closures, lazy generators + async generators/TaskGroup, exception hierarchy/chaining, precise shadow-stack GC + size-classed payload allocator, threads/processes/pool with shutdown cleanup, TLS/UDP/select networking, argparse/pytest, IR interpreter/REPL, fuzz gate | `scripts/verify.sh` ALL GREEN |
 | P3 Toolchain | moved to the separate **Tea** repository (`../tea`) | Tea gate |
-| P4 Compatibility | **CPython 3.14.9 target; option B (Hydro-native ABI, no `libpython`); abi3 slice + import matrix + official-test gate**; full ABI/stdlib/ecosystem open | `docs/C_API.md`, `docs/COMPATIBILITY.md`, `docs/CPYTHON_TESTS.md` |
+| P4 Compatibility | **CPython 3.14.9 target; option B (Hydro-native ABI, no `libpython`); abi3 slice + import matrix + official-test gate; HNA v1/bindgen/sidecar/packaging delivered**; full ABI/stdlib/ecosystem open | `docs/C_API.md`, `docs/COMPATIBILITY.md`, `docs/CPYTHON_TESTS.md`, `docs/NATIVE_BINDINGS.md` |
 | P5 Performance | baseline + local threshold gate + CPython/Hydro/PyPy/Go engine comparison | `benchmarks/hydro/results/latest.md`, `thresholds.json`, `compare_engines.py` |
 | P6 Polish | diagnostics/JSON/doctor/ICE in Hydro; CLI/manpage/completions in Tea | `docs/DIAGNOSTICS.md`, Tea repo docs |
 
-**Compatibility target:** **CPython 3.14.9** (single definition in
+**Compatibility target (2026-10-29):** **CPython 3.14.9** (single definition in
 `hydro_ir::compat`; 3.13 is security-only, 3.15 is newer than the oracle).
 Official `Lib/test` runs are a release gate; the offline manifest check runs
 in `scripts/verify.sh`/CI. LTS is policy only (P4-12).
 
-**2026-10-28 package checkpoint:** the pinned CPython-3.14 wheels for NumPy
+**2026-10-29 native-bindings checkpoint:** HNA v1 is implemented and tested:
+the header `include/hydro_native.h`, the `hydro-hna` crate, loader and
+persistent root/projection services, `.hna.so` discovery with ambiguity and
+manifest diagnostics, and Rust/C/Go fixtures running under JIT and AOT with
+strict GC and no `libpython`. `hydro-bindgen` `generate`/`check` emits
+deterministic crates; generated libm passes the CPython differential and the
+handwritten sqlite HNA binding passes the `sqlite3` differential under
+JIT/AOT. `_hydro_sidecar` protocol v1 (spawn/call/restart/close/alive) works
+with a CPython worker and a C HNA adapter. The Tea wheel path emits the
+`hydro1_0` tag, preserves upstream `RECORD` verbatim, and passes mixed
+`.py`/`.hna.so`/CPython-extension artifact tests. Remaining limits:
+`init` is lazy until first module load, hold tokens root on the calling thread
+and must be released there, the manifest is optional when absent,
+`thread_safe = false` serializes calls, bindgen covers a bounded C subset, and
+`exec`/`eval` accept only a bounded source subset (no full runtime compiler;
+NB-3 panic fixture and NB-2 boundary-cost measurement open).
+
+**2026-10-29 ecosystem checkpoint:** the pinned CPython-3.14 wheels for NumPy
 2.5.0, pandas 3.1.0, pydantic 2.14.1 and pydantic-core 2.50.1 install into
-`.hydro/ecosystem/site`. The generated ABI inventory now reports **0 missing
-required CPython symbols** across all 68 extension modules (479 referenced,
-593 exported). Import is still **not green**: NumPy reaches
-`numpy._core.umath` and fails on the missing `datetime.datetime_CAPI` capsule;
-pandas gets past dotted extension imports and fails in the type checker at
-`pandas/core/config_init.py` (mixed `str`/`bool` conditional). **pydantic now
-imports** (`2.14.1`): PyO3 exception-class validation, heap-type `__match_args__`,
-the `datetime.datetime_CAPI` capsule, keyword calls through vectorcall and
-`types.SimpleNamespace(**kwargs)` are fixed. pydantic model smoke still stops on
-lazy `pydantic.main` imports and unimplemented walrus-in-generator/dataclasses
-surface. These are semantic/object-model blockers, not link-time symbol gaps.
-**All-core gate:** `cargo nextest run --workspace` runs 2340 tests in ~3 s
-(2340 pass, 1 skipped; 2341 total) and is the default in `scripts/verify.sh`/CI; Cargo test
-binaries are no longer serial.
+`.hydro/ecosystem/site`. The ABI inventory reports **0 missing required
+CPython symbols** across 68 extension modules (479 referenced, 593 exported),
+and Tier 3 now matches the CPython handle, tuple and list item layout.
+pydantic 2.14.1 imports, but pydantic model smoke still fails at typed-dict
+class naming/annotations; NumPy fails at delayed dtype/module init; pandas
+remains blocked. These are semantic/object-model blockers, not link-time
+symbol gaps. **All-core gate:** `cargo nextest run --workspace` is the default
+in `scripts/verify.sh`/CI (see the canonical counts below).
 
 **2026-10-26 checkpoint:** the four open construction sites received a
 substantial implementation slice: import/module registry + `HYDRO_STDLIB`,
@@ -59,26 +70,30 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-10-29: **2340 tests run
-(2340 pass, 1 skipped)**; the per-crate listing totals 2341 including the
-skipped test:
+`cargo nextest run --workspace` on 2026-10-29: **2553 tests listed
+(2552 passed, 1 skipped)**; the per-crate breakdown below sums to 2553:
 
 | Crate | Tests |
 |---|---:|
-| frontend | 755 |
-| runtime (unit + integration) | 1420 |
-| codegen | 73 |
-| IR | 50 |
+| runtime (unit + integration) | 1553 |
+| frontend | 788 |
+| codegen | 76 |
+| IR | 51 |
+| bindgen | 42 |
 | interpreter | 24 |
 | parser | 19 |
+| hna | 0 |
+| hna-fixture | 0 |
+| sqlite-hna | 0 |
 
-Tea (separate repository) carries **339** CLI/E2E/AOT/pytest/REPL/PGO/wheel tests.
+Tea (separate repository) `cargo test` is green: **154 E2E tests** plus all
+other suites, including HNA 7/7, bindgen 2/2, sidecar 6/6 and wheels 15/15.
 Other docs must link here instead of repeating the total.
 
 ### Compatibility checkpoint (2026-10-29)
 
-- **Import matrix:** **130/297 modules importable** (30 builtin/frozen, 88 pure,
-  12 extension; 167 failed; 9 modules fail under CPython 3.14.9 itself).
+- **Import matrix:** **145/297 modules importable** (31 builtin/frozen, 102 pure,
+  12 extension; 152 failed; 9 modules fail under CPython 3.14.9 itself).
   Report: `docs/COMPATIBILITY.md`, JSON `benchmarks/compat/latest.json`.
 - **Official suite:** **3/398 passing** (`test_errno.py`,
   `test_int_literal.py`, `test_longexp.py`), 333 `hydro_fail`, 62
@@ -86,14 +101,19 @@ Other docs must link here instead of repeating the total.
   733.8 s. Manifest `tests/compat/cpython-3.14.9.json` grows only from real
   `hydro_pass` runs.
 - **Ecosystem:** the ABI inventory reports **0 missing required symbols** across
-  68 pinned extension modules. `pydantic 2.14.1` now imports through the real
-  `_pydantic_core` extension; NumPy/pandas still stop on semantic gaps, and
-  pydantic model smoke is not yet green (lazy submodule imports,
-  walrus-in-generator, dataclasses APIs).
+  68 pinned extension modules. `pydantic 2.14.1` imports through the real
+  `_pydantic_core` extension; pydantic model smoke still fails at typed-dict
+  class naming/annotations, NumPy fails at delayed dtype/module init, and
+  pandas remains blocked. Pinned ecosystem report: `docs/ECOSYSTEM.md`.
+- **Native bindings:** HNA v1, `hydro-bindgen` and `_hydro_sidecar` protocol v1
+  are implemented and tested (see the checkpoint above and
+  `docs/NATIVE_BINDINGS.md` §3.7); Tier 2 is implemented for the v1 slice and
+  Tier 4 is a sidecar/C-adapter pilot.
 - **C-API:** limited-API fixture runs under JIT/AOT without `libpython`;
-  multi-phase init, wheel tags, heap types, vectorcall, buffers and the
-  pinned-wheel link-time symbol set work. Full ABI behavior/GIL/ecosystem
-  suites remain open.
+  multi-phase init, wheel tags, heap types, vectorcall, buffers, the
+  CPython-compatible handle prefix and `PyTuple`/`PyList` item access, and the
+  pinned-wheel link-time symbol set work. Full `tp_traverse`/`tp_clear`,
+  GIL/thread integration and the NumPy/pandas ecosystem model remain open.
 - **Benchmarks:** default-GC micro suite (2026-10-29) passes all 22 workloads
   plus startup: hello JIT/AOT 1.54/1.35 ms, while_sum 4.28/1.83 ms,
   math_loop 3.28/1.58 ms, async_gather 24.08/22.37 ms; generator_sum is now
@@ -112,7 +132,7 @@ Other docs must link here instead of repeating the total.
   resumes remain the narrowest compute result but are now faster than CPython
   (P5 focuses on PGO/inlining).
 - Full CPython stdlib/P7 parity, C extensions/full ABI behavior, and the
-  ecosystem suites remain open; 130/297 stdlib modules import.
+  ecosystem suites remain open; 145/297 stdlib modules import.
 - Imports: packages, dotted/relative imports, site-packages and vendored
   `stdlib/` work; dynamic imports of unlinked package submodules, namespace/
   zip/frozen imports and `from x import *` remain incomplete.
@@ -123,9 +143,22 @@ Other docs must link here instead of repeating the total.
   IPv6, TLS client, non-blocking I/O and selectors; argparse covers the
   documented CPython surface, pytest is the native runner, and pickle uses
   HYD1. Full P7 parity is open.
-- C-API: full link-time symbol coverage for the pinned wheels, but NumPy/
-  pandas semantic ABI, full GIL/thread integration, wheel ecosystem suites and
-  some `ctypes` paths remain open; pydantic imports, model smoke does not yet.
+- C-API: full link-time symbol coverage for the pinned wheels and the
+  CPython-compatible handle/tuple/list layout, but full `PyTypeObject`
+  behavior, `tp_traverse`/`tp_clear`, NumPy/pandas semantic ABI, full
+  GIL/thread integration, wheel ecosystem suites and some `ctypes` paths
+  remain open; pydantic imports, model smoke does not yet.
+- HNA v1 limits: `init` is lazy until first module load; hold tokens root on
+  the calling thread and must be released there (the token table is
+  process-wide); the manifest is optional when absent;
+  `thread_safe = false` serializes calls per module; leaf modules only.
+  Bindgen supports a bounded C declaration subset (no variadics, function
+  pointers, `long double`, struct-by-value or mutable output pointers); there
+  is no general `exec`/`eval` (bounded source subset, no runtime Python
+  compiler), and boundary cost is not yet measured. The sidecar protocol is
+  v1 (16 MiB frames, depth 64); no JVM/.NET/Node adapter exists. Ecosystem
+  blockers: pydantic model typed-dict naming/annotations, NumPy delayed
+  dtype/module initialization, and pandas behind those gaps.
 - Tea owns uv interoperability/injection and packaging; Hydro does not embed
   `uv` or a package manager.
 - Linux x86_64 is the verified target; aarch64 is untested; macOS/Windows and
@@ -133,17 +166,22 @@ Other docs must link here instead of repeating the total.
 
 ## Next Steps
 
-1. **P7 stdlib:** continue Batches B/C/D/E/F, wire P7-05 per-module
-   `Lib/test` subsets, then the dependency-ordered remaining batches.
-2. **P4:** P4-04c/d full ABI/GIL, P4-05 wheel install, P4-06 `ctypes`/`cffi`,
-   then ecosystem suites/benchmarks (P4-10/P4-11).
-3. **P5:** generator resume is now faster than CPython; continue with
+1. **NB-4 ecosystem:** close the typed-dict naming/annotation blocker in
+   pydantic model smoke, NumPy delayed dtype/module init and the pandas
+   import blockers, then thread/GIL and `ctypes` paths (P4-04c/d, P4-05,
+   P4-06, P4-10/P4-11).
+2. **NB-3/NB-2:** add the bindgen panic fixture, measure HNA boundary cost,
+   and register `hydro-bindgen --check` in CI.
+3. **NB-1/P7 stdlib:** continue Batches B/C/D/E/F and native modules, wire
+   P7-05 per-module `Lib/test` subsets, then the dependency-ordered remaining
+   batches.
+4. **P5:** generator resume is now faster than CPython; continue with
    PGO/inlining and threshold tuning.
-4. **P3:** uv interpreter injection, reproducible builds (P3-05), packaging
+5. **P3:** uv interpreter injection, reproducible builds (P3-05), packaging
    (P3-08).
-5. **P6:** troubleshooting/migration docs (P6-09), progress/exit summary
+6. **P6:** troubleshooting/migration docs (P6-09), progress/exit summary
    (P6-10).
-6. **Cross-cutting:** long fuzz campaigns (Q-03/Q-04), `unsafe` security
+7. **Cross-cutting:** long fuzz campaigns (Q-03/Q-04), `unsafe` security
    review (Q-05), debugger (Q-01), cross-platform (Q-09).
 
 ## Commands

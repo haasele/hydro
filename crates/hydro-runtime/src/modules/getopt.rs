@@ -3,10 +3,11 @@
 //! The parser follows CPython's `Lib/getopt.py`, including GNU permutation
 //! for `gnu_getopt`, the `+`/`-` prefixes on the short-option string, prefix
 //! matching of long options, and the `=`/`=?` suffixes in the long-option
-//! table. Errors are reported as `RuntimeError` (Hydro has no `GetoptError`
-//! class yet) with the message CPython would produce.
+//! table. Every parse error raises `GetoptError` (also exported as `error`)
+//! with CPython's exact message and the offending option in `.opt`.
 
-use crate::exc::{self, ATTRIBUTE_ERROR, RUNTIME_ERROR, TYPE_ERROR};
+use crate::core::globals;
+use crate::exc::{self, ATTRIBUTE_ERROR, TYPE_ERROR};
 use crate::heap;
 use crate::value::{self, NONE};
 
@@ -35,8 +36,54 @@ fn type_error(message: &str) -> i64 {
     exc::raise_with_message(TYPE_ERROR, message)
 }
 
-fn runtime_error(message: &str) -> i64 {
-    exc::raise_with_message(RUNTIME_ERROR, message)
+/// `getopt.GetoptError`: a cached `Exception` subclass whose instances carry
+/// CPython's `.msg` and `.opt` attributes.
+fn getopt_error_class() -> i64 {
+    const KEY: &str = "getopt.GetoptError";
+    if let Some(class) = globals::registry_get(KEY) {
+        return class;
+    }
+    let empty_msg = value::str_alloc(String::new());
+    let empty_opt = value::str_alloc(String::new());
+    let roots = heap::root_values(&[empty_msg, empty_opt]);
+    let class = value::class_new_full(
+        "GetoptError".to_string(),
+        exc::exception_class(exc::EXCEPTION),
+        Vec::new(),
+        vec![
+            ("msg".to_string(), empty_msg),
+            ("opt".to_string(), empty_opt),
+        ],
+    );
+    let class_roots = heap::root_values(&[class]);
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    class
+}
+
+/// Raises `GetoptError(message, opt)` and returns the ABI dummy value.
+///
+/// The instance is built through the class so its Python class identity is
+/// preserved for `except getopt.GetoptError`; `.args` is `(message, opt)` and
+/// `.msg`/`.opt` hold the same strings, matching CPython's constructor.
+fn getopt_error(message: &str, opt: &str) -> i64 {
+    let msg = value::str_alloc(message.to_string());
+    let opt_value = value::str_alloc(opt.to_string());
+    let class = getopt_error_class();
+    let roots = heap::root_values(&[msg, opt_value, class]);
+    let argv = [msg, opt_value];
+    let instance = crate::builtins::call(class, argv.len(), argv.as_ptr());
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let instance_roots = heap::root_values(&[instance]);
+    value::instance_setattr(instance, "msg".to_string(), msg);
+    value::instance_setattr(instance, "opt".to_string(), opt_value);
+    heap::release_roots(instance_roots);
+    heap::release_roots(roots);
+    exc::raise_value(instance)
 }
 
 /// A list/tuple of `str`, copied so later allocations cannot invalidate it.
@@ -84,7 +131,10 @@ fn short_arg_kind(option: char, shortopts: &[char]) -> Result<ArgKind, i64> {
             ArgKind::Required
         });
     }
-    Err(runtime_error(&format!("option -{option} not recognized")))
+    Err(getopt_error(
+        &format!("option -{option} not recognized"),
+        &option.to_string(),
+    ))
 }
 
 /// `long_has_args`: resolves a (possibly abbreviated) long option name.
@@ -95,7 +145,10 @@ fn long_arg_kind(option: &str, longopts: &[String]) -> Result<(ArgKind, String),
         .map(String::as_str)
         .collect();
     if possibilities.is_empty() {
-        return Err(runtime_error(&format!("option --{option} not recognized")));
+        return Err(getopt_error(
+            &format!("option --{option} not recognized"),
+            option,
+        ));
     }
     if possibilities.contains(&option) {
         return Ok((ArgKind::None, option.to_string()));
@@ -110,9 +163,10 @@ fn long_arg_kind(option: &str, longopts: &[String]) -> Result<(ArgKind, String),
     }
     if possibilities.len() > 1 {
         let joined = possibilities.join(", ");
-        return Err(runtime_error(&format!(
-            "option --{option} not a unique prefix; possible options: {joined}"
-        )));
+        return Err(getopt_error(
+            &format!("option --{option} not a unique prefix; possible options: {joined}"),
+            option,
+        ));
     }
     let unique = possibilities[0];
     if let Some(stem) = unique.strip_suffix("=?") {
@@ -141,7 +195,10 @@ fn parse_long(
             Some(value) => value,
             None => {
                 let Some(first) = rest.first() else {
-                    return Err(runtime_error(&format!("option --{full} requires argument")));
+                    return Err(getopt_error(
+                        &format!("option --{full} requires argument"),
+                        &full,
+                    ));
                 };
                 let value = first.clone();
                 *rest = &rest[1..];
@@ -151,9 +208,10 @@ fn parse_long(
         ArgKind::Optional => inline.unwrap_or_default(),
         ArgKind::None => {
             if inline.is_some() {
-                return Err(runtime_error(&format!(
-                    "option --{full} must not have an argument"
-                )));
+                return Err(getopt_error(
+                    &format!("option --{full} must not have an argument"),
+                    &full,
+                ));
             }
             String::new()
         }
@@ -186,9 +244,10 @@ fn parse_short(
             String::new()
         } else {
             let Some(first) = rest.first() else {
-                return Err(runtime_error(&format!(
-                    "option -{option} requires argument"
-                )));
+                return Err(getopt_error(
+                    &format!("option -{option} requires argument"),
+                    &option.to_string(),
+                ));
             };
             let value = first.clone();
             *rest = &rest[1..];
@@ -372,6 +431,18 @@ fn run(function: &str, args: &[i64], gnu: bool) -> i64 {
     }
 }
 
+/// Materialises a `getopt` module constant: the exception class and its
+/// backward-compatible `error` alias.
+pub(crate) fn constant(name: &str) -> i64 {
+    match name {
+        "GetoptError" | "error" => getopt_error_class(),
+        _ => exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("module 'getopt' has no attribute '{name}'"),
+        ),
+    }
+}
+
 /// Dispatches `getopt.function(...)` calls.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -447,13 +518,28 @@ mod tests {
         assert_eq!(remaining, expected);
     }
 
-    fn error_message(result: i64) -> String {
+    /// Asserts that `result` raised `GetoptError` and returns `(msg, opt)`.
+    fn error_message(result: i64) -> (String, String) {
         assert_eq!(result, NONE);
         assert!(exc::pending(), "expected an exception");
-        assert_eq!(exc::pending_tag(), RUNTIME_ERROR as i64);
-        let message = value::to_string(exc::pending_value());
+        assert_eq!(exc::pending_tag(), exc::EXCEPTION as i64);
+        let instance = exc::pending_value();
+        assert_eq!(
+            value::instance_class_value(instance),
+            Some(getopt_error_class())
+        );
+        let msg = value::instance_attr(instance, "msg")
+            .and_then(value::as_str)
+            .expect("msg")
+            .to_string();
+        let opt = value::instance_attr(instance, "opt")
+            .and_then(value::as_str)
+            .expect("opt")
+            .to_string();
+        // CPython's `GetoptError.__str__` returns `.msg`, not the args tuple.
+        assert_eq!(value::to_string(instance), msg);
         exc::clear();
-        message
+        (msg, opt)
     }
 
     #[test]
@@ -465,11 +551,13 @@ mod tests {
             &[("-a", ""), ("-b", "v")],
             &[],
         );
-        // A missing argument is reported as a RuntimeError.
-        let message = error_message(getopt(&["-a"], "a:"));
+        // A missing argument is reported as GetoptError.
+        let (message, opt) = error_message(getopt(&["-a"], "a:"));
         assert_eq!(message, "option -a requires argument");
-        let message = error_message(getopt(&["-z"], "a:"));
+        assert_eq!(opt, "a");
+        let (message, opt) = error_message(getopt(&["-z"], "a:"));
         assert_eq!(message, "option -z not recognized");
+        assert_eq!(opt, "z");
     }
 
     #[test]
@@ -521,20 +609,24 @@ mod tests {
     #[test]
     fn long_option_errors() {
         exc::init();
-        let message = error_message(invoke("getopt", &["--zzz"], "", Some(&["foo"])));
+        let (message, opt) = error_message(invoke("getopt", &["--zzz"], "", Some(&["foo"])));
         assert_eq!(message, "option --zzz not recognized");
+        assert_eq!(opt, "zzz");
 
-        let message = error_message(invoke("getopt", &["--foo"], "", Some(&["foo="])));
+        let (message, opt) = error_message(invoke("getopt", &["--foo"], "", Some(&["foo="])));
         assert_eq!(message, "option --foo requires argument");
+        assert_eq!(opt, "foo");
 
-        let message = error_message(invoke("getopt", &["--flag=1"], "", Some(&["flag"])));
+        let (message, opt) = error_message(invoke("getopt", &["--flag=1"], "", Some(&["flag"])));
         assert_eq!(message, "option --flag must not have an argument");
+        assert_eq!(opt, "flag");
 
-        let message = error_message(invoke("getopt", &["--f"], "", Some(&["foo", "fob"])));
+        let (message, opt) = error_message(invoke("getopt", &["--f"], "", Some(&["foo", "fob"])));
         assert_eq!(
             message,
             "option --f not a unique prefix; possible options: foo, fob"
         );
+        assert_eq!(opt, "f");
     }
 
     #[test]
@@ -581,6 +673,28 @@ mod tests {
         assert_eq!(value::as_str(last[0]), Some("--b"));
         assert_eq!(value::as_str(last[1]), Some(""));
         assert_eq!(value::as_list(outer[1]).map(|items| items.len()), Some(0));
+    }
+
+    #[test]
+    fn getopt_error_class_has_cpython_defaults_and_alias() {
+        exc::init();
+        let class = constant("GetoptError");
+        assert!(!exc::pending());
+        assert_eq!(constant("error"), class);
+        assert_eq!(value::class_display_name(class), Some("GetoptError"));
+        let namespace = value::class_namespace(class);
+        let msg = namespace
+            .iter()
+            .find(|(name, _)| name.as_str() == "msg")
+            .and_then(|(_, item)| value::as_str(*item))
+            .expect("class-level msg");
+        let opt = namespace
+            .iter()
+            .find(|(name, _)| name.as_str() == "opt")
+            .and_then(|(_, item)| value::as_str(*item))
+            .expect("class-level opt");
+        assert_eq!(msg, "");
+        assert_eq!(opt, "");
     }
 
     #[test]

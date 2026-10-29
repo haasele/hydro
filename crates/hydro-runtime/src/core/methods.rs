@@ -1664,6 +1664,12 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    // `__class__` is universal for every Python object, including dict views
+    // and immediate singletons. Object-specific branches below still handle
+    // their more specific attributes.
+    if attr == "__class__" {
+        return value::type_class(obj);
+    }
     if let Some(attribute) = modules::extension::ext_function_getattr(obj, &attr) {
         return attribute;
     }
@@ -1707,8 +1713,10 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         if matches!(
             &function.body,
             value::FunctionBody::Builtin(hydro_ir::Builtin::Int)
-        ) && matches!(attr.as_str(), "from_bytes" | "to_bytes" | "bit_length")
-        {
+        ) && matches!(
+            attr.as_str(),
+            "from_bytes" | "to_bytes" | "bit_length" | "__new__"
+        ) {
             return value::bound_method_new(obj, attr);
         }
         // The `type` metaclass exposes its C-level class operations as
@@ -2102,6 +2110,11 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             }
             _ => attribute_error(obj, &attr),
         };
+    }
+    // Every Python object answers `__class__`, including immediate
+    // singletons such as `NotImplemented`, `None` and booleans.
+    if attr == "__class__" {
+        return value::type_class(obj);
     }
     // Integer values expose their bytes-conversion and bit-length methods as
     // bound-method values (`f = (255).to_bytes`).
@@ -6211,6 +6224,15 @@ fn path_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 path
             };
             value::str_alloc(text)
+        }
+        // `os.PathLike` protocol: a path exposes its text through
+        // `__fspath__` (the native payload also satisfies `os.fspath`
+        // directly).
+        "__fspath__" => {
+            if let Some(err) = check_arity("Path", method, args.len(), 0, 0) {
+                return err;
+            }
+            value::str_alloc(path)
         }
         "absolute" => {
             if let Some(err) = check_arity("Path", method, args.len(), 0, 0) {

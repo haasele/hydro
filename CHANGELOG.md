@@ -8,6 +8,77 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Native bindings — 2026-10-29 HNA v1
+
+- Added HNA v1: the C99 header `include/hydro_native.h`, the `hydro-hna`
+  descriptor crate, `.hna.so` loader/discovery with duplicate-artifact and
+  name/version/platform/provider diagnostics, lazy one-time `init`, cached
+  constants, typed projections and persistent
+  `hydro_root_hold`/`hydro_root_release` roots.
+- `hydro-manifest.toml` is verified before `dlopen` when present; a
+  distribution without one keeps the pre-manifest behaviour. Panics abort at
+  the boundary; no unwinding and no `libpython`.
+- Rust, C and Go fixtures load under JIT and AOT and pass the strict-GC loop.
+
+### Native bindings — 2026-10-29 `hydro-bindgen`
+
+- Added `hydro-bindgen generate|check`: libclang header ingestion, a
+  deterministic C-subset type table, generated crate/descriptor/manifest/JSON
+  report, atomic publication and byte-for-byte `check`.
+- The generated libm binding matches the CPython differential under JIT/AOT;
+  the handwritten `hydro-sqlite-hna` binding matches CPython `sqlite3` under
+  JIT/AOT. Unsupported headers fail naming the symbol; the panic fixture
+  remains open.
+
+### Native bindings — 2026-10-29 sidecar protocol v1
+
+- Added `_hydro_sidecar` (`spawn`, `call`, `restart`, `close`, `alive`):
+  length-prefixed little-endian frames over stdin/stdout, protocol/ID/kind
+  validation, bounded frame/depth/method sizes, typed values and remote
+  exception mapping, worker restart and clean close.
+- A CPython worker passes round-trip/error/restart tests; a C HNA adapter
+  fixture initialises and shuts down cleanly.
+
+### Packaging — 2026-10-29 Hydro wheel tag
+
+- Tea emits the `hydro1_0` ABI wheel tag and keeps an unmodified wheel's
+  `RECORD` verbatim; mixed `.py`/`.hna.so`/CPython-extension artifacts are
+  covered by tests.
+
+### Compatibility — 2026-10-29 CPython container layout
+
+- Handles now start with the CPython 3.14 `PyVarObject` prefix, tuples store
+  items inline at `PyTupleObject.ob_item` and lists expose the `ob_item`
+  pointer, so `PyTuple_GET_ITEM`/`PyList_GET_ITEM` (and the setters) match
+  CPython/PyO3 direct access. pydantic 2.14.1 imports through
+  `_pydantic_core`; model smoke still fails at typed-dict class
+  naming/annotations.
+
+### Compatibility — 2026-10-29 stdlib primitives
+
+- Compiled module bodies initialise on demand when a C extension imports them
+  during its own initializer, so `numpy.exceptions`-style imports execute the
+  same once-only body as the startup loop. Added Unicode 3.2 tables for
+  `unicodedata.ucd_3_2_0`.
+
+### Docs — 2026-10-29 native-binding status
+
+- Reconciled `docs/NATIVE_BINDINGS.md`, `docs/C_API.md`, `docs/TODO.md`,
+  `AGENTS.md` and the ecosystem notes with the implemented HNA
+  v1/bindgen/sidecar/packaging slices and the 145/297 import matrix. NB-4,
+  NumPy/pandas and pydantic model smoke remain explicitly open.
+
+### Fixed — 2026-10-29 mixed bare and value returns
+
+- A bare `return` returns `None`, so a function may mix it with value returns
+  (CPython's `uuid._parse_mac` and `ensurepip._uninstall_helper` do). The
+  inferred result type joins the value type with `None` to `Any` regardless of
+  the order the branches are visited; a declared return type is left as
+  written and its value returns are still checked against the annotation. The
+  `HYD0104` "mix of value and bare returns" diagnostic is removed, while a body
+  whose returns are all bare still reports a missing return value when it
+  declares a non-`None` type.
+
 ### Compatibility — 2026-10-29 stdlib import surface
 
 - Added `__future__.all_feature_names` as a fresh list in CPython order, the
@@ -15,10 +86,10 @@ initial state of the first runnable core.
   `os.pathsep`/`os.curdir`/`os.O_NOCTTY`, and `io.SEEK_SET`/`SEEK_CUR`/
   `SEEK_END`. `os.lstat` reuses the existing `stat_result`/OSError path and
   accepts `dir_fd=None`.
-- Regenerated the differential baselines: **130/297 modules importable**
-  (30 builtin/frozen, 88 pure, 12 extension; 167 failed) and **3/398**
+- Regenerated the differential baselines: **145/297 modules importable**
+  (31 builtin/frozen, 102 pure, 12 extension; 152 failed) and **3/398**
   official tests passing (333 `hydro_fail`, 62 `expected_fail`).
-- Workspace total is now **2341 tests** (2340 run, 1 skipped).
+- Workspace total is now **2553 tests** (2552 passed, 1 skipped).
 
 ### Performance — 2026-10-29 multithreaded epoll HTTP
 

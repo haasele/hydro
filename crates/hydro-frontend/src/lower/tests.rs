@@ -1647,6 +1647,20 @@ fn native_star_import_provides_token_constants() {
 }
 
 #[test]
+fn datetime_utc_import_binds_the_timezone_singleton() {
+    // PEP 615 exposes `datetime.UTC` as the same object as
+    // `datetime.timezone.utc`, so importing it lowers to a native module
+    // attribute read.
+    let source = "from datetime import UTC\nx = UTC\ny = UTC is UTC\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "x").kind,
+        HExprKind::ModuleAttr { module, name } if module == "datetime" && name == "UTC"
+    ));
+}
+
+#[test]
 fn module_level_conditional_star_imports_are_legal() {
     // A module-level `if`/`try` body still runs at module level, so CPython
     // accepts the wildcard form there.
@@ -9207,6 +9221,20 @@ fn extension_callee(expr: &HExpr) -> (&str, &str) {
     }
 }
 
+/// Callee, positional arguments and keyword pairs of an extension keyword
+/// call (`CallKw` over an `ExtensionAttr` callee).
+#[allow(clippy::type_complexity)]
+fn extension_keyword_call(expr: &HExpr) -> (&HExpr, &[HExpr], &[(String, HExpr)]) {
+    match &expr.kind {
+        HExprKind::CallKw {
+            callee,
+            args,
+            keywords,
+        } => (callee.as_ref(), args.as_slice(), keywords.as_slice()),
+        other => panic!("expected an extension keyword call, got {other:?}"),
+    }
+}
+
 #[test]
 fn extension_import_lowers_calls_and_attributes() {
     let dir = ExtensionDir::new("import");
@@ -9466,31 +9494,86 @@ fn extension_alias_used_as_value_is_a_module() {
 }
 
 #[test]
-fn extension_keyword_arguments_defer_to_runtime() {
+fn extension_keyword_arguments_use_the_runtime_binder() {
     let dir = ExtensionDir::new("keywords");
-    dir.add_extension("mod_ext.abi3.so");
+    let so = dir.add_extension("mod_ext.abi3.so");
+    let expected = fs::canonicalize(&so)
+        .expect("canonical extension path")
+        .to_string_lossy()
+        .into_owned();
     let source = r#"import mod_ext as ext
 def f():
     return ext.add(x=1)
-a = ext.add(y=2)
+a = ext.add(1, y=2)
 "#;
     let (hir, _, diags) = lower_source_in(&dir.path, source);
     assert!(diags.is_empty(), "{diags:?}");
+
     let function = hir
         .functions
         .iter()
         .find(|f| f.name == "f")
         .expect("function f");
+    let HStmtKind::Return(Some(value)) = &function.body[0].kind else {
+        panic!("expected a return, got {:?}", function.body[0].kind);
+    };
+    let (callee, args, keywords) = extension_keyword_call(value);
+    assert!(args.is_empty());
+    match &callee.kind {
+        HExprKind::ExtensionAttr { path, member } => {
+            assert_eq!((path.as_str(), member.as_str()), (expected.as_str(), "add"));
+        }
+        other => panic!("expected an extension attribute callee, got {other:?}"),
+    }
+    let names: Vec<&str> = keywords.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["x"]);
+
+    // A positional operand stays in the positional buffer; keywords keep
+    // their names for the runtime binder.
+    let (callee, args, keywords) = extension_keyword_call(assigned(&hir, "a"));
+    assert_eq!(args.len(), 1);
+    assert!(matches!(args[0].kind, HExprKind::Const(Const::Int(1))));
     assert!(matches!(
-        &function.body[0].kind,
-        HStmtKind::Return(Some(HExpr {
-            kind: HExprKind::DeferredCall { .. },
-            ..
-        }))
+        &callee.kind,
+        HExprKind::ExtensionAttr { member, .. } if member == "add"
+    ));
+    let names: Vec<&str> = keywords.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["y"]);
+    assert!(matches!(
+        keywords[0].1.kind,
+        HExprKind::Const(Const::Int(2))
+    ));
+}
+
+#[test]
+fn imported_extension_member_keyword_call_uses_callkw() {
+    let dir = ExtensionDir::new("keywords-from");
+    let so = dir.add_extension("mod_ext.hna.so");
+    let expected = fs::canonicalize(&so)
+        .expect("canonical HNA path")
+        .to_string_lossy()
+        .into_owned();
+    let source = "from mod_ext import add\nx = add(a=1, b=2)\n";
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let (callee, args, keywords) = extension_keyword_call(assigned(&hir, "x"));
+    assert!(args.is_empty());
+    match &callee.kind {
+        HExprKind::ExtensionAttr { path, member } => {
+            assert_eq!((path.as_str(), member.as_str()), (expected.as_str(), "add"));
+        }
+        other => panic!("expected an extension attribute callee, got {other:?}"),
+    }
+    let names: Vec<&str> = keywords.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["a", "b"]);
+    assert!(matches!(
+        keywords[0].1.kind,
+        HExprKind::Const(Const::Int(1))
     ));
     assert!(matches!(
-        &assigned(&hir, "a").kind,
-        HExprKind::DeferredCall { .. }
+        keywords[1].1.kind,
+        HExprKind::Const(Const::Int(2))
     ));
 }
 
@@ -9740,6 +9823,161 @@ fn cpython_314_and_plain_suffixes_are_preferred_in_order() {
     assert_eq!(
         extension_callee(assigned(&hir, "x")).0,
         expected_path.as_str()
+    );
+}
+
+#[test]
+fn hna_artifact_is_found_and_passed_through() {
+    let dir = ExtensionDir::new("hna-found");
+    let hna = dir.add_extension("mod_ext.hna.so");
+    let expected = fs::canonicalize(&hna)
+        .expect("canonical HNA path")
+        .to_string_lossy()
+        .into_owned();
+
+    let (hir, _, diags) = lower_source_in(&dir.path, "import mod_ext as ext\nx = ext.add(1, 2)\n");
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(
+        extension_callee(assigned(&hir, "x")),
+        (expected.as_str(), "add")
+    );
+}
+
+#[test]
+fn hna_and_cpython_artifacts_are_ambiguous() {
+    let dir = ExtensionDir::new("hna-ambiguous");
+    let hna = fs::canonicalize(dir.add_extension("mod_ext.hna.so")).expect("canonical HNA path");
+    let so =
+        fs::canonicalize(dir.add_extension("mod_ext.abi3.so")).expect("canonical extension path");
+
+    let (_, _, diags) = lower_source_in(&dir.path, "import mod_ext\n");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+
+    let mut paths = [hna, so];
+    paths.sort();
+    let listed = paths
+        .iter()
+        .map(|path| format!("'{}'", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert_eq!(
+        diags[0].message,
+        format!(
+            "ambiguous compiled artifacts for the same import name: {listed}; exactly one artifact kind may ship per import name"
+        )
+    );
+}
+
+#[test]
+fn hna_and_plain_cpython_artifacts_are_ambiguous() {
+    let dir = ExtensionDir::new("hna-ambiguous-plain");
+    let hna = fs::canonicalize(dir.add_extension("mod_ext.hna.so")).expect("canonical HNA path");
+    let so = fs::canonicalize(dir.add_extension("mod_ext.so")).expect("canonical extension path");
+
+    let (_, _, diags) = lower_source_in(&dir.path, "import mod_ext\n");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(
+        diags[0].message.contains(&hna.display().to_string())
+            && diags[0].message.contains(&so.display().to_string()),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn other_extension_tags_still_report_incompatible_next_to_hna() {
+    // A tag Hydro cannot load is never silently dropped, even when an HNA
+    // artifact for the same name also exists: the tag diagnostic wins.
+    let dir = ExtensionDir::new("hna-and-bad-tag");
+    dir.add_extension("mod_ext.hna.so");
+    let tagged = dir.add_extension("mod_ext.cpython-312-x86_64-linux-gnu.so");
+    let tagged = fs::canonicalize(&tagged).expect("canonical extension path");
+
+    let (_, _, diags) = lower_source_in(&dir.path, "import mod_ext\n");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert_eq!(
+        diags[0].message,
+        format!(
+            "compiled extension '{}' is incompatible: unsupported extension ABI tag 'cpython-312-x86_64-linux-gnu' (loadable suffixes are `.so`, `.abi3.so` and `.{PYTHON_ABI_TAG}-<platform>.so` for Python {PYTHON_VERSION_STRING})",
+            tagged.display()
+        )
+    );
+}
+
+#[test]
+fn invalid_cpython_tag_alone_still_reports_incompatible() {
+    let dir = ExtensionDir::new("hna-invalid-tag");
+    let so = dir.add_extension("mod_ext.cpython-312-x86_64-linux-gnu.so");
+    let so = fs::canonicalize(&so).expect("canonical extension path");
+
+    let (_, _, diags) = lower_source_in(&dir.path, "import mod_ext\n");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert_eq!(
+        diags[0].message,
+        format!(
+            "compiled extension '{}' is incompatible: unsupported extension ABI tag 'cpython-312-x86_64-linux-gnu' (loadable suffixes are `.so`, `.abi3.so` and `.{PYTHON_ABI_TAG}-<platform>.so` for Python {PYTHON_VERSION_STRING})",
+            so.display()
+        )
+    );
+}
+
+#[test]
+fn hna_package_init_is_rejected() {
+    let dir = ExtensionDir::new("hna-package-init");
+    let hna = fs::canonicalize(dir.add_extension("pkg.hna.so")).expect("canonical HNA path");
+    fs::create_dir_all(dir.path.join("pkg")).expect("create package dir");
+    fs::write(dir.path.join("pkg").join("__init__.py"), b"").expect("write package init");
+
+    let (_, _, diags) = lower_source_in(&dir.path, "import pkg\n");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::UNSUPPORTED);
+    assert_eq!(
+        diags[0].message,
+        format!(
+            "compiled artifact '{}' cannot be used: it would provide the __init__ of package 'pkg'; HNA artifacts are leaf modules only, so a package __init__ must stay Python source or be a Tier 1 builtin",
+            hna.display()
+        )
+    );
+}
+
+#[test]
+fn hna_leaf_submodule_of_a_package_is_valid() {
+    let dir = ExtensionDir::new("hna-leaf");
+    let hna = dir.add_extension("pkg/_fast.hna.so");
+    let expected = fs::canonicalize(&hna)
+        .expect("canonical HNA path")
+        .to_string_lossy()
+        .into_owned();
+    fs::create_dir_all(dir.path.join("pkg")).expect("create package dir");
+    fs::write(dir.path.join("pkg").join("__init__.py"), b"").expect("write package init");
+
+    let source = "import pkg._fast as fast\nx = fast.add(1, 2)\n";
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(
+        extension_callee(assigned(&hir, "x")),
+        (expected.as_str(), "add")
+    );
+}
+
+#[test]
+fn hna_in_the_first_search_directory_wins_over_a_later_cpython_artifact() {
+    let root = ExtensionDir::new("hna-first-dir");
+    let src = root.path.join("project");
+    let later = root.path.join("site-packages");
+    fs::create_dir_all(&src).expect("create project dir");
+    fs::create_dir_all(&later).expect("create site-packages dir");
+    let hna = src.join("mod_ext.hna.so");
+    fs::write(&hna, b"").expect("write HNA stub");
+    fs::write(later.join("mod_ext.abi3.so"), b"").expect("write extension stub");
+
+    let source = src.join("main.py");
+    assert_eq!(
+        find_extension_in_search_dirs(&source, std::slice::from_ref(&later), "mod_ext"),
+        Some(resolved(&hna)),
+        "the first directory with any artifact kind decides"
     );
 }
 
@@ -11113,6 +11351,239 @@ class Console:
     // generated body fills the real values.
     assert!(matches!(&args[1].kind, HExprKind::Const(Const::None)));
     assert!(matches!(&args[2].kind, HExprKind::Const(Const::Int(0))));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn parametrized_dataclass_decorators_synthesize_an_init() {
+    let source = "\
+from dataclasses import dataclass, field
+import dataclasses
+
+@dataclass(slots=True)
+class Slotted:
+    key: str
+    items: list = field(default_factory=list)
+    count: int = 0
+
+@dataclass(frozen=True, slots=True)
+class FrozenSlotted:
+    value: int
+
+@dataclasses.dataclass()
+class Qualified:
+    flag: bool
+
+@dataclass(slots=True)
+class Base:
+    value: int
+
+class Derived(Base):
+    pass
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    for (name, params) in [
+        ("Slotted.__init__", vec!["self", "key", "items", "count"]),
+        ("FrozenSlotted.__init__", vec!["self", "value"]),
+        ("Qualified.__init__", vec!["self", "flag"]),
+    ] {
+        let init = function(&hir, name);
+        assert_eq!(
+            init.params
+                .iter()
+                .map(|param| param.name.as_str())
+                .collect::<Vec<_>>(),
+            params,
+            "{name}"
+        );
+    }
+    // `slots`/`frozen` are accepted without changing synthesis: defaults and
+    // factories still land on the generated parameters.
+    let slotted = function(&hir, "Slotted.__init__");
+    assert_eq!(slotted.params[1].default, None);
+    assert_eq!(slotted.params[2].default, Some(Const::None));
+    assert_eq!(slotted.params[3].default, Some(Const::Int(0)));
+    // A subclass of a parametrized dataclass inherits its `__init__`; Hydro
+    // must not synthesize a field-less one of its own.
+    assert!(
+        hir.functions
+            .iter()
+            .all(|function| function.name != "Derived.__init__"),
+        "a derived class without fields must inherit Base.__init__"
+    );
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn dataclass_init_false_skips_the_synthesized_init() {
+    let source = "\
+from dataclasses import dataclass
+
+@dataclass(init=False)
+class Manual:
+    value: int
+    items: list
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::ClassDef { methods, .. } = &hir.functions[0].body[0].kind else {
+        panic!(
+            "expected a class definition, got {:?}",
+            hir.functions[0].body[0].kind
+        );
+    };
+    assert!(
+        !methods
+            .iter()
+            .any(|(method, _, _)| method.as_str() == "__init__"),
+        "init=False must not synthesize __init__: {methods:?}"
+    );
+    assert!(
+        hir.functions
+            .iter()
+            .all(|function| function.name != "Manual.__init__"),
+        "init=False must not register an __init__ function"
+    );
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn dataclass_with_thirteen_fields_constructs_positionally_and_by_keyword() {
+    let mut source =
+        String::from("from dataclasses import dataclass\n\n@dataclass(slots=True)\nclass Wide:\n");
+    for index in 1..=13 {
+        source.push_str(&format!("    f{index}: int\n"));
+    }
+    source.push_str("positional = Wide(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)\n");
+    source.push_str(
+        "keyword = Wide(f13=13, f12=12, f11=11, f10=10, f9=9, f8=8, f7=7, f6=6, f5=5, \
+         f4=4, f3=3, f2=2, f1=1)\n",
+    );
+    let (hir, mut infer, diags) = lower_source(&source, &parse(&source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let init = function(&hir, "Wide.__init__");
+    let expected: Vec<String> = std::iter::once("self".to_string())
+        .chain((1..=13).map(|index| format!("f{index}")))
+        .collect();
+    assert_eq!(
+        init.params
+            .iter()
+            .map(|param| param.name.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    for param in &init.params[1..] {
+        assert_eq!(param.default, None, "{}", param.name);
+    }
+
+    // Positional arguments bind in declaration order.
+    let HExprKind::IndirectCall { args, .. } = &assigned(&hir, "positional").kind else {
+        panic!(
+            "expected a class call, got {:?}",
+            assigned(&hir, "positional").kind
+        );
+    };
+    assert_eq!(args.len(), 13);
+    for (index, arg) in args.iter().enumerate() {
+        assert!(
+            matches!(&arg.kind, HExprKind::Const(Const::Int(value)) if *value == index as i64 + 1),
+            "positional argument {index} is {:?}",
+            arg.kind
+        );
+    }
+
+    // Keywords are reordered into the declared field order.
+    let HExprKind::IndirectCall { args, .. } = &assigned(&hir, "keyword").kind else {
+        panic!(
+            "expected a class call, got {:?}",
+            assigned(&hir, "keyword").kind
+        );
+    };
+    assert_eq!(args.len(), 13);
+    for (index, arg) in args.iter().enumerate() {
+        assert!(
+            matches!(&arg.kind, HExprKind::Const(Const::Int(value)) if *value == index as i64 + 1),
+            "keyword argument {index} is {:?}",
+            arg.kind
+        );
+    }
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn computed_field_info_shape_skips_classvar_fields() {
+    let source = "\
+from dataclasses import dataclass
+from typing import Any, ClassVar
+
+@dataclass(slots=True)
+class ComputedFieldInfo:
+    decorator_repr: ClassVar[str] = '@computed_field'
+    wrapped_property: property
+    return_type: Any
+    alias: str | None
+    alias_priority: int | None
+    exclude_if: Any
+    title: str | None
+    field_title_generator: Any
+    description: str | None
+    deprecated: Any
+    examples: list | None
+    json_schema_extra: Any
+    repr: bool
+
+info = ComputedFieldInfo(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, True)
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    // `ClassVar` is a class attribute, never an `__init__` parameter, so the
+    // twelve annotated fields (not thirteen) form the constructor.
+    let init = function(&hir, "ComputedFieldInfo.__init__");
+    assert_eq!(
+        init.params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "self",
+            "wrapped_property",
+            "return_type",
+            "alias",
+            "alias_priority",
+            "exclude_if",
+            "title",
+            "field_title_generator",
+            "description",
+            "deprecated",
+            "examples",
+            "json_schema_extra",
+            "repr",
+        ]
+    );
+
+    let HExprKind::IndirectCall { args, .. } = &assigned(&hir, "info").kind else {
+        panic!(
+            "expected a class call, got {:?}",
+            assigned(&hir, "info").kind
+        );
+    };
+    assert_eq!(args.len(), 12);
+
+    let HStmtKind::ClassDef { attributes, .. } = &hir.functions[0].body[0].kind else {
+        panic!(
+            "expected a class definition, got {:?}",
+            hir.functions[0].body[0].kind
+        );
+    };
+    assert!(
+        attributes
+            .iter()
+            .any(|attribute| attribute.0 == "decorator_repr"),
+        "the ClassVar value must stay a class attribute: {attributes:?}"
+    );
     assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
 
@@ -12519,6 +12990,277 @@ fn assignment_expression_cannot_rebind_a_comprehension_target() {
             .message
             .contains("cannot rebind comprehension iteration variable 'x'"),
         "{diags:?}"
+    );
+}
+
+/// Local slot of `name`, panicking when the scope does not bind it.
+fn local_slot(function: &HFunction, name: &str) -> LocalId {
+    function
+        .locals
+        .iter()
+        .position(|local| local.name == name)
+        .map(|index| index as LocalId)
+        .unwrap_or_else(|| panic!("no local named '{name}'"))
+}
+
+#[test]
+fn assignment_expression_in_generator_expression_writes_an_enclosing_cell() {
+    // `(m := ...)` in a generator expression binds in the enclosing function
+    // (CPython skips comprehension scopes), so the synthetic frame writes a
+    // closure cell owned by `f`; the element reads that same cell.
+    let source =
+        "def f(names, get):\n    return list(m for n in names if (m := get(n)) is not None)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let function = function(&hir, "f");
+    let m_local = local_slot(function, "m");
+    assert!(
+        matches!(
+            function.body.first().map(|stmt| &stmt.kind),
+            Some(HStmtKind::CellInit {
+                target,
+                value: None
+            }) if *target == m_local
+        ),
+        "the enclosing frame creates an unbound cell: {:?}",
+        function.body.first().map(|stmt| &stmt.kind)
+    );
+
+    let helper = hir
+        .functions
+        .iter()
+        .find(|helper| helper.name == "<genexpr>")
+        .expect("generator expression helper");
+    let helper_m = local_slot(helper, "m");
+
+    let HStmtKind::ForEach { body, .. } = &helper.body[0].kind else {
+        panic!(
+            "expected the comprehension loop, got {:?}",
+            helper.body[0].kind
+        );
+    };
+    let HStmtKind::If {
+        cond, then_body, ..
+    } = &body[0].kind
+    else {
+        panic!("expected the filter, got {:?}", body[0].kind);
+    };
+    let HExprKind::Bin { lhs, rhs, .. } = &cond.kind else {
+        panic!("expected the `is not None` test, got {:?}", cond.kind);
+    };
+    assert!(
+        matches!(&lhs.kind, HExprKind::CellSet { target, .. } if *target == helper_m),
+        "the filter must write through the captured cell, got {:?}",
+        lhs.kind
+    );
+    assert!(matches!(rhs.kind, HExprKind::Const(Const::None)));
+    assert!(
+        matches!(
+            &then_body[0].kind,
+            HStmtKind::Yield { value: Some(value) }
+                if matches!(value.kind, HExprKind::CellGet(id) if id == helper_m)
+        ),
+        "the element must read the same cell, got {:?}",
+        then_body[0].kind
+    );
+}
+
+#[test]
+fn assignment_expression_target_is_read_by_a_later_filter() {
+    let source =
+        "def f(names, get):\n    return list(1 for n in names if (m := get(n)) if m > 0)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let helper = hir
+        .functions
+        .iter()
+        .find(|helper| helper.name == "<genexpr>")
+        .expect("generator expression helper");
+    let helper_m = local_slot(helper, "m");
+
+    let HStmtKind::ForEach { body, .. } = &helper.body[0].kind else {
+        panic!(
+            "expected the comprehension loop, got {:?}",
+            helper.body[0].kind
+        );
+    };
+    let HStmtKind::If {
+        cond, then_body, ..
+    } = &body[0].kind
+    else {
+        panic!("expected the assigning filter, got {:?}", body[0].kind);
+    };
+    assert!(
+        matches!(&cond.kind, HExprKind::CellSet { target, .. } if *target == helper_m),
+        "the first filter binds the target, got {:?}",
+        cond.kind
+    );
+    let HStmtKind::If { cond: later, .. } = &then_body[0].kind else {
+        panic!("expected the later filter, got {:?}", then_body[0].kind);
+    };
+    let HExprKind::Bin { lhs, .. } = &later.kind else {
+        panic!("expected the `m > 0` test, got {:?}", later.kind);
+    };
+    assert!(
+        matches!(lhs.kind, HExprKind::CellGet(id) if id == helper_m),
+        "the later filter reads the captured cell, got {:?}",
+        lhs.kind
+    );
+}
+
+#[test]
+fn nested_generator_expression_walrus_targets_share_enclosing_cells() {
+    // Both assignment expressions bind in `f`, so the outer frame captures
+    // both cells and passes the inner target's cell on to the inner frame.
+    let source =
+        "def f(xs, ys):\n    return list(((w := y) for y in ys) for x in xs if (z := x))\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let function = function(&hir, "f");
+    let z_local = local_slot(function, "z");
+    let w_local = local_slot(function, "w");
+    let init_targets: Vec<LocalId> = function
+        .body
+        .iter()
+        .filter_map(|stmt| match &stmt.kind {
+            HStmtKind::CellInit { target, .. } => Some(*target),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        init_targets.contains(&z_local) && init_targets.contains(&w_local),
+        "both targets are cell-initialised at function entry: {init_targets:?}"
+    );
+
+    let mut helpers: Vec<&HFunction> = hir
+        .functions
+        .iter()
+        .filter(|helper| helper.name == "<genexpr>")
+        .collect();
+    assert_eq!(helpers.len(), 2, "one helper per generator expression");
+    let outer_index = helpers
+        .iter()
+        .position(|helper| helper.locals.iter().any(|local| local.name == "z"))
+        .expect("the outer frame captures `z`");
+    let outer = helpers.remove(outer_index);
+    let inner = helpers.pop().expect("the inner generator expression");
+    let outer_z = local_slot(outer, "z");
+    let outer_w = local_slot(outer, "w");
+    let inner_w = local_slot(inner, "w");
+
+    let HStmtKind::ForEach { body, .. } = &outer.body[0].kind else {
+        panic!("expected the outer loop, got {:?}", outer.body[0].kind);
+    };
+    let HStmtKind::If {
+        cond, then_body, ..
+    } = &body[0].kind
+    else {
+        panic!("expected the outer filter, got {:?}", body[0].kind);
+    };
+    assert!(
+        matches!(&cond.kind, HExprKind::CellSet { target, .. } if *target == outer_z),
+        "the outer filter writes the shared `z` cell, got {:?}",
+        cond.kind
+    );
+    let HStmtKind::Yield { value: Some(call) } = &then_body[0].kind else {
+        panic!(
+            "expected the yielded inner generator, got {:?}",
+            then_body[0].kind
+        );
+    };
+    let HExprKind::Call { args, .. } = &call.kind else {
+        panic!("expected the inner helper call, got {:?}", call.kind);
+    };
+    assert!(
+        matches!(
+            args.last().map(|arg| &arg.kind),
+            Some(HExprKind::Local(id)) if *id == outer_w
+        ),
+        "the inner frame receives the same `w` cell: {:?}",
+        args.last()
+    );
+
+    let HStmtKind::ForEach { body, .. } = &inner.body[0].kind else {
+        panic!("expected the inner loop, got {:?}", inner.body[0].kind);
+    };
+    let HStmtKind::Yield { value: Some(value) } = &body[0].kind else {
+        panic!("expected the inner element, got {:?}", body[0].kind);
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::CellSet { target, .. } if *target == inner_w),
+        "the inner element writes the shared `w` cell, got {:?}",
+        value.kind
+    );
+}
+
+#[test]
+fn assignment_expression_target_that_is_an_outer_local_updates_it() {
+    // The target already has an enclosing local slot; it becomes a cell from
+    // function entry on, so the earlier write, the generator frame write and
+    // the later read all use the same cell (CPython semantics).
+    let source = "def f(names, get):\n    m = None\n    values = list(m for n in names if (m := get(n)) is not None)\n    return m, values\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let function = function(&hir, "f");
+    let m_local = local_slot(function, "m");
+    assert!(
+        matches!(
+            &function.body[0].kind,
+            HStmtKind::CellInit {
+                target,
+                value: None
+            } if *target == m_local
+        ),
+        "the pre-existing local becomes a cell at entry: {:?}",
+        function.body[0].kind
+    );
+    let HStmtKind::CellAssign { target, value } = &function.body[1].kind else {
+        panic!(
+            "expected the earlier write, got {:?}",
+            function.body[1].kind
+        );
+    };
+    assert_eq!(*target, m_local);
+    assert!(matches!(value.kind, HExprKind::Const(Const::None)));
+
+    let HStmtKind::Return(Some(result)) = &function.body.last().unwrap().kind else {
+        panic!("expected the returned tuple");
+    };
+    let HExprKind::Tuple(elements) = &result.kind else {
+        panic!("expected a tuple result, got {:?}", result.kind);
+    };
+    assert!(
+        matches!(elements[0].kind, HExprKind::CellGet(id) if id == m_local),
+        "the later read observes the cell the frame writes: {:?}",
+        elements[0].kind
+    );
+
+    let helper = hir
+        .functions
+        .iter()
+        .find(|helper| helper.name == "<genexpr>")
+        .expect("generator expression helper");
+    let helper_m = local_slot(helper, "m");
+    let HStmtKind::ForEach { body, .. } = &helper.body[0].kind else {
+        panic!(
+            "expected the comprehension loop, got {:?}",
+            helper.body[0].kind
+        );
+    };
+    let HStmtKind::If { cond, .. } = &body[0].kind else {
+        panic!("expected the filter, got {:?}", body[0].kind);
+    };
+    let HExprKind::Bin { lhs, .. } = &cond.kind else {
+        panic!("expected the `is not None` test, got {:?}", cond.kind);
+    };
+    assert!(
+        matches!(&lhs.kind, HExprKind::CellSet { target, .. } if *target == helper_m),
+        "the frame writes the enclosing cell, got {:?}",
+        lhs.kind
     );
 }
 

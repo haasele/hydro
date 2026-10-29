@@ -354,8 +354,8 @@ fn collections_abc_classes_and_inheritance_checks() {
     assert_true(module("builtins", "issubclass", &[my_map, mapping]));
     assert_false(module("builtins", "issubclass", &[my_map, sequence]));
 
-    // Documented limit: virtual registration does not exist, so a plain dict
-    // is only a Mapping when it subclasses the ABC.
+    // Before any edge is recorded a dict is not a Mapping: the runtime does
+    // not infer structure from `keys`/`__getitem__`.
     let dict = empty_dict();
     assert_false(module("builtins", "isinstance", &[dict, mapping]));
     assert_false(module(
@@ -364,10 +364,60 @@ fn collections_abc_classes_and_inheritance_checks() {
         &[hydro_list_new(0, std::ptr::null()), mapping],
     ));
 
-    // `register` exists (as in CPython) but reports the unsupported semantics.
-    let args = [dict];
+    // `Mapping.register(dict)` records a real virtual-subclass edge for the
+    // native `dict` spelling, exactly like CPython's `_collections_abc`.
+    // Registering also invalidates ABC caches: `get_cache_token()` moves.
+    assert_int(module("abc", "get_cache_token", &[]), 0);
+    let dict_builtin = hydro_builtin_function(b"dict".as_ptr(), 4);
+    let args = [dict_builtin];
+    let result = hydro_method(mapping, b"register".as_ptr(), 8, 1, args.as_ptr());
+    assert_same(result, dict_builtin);
+    assert_int(module("abc", "get_cache_token", &[]), 1);
+    assert_true(module("builtins", "isinstance", &[dict, mapping]));
+    // An unregistered value still does not match.
+    assert_false(module(
+        "builtins",
+        "isinstance",
+        &[hydro_list_new(0, std::ptr::null()), mapping],
+    ));
+
+    // A user class registered the same way answers `issubclass`/`isinstance`,
+    // and a real subclass inherits the edge.
+    let virtual_cls = class("Virtual", hydro_none());
+    let derived = class("VirtualDerived", virtual_cls);
+    let args = [virtual_cls];
+    assert_same(
+        hydro_method(mapping, b"register".as_ptr(), 8, 1, args.as_ptr()),
+        virtual_cls,
+    );
+    // Registering the same class again is idempotent and returns it unchanged.
+    let args = [virtual_cls];
+    assert_same(
+        hydro_method(mapping, b"register".as_ptr(), 8, 1, args.as_ptr()),
+        virtual_cls,
+    );
+    assert_true(module("builtins", "issubclass", &[virtual_cls, mapping]));
+    assert_true(module("builtins", "issubclass", &[derived, mapping]));
+    assert_true(module(
+        "builtins",
+        "isinstance",
+        &[hydro_instance_new(virtual_cls), mapping],
+    ));
+    assert_true(module(
+        "builtins",
+        "isinstance",
+        &[hydro_instance_new(derived), mapping],
+    ));
+    // The edge belongs to `Mapping`, not to the unrelated `Sequence` ABC.
+    assert_false(module("builtins", "issubclass", &[virtual_cls, sequence]));
+    // Real inheritance keeps working alongside the virtual edge.
+    assert_true(module("builtins", "issubclass", &[my_map, mapping]));
+
+    // Registering a non-class raises `TypeError` instead of pretending the
+    // registration took effect.
+    let args = [text("not a class")];
     hydro_method(mapping, b"register".as_ptr(), 8, 1, args.as_ptr());
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
+    assert_error_tag(TYPE_ERROR);
 
     module_get("collections.abc", "Missing");
     assert_error_tag(ATTRIBUTE_ERROR);

@@ -13,7 +13,10 @@
 //!   a no-op that returns it; a duplicate registration is idempotent; neither
 //!   class values nor the runtime's native type spellings (`int`, `float`, …)
 //!   are rejected. Nothing is recorded when the target is not a class, so
-//!   `register` never reports a success that has no effect.
+//!   `register` never reports a success that has no effect. Every native
+//!   `collections.abc` class is an `ABCMeta` instance, so `Mapping.register`
+//!   resolves here through the ordinary metaclass lookup and records into the
+//!   same registry.
 //! * `__instancecheck__`/`__subclasscheck__` delegate to the same checks, and
 //!   `__abstractmethods__` reports the abstract names computed from the class
 //!   namespace and the MRO.
@@ -212,6 +215,17 @@ fn register(args: &[i64]) -> i64 {
         add_virtual_edge(abc, subclass);
     }
     subclass
+}
+
+/// Native entry point for the `register` method inherited by every ABC.
+///
+/// `collections.abc` classes are `ABCMeta` instances, so `Mapping.register(X)`
+/// resolves to `ABCMeta.register` and reaches [`register`] with
+/// `[Mapping, X]`; the private `_collections_abc._abc_register` spelling is
+/// answered by the same entry point. Both share the single edge registry above
+/// instead of keeping a second one.
+pub(crate) fn register_from_method(args: &[i64]) -> i64 {
+    register(args)
 }
 
 /// Whether `class` was created by `ABCMeta` or a subclass of it.

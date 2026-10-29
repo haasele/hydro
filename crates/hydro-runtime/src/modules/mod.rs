@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use hydro_ir::stdlib;
 use hydro_ir::{PYTHON_ABI_TAG, PYTHON_VERSION, PYTHON_VERSION_STRING};
 use num_bigint::{BigInt, Sign};
-use num_traits::{Signed, ToPrimitive};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use crate::core::globals;
 
@@ -75,6 +75,7 @@ pub(crate) mod quopri;
 pub(crate) mod re;
 pub(crate) mod select;
 pub(crate) mod shutil;
+pub(crate) mod sidecar;
 pub(crate) mod site;
 pub(crate) mod socket;
 pub(crate) mod stat;
@@ -98,8 +99,8 @@ pub(crate) mod zoneinfo;
 
 use crate::container;
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, INDEX_ERROR, OS_ERROR, OVERFLOW_ERROR, RECURSION_ERROR, RUNTIME_ERROR,
-    STOP_ITERATION, TYPE_ERROR, VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, INDEX_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR, OVERFLOW_ERROR,
+    RECURSION_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::iter;
@@ -1090,6 +1091,87 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         "functools._singledispatchmethod_get.__repr__",
         native_member("_singledispatchmethod_get.__repr__", 1, 1),
     ),
+    // Native methods of the `time.struct_time` class. The spec `name` must be
+    // the internal dispatch name (dispatch receives `spec.name`), exactly like
+    // the `_datetime_*` entries. `__init__` may be called with only `self` so
+    // the constructor can report CPython's missing-sequence TypeError itself.
+    (
+        "time._struct_time_init",
+        native_member("_struct_time_init", 1, 2),
+    ),
+    (
+        "time._struct_time_len",
+        native_member("_struct_time_len", 1, 1),
+    ),
+    (
+        "time._struct_time_getitem",
+        native_member("_struct_time_getitem", 2, 2),
+    ),
+    (
+        "time._struct_time_iter",
+        native_member("_struct_time_iter", 1, 1),
+    ),
+    (
+        "time._struct_time_repr",
+        native_member("_struct_time_repr", 1, 1),
+    ),
+    (
+        "time._struct_time_eq",
+        native_member("_struct_time_eq", 2, 2),
+    ),
+    // Methods of the cached `functools.cmp_to_key` wrapper class.
+    (
+        "functools._cmp_key_call",
+        native_member("_cmp_key_call", 2, 2),
+    ),
+    ("functools._cmp_key_lt", native_member("_cmp_key_lt", 2, 2)),
+    ("functools._cmp_key_gt", native_member("_cmp_key_gt", 2, 2)),
+    ("functools._cmp_key_le", native_member("_cmp_key_le", 2, 2)),
+    ("functools._cmp_key_ge", native_member("_cmp_key_ge", 2, 2)),
+    ("functools._cmp_key_eq", native_member("_cmp_key_eq", 2, 2)),
+    // `sys.monitoring` tool surface. Hydro never emits instrumentation events;
+    // the calls below only maintain the observable registry CPython exposes so
+    // importers such as `bdb` can be constructed.
+    (
+        "sys._monitoring_register_callback",
+        native_member("_monitoring_register_callback", 3, 3),
+    ),
+    (
+        "sys._monitoring_use_tool_id",
+        native_member("_monitoring_use_tool_id", 2, 2),
+    ),
+    (
+        "sys._monitoring_free_tool_id",
+        native_member("_monitoring_free_tool_id", 1, 1),
+    ),
+    (
+        "sys._monitoring_clear_tool_id",
+        native_member("_monitoring_clear_tool_id", 1, 1),
+    ),
+    (
+        "sys._monitoring_get_tool",
+        native_member("_monitoring_get_tool", 1, 1),
+    ),
+    (
+        "sys._monitoring_set_events",
+        native_member("_monitoring_set_events", 2, 2),
+    ),
+    (
+        "sys._monitoring_get_events",
+        native_member("_monitoring_get_events", 1, 1),
+    ),
+    (
+        "sys._monitoring_set_local_events",
+        native_member("_monitoring_set_local_events", 3, 3),
+    ),
+    (
+        "sys._monitoring_get_local_events",
+        native_member("_monitoring_get_local_events", 2, 2),
+    ),
+    (
+        "sys._monitoring_restart_events",
+        native_member("_monitoring_restart_events", 0, 0),
+    ),
 ];
 
 /// Resolves a [`SUPPLEMENTAL_FUNCTIONS`] entry by module and member name.
@@ -1688,11 +1770,33 @@ pub(crate) fn module_dict(module: &str) -> i64 {
     for name in names {
         let item = module_get_named(module, name);
         if exc::pending() {
-            // A spec entry that cannot be materialised (none today, but the
-            // table is shared) must not silently become `None`: propagate so
-            // the caller sees the real failure.
-            crate::heap::release_roots(roots);
-            return NONE;
+            // A single un-materialisable name must not erase the rest of the
+            // namespace; the retry pass below installs the spec default.
+            exc::init();
+            continue;
+        }
+        insert_namespace_entry(dict, name, item);
+    }
+    // Guarantee every spec function and constant is present, even if an
+    // override shadowed a name or the override-aware pass above skipped one.
+    let spec_names = spec
+        .functions
+        .iter()
+        .map(|function| function.name)
+        .chain(spec.constants.iter().map(|constant| constant.name));
+    for name in spec_names {
+        let present = value::as_dict(dict).is_some_and(|pairs| {
+            pairs
+                .iter()
+                .any(|(key, _)| value::as_str(*key) == Some(name))
+        });
+        if present {
+            continue;
+        }
+        let item = module_get_default_named(module, name);
+        if exc::pending() {
+            exc::init();
+            continue;
         }
         insert_namespace_entry(dict, name, item);
     }
@@ -1862,7 +1966,12 @@ fn call_native_kw_at(
     ) else {
         return missing_attribute(module, function);
     };
-    if !spec.dynamic_keywords {
+    // A spec with declared parameter names accepts those names through the
+    // generic binder below; only a spec with no names and no dynamic keywords
+    // rejects keyword calls outright. (The compiler normally binds named
+    // parameters statically, but native callers such as `partial` and this
+    // ABI path also exercise the runtime binder.)
+    if !spec.dynamic_keywords && spec.params.is_empty() {
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!("{module_name}.{function_name}() does not accept keyword arguments"),
@@ -1949,7 +2058,12 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         "os" => os_call_kw(function, args, keywords),
         "os.path" => os_path_call_kw(function, args, &keywords),
         "itertools" => itertools_call_kw(function, args, keywords),
+        "time" => time_call_kw(function, args, keywords),
         "importlib.metadata" => importlib_metadata::call_kw(function, args, &keywords),
+        // A spec with named parameters and no module-specific keyword
+        // semantics (base64's `padded`) binds them into the positional
+        // layout before this point.
+        "base64" => base64::call(function, args),
         _ => exc::raise_with_message(
             TYPE_ERROR,
             &format!("{module}.{function}() does not accept keyword arguments"),
@@ -2479,6 +2593,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "_struct" | "struct" => struct_mod::call(function, args),
         "unicodedata" => unicodedata::call(function, args),
         "_contextvars" | "contextvars" => contextvars::call(function, args),
+        "_hydro_sidecar" => sidecar::call(function, args),
         _ => missing_attribute(module, function),
     }
 }
@@ -2597,7 +2712,10 @@ pub(crate) fn extension_module_value(name: &str, path: &str) -> i64 {
 }
 
 /// Inserts a freshly materialised module into the cached `sys.modules` dict.
-fn publish_module(name: &str, module: i64) {
+///
+/// Also used by the HNA loader ([`crate::native`]): it publishes a native
+/// module only after the descriptor validated and `init` succeeded.
+pub(crate) fn publish_module(name: &str, module: i64) {
     // The freshly allocated value is not reachable from generated code yet;
     // root it across the registry lookup, key allocation and insert.
     let module_root = crate::heap::root_values(&[module]);
@@ -2626,6 +2744,9 @@ pub(crate) fn module_attr(module: &value::ModuleState, name: &str) -> i64 {
         return value::str_alloc(module.name().to_string());
     }
     if let Some(path) = module.path() {
+        if crate::native::is_hna_path(path) {
+            return crate::native::get_named(module.name(), path, name);
+        }
         return extension::get(path.as_ptr(), path.len(), name.as_ptr(), name.len());
     }
     module_get_by_name(module.name(), name)
@@ -2639,9 +2760,13 @@ pub(crate) fn module_attr(module: &value::ModuleState, name: &str) -> i64 {
 pub(crate) fn module_attr_names(
     module: &value::ModuleState,
 ) -> Option<Result<Vec<String>, String>> {
-    module
-        .path()
-        .map(crate::modules::extension::module_attribute_names)
+    module.path().map(|path| {
+        if crate::native::is_hna_path(path) {
+            crate::native::attribute_names(Some(module.name()), path)
+        } else {
+            crate::modules::extension::module_attribute_names(path)
+        }
+    })
 }
 
 /// `module.name = value`: stores an attribute override for the module.
@@ -3015,6 +3140,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
             }
         }
         ("types", name) => types::constant(name),
+        ("json", "JSONDecodeError") => crate::exc::exception_class(crate::exc::VALUE_ERROR),
         ("annotationlib", name) => annotationlib::constant(name),
         ("functools" | "_functools", name) => functools::constant(name),
         ("inspect", name) => inspect::constant(name),
@@ -3087,6 +3213,11 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("sys", "stdin") | ("sys", "__stdin__") => value::std_stream_new(0),
         ("sys", "stdout") | ("sys", "__stdout__") => value::std_stream_new(1),
         ("sys", "stderr") | ("sys", "__stderr__") => value::std_stream_new(2),
+        // `sys.flags` and `sys.monitoring` are cached objects (their identity
+        // is observable); `sys.meta_path` is the cached finder list.
+        ("sys", "flags") => sys_flags(),
+        ("sys", "monitoring") => sys_monitoring(),
+        ("sys", "meta_path") => sys_meta_path(),
         ("os", "name") => {
             let name = if cfg!(windows) { "nt" } else { "posix" };
             value::str_from_bytes(name.as_bytes())
@@ -3127,10 +3258,31 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("os", "O_APPEND") => encode_int(libc::O_APPEND as i64),
         ("os", "O_CLOEXEC") => encode_int(libc::O_CLOEXEC as i64),
         ("os", "O_NOCTTY") => encode_int(libc::O_NOCTTY as i64),
+        // `altsep` is `None` on POSIX; `defpath` is the POSIX default search
+        // path; `WNOHANG` is the non-blocking `waitpid` flag.
+        ("os", "altsep") => {
+            if cfg!(windows) {
+                value::str_from_bytes(b"\\")
+            } else {
+                NONE
+            }
+        }
+        ("os", "defpath") => {
+            if cfg!(windows) {
+                value::str_from_bytes(b".;C:\\bin")
+            } else {
+                value::str_from_bytes(b":/bin:/usr/bin")
+            }
+        }
+        ("os", "WNOHANG") => encode_int(os_wnohang()),
         // `io`/`_io` seek whence values (`os.SEEK_*` share the values).
         ("io" | "_io", "SEEK_SET") => encode_int(0),
         ("io" | "_io", "SEEK_CUR") => encode_int(1),
         ("io" | "_io", "SEEK_END") => encode_int(2),
+        // CPython's default buffered-I/O size and the module's exported name
+        // list. `_io` does not declare either constant.
+        ("io", "DEFAULT_BUFFER_SIZE") => encode_int(8192),
+        ("io", "__all__") => io_all_list(),
         // `threading.local` is an empty base class: it exists so thread-local
         // subclasses (`class X(threading.local)`) and `local()` calls work.
         // Hydro stores attributes per instance, not per thread; the documented
@@ -3156,6 +3308,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
             .unwrap_or_else(|| missing_attribute("asyncio.coroutines", "_is_coroutine")),
         ("socket" | "_socket", name) => socket::constant(module, name),
         ("select", name) => select::constant(name),
+        ("getopt", name) => getopt::constant(name),
         ("selectors", name) => select::selectors_constant(name),
         ("ssl", name) => socket::ssl_constant(name),
         ("subprocess", "PIPE") => encode_int(subprocess::PIPE),
@@ -3171,6 +3324,11 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("datetime", name) => datetime::constant(name),
         ("typing", name) => typing::constant(name),
         ("abc", name) => abc::constant(name),
+        // The pure-path classes are cached class values: pydantic compares
+        // them with `is` and calls them as `os.PathLike` constructors.
+        ("pathlib", name) => {
+            pathlib_class_value(name).unwrap_or_else(|| missing_attribute("pathlib", name))
+        }
         ("builtins", name) => builtins::constant(name),
         ("_opcode", name) => opcode::constant(name),
         ("_weakref" | "weakref", name) => weakref::constant(name),
@@ -3201,16 +3359,34 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("zoneinfo", name) => zoneinfo::constant(name),
         ("decimal" | "_decimal", name) => decimal::constant(name),
         ("_struct" | "struct", "error") => struct_mod::error_value(),
-        ("unicodedata", "unidata_version") => {
-            value::str_alloc(unicodedata::UNIDATA_VERSION.to_string())
-        }
+        ("unicodedata", name) => unicodedata::constant(name),
         ("_contextvars" | "contextvars", name) => contextvars::constant(name),
+        // `time`'s struct-sequence surface: the class object, the timezone
+        // name pair, the DST flag and the sequence field-name list.
+        ("time", "struct_time") => time_struct_time_class(),
+        ("time", "tzname") => time_tzname(),
+        ("time", "daylight") => encode_int(time_daylight()),
+        ("time", "_STRUCT_TM_ITEMS") => time_struct_tm_items(),
+        // `pickle.DEFAULT_PROTOCOL`: the protocol `dump`/`dumps` use when none
+        // is given.
+        ("pickle", "DEFAULT_PROTOCOL") => encode_int(pickle_default_protocol()),
         // The `@dataclass` decorator is expanded by the frontend; the runtime
         // value only has to exist for the import.
         ("dataclasses", "dataclass") => NONE,
         ("dataclasses", "InitVar") => value::class_new("InitVar".to_string(), NONE, Vec::new()),
+        // `Field` is a real class: `dataclasses.field()` returns instances of
+        // it and `isinstance`/`type` observe the cached class.
+        ("dataclasses", "Field") => dataclasses_field_class(),
+        // `MISSING` is the unique sentinel omitted `field()` settings carry,
+        // so `field().default is MISSING` holds.
+        ("dataclasses", "MISSING") => dataclasses_missing(),
+        ("dataclasses", "_HAS_DEFAULT_FACTORY") => dataclasses_has_default_factory(),
         ("contextlib", name) => contextlib_class_value("contextlib", name)
             .unwrap_or_else(|| missing_attribute("contextlib", name)),
+        ("_hydro_sidecar", name) => match sidecar::constant(name) {
+            Some(value) => value,
+            None => missing_attribute("_hydro_sidecar", name),
+        },
         _ => missing_attribute(module, name),
     }
 }
@@ -4092,35 +4268,257 @@ fn same_exception(a: i64, b: i64) -> bool {
 
 /// `dataclasses` functions. The frontend reads `field(...)` from the class-body
 /// AST to synthesize `__init__`; executing the class body still evaluates the
-/// call, so it returns a marker namespace carrying both settings.
-///
-/// `replace(obj, **changes)` copies the instance; the positional form binds no
-/// changes, the keyword form goes through [`dataclasses_call_kw`].
+/// call, so it returns a real `Field` instance carrying every CPython field
+/// attribute.
 fn dataclasses_call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "field" => {
-            // Omitted slots arrive as `None` (the frontend fills them).
-            let default = args.first().copied().unwrap_or(NONE);
-            let default_factory = args.get(1).copied().unwrap_or(NONE);
-            value::namespace_new(vec![
-                ("default".to_string(), default),
-                ("default_factory".to_string(), default_factory),
-            ])
-        }
+        "field" => dataclasses_field(args, Vec::new()),
         "replace" => dataclasses_replace(args[0], Vec::new()),
+        "is_dataclass" => dataclasses_is_dataclass(args[0]),
+        "fields" => dataclasses_fields(args[0]),
         _ => missing_attribute("dataclasses", function),
     }
 }
 
-/// Keyword-aware `dataclasses` dispatch: only `replace` binds names.
+/// Keyword-aware `dataclasses` dispatch: `field` and `replace` bind names.
 fn dataclasses_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
     match function {
+        "field" => dataclasses_field(args, keywords),
         "replace" => dataclasses_replace(args[0], keywords),
         _ => exc::raise_with_message(
             TYPE_ERROR,
             &format!("dataclasses.{function}() does not accept keyword arguments"),
         ),
     }
+}
+
+/// Cached `dataclasses.Field` class. Instances are the objects `field()`
+/// returns; `isinstance(field(), dataclasses.Field)` and `type(...)` observe
+/// this identity.
+fn dataclasses_field_class() -> i64 {
+    if let Some(cached) = globals::registry_get("dataclasses.Field") {
+        return cached;
+    }
+    let class = value::class_new("Field".to_string(), NONE, Vec::new());
+    globals::registry_set("dataclasses.Field", class);
+    class
+}
+
+/// The `dataclasses.MISSING` sentinel shared by omitted `field()` settings.
+///
+/// It is exposed as the module attribute `dataclasses.MISSING`, and the
+/// `Field` attributes carry the same unique object on every field, which is
+/// the observable CPython behavior.
+fn dataclasses_missing() -> i64 {
+    if let Some(cached) = globals::registry_get("dataclasses.MISSING") {
+        return cached;
+    }
+    let class = if let Some(class) = globals::registry_get("dataclasses._MISSING_TYPE.class") {
+        class
+    } else {
+        let class = value::class_new("_MISSING_TYPE".to_string(), NONE, Vec::new());
+        globals::registry_set("dataclasses._MISSING_TYPE.class", class);
+        class
+    };
+    let missing = value::instance_new(class);
+    globals::registry_set("dataclasses.MISSING", missing);
+    missing
+}
+
+/// The private `dataclasses._HAS_DEFAULT_FACTORY` marker.
+///
+/// CPython uses a dedicated sentinel (distinct from `MISSING`) while binding
+/// synthesized `__init__` defaults. Pydantic inspects it by identity, so the
+/// object must be stable for the process lifetime.
+fn dataclasses_has_default_factory() -> i64 {
+    if let Some(cached) = globals::registry_get("dataclasses._HAS_DEFAULT_FACTORY") {
+        return cached;
+    }
+    let class = value::class_new("_HAS_DEFAULT_FACTORY_CLASS".to_string(), NONE, Vec::new());
+    let sentinel = value::instance_new(class);
+    globals::registry_set("dataclasses._HAS_DEFAULT_FACTORY_CLASS", class);
+    globals::registry_set("dataclasses._HAS_DEFAULT_FACTORY", sentinel);
+    sentinel
+}
+
+/// `dataclasses.field(...)`: builds a `Field` instance.
+///
+/// CPython's `field` is keyword-only (the spec declares no positional slots, so
+/// the generic binder never shifts `default_factory` into the `default` slot).
+/// Omitted `default`/`default_factory`/`kw_only` become the MISSING sentinel,
+/// supplying both defaults raises CPython's `ValueError`, and `metadata=None`
+/// becomes a fresh empty dict (the runtime has no `mappingproxy`, a documented
+/// representational limit).
+fn dataclasses_field(args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    let missing = dataclasses_missing();
+    let mut default = args.first().copied().unwrap_or(missing);
+    let mut default_factory = args.get(1).copied().unwrap_or(missing);
+    let mut default_bound = !args.is_empty();
+    let mut factory_bound = args.len() > 1;
+    if args.len() > 2 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "field() takes at most 2 positional arguments ({} given)",
+                args.len()
+            ),
+        );
+    }
+    let mut init = TRUE;
+    let mut repr = TRUE;
+    let mut hash = NONE;
+    let mut compare = TRUE;
+    let mut metadata = NONE;
+    let mut kw_only = missing;
+    let mut doc = NONE;
+    for (name, value) in keywords {
+        match name.as_str() {
+            "default" => {
+                if default_bound {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "field() got multiple values for argument 'default'",
+                    );
+                }
+                default = value;
+                default_bound = true;
+            }
+            "default_factory" => {
+                if factory_bound {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "field() got multiple values for argument 'default_factory'",
+                    );
+                }
+                default_factory = value;
+                factory_bound = true;
+            }
+            "init" => init = value,
+            "repr" => repr = value,
+            "hash" => hash = value,
+            "compare" => compare = value,
+            "metadata" => metadata = value,
+            "kw_only" => kw_only = value,
+            "doc" => doc = value,
+            other => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("field() got an unexpected keyword argument '{other}'"),
+                )
+            }
+        }
+    }
+    if default_bound && factory_bound {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "cannot specify both default and default_factory",
+        );
+    }
+    let metadata = if metadata == NONE {
+        value::dict_new(Vec::new())
+    } else if value::as_dict(metadata).is_some() {
+        metadata
+    } else {
+        return exc::raise_with_message(TYPE_ERROR, "metadata must be a mapping");
+    };
+    let values = [
+        missing,
+        metadata,
+        default,
+        default_factory,
+        init,
+        repr,
+        hash,
+        compare,
+        kw_only,
+        doc,
+    ];
+    let roots = crate::heap::root_values(&values);
+    let instance = value::instance_new(dataclasses_field_class());
+    let instance_roots = crate::heap::root_values(&[instance]);
+    for (name, value) in [
+        ("name", NONE),
+        ("type", NONE),
+        ("default", default),
+        ("default_factory", default_factory),
+        ("repr", repr),
+        ("hash", hash),
+        ("init", init),
+        ("compare", compare),
+        ("metadata", metadata),
+        ("kw_only", kw_only),
+        ("doc", doc),
+        ("_field_type", NONE),
+    ] {
+        value::instance_setattr(instance, name.to_string(), value);
+    }
+    crate::heap::release_roots(instance_roots);
+    crate::heap::release_roots(roots);
+    instance
+}
+
+/// `dataclasses.is_dataclass(obj)`: true for a class or instance carrying the
+/// `__dataclass_fields__` marker.
+///
+/// CPython's predicate is exactly that attribute check. Hydro's frontend
+/// currently synthesizes dataclass `__init__` methods without materializing
+/// `__dataclass_fields__`, so a Hydro `@dataclass` class reports false until
+/// such metadata exists; the check is nevertheless truthful (it recognises a
+/// user class that defines the attribute, as CPython would).
+fn dataclasses_is_dataclass(object: i64) -> i64 {
+    let class = if value::as_class(object).is_some() {
+        object
+    } else if let Some(class) = value::instance_class_value(object) {
+        class
+    } else {
+        return FALSE;
+    };
+    value::bool_value(value::class_lookup(class, "__dataclass_fields__").is_some())
+}
+
+/// `dataclasses.fields(class_or_instance)`: tuple of the declared `Field`
+/// objects in declaration order.
+///
+/// The mapping comes from `__dataclass_fields__`, looked up on the instance
+/// first and then on its class (so an inherited mapping behaves like CPython's
+/// `getattr`). Values are the `field()` instances stored by the caller; when a
+/// stored field's `name` is unset, the mapping key supplies it. A class or
+/// instance without a dict metadata attribute gets CPython's `TypeError`
+/// instead of fabricated fields.
+fn dataclasses_fields(object: i64) -> i64 {
+    let class = if value::as_class(object).is_some() {
+        Some(object)
+    } else {
+        value::instance_class_value(object)
+    };
+    let metadata = value::instance_attr(object, "__dataclass_fields__").or_else(|| {
+        class.and_then(
+            |class| match value::class_lookup(class, "__dataclass_fields__") {
+                Some(value::ClassEntry::Attr(metadata)) => Some(metadata),
+                _ => None,
+            },
+        )
+    });
+    let Some(pairs) = metadata.and_then(value::as_dict) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "fields() should be called with a dataclass type or instance",
+        );
+    };
+    let pairs = pairs.to_vec();
+    let mut fields = Vec::with_capacity(pairs.len());
+    for (key, field) in pairs {
+        if value::as_instance(field).is_some()
+            && matches!(value::instance_attr(field, "name"), None | Some(NONE))
+        {
+            value::instance_setattr(field, "name".to_string(), key);
+        }
+        fields.push(field);
+    }
+    let roots = crate::heap::root_values(&fields);
+    let result = value::tuple_new(fields);
+    crate::heap::release_roots(roots);
+    result
 }
 
 /// `dataclasses.replace(obj, **changes)`: shallow copy of an instance's
@@ -4550,28 +4948,97 @@ pub(crate) fn random_method(obj: i64, method: &str, args: &[i64]) -> i64 {
 
 // pathlib
 
+/// Names of the pure-path class family pydantic 2.14 looks up by identity.
+///
+/// `Path` is deliberately absent: it stays the module-level constructor
+/// function. The five names below are cached class values (see
+/// [`pathlib_class_value`]).
+const PATHLIB_CLASSES: [&str; 5] = [
+    "PurePath",
+    "PosixPath",
+    "WindowsPath",
+    "PurePosixPath",
+    "PureWindowsPath",
+];
+
+/// Returns the cached class value for a `pathlib` name, if it is one.
+///
+/// The class objects carry no Python-level methods: instantiating them is
+/// routed back to [`pathlib_construct`], whose result is the same native
+/// `pathlib.Path` value the `Path` constructor returns. That keeps path
+/// arithmetic, `str()`/`os.fspath()` and the existing filesystem helpers
+/// working while pydantic's class-identity comparisons hold.
+pub(crate) fn pathlib_class_value(name: &str) -> Option<i64> {
+    if !PATHLIB_CLASSES.contains(&name) {
+        return None;
+    }
+    let key = format!("pathlib.{name}");
+    if let Some(class) = globals::registry_get(&key) {
+        return Some(class);
+    }
+    let class = value::class_new(name.to_string(), NONE, Vec::new());
+    globals::registry_set(&key, class);
+    Some(class)
+}
+
+/// Instantiates one of the cached pure-path classes, if `class` is one.
+///
+/// Called from the core class-call paths before generic instantiation. The
+/// constructor accepts at most one positional path segment (the same shape
+/// `pathlib.Path` supports) and no keywords. On a POSIX host `WindowsPath`
+/// raises `NotImplementedError`, matching CPython; `PosixPath` does the same
+/// on Windows. The `Pure*` classes are platform-independent, but they store
+/// the raw text without Windows-specific parsing or normalisation.
+pub(crate) fn pathlib_instantiate(
+    class: i64,
+    args: &[i64],
+    keywords: &[(String, i64)],
+) -> Option<i64> {
+    let name = value::class_display_name(class)?;
+    if !PATHLIB_CLASSES.contains(&name) {
+        return None;
+    }
+    // Only the cached class value may take this path: a user class that
+    // happens to be named `PurePath` keeps the generic constructor rules.
+    if globals::registry_get(&format!("pathlib.{name}")) != Some(class) {
+        return None;
+    }
+    if !keywords.is_empty() {
+        return Some(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name}() takes no keyword arguments"),
+        ));
+    }
+    // CPython checks the concrete filesystem flavour before touching the
+    // arguments: a WindowsPath on POSIX is never constructible.
+    if name == "WindowsPath" && !cfg!(windows) {
+        return Some(exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            "cannot instantiate 'WindowsPath' on your system",
+        ));
+    }
+    if name == "PosixPath" && cfg!(windows) {
+        return Some(exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            "cannot instantiate 'PosixPath' on your system",
+        ));
+    }
+    if args.len() > 1 {
+        return Some(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name}() expected at most 1 argument, got {}", args.len()),
+        ));
+    }
+    Some(pathlib_construct(name, args))
+}
+
 /// `pathlib.Path(path=None)`, `pathlib.cwd()` and `pathlib.home()`.
 ///
 /// A keyword call arrives with `None` in every omitted slot (the frontend
 /// fills the gaps), so `None` selects the documented default.
 fn pathlib_call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "Path" => {
-            let arg = args.first().copied().unwrap_or(NONE);
-            if arg == NONE {
-                return value::path_new(".".to_string());
-            }
-            if let Some(text) = value::as_str(arg) {
-                return value::path_new(text.to_string());
-            }
-            if let Some(state) = value::as_path(arg) {
-                return value::path_new(state.path().to_string());
-            }
-            exc::raise_with_message(
-                TYPE_ERROR,
-                &format!("Path() argument must be str, not {}", value::type_name(arg)),
-            )
-        }
+        "Path" => pathlib_construct("Path", args),
         "cwd" => match std::env::current_dir() {
             Ok(path) => value::path_new(path.to_string_lossy().into_owned()),
             Err(error) => exc::raise_with_message(OS_ERROR, &format!("cwd: {error}")),
@@ -4587,6 +5054,27 @@ fn pathlib_call(function: &str, args: &[i64]) -> i64 {
         }
         _ => missing_attribute("pathlib", function),
     }
+}
+
+/// Shared path value construction for `Path` and the pure-path classes.
+fn pathlib_construct(constructor: &str, args: &[i64]) -> i64 {
+    let arg = args.first().copied().unwrap_or(NONE);
+    if arg == NONE {
+        return value::path_new(".".to_string());
+    }
+    if let Some(text) = value::as_str(arg) {
+        return value::path_new(text.to_string());
+    }
+    if let Some(state) = value::as_path(arg) {
+        return value::path_new(state.path().to_string());
+    }
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "{constructor}() argument must be str, not {}",
+            value::type_name(arg)
+        ),
+    )
 }
 
 // platform
@@ -4850,6 +5338,23 @@ fn math_isclose(a: f64, b: f64, rel_tol: f64, abs_tol: f64) -> i64 {
     value::bool_value(diff <= (rel_tol * b).abs() || diff <= (rel_tol * a).abs() || diff <= abs_tol)
 }
 
+/// Exact floor square root by Newton's method. `x` starts at a power of two
+/// above `sqrt(n)` and strictly decreases until the fixed point is the floor.
+fn isqrt_bigint(n: &BigInt) -> BigInt {
+    if n.is_zero() {
+        return BigInt::zero();
+    }
+    let bits = n.bits();
+    let mut x = BigInt::one() << bits.div_ceil(2) as usize;
+    loop {
+        let next = (&x + n / &x) >> 1usize;
+        if next >= x {
+            return x;
+        }
+        x = next;
+    }
+}
+
 fn math_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "sqrt" => match number(args[0]) {
@@ -4938,6 +5443,38 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
             Ok(x) => value::float_new(x.abs()),
             Err(err) => err,
         },
+        // `copysign(x, y)`: x's magnitude (including a NaN payload) with y's
+        // sign bit. Both operands are converted to double exactly as CPython.
+        "copysign" => {
+            let x = match number(args[0]) {
+                Ok(x) => x,
+                Err(err) => return err,
+            };
+            let y = match number(args[1]) {
+                Ok(y) => y,
+                Err(err) => return err,
+            };
+            value::float_new(x.copysign(y))
+        }
+        // `isqrt(n)`: exact floor square root of a non-negative integer.
+        "isqrt" => {
+            let Some(n) = value::to_bigint(args[0]) else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        value::type_name(args[0])
+                    ),
+                );
+            };
+            if n.is_negative() {
+                return exc::raise_with_message(
+                    VALUE_ERROR,
+                    "isqrt() argument must be nonnegative",
+                );
+            }
+            value::bigint_new(isqrt_bigint(&n))
+        }
         "isfinite" | "isnan" => match classification_number(args[0]) {
             Ok(x) if function == "isfinite" => value::bool_value(x.is_finite()),
             Ok(x) => value::bool_value(x.is_nan()),
@@ -5186,8 +5723,137 @@ fn functools_call(function: &str, args: &[i64]) -> i64 {
         "lru_cache" => value::identity_function_new("lru_cache.<locals>.decorator"),
         "wraps" => functools::wraps_decorator(args[0], args.get(1).copied(), args.get(2).copied()),
         "partial" => value::partial_new(args[0], args[1..].to_vec()),
+        "cmp_to_key" => functools_cmp_to_key(args[0]),
+        // Native `KeyWrapper` methods (values carry these dotted names).
+        "_cmp_key_call" => cmp_key_call(args),
+        "_cmp_key_lt" => cmp_key_lt(args),
+        "_cmp_key_gt" => cmp_key_gt(args),
+        "_cmp_key_le" => cmp_key_le(args),
+        "_cmp_key_ge" => cmp_key_ge(args),
+        "_cmp_key_eq" => cmp_key_eq(args),
         _ => missing_attribute("functools", function),
     }
+}
+
+/// Cached `functools.KeyWrapper` class used by `cmp_to_key`.
+///
+/// A wrapper instance stores the comparison callable in `cmp`; calling it with
+/// a value produces a key instance that also carries `obj`. Every comparison
+/// operator calls the comparator with the two keys' `obj` values and tests the
+/// result against zero, exactly like CPython's old-style key class.
+fn cmp_key_class() -> i64 {
+    if let Some(cached) = globals::registry_get("functools.KeyWrapper") {
+        return cached;
+    }
+    let methods = [
+        ("__call__", "_cmp_key_call"),
+        ("__lt__", "_cmp_key_lt"),
+        ("__gt__", "_cmp_key_gt"),
+        ("__le__", "_cmp_key_le"),
+        ("__ge__", "_cmp_key_ge"),
+        ("__eq__", "_cmp_key_eq"),
+    ];
+    let mut entries = Vec::with_capacity(methods.len());
+    let mut values = Vec::with_capacity(methods.len());
+    for (name, native) in methods {
+        let function = value::native_function_new("functools", native, 2);
+        values.push(function);
+        entries.push((name.to_string(), function));
+    }
+    let roots = heap::root_values(&values);
+    let class = value::class_new("KeyWrapper".to_string(), NONE, entries);
+    let class_roots = heap::root_values(&[class]);
+    globals::registry_set("functools.KeyWrapper", class);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    class
+}
+
+/// `functools.cmp_to_key(mycmp)`: returns a callable wrapper for the
+/// comparison function.
+fn functools_cmp_to_key(comparator: i64) -> i64 {
+    let wrapper = value::instance_new(cmp_key_class());
+    let roots = heap::root_values(&[wrapper]);
+    value::instance_setattr(wrapper, "cmp".to_string(), comparator);
+    value::instance_setattr(wrapper, "obj".to_string(), NONE);
+    value::instance_setattr(wrapper, "is_key".to_string(), FALSE);
+    heap::release_roots(roots);
+    wrapper
+}
+
+/// `KeyWrapper.__call__(obj)`: builds a comparison key carrying `obj`.
+fn cmp_key_call(args: &[i64]) -> i64 {
+    let Some(&wrapper) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "KeyWrapper.__call__() requires self");
+    };
+    let Some(&obj) = args.get(1) else {
+        return exc::raise_with_message(TYPE_ERROR, "KeyWrapper.__call__() requires an argument");
+    };
+    let Some(comparator) = value::instance_attr(wrapper, "cmp") else {
+        return exc::raise_with_message(TYPE_ERROR, "KeyWrapper has no comparator");
+    };
+    // Use the wrapper's own class: a concurrent `globals::reset` may publish a
+    // fresh cached class, and keys must keep the methods their wrapper has.
+    let class = value::instance_class_value(wrapper).unwrap_or_else(cmp_key_class);
+    let key = value::instance_new(class);
+    let roots = heap::root_values(&[key, comparator, obj]);
+    value::instance_setattr(key, "cmp".to_string(), comparator);
+    value::instance_setattr(key, "obj".to_string(), obj);
+    value::instance_setattr(key, "is_key".to_string(), TRUE);
+    heap::release_roots(roots);
+    key
+}
+
+/// Shared body of the key comparison operators.
+///
+/// Any instance carrying `obj` (and using this path) compares through the
+/// left key's comparator, so a class rebuilt by a cache reset cannot turn the
+/// operation into `NotImplemented`.
+fn cmp_key_compare(args: &[i64], compare: u32) -> i64 {
+    let Some(&left) = args.first() else {
+        return value::NOT_IMPLEMENTED;
+    };
+    let other = args.get(1).copied().unwrap_or(NONE);
+    let (Some(left_obj), Some(comparator)) = (
+        value::instance_attr(left, "obj"),
+        value::instance_attr(left, "cmp"),
+    ) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    let Some(right_obj) = value::instance_attr(other, "obj") else {
+        return value::NOT_IMPLEMENTED;
+    };
+    let call_args = [left_obj, right_obj];
+    let result = crate::builtins::call(comparator, 2, call_args.as_ptr());
+    if exc::pending() {
+        return NONE;
+    }
+    let outcome = ops::binop(compare, result, encode_int(0));
+    if exc::pending() {
+        return NONE;
+    }
+    // The six operators must always produce a real bool (`True`/`False`).
+    value::bool_value(value::truthy(outcome))
+}
+
+fn cmp_key_lt(args: &[i64]) -> i64 {
+    cmp_key_compare(args, ops::OP_LT)
+}
+
+fn cmp_key_gt(args: &[i64]) -> i64 {
+    cmp_key_compare(args, ops::OP_GT)
+}
+
+fn cmp_key_le(args: &[i64]) -> i64 {
+    cmp_key_compare(args, ops::OP_LE)
+}
+
+fn cmp_key_ge(args: &[i64]) -> i64 {
+    cmp_key_compare(args, ops::OP_GE)
+}
+
+fn cmp_key_eq(args: &[i64]) -> i64 {
+    cmp_key_compare(args, ops::OP_EQ)
 }
 
 /// Keyword-aware `functools` dispatch: `partial` forwards names,
@@ -5316,6 +5982,70 @@ fn operator_index(a: i64) -> i64 {
     )
 }
 
+/// `operator._compare_digest(a, b)`: timing-safe equality for `str`, `bytes`
+/// and `bytearray`.
+///
+/// A length mismatch is `False` without comparing contents; the byte loop
+/// always reads every byte of the equal-length operands. `str` operands must
+/// be ASCII, exactly like CPython. Unsupported type combinations raise the
+/// same `TypeError` spellings `hmac.compare_digest` relies on.
+fn operator_compare_digest(a: i64, b: i64) -> i64 {
+    fn bytes_of(value_arg: i64) -> Option<&'static [u8]> {
+        if let Some(bytes) = value::as_bytes(value_arg) {
+            return Some(bytes);
+        }
+        value::as_bytearray(value_arg).map(Vec::as_slice)
+    }
+    fn ascii(text: &str) -> Option<&[u8]> {
+        let bytes = text.as_bytes();
+        bytes.iter().all(|byte| *byte < 0x80).then_some(bytes)
+    }
+    fn equal(left: &[u8], right: &[u8]) -> bool {
+        if left.len() != right.len() {
+            return false;
+        }
+        let mut difference = 0u8;
+        for (x, y) in left.iter().zip(right.iter()) {
+            difference |= x ^ y;
+        }
+        difference == 0
+    }
+    if let (Some(left), Some(right)) = (value::as_str(a), value::as_str(b)) {
+        let (Some(left), Some(right)) = (ascii(left), ascii(right)) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "comparing strings with non-ASCII characters is not supported",
+            );
+        };
+        return value::bool_value(equal(left, right));
+    }
+    match (bytes_of(a), bytes_of(b)) {
+        (Some(left), Some(right)) => value::bool_value(equal(left, right)),
+        (Some(_), None) => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "a bytes-like object is required, not '{}'",
+                value::type_name_of(b)
+            ),
+        ),
+        (None, Some(_)) => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "a bytes-like object is required, not '{}'",
+                value::type_name_of(a)
+            ),
+        ),
+        (None, None) => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "unsupported operand types(s) or combination of types: '{}' and '{}'",
+                value::type_name_of(a),
+                value::type_name_of(b)
+            ),
+        ),
+    }
+}
+
 fn operator_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "attrgetter" => {
@@ -5336,6 +6066,7 @@ fn operator_call(function: &str, args: &[i64]) -> i64 {
         }
         "itemgetter" => return value::item_getter_new(args.to_vec()),
         "index" => return operator_index(args[0]),
+        "_compare_digest" => return operator_compare_digest(args[0], args[1]),
         // The subscript protocols, exactly as the `[]` syntax performs them.
         "getitem" => return container::subscript(args[0], args[1]),
         "setitem" => return container::subscript_set(args[0], args[1], args[2]),
@@ -5410,12 +6141,712 @@ fn nanos_value(nanos: u128) -> i64 {
     value::bigint_new(BigInt::from(nanos))
 }
 
+/// Names of the nine sequence fields of `time.struct_time`.
+const STRUCT_TIME_FIELDS: [&str; 9] = [
+    "tm_year", "tm_mon", "tm_mday", "tm_hour", "tm_min", "tm_sec", "tm_wday", "tm_yday", "tm_isdst",
+];
+
+/// Cached `time.struct_time` class.
+///
+/// A `struct_time` instance stores its items as attributes in sequence order
+/// (the C `structseq` keeps the objects unchanged, so a sequence of floats or
+/// strings stays that way), plus `tm_zone`/`tm_gmtoff`. Indexing, iteration
+/// and length expose the first nine items only, matching CPython.
+fn time_struct_time_class() -> i64 {
+    if let Some(cached) = globals::registry_get("time.struct_time") {
+        return cached;
+    }
+    let functions = [
+        ("__init__", "_struct_time_init"),
+        ("__len__", "_struct_time_len"),
+        ("__getitem__", "_struct_time_getitem"),
+        ("__iter__", "_struct_time_iter"),
+        ("__repr__", "_struct_time_repr"),
+        ("__eq__", "_struct_time_eq"),
+    ];
+    let mut methods = Vec::with_capacity(functions.len());
+    let mut values = Vec::with_capacity(functions.len());
+    for (method, native) in functions {
+        let function = value::native_function_new("time", native, 2);
+        values.push(function);
+        methods.push((method.to_string(), function));
+    }
+    let roots = heap::root_values(&values);
+    let class = value::class_new("struct_time".to_string(), NONE, methods);
+    let class_roots = heap::root_values(&[class]);
+    value::class_set_attr(class, "n_fields".to_string(), encode_int(11));
+    value::class_set_attr(class, "n_sequence_fields".to_string(), encode_int(9));
+    value::class_set_attr(class, "n_unnamed_fields".to_string(), encode_int(0));
+    globals::registry_set("time.struct_time", class);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    class
+}
+
+/// Allocates a `struct_time` from the nine mandatory items plus the optional
+/// zone name and UTC offset.
+fn struct_time_new(items: &[i64], zone: i64, gmtoff: i64) -> i64 {
+    let class = time_struct_time_class();
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance]);
+    for (name, item) in STRUCT_TIME_FIELDS.iter().zip(items.iter()) {
+        value::instance_setattr(instance, (*name).to_string(), *item);
+    }
+    value::instance_setattr(instance, "tm_zone".to_string(), zone);
+    value::instance_setattr(instance, "tm_gmtoff".to_string(), gmtoff);
+    heap::release_roots(roots);
+    instance
+}
+
+/// Returns the nine sequence items of a `struct_time` instance.
+///
+/// The fields are read from the attribute table instead of comparing against
+/// the cached class: a concurrent module-registry reset may republish the
+/// class object, and identity must not decide whether a value is a struct_time.
+fn struct_time_fields(instance: i64) -> Option<[i64; 9]> {
+    value::as_instance(instance)?;
+    let mut fields = [NONE; 9];
+    for (slot, name) in fields.iter_mut().zip(STRUCT_TIME_FIELDS.iter()) {
+        *slot = value::instance_attr(instance, name)?;
+    }
+    Some(fields)
+}
+
+/// `struct_time.__init__(self, sequence)`: validates and stores the sequence.
+fn struct_time_init(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "structseq() missing self");
+    };
+    let Some(sequence) = args.get(1).copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "structseq() missing required argument 'sequence' (pos 1)",
+        );
+    };
+    let items: Vec<i64> = if let Some(items) = value::as_tuple(sequence) {
+        items.to_vec()
+    } else if let Some(items) = value::as_list(sequence) {
+        items.to_vec()
+    } else {
+        return exc::raise_with_message(TYPE_ERROR, "constructor requires a sequence");
+    };
+    if items.len() < 9 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "time.struct_time() takes an at least 9-sequence ({}-sequence given)",
+                items.len()
+            ),
+        );
+    }
+    if items.len() > 11 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "time.struct_time() takes an at most 11-sequence ({}-sequence given)",
+                items.len()
+            ),
+        );
+    }
+    let zone = items.get(9).copied().unwrap_or(NONE);
+    let gmtoff = items.get(10).copied().unwrap_or(NONE);
+    let roots = heap::root_values(&[instance, zone, gmtoff]);
+    for (name, item) in STRUCT_TIME_FIELDS.iter().zip(items.iter()) {
+        value::instance_setattr(instance, (*name).to_string(), *item);
+    }
+    value::instance_setattr(instance, "tm_zone".to_string(), zone);
+    value::instance_setattr(instance, "tm_gmtoff".to_string(), gmtoff);
+    heap::release_roots(roots);
+    NONE
+}
+
+/// `struct_time.__len__`: always nine sequence fields (the zone and offset are
+/// exposed as attributes only).
+fn struct_time_len(args: &[i64]) -> i64 {
+    let _ = args;
+    encode_int(9)
+}
+
+/// `struct_time.__getitem__`: indexes/slices the nine-item sequence.
+fn struct_time_getitem(args: &[i64]) -> i64 {
+    let Some(fields) = args.first().copied().and_then(struct_time_fields) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "descriptor '__getitem__' requires a struct_time",
+        );
+    };
+    let Some(&key) = args.get(1) else {
+        return exc::raise_with_message(TYPE_ERROR, "__getitem__() missing key");
+    };
+    let items = value::tuple_new(fields.to_vec());
+    container::subscript(items, key)
+}
+
+/// `struct_time.__iter__`: iterates the nine sequence fields.
+fn struct_time_iter(args: &[i64]) -> i64 {
+    let Some(fields) = args.first().copied().and_then(struct_time_fields) else {
+        return exc::raise_with_message(TYPE_ERROR, "descriptor '__iter__' requires a struct_time");
+    };
+    let items = value::tuple_new(fields.to_vec());
+    iter::iter_of(items)
+}
+
+/// `struct_time.__repr__`: CPython's `time.struct_time(...)` rendering.
+fn struct_time_repr(args: &[i64]) -> i64 {
+    let Some(fields) = args.first().copied().and_then(struct_time_fields) else {
+        return exc::raise_with_message(TYPE_ERROR, "descriptor '__repr__' requires a struct_time");
+    };
+    let mut text = String::from("time.struct_time(");
+    for (index, (name, item)) in STRUCT_TIME_FIELDS.iter().zip(fields.iter()).enumerate() {
+        if index > 0 {
+            text.push_str(", ");
+        }
+        text.push_str(name);
+        text.push('=');
+        text.push_str(&value::to_string(*item));
+    }
+    text.push(')');
+    value::str_alloc(text)
+}
+
+/// `struct_time.__eq__`: compares the nine sequence fields with another
+/// `struct_time` or a tuple/list of the same length.
+fn struct_time_eq(args: &[i64]) -> i64 {
+    let Some(left) = args.first().copied().and_then(struct_time_fields) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    let other = args.get(1).copied().unwrap_or(NONE);
+    if let Some(right) = struct_time_fields(other) {
+        for (a, b) in left.iter().zip(right.iter()) {
+            let equal = ops::binop(ops::OP_EQ, *a, *b);
+            if exc::pending() {
+                return NONE;
+            }
+            if !value::truthy(equal) {
+                return FALSE;
+            }
+        }
+        return TRUE;
+    }
+    let items = value::tuple_new(left.to_vec());
+    if value::as_tuple(other).is_none() && value::as_list(other).is_none() {
+        return value::NOT_IMPLEMENTED;
+    }
+    ops::binop(ops::OP_EQ, items, other)
+}
+
+/// Converts epoch `seconds` into a `libc::time_t`, mirroring CPython's
+/// `NaN`/out-of-range diagnostics.
+fn time_t_from_seconds(seconds: f64) -> Result<libc::time_t, i64> {
+    if seconds.is_nan() {
+        return Err(exc::raise_with_message(
+            VALUE_ERROR,
+            "Invalid value NaN (not a number)",
+        ));
+    }
+    let truncated = seconds.trunc();
+    let limit = if std::mem::size_of::<libc::time_t>() >= 8 {
+        i64::MAX as f64
+    } else {
+        i32::MAX as f64
+    };
+    if !truncated.is_finite() || truncated < -(limit) || truncated > limit {
+        return Err(exc::raise_with_message(
+            OVERFLOW_ERROR,
+            "timestamp out of range for platform time_t",
+        ));
+    }
+    Ok(truncated as libc::time_t)
+}
+
+/// Current epoch time as `time_t` (the `localtime()`/`gmtime()` default).
+fn current_time_t() -> libc::time_t {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs() as libc::time_t,
+        Err(error) => -(error.duration().as_secs() as libc::time_t),
+    }
+}
+
+/// `time.localtime([secs])`: the local broken-down time.
+fn time_localtime(args: &[i64]) -> i64 {
+    let seconds = match args.first().copied() {
+        None | Some(NONE) => current_time_t() as f64,
+        Some(argument) => match number(argument) {
+            Ok(seconds) => seconds,
+            Err(err) => return err,
+        },
+    };
+    let stamp = match time_t_from_seconds(seconds) {
+        Ok(stamp) => stamp,
+        Err(err) => return err,
+    };
+    #[cfg(unix)]
+    {
+        // SAFETY: `tm` is a plain C struct and `stamp` is a valid time_t;
+        // `localtime_r` fills the buffer.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&stamp, &mut tm) }.is_null() {
+            return exc::raise_with_message(OS_ERROR, "localtime: failed to convert the timestamp");
+        }
+        struct_time_from_tm(&tm)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = stamp;
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "time.localtime is not supported on this platform",
+        )
+    }
+}
+
+/// `time.gmtime([secs])`: the UTC broken-down time.
+fn time_gmtime(args: &[i64]) -> i64 {
+    let seconds = match args.first().copied() {
+        None | Some(NONE) => current_time_t() as f64,
+        Some(argument) => match number(argument) {
+            Ok(seconds) => seconds,
+            Err(err) => return err,
+        },
+    };
+    let stamp = match time_t_from_seconds(seconds) {
+        Ok(stamp) => stamp,
+        Err(err) => return err,
+    };
+    #[cfg(unix)]
+    {
+        // SAFETY: `tm` is a plain C struct and `stamp` is a valid time_t;
+        // `gmtime_r` fills the buffer.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::gmtime_r(&stamp, &mut tm) }.is_null() {
+            return exc::raise_with_message(OS_ERROR, "gmtime: failed to convert the timestamp");
+        }
+        struct_time_from_tm(&tm)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = stamp;
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "time.gmtime is not supported on this platform",
+        )
+    }
+}
+
+/// Converts a filled `libc::tm` into a `struct_time` instance.
+#[cfg(unix)]
+fn struct_time_from_tm(tm: &libc::tm) -> i64 {
+    let items = [
+        encode_int(i64::from(tm.tm_year) + 1900),
+        encode_int(i64::from(tm.tm_mon) + 1),
+        encode_int(i64::from(tm.tm_mday)),
+        encode_int(i64::from(tm.tm_hour)),
+        encode_int(i64::from(tm.tm_min)),
+        encode_int(i64::from(tm.tm_sec)),
+        encode_int(i64::from(tm.tm_wday)),
+        encode_int(i64::from(tm.tm_yday) + 1),
+        encode_int(i64::from(tm.tm_isdst)),
+    ];
+    let (zone, gmtoff) = tm_zone_and_offset(tm);
+    struct_time_new(&items, zone, gmtoff)
+}
+
+/// The `tm_zone`/`tm_gmtoff` extras of a `libc::tm`, where the platform
+/// provides them.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+fn tm_zone_and_offset(tm: &libc::tm) -> (i64, i64) {
+    let zone = if tm.tm_zone.is_null() {
+        NONE
+    } else {
+        // SAFETY: `tm_zone` is either null or a NUL-terminated C string owned
+        // by the timezone database.
+        value::str_from_bytes(unsafe { CStr::from_ptr(tm.tm_zone) }.to_bytes())
+    };
+    (zone, encode_int(tm.tm_gmtoff))
+}
+
+/// Platform without `tm_zone`/`tm_gmtoff`: the extra fields stay absent.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
+fn tm_zone_and_offset(tm: &libc::tm) -> (i64, i64) {
+    let _ = tm;
+    (NONE, NONE)
+}
+
+/// Builds a `libc::tm` from a `struct_time` or a 9-to-11 item tuple.
+#[cfg(unix)]
+fn tm_from_time_value(argument: i64) -> Result<(libc::tm, Option<CString>), i64> {
+    let fields: Vec<i64>;
+    let (zone, gmtoff);
+    if let Some(found) = struct_time_fields(argument) {
+        fields = found.to_vec();
+        zone = value::instance_attr(argument, "tm_zone").unwrap_or(NONE);
+        gmtoff = value::instance_attr(argument, "tm_gmtoff").unwrap_or(NONE);
+    } else if let Some(items) = value::as_tuple(argument) {
+        if !(9..=11).contains(&items.len()) {
+            return Err(exc::raise_with_message(
+                TYPE_ERROR,
+                "strftime(): illegal time tuple argument",
+            ));
+        }
+        fields = items.to_vec();
+        zone = items.get(9).copied().unwrap_or(NONE);
+        gmtoff = items.get(10).copied().unwrap_or(NONE);
+    } else {
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            "Tuple or struct_time argument required",
+        ));
+    }
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let mut values = [0i64; 9];
+    for (slot, field) in values.iter_mut().zip(fields.iter()) {
+        let Some(n) = value::as_integer(*field) else {
+            return Err(exc::raise_with_message(
+                TYPE_ERROR,
+                "strftime(): illegal time tuple argument",
+            ));
+        };
+        *slot = n;
+    }
+    let cast = |n: i64| n as libc::c_int;
+    tm.tm_year = cast(values[0] - 1900);
+    tm.tm_mon = cast(values[1] - 1);
+    tm.tm_mday = cast(values[2]);
+    tm.tm_hour = cast(values[3]);
+    tm.tm_min = cast(values[4]);
+    tm.tm_sec = cast(values[5]);
+    tm.tm_wday = cast(values[6]);
+    tm.tm_yday = cast(values[7] - 1);
+    tm.tm_isdst = cast(values[8]);
+    Ok((tm, set_tm_zone_and_offset(&mut tm, zone, gmtoff)))
+}
+
+/// Installs the zone name and UTC offset on a `libc::tm` where the platform
+/// exposes those fields; the returned `CString` must stay alive for the
+/// `strftime` call so `tm_zone` keeps pointing at valid storage.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+fn set_tm_zone_and_offset(tm: &mut libc::tm, zone: i64, gmtoff: i64) -> Option<CString> {
+    let mut storage = None;
+    if let Some(text) = value::as_str(zone) {
+        if let Ok(c_string) = CString::new(text) {
+            tm.tm_zone = c_string.as_ptr();
+            storage = Some(c_string);
+        }
+    }
+    if let Some(offset) = value::as_integer(gmtoff) {
+        tm.tm_gmtoff = offset as libc::c_long;
+    }
+    storage
+}
+
+/// Platform without `tm_zone`/`tm_gmtoff`: the extras are ignored.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))
+))]
+fn set_tm_zone_and_offset(tm: &mut libc::tm, zone: i64, gmtoff: i64) -> Option<CString> {
+    let _ = (tm, zone, gmtoff);
+    None
+}
+
+/// `time.strftime(format[, t])`: formats a broken-down time with the C library.
+fn time_strftime(format: i64, t: i64) -> i64 {
+    let Some(pattern) = value::as_str(format) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "strftime() argument 1 must be str, not {}",
+                value::type_name(format)
+            ),
+        );
+    };
+    if pattern.is_empty() {
+        return value::str_alloc(String::new());
+    }
+    #[cfg(unix)]
+    {
+        let (tm, _zone_storage) = if t == NONE {
+            let stamp = current_time_t();
+            // SAFETY: `tm` is a plain struct; `localtime_r` fills it.
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            if unsafe { libc::localtime_r(&stamp, &mut tm) }.is_null() {
+                return exc::raise_with_message(OS_ERROR, "strftime: localtime failed");
+            }
+            (tm, None)
+        } else {
+            match tm_from_time_value(t) {
+                Ok(found) => found,
+                Err(err) => return err,
+            }
+        };
+        let Ok(c_format) = CString::new(pattern) else {
+            return exc::raise_with_message(VALUE_ERROR, "embedded null character");
+        };
+        let mut size = 128usize;
+        loop {
+            let mut buffer = vec![0u8; size];
+            // SAFETY: `buffer` has `size` writable bytes; `c_format` and the
+            // struct fields are valid for the call, and `_zone_storage` keeps
+            // the `tm_zone` pointer alive.
+            let length = unsafe {
+                libc::strftime(
+                    buffer.as_mut_ptr() as *mut libc::c_char,
+                    size,
+                    c_format.as_ptr(),
+                    &tm,
+                )
+            };
+            if length > 0 {
+                return value::str_from_bytes(&buffer[..length]);
+            }
+            if size >= 1 << 20 {
+                return exc::raise_with_message(VALUE_ERROR, "strftime: invalid format string");
+            }
+            size *= 4;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = t;
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "time.strftime is not supported on this platform",
+        )
+    }
+}
+
+/// `time.process_time()`: consumed CPU time of the process, in seconds.
+fn time_process_time() -> i64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `timespec` is a plain struct; `clock_gettime` fills it.
+        let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+        if unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut time) } != 0 {
+            return os_error_from_io("process_time", std::io::Error::last_os_error(), None);
+        }
+        value::float_new(time.tv_sec as f64 + time.tv_nsec as f64 / 1_000_000_000.0)
+    }
+    #[cfg(not(unix))]
+    {
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "time.process_time is not supported on this platform",
+        )
+    }
+}
+
+/// Serialises reads of the C library's mutable timezone globals.
+///
+/// `tzname`/`daylight` are process-wide C globals that `tzset` rewrites, so a
+/// read must copy its strings while no concurrent `tzset` is running. The lock
+/// is never held while user code runs, and it is never taken from inside the
+/// collector.
+#[cfg(unix)]
+static TZ_LOCK: Mutex<()> = Mutex::new(());
+
+// The POSIX timezone symbols are not declared for every target by the `libc`
+// crate, so they are declared here with their C link names (no extra crate).
+#[cfg(unix)]
+unsafe extern "C" {
+    // `void tzset(void)`: reloads the timezone database.
+    #[link_name = "tzset"]
+    fn c_tzset();
+    // `char *tzname[2]`: the standard/daylight abbreviation pair.
+    #[link_name = "tzname"]
+    static mut C_TZNAME: [*mut libc::c_char; 2];
+    // `int daylight`: non-zero when the local timezone observes DST.
+    #[link_name = "daylight"]
+    static mut C_DAYLIGHT: libc::c_int;
+}
+
+/// `time.tzset()`: reloads the timezone database and updates `tzname`/
+/// `daylight` (which are read fresh on every attribute access).
+fn time_tzset() -> i64 {
+    #[cfg(unix)]
+    {
+        let _guard = TZ_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: `tzset` has no preconditions; the lock keeps concurrent
+        // readers from observing a half-updated table.
+        unsafe { c_tzset() };
+    }
+    NONE
+}
+
+/// `time.tzname`: the `(standard, daylight)` name pair.
+fn time_tzname() -> i64 {
+    #[cfg(unix)]
+    {
+        let _guard = TZ_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut values = Vec::with_capacity(2);
+        let mut roots = Vec::new();
+        // Copy the two-element pointer table out of the C static while the
+        // lock is held; `addr_of!` avoids forming a reference to `static mut`.
+        let pointers = unsafe { std::ptr::read(std::ptr::addr_of!(C_TZNAME)) };
+        for pointer in pointers {
+            let name = if pointer.is_null() {
+                String::new()
+            } else {
+                // SAFETY: a non-null entry is a NUL-terminated C string owned
+                // by the timezone database for the duration of the lock.
+                unsafe { CStr::from_ptr(pointer) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let item = value::str_alloc(name);
+            roots.push(heap::root_values(&[item]));
+            values.push(item);
+        }
+        let names = value::tuple_new(values);
+        for root in roots.into_iter().rev() {
+            heap::release_roots(root);
+        }
+        names
+    }
+    #[cfg(not(unix))]
+    {
+        value::tuple_new(vec![
+            value::str_alloc(String::new()),
+            value::str_alloc(String::new()),
+        ])
+    }
+}
+
+/// `time.daylight`: non-zero when the local timezone observes DST.
+fn time_daylight() -> i64 {
+    #[cfg(unix)]
+    {
+        let _guard = TZ_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: `daylight` is a C library global int read under the lock.
+        i64::from(unsafe { C_DAYLIGHT })
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// `time._STRUCT_TM_ITEMS`: the nine sequence field names, as a real list.
+fn time_struct_tm_items() -> i64 {
+    if let Some(cached) = globals::registry_get("time._STRUCT_TM_ITEMS") {
+        return cached;
+    }
+    let mut values = Vec::with_capacity(STRUCT_TIME_FIELDS.len());
+    let mut roots = Vec::with_capacity(STRUCT_TIME_FIELDS.len());
+    for name in STRUCT_TIME_FIELDS {
+        let item = value::str_from_bytes(name.as_bytes());
+        roots.push(heap::root_values(&[item]));
+        values.push(item);
+    }
+    let list = value::list_new(values);
+    globals::registry_set("time._STRUCT_TM_ITEMS", list);
+    for root in roots.into_iter().rev() {
+        heap::release_roots(root);
+    }
+    list
+}
+
+/// Keyword-aware `time` dispatch: `strftime` binds `format` and `t`.
+fn time_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    if function != "strftime" {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("time.{function}() does not accept keyword arguments"),
+        );
+    }
+    let mut format = args.first().copied();
+    let mut t = args.get(1).copied().unwrap_or(NONE);
+    let mut format_bound = format.is_some();
+    for (name, value) in keywords {
+        match name.as_str() {
+            "format" if !format_bound => {
+                format = Some(value);
+                format_bound = true;
+            }
+            "t" => t = value,
+            "format" => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "strftime() got multiple values for argument 'format'",
+                )
+            }
+            other => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("strftime() got an unexpected keyword argument '{other}'"),
+                )
+            }
+        }
+    }
+    match format {
+        Some(format) => time_strftime(format, t),
+        None => {
+            exc::raise_with_message(TYPE_ERROR, "strftime() missing required argument 'format'")
+        }
+    }
+}
+
 fn time_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "time" => value::float_new(wall_clock().as_secs_f64()),
         "perf_counter" | "monotonic" => value::float_new(monotonic_seconds()),
         "time_ns" => wall_clock_nanos(),
         "perf_counter_ns" | "monotonic_ns" => monotonic_nanos(),
+        "process_time" => time_process_time(),
+        "localtime" => time_localtime(args),
+        "gmtime" => time_gmtime(args),
+        "strftime" => time_strftime(args[0], args.get(1).copied().unwrap_or(NONE)),
+        "tzset" => time_tzset(),
+        "_struct_time_init" => struct_time_init(args),
+        "_struct_time_len" => struct_time_len(args),
+        "_struct_time_getitem" => struct_time_getitem(args),
+        "_struct_time_iter" => struct_time_iter(args),
+        "_struct_time_repr" => struct_time_repr(args),
+        "_struct_time_eq" => struct_time_eq(args),
         "sleep" => match number(args[0]) {
             Ok(seconds) => {
                 if seconds.is_nan() || seconds < 0.0 {
@@ -5504,6 +6935,8 @@ fn thread_call(function: &str, args: &[i64]) -> i64 {
         "join" => join_thread(args[0]),
         "get_ident" => encode_int(heap::current_thread_id()),
         "allocate_lock" => value::lock_new(),
+        // The reentrant lock is the same real object `threading.RLock` uses.
+        "RLock" => value::lock_new_reentrant(),
         _ => missing_attribute("_thread", function),
     }
 }
@@ -5519,11 +6952,15 @@ fn spawn_arity_error(function: i64, argc: usize) -> Option<String> {
         value::FunctionBody::Wrapper { .. } | value::FunctionBody::Host { .. } => (func.arity
             != argc)
             .then(|| format!("function takes {} arguments ({argc} given)", func.arity)),
+        // HNA functions store `min_args` in `arity`.
+        value::FunctionBody::Hna { .. } => (func.arity != argc)
+            .then(|| format!("function takes {} arguments ({argc} given)", func.arity)),
         // Getter and identity callables also have an exact arity; a partial
         // validates the combined argument list when it calls its target.
         value::FunctionBody::AttributeGetter { .. }
         | value::FunctionBody::ItemGetter { .. }
-        | value::FunctionBody::Identity => (func.arity != argc)
+        | value::FunctionBody::Identity
+        | value::FunctionBody::Exec { .. } => (func.arity != argc)
             .then(|| format!("function takes {} arguments ({argc} given)", func.arity)),
         value::FunctionBody::Partial { .. } | value::FunctionBody::BoundMethod { .. } => None,
         value::FunctionBody::Native { module, name } => {
@@ -5935,6 +7372,8 @@ fn threading_call(function: &str, args: &[i64]) -> i64 {
         "RLock" => value::lock_new_reentrant(),
         "Event" => value::event_new(),
         "get_ident" => encode_int(heap::current_thread_id()),
+        "current_thread" => threading_current_thread(),
+        "main_thread" => threading_thread_for_ident(1),
         "active_count" => encode_int(heap::active_threads() as i64),
         "_threadbase_init" => NONE,
         "_threadbase_run" => NONE,
@@ -5943,6 +7382,44 @@ fn threading_call(function: &str, args: &[i64]) -> i64 {
         "_threadbase_is_alive" => threadbase_is_alive(args),
         _ => missing_attribute("threading", function),
     }
+}
+
+/// Serialises creation of the per-ident `Thread` objects.
+static THREAD_OBJECTS_LOCK: Mutex<()> = Mutex::new(());
+
+/// Returns (creating on first use) the `Thread` object registered for `ident`.
+///
+/// The object is a real native `threading.Thread` (its `ident` attribute is
+/// the requested id) and is cached in the rooted module registry, so repeated
+/// `current_thread()` calls in one thread return the same object. The main
+/// thread (id 1) is named `MainThread`, worker placeholders `Thread-<id>`.
+/// Limitation: a `threading.Thread` object started by user code is not the
+/// same object as its worker's placeholder, because the native `start` path
+/// lives in `core::methods` and does not hand the object to the child.
+fn threading_thread_for_ident(ident: i64) -> i64 {
+    let key = format!("threading.thread.{ident}");
+    let _guard = THREAD_OBJECTS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(thread) = globals::registry_get(&key) {
+        return thread;
+    }
+    let name = if ident == 1 {
+        "MainThread".to_string()
+    } else {
+        format!("Thread-{ident}")
+    };
+    let thread = value::thread_new(NONE, Vec::new(), name);
+    if let Some(state) = value::as_thread(thread) {
+        state.id.store(ident, Ordering::Release);
+    }
+    globals::registry_set(&key, thread);
+    thread
+}
+
+/// `threading.current_thread()`: the `Thread` object for the running thread.
+fn threading_current_thread() -> i64 {
+    threading_thread_for_ident(heap::current_thread_id())
 }
 
 fn queue_call(function: &str, args: &[i64]) -> i64 {
@@ -6240,8 +7717,42 @@ fn pickle_call(function: &str, args: &[i64]) -> i64 {
             }
         }
         "load" => pickle_load(args),
+        "decode_long" => pickle_decode_long(args),
         _ => missing_attribute("pickle", function),
     }
+}
+
+/// `pickle.DEFAULT_PROTOCOL` for Hydro's HYD1 payloads.
+fn pickle_default_protocol() -> i64 {
+    5
+}
+
+/// `pickle.decode_long(data)`: little-endian two's-complement integer.
+fn pickle_decode_long(args: &[i64]) -> i64 {
+    let operand = args.first().copied().unwrap_or(NONE);
+    let bytes: Vec<u8> = if let Some(bytes) = value::as_bytes(operand) {
+        bytes.to_vec()
+    } else if let Some(bytes) = value::as_bytearray(operand) {
+        bytes.clone()
+    } else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "cannot convert '{}' object to bytes",
+                value::type_name(operand)
+            ),
+        );
+    };
+    if bytes.is_empty() {
+        return encode_int(0);
+    }
+    let unsigned = BigInt::from_bytes_le(Sign::Plus, &bytes);
+    let value = if bytes.last().is_some_and(|byte| byte & 0x80 != 0) {
+        unsigned - (BigInt::one() << (bytes.len() * 8))
+    } else {
+        unsigned
+    };
+    value::bigint_new(value)
 }
 
 // csv
@@ -7540,6 +9051,8 @@ fn os_path_call(function: &str, args: &[i64]) -> i64 {
         "splitdrive" => os_path_splitdrive(args[0]),
         "normcase" => os_path_normcase(args[0]),
         "realpath" => os_path_realpath(args[0], args.get(1).is_some_and(|v| value::truthy(*v))),
+        "expanduser" => os_path_expanduser(args[0]),
+        "islink" => os_path_islink(args[0]),
         _ => missing_attribute("os.path", function),
     }
 }
@@ -7850,6 +9363,371 @@ fn os_makedirs(args: &[i64]) -> i64 {
     }
 }
 
+/// `os.WNOHANG`: the `waitpid(2)` non-blocking flag.
+fn os_wnohang() -> i64 {
+    #[cfg(unix)]
+    {
+        libc::WNOHANG as i64
+    }
+    #[cfg(not(unix))]
+    {
+        1
+    }
+}
+
+/// `os.system(command)`: runs the command through the C library shell and
+/// returns the raw `system(3)` wait status (CPython returns the same value).
+///
+/// The operand goes through `os.fspath`, so `str`, `bytes` and path objects are
+/// accepted and a NUL raises `ValueError`.
+fn os_system(args: &[i64]) -> i64 {
+    let path = os_fspath(args[0]);
+    if failed() {
+        return NONE;
+    }
+    let command = if let Some(text) = value::as_str(path) {
+        text.as_bytes().to_vec()
+    } else if let Some(bytes) = value::as_bytes(path) {
+        bytes.to_vec()
+    } else {
+        return exc::raise_with_message(TYPE_ERROR, "system() argument must be a path string");
+    };
+    let Ok(command) = CString::new(command) else {
+        return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+    };
+    #[cfg(unix)]
+    {
+        // SAFETY: `command` is NUL-terminated and `system(3)` copies nothing
+        // from it after it returns.
+        let status = unsafe { libc::system(command.as_ptr()) };
+        encode_int(i64::from(status))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "os.system is not supported on this platform",
+        )
+    }
+}
+
+/// Encodes a filename as the filesystem representation (`os.fsencode`).
+///
+/// Hydro's filesystem encoding is UTF-8 and every runtime string is a valid
+/// Unicode scalar sequence, so the encoding is the plain UTF-8 form. The
+/// `surrogateescape` half is unreachable because the runtime string type
+/// cannot hold lone surrogates (documented limit: an undecodable byte sequence
+/// cannot be represented after a decode).
+fn os_fsencode(args: &[i64]) -> i64 {
+    let path = os_fspath(args[0]);
+    if failed() {
+        return NONE;
+    }
+    if let Some(bytes) = value::as_bytes(path) {
+        return value::bytes_new(bytes.to_vec());
+    }
+    if let Some(text) = value::as_str(path) {
+        return value::bytes_new(text.as_bytes().to_vec());
+    }
+    exc::raise_with_message(TYPE_ERROR, "fsencode() argument must be a path string")
+}
+
+/// Decodes a filename from the filesystem representation (`os.fsdecode`).
+///
+/// `str` operands pass through unchanged, exactly like CPython. Because the
+/// runtime string type cannot hold the lone surrogates `surrogateescape`
+/// would produce, an invalid UTF-8 operand raises `UnicodeDecodeError`
+/// instead of silently substituting replacement characters.
+fn os_fsdecode(args: &[i64]) -> i64 {
+    let path = os_fspath(args[0]);
+    if failed() {
+        return NONE;
+    }
+    if let Some(text) = value::as_str(path) {
+        return value::str_alloc(text.to_string());
+    }
+    let Some(bytes) = value::as_bytes(path) else {
+        return exc::raise_with_message(TYPE_ERROR, "fsdecode() argument must be a path string");
+    };
+    match std::str::from_utf8(bytes) {
+        Ok(text) => value::str_alloc(text.to_string()),
+        Err(error) => {
+            let position = error.valid_up_to();
+            let byte = bytes.get(position).copied().unwrap_or(0);
+            exc::raise_with_message(
+                exc::UNICODE_DECODE_ERROR,
+                &format!(
+                    "'utf-8' codec can't decode byte 0x{byte:02x} in position {position}: \
+                     invalid data (surrogateescape output cannot be represented)"
+                ),
+            )
+        }
+    }
+}
+
+/// `os.getuid`/`geteuid`/`getgid`/`getegid`: the process credentials.
+fn os_credential(function: &str) -> i64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: these libc calls take no arguments and cannot fail.
+        let id = unsafe {
+            match function {
+                "getuid" => libc::getuid(),
+                "geteuid" => libc::geteuid(),
+                "getgid" => libc::getgid(),
+                _ => libc::getegid(),
+            }
+        };
+        encode_int(i64::from(id))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = function;
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "process credentials are not available on this platform",
+        )
+    }
+}
+
+/// Decodes a file-descriptor argument, matching CPython's conversion errors.
+fn os_fd_argument(argument: i64) -> Result<libc::c_int, i64> {
+    let Some(fd) = value::as_integer(argument) else {
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(argument)
+            ),
+        ));
+    };
+    i32::try_from(fd).map_err(|_| {
+        exc::raise_with_message(OVERFLOW_ERROR, "Python int too large to convert to C int")
+    })
+}
+
+/// `os.close(fd)`: closes the descriptor; an invalid descriptor raises
+/// `OSError(EBADF)`.
+fn os_close(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    #[cfg(unix)]
+    {
+        // SAFETY: the kernel validates the descriptor and reports EBADF.
+        if unsafe { libc::close(fd) } != 0 {
+            return os_error_from_io("close", std::io::Error::last_os_error(), None);
+        }
+        NONE
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "os.close is not supported on this platform",
+        )
+    }
+}
+
+/// `os.fstat(fd)`: metadata of an open descriptor, shaped exactly like
+/// `os.stat`'s `stat_result`.
+fn os_fstat(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    #[cfg(unix)]
+    {
+        // SAFETY: `stat` is a plain C struct; `fstat` fills it in and the
+        // kernel validates `fd`.
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut metadata) } != 0 {
+            return os_error_from_io("fstat", std::io::Error::last_os_error(), None);
+        }
+        stat_result_from_libc(&metadata)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "os.fstat is not supported on this platform",
+        )
+    }
+}
+
+/// Builds the `stat_result` namespace from a raw `struct stat`. The field set
+/// matches [`stat_result`] so `os.stat` and `os.fstat` agree.
+#[cfg(unix)]
+fn stat_result_from_libc(metadata: &libc::stat) -> i64 {
+    let seconds_from_nanos = |nanos: i128| value::float_new(nanos as f64 / 1_000_000_000.0);
+    let (atime_ns, mtime_ns, ctime_ns) = stat_nanoseconds(metadata);
+    let namespace = value::namespace_new(Vec::new());
+    let roots = crate::heap::root_values(&[namespace]);
+    stat_field(namespace, "st_mode", stat_int(i128::from(metadata.st_mode)));
+    stat_field(namespace, "st_ino", stat_int(i128::from(metadata.st_ino)));
+    stat_field(namespace, "st_dev", stat_int(i128::from(metadata.st_dev)));
+    stat_field(
+        namespace,
+        "st_nlink",
+        stat_int(i128::from(metadata.st_nlink)),
+    );
+    stat_field(namespace, "st_uid", stat_int(i128::from(metadata.st_uid)));
+    stat_field(namespace, "st_gid", stat_int(i128::from(metadata.st_gid)));
+    stat_field(namespace, "st_size", stat_int(i128::from(metadata.st_size)));
+    stat_field(namespace, "st_atime", seconds_from_nanos(atime_ns));
+    stat_field(namespace, "st_mtime", seconds_from_nanos(mtime_ns));
+    stat_field(namespace, "st_ctime", seconds_from_nanos(ctime_ns));
+    stat_field(namespace, "st_atime_ns", stat_int(atime_ns));
+    stat_field(namespace, "st_mtime_ns", stat_int(mtime_ns));
+    stat_field(namespace, "st_ctime_ns", stat_int(ctime_ns));
+    stat_field(namespace, "st_rdev", stat_int(i128::from(metadata.st_rdev)));
+    stat_field(
+        namespace,
+        "st_blksize",
+        stat_int(i128::from(metadata.st_blksize)),
+    );
+    stat_field(
+        namespace,
+        "st_blocks",
+        stat_int(i128::from(metadata.st_blocks)),
+    );
+    crate::heap::release_roots(roots);
+    namespace
+}
+
+/// Seconds and nanosecond aliases of a raw `struct stat`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn stat_nanoseconds(metadata: &libc::stat) -> (i128, i128, i128) {
+    let atime = i128::from(metadata.st_atime) * 1_000_000_000 + i128::from(metadata.st_atime_nsec);
+    let mtime = i128::from(metadata.st_mtime) * 1_000_000_000 + i128::from(metadata.st_mtime_nsec);
+    let ctime = i128::from(metadata.st_ctime) * 1_000_000_000 + i128::from(metadata.st_ctime_nsec);
+    (atime, mtime, ctime)
+}
+
+/// Seconds and nanosecond aliases for Unix platforms whose `struct stat`
+/// exposes the second fields but not the `*_nsec` aliases.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn stat_nanoseconds(metadata: &libc::stat) -> (i128, i128, i128) {
+    (
+        i128::from(metadata.st_atime) * 1_000_000_000,
+        i128::from(metadata.st_mtime) * 1_000_000_000,
+        i128::from(metadata.st_ctime) * 1_000_000_000,
+    )
+}
+
+/// `os.path.expanduser(path)`: expands a leading `~` or `~user`.
+///
+/// `~` uses `$HOME`, falling back to the password database; `~user` always
+/// uses the password database. An unknown user, a missing home directory or a
+/// path that does not start with `~` is returned unchanged, like
+/// `posixpath.expanduser`.
+fn os_path_expanduser(arg: i64) -> i64 {
+    let Some(path) = os_path_arg("expanduser", arg) else {
+        return NONE;
+    };
+    if !path.starts_with('~') {
+        return value::str_alloc(path.to_string());
+    }
+    let separator = std::path::MAIN_SEPARATOR;
+    let (prefix, rest) = match path.find(separator) {
+        Some(index) => (&path[..index], &path[index..]),
+        None => (path, ""),
+    };
+    let home = if prefix == "~" {
+        home_directory()
+    } else {
+        user_home_directory(&prefix[1..])
+    };
+    match home {
+        Some(home) => {
+            let mut expanded = home;
+            expanded.push_str(rest);
+            value::str_alloc(expanded)
+        }
+        None => value::str_alloc(path.to_string()),
+    }
+}
+
+/// Home directory of the current user: `$HOME` when set (even empty), else
+/// the password database entry for `getuid()`.
+fn home_directory() -> Option<String> {
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(home.to_string_lossy().into_owned());
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: `getpwuid` returns a pointer into static storage that stays
+        // valid until the next passwd call; it is read immediately.
+        let entry = unsafe { libc::getpwuid(libc::getuid()) };
+        if entry.is_null() {
+            return None;
+        }
+        // SAFETY: `entry` is non-null and `pw_dir` is either NUL or a
+        // NUL-terminated string owned by the passwd entry.
+        let directory = unsafe { (*entry).pw_dir };
+        if directory.is_null() {
+            return None;
+        }
+        // SAFETY: `directory` is a valid NUL-terminated C string.
+        Some(
+            unsafe { CStr::from_ptr(directory) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Home directory of `user`, or `None` when the account does not exist.
+fn user_home_directory(user: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let name = CString::new(user).ok()?;
+        // SAFETY: `getpwnam` returns a pointer into static storage that stays
+        // valid until the next passwd call; it is read immediately.
+        let entry = unsafe { libc::getpwnam(name.as_ptr()) };
+        if entry.is_null() {
+            return None;
+        }
+        // SAFETY: `entry` is non-null and `pw_dir` is either NUL or a
+        // NUL-terminated string owned by the passwd entry.
+        let directory = unsafe { (*entry).pw_dir };
+        if directory.is_null() {
+            return None;
+        }
+        // SAFETY: `directory` is a valid NUL-terminated C string.
+        Some(
+            unsafe { CStr::from_ptr(directory) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = user;
+        None
+    }
+}
+
+/// `os.path.islink(path)`: whether the final component is a symbolic link.
+/// Missing paths and inaccessible parents report `False`, never an exception.
+fn os_path_islink(arg: i64) -> i64 {
+    let Some(path) = os_path_arg("islink", arg) else {
+        return NONE;
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => value::bool_value(metadata.file_type().is_symlink()),
+        Err(_) => FALSE,
+    }
+}
+
 /// Keyword-aware `os` dispatch. Only `os.listdir` declares dynamic keywords;
 /// its single `path` parameter has already been moved into the positional
 /// slot by the binder, so any remaining name is unknown.
@@ -7996,6 +9874,15 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "unsetenv" => os_unsetenv(args),
         "listdir" => os_listdir(args),
         "makedirs" => os_makedirs(args),
+        "system" => os_system(args),
+        "fsencode" => os_fsencode(args),
+        "fsdecode" => os_fsdecode(args),
+        "getuid" => os_credential("getuid"),
+        "geteuid" => os_credential("geteuid"),
+        "getgid" => os_credential("getgid"),
+        "getegid" => os_credential("getegid"),
+        "close" => os_close(args),
+        "fstat" => os_fstat(args),
         _ => missing_attribute("os", function),
     }
 }
@@ -8689,10 +10576,443 @@ fn sys_call(function: &str, args: &[i64]) -> i64 {
         "_getframemodulename" => sys::getframemodulename(args),
         "_getframe" => sys::getframe(args),
         "getdefaultencoding" | "getfilesystemencoding" => value::str_from_bytes(b"utf-8"),
+        "getfilesystemencodeerrors" => value::str_from_bytes(b"surrogateescape"),
+        // Hydro's int↔str conversions are unbounded, which CPython spells as
+        // `0` ("no limit") from `get_int_max_str_digits`.
+        "get_int_max_str_digits" => encode_int(0),
+        "audit" => sys_audit(args),
+        "addaudithook" => sys_addaudithook(args),
+        "_monitoring_register_callback" => sys_monitoring_register_callback(args),
+        "_monitoring_use_tool_id" => sys_monitoring_use_tool_id(args),
+        "_monitoring_free_tool_id" => sys_monitoring_tool_id_clear(args, true),
+        "_monitoring_clear_tool_id" => sys_monitoring_tool_id_clear(args, false),
+        "_monitoring_get_tool" => sys_monitoring_get_tool(args),
+        "_monitoring_set_events" => sys_monitoring_set_events(args),
+        "_monitoring_get_events" => sys_monitoring_get_events(args),
+        "_monitoring_set_local_events" => sys_monitoring_set_local_events(args),
+        "_monitoring_get_local_events" => sys_monitoring_get_local_events(args),
+        "_monitoring_restart_events" => {
+            // No instrumentation exists to restart; the call is a documented
+            // no-op rather than a fabricated event stream.
+            NONE
+        }
         "getswitchinterval" => value::float_new(0.005),
         "setswitchinterval" => NONE,
         _ => missing_attribute("sys", function),
     }
+}
+
+/// Registry key holding the process-wide audit hook tuple.
+const AUDIT_HOOKS_KEY: &str = "sys.audit.hooks";
+
+/// Serialises `sys.addaudithook` publication. The stored hook tuple is
+/// immutable, so readers only need the registry lock; this mutex keeps two
+/// concurrent registrations from losing one hook.
+static AUDIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Snapshot of the registered audit hooks, in registration order.
+fn audit_hooks() -> Vec<i64> {
+    globals::registry_get(AUDIT_HOOKS_KEY)
+        .and_then(value::as_tuple)
+        .map(|hooks| hooks.to_vec())
+        .unwrap_or_default()
+}
+
+/// `sys.addaudithook(hook)`: appends a callable to the process-wide hook list.
+fn sys_addaudithook(args: &[i64]) -> i64 {
+    let hook = args.first().copied().unwrap_or(NONE);
+    let _guard = AUDIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut hooks = audit_hooks();
+    hooks.push(hook);
+    let roots = crate::heap::root_values(&hooks);
+    let stored = value::tuple_new(hooks);
+    globals::registry_set(AUDIT_HOOKS_KEY, stored);
+    crate::heap::release_roots(roots);
+    NONE
+}
+
+/// `sys.audit(event, *args)`: calls every hook with `(event, args_tuple)`.
+/// A hook exception propagates to the caller, like CPython.
+fn sys_audit(args: &[i64]) -> i64 {
+    let event = args.first().copied().unwrap_or(NONE);
+    if value::as_str(event).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "audit() argument 1 must be str, not {}",
+                value::type_name(event)
+            ),
+        );
+    }
+    let hooks = audit_hooks();
+    if hooks.is_empty() {
+        return NONE;
+    }
+    let arguments = value::tuple_new(args[1..].to_vec());
+    let roots = crate::heap::root_values(&[event, arguments]);
+    for hook in hooks {
+        let call_args = [event, arguments];
+        let _ = crate::builtins::call(hook, 2, call_args.as_ptr());
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
+    }
+    crate::heap::release_roots(roots);
+    NONE
+}
+
+/// `sys.flags`: a cached namespace carrying every CPython 3.14 flag field.
+///
+/// Hydro has no interpreter command line, so every flag keeps its default;
+/// `hash_randomization` and `gil` are `0` because string hashing is
+/// deterministic and there is no GIL. `int_max_str_digits` is `0` because the
+/// runtime's int conversions are unbounded.
+fn sys_flags() -> i64 {
+    if let Some(cached) = globals::registry_get("sys.flags") {
+        return cached;
+    }
+    let pairs = vec![
+        ("debug".to_string(), encode_int(0)),
+        ("inspect".to_string(), encode_int(0)),
+        ("interactive".to_string(), encode_int(0)),
+        ("optimize".to_string(), encode_int(0)),
+        ("dont_write_bytecode".to_string(), encode_int(0)),
+        ("no_user_site".to_string(), encode_int(0)),
+        ("no_site".to_string(), encode_int(0)),
+        ("ignore_environment".to_string(), encode_int(0)),
+        ("verbose".to_string(), encode_int(0)),
+        ("bytes_warning".to_string(), encode_int(0)),
+        ("quiet".to_string(), encode_int(0)),
+        ("hash_randomization".to_string(), encode_int(0)),
+        ("isolated".to_string(), encode_int(0)),
+        ("dev_mode".to_string(), FALSE),
+        ("utf8_mode".to_string(), encode_int(0)),
+        ("warn_default_encoding".to_string(), encode_int(0)),
+        ("safe_path".to_string(), FALSE),
+        ("int_max_str_digits".to_string(), encode_int(0)),
+        ("gil".to_string(), encode_int(0)),
+        ("thread_inherit_context".to_string(), encode_int(0)),
+        ("context_aware_warnings".to_string(), encode_int(0)),
+        ("n_fields".to_string(), encode_int(21)),
+        ("n_sequence_fields".to_string(), encode_int(18)),
+        ("n_unnamed_fields".to_string(), encode_int(0)),
+    ];
+    let flags = value::namespace_new(pairs);
+    globals::registry_set("sys.flags", flags);
+    flags
+}
+
+/// `sys.monitoring`: the cached tool registry.
+///
+/// Hydro does not instrument bytecode, so no monitoring event is ever
+/// delivered. The namespace still exposes the real constants (`events`,
+/// `DISABLE`, `MISSING`, the tool ids) and a working callback/tool registry so
+/// importers such as `bdb` can be constructed; this limitation is deliberate
+/// and documented rather than simulated with fake events.
+fn sys_monitoring() -> i64 {
+    if let Some(cached) = globals::registry_get("sys.monitoring") {
+        return cached;
+    }
+    let events = sys_monitoring_events();
+    let disable = monitoring_sentinel("sys.monitoring.DISABLE");
+    let missing = monitoring_sentinel("sys.monitoring.MISSING");
+    let functions = [
+        "_monitoring_register_callback",
+        "_monitoring_use_tool_id",
+        "_monitoring_free_tool_id",
+        "_monitoring_clear_tool_id",
+        "_monitoring_get_tool",
+        "_monitoring_set_events",
+        "_monitoring_get_events",
+        "_monitoring_set_local_events",
+        "_monitoring_get_local_events",
+        "_monitoring_restart_events",
+    ];
+    let names = [
+        "register_callback",
+        "use_tool_id",
+        "free_tool_id",
+        "clear_tool_id",
+        "get_tool",
+        "set_events",
+        "get_events",
+        "set_local_events",
+        "get_local_events",
+        "restart_events",
+    ];
+    let arities = [3, 2, 1, 1, 1, 2, 1, 3, 2, 0];
+    let mut function_values = Vec::with_capacity(functions.len());
+    for (index, native) in functions.iter().enumerate() {
+        function_values.push(value::native_function_new("sys", native, arities[index]));
+    }
+    let roots = crate::heap::root_values(&[events, disable, missing]);
+    let function_roots = crate::heap::root_values(&function_values);
+    let mut pairs = vec![
+        ("events".to_string(), events),
+        ("DISABLE".to_string(), disable),
+        ("MISSING".to_string(), missing),
+        ("DEBUGGER_ID".to_string(), encode_int(0)),
+        ("COVERAGE_ID".to_string(), encode_int(1)),
+        ("PROFILER_ID".to_string(), encode_int(2)),
+        ("OPTIMIZER_ID".to_string(), encode_int(5)),
+    ];
+    for (name, function) in names.iter().zip(function_values.iter()) {
+        pairs.push(((*name).to_string(), *function));
+    }
+    let monitoring = value::namespace_new(pairs);
+    globals::registry_set("sys.monitoring", monitoring);
+    crate::heap::release_roots(function_roots);
+    crate::heap::release_roots(roots);
+    monitoring
+}
+
+/// `sys.monitoring.events`: the event-bit namespace.
+fn sys_monitoring_events() -> i64 {
+    if let Some(cached) = globals::registry_get("sys.monitoring.events") {
+        return cached;
+    }
+    let events = value::namespace_new(vec![
+        ("NO_EVENTS".to_string(), encode_int(0)),
+        ("PY_START".to_string(), encode_int(1)),
+        ("PY_RESUME".to_string(), encode_int(2)),
+        ("PY_RETURN".to_string(), encode_int(4)),
+        ("PY_YIELD".to_string(), encode_int(8)),
+        ("CALL".to_string(), encode_int(16)),
+        ("LINE".to_string(), encode_int(32)),
+        ("INSTRUCTION".to_string(), encode_int(64)),
+        ("JUMP".to_string(), encode_int(128)),
+        ("BRANCH_LEFT".to_string(), encode_int(256)),
+        ("BRANCH_RIGHT".to_string(), encode_int(512)),
+        ("STOP_ITERATION".to_string(), encode_int(1024)),
+        ("RAISE".to_string(), encode_int(2048)),
+        ("EXCEPTION_HANDLED".to_string(), encode_int(4096)),
+        ("PY_UNWIND".to_string(), encode_int(8192)),
+        ("PY_THROW".to_string(), encode_int(16384)),
+        ("RERAISE".to_string(), encode_int(32768)),
+        ("C_RETURN".to_string(), encode_int(65536)),
+        ("C_RAISE".to_string(), encode_int(131072)),
+        ("BRANCH".to_string(), encode_int(262144)),
+    ]);
+    globals::registry_set("sys.monitoring.events", events);
+    events
+}
+
+/// A cached unique sentinel object for `sys.monitoring.DISABLE`/`MISSING`.
+fn monitoring_sentinel(key: &str) -> i64 {
+    if let Some(cached) = globals::registry_get(key) {
+        return cached;
+    }
+    let class = if let Some(class) = globals::registry_get("sys.monitoring.sentinel_class") {
+        class
+    } else {
+        let class = value::class_new("_monitoring_sentinel".to_string(), NONE, Vec::new());
+        globals::registry_set("sys.monitoring.sentinel_class", class);
+        class
+    };
+    let sentinel = value::instance_new(class);
+    globals::registry_set(key, sentinel);
+    sentinel
+}
+
+/// Validates a `sys.monitoring` tool id (CPython's range is 0..=5).
+fn monitoring_tool_id(argument: i64) -> Result<i64, i64> {
+    let Some(id) = value::as_integer(argument) else {
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(argument)
+            ),
+        ));
+    };
+    if !(0..=5).contains(&id) {
+        return Err(exc::raise_with_message(
+            VALUE_ERROR,
+            &format!("invalid tool {id} (must be between 0 and 5)"),
+        ));
+    }
+    Ok(id)
+}
+
+fn monitoring_tool_key(id: i64) -> String {
+    format!("sys.monitoring.tool.{id}")
+}
+
+/// `sys.monitoring.use_tool_id(tool_id, name)`.
+fn sys_monitoring_use_tool_id(args: &[i64]) -> i64 {
+    let id = match monitoring_tool_id(args[0]) {
+        Ok(id) => id,
+        Err(err) => return err,
+    };
+    if value::as_str(args[1]).is_none() {
+        return exc::raise_with_message(VALUE_ERROR, "tool name must be a str");
+    }
+    let key = monitoring_tool_key(id);
+    if let Some(name) = globals::registry_get(&key) {
+        if name != NONE {
+            return exc::raise_with_message(VALUE_ERROR, &format!("tool {id} is already in use"));
+        }
+    }
+    globals::registry_set(&key, args[1]);
+    NONE
+}
+
+/// `sys.monitoring.clear_tool_id(tool_id)` (keeps the name) and
+/// `free_tool_id(tool_id)` (also releases the name).
+///
+/// The callback slots are reset to `None`; because the per-event keys are
+/// process-wide registry entries they are overwritten rather than removed.
+fn sys_monitoring_tool_id_clear(args: &[i64], free: bool) -> i64 {
+    let id = match monitoring_tool_id(args[0]) {
+        Ok(id) => id,
+        Err(err) => return err,
+    };
+    for event in MONITORING_EVENTS {
+        globals::registry_set(&format!("sys.monitoring.callback.{id}.{event}"), NONE);
+    }
+    if free {
+        globals::registry_set(&monitoring_tool_key(id), NONE);
+    }
+    NONE
+}
+
+/// The single-event bits accepted by `register_callback`.
+const MONITORING_EVENTS: [i64; 19] = [
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072,
+    262144,
+];
+
+/// `sys.monitoring.get_tool(tool_id)`: the registered tool name or `None`.
+fn sys_monitoring_get_tool(args: &[i64]) -> i64 {
+    let id = match monitoring_tool_id(args[0]) {
+        Ok(id) => id,
+        Err(err) => return err,
+    };
+    globals::registry_get(&monitoring_tool_key(id)).unwrap_or(NONE)
+}
+
+/// `sys.monitoring.register_callback(tool_id, event, callback)`.
+///
+/// Returns the previous callback (or `None`) and stores `callback`; `None`
+/// clears the slot. No event is ever delivered (see [`sys_monitoring`]).
+fn sys_monitoring_register_callback(args: &[i64]) -> i64 {
+    let id = match monitoring_tool_id(args[0]) {
+        Ok(id) => id,
+        Err(err) => return err,
+    };
+    let Some(event) = value::as_integer(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    if event.count_ones() != 1 || !MONITORING_EVENTS.contains(&event) {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "The callback can only be set for one event at a time",
+        );
+    }
+    let key = format!("sys.monitoring.callback.{id}.{event}");
+    let previous = globals::registry_get(&key).unwrap_or(NONE);
+    globals::registry_set(&key, args[2]);
+    previous
+}
+
+/// `sys.monitoring.set_events(tool_id, event_set)`: records the mask for
+/// observation; no instrumentation is installed.
+fn sys_monitoring_set_events(args: &[i64]) -> i64 {
+    let id = match monitoring_tool_id(args[0]) {
+        Ok(id) => id,
+        Err(err) => return err,
+    };
+    let Some(mask) = value::as_integer(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    globals::registry_set(&format!("sys.monitoring.events.{id}"), encode_int(mask));
+    NONE
+}
+
+/// `sys.monitoring.get_events(tool_id)`: the last stored mask, defaulting to 0.
+fn sys_monitoring_get_events(args: &[i64]) -> i64 {
+    let id = match monitoring_tool_id(args[0]) {
+        Ok(id) => id,
+        Err(err) => return err,
+    };
+    globals::registry_get(&format!("sys.monitoring.events.{id}")).unwrap_or_else(|| encode_int(0))
+}
+
+/// `sys.monitoring.set_local_events(tool_id, code, event_set)`: accepted and
+/// stored by identity only; no instrumentation is installed.
+fn sys_monitoring_set_local_events(args: &[i64]) -> i64 {
+    if let Err(err) = monitoring_tool_id(args[0]) {
+        return err;
+    }
+    let Some(mask) = value::as_integer(args[2]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(args[2])
+            ),
+        );
+    };
+    globals::registry_set(
+        &format!("sys.monitoring.local_events.{}", args[1]),
+        encode_int(mask),
+    );
+    NONE
+}
+
+/// `sys.monitoring.get_local_events(tool_id, code)`: 0, because local masks do
+/// not drive any instrumentation here.
+fn sys_monitoring_get_local_events(args: &[i64]) -> i64 {
+    if let Err(err) = monitoring_tool_id(args[0]) {
+        return err;
+    }
+    encode_int(0)
+}
+
+/// `sys.meta_path`: a cached list of the real finder classes Hydro implements.
+///
+/// The list is mutable (as in CPython) but the native importer never consults
+/// it, so appending a finder does not change imports. Hydro's runtime importer
+/// is native and exposes no `PathFinder` class, so the initial list holds the
+/// two real finders it does implement.
+fn sys_meta_path() -> i64 {
+    if let Some(cached) = globals::registry_get("sys.meta_path") {
+        return cached;
+    }
+    let builtin = importlib_machinery::constant("BuiltinImporter");
+    let frozen = importlib_machinery::constant("FrozenImporter");
+    // Do not consult a possibly pre-existing pending exception here: the two
+    // class lookups succeed or leave their own failure pending. Only a real
+    // missing finder class aborts construction.
+    if value::as_class(builtin).is_none() || value::as_class(frozen).is_none() {
+        if exc::pending() {
+            return NONE;
+        }
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "sys.meta_path: importer classes are unavailable",
+        );
+    }
+    let roots = crate::heap::root_values(&[builtin, frozen]);
+    let meta_path = value::list_new(vec![builtin, frozen]);
+    globals::registry_set("sys.meta_path", meta_path);
+    crate::heap::release_roots(roots);
+    meta_path
 }
 
 /// CPython's default recursion limit.
@@ -8801,8 +11121,92 @@ fn io_call(function: &str, args: &[i64]) -> i64 {
         "FileIO" => file_io_new(args),
         "BufferedReader" => buffered_reader_new(args),
         "BufferedWriter" => buffered_writer_new(args),
+        "text_encoding" => io_text_encoding(args),
+        "open_code" => io_open_code(args),
         _ => missing_attribute("io", function),
     }
+}
+
+/// `io.__all__`: the names this runtime's `io` module actually resolves.
+fn io_all_list() -> i64 {
+    if let Some(cached) = globals::registry_get("io.__all__") {
+        return cached;
+    }
+    let names = [
+        "open",
+        "open_code",
+        "text_encoding",
+        "DEFAULT_BUFFER_SIZE",
+        "BytesIO",
+        "StringIO",
+        "BufferedIOBase",
+        "BufferedWriter",
+        "BufferedReader",
+        "FileIO",
+        "IOBase",
+        "RawIOBase",
+        "TextIOBase",
+        "TextIOWrapper",
+        "Reader",
+        "Writer",
+        "SEEK_SET",
+        "SEEK_CUR",
+        "SEEK_END",
+    ];
+    let mut values = Vec::with_capacity(names.len());
+    let mut roots = Vec::with_capacity(names.len());
+    for name in names {
+        // Every listed name is one the module really resolves; a failure means
+        // a runtime arm is missing, so propagate it rather than advertising a
+        // name that would raise on access.
+        let resolved = module_get_default_named("io", name);
+        if exc::pending() {
+            for root in roots.into_iter().rev() {
+                heap::release_roots(root);
+            }
+            return NONE;
+        }
+        // `__all__` is a list of names, not the resolved objects. Resolve
+        // each name first so a missing implementation is still reported
+        // instead of advertising a name that would fail on access.
+        let _ = resolved;
+        let item = value::str_alloc(name.to_string());
+        roots.push(heap::root_values(&[item]));
+        values.push(item);
+    }
+    let list = value::list_new(values);
+    globals::registry_set("io.__all__", list);
+    for root in roots.into_iter().rev() {
+        heap::release_roots(root);
+    }
+    list
+}
+
+/// `io.text_encoding(encoding, stacklevel=2)`: returns `encoding` unchanged or
+/// `"locale"` for `None`. Hydro's `sys.flags.warn_default_encoding` is 0, so no
+/// `EncodingWarning` is emitted (and `stacklevel` is accepted and ignored).
+fn io_text_encoding(args: &[i64]) -> i64 {
+    let encoding = args.first().copied().unwrap_or(NONE);
+    if encoding == NONE {
+        return value::str_from_bytes(b"locale");
+    }
+    match value::as_str(encoding) {
+        Some(text) => value::str_alloc(text.to_string()),
+        None => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "text_encoding() argument must be str or None, not {}",
+                value::type_name(encoding)
+            ),
+        ),
+    }
+}
+
+/// `io.open_code(path)`: opens `path` for binary reading through the normal
+/// file API.
+fn io_open_code(args: &[i64]) -> i64 {
+    let mode = value::str_from_bytes(b"rb");
+    io_open(&[args[0], mode])
 }
 
 /// Cached native `io` class. Stream instances compare by class identity, so
@@ -10568,8 +12972,8 @@ pub(crate) fn io_open(args: &[i64]) -> i64 {
         }
     }
 
-    match (mode.base, mode.binary) {
-        ('r', binary) => match std::fs::read(&path) {
+    match (mode.base, mode.binary, mode.plus) {
+        ('r', binary, false) => match std::fs::read(&path) {
             Ok(content) if binary => value::file_new_read_bytes(path, content),
             Ok(content) => match String::from_utf8(content) {
                 Ok(text) => value::file_new_read(path, text),
@@ -10580,14 +12984,38 @@ pub(crate) fn io_open(args: &[i64]) -> i64 {
             },
             Err(error) => os_failure(&path, &error),
         },
-        (base, binary) => {
-            let opened = match base {
-                'w' => std::fs::File::create(&path),
-                'a' => std::fs::OpenOptions::new()
+        (base, binary, _) => {
+            // Update modes open a real read/write descriptor. The runtime's
+            // file body stores a writable OS stream (reads on the same handle
+            // after an update open are a documented limitation of that body,
+            // not of the mode parser).
+            let opened = match (base, mode.plus) {
+                ('r', true) => std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path),
+                ('w', false) => std::fs::File::create(&path),
+                ('w', true) => std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path),
+                ('a', false) => std::fs::OpenOptions::new()
                     .append(true)
                     .create(true)
                     .open(&path),
-                'x' => std::fs::OpenOptions::new()
+                ('a', true) => std::fs::OpenOptions::new()
+                    .append(true)
+                    .read(true)
+                    .create(true)
+                    .open(&path),
+                ('x', false) => std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path),
+                ('x', true) => std::fs::OpenOptions::new()
+                    .read(true)
                     .write(true)
                     .create_new(true)
                     .open(&path),
@@ -10618,6 +13046,8 @@ struct OpenMode {
     base: char,
     /// `true` for `b`, `false` for text (the default and explicit `t`).
     binary: bool,
+    /// `true` when the mode contains `+` (open for reading and writing).
+    plus: bool,
 }
 
 /// Validates a mode string and returns its base letter plus binary flag.
@@ -10628,6 +13058,7 @@ struct OpenMode {
 fn parse_mode(mode: &str) -> Result<OpenMode, String> {
     let mut base = None;
     let mut binary = None;
+    let mut plus = false;
     for ch in mode.chars() {
         match ch {
             'r' | 'w' | 'a' | 'x' => {
@@ -10642,7 +13073,12 @@ fn parse_mode(mode: &str) -> Result<OpenMode, String> {
                 }
                 binary = Some(ch == 'b');
             }
-            '+' => return Err("read/write mode is not supported".to_string()),
+            '+' => {
+                if plus {
+                    return Err(format!("invalid mode: '{mode}'"));
+                }
+                plus = true;
+            }
             _ => return Err(format!("invalid mode: '{mode}'")),
         }
     }
@@ -10650,6 +13086,7 @@ fn parse_mode(mode: &str) -> Result<OpenMode, String> {
     Ok(OpenMode {
         base,
         binary: binary.unwrap_or(false),
+        plus,
     })
 }
 
@@ -13419,26 +15856,185 @@ mod tests {
     }
 
     #[test]
-    fn dataclasses_field_returns_a_marker_namespace() {
+    fn dataclasses_field_returns_real_field_instances() {
         exc::init();
         let factory = value::builtin_function_new(hydro_ir::Builtin::List);
-        let marker = call("dataclasses", "field", &[NONE, factory]);
+        let ensemble = call_kw("dataclasses", "field", &[], &[("default_factory", factory)]);
         assert!(!exc::pending());
-        let pairs = value::as_namespace(marker).expect("field() marker namespace");
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0].0, "default");
-        assert_eq!(pairs[0].1, NONE);
-        assert_eq!(pairs[1].0, "default_factory");
-        assert_eq!(pairs[1].1, factory);
+        let field_class = get("dataclasses", "Field");
+        assert!(value::as_class(field_class).is_some(), "Field is a class");
+        assert_eq!(value::instance_class_name(ensemble), Some("Field"));
+        let attr = |name: &str| value::instance_attr(ensemble, name);
+        assert_eq!(attr("default_factory"), Some(factory));
+        assert_eq!(attr("init"), Some(TRUE));
+        assert_eq!(attr("repr"), Some(TRUE));
+        assert_eq!(attr("hash"), Some(NONE));
+        assert_eq!(attr("compare"), Some(TRUE));
+        assert_eq!(attr("doc"), Some(NONE));
+        assert_eq!(attr("name"), Some(NONE));
+        assert_eq!(attr("type"), Some(NONE));
+        assert_eq!(attr("_field_type"), Some(NONE));
+        assert!(value::as_dict(attr("metadata").expect("metadata")).is_some());
 
-        // Both settings omitted default to `None`.
+        // Omitted settings share the MISSING sentinel, which is neither
+        // `None` nor a fresh object per field. `field(default_factory=...)`
+        // must not shift the factory into the `default` slot.
         let empty = call("dataclasses", "field", &[]);
-        let pairs = value::as_namespace(empty).expect("field() marker namespace");
-        assert!(pairs.iter().all(|(_, value)| *value == NONE));
+        let missing_default = value::instance_attr(empty, "default").expect("default");
+        assert_ne!(missing_default, NONE);
+        assert_eq!(attr("default"), Some(missing_default));
+        assert_eq!(
+            Some(missing_default),
+            value::instance_attr(empty, "kw_only")
+        );
+        let second = call("dataclasses", "field", &[]);
+        assert_eq!(
+            Some(missing_default),
+            value::instance_attr(second, "default")
+        );
+
+        // A keyword default is stored as-is.
+        let with_default = call_kw("dataclasses", "field", &[], &[("default", int(3))]);
+        assert_eq!(value::instance_attr(with_default, "default"), Some(int(3)));
 
         // `from dataclasses import field` resolves to a callable value.
         let function = get("dataclasses", "field");
         assert!(value::as_function(function).is_some());
+
+        // Duplicate binding and a non-mapping metadata are CPython `TypeError`s.
+        exc::init();
+        assert_eq!(
+            call_kw(
+                "dataclasses",
+                "field",
+                &[],
+                &[("default", int(1)), ("default", int(2))]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(message().contains("multiple values for argument 'default'"));
+        exc::init();
+        assert_eq!(
+            call_kw("dataclasses", "field", &[], &[("metadata", int(1))]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "metadata must be a mapping");
+
+        // Both defaults at once is CPython's ValueError.
+        exc::init();
+        assert_eq!(
+            call_kw(
+                "dataclasses",
+                "field",
+                &[],
+                &[("default", int(1)), ("default_factory", factory),]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "cannot specify both default and default_factory");
+    }
+
+    #[test]
+    fn dataclasses_is_dataclass_checks_the_metadata_attribute() {
+        exc::init();
+        let plain = value::class_new("Plain".to_string(), NONE, Vec::new());
+        assert_eq!(call("dataclasses", "is_dataclass", &[plain]), FALSE);
+        assert_eq!(
+            call("dataclasses", "is_dataclass", &[value::instance_new(plain)]),
+            FALSE
+        );
+        assert_eq!(call("dataclasses", "is_dataclass", &[int(1)]), FALSE);
+
+        let marked = value::class_new("Marked".to_string(), NONE, Vec::new());
+        let fields = value::dict_new(Vec::new());
+        value::class_set_attr(marked, "__dataclass_fields__".to_string(), fields);
+        assert_eq!(call("dataclasses", "is_dataclass", &[marked]), TRUE);
+        assert_eq!(
+            call(
+                "dataclasses",
+                "is_dataclass",
+                &[value::instance_new(marked)]
+            ),
+            TRUE
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn dataclasses_missing_is_the_omitted_field_sentinel() {
+        exc::init();
+        let missing = get("dataclasses", "MISSING");
+        assert_ne!(missing, NONE);
+        assert_eq!(missing, get("dataclasses", "MISSING"));
+
+        let field = call("dataclasses", "field", &[]);
+        assert_eq!(value::instance_attr(field, "default"), Some(missing));
+        assert_eq!(
+            value::instance_attr(field, "default_factory"),
+            Some(missing)
+        );
+        assert_eq!(value::instance_attr(field, "kw_only"), Some(missing));
+
+        // An explicit default is untouched: only the omitted slots are MISSING.
+        let explicit = call_kw("dataclasses", "field", &[], &[("default", int(4))]);
+        assert_eq!(value::instance_attr(explicit, "default"), Some(int(4)));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn dataclasses_fields_reads_the_metadata_mapping() {
+        exc::init();
+        let first = call("dataclasses", "field", &[]);
+        let second = call_kw("dataclasses", "field", &[], &[("default", int(7))]);
+        let metadata = value::dict_new(Vec::new());
+        container::dict_set(metadata, string("alpha"), first);
+        container::dict_set(metadata, string("beta"), second);
+
+        let class = value::class_new("Located".to_string(), NONE, Vec::new());
+        value::class_set_attr(class, "__dataclass_fields__".to_string(), metadata);
+        let instance = value::instance_new(class);
+
+        // Declaration order follows the mapping, on both a class and an
+        // instance, and the mapping keys supply the unset `Field.name`s.
+        let by_class = call("dataclasses", "fields", &[class]);
+        assert!(!exc::pending(), "{}", message());
+        let by_instance = call("dataclasses", "fields", &[instance]);
+        assert!(!exc::pending(), "{}", message());
+        for result in [by_class, by_instance] {
+            let items = value::as_tuple(result).expect("tuple of fields");
+            assert_eq!(items, &[first, second][..]);
+            let name_at =
+                |index: usize| value::instance_attr(items[index], "name").and_then(value::as_str);
+            assert_eq!(name_at(0), Some("alpha"));
+            assert_eq!(name_at(1), Some("beta"));
+            assert_eq!(value::instance_attr(items[1], "default"), Some(int(7)));
+        }
+
+        // A non-dataclass (and a non-dict metadata attribute) raises CPython's
+        // TypeError rather than fabricating fields.
+        exc::init();
+        assert_eq!(call("dataclasses", "fields", &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "fields() should be called with a dataclass type or instance"
+        );
+        exc::init();
+        let plain = value::class_new("Plain".to_string(), NONE, Vec::new());
+        assert_eq!(call("dataclasses", "fields", &[plain]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::init();
+        let bogus = value::class_new("Bogus".to_string(), NONE, Vec::new());
+        value::class_set_attr(bogus, "__dataclass_fields__".to_string(), int(1));
+        assert_eq!(call("dataclasses", "fields", &[bogus]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "fields() should be called with a dataclass type or instance"
+        );
     }
 
     #[test]
@@ -17251,5 +19847,567 @@ mod tests {
         assert_eq!(exc::pending_tag(), i64::from(ATTRIBUTE_ERROR));
         assert_eq!(message(), "module 'app' has no attribute 'missing'");
         exc::clear();
+    }
+
+    #[test]
+    fn os_process_filesystem_and_descriptor_primitives() {
+        exc::init();
+        let encoded = call("os", "fsencode", &[string("h\u{e9}llo")]);
+        assert_eq!(value::as_bytes(encoded), Some(&b"h\xc3\xa9llo"[..]));
+        assert_eq!(
+            value::as_str(call("os", "fsdecode", &[encoded])),
+            Some("h\u{e9}llo")
+        );
+        assert_eq!(
+            value::as_bytes(call("os", "fsencode", &[value::bytes_new(b"raw".to_vec())])),
+            Some(&b"raw"[..])
+        );
+        exc::init();
+        assert_eq!(
+            call("os", "fsdecode", &[value::bytes_new(vec![0xff])]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), crate::exc::UNICODE_DECODE_ERROR as i64);
+        exc::init();
+        assert_eq!(call("os", "system", &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+
+        exc::init();
+        #[cfg(unix)]
+        {
+            for name in ["getuid", "geteuid", "getgid", "getegid"] {
+                assert!(as_big(call("os", name, &[])) >= BigInt::from(0), "{name}");
+            }
+            assert_eq!(value::as_str(get("os", "defpath")), Some(":/bin:/usr/bin"));
+            assert_eq!(get("os", "altsep"), NONE);
+            assert!(as_int(get("os", "WNOHANG")) > 0);
+
+            assert_eq!(call("os", "system", &[string("true")]), int(0));
+            assert_ne!(call("os", "system", &[string("exit 3")]), int(0));
+
+            let root = temp_root("fstat");
+            let path = root.join("data.txt");
+            std::fs::write(&path, b"hello").expect("write fstat fixture");
+            let file = std::fs::File::open(&path).expect("open fstat fixture");
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let metadata = call("os", "fstat", &[int(i64::from(fd))]);
+            assert!(!exc::pending());
+            assert_eq!(
+                as_int(namespace_value(metadata, "st_size").expect("st_size")),
+                5
+            );
+            assert_eq!(
+                as_int(namespace_value(metadata, "st_mode").expect("st_mode")) & 0o170000,
+                0o100000
+            );
+
+            exc::init();
+            assert_eq!(call("os", "close", &[int(-1)]), NONE);
+            assert_eq!(exc::pending_tag(), crate::exc::OS_ERROR as i64);
+            assert!(message().contains("Bad file descriptor"));
+        }
+    }
+
+    #[test]
+    fn os_path_expanduser_and_islink() {
+        exc::init();
+        let saved = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/hydro-home");
+        assert_eq!(
+            value::as_str(call("os.path", "expanduser", &[string("~")])),
+            Some("/hydro-home")
+        );
+        assert_eq!(
+            value::as_str(call("os.path", "expanduser", &[string("~/x")])),
+            Some("/hydro-home/x")
+        );
+        assert_eq!(
+            value::as_str(call("os.path", "expanduser", &[string("~/")])),
+            Some("/hydro-home/")
+        );
+        assert_eq!(
+            value::as_str(call("os.path", "expanduser", &[string("plain")])),
+            Some("plain")
+        );
+        assert_eq!(
+            value::as_str(call(
+                "os.path",
+                "expanduser",
+                &[string("~hydro_no_such_user_9/x")]
+            )),
+            Some("~hydro_no_such_user_9/x")
+        );
+        match saved {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        #[cfg(unix)]
+        {
+            let root = temp_root("islink");
+            let target = root.join("target");
+            std::fs::write(&target, b"x").expect("write link target");
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+            assert_eq!(
+                call("os.path", "islink", &[string(&link.to_string_lossy())]),
+                TRUE
+            );
+            assert_eq!(
+                call("os.path", "islink", &[string(&target.to_string_lossy())]),
+                FALSE
+            );
+            assert_eq!(
+                call("os.path", "islink", &[string("/no/such/hydro-link")]),
+                FALSE
+            );
+        }
+    }
+
+    #[test]
+    fn time_struct_time_formatting_and_zone_constants() {
+        exc::init();
+        let class = get("time", "struct_time");
+        assert!(value::as_class(class).is_some(), "struct_time is a class");
+        let sequence = value::tuple_new(vec![
+            int(2024),
+            int(1),
+            int(2),
+            int(3),
+            int(4),
+            int(5),
+            int(1),
+            int(2),
+            int(0),
+        ]);
+        let broken = call_value(class, &[sequence]);
+        assert!(!exc::pending());
+        assert_eq!(value::instance_class_name(broken), Some("struct_time"));
+        assert_eq!(value::instance_attr(broken, "tm_year"), Some(int(2024)));
+        assert_eq!(value::instance_attr(broken, "tm_zone"), Some(NONE));
+        assert_eq!(as_int(call("builtins", "len", &[broken])), 9);
+        assert_eq!(as_int(container::subscript(broken, int(0))), 2024);
+        assert_eq!(as_int(container::subscript(broken, int(-1))), 0);
+        let items = call("builtins", "list", &[broken]);
+        assert_eq!(value::as_list(items).expect("list").len(), 9);
+        assert!(value::as_str(struct_time_repr(&[broken]))
+            .expect("repr")
+            .contains("tm_year=2024"));
+        assert_eq!(ops::binop(ops::OP_EQ, broken, sequence), TRUE);
+        assert_eq!(
+            ops::binop(ops::OP_EQ, broken, value::tuple_new(vec![int(0); 9])),
+            FALSE
+        );
+
+        let gm = call("time", "gmtime", &[int(0)]);
+        assert!(!exc::pending());
+        assert_eq!(value::instance_class_name(gm), Some("struct_time"));
+        assert_eq!(value::instance_attr(gm, "tm_year"), Some(int(1970)));
+        assert_eq!(value::instance_attr(gm, "tm_mday"), Some(int(1)));
+        assert_eq!(value::instance_attr(gm, "tm_wday"), Some(int(4)));
+        assert_eq!(value::instance_attr(gm, "tm_yday"), Some(int(1)));
+        assert_eq!(
+            value::as_str(call("time", "strftime", &[string("%Y-%m-%d"), gm])),
+            Some("1970-01-01")
+        );
+        assert_eq!(
+            value::as_str(call_kw(
+                "time",
+                "strftime",
+                &[],
+                &[("format", string("%Y")), ("t", gm)]
+            )),
+            Some("1970")
+        );
+        assert!(!exc::pending(), "keyword strftime raised: {}", message());
+        assert!(as_float(call("time", "process_time", &[])) >= 0.0);
+        assert_eq!(call("time", "tzset", &[]), NONE);
+        assert_eq!(
+            value::as_tuple(get("time", "tzname"))
+                .expect("tzname tuple")
+                .len(),
+            2
+        );
+        assert!(as_int(get("time", "daylight")) >= 0);
+        let tm_items = value::as_list(get("time", "_STRUCT_TM_ITEMS")).expect("field list");
+        assert_eq!(tm_items.len(), 9);
+        assert_eq!(value::as_str(tm_items[0]), Some("tm_year"));
+
+        exc::init();
+        assert_eq!(call_value(class, &[value::tuple_new(vec![int(1)])]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::init();
+        assert_eq!(call_value(class, &[int(1)]), NONE);
+        assert_eq!(message(), "constructor requires a sequence");
+        exc::init();
+        assert_eq!(
+            call(
+                "time",
+                "strftime",
+                &[string("%Y"), value::tuple_new(vec![int(1)])]
+            ),
+            NONE
+        );
+        assert!(message().contains("illegal time tuple"));
+    }
+
+    #[test]
+    fn sys_flags_monitoring_meta_path_and_audit() {
+        exc::init();
+        let flags = get("sys", "flags");
+        assert_eq!(get("sys", "flags"), flags);
+        assert_eq!(namespace_value(flags, "hash_randomization"), Some(int(0)));
+        assert_eq!(namespace_value(flags, "int_max_str_digits"), Some(int(0)));
+        assert_eq!(namespace_value(flags, "gil"), Some(int(0)));
+        assert_eq!(namespace_value(flags, "dev_mode"), Some(FALSE));
+
+        let monitoring = get("sys", "monitoring");
+        assert_eq!(get("sys", "monitoring"), monitoring);
+        let events = namespace_value(monitoring, "events").expect("events");
+        assert_eq!(namespace_value(events, "PY_START"), Some(int(1)));
+        assert_ne!(
+            namespace_value(monitoring, "DISABLE"),
+            namespace_value(monitoring, "MISSING")
+        );
+        assert_eq!(namespace_value(monitoring, "DEBUGGER_ID"), Some(int(0)));
+        let register = namespace_value(monitoring, "register_callback").expect("register");
+        assert!(value::as_function(register).is_some());
+        let use_tool = namespace_value(monitoring, "use_tool_id").expect("use_tool_id");
+        let get_tool = namespace_value(monitoring, "get_tool").expect("get_tool");
+        let free_tool = namespace_value(monitoring, "free_tool_id").expect("free_tool_id");
+        assert_eq!(
+            call_value(use_tool, &[int(5), string("hydro-test-tool")]),
+            NONE
+        );
+        assert_eq!(
+            value::as_str(call_value(get_tool, &[int(5)])),
+            Some("hydro-test-tool")
+        );
+        exc::init();
+        assert_eq!(call_value(use_tool, &[int(5), string("other")]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        // Duplicate-tool failure is expected above; the registry operations
+        // below must run with no pending exception.
+        exc::init();
+        assert_eq!(call_value(register, &[int(5), int(1), NONE]), NONE);
+        assert_eq!(call_value(register, &[int(5), int(1), NONE]), NONE);
+        assert_eq!(call_value(free_tool, &[int(5)]), NONE);
+        assert_eq!(call_value(get_tool, &[int(5)]), NONE);
+        assert!(!exc::pending(), "monitoring registry left an exception");
+
+        let meta_path = get("sys", "meta_path");
+        assert!(!exc::pending(), "sys.meta_path raised: {}", message());
+        assert_eq!(get("sys", "meta_path"), meta_path);
+        let finders = value::as_list(meta_path).expect("sys.meta_path must be a list");
+        assert_eq!(finders.len(), 2);
+        assert!(finders
+            .iter()
+            .all(|finder| value::as_class(*finder).is_some()));
+
+        assert_eq!(
+            value::as_str(call("sys", "getfilesystemencodeerrors", &[])),
+            Some("surrogateescape")
+        );
+        assert_eq!(as_int(call("sys", "get_int_max_str_digits", &[])), 0);
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn audit_probe(argv: *const i64) -> i64 {
+            // SAFETY: audit hooks are invoked with exactly `(event, args)`.
+            let (event, arguments) = unsafe { (*argv, *argv.add(1)) };
+            if value::as_str(event) == Some("hydro-audit") {
+                CALLS.fetch_add(1, Ordering::Relaxed);
+                let arguments = value::as_tuple(arguments).expect("audit args tuple");
+                assert_eq!(arguments.len(), 2);
+            }
+            NONE
+        }
+        let hook = value::function_new(audit_probe as *const () as usize, 2, "hook".to_string());
+        assert_eq!(call("sys", "addaudithook", &[hook]), NONE);
+        assert_eq!(
+            call(
+                "sys",
+                "audit",
+                &[string("hydro-audit"), int(1), string("x")]
+            ),
+            NONE
+        );
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        exc::init();
+        assert_eq!(call("sys", "audit", &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "audit() argument 1 must be str, not int");
+    }
+
+    #[test]
+    fn math_operator_pickle_functools_and_io_primitives() {
+        exc::init();
+        assert_eq!(
+            as_float(call("math", "copysign", &[value::float_new(3.0), int(-1)])),
+            -3.0
+        );
+        assert!(as_float(call(
+            "math",
+            "copysign",
+            &[value::float_new(f64::NAN), int(-1)]
+        ))
+        .is_sign_negative());
+        assert!(!as_float(call(
+            "math",
+            "copysign",
+            &[value::float_new(f64::NAN), int(1)]
+        ))
+        .is_sign_negative());
+        assert_eq!(as_int(call("math", "isqrt", &[int(0)])), 0);
+        assert_eq!(as_int(call("math", "isqrt", &[int(10)])), 3);
+        let square = value::bigint_new(BigInt::from(10).pow(20));
+        assert_eq!(
+            value::to_bigint(call("math", "isqrt", &[square])),
+            Some(BigInt::from(10).pow(10))
+        );
+        exc::init();
+        assert_eq!(call("math", "isqrt", &[int(-1)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::init();
+        assert_eq!(call("math", "isqrt", &[value::float_new(1.5)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+
+        let bytes = |data: &[u8]| value::bytes_new(data.to_vec());
+        assert_eq!(
+            call("operator", "_compare_digest", &[bytes(b"ab"), bytes(b"ab")]),
+            TRUE
+        );
+        assert_eq!(
+            call(
+                "operator",
+                "_compare_digest",
+                &[bytes(b"ab"), bytes(b"abcd")]
+            ),
+            FALSE
+        );
+        assert_eq!(
+            call(
+                "operator",
+                "_compare_digest",
+                &[value::bytearray_new(b"ab".to_vec()), bytes(b"ab")]
+            ),
+            TRUE
+        );
+        assert_eq!(
+            call(
+                "_operator",
+                "_compare_digest",
+                &[string("abc"), string("abc")]
+            ),
+            TRUE
+        );
+        exc::init();
+        assert_eq!(
+            call(
+                "operator",
+                "_compare_digest",
+                &[string("\u{e9}"), string("\u{e9}")]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::init();
+        assert_eq!(
+            call("operator", "_compare_digest", &[bytes(b"a"), string("a")]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+
+        assert_eq!(as_int(get("pickle", "DEFAULT_PROTOCOL")), 5);
+        assert_eq!(as_int(call("pickle", "decode_long", &[bytes(&[0xff])])), -1);
+        assert_eq!(
+            as_int(call("pickle", "decode_long", &[bytes(&[0x00, 0x01])])),
+            256
+        );
+        assert_eq!(
+            as_big(call("pickle", "decode_long", &[bytes(&[0; 20])])),
+            BigInt::from(0)
+        );
+        exc::init();
+        assert_eq!(call("pickle", "decode_long", &[int(1)]), NONE);
+        assert_eq!(message(), "cannot convert 'int' object to bytes");
+        // The assertion above deliberately left a pending TypeError; clear it
+        // so the KeyWrapper checks below start from a clean exception state.
+        exc::init();
+
+        extern "C" fn compare_probe(argv: *const i64) -> i64 {
+            // SAFETY: the comparator is called with exactly two integers.
+            let (left, right) = unsafe { (*argv, *argv.add(1)) };
+            let left = value::as_integer(left).unwrap_or(0);
+            let right = value::as_integer(right).unwrap_or(0);
+            int((left > right) as i64 - (left < right) as i64)
+        }
+        let comparator =
+            value::function_new(compare_probe as *const () as usize, 2, "cmp".to_string());
+        let wrapper = call("functools", "cmp_to_key", &[comparator]);
+        assert!(value::as_instance(wrapper).is_some(), "KeyWrapper instance");
+        let three = call_value(wrapper, &[int(3)]);
+        let one = call_value(wrapper, &[int(1)]);
+        let two = call_value(wrapper, &[int(2)]);
+        let three_again = call_value(wrapper, &[int(3)]);
+        assert!(!exc::pending(), "KeyWrapper.__call__ must not raise");
+        assert_eq!(ops::binop(ops::OP_GT, three, one), TRUE);
+        assert_eq!(ops::binop(ops::OP_LT, three, one), FALSE);
+        assert_eq!(ops::binop(ops::OP_EQ, three, one), FALSE);
+        assert_eq!(ops::binop(ops::OP_LT, one, two), TRUE);
+        assert_eq!(ops::binop(ops::OP_LE, two, three), TRUE);
+        assert_eq!(ops::binop(ops::OP_LE, three, two), FALSE);
+        assert_eq!(ops::binop(ops::OP_GE, three, two), TRUE);
+        assert_eq!(ops::binop(ops::OP_GE, one, two), FALSE);
+        assert_eq!(ops::binop(ops::OP_EQ, three, three_again), TRUE);
+
+        // The comparator really orders arbitrary values: insertion-sort the
+        // wrapper keys by `__lt__` and recover the original objects.
+        let mut keys: Vec<i64> = [3i64, 1, 4, 2]
+            .iter()
+            .map(|number| call_value(wrapper, &[int(*number)]))
+            .collect();
+        for index in 0..keys.len() {
+            for next in index + 1..keys.len() {
+                if value::truthy(ops::binop(ops::OP_LT, keys[next], keys[index])) {
+                    keys.swap(index, next);
+                }
+            }
+        }
+        let ordered: Vec<i64> = keys
+            .iter()
+            .map(|key| value::instance_attr(*key, "obj").expect("key payload"))
+            .collect();
+        assert_eq!(ordered, vec![int(1), int(2), int(3), int(4)]);
+
+        assert_eq!(as_int(get("io", "DEFAULT_BUFFER_SIZE")), 8192);
+        let all = value::as_list(get("io", "__all__")).expect("io.__all__");
+        assert!(all.iter().any(|name| value::as_str(*name) == Some("open")));
+        assert!(!all.is_empty());
+        assert_eq!(
+            value::as_str(call("io", "text_encoding", &[NONE])),
+            Some("locale")
+        );
+        assert_eq!(
+            value::as_str(call("io", "text_encoding", &[string("utf-8")])),
+            Some("utf-8")
+        );
+        exc::init();
+        assert_eq!(call("io", "text_encoding", &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::init();
+
+        let root = temp_root("open-code");
+        let path = root.join("module.py");
+        std::fs::write(&path, b"x = 1\n").expect("write open_code fixture");
+        let file = call("io", "open_code", &[string(&path.to_string_lossy())]);
+        assert!(!exc::pending());
+        assert!(value::as_file(file).expect("file object").binary());
+
+        // Update modes (`r+`, `w+`, `a+`, `x+`, and binary variants) open a
+        // real read/write descriptor instead of being rejected.
+        let plus_path = root.join("plus.bin");
+        std::fs::write(&plus_path, b"hi").expect("write r+ fixture");
+        let plus = call(
+            "io",
+            "open",
+            &[string(&plus_path.to_string_lossy()), string("r+b")],
+        );
+        assert!(!exc::pending());
+        let plus_file = value::as_file(plus).expect("r+b file");
+        assert!(plus_file.binary());
+        plus_file.write_bytes(b"xy").expect("write update mode");
+        assert_eq!(std::fs::read(&plus_path).expect("read r+ fixture"), b"xy");
+
+        let created = root.join("created.bin");
+        let new_file = call(
+            "io",
+            "open",
+            &[string(&created.to_string_lossy()), string("w+b")],
+        );
+        assert!(!exc::pending());
+        value::as_file(new_file)
+            .expect("w+b file")
+            .write_bytes(b"payload")
+            .expect("write w+b");
+        assert_eq!(
+            std::fs::read(&created).expect("read w+b fixture"),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn thread_rlock_and_thread_object_registry() {
+        exc::init();
+        assert!(value::as_lock(call("_thread", "RLock", &[])).is_some());
+        assert!(value::as_lock(call("threading", "RLock", &[])).is_some());
+
+        let current = call("threading", "current_thread", &[]);
+        assert!(value::as_thread(current).is_some());
+        assert_eq!(call("threading", "current_thread", &[]), current);
+        let main = call("threading", "main_thread", &[]);
+        assert_eq!(main, current);
+        let state = value::as_thread(main).expect("main Thread");
+        assert_eq!(state.name, "MainThread");
+        assert_eq!(
+            state.id.load(Ordering::Acquire),
+            as_int(call("threading", "get_ident", &[]))
+        );
+    }
+
+    #[test]
+    fn sidecar_spec_and_runtime_dispatch_agree() {
+        exc::init();
+        let spec = stdlib::module("_hydro_sidecar").expect("_hydro_sidecar spec");
+        assert_eq!(spec.name, "_hydro_sidecar");
+        let spawn = stdlib::function("_hydro_sidecar", "spawn").expect("spawn");
+        assert_eq!((spawn.min_args, spawn.max_args), (1, 2));
+        assert_eq!(
+            stdlib::function("_hydro_sidecar", "call")
+                .expect("call")
+                .max_args,
+            usize::MAX
+        );
+        assert_eq!(
+            stdlib::constant("_hydro_sidecar", "PROTOCOL_VERSION")
+                .expect("PROTOCOL_VERSION")
+                .ty,
+            hydro_ir::Type::Int
+        );
+        assert_eq!(
+            stdlib::constant("_hydro_sidecar", "MAX_FRAME")
+                .expect("MAX_FRAME")
+                .ty,
+            hydro_ir::Type::Int
+        );
+
+        // Runtime constant lookup agrees with the spec, and function lookups
+        // materialise a native function without launching a worker.
+        assert_eq!(as_int(get("_hydro_sidecar", "PROTOCOL_VERSION")), 1);
+        assert_eq!(as_int(get("_hydro_sidecar", "MAX_FRAME")), 16 * 1024 * 1024);
+        for name in ["spawn", "call", "restart", "close", "alive"] {
+            assert!(
+                stdlib::function("_hydro_sidecar", name).is_some(),
+                "{name} missing from the spec"
+            );
+            assert_ne!(get("_hydro_sidecar", name), NONE, "{name} did not resolve");
+        }
+        // `module_dict` builds a dict (not a namespace), and it must enumerate
+        // every spec function and constant.
+        let dict = module_dict("_hydro_sidecar");
+        for name in [
+            "spawn",
+            "call",
+            "restart",
+            "close",
+            "alive",
+            "PROTOCOL_VERSION",
+            "MAX_FRAME",
+        ] {
+            assert!(
+                registry_value(dict, name).is_some(),
+                "{name} missing from module.__dict__"
+            );
+        }
     }
 }

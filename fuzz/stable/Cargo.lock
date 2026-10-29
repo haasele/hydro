@@ -411,6 +411,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydro-hna"
+version = "0.1.0"
+
+[[package]]
 name = "hydro-ir"
 version = "0.1.0"
 
@@ -441,6 +445,7 @@ name = "hydro-runtime"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "hydro-hna",
  "hydro-ir",
  "libc",
  "num-bigint",

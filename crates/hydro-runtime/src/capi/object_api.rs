@@ -1045,7 +1045,7 @@ fn localsplus_from_tuples(
     let names_object = if names.is_empty() {
         empty_tuple()
     } else {
-        new_object(ShimKind::Tuple(names))
+        new_tuple(names)
     };
     Ok((names_object, new_bytes(kinds)))
 }

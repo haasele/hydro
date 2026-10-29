@@ -34,6 +34,107 @@ fn attribute_error(name: &str) -> i64 {
     )
 }
 
+/// Collects `source` into insertion-ordered pairs, last value winning for a
+/// duplicate key, exactly like `dict(source)`.
+///
+/// The pairs live only in Rust memory that the collector does not scan, so the
+/// caller takes a root marker first and keeps it until
+/// [`value::defaultdict_new`] makes the result own every value. This function
+/// roots each pair it appends.
+fn defaultdict_collect(source: i64) -> Result<Vec<(i64, i64)>, i64> {
+    if let Some(pairs) = value::as_dict(source) {
+        return Ok(pairs.to_vec());
+    }
+    if let Some((pairs, _)) = value::as_defaultdict(source) {
+        return Ok(pairs.to_vec());
+    }
+    let iterator = iter::iter_of(source);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    let mut pairs: Vec<(i64, i64)> = Vec::new();
+    let mut index = 0usize;
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return Err(NONE);
+        }
+        if status == 0 {
+            break;
+        }
+        let Some(items) = value::as_list(item).or_else(|| value::as_tuple(item)) else {
+            return Err(type_error(&format!(
+                "cannot convert dictionary update sequence element #{index} to a sequence"
+            )));
+        };
+        if items.len() != 2 {
+            return Err(exc::raise_with_message(
+                VALUE_ERROR,
+                &format!(
+                    "dictionary update sequence element #{index} has length {}; 2 is required",
+                    items.len()
+                ),
+            ));
+        }
+        let (key, entry) = (items[0], items[1]);
+        if let Some(name) = container::unhashable_name(key) {
+            return Err(type_error(&container::unhashable_message(name)));
+        }
+        match container::dict_find(&pairs, key) {
+            Some(position) => pairs[position].1 = entry,
+            None => {
+                heap::root_values(&[key, entry]);
+                pairs.push((key, entry));
+            }
+        }
+        index += 1;
+    }
+    Ok(pairs)
+}
+
+/// `defaultdict(default_factory=None, /, initial=(), **kwargs)`: the factory
+/// must be callable or `None`, the optional second positional argument is a
+/// mapping or an iterable of key/value pairs, and every keyword is a data key
+/// (the factory name is positional-only in CPython).
+fn defaultdict_construct(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let factory = args.first().copied().unwrap_or(NONE);
+    if factory != NONE && value::as_function(factory).is_none() {
+        return type_error(&format!(
+            "defaultdict() first argument must be callable or None, not {}",
+            value::type_name(factory)
+        ));
+    }
+    if args.len() > 2 {
+        return type_error(&format!(
+            "dict expected at most 1 argument, got {}",
+            args.len() - 1
+        ));
+    }
+    let mark = heap::root_values(std::slice::from_ref(&factory));
+    let mut pairs = match args.get(1).copied() {
+        Some(source) => match defaultdict_collect(source) {
+            Ok(pairs) => pairs,
+            Err(error) => {
+                heap::release_roots(mark);
+                return error;
+            }
+        },
+        None => Vec::new(),
+    };
+    for (name, value) in keywords {
+        let key = value::str_alloc(name.clone());
+        heap::root_values(&[key, *value]);
+        match container::dict_find(&pairs, key) {
+            Some(position) => pairs[position].1 = *value,
+            None => pairs.push((key, *value)),
+        }
+    }
+    let result = value::defaultdict_new(factory, pairs);
+    heap::release_roots(mark);
+    result
+}
+
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     if let Some(method) = function.strip_prefix("OrderedDict.") {
         return ordereddict_method(method, args);
@@ -44,16 +145,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         "OrderedDict" => ordereddict_new(args, &[]),
         "Counter" => counter_new(args, &[]),
-        "defaultdict" => {
-            let factory = args.first().copied().unwrap_or(NONE);
-            if factory != NONE && value::as_function(factory).is_none() {
-                return type_error(&format!(
-                    "defaultdict() first argument must be callable or None, not {}",
-                    value::type_name(factory)
-                ));
-            }
-            value::defaultdict_new(factory, Vec::new())
-        }
+        "defaultdict" => defaultdict_construct(args, &[]),
         "namedtuple" => namedtuple(args),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
@@ -62,11 +154,13 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
-/// Keyword-aware dispatch: `OrderedDict(**items)` keeps the keyword names as
-/// keys and `Counter(**kwds)` counts them. No other `collections` constructor
-/// accepts dynamic keywords.
+/// Keyword-aware dispatch: `defaultdict(list, a=1)` stores the keyword names
+/// as keys, `OrderedDict(**items)` keeps the keyword names as keys and
+/// `Counter(**kwds)` counts them. No other `collections` constructor accepts
+/// dynamic keywords.
 pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     match function {
+        "defaultdict" => defaultdict_construct(args, keywords),
         "OrderedDict" => ordereddict_new(args, keywords),
         "Counter" => counter_new(args, keywords),
         _ => type_error(&format!(

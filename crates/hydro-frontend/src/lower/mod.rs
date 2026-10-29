@@ -649,8 +649,8 @@ pub enum HExprKind {
         /// Class name for runtime error messages.
         class_name: String,
     },
-    /// A call the frontend could not bind statically (`f(*args, **kwargs)`,
-    /// keyword arguments on a function value or imported signature). The
+    /// A call the frontend cannot bind through any runtime call shape (for
+    /// example a dynamic-signature coroutine called with keywords). The
     /// operands are evaluated in source order; executing the call raises
     /// `RuntimeError`.
     DeferredCall {
@@ -798,6 +798,27 @@ struct DataclassField<'a> {
     name: &'a str,
     ty: Ty,
     default: FieldDefault<'a>,
+}
+
+/// The `@dataclass(...)` keyword arguments that change compile-time synthesis.
+///
+/// The decorator call is never evaluated at runtime, so only literal options
+/// can be honored:
+///
+/// - `init` is honored: `init=False` suppresses the synthesized `__init__`
+///   (the class keeps its own or inherited one).
+/// - `slots`, `frozen`, `eq`, `order`, `unsafe_hash`, `repr`, `match_args`,
+///   `weakref_slot` and `kw_only` are accepted and ignored. Hydro synthesizes
+///   no `__eq__`/`__repr__`/ordering/hash methods, enforces no frozen
+///   attribute writes, allocates no `__slots__` storage, and its synthesized
+///   `__init__` parameters stay positional (call sites may still bind them by
+///   keyword, which is what `kw_only=True` call shapes rely on).
+/// - Non-literal values (for example `init=FLAG`) are accepted and keep the
+///   default behavior instead of being evaluated.
+#[derive(Clone, Copy, Debug)]
+struct DataclassOptions {
+    /// Whether the decorator asks for a generated `__init__`.
+    init: bool,
 }
 
 /// One method planned for a class body.
@@ -1053,15 +1074,56 @@ fn module_member(module: &'static ModuleSpec, name: &str) -> Option<ModuleMember
     }
 }
 
+/// Kind of compiled artifact a lookup resolved.
+///
+/// Both kinds are passed to codegen as a plain artifact path; the runtime
+/// selects the loader by file-name suffix (`.hna.so` is HNA, everything else
+/// is the CPython extension shim).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtensionKind {
+    /// A CPython C extension (`.so`, `.abi3.so`, `.<cpython tag>.so`).
+    Cpython,
+    /// A Hydro Native ABI artifact (`<name>.hna.so`).
+    Hna,
+}
+
 /// Result of looking up a compiled extension module.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExtensionLookup {
-    /// A loadable shared object at this canonical absolute path.
-    Found(PathBuf),
+    /// A loadable artifact at this canonical absolute path.
+    Found { path: PathBuf, kind: ExtensionKind },
+    /// Two artifact kinds claim the same dotted name in the same directory.
+    /// A distribution ships exactly one artifact per import name, so this is
+    /// a compile-time error instead of a precedence guess. Paths are canonical
+    /// and sorted for a deterministic diagnostic.
+    Ambiguous { paths: Vec<PathBuf> },
+    /// An HNA artifact exists for a name that must stay Python source: a
+    /// package `__init__`. HNA artifacts are leaf modules only in v1.
+    PackageInit { path: PathBuf, reason: String },
     /// A shared object exists, but its wheel ABI tag cannot be loaded.
     Incompatible { path: PathBuf, reason: String },
     /// No shared object with a supported suffix exists.
     Missing,
+}
+
+/// Message for [`ExtensionLookup::Ambiguous`].
+pub(crate) fn ambiguous_artifacts_message(paths: &[PathBuf]) -> String {
+    let listed = paths
+        .iter()
+        .map(|path| format!("'{}'", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "ambiguous compiled artifacts for the same import name: {listed}; exactly one artifact kind may ship per import name"
+    )
+}
+
+/// Message for [`ExtensionLookup::PackageInit`].
+pub(crate) fn package_init_artifact_message(path: &Path, reason: &str) -> String {
+    format!(
+        "compiled artifact '{}' cannot be used: {reason}",
+        path.display()
+    )
 }
 
 /// A compiled extension module bound by an import.
@@ -1076,10 +1138,13 @@ pub(crate) struct ExtensionAlias {
 
 /// Looks up a compiled extension for `name` in `dir`.
 ///
-/// `name` may be dotted: `pkg.sub_ext` searches `<dir>/pkg/sub_ext...so`. Only
-/// `<leaf>.so`, `<leaf>.abi3.so` and `<leaf>.cpython-314-<platform>.so` (the
-/// `PYTHON_ABI_TAG` target) are loadable; any other `<leaf>.*.so` is
-/// reported as incompatible instead of being silently preferred.
+/// `name` may be dotted: `pkg.sub_ext` searches `<dir>/pkg/sub_ext...so`. Two
+/// artifact kinds are loadable: an HNA artifact `<leaf>.hna.so`, and the
+/// CPython suffixes `<leaf>.so`, `<leaf>.abi3.so` and
+/// `<leaf>.cpython-314-<platform>.so` (the `PYTHON_ABI_TAG` target). Any other
+/// `<leaf>.*.so` is reported as incompatible instead of being silently
+/// preferred, and an HNA artifact next to a CPython artifact of the same name
+/// is reported as ambiguous.
 fn extension_lookup_in(dir: &Path, name: &str) -> ExtensionLookup {
     let mut relative = PathBuf::new();
     for segment in name.split('.') {
@@ -1168,8 +1233,11 @@ fn find_extension_in_search_dirs(
     name: &str,
 ) -> Option<PathBuf> {
     match lookup_extension_in_search_dirs(source, search_dirs, name) {
-        ExtensionLookup::Found(path) => Some(path),
-        ExtensionLookup::Incompatible { .. } | ExtensionLookup::Missing => None,
+        ExtensionLookup::Found { path, .. } => Some(path),
+        ExtensionLookup::Ambiguous { .. }
+        | ExtensionLookup::PackageInit { .. }
+        | ExtensionLookup::Incompatible { .. }
+        | ExtensionLookup::Missing => None,
     }
 }
 
@@ -1250,69 +1318,140 @@ pub(crate) fn prefix_site_packages(prefix: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Picks the shared object for `name` (a relative path without `.so`) in `dir`.
+/// Picks the artifact for `name` (a relative path without a suffix) in `dir`.
 ///
-/// A plain `<name>.so` wins over `<name>.abi3.so`, which wins over any
-/// `<name>.cpython-314-<platform>.so` (the `PYTHON_ABI_TAG` target; first in
-/// sorted order). Every other `<name>.*.so` tag is incompatible: Hydro cannot
-/// load it and reports the offending file instead of falling back to it.
+/// CPython precedence is unchanged: a plain `<name>.so` wins over
+/// `<name>.abi3.so`, which wins over any `<name>.cpython-314-<platform>.so`
+/// (the `PYTHON_ABI_TAG` target; first in sorted order). Every other
+/// `<name>.<tag>.so` is incompatible: Hydro cannot load it and reports the
+/// offending file instead of falling back to it.
+///
+/// `<name>.hna.so` is a distinct artifact kind. It is never part of the
+/// incompatible tag list: an HNA artifact alone resolves as [`Found`], and an
+/// HNA artifact in the same directory as a loadable CPython artifact (`.so`,
+/// `.abi3.so`, `.<cpython tag>.so`) is [`Ambiguous`] because a distribution
+/// ships exactly one artifact kind per import name. An unsupported
+/// `<name>.<other>.so` tag keeps reporting [`Incompatible`] exactly as before,
+/// even when an HNA artifact is present, so a bad wheel tag is never silently
+/// ignored. Compiled artifacts are leaf modules only, so an HNA artifact whose
+/// dotted name is a package (`<name>/__init__.py` exists) is
+/// [`PackageInit`], never a package initializer.
+///
+/// [`Found`]: ExtensionLookup::Found
+/// [`Ambiguous`]: ExtensionLookup::Ambiguous
+/// [`PackageInit`]: ExtensionLookup::PackageInit
+/// [`Incompatible`]: ExtensionLookup::Incompatible
 fn extension_candidate(dir: &Path, name: &Path) -> ExtensionLookup {
     let stem = dir.join(name);
-    let direct = stem.with_extension("so");
-    if direct.is_file() {
-        return ExtensionLookup::Found(canonical(direct));
-    }
-    let abi3 = stem.with_extension("abi3.so");
-    if abi3.is_file() {
-        return ExtensionLookup::Found(canonical(abi3));
-    }
-
     let Some(parent) = stem.parent() else {
         return ExtensionLookup::Missing;
     };
     let Some(leaf) = stem.file_name().and_then(|leaf| leaf.to_str()) else {
         return ExtensionLookup::Missing;
     };
+
+    // CPython candidates ranked by the documented precedence; rank 3 is an
+    // unsupported tag, reported only when no loadable artifact exists.
+    let mut cpython: Vec<(u8, String, PathBuf)> = Vec::new();
+    let direct = stem.with_extension("so");
+    if direct.is_file() {
+        cpython.push((0, String::new(), direct));
+    }
+    let abi3 = stem.with_extension("abi3.so");
+    if abi3.is_file() {
+        cpython.push((1, "abi3".to_string(), abi3));
+    }
+
     let prefix = format!("{leaf}.");
-    let Ok(entries) = fs::read_dir(parent) else {
-        return ExtensionLookup::Missing;
-    };
-    let mut compatible = Vec::new();
-    let mut incompatible = Vec::new();
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
-            continue;
-        };
-        let Some(tag) = file_name
-            .strip_prefix(&prefix)
-            .and_then(|rest| rest.strip_suffix(".so"))
-        else {
-            continue;
-        };
-        if tag.is_empty() {
-            continue;
-        }
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let abi_platform = tag
-            .strip_prefix(PYTHON_ABI_TAG)
-            .and_then(|rest| rest.strip_prefix('-'));
-        match abi_platform {
-            Some(platform) if !platform.is_empty() => compatible.push((tag.to_string(), path)),
-            _ => incompatible.push((tag.to_string(), path)),
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(tag) = file_name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".so"))
+            else {
+                continue;
+            };
+            // `abi3` is handled above; `hna` is the HNA artifact suffix and a
+            // separate kind, never an incompatible CPython tag.
+            if tag.is_empty() || tag == "abi3" || tag == "hna" {
+                continue;
+            }
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let platform = tag
+                .strip_prefix(PYTHON_ABI_TAG)
+                .and_then(|rest| rest.strip_prefix('-'));
+            let rank = match platform {
+                Some(platform) if !platform.is_empty() => 2,
+                _ => 3,
+            };
+            cpython.push((rank, tag.to_string(), path));
         }
     }
-    compatible.sort();
-    if let Some((_, path)) = compatible.into_iter().next() {
-        return ExtensionLookup::Found(canonical(path));
+    cpython.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let hna = stem.with_extension("hna.so");
+    let hna = hna.is_file().then_some(hna);
+
+    if let Some(hna) = &hna {
+        // Ambiguity is between loadable artifact kinds. An unsupported
+        // CPython tag is never silently dropped, so it keeps the incompatible
+        // diagnostic below instead of masking (or being masked by) the HNA
+        // artifact.
+        let loadable = cpython.iter().any(|(rank, _, _)| *rank < 3);
+        if loadable {
+            let mut paths: Vec<PathBuf> = cpython
+                .iter()
+                .map(|(_, _, path)| canonical(path.clone()))
+                .collect();
+            paths.push(canonical(hna.clone()));
+            paths.sort();
+            paths.dedup();
+            return ExtensionLookup::Ambiguous { paths };
+        }
+        if let Some((_, tag, path)) = cpython.first() {
+            return ExtensionLookup::Incompatible {
+                path: canonical(path.clone()),
+                reason: format!(
+                    "unsupported extension ABI tag '{tag}' (loadable suffixes are `.so`, `.abi3.so` and `.{PYTHON_ABI_TAG}-<platform>.so` for Python {PYTHON_VERSION_STRING})"
+                ),
+            };
+        }
+        let package_init = stem.join("__init__.py");
+        if package_init.is_file() {
+            let dotted = name
+                .iter()
+                .filter_map(|part| part.to_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            return ExtensionLookup::PackageInit {
+                path: canonical(hna.clone()),
+                reason: format!(
+                    "it would provide the __init__ of package '{dotted}'; HNA artifacts are leaf modules only, so a package __init__ must stay Python source or be a Tier 1 builtin"
+                ),
+            };
+        }
+        return ExtensionLookup::Found {
+            path: canonical(hna.clone()),
+            kind: ExtensionKind::Hna,
+        };
     }
-    incompatible.sort();
-    if let Some((tag, path)) = incompatible.into_iter().next() {
+
+    if let Some((rank, tag, path)) = cpython.first() {
+        if *rank < 3 {
+            return ExtensionLookup::Found {
+                path: canonical(path.clone()),
+                kind: ExtensionKind::Cpython,
+            };
+        }
         return ExtensionLookup::Incompatible {
-            path: canonical(path),
+            path: canonical(path.clone()),
             reason: format!(
                 "unsupported extension ABI tag '{tag}' (loadable suffixes are `.so`, `.abi3.so` and `.{PYTHON_ABI_TAG}-<platform>.so` for Python {PYTHON_VERSION_STRING})"
             ),
@@ -2370,6 +2509,16 @@ impl<'a> Lowerer<'a> {
                 module_names.push(name.clone());
             }
         }
+        // Assignment-expression targets inside generator expressions bind in
+        // this module frame (CPython skips comprehension scopes), so the
+        // synthetic generator frames write them through a closure cell owned
+        // by the module body.
+        let genexp_walrus = genexp_walrus_targets(&module.body);
+        for name in &genexp_walrus {
+            if !module_names.iter().any(|existing| existing == name) {
+                module_names.push(name.clone());
+            }
+        }
         // A session fragment that only augments a name bound by an earlier
         // fragment must not allocate a fresh local for it: the read and the
         // write both go through the runtime global table. Names the fragment
@@ -2394,6 +2543,10 @@ impl<'a> Lowerer<'a> {
             module_locals.insert(name, id);
         }
         self.module_local_names = module_locals.keys().cloned().collect();
+        let module_cells: HashSet<LocalId> = genexp_walrus
+            .iter()
+            .filter_map(|name| module_locals.get(name).copied())
+            .collect();
 
         //    Module dunders are module globals: the module body assigns a
         //    local and mirrors it into the runtime global table, so functions
@@ -2421,7 +2574,7 @@ impl<'a> Lowerer<'a> {
             fid: 0,
             is_module: true,
             locals: module_locals,
-            cells: HashSet::new(),
+            cells: module_cells,
             cell_aliases: HashSet::new(),
             comp_shadowed: HashMap::new(),
             type_param_locals: HashMap::new(),
@@ -2567,6 +2720,24 @@ impl<'a> Lowerer<'a> {
                 col: 0,
             });
         }
+        // Cells owned by the module frame start unbound, exactly like the
+        // function-entry cells (`CellInit` with no value). A generator frame
+        // may fill them later through an assignment expression.
+        let mut module_cell_inits = Vec::new();
+        let mut owned_cells: Vec<LocalId> =
+            fs.cells.difference(&fs.cell_aliases).copied().collect();
+        owned_cells.sort_unstable();
+        for target in owned_cells {
+            module_cell_inits.push(HStmt {
+                kind: HStmtKind::CellInit {
+                    target,
+                    value: None,
+                },
+                line: 0,
+                col: 0,
+            });
+        }
+        body.splice(0..0, module_cell_inits);
         self.functions[0].body = body;
 
         self.synthesize_pytest(&module.body, &mut fs);
@@ -4217,7 +4388,7 @@ impl<'a> Lowerer<'a> {
         if stdlib::module(module).is_some() {
             return true;
         }
-        if matches!(self.find_extension(module), ExtensionLookup::Found(_)) {
+        if matches!(self.find_extension(module), ExtensionLookup::Found { .. }) {
             return false;
         }
         self.user_modules.contains_key(module)
@@ -4245,7 +4416,7 @@ impl<'a> Lowerer<'a> {
                 .iter()
                 .all(|alias| module_member(module, alias.name.as_str()).is_some());
         }
-        if matches!(self.find_extension(imported), ExtensionLookup::Found(_)) {
+        if matches!(self.find_extension(imported), ExtensionLookup::Found { .. }) {
             return false;
         }
         // `from . import name` inside a package `__init__.py` names this very
@@ -4277,7 +4448,7 @@ impl<'a> Lowerer<'a> {
             }
             if matches!(
                 self.find_extension(&format!("{imported}.{member}")),
-                ExtensionLookup::Found(_)
+                ExtensionLookup::Found { .. }
             ) {
                 return false;
             }
@@ -4307,8 +4478,16 @@ impl<'a> Lowerer<'a> {
                 None => binding,
             };
             let path = match self.find_extension(imported) {
-                ExtensionLookup::Found(path) => Some(path.to_string_lossy().into_owned()),
-                _ => None,
+                ExtensionLookup::Found { path, .. } => Some(path.to_string_lossy().into_owned()),
+                ExtensionLookup::Ambiguous { paths } => {
+                    self.error_ambiguous_extension(alias.range, &paths);
+                    return;
+                }
+                ExtensionLookup::PackageInit { path, reason } => {
+                    self.error_package_init_extension(alias.range, &path, &reason);
+                    return;
+                }
+                ExtensionLookup::Incompatible { .. } | ExtensionLookup::Missing => None,
             };
             self.record_optional_import(statement, binding, module, None, path.as_deref());
             return;
@@ -4340,7 +4519,7 @@ impl<'a> Lowerer<'a> {
             return;
         }
         match self.find_extension(imported) {
-            ExtensionLookup::Found(path) => {
+            ExtensionLookup::Found { path, .. } => {
                 let path = path.to_string_lossy().into_owned();
                 if alias.asname.is_none() && imported.contains('.') {
                     // `import pkg.sub_ext` binds `pkg` and loads the extension
@@ -4377,6 +4556,18 @@ impl<'a> Lowerer<'a> {
                     return;
                 }
                 self.error_incompatible_extension(alias.range, &path, &reason);
+                return;
+            }
+            ExtensionLookup::Ambiguous { paths } => {
+                // A packaging error, never deferred: the same import name
+                // resolves to two artifact kinds.
+                self.error_ambiguous_extension(alias.range, &paths);
+                return;
+            }
+            ExtensionLookup::PackageInit { path, reason } => {
+                // An HNA artifact cannot stand in for a package `__init__`,
+                // so this is an error even inside an optional import.
+                self.error_package_init_extension(alias.range, &path, &reason);
                 return;
             }
             ExtensionLookup::Missing => {}
@@ -4532,7 +4723,7 @@ impl<'a> Lowerer<'a> {
                 // wheel stays deferred inside an optional import so the
                 // runtime import failure is catchable.
                 match self.find_extension(&submodule) {
-                    ExtensionLookup::Found(path) => {
+                    ExtensionLookup::Found { path, .. } => {
                         self.extension_aliases.insert(
                             binding.to_string(),
                             ExtensionAlias {
@@ -4548,6 +4739,14 @@ impl<'a> Lowerer<'a> {
                         } else {
                             self.error_incompatible_extension(alias.range, &path, &reason);
                         }
+                        continue;
+                    }
+                    ExtensionLookup::Ambiguous { paths } => {
+                        self.error_ambiguous_extension(alias.range, &paths);
+                        continue;
+                    }
+                    ExtensionLookup::PackageInit { path, reason } => {
+                        self.error_package_init_extension(alias.range, &path, &reason);
                         continue;
                     }
                     ExtensionLookup::Missing => {}
@@ -4703,7 +4902,7 @@ impl<'a> Lowerer<'a> {
                 // attribute. Bind the lazy ABI loader exactly like the
                 // non-late branch does.
                 match self.find_extension(&submodule) {
-                    ExtensionLookup::Found(path) => {
+                    ExtensionLookup::Found { path, .. } => {
                         self.extension_aliases.insert(
                             binding.to_string(),
                             ExtensionAlias {
@@ -4719,6 +4918,12 @@ impl<'a> Lowerer<'a> {
                             self.error_incompatible_extension(alias.range, &path, &reason);
                         }
                     }
+                    ExtensionLookup::Ambiguous { paths } => {
+                        self.error_ambiguous_extension(alias.range, &paths);
+                    }
+                    ExtensionLookup::PackageInit { path, reason } => {
+                        self.error_package_init_extension(alias.range, &path, &reason);
+                    }
                     ExtensionLookup::Missing => {
                         self.bind_user_global(binding, imported, member);
                     }
@@ -4728,7 +4933,7 @@ impl<'a> Lowerer<'a> {
         }
 
         match self.find_extension(imported) {
-            ExtensionLookup::Found(path) => {
+            ExtensionLookup::Found { path, .. } => {
                 let path = path.to_string_lossy().into_owned();
                 self.collect_extension_members(s, &path, nested);
             }
@@ -4762,6 +4967,12 @@ impl<'a> Lowerer<'a> {
             }
             ExtensionLookup::Incompatible { path, reason } => {
                 self.error_incompatible_extension(s.range, &path, &reason);
+            }
+            ExtensionLookup::Ambiguous { paths } => {
+                self.error_ambiguous_extension(s.range, &paths);
+            }
+            ExtensionLookup::PackageInit { path, reason } => {
+                self.error_package_init_extension(s.range, &path, &reason);
             }
             ExtensionLookup::Missing if self.may_defer_at(imported, nested) => {
                 // The loader never probed this module, so it may simply not be
@@ -4824,10 +5035,21 @@ impl<'a> Lowerer<'a> {
             let submodule = format!("{imported}.{member}");
             // `from pkg import ext` names a compiled extension submodule: the
             // binding is the module itself, resolved through its shared object.
-            if let ExtensionLookup::Found(path) = self.find_extension(&submodule) {
-                let path = path.to_string_lossy().into_owned();
-                self.record_optional_import(statement, binding, &submodule, None, Some(&path));
-                continue;
+            match self.find_extension(&submodule) {
+                ExtensionLookup::Found { path, .. } => {
+                    let path = path.to_string_lossy().into_owned();
+                    self.record_optional_import(statement, binding, &submodule, None, Some(&path));
+                    continue;
+                }
+                ExtensionLookup::Ambiguous { paths } => {
+                    self.error_ambiguous_extension(alias.range, &paths);
+                    continue;
+                }
+                ExtensionLookup::PackageInit { path, reason } => {
+                    self.error_package_init_extension(alias.range, &path, &reason);
+                    continue;
+                }
+                ExtensionLookup::Incompatible { .. } | ExtensionLookup::Missing => {}
             }
             // `from ext import member` names an attribute of a compiled
             // extension. The runtime loads the shared object lazily and reports
@@ -4836,8 +5058,16 @@ impl<'a> Lowerer<'a> {
                 || self.is_initializing_ancestor(imported)
                 || self.late_modules.contains(imported);
             let module_path = match self.find_extension(imported) {
-                ExtensionLookup::Found(path) if !base_is_unit => {
+                ExtensionLookup::Found { path, .. } if !base_is_unit => {
                     Some(path.to_string_lossy().into_owned())
+                }
+                ExtensionLookup::Ambiguous { paths } if !base_is_unit => {
+                    self.error_ambiguous_extension(alias.range, &paths);
+                    None
+                }
+                ExtensionLookup::PackageInit { path, reason } if !base_is_unit => {
+                    self.error_package_init_extension(alias.range, &path, &reason);
+                    None
                 }
                 _ => None,
             };
@@ -5138,6 +5368,25 @@ impl<'a> Lowerer<'a> {
                 "compiled extension '{}' is incompatible: {reason}",
                 path.display()
             ),
+        );
+    }
+
+    /// Reports two artifact kinds claiming the same import name in one
+    /// directory. Names every matching file in sorted order.
+    fn error_ambiguous_extension(&mut self, range: TextRange, paths: &[PathBuf]) {
+        self.error_at_code(
+            range,
+            codes::UNSUPPORTED,
+            ambiguous_artifacts_message(paths),
+        );
+    }
+
+    /// Reports an HNA artifact that would provide a package `__init__`.
+    fn error_package_init_extension(&mut self, range: TextRange, path: &Path, reason: &str) {
+        self.error_at_code(
+            range,
+            codes::UNSUPPORTED,
+            package_init_artifact_message(path, reason),
         );
     }
 
@@ -5512,8 +5761,15 @@ impl<'a> Lowerer<'a> {
 
     /// Lowers `ext.member(...)` / `member(...)` for a compiled extension.
     ///
-    /// Keyword arguments are not supported by the extension ABI yet; the call
-    /// itself is checked at runtime by `hydro_extension_call`.
+    /// A positional-only call keeps the direct `Callee::Extension` shape and
+    /// is checked at runtime by `hydro_extension_call`. A call with named
+    /// keywords has no static signature to bind against, so it goes through
+    /// the general function-value protocol: the member lowers to
+    /// [`HExprKind::ExtensionAttr`] and the call to [`HExprKind::CallKw`],
+    /// which codegen forwards to `hydro_call_kw` (the runtime resolves the
+    /// extension/HNA function value and binds the keywords). A `*`/`**`
+    /// operand is intercepted by the dynamic-call path before this helper;
+    /// the defensive fallback here keeps the deferred shape.
     fn extension_call(
         &mut self,
         path: &str,
@@ -5523,31 +5779,42 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> HExpr {
-        if !call.keywords.is_empty() {
-            self.error_at_code(
-                call.range,
-                codes::CALL,
-                format!("keyword arguments are not supported for extension function '{member}'"),
-            );
-            return self.error_expr(call.range);
-        }
-        let mut args = Vec::with_capacity(call.args.len());
-        for arg in &call.args {
-            args.push(self.expr(arg, fs));
-        }
-        HExpr {
-            kind: HExprKind::Call {
-                callee: Callee::Extension {
-                    path: path.to_string(),
-                    member: member.to_string(),
+        if call.keywords.is_empty() {
+            let mut args = Vec::with_capacity(call.args.len());
+            for arg in &call.args {
+                args.push(self.expr(arg, fs));
+            }
+            return HExpr {
+                kind: HExprKind::Call {
+                    callee: Callee::Extension {
+                        path: path.to_string(),
+                        member: member.to_string(),
+                    },
+                    args,
                 },
-                args,
-            },
-            // Extensions expose no static types; the result is dynamic.
-            ty: Ty::Concrete(Type::Any),
-            line,
-            col,
+                // Extensions expose no static types; the result is dynamic.
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            };
         }
+        if call_has_dynamic_arguments(call) {
+            return self.lower_deferred_call(call, fs, line, col);
+        }
+        let (callee_line, callee_col) = self.span(call.func.range());
+        let callee = HExpr {
+            kind: HExprKind::ExtensionAttr {
+                path: path.to_string(),
+                member: member.to_string(),
+            },
+            ty: Ty::Concrete(Type::Any),
+            line: callee_line,
+            col: callee_col,
+        };
+        let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+            return self.error_expr(call.range);
+        };
+        result
     }
 
     /// Resolves the base of an attribute chain to an imported module.
@@ -5998,8 +6265,15 @@ impl<'a> Lowerer<'a> {
         let Some(scope) = &self.method_capture_scope else {
             return Vec::new();
         };
+        // Assignment expressions inside generator expressions bind in the
+        // method itself, so they are local even when the enclosing scope (the
+        // class body's function) has a local of the same name.
+        let genexp_walrus: HashSet<String> = genexp_walrus_targets(decl.body).into_iter().collect();
         let mut plan = Vec::new();
         for name in function_free_names(decl.body, decl.args) {
+            if genexp_walrus.contains(&name) {
+                continue;
+            }
             if let Some(cell) = scope.get(&name) {
                 plan.push((name, *cell));
             }
@@ -6185,6 +6459,18 @@ impl<'a> Lowerer<'a> {
         // value from creation time.
         collect_lambda_needed(decl.body, &mut needed);
         needed.extend(self.nested_function_template_names(decl.body));
+        // `(target := value)` inside a generator expression binds here, not in
+        // the generator frame (CPython skips comprehension scopes), and the
+        // frame writes it through a cell. The cell must exist from the first
+        // statement on, so plan it like any other captured-and-mutated local.
+        for name in genexp_walrus_targets(decl.body) {
+            if scope_globals.contains(&name) || nonlocal_names.contains(&name) {
+                continue;
+            }
+            bound.insert(name.clone());
+            mutated.insert(name.clone());
+            needed.insert(name);
+        }
         let owned = bound
             .iter()
             .filter(|name| {
@@ -6269,17 +6555,23 @@ impl<'a> Lowerer<'a> {
     fn register_class<'s>(&mut self, s: &'s ast::StmtClassDef) -> ClassPlan {
         let class = s.name.to_string();
         self.class_names.insert(class.clone());
-        // `@dataclass` is consumed at compile time: the frontend only needs
-        // to recognise the imported name to synthesize `__init__`. Every other
-        // class decorator is evaluated and applied at runtime, bottom-up, in
-        // source order. `@overload` is a type-only marker and `@rich_repr`
-        // would install a generated `__repr__` that Hydro cannot synthesize,
-        // so it is diagnosed instead of being silently ignored.
+        // `@dataclass` and `@dataclass(...)` are consumed at compile time: the
+        // frontend only needs to recognise the imported name to synthesize
+        // `__init__` (the decorator call's arguments are never evaluated).
+        // Every other class decorator is evaluated and applied at runtime,
+        // bottom-up, in source order. `@overload` is a type-only marker and
+        // `@rich_repr` would install a generated `__repr__` that Hydro cannot
+        // synthesize, so it is diagnosed instead of being silently ignored.
         let mut is_dataclass = false;
+        let mut dataclass_init = true;
         let mut decorators = Vec::new();
         for (index, decorator) in s.decorator_list.iter().enumerate() {
             if self.is_dataclass_decorator(decorator) {
                 is_dataclass = true;
+                // `@dataclass(init=False)` keeps the class's own (or
+                // inherited) `__init__`; several dataclass decorators on one
+                // class only synthesize when all of them allow it.
+                dataclass_init &= self.dataclass_decorator_options(decorator).init;
             } else if is_overload_decorator(decorator) {
                 // Type-only class stub; no runtime effect.
             } else if is_pytest_decorator(decorator) {
@@ -6373,6 +6665,11 @@ impl<'a> Lowerer<'a> {
                     if !seen.insert(field.clone()) {
                         continue;
                     }
+                    // A `ClassVar` annotation is a class attribute, never an
+                    // `__init__` parameter.
+                    if self.is_classvar_annotation(&ann.annotation) {
+                        continue;
+                    }
                     let ty = self.annotation_ty(&ann.annotation);
                     let default = if is_dataclass || is_namedtuple {
                         match ann.value.as_deref() {
@@ -6401,7 +6698,8 @@ impl<'a> Lowerer<'a> {
             // A named target is a class member: a bare annotation is a
             // dataclass/NamedTuple field (and plain annotation elsewhere), an
             // annotated assignment is a field plus a frozen class attribute,
-            // and a plain assignment is a frozen class attribute.
+            // and a plain assignment is a frozen class attribute. A `ClassVar`
+            // annotation only declares a class attribute, never a field.
             if let ast::Stmt::AnnAssign(ann) = stmt {
                 let ast::Expr::Name(target) = &*ann.target else {
                     self.error_at(
@@ -6420,6 +6718,10 @@ impl<'a> Lowerer<'a> {
                     continue;
                 }
                 let ty = self.annotation_ty(&ann.annotation);
+                // A `ClassVar` annotation declares a class attribute, not a
+                // dataclass field: CPython's `dataclasses` skips it, so the
+                // synthesized `__init__` never takes it as a parameter.
+                let is_classvar = self.is_classvar_annotation(&ann.annotation);
                 // Only a synthesized `__init__` consumes defaults; plain
                 // classes keep their frozen class attributes untouched.
                 let default = if is_dataclass || is_namedtuple {
@@ -6430,11 +6732,13 @@ impl<'a> Lowerer<'a> {
                 } else {
                     FieldDefault::Required
                 };
-                fields.push(DataclassField {
-                    name: target.id.as_str(),
-                    ty,
-                    default,
-                });
+                if !is_classvar {
+                    fields.push(DataclassField {
+                        name: target.id.as_str(),
+                        ty,
+                        default,
+                    });
+                }
                 if ann.value.is_some() {
                     attributes.push((field, idx));
                 }
@@ -6632,9 +6936,10 @@ impl<'a> Lowerer<'a> {
         self.register_nested_classes(&s.body);
 
         // A dataclass or class-form NamedTuple gets an ordinary `__init__`
-        // unless it declares its own. Only annotated fields take part; methods
-        // and class attributes never become parameters.
-        if (is_dataclass || is_namedtuple)
+        // unless it declares its own or the decorator passes `init=False`.
+        // Only annotated fields take part; methods and class attributes never
+        // become parameters.
+        if ((is_dataclass && dataclass_init) || is_namedtuple)
             && !methods
                 .iter()
                 .any(|method| method.name.as_str() == "__init__")
@@ -6787,11 +7092,12 @@ impl<'a> Lowerer<'a> {
 
     /// Whether a class decorator is the stdlib `dataclass` decorator.
     ///
-    /// Only the imported name is recognised (`from dataclasses import
-    /// dataclass [as name]`, or `import dataclasses` plus
-    /// `@dataclasses.dataclass`). Parametrized forms (`@dataclass(frozen=True)`)
-    /// are recognised by their callee and their arguments are never evaluated.
-    /// An unresolved decorator therefore keeps its "not supported" diagnostic.
+    /// Both the bare form and the parametrized form are recognised: the
+    /// imported name (`from dataclasses import dataclass [as name]`, or
+    /// `import dataclasses` plus `@dataclasses.dataclass`), optionally called
+    /// (`@dataclass()`, `@dataclass(slots=True)`, ...). The decorator call's
+    /// arguments are never evaluated. An unresolved decorator therefore keeps
+    /// its "not supported" diagnostic.
     fn is_dataclass_decorator(&self, expr: &ast::Expr) -> bool {
         let is_dataclass_member = |name: &str| {
             self.imported_functions
@@ -6822,6 +7128,64 @@ impl<'a> Lowerer<'a> {
                 self.module_aliases
                     .get(module.id.as_str())
                     .is_some_and(|spec| spec.name == "dataclasses")
+            }
+            _ => false,
+        }
+    }
+
+    /// Read the `@dataclass(...)` keyword arguments that affect synthesis.
+    ///
+    /// Only the literal `init=False` is honored; every other option is
+    /// accepted and ignored (see [`DataclassOptions`]). The call's arguments
+    /// are never evaluated, so a non-literal option value keeps the default.
+    fn dataclass_decorator_options(&self, expr: &ast::Expr) -> DataclassOptions {
+        let mut options = DataclassOptions { init: true };
+        let ast::Expr::Call(call) = expr else {
+            return options;
+        };
+        for keyword in &call.keywords {
+            if keyword.arg.as_deref() != Some("init") {
+                continue;
+            }
+            if matches!(
+                &keyword.value,
+                ast::Expr::Constant(constant)
+                    if matches!(&constant.value, ast::Constant::Bool(false))
+            ) {
+                options.init = false;
+            }
+        }
+        options
+    }
+
+    /// Whether an annotation is `ClassVar[...]` (or `typing.ClassVar[...]`).
+    ///
+    /// `ClassVar` declares a class attribute, not a dataclass field, so it
+    /// never becomes an `__init__` parameter or a field local; the annotation
+    /// is otherwise a hint and is not evaluated. Only the imported name is
+    /// recognised, matching [`Self::is_dataclass_decorator`].
+    fn is_classvar_annotation(&self, ann: &ast::Expr) -> bool {
+        let ast::Expr::Subscript(subscript) = ann else {
+            return false;
+        };
+        match &*subscript.value {
+            ast::Expr::Name(name) => {
+                self.imported_constants
+                    .get(name.id.as_str())
+                    .is_some_and(|(module, constant)| {
+                        module.name == "typing" && constant.name == "ClassVar"
+                    })
+            }
+            ast::Expr::Attribute(attr) => {
+                if attr.attr.as_str() != "ClassVar" {
+                    return false;
+                }
+                let ast::Expr::Name(module) = &*attr.value else {
+                    return false;
+                };
+                self.module_aliases
+                    .get(module.id.as_str())
+                    .is_some_and(|spec| spec.name == "typing")
             }
             _ => false,
         }
@@ -7319,6 +7683,10 @@ impl<'a> Lowerer<'a> {
     fn lower_function_body(&mut self, fid: FunctionId, body: &[ast::Stmt]) -> Vec<HStmt> {
         let mut names = Vec::new();
         collect_names(body, &mut names, true);
+        // Assignment expressions inside generator expressions bind in this
+        // scope; their closure cells are planned in
+        // `create_function_with_captures`, which needs an actual slot here.
+        names.extend(genexp_walrus_targets(body));
         let mut globals = HashSet::new();
         collect_scope_globals(body, &mut globals);
         let mut nonlocals = Vec::new();
@@ -7503,6 +7871,10 @@ impl<'a> Lowerer<'a> {
         let mut nested_names = Vec::new();
         collect_names(decl.body, &mut nested_names, true);
         let mut nested_locals: HashSet<String> = nested_names.into_iter().collect();
+        // An assignment expression inside a generator expression in this body
+        // binds in this function, not in the enclosing one, so it must not be
+        // captured even when the enclosing scope holds a local of that name.
+        nested_locals.extend(genexp_walrus_targets(decl.body));
         // Imports inside the nested body resolve through the module binding
         // tables; they must not become captures of a same-named enclosing local.
         collect_import_bindings(decl.body, &mut nested_locals);
@@ -7763,16 +8135,14 @@ impl<'a> Lowerer<'a> {
                 Some(local) => local.ty,
                 None => Ty::Concrete(Type::Any),
             };
+            // A closure-cell binding stores the cell object in its slot, so
+            // the published value is the cell's contents.
+            let value = self.local_read(fs, local, ty, line, col);
             out.push(HStmt {
                 kind: HStmtKind::GlobalSet {
                     module: self.dunder_name.clone(),
                     name,
-                    value: HExpr {
-                        kind: HExprKind::Local(local),
-                        ty,
-                        line,
-                        col,
-                    },
+                    value,
                 },
                 line,
                 col,
@@ -12941,12 +13311,54 @@ impl<'a> Lowerer<'a> {
         // contains one is decided after lowering (`await_frames`).
         let frame_is_async = async_for_clause || fs.is_async;
 
+        // `(target := value)` inside this frame binds in the scope enclosing
+        // the generator expression, never in the frame itself (CPython skips
+        // comprehension scopes). The enclosing function/module/lambda made the
+        // target a closure cell; capture that cell below so the frame writes
+        // it with `CellSet` and the enclosing scope sees the value afterwards.
+        let walrus_targets = {
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            collect_comp_frame_walrus_targets(
+                &c.generators,
+                &[c.elt.as_ref()],
+                false,
+                &mut out,
+                &mut seen,
+            );
+            out
+        };
+        if !walrus_targets.is_empty()
+            && (fs.class_ns.is_some() || (!fs.in_lambda && !self.class_attr_scopes.is_empty()))
+        {
+            // CPython rejects this too: a class body has no closure frame the
+            // comprehension could write. A lambda inside the class body is a
+            // real function scope, so its comprehensions stay legal.
+            self.error_at_code(
+                c.range,
+                codes::UNSUPPORTED,
+                "assignment expression within a comprehension cannot be used in a class body",
+            );
+            return self.error_expr(c.range);
+        }
+
         // Free names read by the generator frame in first-use order. The
         // outermost iterable is evaluated in the enclosing frame, so names it
         // reads nowhere else are not captures. Everything the frame does read
         // from the enclosing scope becomes a parameter.
-        let (capture_names, captures, capture_cells, globals) =
+        let (mut capture_names, mut captures, mut capture_cells, globals) =
             self.comp_captures(&c.generators, &[c.elt.as_ref()], fs, line, col);
+        // A target the frame never reads still has to reach it so the
+        // assignment expression can write the enclosing cell.
+        self.append_comp_walrus_captures(
+            &walrus_targets,
+            fs,
+            &mut capture_names,
+            &mut captures,
+            &mut capture_cells,
+            line,
+            col,
+        );
 
         // The outermost iterable belongs to the enclosing frame.
         let outer_iterable = self.expr(&first.iter, fs);
@@ -13050,6 +13462,7 @@ impl<'a> Lowerer<'a> {
             }],
             &mut gfs,
         );
+        let body = self.prepend_frame_cell_inits(&gfs, body, line, col);
         self.functions[fid as usize].body = body;
         // A frame that awaits is an async generator even without an
         // `async for` clause, e.g. `(await f(x) for x in xs)`.
@@ -13090,13 +13503,46 @@ impl<'a> Lowerer<'a> {
         let Some(first) = generators.first() else {
             return self.error_expr(range);
         };
+        // Assignment-expression targets inside the comprehension bind in the
+        // enclosing scope (see `lower_generator_exp`), which owns their cells.
+        let walrus_targets = {
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            collect_comp_frame_walrus_targets(
+                generators,
+                &kind.elements(),
+                false,
+                &mut out,
+                &mut seen,
+            );
+            out
+        };
+        if !walrus_targets.is_empty()
+            && (fs.class_ns.is_some() || (!fs.in_lambda && !self.class_attr_scopes.is_empty()))
+        {
+            self.error_at_code(
+                range,
+                codes::UNSUPPORTED,
+                "assignment expression within a comprehension cannot be used in a class body",
+            );
+            return self.error_expr(range);
+        }
         // The result is the `await` of the helper, so the enclosing frame
         // awaits as well; a generator expression containing this value is
         // therefore an async generator.
         self.await_frames.insert(fs.fid);
         let result_ty = kind.result_ty();
-        let (capture_names, captures, capture_cells, globals) =
+        let (mut capture_names, mut captures, mut capture_cells, globals) =
             self.comp_captures(generators, &kind.elements(), fs, line, col);
+        self.append_comp_walrus_captures(
+            &walrus_targets,
+            fs,
+            &mut capture_names,
+            &mut captures,
+            &mut capture_cells,
+            line,
+            col,
+        );
         let outer_iterable = self.expr(&first.iter, fs);
 
         let fid = self.functions.len() as FunctionId;
@@ -13285,6 +13731,7 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
+        let helper_body = self.prepend_frame_cell_inits(&cfs, helper_body, line, col);
         self.functions[fid as usize].body = helper_body;
 
         let mut args = Vec::with_capacity(captures.len() + 1);
@@ -13594,6 +14041,82 @@ impl<'a> Lowerer<'a> {
             }
         }
         (capture_names, captures, capture_cells, globals)
+    }
+
+    /// Resolve the closure cell an assignment-expression target inside a
+    /// comprehension writes, when the enclosing scope owns one. A `global`
+    /// target needs no cell (the frame writes the runtime global table), and a
+    /// plain local or capture cannot be written from the frame's own scope.
+    fn comp_walrus_cell(&self, fs: &FuncState, name: &str) -> Option<LocalId> {
+        if fs.is_global(name) {
+            return None;
+        }
+        let local = fs.lookup(name)?;
+        fs.is_cell(local).then_some(local)
+    }
+
+    /// Add a capture parameter for every assignment-expression target the
+    /// generator frame never reads itself but still has to write. A target
+    /// that is already a capture needs nothing: `comp_captures` captured the
+    /// same cell because the read made the name free.
+    #[allow(clippy::too_many_arguments)]
+    fn append_comp_walrus_captures(
+        &self,
+        targets: &[String],
+        fs: &FuncState,
+        capture_names: &mut Vec<String>,
+        captures: &mut Vec<HExpr>,
+        capture_cells: &mut Vec<bool>,
+        line: u32,
+        col: u32,
+    ) {
+        for name in targets {
+            let Some(local) = self.comp_walrus_cell(fs, name) else {
+                continue;
+            };
+            if capture_names.iter().any(|existing| existing == name) {
+                continue;
+            }
+            capture_names.push(name.clone());
+            capture_cells.push(true);
+            captures.push(HExpr {
+                kind: HExprKind::Local(local),
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            });
+        }
+    }
+
+    /// Prepend `CellInit` statements for the cells a synthetic comprehension
+    /// frame owns (capture aliases already reference an enclosing cell and
+    /// need none). The normal lowering path owns no cells; this only covers
+    /// the generator-local fallback in the `NamedExpr` case.
+    fn prepend_frame_cell_inits(
+        &self,
+        fs: &FuncState,
+        mut body: Vec<HStmt>,
+        line: u32,
+        col: u32,
+    ) -> Vec<HStmt> {
+        let mut owned: Vec<LocalId> = fs.cells.difference(&fs.cell_aliases).copied().collect();
+        owned.sort_unstable();
+        if owned.is_empty() {
+            return body;
+        }
+        let mut init = Vec::with_capacity(owned.len() + body.len());
+        for target in owned {
+            init.push(HStmt {
+                kind: HStmtKind::CellInit {
+                    target,
+                    value: None,
+                },
+                line,
+                col,
+            });
+        }
+        init.append(&mut body);
+        init
     }
 
     /// Restore the bindings shadowed by a comprehension. Reversed so that a
@@ -15983,15 +16506,42 @@ impl<'a> Lowerer<'a> {
                     };
                 }
                 if fs.genexp_frame {
-                    // CPython binds the target in the enclosing function; a
-                    // generator frame cannot write there, so binding locally
-                    // would silently hide the assignment.
-                    self.error_at_code(
-                        n.range,
-                        codes::UNSUPPORTED,
-                        "assignment expressions inside a generator expression are not supported",
-                    );
-                    return self.error_expr(e.range());
+                    // A comprehension frame cannot write an enclosing plain
+                    // local. Every `(target := value)` target is planned as a
+                    // closure cell of the enclosing scope by
+                    // `genexp_walrus_targets`, and the frame captured that
+                    // cell, so the store goes through `CellSet` and the
+                    // enclosing scope observes the value after the generator
+                    // expression (CPython skips comprehension scopes).
+                    //
+                    // If no cell reached this frame (a synthetic scope lowered
+                    // without a cell plan, such as a dataclass field default),
+                    // bind a frame-owned cell instead: the value stays visible
+                    // inside the rest of the frame, but not to the enclosing
+                    // scope. The divergence is confined to those scopes.
+                    let value = self.expr(&n.value, fs);
+                    let local = match fs.lookup(name) {
+                        Some(local) if fs.is_cell(local) => local,
+                        _ => {
+                            let local = self.functions[fs.fid as usize].locals.len() as LocalId;
+                            self.functions[fs.fid as usize].locals.push(HLocal {
+                                name: name.to_string(),
+                                ty: Ty::Concrete(Type::Any),
+                            });
+                            fs.locals.insert(name.to_string(), local);
+                            fs.cells.insert(local);
+                            local
+                        }
+                    };
+                    return HExpr {
+                        kind: HExprKind::CellSet {
+                            target: local,
+                            value: Box::new(value),
+                        },
+                        ty: self.infer.fresh(),
+                        line,
+                        col,
+                    };
                 }
                 // The value is evaluated before the binding takes effect, so
                 // `x := x + 1` reads the existing local; for a fresh name the
@@ -16134,10 +16684,19 @@ impl<'a> Lowerer<'a> {
         // there is nothing to capture there. A comprehension target is the
         // exception: it is a private synthetic slot of the module frame (named
         // `$comp…`), so a lambda inside the comprehension closes over it.
+        // Assignment expressions in the lambda body make their targets local
+        // to the lambda (Python's compiler treats every assignment target as a
+        // local), including targets inside generator expressions. Such a name
+        // must not become a capture even when the body also reads it.
+        let genexp_walrus_names = genexp_walrus_targets_in_expr(&l.body);
+        let genexp_walrus: HashSet<String> = genexp_walrus_names.iter().cloned().collect();
         let mut capture_names = Vec::new();
         let mut capture_locals = Vec::new();
         let mut capture_cells = Vec::new();
         for name in lambda_free_names(l) {
+            if genexp_walrus.contains(&name) {
+                continue;
+            }
             let Some(local) = fs.lookup(&name) else {
                 continue;
             };
@@ -16239,9 +16798,29 @@ impl<'a> Lowerer<'a> {
         }
 
         let fid = self.functions.len() as FunctionId;
-        let mut local_map = HashMap::with_capacity(params.len());
-        for param in &params {
-            local_map.insert(param.name.clone(), param.local);
+        // Assignment-expression targets inside generator expressions in the
+        // lambda body bind in the lambda. Give them a slot and a closure cell
+        // the generated frame can write.
+        let mut owned_cells = Vec::new();
+        for name in &genexp_walrus_names {
+            if let Some(param) = params.iter().find(|param| &param.name == name) {
+                owned_cells.push(param.local);
+                continue;
+            }
+            let local = locals.len() as LocalId;
+            locals.push(HLocal {
+                name: name.clone(),
+                ty: Ty::Concrete(Type::Any),
+            });
+            owned_cells.push(local);
+        }
+        owned_cells.sort_unstable();
+        owned_cells.dedup();
+        let owned_cell_set: HashSet<LocalId> = owned_cells.iter().copied().collect();
+        let param_ids: HashSet<LocalId> = params.iter().map(|param| param.local).collect();
+        let mut local_map = HashMap::with_capacity(locals.len());
+        for (index, local) in locals.iter().enumerate() {
+            local_map.insert(local.name.clone(), index as LocalId);
         }
         self.functions.push(HFunction {
             name: "<lambda>".to_string(),
@@ -16256,15 +16835,17 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
-        // The body is a single expression, so the lambda never rebinds a
-        // local: it owns no cells, but a captured cell stays an alias (the
+        // The lambda body is a single expression, so it owns cells only for
+        // assignment-expression targets; a captured cell stays an alias (the
         // capture slot holds the cell object itself).
 
+        let mut cells = cell_alias_locals.clone();
+        cells.extend(owned_cell_set);
         let mut fs = FuncState {
             fid,
             is_module: false,
             locals: local_map,
-            cells: cell_alias_locals.clone(),
+            cells,
             cell_aliases: cell_alias_locals,
             comp_shadowed: HashMap::new(),
             type_param_locals: HashMap::new(),
@@ -16278,11 +16859,35 @@ impl<'a> Lowerer<'a> {
         };
         let value = self.expr(&l.body, &mut fs);
         let (body_line, body_col) = self.span(l.body.range());
-        self.functions[fid as usize].body = vec![HStmt {
+        let mut body = vec![HStmt {
             kind: HStmtKind::Return(Some(value)),
             line: body_line,
             col: body_col,
         }];
+        if !owned_cells.is_empty() {
+            let mut init = Vec::with_capacity(owned_cells.len() + body.len());
+            for target in &owned_cells {
+                // A parameter that an assignment expression rebinds starts
+                // with its argument value; every other cell starts unbound.
+                let value = param_ids.contains(target).then_some(HExpr {
+                    kind: HExprKind::Local(*target),
+                    ty: Ty::Concrete(Type::Any),
+                    line: body_line,
+                    col: body_col,
+                });
+                init.push(HStmt {
+                    kind: HStmtKind::CellInit {
+                        target: *target,
+                        value,
+                    },
+                    line: body_line,
+                    col: body_col,
+                });
+            }
+            init.append(&mut body);
+            body = init;
+        }
+        self.functions[fid as usize].body = body;
 
         let function = self.fid_base + fid;
         if capture_names.is_empty() {
@@ -17560,12 +18165,9 @@ impl<'a> Lowerer<'a> {
                     return self.user_module_call(&module, attr.attr.as_str(), call, fs, line, col);
                 }
                 if let Some(path) = self.resolve_extension_alias(&attr.value, fs) {
-                    // The extension shim ABI passes positional operands only,
-                    // so a keyword call has no binding to reach; it stays
-                    // deferred and raises at runtime.
-                    if !call.keywords.is_empty() {
-                        return self.lower_deferred_call(call, fs, line, col);
-                    }
+                    // A positional call keeps the direct shim ABI; a keyword
+                    // call lowers the member to a function value and binds
+                    // through the runtime call protocol.
                     return self.extension_call(&path, attr.attr.as_str(), call, fs, line, col);
                 }
                 if let Some((module, member, path)) = self.resolve_deferred_import(&call.func, fs) {
@@ -18035,11 +18637,9 @@ impl<'a> Lowerer<'a> {
         }
 
         if let Some((path, member)) = self.imported_extension_members.get(name).cloned() {
-            // The extension shim ABI has no keyword binding, so a keyword
-            // call has to stay deferred (positional shapes call directly).
-            if !call.keywords.is_empty() {
-                return self.lower_deferred_call(call, fs, line, col);
-            }
+            // Positional calls use the shim ABI directly; keyword calls lower
+            // through the member's function value so the runtime binder sees
+            // the keyword names.
             return self.extension_call(&path, &member, call, fs, line, col);
         }
 
@@ -18384,11 +18984,8 @@ impl<'a> Lowerer<'a> {
         }
 
         if let Some(path) = self.extension_stars.first().cloned() {
-            // A lazily resolved extension member (star import) keeps the same
-            // keyword limitation as a statically imported one.
-            if !call.keywords.is_empty() {
-                return self.lower_deferred_call(call, fs, line, col);
-            }
+            // A lazily resolved extension member (star import) uses the same
+            // call shapes as a statically imported one.
             return self.extension_call(&path, name, call, fs, line, col);
         }
 
@@ -18613,11 +19210,10 @@ impl<'a> Lowerer<'a> {
     /// `RuntimeError` when the call executes.
     ///
     /// Ordinary dynamic calls no longer use this node: they lower to
-    /// `IndirectCall`/`CallKw`/`CallFull` so keyword names survive. Only two
-    /// runtime-limited shapes remain: an extension member called with
-    /// keywords (the extension shim ABI has no keyword slot) and a
-    /// coroutine/generator with a dynamic signature called with keywords (the
-    /// runtime builds the fiber from positional arguments only).
+    /// `IndirectCall`/`CallKw`/`CallFull` so keyword names survive. The one
+    /// runtime-limited shape left is a coroutine/generator with a dynamic
+    /// signature called with keywords (the runtime builds the fiber from
+    /// positional arguments only).
     fn lower_deferred_call(
         &mut self,
         call: &ast::ExprCall,
@@ -22598,6 +23194,15 @@ fn global_assignment_targets(stmt: &ast::Stmt, h: &HStmt) -> Vec<(String, LocalI
             [ast::Expr::Name(name)] => vec![(name.id.to_string(), *target)],
             _ => Vec::new(),
         },
+        // A closure-cell binding (`name` is a cell of the module frame) stores
+        // through `CellAssign` but still publishes the value, like a plain
+        // assignment.
+        (ast::Stmt::Assign(s), HStmtKind::CellAssign { target, .. }) => {
+            match s.targets.as_slice() {
+                [ast::Expr::Name(name)] => vec![(name.id.to_string(), *target)],
+                _ => Vec::new(),
+            }
+        }
         (ast::Stmt::Assign(s), HStmtKind::Unpack { targets, .. }) => {
             let [target] = s.targets.as_slice() else {
                 return Vec::new();
@@ -22610,7 +23215,15 @@ fn global_assignment_targets(stmt: &ast::Stmt, h: &HStmt) -> Vec<(String, LocalI
             ast::Expr::Name(name) => vec![(name.id.to_string(), *target)],
             _ => Vec::new(),
         },
+        (ast::Stmt::AnnAssign(s), HStmtKind::CellAssign { target, .. }) => match &*s.target {
+            ast::Expr::Name(name) => vec![(name.id.to_string(), *target)],
+            _ => Vec::new(),
+        },
         (ast::Stmt::AugAssign(s), HStmtKind::AugAssign { target, .. }) => match &*s.target {
+            ast::Expr::Name(name) => vec![(name.id.to_string(), *target)],
+            _ => Vec::new(),
+        },
+        (ast::Stmt::AugAssign(s), HStmtKind::CellAssign { target, .. }) => match &*s.target {
             ast::Expr::Name(name) => vec![(name.id.to_string(), *target)],
             _ => Vec::new(),
         },
@@ -22669,6 +23282,9 @@ fn collect_unpack_binding_name(
 ) {
     match (source, target) {
         (ast::Expr::Name(name), HUnpackTarget::Name(local)) => {
+            out.push((name.id.to_string(), *local));
+        }
+        (ast::Expr::Name(name), HUnpackTarget::Cell(local)) => {
             out.push((name.id.to_string(), *local));
         }
         (ast::Expr::Starred(star), HUnpackTarget::Star(inner)) => {
@@ -23726,6 +24342,427 @@ fn collect_comp_target_names(target: &ast::Expr, bound: &mut HashSet<String>) {
         }
         ast::Expr::Starred(s) => collect_comp_target_names(&s.value, bound),
         _ => {}
+    }
+}
+
+/// Names bound by an assignment expression (`:=`) inside a generator
+/// expression anywhere in `stmts`, in first-use order.
+///
+/// CPython binds such a target in the nearest enclosing function, lambda or
+/// module scope, skipping every comprehension scope. The synthetic generator
+/// frame therefore cannot own the binding: it must write through a closure
+/// cell of the enclosing scope. This pass runs before the enclosing body is
+/// lowered so that scope owns the cell from its first statement (an earlier
+/// plain assignment to the same name would otherwise overwrite the cell
+/// object), and the result feeds the cell plan in
+/// [`Lowerer::create_function_with_captures`], the slot registration in
+/// [`Lowerer::lower_function_body`] and [`Lowerer::lower_module`].
+///
+/// Nested `def`/`class`/`lambda` scopes are not entered: an assignment
+/// expression there binds in that inner scope, which runs this pass over its
+/// own body.
+fn genexp_walrus_targets(stmts: &[ast::Stmt]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for stmt in stmts {
+        collect_genexp_walrus_stmt(stmt, &mut out, &mut seen);
+    }
+    out
+}
+
+/// [`genexp_walrus_targets`] for a lambda body: a lambda is its own closure
+/// scope, so a generator expression in its single expression binds there.
+fn genexp_walrus_targets_in_expr(expr: &ast::Expr) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    collect_genexp_walrus_expr(expr, false, &mut out, &mut seen);
+    out
+}
+
+fn collect_genexp_walrus_stmt(stmt: &ast::Stmt, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    match stmt {
+        // A definition's decorators and annotations are evaluated in this
+        // scope; its body is a separate scope handled by its own lowering
+        // pass, and parameter defaults use their own module-like scope.
+        ast::Stmt::FunctionDef(f) => {
+            for decorator in &f.decorator_list {
+                collect_genexp_walrus_expr(decorator, false, out, seen);
+            }
+            collect_genexp_walrus_args(&f.args, out, seen);
+            if let Some(returns) = &f.returns {
+                collect_genexp_walrus_expr(returns, false, out, seen);
+            }
+        }
+        ast::Stmt::AsyncFunctionDef(f) => {
+            for decorator in &f.decorator_list {
+                collect_genexp_walrus_expr(decorator, false, out, seen);
+            }
+            collect_genexp_walrus_args(&f.args, out, seen);
+            if let Some(returns) = &f.returns {
+                collect_genexp_walrus_expr(returns, false, out, seen);
+            }
+        }
+        ast::Stmt::ClassDef(c) => {
+            for decorator in &c.decorator_list {
+                collect_genexp_walrus_expr(decorator, false, out, seen);
+            }
+            for base in &c.bases {
+                collect_genexp_walrus_expr(base, false, out, seen);
+            }
+            for keyword in &c.keywords {
+                collect_genexp_walrus_expr(&keyword.value, false, out, seen);
+            }
+        }
+        ast::Stmt::Return(s) => {
+            if let Some(value) = &s.value {
+                collect_genexp_walrus_expr(value, false, out, seen);
+            }
+        }
+        ast::Stmt::Delete(s) => {
+            for target in &s.targets {
+                collect_genexp_walrus_expr(target, false, out, seen);
+            }
+        }
+        ast::Stmt::Assign(s) => {
+            for target in &s.targets {
+                collect_genexp_walrus_expr(target, false, out, seen);
+            }
+            collect_genexp_walrus_expr(&s.value, false, out, seen);
+        }
+        ast::Stmt::AugAssign(s) => {
+            collect_genexp_walrus_expr(&s.target, false, out, seen);
+            collect_genexp_walrus_expr(&s.value, false, out, seen);
+        }
+        ast::Stmt::AnnAssign(s) => {
+            collect_genexp_walrus_expr(&s.target, false, out, seen);
+            collect_genexp_walrus_expr(&s.annotation, false, out, seen);
+            if let Some(value) = &s.value {
+                collect_genexp_walrus_expr(value, false, out, seen);
+            }
+        }
+        ast::Stmt::TypeAlias(s) => {
+            collect_genexp_walrus_expr(&s.name, false, out, seen);
+            collect_genexp_walrus_expr(&s.value, false, out, seen);
+        }
+        ast::Stmt::For(s) => {
+            collect_genexp_walrus_expr(&s.iter, false, out, seen);
+            collect_genexp_walrus_expr(&s.target, false, out, seen);
+            collect_genexp_walrus_stmts(&s.body, out, seen);
+            collect_genexp_walrus_stmts(&s.orelse, out, seen);
+        }
+        ast::Stmt::AsyncFor(s) => {
+            collect_genexp_walrus_expr(&s.iter, false, out, seen);
+            collect_genexp_walrus_expr(&s.target, false, out, seen);
+            collect_genexp_walrus_stmts(&s.body, out, seen);
+            collect_genexp_walrus_stmts(&s.orelse, out, seen);
+        }
+        ast::Stmt::While(s) => {
+            collect_genexp_walrus_expr(&s.test, false, out, seen);
+            collect_genexp_walrus_stmts(&s.body, out, seen);
+            collect_genexp_walrus_stmts(&s.orelse, out, seen);
+        }
+        ast::Stmt::If(s) => {
+            collect_genexp_walrus_expr(&s.test, false, out, seen);
+            collect_genexp_walrus_stmts(&s.body, out, seen);
+            collect_genexp_walrus_stmts(&s.orelse, out, seen);
+        }
+        ast::Stmt::With(s) => {
+            for item in &s.items {
+                collect_genexp_walrus_expr(&item.context_expr, false, out, seen);
+                if let Some(target) = &item.optional_vars {
+                    collect_genexp_walrus_expr(target, false, out, seen);
+                }
+            }
+            collect_genexp_walrus_stmts(&s.body, out, seen);
+        }
+        ast::Stmt::AsyncWith(s) => {
+            for item in &s.items {
+                collect_genexp_walrus_expr(&item.context_expr, false, out, seen);
+                if let Some(target) = &item.optional_vars {
+                    collect_genexp_walrus_expr(target, false, out, seen);
+                }
+            }
+            collect_genexp_walrus_stmts(&s.body, out, seen);
+        }
+        ast::Stmt::Match(s) => {
+            collect_genexp_walrus_expr(&s.subject, false, out, seen);
+            for case in &s.cases {
+                if let Some(guard) = &case.guard {
+                    collect_genexp_walrus_expr(guard, false, out, seen);
+                }
+                collect_genexp_walrus_stmts(&case.body, out, seen);
+            }
+        }
+        ast::Stmt::Raise(s) => {
+            if let Some(exc) = &s.exc {
+                collect_genexp_walrus_expr(exc, false, out, seen);
+            }
+            if let Some(cause) = &s.cause {
+                collect_genexp_walrus_expr(cause, false, out, seen);
+            }
+        }
+        ast::Stmt::Try(s) => {
+            collect_genexp_walrus_stmts(&s.body, out, seen);
+            for handler in &s.handlers {
+                let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                collect_genexp_walrus_stmts(&handler.body, out, seen);
+            }
+            collect_genexp_walrus_stmts(&s.orelse, out, seen);
+            collect_genexp_walrus_stmts(&s.finalbody, out, seen);
+        }
+        ast::Stmt::TryStar(s) => {
+            collect_genexp_walrus_stmts(&s.body, out, seen);
+            for handler in &s.handlers {
+                let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                collect_genexp_walrus_stmts(&handler.body, out, seen);
+            }
+            collect_genexp_walrus_stmts(&s.orelse, out, seen);
+            collect_genexp_walrus_stmts(&s.finalbody, out, seen);
+        }
+        ast::Stmt::Assert(s) => {
+            collect_genexp_walrus_expr(&s.test, false, out, seen);
+            if let Some(msg) = &s.msg {
+                collect_genexp_walrus_expr(msg, false, out, seen);
+            }
+        }
+        ast::Stmt::Expr(s) => collect_genexp_walrus_expr(&s.value, false, out, seen),
+        ast::Stmt::Import(_)
+        | ast::Stmt::ImportFrom(_)
+        | ast::Stmt::Global(_)
+        | ast::Stmt::Nonlocal(_)
+        | ast::Stmt::Pass(_)
+        | ast::Stmt::Break(_)
+        | ast::Stmt::Continue(_) => {}
+    }
+}
+
+fn collect_genexp_walrus_stmts(
+    stmts: &[ast::Stmt],
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    for stmt in stmts {
+        collect_genexp_walrus_stmt(stmt, out, seen);
+    }
+}
+
+fn collect_genexp_walrus_args(
+    args: &ast::Arguments,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    // Defaults are lowered in their own module-like scope (see
+    // `Lowerer::lowered_default`), so a generator expression there binds in
+    // that synthetic scope, not in this function. Annotations are evaluated
+    // where the definition runs, so they stay in this walk.
+    for arg in args
+        .posonlyargs
+        .iter()
+        .chain(args.args.iter())
+        .chain(args.kwonlyargs.iter())
+    {
+        collect_genexp_walrus_arg(&arg.def, out, seen);
+    }
+    for arg in [args.vararg.as_deref(), args.kwarg.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        collect_genexp_walrus_arg(arg, out, seen);
+    }
+}
+
+fn collect_genexp_walrus_arg(arg: &ast::Arg, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    if let Some(annotation) = &arg.annotation {
+        collect_genexp_walrus_expr(annotation, false, out, seen);
+    }
+}
+
+/// Walk one expression, recording every assignment-expression target that is
+/// evaluated inside a comprehension frame. `in_genexp` is true once the walk
+/// has entered a generator expression's frame.
+fn collect_genexp_walrus_expr(
+    expr: &ast::Expr,
+    in_genexp: bool,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match expr {
+        ast::Expr::NamedExpr(n) => {
+            if in_genexp {
+                if let ast::Expr::Name(name) = &*n.target {
+                    if seen.insert(name.id.to_string()) {
+                        out.push(name.id.to_string());
+                    }
+                }
+            }
+            collect_genexp_walrus_expr(&n.value, in_genexp, out, seen);
+        }
+        ast::Expr::GeneratorExp(g) => collect_comp_frame_walrus_targets(
+            &g.generators,
+            &[g.elt.as_ref()],
+            in_genexp,
+            out,
+            seen,
+        ),
+        ast::Expr::ListComp(c) => collect_inline_comp_walrus_targets(
+            &c.generators,
+            &[c.elt.as_ref()],
+            in_genexp,
+            out,
+            seen,
+        ),
+        ast::Expr::SetComp(c) => collect_inline_comp_walrus_targets(
+            &c.generators,
+            &[c.elt.as_ref()],
+            in_genexp,
+            out,
+            seen,
+        ),
+        ast::Expr::DictComp(c) => collect_inline_comp_walrus_targets(
+            &c.generators,
+            &[c.key.as_ref(), c.value.as_ref()],
+            in_genexp,
+            out,
+            seen,
+        ),
+        ast::Expr::BinOp(b) => {
+            collect_genexp_walrus_expr(&b.left, in_genexp, out, seen);
+            collect_genexp_walrus_expr(&b.right, in_genexp, out, seen);
+        }
+        ast::Expr::UnaryOp(u) => collect_genexp_walrus_expr(&u.operand, in_genexp, out, seen),
+        ast::Expr::BoolOp(b) => {
+            for value in &b.values {
+                collect_genexp_walrus_expr(value, in_genexp, out, seen);
+            }
+        }
+        ast::Expr::Compare(c) => {
+            collect_genexp_walrus_expr(&c.left, in_genexp, out, seen);
+            for comparator in &c.comparators {
+                collect_genexp_walrus_expr(comparator, in_genexp, out, seen);
+            }
+        }
+        ast::Expr::Call(c) => {
+            collect_genexp_walrus_expr(&c.func, in_genexp, out, seen);
+            for arg in &c.args {
+                collect_genexp_walrus_expr(arg, in_genexp, out, seen);
+            }
+            for keyword in &c.keywords {
+                collect_genexp_walrus_expr(&keyword.value, in_genexp, out, seen);
+            }
+        }
+        ast::Expr::Attribute(a) => collect_genexp_walrus_expr(&a.value, in_genexp, out, seen),
+        ast::Expr::Subscript(s) => {
+            collect_genexp_walrus_expr(&s.value, in_genexp, out, seen);
+            collect_genexp_walrus_expr(&s.slice, in_genexp, out, seen);
+        }
+        ast::Expr::Slice(s) => {
+            for part in [s.lower.as_deref(), s.upper.as_deref(), s.step.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                collect_genexp_walrus_expr(part, in_genexp, out, seen);
+            }
+        }
+        ast::Expr::Tuple(t) => {
+            for elem in &t.elts {
+                collect_genexp_walrus_expr(elem, in_genexp, out, seen);
+            }
+        }
+        ast::Expr::List(l) => {
+            for elem in &l.elts {
+                collect_genexp_walrus_expr(elem, in_genexp, out, seen);
+            }
+        }
+        ast::Expr::Set(s) => {
+            for elem in &s.elts {
+                collect_genexp_walrus_expr(elem, in_genexp, out, seen);
+            }
+        }
+        ast::Expr::Dict(d) => {
+            for (key, value) in d.keys.iter().zip(d.values.iter()) {
+                if let Some(key) = key {
+                    collect_genexp_walrus_expr(key, in_genexp, out, seen);
+                }
+                collect_genexp_walrus_expr(value, in_genexp, out, seen);
+            }
+        }
+        ast::Expr::IfExp(i) => {
+            collect_genexp_walrus_expr(&i.test, in_genexp, out, seen);
+            collect_genexp_walrus_expr(&i.body, in_genexp, out, seen);
+            collect_genexp_walrus_expr(&i.orelse, in_genexp, out, seen);
+        }
+        ast::Expr::Await(a) => collect_genexp_walrus_expr(&a.value, in_genexp, out, seen),
+        ast::Expr::Yield(y) => {
+            if let Some(value) = &y.value {
+                collect_genexp_walrus_expr(value, in_genexp, out, seen);
+            }
+        }
+        ast::Expr::YieldFrom(y) => collect_genexp_walrus_expr(&y.value, in_genexp, out, seen),
+        ast::Expr::JoinedStr(s) => {
+            for value in &s.values {
+                collect_genexp_walrus_expr(value, in_genexp, out, seen);
+            }
+        }
+        ast::Expr::FormattedValue(f) => {
+            collect_genexp_walrus_expr(&f.value, in_genexp, out, seen);
+            if let Some(spec) = &f.format_spec {
+                collect_genexp_walrus_expr(spec, in_genexp, out, seen);
+            }
+        }
+        ast::Expr::Starred(s) => collect_genexp_walrus_expr(&s.value, in_genexp, out, seen),
+        // A lambda is its own closure scope: its assignment expressions bind
+        // in the lambda, not here.
+        ast::Expr::Lambda(_) => {}
+        ast::Expr::Constant(_) | ast::Expr::Name(_) => {}
+    }
+}
+
+/// Assignment-expression targets evaluated inside a comprehension that lowers
+/// to its own synthetic frame (a generator expression or an async
+/// comprehension).
+///
+/// Its outermost iterable is evaluated in the enclosing scope before the
+/// frame exists; `nested_frame` says whether that enclosing scope is itself a
+/// comprehension frame (only then does a target there need the shared cell
+/// too). Every later clause and the element run inside the new frame.
+fn collect_comp_frame_walrus_targets(
+    generators: &[ast::Comprehension],
+    elements: &[&ast::Expr],
+    nested_frame: bool,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    for (index, generator) in generators.iter().enumerate() {
+        collect_genexp_walrus_expr(&generator.iter, nested_frame || index > 0, out, seen);
+        collect_genexp_walrus_expr(&generator.target, true, out, seen);
+        for condition in &generator.ifs {
+            collect_genexp_walrus_expr(condition, true, out, seen);
+        }
+    }
+    for element in elements {
+        collect_genexp_walrus_expr(element, true, out, seen);
+    }
+}
+
+/// Like [`collect_comp_frame_walrus_targets`] for a list/set/dict
+/// comprehension: those lower eagerly in the current frame, so every part of
+/// the comprehension stays in the same scope.
+fn collect_inline_comp_walrus_targets(
+    generators: &[ast::Comprehension],
+    elements: &[&ast::Expr],
+    in_genexp: bool,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    for generator in generators {
+        collect_genexp_walrus_expr(&generator.iter, in_genexp, out, seen);
+        collect_genexp_walrus_expr(&generator.target, in_genexp, out, seen);
+        for condition in &generator.ifs {
+            collect_genexp_walrus_expr(condition, in_genexp, out, seen);
+        }
+    }
+    for element in elements {
+        collect_genexp_walrus_expr(element, in_genexp, out, seen);
     }
 }
 

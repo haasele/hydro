@@ -1,6 +1,7 @@
-//! `datetime`: `date`, `time`, `datetime`, `timedelta` and `tzinfo`.
+//! `datetime`: `date`, `time`, `datetime`, `timedelta`, `tzinfo` and
+//! `timezone`.
 //!
-//! The five value classes are cached native classes (registered under
+//! The value classes are cached native classes (registered under
 //! `datetime.*` in the runtime registry, so repeated module lookups and
 //! `type()`/`isinstance()` identity agree). Every instance stores its
 //! components as integer attributes, which keeps attribute reads, `vars()` and
@@ -8,6 +9,11 @@
 //! CPython's ranges and report the usual `TypeError`/`ValueError`/
 //! `OverflowError` wording; keyword calls (`timedelta(days=1)`,
 //! `datetime(2020, 1, 2, tzinfo=...)`) bind the declared parameter names.
+//!
+//! `timezone` is a fixed-offset `tzinfo` subclass storing a `timedelta` and an
+//! optional name. It implements `utcoffset`, `dst`, `tzname`, `fromutc`,
+//! `__repr__`, `__str__` and value equality on the offset; `timezone.utc` is
+//! the zero-offset singleton.
 //!
 //! Supported arithmetic: `date`/`datetime` ± `timedelta`,
 //! `date - date`, `datetime - datetime` and `timedelta ± timedelta`. The
@@ -42,11 +48,16 @@ const TIME_CLASS: &str = "time";
 const DATETIME_CLASS: &str = "datetime";
 const TIMEDELTA_CLASS: &str = "timedelta";
 const TZINFO_CLASS: &str = "tzinfo";
+const TIMEZONE_CLASS: &str = "timezone";
 const DATE_KEY: &str = "datetime.date";
 const TIME_KEY: &str = "datetime.time";
 const DATETIME_KEY: &str = "datetime.datetime";
 const TIMEDELTA_KEY: &str = "datetime.timedelta";
 const TZINFO_KEY: &str = "datetime.tzinfo";
+const TIMEZONE_KEY: &str = "datetime.timezone";
+/// The zero-offset singleton, cached separately so `timezone(timedelta(0))`
+/// can return the same object as `timezone.utc`.
+const TIMEZONE_UTC_KEY: &str = "datetime.timezone.utc";
 
 /// Internal names consumed by the runtime's native dispatch.
 const NOW_METHOD: &str = "_datetime_now";
@@ -71,6 +82,11 @@ const TZNAME_METHOD: &str = "_datetime_tzname";
 const TZINFO_UTCOFFSET_METHOD: &str = "_datetime_tzinfo_utcoffset";
 const TZINFO_DST_METHOD: &str = "_datetime_tzinfo_dst";
 const TZINFO_TZNAME_METHOD: &str = "_datetime_tzinfo_tzname";
+const TIMEZONE_UTCOFFSET_METHOD: &str = "_datetime_timezone_utcoffset";
+const TIMEZONE_DST_METHOD: &str = "_datetime_timezone_dst";
+const TIMEZONE_TZNAME_METHOD: &str = "_datetime_timezone_tzname";
+const TIMEZONE_FROMUTC_METHOD: &str = "_datetime_timezone_fromutc";
+const TIMEZONE_EQ_METHOD: &str = "_datetime_timezone_eq";
 const REPR_METHOD: &str = "_datetime_repr";
 const STR_METHOD: &str = "_datetime_str";
 const EQ_METHOD: &str = "_datetime_eq";
@@ -120,6 +136,7 @@ enum Kind {
     DateTime,
     Timedelta,
     TzInfo,
+    TimeZone,
 }
 
 /// A calendar date.
@@ -215,6 +232,7 @@ fn kind_of(instance: i64) -> Option<Kind> {
         "datetime" => Some(Kind::DateTime),
         "timedelta" => Some(Kind::Timedelta),
         "tzinfo" => Some(Kind::TzInfo),
+        "timezone" => Some(Kind::TimeZone),
         _ => None,
     }
 }
@@ -622,6 +640,39 @@ fn tzinfo_class() -> i64 {
     class
 }
 
+/// The cached `datetime.timezone` class.
+///
+/// A `timezone` is a fixed-offset [`tzinfo`] subclass: its `_offset` attribute
+/// holds a `timedelta` and `_name` holds an optional `str`. `timezone.utc` is
+/// the zero-offset singleton, published as a class attribute.
+fn timezone_class() -> i64 {
+    if let Some(class) = globals::registry_get(TIMEZONE_KEY) {
+        return class;
+    }
+    let methods = [
+        entry(
+            "utcoffset",
+            TIMEZONE_UTCOFFSET_METHOD,
+            2,
+            MethodKind::Normal,
+        ),
+        entry("dst", TIMEZONE_DST_METHOD, 2, MethodKind::Normal),
+        entry("tzname", TIMEZONE_TZNAME_METHOD, 2, MethodKind::Normal),
+        entry("fromutc", TIMEZONE_FROMUTC_METHOD, 2, MethodKind::Normal),
+        entry("__repr__", REPR_METHOD, 1, MethodKind::Normal),
+        entry("__str__", STR_METHOD, 1, MethodKind::Normal),
+        entry("__eq__", TIMEZONE_EQ_METHOD, 2, MethodKind::Normal),
+    ];
+    let class = build_class(TIMEZONE_CLASS, tzinfo_class(), &methods);
+    globals::registry_set(TIMEZONE_KEY, class);
+    // The class is already registered, so building the singleton resolves the
+    // cached class instead of recursing.
+    let utc = timezone_instance(Delta(0), NONE);
+    value::class_set_attr(class, "utc".to_string(), utc);
+    globals::registry_set(TIMEZONE_UTC_KEY, utc);
+    class
+}
+
 /// Which of the module's classes `class` is, from the registry only (never
 /// creating a class).
 fn registered_kind(class: i64) -> Option<Kind> {
@@ -639,6 +690,9 @@ fn registered_kind(class: i64) -> Option<Kind> {
     }
     if globals::registry_get(TZINFO_KEY) == Some(class) {
         return Some(Kind::TzInfo);
+    }
+    if globals::registry_get(TIMEZONE_KEY) == Some(class) {
+        return Some(Kind::TimeZone);
     }
     None
 }
@@ -707,6 +761,30 @@ fn new_timedelta(delta: Delta) -> i64 {
         encode(delta.microseconds()),
     );
     instance
+}
+
+/// Creates one `timezone` instance from a fixed offset and an optional name
+/// (`NONE` means the name is generated from the offset).
+fn timezone_instance(offset: Delta, name: i64) -> i64 {
+    let offset_value = new_timedelta(offset);
+    let class = timezone_class();
+    let instance = value::instance_new(class);
+    value::instance_setattr(instance, "_offset".to_string(), offset_value);
+    value::instance_setattr(instance, "_name".to_string(), name);
+    instance
+}
+
+/// Stored offset of a `timezone` instance.
+fn timezone_offset(instance: i64) -> Option<Delta> {
+    if kind_of(instance) != Some(Kind::TimeZone) {
+        return None;
+    }
+    delta_from_instance(value::instance_attr(instance, "_offset")?)
+}
+
+/// Stored name of a `timezone` instance (`NONE` when auto-generated).
+fn timezone_name(instance: i64) -> i64 {
+    value::instance_attr(instance, "_name").unwrap_or(NONE)
 }
 
 /// Reads a validated `Date` from a `date`/`datetime` instance.
@@ -858,6 +936,10 @@ const TIMEDELTA_PARAMS: [&str; 7] = [
     "weeks",
 ];
 
+/// Slots of `timezone(offset, name=None)`. An omitted `name` generates one
+/// from the offset; an explicit `None` is rejected, like CPython 3.7+.
+const TIMEZONE_PARAMS: [&str; 2] = ["offset", "name"];
+
 /// Binds positional and keyword arguments into one slot per declared parameter.
 fn bind(
     function: &str,
@@ -945,6 +1027,21 @@ fn tzinfo_argument(candidate: i64) -> Result<i64, i64> {
     Err(type_error(
         "tzinfo argument must be None or of a tzinfo subclass",
     ))
+}
+
+/// CPython spells the module's classes with their qualified name in argument
+/// diagnostics (`datetime.timedelta`, not `timedelta`).
+fn argument_type_name(candidate: i64) -> String {
+    match kind_of(candidate) {
+        Some(Kind::Date) => "datetime.date".to_string(),
+        Some(Kind::Time) => "datetime.time".to_string(),
+        Some(Kind::DateTime) => "datetime.datetime".to_string(),
+        Some(Kind::Timedelta) => "datetime.timedelta".to_string(),
+        Some(Kind::TzInfo) => "datetime.tzinfo".to_string(),
+        Some(Kind::TimeZone) => "datetime.timezone".to_string(),
+        None if candidate == NONE => "None".to_string(),
+        None => value::type_name_of(candidate),
+    }
 }
 
 fn fold_argument(slot: Option<i64>) -> Result<i64, i64> {
@@ -1089,6 +1186,44 @@ fn timedelta_from_slots(slots: &[Option<i64>]) -> Result<Delta, i64> {
     delta_from_total(total)
 }
 
+/// Validates `timezone(offset, name=None)` slots.
+fn timezone_from_slots(slots: &[Option<i64>]) -> Result<(Delta, i64), i64> {
+    let Some(candidate) = slots[0] else {
+        return Err(type_error(
+            "timezone() missing required argument 'offset' (pos 1)",
+        ));
+    };
+    if kind_of(candidate) != Some(Kind::Timedelta) {
+        return Err(type_error(&format!(
+            "timezone() argument 1 must be datetime.timedelta, not {}",
+            argument_type_name(candidate)
+        )));
+    }
+    let Some(offset) = delta_from_instance(candidate) else {
+        return Err(invalid_instance("invalid timedelta object"));
+    };
+    if offset.0 <= -MICROS_PER_DAY || offset.0 >= MICROS_PER_DAY {
+        return Err(invalid_instance(&format!(
+            "offset must be a timedelta strictly between -timedelta(hours=24) and \
+             timedelta(hours=24), not {}",
+            delta_repr(offset)
+        )));
+    }
+    let name = match slots[1] {
+        None => NONE,
+        Some(candidate) => {
+            if value::as_str(candidate).is_none() {
+                return Err(type_error(&format!(
+                    "timezone() argument 2 must be str, not {}",
+                    argument_type_name(candidate)
+                )));
+            }
+            candidate
+        }
+    };
+    Ok((offset, name))
+}
+
 fn date_new(args: &[i64], keywords: &[(String, i64)]) -> i64 {
     match bind("date", &DATE_PARAMS, DATE_PARAMS.len(), args, keywords)
         .and_then(|slots| date_from_slots(&slots))
@@ -1144,6 +1279,30 @@ fn tzinfo_new(args: &[i64], keywords: &[(String, i64)]) -> i64 {
     value::instance_new(tzinfo_class())
 }
 
+fn timezone_new(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    match bind(
+        "timezone",
+        &TIMEZONE_PARAMS,
+        TIMEZONE_PARAMS.len(),
+        args,
+        keywords,
+    )
+    .and_then(|slots| timezone_from_slots(&slots))
+    {
+        Ok((offset, name)) => {
+            // CPython folds an unnamed zero offset onto the `timezone.utc`
+            // singleton, so identity (not just equality) matches.
+            if offset.0 == 0 && name == NONE {
+                if let Some(utc) = globals::registry_get(TIMEZONE_UTC_KEY) {
+                    return utc;
+                }
+            }
+            timezone_instance(offset, name)
+        }
+        Err(err) => err,
+    }
+}
+
 /// Runs the constructor of one of the module's value classes, or returns
 /// `None` when `class` is not one of them.
 pub(crate) fn instantiate(class: i64, args: &[i64]) -> Option<i64> {
@@ -1153,6 +1312,7 @@ pub(crate) fn instantiate(class: i64, args: &[i64]) -> Option<i64> {
         Kind::DateTime => datetime_new(args, &[]),
         Kind::Timedelta => timedelta_new(args, &[]),
         Kind::TzInfo => tzinfo_new(args, &[]),
+        Kind::TimeZone => timezone_new(args, &[]),
     })
 }
 
@@ -1164,6 +1324,7 @@ pub(crate) fn instantiate_kw(class: i64, args: &[i64], keywords: &[(String, i64)
         Kind::DateTime => datetime_new(args, keywords),
         Kind::Timedelta => timedelta_new(args, keywords),
         Kind::TzInfo => tzinfo_new(args, keywords),
+        Kind::TimeZone => timezone_new(args, keywords),
     })
 }
 
@@ -1522,14 +1683,18 @@ fn format(parts: &Parts, pattern: &str) -> String {
 // Rendering
 // -------------------------------------------------------------------------
 
-/// `±HH:MM` (or `±HH:MM:SS`) for an offset in microseconds.
+/// `±HH:MM` (or `±HH:MM:SS[.ffffff]`) for an offset in microseconds.
 fn offset_text(offset: i128) -> String {
     let sign = if offset < 0 { '-' } else { '+' };
-    let total_seconds = offset.abs() / i128::from(MICROS_PER_SECOND);
+    let magnitude = offset.abs();
+    let total_seconds = magnitude / i128::from(MICROS_PER_SECOND);
+    let micros = magnitude % i128::from(MICROS_PER_SECOND);
     let hours = total_seconds / 3_600;
     let minutes = (total_seconds % 3_600) / 60;
     let seconds = total_seconds % 60;
-    if seconds == 0 {
+    if micros != 0 {
+        format!("{sign}{hours:02}:{minutes:02}:{seconds:02}.{micros:06}")
+    } else if seconds == 0 {
         format!("{sign}{hours:02}:{minutes:02}")
     } else {
         format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
@@ -1672,6 +1837,36 @@ fn datetime_repr(date: Date, time: Time, tzinfo: i64, fold: i64) -> String {
     out
 }
 
+/// Generated `tzname()` for a fixed offset: `UTC`, or `UTC±HH:MM[:SS]`.
+fn timezone_default_name(offset: Delta) -> String {
+    if offset.0 == 0 {
+        "UTC".to_string()
+    } else {
+        format!("UTC{}", offset_text(offset.0))
+    }
+}
+
+/// `str()` of a `timezone` instance: its name, or the generated one.
+fn timezone_text(offset: Delta, name: i64) -> String {
+    match value::as_str(name) {
+        Some(text) => text.to_string(),
+        None => timezone_default_name(offset),
+    }
+}
+
+/// `repr()` of a `timezone` instance.
+fn timezone_repr(offset: Delta, name: i64) -> String {
+    if name == NONE && offset.0 == 0 {
+        return "datetime.timezone.utc".to_string();
+    }
+    let mut out = format!("datetime.timezone({}", delta_repr(offset));
+    if name != NONE {
+        out.push_str(&format!(", {}", value::repr(name)));
+    }
+    out.push(')');
+    out
+}
+
 /// Text of one instance, `None` when it is not a module value.
 fn render(candidate: i64, repr: bool) -> Option<String> {
     let kind = kind_of(candidate)?;
@@ -1713,6 +1908,15 @@ fn render(candidate: i64, repr: bool) -> Option<String> {
         }
         // CPython's base `tzinfo` has no reader-friendly rendering either.
         Kind::TzInfo => "<datetime.tzinfo object>".to_string(),
+        Kind::TimeZone => {
+            let offset = timezone_offset(candidate)?;
+            let name = timezone_name(candidate);
+            if repr {
+                timezone_repr(offset, name)
+            } else {
+                timezone_text(offset, name)
+            }
+        }
     })
 }
 
@@ -1760,7 +1964,8 @@ fn ordering_of(a: i64, b: i64) -> Option<Ordering> {
             )
         }
         Kind::Timedelta => Some(delta_from_instance(a)?.cmp(&delta_from_instance(b)?)),
-        Kind::TzInfo => None,
+        // `timezone` defines only `__eq__`; ordering is not supported.
+        Kind::TzInfo | Kind::TimeZone => None,
     }
 }
 
@@ -2457,6 +2662,86 @@ fn unknown_zone_method(args: &[i64]) -> i64 {
     NONE
 }
 
+/// `timezone.utcoffset(dt)`/`dst(dt)`/`tzname(dt)`.
+///
+/// The fixed zone ignores the datetime value, but still validates its
+/// argument the way CPython does (a `datetime` or `None`).
+fn timezone_zone_method(args: &[i64], method: &str) -> i64 {
+    if args.len() != 2 {
+        return arity_error(
+            &format!("timezone.{method}"),
+            "exactly 1",
+            args.len().saturating_sub(1),
+        );
+    }
+    let receiver = args[0];
+    let Some(offset) = timezone_offset(receiver) else {
+        return invalid_instance("invalid timezone object");
+    };
+    let argument = args[1];
+    if argument != NONE && kind_of(argument) != Some(Kind::DateTime) {
+        return type_error(&format!(
+            "{method}(dt) argument must be a datetime instance or None, not {}",
+            argument_type_name(argument)
+        ));
+    }
+    match method {
+        "utcoffset" => new_timedelta(offset),
+        "dst" => NONE,
+        _ => {
+            let name = timezone_name(receiver);
+            if name == NONE {
+                value::str_alloc(timezone_default_name(offset))
+            } else {
+                name
+            }
+        }
+    }
+}
+
+/// `timezone.fromutc(dt)`: shift the UTC wall clock by the fixed offset.
+fn timezone_fromutc_method(args: &[i64]) -> i64 {
+    if args.len() != 2 {
+        return arity_error(
+            "timezone.fromutc",
+            "exactly 1",
+            args.len().saturating_sub(1),
+        );
+    }
+    let receiver = args[0];
+    let Some(offset) = timezone_offset(receiver) else {
+        return invalid_instance("invalid timezone object");
+    };
+    let dt = args[1];
+    if kind_of(dt) != Some(Kind::DateTime) {
+        return type_error("fromutc: argument must be a datetime");
+    }
+    if tzinfo_of(dt) != receiver {
+        return invalid_instance("fromutc: dt.tzinfo is not self");
+    }
+    // Adding a duration resets `fold`, matching CPython's `fromutc`.
+    let result = datetime_shift(dt, offset.0);
+    if exc::pending() {
+        return result;
+    }
+    value::instance_setattr(result, "fold".to_string(), encode(0));
+    result
+}
+
+/// `timezone.__eq__`: fixed offsets compare by value, names are ignored.
+fn timezone_eq_method(args: &[i64]) -> i64 {
+    let (Some(left), Some(right)) = (args.first().copied(), args.get(1).copied()) else {
+        return arity_error("comparison", "exactly 2", args.len());
+    };
+    if kind_of(left) != Some(Kind::TimeZone) || kind_of(right) != Some(Kind::TimeZone) {
+        return value::NOT_IMPLEMENTED;
+    }
+    match (timezone_offset(left), timezone_offset(right)) {
+        (Some(left), Some(right)) => value::bool_value(left == right),
+        _ => invalid_instance("invalid timezone object"),
+    }
+}
+
 fn repr_method(args: &[i64]) -> i64 {
     let Some(receiver) = args.first().copied() else {
         return arity_error("__repr__", "exactly 1", args.len());
@@ -2505,6 +2790,11 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         TZINFO_UTCOFFSET_METHOD | TZINFO_DST_METHOD | TZINFO_TZNAME_METHOD => {
             unknown_zone_method(args)
         }
+        TIMEZONE_UTCOFFSET_METHOD => timezone_zone_method(args, "utcoffset"),
+        TIMEZONE_DST_METHOD => timezone_zone_method(args, "dst"),
+        TIMEZONE_TZNAME_METHOD => timezone_zone_method(args, "tzname"),
+        TIMEZONE_FROMUTC_METHOD => timezone_fromutc_method(args),
+        TIMEZONE_EQ_METHOD => timezone_eq_method(args),
         REPR_METHOD => repr_method(args),
         STR_METHOD => str_method(args),
         EQ_METHOD => compare_method(args, OP_EQ),
@@ -2541,6 +2831,22 @@ pub(crate) fn constant(name: &str) -> i64 {
         "datetime" => datetime_class(),
         "timedelta" => timedelta_class(),
         "tzinfo" => tzinfo_class(),
+        "timezone" => timezone_class(),
+        // PEP 615: `datetime.UTC` is `datetime.timezone.utc` itself, so
+        // `from datetime import UTC` binds the same object as
+        // `timezone.utc` and `UTC is timezone.utc` holds.
+        "UTC" => {
+            let class = timezone_class();
+            match value::class_lookup(class, "utc") {
+                Some(value::ClassEntry::Attr(utc)) => utc,
+                // `timezone_class()` always installs the singleton; this is a
+                // defensive fallback, never reached in practice.
+                _ => exc::raise_with_message(
+                    ATTRIBUTE_ERROR,
+                    "module 'datetime' has no attribute 'UTC'",
+                ),
+            }
+        }
         "MINYEAR" => encode(MINYEAR),
         "MAXYEAR" => encode(MAXYEAR),
         "datetime_CAPI" => crate::capi::datetime_capsule(),
@@ -3164,5 +3470,229 @@ mod tests {
         assert!(date_from_instance(moment).is_none());
         call(STRFTIME_METHOD, &[moment, text("%Y")]);
         assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+    }
+
+    fn delta_with_seconds(seconds: i64) -> i64 {
+        instantiate(timedelta_class(), &[int(0), int(seconds)]).expect("timedelta class")
+    }
+
+    fn timezone_instance_for(seconds: i64, name: Option<i64>) -> i64 {
+        match name {
+            Some(name) => instantiate_kw(
+                timezone_class(),
+                &[delta_with_seconds(seconds)],
+                &[("name".to_string(), name)],
+            ),
+            None => instantiate(timezone_class(), &[delta_with_seconds(seconds)]),
+        }
+        .expect("timezone class")
+    }
+
+    #[test]
+    fn timezone_class_is_cached_with_utc_singleton() {
+        exc::init();
+        let class = constant("timezone");
+        assert!(!exc::pending());
+        assert_eq!(value::class_display_name(class), Some(TIMEZONE_CLASS));
+        assert_eq!(constant("timezone"), class);
+        // `timezone` is a `tzinfo` subclass.
+        assert_ne!(
+            crate::builtins::issubclass(class, tzinfo_class()),
+            value::FALSE
+        );
+
+        let utc = crate::methods::getattr(class, b"utc".as_ptr(), 3);
+        assert!(!exc::pending());
+        assert_eq!(kind_of(utc), Some(Kind::TimeZone));
+        assert_eq!(as_text(repr_method(&[utc])), "datetime.timezone.utc");
+        assert_eq!(as_text(str_method(&[utc])), "UTC");
+
+        // An unnamed zero offset folds onto the singleton, like CPython.
+        let zero = timezone_instance_for(0, None);
+        assert_eq!(zero, utc);
+        assert_eq!(as_text(repr_method(&[zero])), "datetime.timezone.utc");
+        // An explicit name is a distinct zone with the same offset.
+        let named_zero = timezone_instance_for(0, Some(text("UTC")));
+        assert_ne!(named_zero, utc);
+        assert_eq!(call(TIMEZONE_EQ_METHOD, &[named_zero, utc]), value::TRUE);
+    }
+
+    #[test]
+    fn utc_constant_is_the_timezone_utc_singleton() {
+        exc::init();
+        // PEP 615: the module-level name and the class attribute are one
+        // object, so `UTC is timezone.utc` and both spellings of `__repr__`
+        // agree.
+        let utc = constant("UTC");
+        assert!(!exc::pending());
+        assert_eq!(
+            utc,
+            crate::methods::getattr(timezone_class(), b"utc".as_ptr(), 3)
+        );
+        assert_eq!(utc, constant("UTC"));
+        assert_eq!(kind_of(utc), Some(Kind::TimeZone));
+        assert_eq!(as_text(repr_method(&[utc])), "datetime.timezone.utc");
+        assert_eq!(as_text(str_method(&[utc])), "UTC");
+    }
+
+    #[test]
+    fn timezone_renders_offsets_and_names() {
+        exc::init();
+        let hours_two = timezone_instance_for(7_200, None);
+        assert_eq!(
+            as_text(repr_method(&[hours_two])),
+            "datetime.timezone(datetime.timedelta(seconds=7200))"
+        );
+        assert_eq!(as_text(str_method(&[hours_two])), "UTC+02:00");
+
+        let named = timezone_instance_for(7_200, Some(text("CET")));
+        assert_eq!(
+            as_text(repr_method(&[named])),
+            "datetime.timezone(datetime.timedelta(seconds=7200), 'CET')"
+        );
+        assert_eq!(as_text(str_method(&[named])), "CET");
+
+        let negative = timezone_instance_for(-10_800, None);
+        assert_eq!(
+            as_text(repr_method(&[negative])),
+            "datetime.timezone(datetime.timedelta(days=-1, seconds=75600))"
+        );
+        assert_eq!(as_text(str_method(&[negative])), "UTC-03:00");
+
+        // Sub-minute offsets keep their seconds and microseconds.
+        let odd = timezone_instance_for(90, None);
+        assert_eq!(as_text(str_method(&[odd])), "UTC+00:01:30");
+        assert_eq!(
+            as_text(call(ISOFORMAT_METHOD, &[datetime_with_zone(odd)])),
+            "2020-01-01T00:00:00+00:01:30"
+        );
+
+        // Names are ignored by equality, offsets are not.
+        assert_eq!(call(TIMEZONE_EQ_METHOD, &[named, hours_two]), value::TRUE);
+        assert_eq!(call(TIMEZONE_EQ_METHOD, &[named, negative]), value::FALSE);
+        assert_eq!(
+            call(TIMEZONE_EQ_METHOD, &[named, NONE]),
+            value::NOT_IMPLEMENTED
+        );
+    }
+
+    fn datetime_with_zone(zone: i64) -> i64 {
+        let moment = datetime_instance(2020, 1, 1, 0, 0, 0, 0);
+        value::instance_setattr(moment, "tzinfo".to_string(), zone);
+        moment
+    }
+
+    #[test]
+    fn timezone_methods_delegate_to_fixed_offset() {
+        exc::init();
+        let zone = timezone_instance_for(7_200, None);
+        let offset = call(TIMEZONE_UTCOFFSET_METHOD, &[zone, NONE]);
+        assert!(!exc::pending());
+        assert_eq!(value::instance_class_name(offset), Some("timedelta"));
+        assert_eq!(as_text(call(STR_METHOD, &[offset])), "2:00:00");
+        assert_eq!(call(TIMEZONE_DST_METHOD, &[zone, NONE]), NONE);
+        assert_eq!(
+            as_text(call(TIMEZONE_TZNAME_METHOD, &[zone, NONE])),
+            "UTC+02:00"
+        );
+        assert_eq!(
+            as_text(call(
+                TIMEZONE_TZNAME_METHOD,
+                &[zone, datetime_with_zone(zone)]
+            )),
+            "UTC+02:00"
+        );
+
+        let named = timezone_instance_for(7_200, Some(text("CET")));
+        assert_eq!(as_text(call(TIMEZONE_TZNAME_METHOD, &[named, NONE])), "CET");
+
+        // `fromutc` adds the offset and resets `fold`.
+        let utc_moment = datetime_with_zone(zone);
+        value::instance_setattr(utc_moment, "hour".to_string(), int(1));
+        value::instance_setattr(utc_moment, "fold".to_string(), int(1));
+        let local = call(TIMEZONE_FROMUTC_METHOD, &[zone, utc_moment]);
+        assert!(!exc::pending());
+        assert_eq!(
+            as_text(call(STR_METHOD, &[local])),
+            "2020-01-01 03:00:00+02:00"
+        );
+        assert_eq!(fold_of(local), 0);
+        assert_eq!(tzinfo_of(local), zone);
+
+        // Wrong argument types and a foreign tzinfo are reported.
+        exc::init();
+        call(TIMEZONE_FROMUTC_METHOD, &[zone, int(1)]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::init();
+        call(
+            TIMEZONE_FROMUTC_METHOD,
+            &[zone, datetime_instance(2020, 1, 1, 0, 0, 0, 0)],
+        );
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        exc::init();
+        call(
+            TIMEZONE_UTCOFFSET_METHOD,
+            &[zone, date_instance(2020, 1, 1)],
+        );
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+    }
+
+    #[test]
+    fn timezone_constructor_validates_arguments() {
+        exc::init();
+        instantiate(timezone_class(), &[]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "timezone() missing required argument 'offset' (pos 1)"
+        );
+
+        exc::init();
+        instantiate(timezone_class(), &[int(0)]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "timezone() argument 1 must be datetime.timedelta, not int"
+        );
+
+        exc::init();
+        instantiate(timezone_class(), &[delta_instance(1)]);
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "offset must be a timedelta strictly between -timedelta(hours=24) and \
+             timedelta(hours=24), not datetime.timedelta(days=1)"
+        );
+
+        exc::init();
+        instantiate(timezone_class(), &[delta_with_seconds(0), int(5)]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "timezone() argument 2 must be str, not int"
+        );
+
+        // An explicit `None` name is rejected; omitting it generates a name.
+        exc::init();
+        instantiate(timezone_class(), &[delta_with_seconds(0), NONE]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "timezone() argument 2 must be str, not None"
+        );
+        exc::init();
+        let generated =
+            instantiate(timezone_class(), &[delta_with_seconds(0)]).expect("timezone class");
+        assert!(!exc::pending());
+        assert_eq!(as_text(call(STR_METHOD, &[generated])), "UTC");
+
+        // The bounds are strict: ±24h is rejected.
+        exc::init();
+        instantiate_kw(
+            timezone_class(),
+            &[delta_with_seconds(86_399)],
+            &[("name".to_string(), text("X"))],
+        );
+        assert!(!exc::pending());
     }
 }

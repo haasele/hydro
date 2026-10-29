@@ -380,6 +380,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hydro-bindgen"
+version = "0.1.0"
+
+[[package]]
 name = "hydro-codegen"
 version = "0.1.0"
 dependencies = [
@@ -399,6 +403,17 @@ version = "0.1.0"
 dependencies = [
  "hydro-ir",
  "hydro-python-parser",
+]
+
+[[package]]
+name = "hydro-hna"
+version = "0.1.0"
+
+[[package]]
+name = "hydro-hna-fixture"
+version = "0.1.0"
+dependencies = [
+ "hydro-hna",
 ]
 
 [[package]]
@@ -443,6 +458,7 @@ name = "hydro-runtime"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "hydro-hna",
  "hydro-ir",
  "libc",
  "num-bigint",
@@ -451,6 +467,13 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "webpki-roots",
+]
+
+[[package]]
+name = "hydro-sqlite-hna"
+version = "0.1.0"
+dependencies = [
+ "hydro-hna",
 ]
 
 [[package]]

@@ -1,5 +1,7 @@
 use std::os::raw::c_uchar;
 
+use num_traits::ToPrimitive;
+
 use crate::gc::roots;
 use crate::{builtins, container, exc, fiber, format, heap, iter, methods, modules, ops, value};
 
@@ -1159,6 +1161,9 @@ pub extern "C" fn hydro_extension_module_value(
             "extension module name and path must be non-empty strings",
         );
     };
+    if crate::native::is_hna_path(&path) {
+        return crate::native::extension_module_value(&name, &path);
+    }
     modules::extension_module_value(&name, &path)
 }
 
@@ -1834,6 +1839,263 @@ pub extern "C" fn hydro_gc_scope_pop(token: usize) {
     roots::scope_pop(token);
 }
 
+// HNA v1 runtime services (include/hydro_native.h)
+
+/// Numeric revision of the hydro runtime ABI, for binding-side negotiation.
+#[no_mangle]
+pub extern "C" fn hydro_hna_runtime_abi() -> u32 {
+    hydro_hna::RUNTIME_ABI
+}
+
+/// Roots `value` for the process lifetime and returns its hold token.
+///
+/// The persistent root belongs to the calling Hydro thread's collector
+/// registration, so a binding must hold and release on the same thread (HNA v1
+/// is single-threaded per binding); the token table is process-wide. A token is
+/// never zero; unknown tokens are ignored by [`hydro_root_release`].
+#[no_mangle]
+pub extern "C" fn hydro_root_hold(value: i64) -> u64 {
+    crate::native::root_hold(value)
+}
+
+/// Releases a token returned by [`hydro_root_hold`]. Repeated releases and
+/// unknown tokens are ignored, never a crash.
+#[no_mangle]
+pub extern "C" fn hydro_root_release(token: u64) {
+    crate::native::root_release(token);
+}
+
+// Typed projections used by generated HNA wrappers.
+
+/// `HydroTypeTag` values (`enum HydroTypeTag` in the header).
+const HYDRO_TYPE_NONE: i32 = 0;
+const HYDRO_TYPE_BOOL: i32 = 1;
+const HYDRO_TYPE_INT: i32 = 2;
+const HYDRO_TYPE_FLOAT: i32 = 3;
+const HYDRO_TYPE_STR: i32 = 4;
+const HYDRO_TYPE_BYTES: i32 = 5;
+const HYDRO_TYPE_LIST: i32 = 6;
+const HYDRO_TYPE_TUPLE: i32 = 7;
+const HYDRO_TYPE_DICT: i32 = 8;
+const HYDRO_TYPE_OTHER: i32 = 9;
+
+/// Classifies a tagged value for projection dispatch.
+#[no_mangle]
+pub extern "C" fn hydro_type_tag(value: i64) -> i32 {
+    if value == value::NONE {
+        return HYDRO_TYPE_NONE;
+    }
+    if value == value::TRUE || value == value::FALSE {
+        return HYDRO_TYPE_BOOL;
+    }
+    if value::is_int(value) || value::is_bigint(value) {
+        return HYDRO_TYPE_INT;
+    }
+    if value::as_float(value).is_some() {
+        return HYDRO_TYPE_FLOAT;
+    }
+    if value::as_str(value).is_some() {
+        return HYDRO_TYPE_STR;
+    }
+    if value::as_bytes(value).is_some() {
+        return HYDRO_TYPE_BYTES;
+    }
+    if value::as_list(value).is_some() {
+        return HYDRO_TYPE_LIST;
+    }
+    if value::as_tuple(value).is_some() {
+        return HYDRO_TYPE_TUPLE;
+    }
+    if value::as_dict(value).is_some() {
+        return HYDRO_TYPE_DICT;
+    }
+    HYDRO_TYPE_OTHER
+}
+
+/// Reports a failed projection: raises `message` as `TypeError` and returns 0.
+fn projection_type_error(message: String) -> i32 {
+    exc::raise_with_message(exc::TYPE_ERROR, &message);
+    0
+}
+
+/// Reports an integer that does not fit the projection's range.
+fn projection_overflow(message: &str) -> i32 {
+    exc::raise_with_message(exc::OVERFLOW_ERROR, message);
+    0
+}
+
+/// `int` projection: accepts `bool` and `int` (CPython's int-subclass rule)
+/// and stores the value in `*out`.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // ABI contract: `out` is a writable slot.
+pub extern "C" fn hydro_int_value(value: i64, out: *mut i64) -> i32 {
+    if out.is_null() {
+        return projection_type_error(
+            "int projection requires a non-NULL output pointer".to_string(),
+        );
+    }
+    if let Some(number) = value::as_integer(value) {
+        // SAFETY: NULL was rejected above and the caller owns the slot.
+        unsafe { *out = number };
+        return 1;
+    }
+    if let Some(big) = value::as_bigint(value) {
+        let Some(number) = big.to_i64() else {
+            return projection_overflow("Python int too large to convert to C long");
+        };
+        // SAFETY: NULL was rejected above.
+        unsafe { *out = number };
+        return 1;
+    }
+    projection_type_error(format!(
+        "'{}' object cannot be interpreted as an integer",
+        value::type_name_of(value)
+    ))
+}
+
+/// `float` projection: accepts `int`, `bool` and `float`.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // ABI contract: `out` is a writable slot.
+pub extern "C" fn hydro_float_value(value: i64, out: *mut f64) -> i32 {
+    if out.is_null() {
+        return projection_type_error(
+            "float projection requires a non-NULL output pointer".to_string(),
+        );
+    }
+    if let Some(number) = value::as_float(value) {
+        // SAFETY: NULL was rejected above.
+        unsafe { *out = number };
+        return 1;
+    }
+    if let Some(number) = value::as_integer(value) {
+        // SAFETY: NULL was rejected above.
+        unsafe { *out = number as f64 };
+        return 1;
+    }
+    if let Some(big) = value::as_bigint(value) {
+        let Some(number) = big.to_f64() else {
+            return projection_overflow("int too large to convert to float");
+        };
+        if !number.is_finite() {
+            return projection_overflow("int too large to convert to float");
+        }
+        // SAFETY: NULL was rejected above.
+        unsafe { *out = number };
+        return 1;
+    }
+    projection_type_error(format!(
+        "'{}' object cannot be interpreted as a float",
+        value::type_name_of(value)
+    ))
+}
+
+/// `bool` projection: Python truthiness, always succeeds for a valid value.
+///
+/// A NULL `out` is a caller bug; nothing can be reported through it, so the
+/// function still reports success without writing.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // ABI contract: `out` is a writable slot.
+pub extern "C" fn hydro_bool_value(value: i64, out: *mut i32) -> i32 {
+    if out.is_null() {
+        return 1;
+    }
+    // SAFETY: NULL was rejected above.
+    unsafe { *out = if value::truthy(value) { 1 } else { 0 } };
+    1
+}
+
+/// Copies `data` into the caller's buffer following the projection contract:
+/// `needed` always receives the byte length, zero length copies nothing, and a
+/// short (or NULL) buffer reports 2 after `needed` is set.
+fn copy_projection_bytes(
+    data: &[u8],
+    buffer: *mut c_uchar,
+    capacity: u64,
+    needed: *mut u64,
+) -> i32 {
+    if needed.is_null() {
+        return 0;
+    }
+    let len = data.len();
+    // SAFETY: NULL checked above; the caller owns the u64 slot.
+    unsafe { *needed = len as u64 };
+    if capacity < len as u64 {
+        return 2;
+    }
+    if len == 0 {
+        return 1;
+    }
+    if buffer.is_null() {
+        return 2;
+    }
+    // SAFETY: `data` is readable for `len` bytes and the buffer has at least
+    // `capacity >= len` writable bytes.
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buffer, len) };
+    1
+}
+
+/// `str` projection: copies the exact bytes (never NUL-terminated or sniffed).
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // ABI contract: `buffer`/`needed` are caller slots.
+pub extern "C" fn hydro_str_copy(
+    value: i64,
+    buffer: *mut c_uchar,
+    capacity: u64,
+    needed: *mut u64,
+) -> i32 {
+    let Some(text) = value::as_str(value) else {
+        if !needed.is_null() {
+            // SAFETY: NULL checked; the caller owns the slot.
+            unsafe { *needed = 0 };
+        }
+        return projection_type_error(format!(
+            "expected str, not '{}'",
+            value::type_name_of(value)
+        ));
+    };
+    copy_projection_bytes(text.as_bytes(), buffer, capacity, needed)
+}
+
+/// `bytes`/`bytearray` projection: copies the exact contents.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // ABI contract: `buffer`/`needed` are caller slots.
+pub extern "C" fn hydro_bytes_copy(
+    value: i64,
+    buffer: *mut c_uchar,
+    capacity: u64,
+    needed: *mut u64,
+) -> i32 {
+    let Some(data) = value::as_bytes(value) else {
+        if !needed.is_null() {
+            // SAFETY: NULL checked; the caller owns the slot.
+            unsafe { *needed = 0 };
+        }
+        return projection_type_error(format!(
+            "expected bytes-like object, not '{}'",
+            value::type_name_of(value)
+        ));
+    };
+    copy_projection_bytes(data, buffer, capacity, needed)
+}
+
+/// Raises `TypeError(message)` and returns the `None` immediate.
+#[no_mangle]
+pub extern "C" fn hydro_raise_type_error(ptr: *const c_uchar, len: usize) -> i64 {
+    hydro_raise_msg(exc::TYPE_ERROR, ptr, len)
+}
+
+/// Raises `ValueError(message)` and returns the `None` immediate.
+#[no_mangle]
+pub extern "C" fn hydro_raise_value_error(ptr: *const c_uchar, len: usize) -> i64 {
+    hydro_raise_msg(exc::VALUE_ERROR, ptr, len)
+}
+
+/// Raises `OverflowError(message)` and returns the `None` immediate.
+#[no_mangle]
+pub extern "C" fn hydro_raise_overflow_error(ptr: *const c_uchar, len: usize) -> i64 {
+    hydro_raise_msg(exc::OVERFLOW_ERROR, ptr, len)
+}
+
 #[no_mangle]
 pub extern "C" fn hydro_runtime_init() {
     // Unit tests run concurrently in one process, and this reset frees the
@@ -1857,9 +2119,18 @@ pub extern "C" fn hydro_runtime_init() {
     // A fresh program run starts with no module globals (the unittest class
     // registry is cleared by `heap::reset`).
     crate::core::globals::reset();
+    // Initializer registrations belong to the previous compilation unit;
+    // after a JIT module is dropped their code pointers are stale.
+    // `hydro_main` registers this program's module bodies right after this
+    // call.
+    crate::module_init::reset();
     // Anchor the CPython shim so its symbols are linked into AOT binaries and
     // never dropped as unreachable (JIT links the same runtime object).
     crate::capi::anchor();
+    // Anchor the HNA runtime services for the same reason: a binding resolves
+    // them at `dlopen` time, so generated code never references them and the
+    // linker would otherwise drop their definitions from the AOT archive.
+    crate::native::anchor();
 }
 
 // Spawn start method
@@ -1876,6 +2147,88 @@ pub extern "C" fn hydro_register_function(
     arity: usize,
 ) {
     crate::spawn::register_from_abi(name_ptr, name_len, wrapper as usize, arity);
+}
+
+// On-demand module initialisation
+
+/// Decodes an ABI `(ptr, len)` module name.
+///
+/// `None` for a null pointer with a non-zero length, an empty name and
+/// non-UTF-8 bytes. A zero length with a null pointer is an empty name and is
+/// rejected the same way.
+fn abi_module_name(ptr: *const u8, len: usize) -> Option<String> {
+    // SAFETY: the caller guarantees `ptr..ptr+len` is readable when non-null
+    // (`abi_bytes` returns `None` for the invalid combinations).
+    let bytes = unsafe { abi_bytes(ptr, len) }?;
+    if bytes.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok().map(str::to_owned)
+}
+
+/// Registers the module body of a compiled import.
+///
+/// `name_ptr[..name_len]` is the import name (the generated function name with
+/// the `.<module>` suffix stripped, e.g. `numpy.exceptions`) and `entry` is the
+/// address of the generated `extern "C" fn() -> i64` module body. Called by
+/// `hydro_main` after [`hydro_runtime_init`] and before the startup
+/// initializer loop, once per program initializer list entry.
+///
+/// An invalid name or a null entry raises `TypeError` and leaves the registry
+/// unchanged; the function never panics.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn hydro_register_module_initializer(
+    name_ptr: *const c_uchar,
+    name_len: usize,
+    entry: *const u8,
+) {
+    let Some(name) = abi_module_name(name_ptr, name_len) else {
+        exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "hydro_register_module_initializer: invalid module name",
+        );
+        return;
+    };
+    if entry.is_null() {
+        exc::raise_with_message(
+            exc::TYPE_ERROR,
+            &format!("hydro_register_module_initializer: no initializer for '{name}'"),
+        );
+        return;
+    }
+    // SAFETY: generated code passes the address of a generated
+    // `extern "C" fn() -> i64` module body. The code stays alive for the rest
+    // of the run (the JIT module outlives `hydro_main`); `hydro_runtime_init`
+    // clears the registration before the next run repopulates it.
+    let entry: crate::module_init::Entry = unsafe { std::mem::transmute(entry) };
+    crate::module_init::register(&name, entry);
+}
+
+/// Runs the module body registered for `name_ptr[..name_len]` if it exists and
+/// has not run yet.
+///
+/// Returns `1` when the body executed during this call, `0` when no
+/// initializer is registered, the name was already initialized, or the body is
+/// currently running on another thread. A `0` return is a no-op, not an error.
+///
+/// A pending exception raised by the body is left pending for the caller
+/// (`hydro_exc_pending`); the entry is still marked initialized so a failing
+/// body is not retried. This is the ABI used by the startup initializer loop
+/// and by the C API import bridge, so a compiled module imported from an
+/// extension runs exactly once even if the startup loop reaches it later.
+///
+/// An invalid name buffer raises `TypeError` and returns `0`.
+#[no_mangle]
+pub extern "C" fn hydro_initialize_module(name_ptr: *const c_uchar, name_len: usize) -> i64 {
+    let Some(name) = abi_module_name(name_ptr, name_len) else {
+        exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "hydro_initialize_module: invalid module name",
+        );
+        return 0;
+    };
+    crate::module_init::initialize(&name)
 }
 
 /// Runs a spawned child's target without executing the module body.
@@ -1952,10 +2305,10 @@ pub extern "C" fn hydro_profile_dump(path_ptr: *const u8, path_len: usize) -> i3
 mod tests {
     use super::*;
 
-    /// Serialises the tests in this binary: the module-global store and the
-    /// module caches derived from it are process-wide, so one test's
-    /// `hydro_runtime_init` must not clear them while another test compares
-    /// cached values.
+    /// Serialises the tests in this binary: the module-global store, the
+    /// module caches derived from it and the compiled-module initializer
+    /// registry are process-wide, so one test's `hydro_runtime_init` must not
+    /// clear them while another test compares cached values.
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Initialises the runtime for a test, holding the process-wide test lock
@@ -1980,6 +2333,54 @@ mod tests {
             }
         });
         super::hydro_runtime_init();
+    }
+
+    static MODULE_INIT_RUNS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn counted_module_body() -> i64 {
+        MODULE_INIT_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        value::NONE
+    }
+
+    #[test]
+    fn compiled_module_initializers_run_once_through_the_abi() {
+        test_init();
+        exc::clear();
+        MODULE_INIT_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let name = b"abi_test.module.body";
+        let entry = counted_module_body as *const () as usize as *const u8;
+        hydro_register_module_initializer(name.as_ptr(), name.len(), entry);
+        assert_eq!(
+            hydro_initialize_module(name.as_ptr(), name.len()),
+            1,
+            "the registered body runs once"
+        );
+        assert_eq!(
+            hydro_initialize_module(name.as_ptr(), name.len()),
+            0,
+            "a second initialization is a no-op"
+        );
+        assert_eq!(
+            MODULE_INIT_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // An unregistered name is a no-op, not an error.
+        let unknown = b"abi_test.module.unknown";
+        assert_eq!(hydro_initialize_module(unknown.as_ptr(), unknown.len()), 0);
+        assert!(!exc::pending());
+
+        // Invalid buffers raise TypeError instead of panicking.
+        assert_eq!(hydro_initialize_module([0xff_u8].as_ptr(), 1), 0);
+        assert_eq!(exc::pending_tag(), exc::TYPE_ERROR as i64);
+        exc::clear();
+        hydro_register_module_initializer([0xff_u8].as_ptr(), 1, entry);
+        assert_eq!(exc::pending_tag(), exc::TYPE_ERROR as i64);
+        exc::clear();
+        hydro_register_module_initializer(name.as_ptr(), name.len(), std::ptr::null());
+        assert_eq!(exc::pending_tag(), exc::TYPE_ERROR as i64);
+        exc::clear();
     }
 
     #[test]
@@ -3342,5 +3743,210 @@ mod tests {
         assert_eq!(hydro_uncaught(), 1);
         assert_eq!(hydro_exc_pending(), 0);
         assert_eq!(hydro_uncaught(), 0);
+    }
+
+    /// Classifies the values the projection services dispatch on.
+    #[test]
+    fn hna_type_tag_classifies_the_projection_surface() {
+        test_init();
+        assert_eq!(hydro_type_tag(hydro_none()), HYDRO_TYPE_NONE);
+        assert_eq!(hydro_type_tag(hydro_true()), HYDRO_TYPE_BOOL);
+        assert_eq!(hydro_type_tag(hydro_false()), HYDRO_TYPE_BOOL);
+        assert_eq!(hydro_type_tag(hydro_int(7)), HYDRO_TYPE_INT);
+        assert_eq!(
+            hydro_type_tag(hydro_bigint_from_str(
+                b"123456789012345678901234567890".as_ptr(),
+                30
+            )),
+            HYDRO_TYPE_INT
+        );
+        assert_eq!(hydro_type_tag(hydro_float_new(1.5)), HYDRO_TYPE_FLOAT);
+        assert_eq!(
+            hydro_type_tag(hydro_str_new(b"abc".as_ptr(), 3)),
+            HYDRO_TYPE_STR
+        );
+        assert_eq!(
+            hydro_type_tag(hydro_bytes_new(b"abc".as_ptr(), 3)),
+            HYDRO_TYPE_BYTES
+        );
+        assert_eq!(
+            hydro_type_tag(hydro_bytearray_new(b"abc".as_ptr(), 3)),
+            HYDRO_TYPE_BYTES
+        );
+        assert_eq!(
+            hydro_type_tag(hydro_list_new(0, std::ptr::null())),
+            HYDRO_TYPE_LIST
+        );
+        assert_eq!(
+            hydro_type_tag(hydro_tuple_new(0, std::ptr::null())),
+            HYDRO_TYPE_TUPLE
+        );
+        assert_eq!(
+            hydro_type_tag(hydro_dict_new(0, std::ptr::null(), std::ptr::null())),
+            HYDRO_TYPE_DICT
+        );
+        assert_eq!(
+            hydro_type_tag(hydro_range_new(hydro_int(0), hydro_int(3), hydro_int(1))),
+            HYDRO_TYPE_OTHER
+        );
+        assert_eq!(hydro_exc_pending(), 0);
+    }
+
+    /// `bool`/`int` acceptance, output writes and the error classes.
+    #[test]
+    fn hna_int_and_float_projections_validate_their_inputs() {
+        test_init();
+        let mut out = 0i64;
+        assert_eq!(hydro_int_value(hydro_int(42), &mut out), 1);
+        assert_eq!(out, 42);
+        assert_eq!(hydro_int_value(hydro_true(), &mut out), 1);
+        assert_eq!(out, 1);
+        assert_eq!(hydro_int_value(hydro_false(), &mut out), 1);
+        assert_eq!(out, 0);
+
+        // A heap BigInt that fits is accepted; one that does not is an
+        // OverflowError rather than a wrapped value.
+        let big = hydro_bigint_from_str(b"9223372036854775808".as_ptr(), 19);
+        assert_eq!(hydro_int_value(big, &mut out), 0);
+        assert_eq!(hydro_exc_tag(), exc::OVERFLOW_ERROR as i64);
+        hydro_exc_clear();
+
+        assert_eq!(
+            hydro_int_value(hydro_str_new(b"x".as_ptr(), 1), &mut out),
+            0
+        );
+        assert_eq!(hydro_exc_tag(), exc::TYPE_ERROR as i64);
+        hydro_exc_clear();
+        assert_eq!(hydro_int_value(hydro_int(1), std::ptr::null_mut()), 0);
+        assert_eq!(hydro_exc_tag(), exc::TYPE_ERROR as i64);
+        hydro_exc_clear();
+
+        let mut float = 0.0f64;
+        assert_eq!(hydro_float_value(hydro_int(5), &mut float), 1);
+        assert_eq!(float, 5.0);
+        assert_eq!(hydro_float_value(hydro_true(), &mut float), 1);
+        assert_eq!(float, 1.0);
+        assert_eq!(hydro_float_value(hydro_float_new(2.5), &mut float), 1);
+        assert_eq!(float, 2.5);
+        assert_eq!(hydro_float_value(hydro_none(), &mut float), 0);
+        assert_eq!(hydro_exc_tag(), exc::TYPE_ERROR as i64);
+        hydro_exc_clear();
+        assert_eq!(hydro_exc_pending(), 0);
+    }
+
+    /// Truthiness never fails for a valid value.
+    #[test]
+    fn hna_bool_projection_uses_python_truthiness() {
+        test_init();
+        let mut out = -1i32;
+        assert_eq!(hydro_bool_value(hydro_none(), &mut out), 1);
+        assert_eq!(out, 0);
+        assert_eq!(hydro_bool_value(hydro_int(0), &mut out), 1);
+        assert_eq!(out, 0);
+        assert_eq!(
+            hydro_bool_value(hydro_str_new(b"".as_ptr(), 0), &mut out),
+            1
+        );
+        assert_eq!(out, 0);
+        assert_eq!(
+            hydro_bool_value(hydro_str_new(b"x".as_ptr(), 1), &mut out),
+            1
+        );
+        assert_eq!(out, 1);
+        assert_eq!(
+            hydro_bool_value(hydro_list_new(0, std::ptr::null()), &mut out),
+            1
+        );
+        assert_eq!(out, 0);
+        assert_eq!(hydro_exc_pending(), 0);
+    }
+
+    /// Exact `str`/`bytes` copying with the needed-length protocol.
+    #[test]
+    fn hna_str_and_bytes_copies_are_exact() {
+        test_init();
+        let text = hydro_str_new(b"hello".as_ptr(), 5);
+        let mut needed = u64::MAX;
+        let mut buffer = [0u8; 8];
+        assert_eq!(
+            hydro_str_copy(text, buffer.as_mut_ptr(), buffer.len() as u64, &mut needed),
+            1
+        );
+        assert_eq!(needed, 5);
+        assert_eq!(&buffer[..5], b"hello");
+
+        // A short buffer reports the required length without writing.
+        buffer = [0xAA; 8];
+        assert_eq!(hydro_str_copy(text, buffer.as_mut_ptr(), 2, &mut needed), 2);
+        assert_eq!(needed, 5);
+        assert_eq!(&buffer[..3], &[0xAA, 0xAA, 0xAA]);
+
+        // Enquiry with a zero-length buffer is allowed.
+        assert_eq!(
+            hydro_str_copy(text, std::ptr::null_mut(), 0, &mut needed),
+            2
+        );
+        assert_eq!(needed, 5);
+
+        // Empty strings copy nothing and succeed.
+        let empty = hydro_str_new(b"".as_ptr(), 0);
+        assert_eq!(
+            hydro_str_copy(empty, std::ptr::null_mut(), 0, &mut needed),
+            1
+        );
+        assert_eq!(needed, 0);
+
+        // Wrong type: TypeError, needed cleared.
+        assert_eq!(
+            hydro_str_copy(hydro_int(1), buffer.as_mut_ptr(), 8, &mut needed),
+            0
+        );
+        assert_eq!(needed, 0);
+        assert_eq!(hydro_exc_tag(), exc::TYPE_ERROR as i64);
+        hydro_exc_clear();
+
+        for value in [
+            hydro_bytes_new(b"abc".as_ptr(), 3),
+            hydro_bytearray_new(b"abc".as_ptr(), 3),
+        ] {
+            assert_eq!(
+                hydro_bytes_copy(value, buffer.as_mut_ptr(), 8, &mut needed),
+                1
+            );
+            assert_eq!(needed, 3);
+            assert_eq!(&buffer[..3], b"abc");
+        }
+        assert_eq!(
+            hydro_bytes_copy(hydro_none(), buffer.as_mut_ptr(), 8, &mut needed),
+            0
+        );
+        assert_eq!(hydro_exc_tag(), exc::TYPE_ERROR as i64);
+        hydro_exc_clear();
+        assert_eq!(hydro_exc_pending(), 0);
+    }
+
+    /// The raising helpers use the canonical exception tags.
+    #[test]
+    fn hna_raise_helpers_use_canonical_tags() {
+        test_init();
+        assert_eq!(
+            hydro_raise_type_error(b"bad type".as_ptr(), 8),
+            hydro_none()
+        );
+        assert_eq!(hydro_exc_tag(), exc::TYPE_ERROR as i64);
+        hydro_exc_clear();
+        assert_eq!(
+            hydro_raise_value_error(b"bad value".as_ptr(), 9),
+            hydro_none()
+        );
+        assert_eq!(hydro_exc_tag(), exc::VALUE_ERROR as i64);
+        hydro_exc_clear();
+        assert_eq!(
+            hydro_raise_overflow_error(b"too big".as_ptr(), 7),
+            hydro_none()
+        );
+        assert_eq!(hydro_exc_tag(), exc::OVERFLOW_ERROR as i64);
+        hydro_exc_clear();
+        assert_eq!(hydro_exc_pending(), 0);
     }
 }

@@ -520,6 +520,9 @@ pub(crate) fn call(
     let Some(member) = name_str(member_ptr, member_len) else {
         return exc::raise_with_message(RUNTIME_ERROR, "invalid extension attribute buffer");
     };
+    if crate::native::is_hna_path(path) {
+        return crate::native::call_member(path, member, argc, argv);
+    }
     let argv = match argument_slice(argc, argv) {
         Ok(args) => args,
         Err(message) => return exc::raise_with_message(TYPE_ERROR, message),
@@ -573,6 +576,9 @@ pub(crate) fn get(
     let Some(member) = name_str(member_ptr, member_len) else {
         return exc::raise_with_message(RUNTIME_ERROR, "invalid extension attribute buffer");
     };
+    if crate::native::is_hna_path(path) {
+        return crate::native::get(path, member);
+    }
     let module = match capi::load_extension(path, &init_name(path)) {
         Ok(module) => module,
         Err(message) => return raised_error(&message),
@@ -592,6 +598,9 @@ pub(crate) fn get(
 
 /// Python-visible attribute names exported by a compiled extension module.
 pub(crate) fn module_attribute_names(path: &str) -> Result<Vec<String>, String> {
+    if crate::native::is_hna_path(path) {
+        return crate::native::attribute_names(None, path);
+    }
     capi::load_extension(path, &init_name(path)).map(capi::module_attribute_names)
 }
 
@@ -612,6 +621,9 @@ fn type_object_value(address: usize) -> i64 {
 /// from-import, so `try: from ext import name` / `except ImportError:` runs the
 /// handler. `module` is the import name used in the error message.
 pub(crate) fn import_member(module: &str, path: &str, member: &str) -> i64 {
+    if crate::native::is_hna_path(path) {
+        return crate::native::import_member(module, path, member);
+    }
     let loaded = match capi::load_extension(path, &init_name(path)) {
         Ok(loaded) => loaded,
         Err(message) => return raised_import_error(&message),

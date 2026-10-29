@@ -66,13 +66,22 @@ uv pip install --target .hydro/ecosystem/site \
 ```
 
 `HYDRO_STDLIB` defaults to the oracle's CPython 3.14.9 `Lib` tree (or
-`--stdlib`/the environment). The 2026-10-29 import run passes
-pydantic/pydantic-core and six dependencies; NumPy stops on
-`numpy.exceptions`, pandas on `dataclasses.is_dataclass`, six on
-`importlib.util.spec_from_loader`, and annotated-types on a native-method
-attribute. The link-time ABI inventory is complete (0 missing symbols); these
-are semantic/dynamic-import blockers. Smoke/AOT/upstream runs are not claimed
-until the runner observes them.
+`--stdlib`/the environment). The checked-in report is the **2026-10-28 import
+suite** (`benchmarks/ecosystem/latest.json`): it passes pydantic/pydantic-core
+and six dependencies; NumPy stops on `numpy.exceptions`, pandas on
+`dataclasses.is_dataclass`, six on `importlib.util.spec_from_loader`, and
+annotated-types on a native-method attribute. The link-time ABI inventory is
+complete (0 missing symbols); these are semantic/dynamic-import blockers.
+Smoke/AOT/upstream runs are not claimed until the runner observes them.
+
+**Status note (2026-10-29):** the report below was *not* regenerated for the
+HNA v1/bindgen/sidecar/packaging work or for the CPython-compatible
+handle/tuple/list layout. The generated table therefore remains the honest
+last observed evidence, not the current state of every case. Current known
+blockers beyond that table: pydantic 2.14.1 imports but model smoke fails at
+typed-dict class naming/annotations; NumPy fails on delayed dtype/module
+initialization; pandas remains blocked behind those gaps. No "all ecosystem"
+claim is made; there is no passing upstream-suite record yet.
 
 <!-- BEGIN GENERATED ECOSYSTEM RESULTS -->
 

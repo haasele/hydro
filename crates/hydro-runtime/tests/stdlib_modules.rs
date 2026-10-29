@@ -23,6 +23,14 @@ fn list(items: &[i64]) -> i64 {
     hydro_list_new(items.len(), items.as_ptr())
 }
 
+fn tuple(items: &[i64]) -> i64 {
+    hydro_tuple_new(items.len(), items.as_ptr())
+}
+
+fn dict(keys: &[i64], values: &[i64]) -> i64 {
+    hydro_dict_new(keys.len(), keys.as_ptr(), values.as_ptr())
+}
+
 fn module(module: &str, function: &str, args: &[i64]) -> i64 {
     hydro_module_call(
         module.as_ptr(),
@@ -287,6 +295,111 @@ fn defaultdict_none_factory_raises_key_error() {
     assert_no_error();
     hydro_subscript(dd, text("missing"));
     expect_error(KEY_ERROR);
+}
+
+#[test]
+fn defaultdict_accepts_zero_one_and_two_positional_arguments() {
+    hydro_runtime_init();
+
+    // Zero arguments: `None` factory and an empty mapping.
+    let empty = module("collections", "defaultdict", &[]);
+    assert_no_error();
+    assert_str(hydro_to_str(getattr(empty, "default_factory")), "None");
+    assert_int(hydro_len(empty), 0);
+
+    // One argument: the factory alone.
+    let factory_only = module("collections", "defaultdict", &[builtin("list")]);
+    assert_no_error();
+    assert_str(
+        hydro_to_str(getattr(factory_only, "default_factory")),
+        "<function list>",
+    );
+    assert_int(hydro_len(factory_only), 0);
+
+    // Two arguments: factory plus an initially empty mapping.
+    let initial = module(
+        "collections",
+        "defaultdict",
+        &[builtin("list"), dict(&[], &[])],
+    );
+    assert_no_error();
+    assert_int(hydro_len(initial), 0);
+    assert_str(hydro_to_str(hydro_subscript(initial, text("new"))), "[]");
+}
+
+#[test]
+fn defaultdict_initial_mapping_preserves_order_and_does_not_use_the_factory() {
+    hydro_runtime_init();
+    let initial = dict(&[text("a"), text("b")], &[list(&[int(1)]), int(2)]);
+    let dd = module("collections", "defaultdict", &[builtin("list"), initial]);
+    assert_no_error();
+    // Construction copies the entries only; `list` is never called for them.
+    assert_str(
+        hydro_to_str(dd),
+        "defaultdict(<class 'list'>, {'a': [1], 'b': 2})",
+    );
+    assert_int(hydro_len(dd), 2);
+    // Missing keys still use the factory.
+    assert_str(hydro_to_str(hydro_subscript(dd, text("c"))), "[]");
+    assert_int(hydro_len(dd), 3);
+}
+
+#[test]
+fn defaultdict_initial_iterable_accepts_pairs_and_last_duplicate_wins() {
+    hydro_runtime_init();
+    let source = list(&[
+        tuple(&[text("a"), int(1)]),
+        tuple(&[text("b"), int(2)]),
+        tuple(&[text("a"), int(3)]),
+    ]);
+    let dd = module("collections", "defaultdict", &[builtin("list"), source]);
+    assert_no_error();
+    // The duplicate key keeps its first position and the last value.
+    assert_str(
+        hydro_to_str(dd),
+        "defaultdict(<class 'list'>, {'a': 3, 'b': 2})",
+    );
+    assert_int(hydro_len(dd), 2);
+    assert_str(hydro_to_str(hydro_subscript(dd, text("missing"))), "[]");
+}
+
+#[test]
+fn defaultdict_rejects_invalid_initial_values() {
+    hydro_runtime_init();
+
+    module("collections", "defaultdict", &[builtin("list"), int(5)]);
+    expect_error(TYPE_ERROR);
+
+    let bad_element = list(&[int(1)]);
+    module(
+        "collections",
+        "defaultdict",
+        &[builtin("list"), bad_element],
+    );
+    expect_error(TYPE_ERROR);
+
+    let bad_length = list(&[tuple(&[text("a"), int(1), int(2)])]);
+    module("collections", "defaultdict", &[builtin("list"), bad_length]);
+    expect_error(VALUE_ERROR);
+}
+
+#[test]
+fn defaultdict_keywords_are_data_keys() {
+    hydro_runtime_init();
+    let initial = dict(&[text("a")], &[int(1)]);
+    let dd = module_kw(
+        "collections",
+        "defaultdict",
+        &[builtin("list"), initial],
+        &[("a", int(2)), ("b", int(3))],
+    );
+    assert_no_error();
+    // Keywords overwrite an initial key in place and append the new one.
+    assert_str(
+        hydro_to_str(dd),
+        "defaultdict(<class 'list'>, {'a': 2, 'b': 3})",
+    );
+    assert_str(hydro_to_str(hydro_subscript(dd, text("missing"))), "[]");
 }
 
 // -------------------------------------------------------------------------

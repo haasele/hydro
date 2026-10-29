@@ -1878,7 +1878,7 @@ fn resolved_method(obj: i64) -> Option<(MethodKind, i64)> {
 fn is_user_function(obj: i64) -> bool {
     matches!(
         function_body(obj),
-        Some(FunctionBody::Wrapper { .. } | FunctionBody::Host { .. })
+        Some(FunctionBody::Wrapper { .. } | FunctionBody::Host { .. } | FunctionBody::Exec { .. })
     )
 }
 

@@ -164,6 +164,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             args.get(3).copied().unwrap_or(NONE),
         ),
         "get_original_bases" => get_original_bases(args.first().copied().unwrap_or(NONE)),
+        "resolve_bases" => args.first().copied().unwrap_or(NONE),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'types' has no attribute '{function}'"),
@@ -189,11 +190,13 @@ fn prepare_class(args: &[i64]) -> i64 {
     } else {
         metaclass
     };
-    value::tuple_new(vec![
-        metaclass,
-        value::dict_new(Vec::new()),
-        value::dict_new(Vec::new()),
-    ])
+    let namespace = value::dict_new(Vec::new());
+    let kwds = if args.len() > 2 {
+        args[2]
+    } else {
+        value::dict_new(Vec::new())
+    };
+    value::tuple_new(vec![metaclass, namespace, kwds])
 }
 
 /// Keyword-aware `types` dispatch: `DynamicClassAttribute` accepts the four
@@ -217,6 +220,50 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
             value::instance_setattr(namespace, name.clone(), *item);
         }
         return namespace;
+    }
+    if function == "prepare_class" {
+        let mut bound = args.to_vec();
+        for (name, item) in keywords {
+            match name.as_str() {
+                "name" => {
+                    if !bound.is_empty() {
+                        bound[0] = *item;
+                    } else {
+                        bound.push(*item);
+                    }
+                }
+                "bases" => {
+                    if bound.len() > 1 {
+                        bound[1] = *item;
+                    } else {
+                        bound.push(*item);
+                    }
+                }
+                "kwds" => {
+                    while bound.len() < 2 {
+                        bound.push(NONE);
+                    }
+                    if bound.len() > 2 {
+                        bound[2] = *item;
+                    } else {
+                        bound.push(*item);
+                    }
+                }
+                other => {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("prepare_class() got an unexpected keyword argument '{other}'"),
+                    )
+                }
+            }
+        }
+        if bound.len() < 2 {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "prepare_class() missing required arguments",
+            );
+        }
+        return prepare_class(&bound);
     }
     if function != "DynamicClassAttribute" {
         return exc::raise_with_message(

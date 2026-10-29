@@ -20,6 +20,8 @@
 //!   methods and exceptions.
 //! - [`gc`]: the conservative mark-&-sweep heap.
 //! - [`modules`]: native standard-library modules.
+//! - [`module_init`]: on-demand initialisation of compiled module bodies
+//!   (registered by codegen, driven by `hydro_initialize_module`).
 //! - [`concurrency`]: `multiprocessing` process spawning, pools and workers.
 //! - [`support`]: serialization helpers (pickle, JSON).
 //! - `csv`: CSV reader/writer support.
@@ -31,7 +33,10 @@ mod concurrency;
 mod core;
 mod csv;
 mod gc;
+mod module_init;
 mod modules;
+mod native;
+mod native_manifest;
 mod profile;
 mod support;
 

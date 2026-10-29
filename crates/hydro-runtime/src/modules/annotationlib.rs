@@ -331,6 +331,28 @@ fn call_annotate_value(annotate: i64, format: i64) -> i64 {
     finish_annotations(result, format)
 }
 
+/// Evaluates a class's PEP 649 `__annotate__` callable, if present.
+///
+/// `value::class_annotations` consults this before creating its lazy empty
+/// mapping, so `Class.__annotations__` observes the deferred annotations that
+/// the frontend emits for class bodies.
+pub(crate) fn evaluate_class_annotate(class: i64) -> Option<i64> {
+    let annotate = match value::class_lookup(class, "__annotate__") {
+        Some(value::ClassEntry::Attr(annotate)) => annotate,
+        Some(value::ClassEntry::Method(_, annotate)) => annotate,
+        None => return None,
+    };
+    let result = call_annotate_value(annotate, FORMAT_VALUE);
+    if crate::exc::pending() {
+        return None;
+    }
+    if value::as_dict(result).is_some() {
+        Some(result)
+    } else {
+        None
+    }
+}
+
 /// `get_annotate_from_class_namespace(obj)`.
 fn get_annotate_from_namespace(args: &[i64]) -> i64 {
     let Some(&namespace) = args.first() else {

@@ -1,0 +1,11 @@
+[package]
+name = "hydro-bindgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Generate HNA v1 bindings for a supported C header subset"
+publish = false
+
+[[bin]]
+name = "hydro-bindgen"
+path = "src/main.rs"

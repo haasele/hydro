@@ -2,8 +2,11 @@
 //!
 //! Unlike the previous opaque `TypeHandle`, every object handed to an
 //! extension is now a CPython-layout handle: instances start with
-//! `PyObject_HEAD` (`ob_refcnt`, `ob_type`), variable-size instances also carry
-//! `ob_size` at offset 16, and type objects are a real `PyTypeObject` mirror.
+//! `PyVarObject` (`ob_refcnt` at 0, `ob_type` at 8, `ob_size` at 16), and type
+//! objects are a real `PyTypeObject` mirror. Shim builtins additionally mirror
+//! the sub-layouts the inline C macros use: tuples store their item pointers
+//! inline at offset 32 and lists publish their `ob_item` pointer at 24 (see
+//! [`super::tuple_layout`]).
 //!
 //! # Type roles
 //!
@@ -805,8 +808,72 @@ pub(crate) static mut CONTEXT_TOKEN_TYPE: TypeObject = TypeObject::builtin(
 pub(crate) static mut HYDRO_TYPE: TypeObject =
     TypeObject::builtin(c"object".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
 
+// The five class slots of CPython's `PyDateTime_CAPI` capsule. They are not
+// exported data symbols (CPython does not export them either); extensions
+// reach them through the capsule, and `Py_TYPE` of a date/date-time/time/
+// timedelta/tzinfo handle is one of these objects so the header macros
+// (`PyDate_Check`, `PyDateTime_Check`, ...) see the right type.
+//
+// `datetime.datetime` is a subtype of `datetime.date`, exactly like CPython:
+// `PyDate_Check` accepts a datetime handle through `PyType_IsSubtype`.
+pub(crate) static mut DATE_CAPI_TYPE: TypeObject = TypeObject::builtin(
+    c"datetime.date".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE,
+);
+pub(crate) static mut DATETIME_CAPI_TYPE: TypeObject = TypeObject::builtin(
+    c"datetime.datetime".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE,
+);
+pub(crate) static mut TIME_CAPI_TYPE: TypeObject = TypeObject::builtin(
+    c"datetime.time".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE,
+);
+pub(crate) static mut TIMEDELTA_CAPI_TYPE: TypeObject = TypeObject::builtin(
+    c"datetime.timedelta".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE,
+);
+pub(crate) static mut TZINFO_CAPI_TYPE: TypeObject = TypeObject::builtin(
+    c"datetime.tzinfo".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE,
+);
+/// `datetime.timezone` (a `tzinfo` subclass). The capsule has no slot for it,
+/// but values of the class appear through `TimeZone_UTC` and
+/// `TimeZone_FromTimeZone`; mapping them keeps `PyTZInfo_Check` correct.
+pub(crate) static mut TIMEZONE_CAPI_TYPE: TypeObject = TypeObject::builtin(
+    c"datetime.timezone".as_ptr(),
+    TypeRole::Shim,
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_BASETYPE,
+);
+
+/// Maps a Hydro value to the `datetime.datetime_CAPI` type object that should
+/// appear as its C-level type, or `None` for every other value.
+///
+/// The runtime caches the native datetime classes under their
+/// `datetime.<name>` keys; comparing the value's class against those cached
+/// handles keeps an unrelated user class that happens to be called `date`
+/// from being treated as a datetime.
+pub(crate) fn datetime_capi_type_for(value: i64) -> Option<*mut TypeObject> {
+    let class = crate::value::instance_class_value(value)?;
+    let candidates: [(&str, *mut TypeObject); 6] = [
+        ("datetime.date", ptr::addr_of_mut!(DATE_CAPI_TYPE)),
+        ("datetime.datetime", ptr::addr_of_mut!(DATETIME_CAPI_TYPE)),
+        ("datetime.time", ptr::addr_of_mut!(TIME_CAPI_TYPE)),
+        ("datetime.timedelta", ptr::addr_of_mut!(TIMEDELTA_CAPI_TYPE)),
+        ("datetime.tzinfo", ptr::addr_of_mut!(TZINFO_CAPI_TYPE)),
+        ("datetime.timezone", ptr::addr_of_mut!(TIMEZONE_CAPI_TYPE)),
+    ];
+    candidates.into_iter().find_map(|(key, type_object)| {
+        (crate::core::globals::registry_get(key) == Some(class)).then_some(type_object)
+    })
+}
+
 /// Every static builtin type, used to patch the metatype link.
-fn builtin_type_pointers() -> [*mut TypeObject; 42] {
+fn builtin_type_pointers() -> [*mut TypeObject; 48] {
     [
         ptr::addr_of_mut!(TYPE_TYPE),
         ptr::addr_of_mut!(OBJECT_TYPE),
@@ -850,10 +917,38 @@ fn builtin_type_pointers() -> [*mut TypeObject; 42] {
         ptr::addr_of_mut!(CONTEXT_VAR_TYPE),
         ptr::addr_of_mut!(CONTEXT_TOKEN_TYPE),
         ptr::addr_of_mut!(HYDRO_TYPE),
+        ptr::addr_of_mut!(DATE_CAPI_TYPE),
+        ptr::addr_of_mut!(DATETIME_CAPI_TYPE),
+        ptr::addr_of_mut!(TIME_CAPI_TYPE),
+        ptr::addr_of_mut!(TIMEDELTA_CAPI_TYPE),
+        ptr::addr_of_mut!(TZINFO_CAPI_TYPE),
+        ptr::addr_of_mut!(TIMEZONE_CAPI_TYPE),
     ]
 }
 
 static TYPES_READY: Once = Once::new();
+
+/// Addresses of type objects this module allocated outside the exported
+/// builtin table (`PyExc_*` classes). `PyType_Ready` must not re-adopt them as
+/// statically declared C types: their role is already correct.
+static INTERNAL_TYPE_ADDRESSES: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn remember_internal_type(type_object: *mut TypeObject) {
+    if !type_object.is_null() {
+        INTERNAL_TYPE_ADDRESSES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(type_object as usize);
+    }
+}
+
+fn is_internal_type(type_object: *mut TypeObject) -> bool {
+    INTERNAL_TYPE_ADDRESSES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&(type_object as usize))
+}
 
 /// `object.__init__`: accepts any arguments and does nothing.
 extern "C" fn object_init(
@@ -893,6 +988,13 @@ pub(crate) fn ensure_builtin_types() {
         let bytes_procs: &'static PyBufferProcs = &super::buffer::BYTES_BUFFER_PROCS;
         (*ptr::addr_of_mut!(BYTES_TYPE)).tp_as_buffer =
             bytes_procs as *const PyBufferProcs as *mut PyBufferProcs;
+        let bytearray_procs: &'static PyBufferProcs = &super::buffer::BYTEARRAY_BUFFER_PROCS;
+        (*ptr::addr_of_mut!(BYTEARRAY_TYPE)).tp_as_buffer =
+            bytearray_procs as *const PyBufferProcs as *mut PyBufferProcs;
+        // `datetime.datetime` is a subclass of `datetime.date` (as in CPython),
+        // so `PyDate_Check` accepts datetime handles.
+        (*ptr::addr_of_mut!(DATETIME_CAPI_TYPE)).tp_base = ptr::addr_of_mut!(DATE_CAPI_TYPE);
+        (*ptr::addr_of_mut!(TIMEZONE_CAPI_TYPE)).tp_base = ptr::addr_of_mut!(TZINFO_CAPI_TYPE);
         let seq_iterator = ptr::addr_of_mut!(SEQITER_TYPE);
         (*seq_iterator).tp_iter = super::PyObject_SelfIter as *const () as usize;
         (*seq_iterator).tp_iternext = super::seqiter_next as *const () as usize;
@@ -1531,12 +1633,20 @@ pub(crate) fn type_from_spec(
         // SAFETY: `base` was validated as a type pointer above.
         let base_role = unsafe { (*base).role };
         let base_flags = unsafe { (*base).tp_flags };
-        // Exception classes live in the Shim role (their instances carry the
-        // CPython exception payload), but PyO3 creates `#[pyclass(extends =
-        // PyException)]` types from them; accept a marked exception base.
-        if base_role != TypeRole::Instance
-            && !(base_role == TypeRole::Shim && base_flags & PY_TPFLAGS_BASE_EXC_SUBCLASS != 0)
-        {
+        // Two kinds of Shim base are still legitimate bases for a heap type:
+        //
+        // * Exception classes carry the CPython exception payload in the Shim
+        //   role, and PyO3 creates `#[pyclass(extends = PyException)]` types
+        //   from them (`PY_TPFLAGS_BASE_EXC_SUBCLASS`).
+        // * The `datetime_CAPI` type objects (`datetime.date`,
+        //   `datetime.tzinfo`, ...) are Shim handles too, but CPython declares
+        //   them subclassable: `#[pyclass(extends = PyTzInfo)]` must work, so a
+        //   Shim base that opts into subclassing via `Py_TPFLAGS_BASETYPE` is
+        //   accepted. The new type lives in the Instance role and only shares
+        //   the base's `tp_basicsize` lower bound and MRO position.
+        let subclassable_shim = base_role == TypeRole::Shim
+            && base_flags & (PY_TPFLAGS_BASE_EXC_SUBCLASS | PY_TPFLAGS_BASETYPE) != 0;
+        if base_role != TypeRole::Instance && !subclassable_shim {
             return Err(format!(
                 "TypeError: PyType_FromSpec: type '{name}' cannot use '{}' as a base (only \
                  instance types can be bases)",
@@ -2024,6 +2134,10 @@ pub(crate) fn free_type_object(type_object: *mut TypeObject) {
         let doc = (*type_object).tp_doc;
         let buffer_procs = (*type_object).tp_as_buffer;
         let suites = (*type_object).tp_as_number as usize;
+        let associated_module = type_module_owners()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(type_object as usize));
         if owns_name && !name.is_null() {
             drop(CString::from_raw(name as *mut c_char));
         }
@@ -2052,7 +2166,193 @@ pub(crate) fn free_type_object(type_object: *mut TypeObject) {
         if !base.is_null() {
             dec_ref(base as *mut ShimObject);
         }
+        if let Some(module) = associated_module {
+            dec_ref(module as *mut ShimObject);
+        }
     }
+}
+
+/// Module association for types created by `PyType_FromModuleAndSpec`.
+///
+/// The association lives in a side table instead of growing `TypeObject`: the
+/// public layout is fixed at 416 bytes and extensions may inspect it. The
+/// stored module holds one strong reference, released when the heap type is
+/// freed (static types never reach `free_type_object`, matching CPython's
+/// process-lifetime heap-type module slot).
+static TYPE_MODULES: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn type_module_owners() -> &'static Mutex<HashMap<usize, usize>> {
+    &TYPE_MODULES
+}
+
+/// Associates `module` with `type_object`, taking a new reference to it.
+pub(crate) fn associate_type_module(type_object: *mut TypeObject, module: *mut ShimObject) {
+    if type_object.is_null() || module.is_null() {
+        return;
+    }
+    inc_ref(module);
+    let replaced = type_module_owners()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(type_object as usize, module as usize);
+    if let Some(previous) = replaced {
+        dec_ref(previous as *mut ShimObject);
+    }
+}
+
+/// The module object associated with `type_object`, if any.
+pub(crate) fn type_module(type_object: *mut TypeObject) -> Option<*mut ShimObject> {
+    if type_object.is_null() {
+        return None;
+    }
+    type_module_owners()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&(type_object as usize))
+        .copied()
+        .map(|module| module as *mut ShimObject)
+}
+
+/// Walks a static type's `tp_base` chain.
+///
+/// The chain is rejected when it contains a non-type, loops, or is longer than
+/// CPython's practical inheritance depth. A valid chain lets `PyType_Ready`
+/// inherit the same slots CPython's `inherit_slots` copies for a static type.
+fn static_ancestors(type_object: *mut TypeObject) -> Result<Vec<*mut TypeObject>, String> {
+    let mut chain: Vec<*mut TypeObject> = Vec::new();
+    let mut current = unsafe { (*type_object).tp_base };
+    while !current.is_null() {
+        if current == type_object || chain.contains(&current) {
+            return Err(format!(
+                "SystemError: PyType_Ready: type '{}' has a cyclic tp_base chain",
+                type_name(type_object)
+            ));
+        }
+        if !is_type_pointer(current as *mut ShimObject) {
+            return Err(format!(
+                "TypeError: PyType_Ready: type '{}' has an invalid tp_base",
+                type_name(type_object)
+            ));
+        }
+        if chain.len() >= 64 {
+            return Err(format!(
+                "SystemError: PyType_Ready: type '{}' has a tp_base chain that is too deep",
+                type_name(type_object)
+            ));
+        }
+        chain.push(current);
+        current = unsafe { (*current).tp_base };
+    }
+    Ok(chain)
+}
+
+/// Copies the slots CPython inherits from the base chain into an unset static
+/// type. Heap types from `PyType_FromSpec` already ran the equivalent
+/// inheritance pass, and builtin types are ready before this runs.
+fn inherit_static_slots(type_object: *mut TypeObject, ancestors: &[*mut TypeObject]) {
+    macro_rules! inherit_value {
+        ($field:ident) => {
+            if unsafe { (*type_object).$field } == 0 {
+                for &ancestor in ancestors {
+                    // SAFETY: every entry was validated by `static_ancestors`.
+                    let candidate = unsafe { (*ancestor).$field };
+                    if candidate != 0 {
+                        unsafe { (*type_object).$field = candidate };
+                        break;
+                    }
+                }
+            }
+        };
+    }
+    macro_rules! inherit_pointer {
+        ($field:ident) => {
+            if unsafe { (*type_object).$field.is_null() } {
+                for &ancestor in ancestors {
+                    // SAFETY: as above.
+                    let candidate = unsafe { (*ancestor).$field };
+                    if !candidate.is_null() {
+                        unsafe { (*type_object).$field = candidate };
+                        break;
+                    }
+                }
+            }
+        };
+    }
+    inherit_value!(tp_dealloc);
+    inherit_value!(tp_free);
+    inherit_value!(tp_init);
+    inherit_value!(tp_new);
+    inherit_value!(tp_call);
+    inherit_value!(tp_getattro);
+    inherit_value!(tp_setattro);
+    inherit_value!(tp_getattr);
+    inherit_value!(tp_setattr);
+    inherit_value!(tp_repr);
+    inherit_value!(tp_str);
+    inherit_value!(tp_hash);
+    inherit_value!(tp_traverse);
+    inherit_value!(tp_clear);
+    inherit_value!(tp_richcompare);
+    inherit_value!(tp_is_gc);
+    inherit_value!(tp_finalize);
+    inherit_value!(tp_del);
+    inherit_value!(tp_iter);
+    inherit_value!(tp_iternext);
+    inherit_value!(tp_descr_get);
+    inherit_value!(tp_descr_set);
+    inherit_value!(tp_vectorcall);
+    inherit_value!(tp_alloc);
+    inherit_value!(tp_weaklistoffset);
+    inherit_value!(tp_dictoffset);
+    inherit_pointer!(tp_as_number);
+    inherit_pointer!(tp_as_sequence);
+    inherit_pointer!(tp_as_mapping);
+    inherit_pointer!(tp_as_buffer);
+    if unsafe { (*type_object).tp_vectorcall_offset == 0 } {
+        for &ancestor in ancestors {
+            // SAFETY: every entry is a live type object.
+            let offset = unsafe { (*ancestor).tp_vectorcall_offset };
+            if offset != 0 {
+                unsafe { (*type_object).tp_vectorcall_offset = offset };
+                break;
+            }
+        }
+    }
+}
+
+/// Fills `tp_bases`, `tp_mro` and `tp_dict` for a static type, matching what
+/// CPython's `type_ready` publishes for a type declared in C.
+fn fill_static_type_metadata(
+    type_object: *mut TypeObject,
+    ancestors: &[*mut TypeObject],
+) -> Result<(), String> {
+    let base = unsafe { (*type_object).tp_base };
+    let bases_tuple = type_tuple(&[base])?;
+    unsafe { (*type_object).tp_bases = bases_tuple as *mut c_void };
+    let mut mro: Vec<*mut TypeObject> = Vec::with_capacity(ancestors.len() + 1);
+    mro.push(type_object);
+    mro.extend_from_slice(ancestors);
+    let mro_tuple = match type_tuple(&mro) {
+        Ok(tuple) => tuple,
+        Err(error) => {
+            unsafe {
+                (*type_object).tp_bases = ptr::null_mut();
+            }
+            dec_ref(bases_tuple);
+            return Err(error);
+        }
+    };
+    unsafe { (*type_object).tp_mro = mro_tuple as *mut c_void };
+    if unsafe { (*type_object).tp_dict.is_null() } {
+        let dict = super::PyDict_New();
+        if dict.is_null() {
+            return Err(super::take_error()
+                .unwrap_or_else(|| "MemoryError: cannot allocate type dictionary".to_string()));
+        }
+        unsafe { (*type_object).tp_dict = dict as *mut c_void };
+    }
+    Ok(())
 }
 
 /// `PyType_Ready` body: validates the layout and fills in defaults.
@@ -2103,6 +2403,28 @@ pub(crate) fn ensure_ready(type_object: *mut TypeObject) -> Result<(), String> {
                 (*type_object).tp_base = ptr::addr_of_mut!(OBJECT_TYPE);
                 inc_ref((*type_object).tp_base as *mut ShimObject);
             }
+            // A static type (no heap-owned `tp_bases` tuple) still receives
+            // CPython's slot inheritance, plus the `tp_bases`/`tp_mro`/`tp_dict`
+            // metadata every ready type publishes. Heap types completed that
+            // pass in `type_from_spec`.
+            if (*type_object).tp_bases.is_null() {
+                let ancestors = static_ancestors(type_object)?;
+                inherit_static_slots(type_object, &ancestors);
+                if !(*type_object).tp_base.is_null() {
+                    fill_static_type_metadata(type_object, &ancestors)?;
+                }
+            }
+            // CPython rejects a GC type without a traversal function: the
+            // collector could not enumerate its references. Both heap and
+            // static types must satisfy this after inheritance.
+            if (*type_object).tp_flags & PY_TPFLAGS_HAVE_GC != 0 && (*type_object).tp_traverse == 0
+            {
+                return Err(format!(
+                    "SystemError: type '{}' has the Py_TPFLAGS_HAVE_GC flag but has no \
+                     tp_traverse function",
+                    (*type_object).name()
+                ));
+            }
             if (*type_object).tp_alloc == 0 {
                 let base = (*type_object).tp_base;
                 if !base.is_null() && (*base).tp_alloc != 0 {
@@ -2116,9 +2438,10 @@ pub(crate) fn ensure_ready(type_object: *mut TypeObject) -> Result<(), String> {
                 // it (through `PyType_GetSlot`) to release their instances.
                 (*type_object).tp_free = instance_free as *const () as usize;
             }
-            if (*type_object).tp_vectorcall_offset <= 0 {
+            if (*type_object).tp_vectorcall_offset <= 0 && (*type_object).tp_vectorcall == 0 {
                 // `Py_TPFLAGS_HAVE_VECTORCALL` only means something when the
-                // instance carries a vectorcall function pointer.
+                // instance carries a vectorcall function pointer or the type
+                // has the (static-type) `tp_vectorcall` callable.
                 (*type_object).tp_flags &= !PY_TPFLAGS_HAVE_VECTORCALL;
             }
         }
@@ -2171,6 +2494,15 @@ pub(crate) fn free_instance(object: *mut ShimObject) {
                 std::mem::transmute((*type_object).tp_dealloc as *const c_void);
             dealloc(object);
             return;
+        }
+        // Default deallocation of a GC type: run `tp_clear` so every edge the
+        // type declared to the collector is dropped exactly once before the
+        // storage is released. A type that installs its own `tp_dealloc` owns
+        // this duty (CPython contract), so it never reaches this branch.
+        if flags & PY_TPFLAGS_HAVE_GC != 0 && (*type_object).tp_clear != 0 {
+            let clear: unsafe extern "C" fn(*mut ShimObject) =
+                std::mem::transmute((*type_object).tp_clear as *const c_void);
+            clear(object);
         }
         if (*type_object).tp_free != 0 {
             let free: unsafe extern "C" fn(*mut c_void) =
@@ -2324,17 +2656,107 @@ pub extern "C" fn PyType_FromSpecWithBases(
     }
 }
 
-/// `PyType_Ready`: finalises a type created by `PyType_FromSpec`.
+/// Adopts a statically declared `PyTypeObject` (the `PyVarObject_HEAD_INIT`
+/// pattern every hand-written C extension uses).
+///
+/// Such an object starts with a NULL `ob_type`; CPython's `PyType_Ready`
+/// makes it immortal, points it at the metatype and treats it as a normal
+/// static type. Only an aligned object with a NULL metatype link, a readable
+/// name and non-negative sizes is adopted. Every other layout is rejected
+/// with a diagnostic instead of being written to, so an instance handle or a
+/// corrupt pointer cannot be turned into a type by accident.
+fn adopt_static_type(pointer: *mut TypeObject) -> Result<*mut TypeObject, String> {
+    if pointer.is_null() {
+        return Err("TypeError: PyType_Ready: type is NULL".to_string());
+    }
+    let address = pointer as usize;
+    if address < std::mem::align_of::<TypeObject>()
+        || !address.is_multiple_of(std::mem::align_of::<TypeObject>())
+    {
+        return Err("TypeError: PyType_Ready: type pointer is misaligned".to_string());
+    }
+    ensure_builtin_types();
+    // SAFETY: the caller owns a PyTypeObject-shaped object at this address;
+    // every read below is inside the CPython prefix.
+    let metatype = unsafe { (*pointer).ob_type };
+    if !metatype.is_null() && metatype != ptr::addr_of_mut!(TYPE_TYPE) {
+        // Not a static type: an instance handle (or a type with an
+        // unsupported custom metatype). Writing through it would corrupt the
+        // object, so report instead.
+        return Err(
+            "TypeError: PyType_Ready: object is not a static type object (ob_type is not NULL or \
+             &PyType_Type)"
+                .to_string(),
+        );
+    }
+    let name = unsafe { (*pointer).tp_name };
+    if name.is_null() {
+        return Err("TypeError: PyType_Ready: static type has a NULL tp_name".to_string());
+    }
+    let basicsize = unsafe { (*pointer).tp_basicsize };
+    let itemsize = unsafe { (*pointer).tp_itemsize };
+    if basicsize < 0 || itemsize < 0 {
+        return Err(format!(
+            "TypeError: PyType_Ready: static type '{}' has negative sizes (basicsize {basicsize}, \
+             itemsize {itemsize})",
+            // SAFETY: `name` is the extension's NUL-terminated type name.
+            unsafe { CStr::from_ptr(name) }.to_string_lossy()
+        ));
+    }
+    // SAFETY: a static PyTypeObject is exactly the CPython prefix; the
+    // internal tail lives in the struct's trailing padding, which the
+    // extension's declaration also contains (sizeof(PyTypeObject) == 416).
+    unsafe {
+        (*pointer).ob_type = ptr::addr_of_mut!(TYPE_TYPE);
+        (*pointer).role = TypeRole::Instance;
+        (*pointer).owns_name = false;
+        (*pointer).owns_buffer = false;
+        // CPython promotes static types to immortal in `type_ready`; without
+        // this a `Py_DecRef(Py_TYPE(obj))` from an extension would free data
+        // owned by the shared object.
+        (*pointer)
+            .ob_refcnt
+            .store(IMMORTAL_REFCNT, Ordering::Relaxed);
+    }
+    Ok(pointer)
+}
+
+/// `PyType_Ready`: finalises a heap type from `PyType_FromSpec` or adopts a
+/// statically declared C `PyTypeObject`.
 #[no_mangle]
 pub extern "C" fn PyType_Ready(type_object: *mut ShimObject) -> c_int {
-    match as_type(type_object) {
-        Ok(type_object) => match ensure_ready(type_object) {
-            Ok(()) => 0,
+    let pointer = match as_type(type_object) {
+        Ok(pointer) => {
+            // SAFETY: `as_type` validated the pointer.
+            let flags = unsafe { (*pointer).tp_flags };
+            let dynamic =
+                flags & (PY_TPFLAGS_READY | PY_TPFLAGS_HEAPTYPE) != 0 || is_internal_type(pointer);
+            if dynamic {
+                pointer
+            } else {
+                // A static C type whose initialiser already named
+                // `&PyType_Type` (instead of NULL) still needs adoption: its
+                // tail role is whatever the extension's storage happened to
+                // contain.
+                match adopt_static_type(pointer) {
+                    Ok(type_object) => type_object,
+                    Err(error) => {
+                        set_error(error);
+                        return -1;
+                    }
+                }
+            }
+        }
+        Err(_) => match adopt_static_type(type_object as *mut TypeObject) {
+            Ok(type_object) => type_object,
             Err(error) => {
                 set_error(error);
-                -1
+                return -1;
             }
         },
+    };
+    match ensure_ready(pointer) {
+        Ok(()) => 0,
         Err(error) => {
             set_error(error);
             -1
@@ -2693,6 +3115,110 @@ pub(crate) fn gc_is_tracked(object: *mut ShimObject) -> bool {
     tracked_lock().contains(&(object as usize))
 }
 
+/// Adapter between `visitproc` and a Rust closure.
+///
+/// `allow(dead_code)`: this is part of the deliberately exposed traversal
+/// bridge below. It has no production caller yet, but it is the only
+/// implementation of CPython's `visitproc` calling convention in this host;
+/// deleting it would silently drop `tp_traverse` support. It is exercised by
+/// the in-crate GC tests.
+#[allow(dead_code)]
+struct TraverseVisitor<'a> {
+    visit: &'a mut dyn FnMut(*mut ShimObject) -> std::ops::ControlFlow<()>,
+}
+
+/// `visitproc` adapter used by [`gc_traverse`] (see its `allow` note).
+#[allow(dead_code)]
+extern "C" fn traverse_visitor(context: *mut c_void, object: *mut c_void) -> c_int {
+    if context.is_null() {
+        return 1;
+    }
+    // SAFETY: `gc_traverse` passes a live `TraverseVisitor` for the duration
+    // of the call, and `visitproc` is only invoked synchronously.
+    let visitor = unsafe { &mut *(context as *mut TraverseVisitor<'_>) };
+    match (visitor.visit)(object as *mut ShimObject) {
+        std::ops::ControlFlow::Continue(()) => 0,
+        std::ops::ControlFlow::Break(()) => 1,
+    }
+}
+
+/// Enumerates the references held by one tracked GC instance through its
+/// `tp_traverse` slot.
+///
+/// `visit` returns [`std::ops::ControlFlow::Break`] to stop early, exactly like
+/// a `visitproc` returning non-zero. Objects of non-GC types and types with no
+/// `tp_traverse` have no traversable edges. A type that installs
+/// `tp_traverse` without `Py_TPFLAGS_HAVE_GC` is not walked: CPython only
+/// calls the slot for GC types.
+// `allow(dead_code)`: the host collector bridge is intentionally present but
+// not wired from Hydro code yet. Extensions' `tp_traverse` must remain
+// executable (PyType_GetSlot also returns it); the in-crate GC tests use this
+// function, and the collector integration will consume it. Do not delete.
+#[allow(dead_code)]
+pub(crate) fn gc_traverse(
+    object: *mut ShimObject,
+    visit: &mut dyn FnMut(*mut ShimObject) -> std::ops::ControlFlow<()>,
+) {
+    if object.is_null() {
+        return;
+    }
+    let type_object = type_of(object);
+    if type_object.is_null() || !type_uses_gc(type_object) {
+        return;
+    }
+    // SAFETY: live type object.
+    let traverse = unsafe { (*type_object).tp_traverse };
+    if traverse == 0 {
+        return;
+    }
+    // SAFETY: `tp_traverse` has CPython's
+    // `int (*)(PyObject *, visitproc, void *)` signature.
+    let traverse: unsafe extern "C" fn(
+        *mut ShimObject,
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
+        *mut c_void,
+    ) -> c_int = unsafe { std::mem::transmute(traverse as *const c_void) };
+    let mut visitor = TraverseVisitor { visit };
+    let _gripper = GilGuard::new();
+    // SAFETY: the visitor outlives the call; a non-zero status only means the
+    // walk stopped and is not an error for this host.
+    let _ = unsafe {
+        traverse(
+            object,
+            Some(traverse_visitor),
+            &mut visitor as *mut TraverseVisitor<'_> as *mut c_void,
+        )
+    };
+}
+
+/// Walks every currently tracked GC instance and enumerates its `tp_traverse`
+/// edges.
+///
+/// This is the bridge a host-side collector uses to see references held by C
+/// instances: the tracked set is the registry of GC-enabled instances, and
+/// this function turns each type's `tp_traverse` into a Rust callback. Hydro
+/// values cross through rooted handles (see `HydroValue`) rather than raw
+/// heap pointers, so a handle held by an extension already has its own
+/// persistent root; the bridge exists so a collector can follow the handle
+/// graph when it needs to, instead of assuming a C instance is an opaque
+/// non-GC container.
+///
+/// `allow(dead_code)`: deliberately exposed in-crate bridge. Its production
+/// consumer (the Hydro collector following C-instance edges) is not wired yet;
+/// the GC tests exercise the machinery and removing it would drop the only
+/// implementation of the `tp_traverse` walk. Do not delete.
+#[allow(dead_code)]
+pub(crate) fn gc_walk_tracked(
+    visit: &mut dyn FnMut(*mut ShimObject, *mut ShimObject) -> std::ops::ControlFlow<()>,
+) {
+    let addresses: Vec<usize> = tracked_lock().iter().copied().collect();
+    for address in addresses {
+        let object = address as *mut ShimObject;
+        let mut child_visit = |child: *mut ShimObject| visit(object, child);
+        gc_traverse(object, &mut child_visit);
+    }
+}
+
 /// CPython's `PyObject_IS_GC`: `HAVE_GC` plus an optional `tp_is_gc` filter.
 pub(crate) fn object_is_gc(object: *mut ShimObject) -> bool {
     let type_object = type_of(object);
@@ -2809,7 +3335,9 @@ pub(crate) fn allocate_named_type(name: &str, flags: c_ulong) -> *mut TypeObject
     type_object.owns_name = false;
     type_object.ob_type = ptr::addr_of_mut!(TYPE_TYPE);
     type_object.tp_base = ptr::addr_of_mut!(OBJECT_TYPE);
-    Box::into_raw(Box::new(type_object))
+    let pointer = Box::into_raw(Box::new(type_object));
+    remember_internal_type(pointer);
+    pointer
 }
 
 /// Allocates an immortal exception class.
@@ -3751,9 +4279,8 @@ pub(crate) fn object_length(object: *mut ShimObject) -> isize {
                     return super::py_ssize_of(pairs.len());
                 }
             }
-            super::ShimKind::List(items) | super::ShimKind::Tuple(items) => {
-                return super::py_ssize_of(items.len())
-            }
+            super::ShimKind::List(items) => return super::py_ssize_of(items.len()),
+            super::ShimKind::Tuple(items) => return super::py_ssize_of(items.len()),
             super::ShimKind::Str { text, .. } => return super::py_ssize_of(text.chars().count()),
             super::ShimKind::Bytes { data, .. } => return super::py_ssize_of(data.len()),
             // Hydro containers and user objects resolve `len()` in Hydro.
@@ -4395,8 +4922,24 @@ pub extern "C" fn PySequence_Contains(object: *mut ShimObject, item: *mut ShimOb
             }
             0
         }
-        Some(super::ShimKind::List(items)) | Some(super::ShimKind::Tuple(items)) => {
+        Some(super::ShimKind::List(items)) => {
             for &entry in items {
+                if entry == 0 {
+                    continue;
+                }
+                let status = PyObject_RichCompareBool(
+                    entry as *mut ShimObject,
+                    item,
+                    2, // Py_EQ
+                );
+                if status != 0 {
+                    return status;
+                }
+            }
+            0
+        }
+        Some(super::ShimKind::Tuple(items)) => {
+            for &entry in items.iter() {
                 if entry == 0 {
                     continue;
                 }

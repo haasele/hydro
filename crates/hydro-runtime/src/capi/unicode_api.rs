@@ -807,7 +807,7 @@ pub unsafe extern "C" fn PyUnicode_CopyCharacters(
         // SAFETY: the payload was validated as a string above; the GIL
         // serialises access to the storage.
         unsafe {
-            match &mut (*to).kind {
+            match kind_mut(to) {
                 ShimKind::Str { raw, .. } => {
                     *raw = Some(RawText {
                         width: to_width,
@@ -826,7 +826,7 @@ pub unsafe extern "C" fn PyUnicode_CopyCharacters(
     // SAFETY: the destination is a string with `PyUnicode_New` storage and the
     // bounds were checked against its code points.
     unsafe {
-        let raw = match &mut (*to).kind {
+        let raw = match kind_mut(to) {
             ShimKind::Str { raw: Some(raw), .. } => raw,
             _ => {
                 set_error("SystemError: PyUnicode_CopyCharacters requires writable string storage");
@@ -933,7 +933,7 @@ pub unsafe extern "C" fn PyUnicode_Resize(unicode: *mut *mut ShimObject, length:
         // Grow or shrink the existing UCS buffer without disturbing the
         // object's identity.
         let resized = unsafe {
-            match &mut (*object).kind {
+            match kind_mut(object) {
                 ShimKind::Str { raw: Some(raw), .. } if raw.width == width => {
                     if new_length > old_length {
                         let additional = byte_length.saturating_sub(raw.data.len());
@@ -990,7 +990,7 @@ pub unsafe extern "C" fn PyUnicode_Resize(unicode: *mut *mut ShimObject, length:
     }
     // SAFETY: the payload was validated as a string above.
     unsafe {
-        if let ShimKind::Str { raw, .. } = &mut (*object).kind {
+        if let ShimKind::Str { raw, .. } = kind_mut(object) {
             *raw = Some(RawText { width, data });
         }
     }
@@ -1320,7 +1320,8 @@ unsafe fn join_unicode_sequence(
     fseq: *mut ShimObject,
 ) -> *mut ShimObject {
     let items: &'static [usize] = match kind_ref(fseq) {
-        Some(ShimKind::List(items)) | Some(ShimKind::Tuple(items)) => items.as_slice(),
+        Some(ShimKind::List(items)) => items.as_slice(),
+        Some(ShimKind::Tuple(items)) => items.as_slice(),
         _ => {
             set_error("SystemError: PyUnicode_Join requires a sequence");
             return ptr::null_mut();
@@ -1511,7 +1512,8 @@ unsafe fn join_bytes_sequence(sep: *mut ShimObject, fseq: *mut ShimObject) -> *m
         }
     };
     let items: &'static [usize] = match kind_ref(fseq) {
-        Some(ShimKind::List(items)) | Some(ShimKind::Tuple(items)) => items.as_slice(),
+        Some(ShimKind::List(items)) => items.as_slice(),
+        Some(ShimKind::Tuple(items)) => items.as_slice(),
         _ => {
             set_error("SystemError: PyBytes_Join requires a sequence");
             return ptr::null_mut();
@@ -1583,7 +1585,8 @@ unsafe fn join_bytes_sequence(sep: *mut ShimObject, fseq: *mut ShimObject) -> *m
         }
     }
     let current_length = match kind_ref(fseq) {
-        Some(ShimKind::List(items)) | Some(ShimKind::Tuple(items)) => items.len(),
+        Some(ShimKind::List(items)) => items.len(),
+        Some(ShimKind::Tuple(items)) => items.len(),
         _ => snapshot.0.len(),
     };
     if current_length != snapshot.0.len() {

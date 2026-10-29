@@ -151,6 +151,8 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         hydro_uncaught,
         hydro_runtime_init,
         hydro_register_function,
+        hydro_register_module_initializer,
+        hydro_initialize_module,
         hydro_spawn_child,
         hydro_profile_reset,
         hydro_profile_hit,

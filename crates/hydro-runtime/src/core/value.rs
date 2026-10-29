@@ -240,6 +240,23 @@ pub(crate) struct IterState {
     pub(crate) exhausted: bool,
 }
 
+/// Return expression of a tiny function compiled by the runtime `exec`
+/// subset.
+///
+/// The supported expressions are the ones `typing_inspection` generates:
+/// an identity check, either of two identity checks, an `isinstance` check
+/// against a cached type (or tuple of types), and the literal `False`.
+pub(crate) enum ExecCheck {
+    /// `PARAM is NAME`
+    Identity { name: String },
+    /// `PARAM is FIRST or PARAM is SECOND`
+    IdentityEither { first: String, second: String },
+    /// `isinstance(PARAM, NAME)`
+    IsInstance { name: String },
+    /// `False`
+    AlwaysFalse,
+}
+
 /// What a function value refers to.
 pub(crate) enum FunctionBody {
     /// Address of a generated `extern "C"` entry point plus the values
@@ -281,6 +298,22 @@ pub(crate) enum FunctionBody {
     /// values (traced as GC edges). The runtime calls back into the
     /// interpreter through the dispatcher installed by `hydro-interp`.
     Host { token: u64, captures: Vec<i64> },
+    /// Function exported by an HNA (`*.hna.so`) module. `module` is the
+    /// process-wide registry id of [`crate::native`] and `index` the position
+    /// in the descriptor's function array. The body owns no Hydro values: the
+    /// registry keeps the module value and its constants rooted, and the call
+    /// path roots the arguments for the duration of the foreign call.
+    Hna { module: u64, index: u32 },
+    /// Function compiled by the runtime `exec` subset: a single positional
+    /// parameter and one of the [`ExecCheck`] expressions. Names in the
+    /// expression resolve against `globals` and then `locals`; both mappings
+    /// are traced as GC edges because the call needs them for the lifetime of
+    /// the function.
+    Exec {
+        check: ExecCheck,
+        globals: i64,
+        locals: i64,
+    },
 }
 
 /// A function value. For [`FunctionBody::Wrapper`] values `arity` is the exact
@@ -294,9 +327,11 @@ pub(crate) enum FunctionBody {
 /// remaining count when its target is a generated wrapper. `name` is the
 /// Python-visible name (`<lambda>` for anonymous functions). Wrapper functions
 /// own their captured values, item getters own their keys and partials own the
-/// target callable plus the bound arguments; the collector traces those edges
-/// (see `gc::heap`). `metadata` holds the writable attribute slots and the
-/// function's own `__dict__`, whose values are traced as well.
+/// target callable plus the bound arguments; exec-compiled functions own the
+/// globals and locals mappings they resolve names against. The collector
+/// traces those edges (see `gc::heap`). `metadata` holds the writable
+/// attribute slots and the function's own `__dict__`, whose values are traced
+/// as well.
 pub(crate) struct ParamMeta {
     pub(crate) name: String,
     pub(crate) kind: ParamKind,
@@ -6455,6 +6490,45 @@ pub(crate) fn native_function_new(module: &'static str, name: &'static str, arit
     )
 }
 
+/// Allocates a function value backed by an HNA module export.
+///
+/// `module` is the native registry id and `index` the descriptor function
+/// position. `params` are the keyword-bindable positional names; they become
+/// [`ParamMeta`] entries with [`ParamKind::Positional`] and the function's
+/// user-visible parameter list, and `arity` is the descriptor's `min_args`.
+/// `full_entry` stays `0`: HNA functions have no generated machine-code
+/// trampoline, so keyword calls are bound by
+/// [`crate::native::call_function_kw`] before the generic binder can see them.
+pub(crate) fn hna_function_new(
+    module: u64,
+    index: u32,
+    name: String,
+    params: Vec<String>,
+    min_args: usize,
+) -> i64 {
+    let signature: Vec<ParamMeta> = params
+        .iter()
+        .map(|param| ParamMeta {
+            name: param.clone(),
+            kind: ParamKind::Positional,
+            default: None,
+        })
+        .collect();
+    alloc(
+        KIND_FUNCTION,
+        ObjData::Function(FunctionObj {
+            body: FunctionBody::Hna { module, index },
+            arity: min_args,
+            name,
+            flags: 0,
+            full_entry: 0,
+            signature,
+            metadata: FunctionMetadata::default(),
+            params,
+        }),
+    )
+}
+
 /// Allocates a builtin function value. Builtins validate their own arity, so
 /// `arity` is `usize::MAX` (variadic); callers never rely on it.
 pub(crate) fn builtin_function_new(builtin: hydro_ir::Builtin) -> i64 {
@@ -6514,6 +6588,44 @@ pub(crate) fn host_function_new(
             signature,
             metadata: FunctionMetadata::default(),
             params: positional,
+        }),
+    )
+}
+
+/// Allocates a function value compiled by the runtime `exec` subset.
+///
+/// The function takes exactly one positional-only parameter (`param`). Its
+/// `globals` and `locals` mappings are stored as traced GC edges: the check
+/// expression resolves its names against them at call time, so the function
+/// keeps whichever mapping supplied the referenced objects alive.
+pub(crate) fn exec_function_new(
+    name: String,
+    param: String,
+    check: ExecCheck,
+    globals: i64,
+    locals: i64,
+) -> i64 {
+    alloc(
+        KIND_FUNCTION,
+        ObjData::Function(FunctionObj {
+            body: FunctionBody::Exec {
+                check,
+                globals,
+                locals,
+            },
+            arity: 1,
+            name,
+            flags: 0,
+            // No machine-code trampoline: keyword calls are rejected by the
+            // runtime binder before it consults the signature.
+            full_entry: 0,
+            signature: vec![ParamMeta {
+                name: param.clone(),
+                kind: ParamKind::PosOnly,
+                default: None,
+            }],
+            metadata: FunctionMetadata::default(),
+            params: vec![param],
         }),
     )
 }
@@ -6592,8 +6704,10 @@ pub(crate) fn partial_new_with_keywords(
             // callables here take exactly one argument.
             FunctionBody::Wrapper { .. }
             | FunctionBody::Host { .. }
+            | FunctionBody::Hna { .. }
             | FunctionBody::Partial { .. }
             | FunctionBody::Identity
+            | FunctionBody::Exec { .. }
             | FunctionBody::AttributeGetter { .. }
             | FunctionBody::ItemGetter { .. } => func.arity.saturating_sub(bound),
         },
@@ -6710,10 +6824,10 @@ pub(crate) fn function_params(function: i64) -> &'static [String] {
 
 /// Whether a function value carries CPython's writable attribute surface.
 ///
-/// Generated wrappers, interpreter functions and `functools.partial` objects
-/// are Python-level callables with a `__dict__`; native module functions,
-/// builtins and native bound methods are C-level callables that reject
-/// attribute assignment.
+/// Generated wrappers, interpreter functions, exec-compiled functions and
+/// `functools.partial` objects are Python-level callables with a `__dict__`;
+/// native module functions, builtins and native bound methods are C-level
+/// callables that reject attribute assignment.
 pub(crate) fn function_has_attributes(function: i64) -> bool {
     match as_function(function) {
         Some(func) => matches!(
@@ -6722,6 +6836,7 @@ pub(crate) fn function_has_attributes(function: i64) -> bool {
                 | FunctionBody::Host { .. }
                 | FunctionBody::Partial { .. }
                 | FunctionBody::Identity
+                | FunctionBody::Exec { .. }
         ),
         None => false,
     }
@@ -7506,6 +7621,15 @@ pub(crate) fn class_annotations(class: i64) -> Option<i64> {
         // A method-style entry is not an annotation mapping; never shadow it.
         Some(ClassEntry::Method(_, _)) => return None,
         None => {}
+    }
+    // PEP 649: a class body with annotations publishes an `__annotate__`
+    // callable instead of the mapping itself. Evaluate it on first access and
+    // cache the resulting dictionary just like CPython's getset.
+    if let Some(annotations) = crate::modules::annotationlib::evaluate_class_annotate(class) {
+        let roots = crate::heap::root_values(&[annotations]);
+        class_set_attr(class, "__annotations__".to_string(), annotations);
+        crate::heap::release_roots(roots);
+        return Some(annotations);
     }
     let annotations = dict_new(Vec::new());
     let roots = crate::heap::root_values(&[annotations]);

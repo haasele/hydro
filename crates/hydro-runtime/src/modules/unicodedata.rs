@@ -1,7 +1,7 @@
 //! `unicodedata`: Unicode character database properties and normalization.
 //!
-//! The tables are generated from Unicode 16.0.0 data (the version shipped by
-//! CPython 3.14). Every code point has category, combining class,
+//! The module tables are generated from Unicode 16.0.0 data (the version
+//! shipped by CPython 3.14). Every code point has category, combining class,
 //! east-asian-width, bidirectional and decomposition entries; `numeric`,
 //! `digit` and `decimal` cover every character with a numeric value.
 //!
@@ -9,8 +9,18 @@
 //! punctuation, symbols and emoji below U+3000 plus the common emoji block),
 //! the algorithmic Hangul syllable names and the CJK ideograph names. A name
 //! outside that set raises `ValueError` (or returns the caller's default)
-//! instead of inventing a value; `ucd_3_2_0` and `unidata_version` describe
-//! the shipped 16.0.0 database.
+//! instead of inventing a value; `unidata_version` describes the shipped
+//! 16.0.0 database.
+//!
+//! `ucd_3_2_0` is the frozen Unicode 3.2.0 database used by the IDNA codec.
+//! It is a cached `UCD` object with the same read-only methods as CPython's
+//! (`category`, `bidirectional`, `combining`, `decomposition`,
+//! `east_asian_width`, `mirrored`, `name`, `lookup`, `normalize`,
+//! `is_normalized`, `numeric`, `digit`, `decimal`) and
+//! `unidata_version == "3.2.0"`. Its tables live in
+//! `unicodedata_3_2_tables.rs`, generated from UnicodeData-3.2.0.txt,
+//! CompositionExclusions-3.2.0.txt and the East Asian Width data, with
+//! provenance documented in that file.
 //!
 //! Normalization implements UAX #15 NFC/NFD/NFKC/NFKD: recursive canonical or
 //! compatibility decomposition, canonical ordering and blocked canonical
@@ -19,11 +29,20 @@
 //! No input can panic; type/length/value errors report a pending exception and
 //! return `None`.
 
+use hydro_ir::MethodKind;
+
+use crate::core::globals;
 use crate::exc::{self, ATTRIBUTE_ERROR, KEY_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::value::{self, NONE};
 
-/// `unicodedata.unidata_version`: the Unicode version of the tables.
+/// Module name used for native function values.
+const MODULE: &str = "unicodedata";
+
+/// `unicodedata.unidata_version`: the Unicode version of the module tables.
 pub(crate) const UNIDATA_VERSION: &str = "16.0.0";
+
+/// `unicodedata.ucd_3_2_0.unidata_version`: the frozen IDNA database.
+pub(crate) const UNIDATA_VERSION_3_2_0: &str = "3.2.0";
 
 fn type_error(message: &str) -> i64 {
     exc::raise_with_message(TYPE_ERROR, message)
@@ -72,36 +91,101 @@ fn range_index(starts: &[u32], cp: u32) -> usize {
         .saturating_sub(1)
 }
 
+/// Static table bundle for one Unicode database version.
+///
+/// The 16.0 tables back the module functions; the 3.2 tables back the frozen
+/// `ucd_3_2_0` object. Both go through the same lookup and normalization code.
+struct Tables {
+    category_names: &'static [&'static str],
+    category_starts: &'static [u32],
+    category_ids: &'static [u8],
+    combining_starts: &'static [u32],
+    combining_ends: &'static [u32],
+    combining_values: &'static [u8],
+    eaw_names: &'static [&'static str],
+    eaw_starts: &'static [u32],
+    eaw_ids: &'static [u8],
+    bidi_names: &'static [&'static str],
+    bidi_starts: &'static [u32],
+    bidi_ids: &'static [u8],
+    decomp_tag_names: &'static [&'static str],
+    decomp_keys: &'static [u32],
+    decomp_offsets: &'static [u32],
+    decomp_tags: &'static [u8],
+    decomp_data: &'static [u32],
+    /// `decomposition()` strings that differ from the normalization data
+    /// (Unicode Corrigendum #4, see the generated table header).
+    decomp_overrides: &'static [(u32, &'static str)],
+    compose: &'static [(u32, u32, u32)],
+    num_keys: &'static [u32],
+    num_digits: &'static [i8],
+    num_decimals: &'static [i8],
+    num_numerators: &'static [i64],
+    num_denominators: &'static [i32],
+    /// Numeric values too large for the rational representation.
+    numeric_floats: &'static [(u32, f64)],
+    names: &'static [(u32, &'static str)],
+    cjk_unified: &'static [(u32, u32)],
+    cjk_compat: &'static [(u32, u32)],
+    mirrored: &'static [u32],
+}
+
 pub(crate) fn category_of(ch: char) -> &'static str {
-    let index = range_index(CATEGORY_STARTS, ch as u32);
-    CATEGORY_NAMES[CATEGORY_IDS[index] as usize]
+    category_in(&V16, ch)
+}
+
+fn category_in(db: &'static Tables, ch: char) -> &'static str {
+    let index = range_index(db.category_starts, ch as u32);
+    db.category_names[db.category_ids[index] as usize]
 }
 
 fn combining_of(ch: char) -> u8 {
+    combining_in(&V16, ch)
+}
+
+fn combining_in(db: &'static Tables, ch: char) -> u8 {
     let cp = ch as u32;
-    let index = COMBINING_STARTS.partition_point(|&start| start <= cp);
-    if index == 0 || cp >= COMBINING_ENDS[index - 1] {
+    let index = db.combining_starts.partition_point(|&start| start <= cp);
+    if index == 0 || cp >= db.combining_ends[index - 1] {
         return 0;
     }
-    COMBINING_VALUES[index - 1]
+    db.combining_values[index - 1]
 }
 
 fn east_asian_width_of(ch: char) -> &'static str {
-    let index = range_index(EAW_STARTS, ch as u32);
-    EAW_NAMES[EAW_IDS[index] as usize]
+    east_asian_width_in(&V16, ch)
+}
+
+fn east_asian_width_in(db: &'static Tables, ch: char) -> &'static str {
+    let index = range_index(db.eaw_starts, ch as u32);
+    db.eaw_names[db.eaw_ids[index] as usize]
 }
 
 fn bidirectional_of(ch: char) -> &'static str {
-    let index = range_index(BIDI_STARTS, ch as u32);
-    BIDI_NAMES[BIDI_IDS[index] as usize]
+    bidirectional_in(&V16, ch)
+}
+
+fn bidirectional_in(db: &'static Tables, ch: char) -> &'static str {
+    let index = range_index(db.bidi_starts, ch as u32);
+    db.bidi_names[db.bidi_ids[index] as usize]
 }
 
 /// Direct (one-level) decomposition entry: `(tag id, code points)`.
-fn decomposition_entry(ch: char) -> Option<(u8, &'static [u32])> {
-    let index = DECOMP_KEYS.binary_search(&(ch as u32)).ok()?;
-    let start = DECOMP_OFFSETS[index] as usize;
-    let end = DECOMP_OFFSETS[index + 1] as usize;
-    Some((DECOMP_TAGS[index], &DECOMP_DATA[start..end]))
+fn decomposition_entry_in(db: &'static Tables, ch: char) -> Option<(u8, &'static [u32])> {
+    let index = db.decomp_keys.binary_search(&(ch as u32)).ok()?;
+    let start = db.decomp_offsets[index] as usize;
+    let end = db.decomp_offsets[index + 1] as usize;
+    Some((db.decomp_tags[index], &db.decomp_data[start..end]))
+}
+
+/// Published `decomposition()` string when it differs from the normalization
+/// mapping.
+fn decomposition_override_in(db: &'static Tables, cp: u32) -> Option<&'static str> {
+    let index = db
+        .decomp_overrides
+        .binary_search_by_key(&cp, |&(code, _)| code)
+        .ok()?;
+    Some(db.decomp_overrides[index].1)
 }
 
 /// Algorithmic Hangul syllable decomposition: `(L, V, T)` code points, with
@@ -118,19 +202,26 @@ fn hangul_decomposition(cp: u32) -> Option<(u32, u32, u32)> {
 }
 
 fn decomposition_string(ch: char) -> String {
+    decomposition_string_in(&V16, ch)
+}
+
+fn decomposition_string_in(db: &'static Tables, ch: char) -> String {
+    if let Some(text) = decomposition_override_in(db, ch as u32) {
+        return text.to_string();
+    }
     if let Some((l, v, t)) = hangul_decomposition(ch as u32) {
         if t == 0 {
             return format!("{l:04X} {v:04X}");
         }
         return format!("{l:04X} {v:04X} {t:04X}");
     }
-    let Some((tag, parts)) = decomposition_entry(ch) else {
+    let Some((tag, parts)) = decomposition_entry_in(db, ch) else {
         return String::new();
     };
     let mut text = String::new();
     if tag != 0 {
         text.push('<');
-        text.push_str(DECOMP_TAG_NAMES[tag as usize]);
+        text.push_str(db.decomp_tag_names[tag as usize]);
         text.push('>');
     }
     for &part in parts {
@@ -143,7 +234,7 @@ fn decomposition_string(ch: char) -> String {
 }
 
 /// Recursively decomposes `ch` into `out`.
-fn decompose_into(ch: char, compatibility: bool, out: &mut Vec<char>) {
+fn decompose_into(db: &'static Tables, ch: char, compatibility: bool, out: &mut Vec<char>) {
     if let Some((l, v, t)) = hangul_decomposition(ch as u32) {
         if let Some(l) = char::from_u32(l) {
             out.push(l);
@@ -158,11 +249,11 @@ fn decompose_into(ch: char, compatibility: bool, out: &mut Vec<char>) {
         }
         return;
     }
-    if let Some((tag, parts)) = decomposition_entry(ch) {
+    if let Some((tag, parts)) = decomposition_entry_in(db, ch) {
         if tag == 0 || compatibility {
             for &part in parts {
                 if let Some(part) = char::from_u32(part) {
-                    decompose_into(part, compatibility, out);
+                    decompose_into(db, part, compatibility, out);
                 }
             }
             return;
@@ -172,17 +263,17 @@ fn decompose_into(ch: char, compatibility: bool, out: &mut Vec<char>) {
 }
 
 /// Canonical ordering of combining marks within each starter run.
-fn canonical_order(chars: &mut [char]) {
+fn canonical_order(db: &'static Tables, chars: &mut [char]) {
     let mut index = 0;
     while index < chars.len() {
-        if combining_of(chars[index]) == 0 {
+        if combining_in(db, chars[index]) == 0 {
             index += 1;
             continue;
         }
         let mut position = index;
         while position > 0 {
-            let previous = combining_of(chars[position - 1]);
-            let current = combining_of(chars[position]);
+            let previous = combining_in(db, chars[position - 1]);
+            let current = combining_in(db, chars[position]);
             if previous == 0 || previous <= current {
                 break;
             }
@@ -194,7 +285,7 @@ fn canonical_order(chars: &mut [char]) {
 }
 
 /// Canonical pair composition, including the algorithmic Hangul cases.
-fn compose_pair(first: char, second: char) -> Option<char> {
+fn compose_pair(db: &'static Tables, first: char, second: char) -> Option<char> {
     let a = first as u32;
     let b = second as u32;
     if (0x1100..=0x1112).contains(&a) && (0x1161..=0x1175).contains(&b) {
@@ -207,20 +298,24 @@ fn compose_pair(first: char, second: char) -> Option<char> {
         return char::from_u32(a + (b - 0x11A7));
     }
     let key = (a, b);
-    COMPOSE
+    db.compose
         .binary_search_by_key(&key, |&(x, y, _)| (x, y))
         .ok()
-        .and_then(|index| char::from_u32(COMPOSE[index].2))
+        .and_then(|index| char::from_u32(db.compose[index].2))
 }
 
 fn normalize(form: &str, text: &str) -> String {
+    normalize_in(&V16, form, text)
+}
+
+fn normalize_in(db: &'static Tables, form: &str, text: &str) -> String {
     let compatibility = form.starts_with("NFK");
     let compose = form == "NFC" || form == "NFKC";
     let mut buffer = Vec::with_capacity(text.chars().count());
     for ch in text.chars() {
-        decompose_into(ch, compatibility, &mut buffer);
+        decompose_into(db, ch, compatibility, &mut buffer);
     }
-    canonical_order(&mut buffer);
+    canonical_order(db, &mut buffer);
     if !compose {
         return buffer.into_iter().collect();
     }
@@ -228,10 +323,10 @@ fn normalize(form: &str, text: &str) -> String {
     let mut starter: Option<usize> = None;
     let mut last_class: u8 = 0;
     for ch in buffer {
-        let class = combining_of(ch);
+        let class = combining_in(db, ch);
         if let Some(position) = starter {
             if last_class == 0 || last_class < class {
-                if let Some(composed) = compose_pair(out[position], ch) {
+                if let Some(composed) = compose_pair(db, out[position], ch) {
                     out[position] = composed;
                     continue;
                 }
@@ -266,13 +361,13 @@ fn hangul_name(cp: u32) -> Option<String> {
     ))
 }
 
-fn cjk_name(cp: u32) -> Option<String> {
-    for &(start, end) in CJK_UNIFIED {
+fn cjk_name_in(db: &'static Tables, cp: u32) -> Option<String> {
+    for &(start, end) in db.cjk_unified {
         if (start..=end).contains(&cp) {
             return Some(format!("CJK UNIFIED IDEOGRAPH-{cp:04X}"));
         }
     }
-    for &(start, end) in CJK_COMPAT {
+    for &(start, end) in db.cjk_compat {
         if (start..=end).contains(&cp) {
             return Some(format!("CJK COMPATIBILITY IDEOGRAPH-{cp:04X}"));
         }
@@ -283,19 +378,27 @@ fn cjk_name(cp: u32) -> Option<String> {
 /// Full Unicode name of `cp`, or `None` for unassigned characters and names
 /// outside the generated table.
 fn char_name(cp: u32) -> Option<String> {
+    char_name_in(&V16, cp)
+}
+
+fn char_name_in(db: &'static Tables, cp: u32) -> Option<String> {
     if let Some(name) = hangul_name(cp) {
         return Some(name);
     }
-    if let Some(name) = cjk_name(cp) {
+    if let Some(name) = cjk_name_in(db, cp) {
         return Some(name);
     }
-    NAMES
+    db.names
         .binary_search_by_key(&cp, |&(code, _)| code)
         .ok()
-        .map(|index| NAMES[index].1.to_string())
+        .map(|index| db.names[index].1.to_string())
 }
 
 fn lookup_name(text: &str) -> Option<char> {
+    lookup_name_in(&V16, text)
+}
+
+fn lookup_name_in(db: &'static Tables, text: &str) -> Option<char> {
     let upper = text.to_uppercase();
     if upper.starts_with("HANGUL SYLLABLE ") {
         for cp in 0xAC00..=0xD7A3u32 {
@@ -306,8 +409,8 @@ fn lookup_name(text: &str) -> Option<char> {
         return None;
     }
     for (prefix, ranges) in [
-        ("CJK UNIFIED IDEOGRAPH-", CJK_UNIFIED),
-        ("CJK COMPATIBILITY IDEOGRAPH-", CJK_COMPAT),
+        ("CJK UNIFIED IDEOGRAPH-", db.cjk_unified),
+        ("CJK COMPATIBILITY IDEOGRAPH-", db.cjk_compat),
     ] {
         if let Some(hex) = upper.strip_prefix(prefix) {
             let Ok(cp) = u32::from_str_radix(hex, 16) else {
@@ -325,20 +428,313 @@ fn lookup_name(text: &str) -> Option<char> {
             return None;
         }
     }
-    NAMES
+    db.names
         .iter()
         .find(|(_, name)| *name == upper.as_str())
         .and_then(|&(cp, _)| char::from_u32(cp))
 }
 
 pub(crate) fn numeric_entry(cp: u32) -> Option<(i8, i8, i64, i64)> {
-    let index = NUM_KEYS.binary_search(&cp).ok()?;
+    numeric_entry_in(&V16, cp)
+}
+
+fn numeric_entry_in(db: &'static Tables, cp: u32) -> Option<(i8, i8, i64, i64)> {
+    let index = db.num_keys.binary_search(&cp).ok()?;
     Some((
-        NUM_DIGITS[index],
-        NUM_DECIMALS[index],
-        NUM_NUMERATORS[index],
-        i64::from(NUM_DENOMINATORS[index]),
+        db.num_digits[index],
+        db.num_decimals[index],
+        db.num_numerators[index],
+        i64::from(db.num_denominators[index]),
     ))
+}
+
+fn mirrored_in(db: &'static Tables, ch: char) -> bool {
+    db.mirrored.binary_search(&(ch as u32)).is_ok()
+}
+
+/// Numeric value that does not fit the rational `(numerator, denominator)`
+/// representation (a 3.2 CJK numeral beyond `i64`).
+fn numeric_float_in(db: &'static Tables, cp: u32) -> Option<f64> {
+    let index = db
+        .numeric_floats
+        .binary_search_by_key(&cp, |&(code, _)| code)
+        .ok()?;
+    Some(db.numeric_floats[index].1)
+}
+
+// -------------------------------------------------------------------------
+// The frozen `ucd_3_2_0` database object
+// -------------------------------------------------------------------------
+
+/// Registry keys of the `UCD` class and its 3.2 singleton.
+const UCD_CLASS_KEY: &str = "unicodedata.UCD";
+const UCD_3_2_0_KEY: &str = "unicodedata.ucd_3_2_0";
+
+/// Native method names of the `UCD` class.
+const UCD_CATEGORY: &str = "_ucd32_category";
+const UCD_BIDIRECTIONAL: &str = "_ucd32_bidirectional";
+const UCD_COMBINING: &str = "_ucd32_combining";
+const UCD_DECOMPOSITION: &str = "_ucd32_decomposition";
+const UCD_EAST_ASIAN_WIDTH: &str = "_ucd32_east_asian_width";
+const UCD_MIRRORED: &str = "_ucd32_mirrored";
+const UCD_NAME: &str = "_ucd32_name";
+const UCD_LOOKUP: &str = "_ucd32_lookup";
+const UCD_NORMALIZE: &str = "_ucd32_normalize";
+const UCD_IS_NORMALIZED: &str = "_ucd32_is_normalized";
+const UCD_NUMERIC: &str = "_ucd32_numeric";
+const UCD_DIGIT: &str = "_ucd32_digit";
+const UCD_DECIMAL: &str = "_ucd32_decimal";
+
+fn ucd_entry(name: &str, native: &'static str, arity: usize) -> (String, i64, MethodKind) {
+    (
+        name.to_string(),
+        value::native_function_new(MODULE, native, arity),
+        MethodKind::Normal,
+    )
+}
+
+/// The cached `unicodedata.UCD` class.
+fn ucd_class() -> i64 {
+    if let Some(class) = globals::registry_get(UCD_CLASS_KEY) {
+        return class;
+    }
+    let methods = [
+        ucd_entry("category", UCD_CATEGORY, 2),
+        ucd_entry("bidirectional", UCD_BIDIRECTIONAL, 2),
+        ucd_entry("combining", UCD_COMBINING, 2),
+        ucd_entry("decomposition", UCD_DECOMPOSITION, 2),
+        ucd_entry("east_asian_width", UCD_EAST_ASIAN_WIDTH, 2),
+        ucd_entry("mirrored", UCD_MIRRORED, 2),
+        ucd_entry("name", UCD_NAME, 3),
+        ucd_entry("lookup", UCD_LOOKUP, 2),
+        ucd_entry("normalize", UCD_NORMALIZE, 3),
+        ucd_entry("is_normalized", UCD_IS_NORMALIZED, 3),
+        ucd_entry("numeric", UCD_NUMERIC, 3),
+        ucd_entry("digit", UCD_DIGIT, 3),
+        ucd_entry("decimal", UCD_DECIMAL, 3),
+    ];
+    let roots: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let roots = crate::heap::root_values(&roots);
+    let class = value::class_new_full("UCD".to_string(), NONE, methods.to_vec(), Vec::new());
+    crate::heap::release_roots(roots);
+    globals::registry_set(UCD_CLASS_KEY, class);
+    class
+}
+
+/// `unicodedata.ucd_3_2_0`: the cached Unicode 3.2.0 database object.
+pub(crate) fn ucd_3_2_0() -> i64 {
+    if let Some(instance) = globals::registry_get(UCD_3_2_0_KEY) {
+        return instance;
+    }
+    let class = ucd_class();
+    let version = value::str_alloc(UNIDATA_VERSION_3_2_0.to_string());
+    let instance = value::instance_new(class);
+    value::instance_setattr(instance, "unidata_version".to_string(), version);
+    globals::registry_set(UCD_3_2_0_KEY, instance);
+    instance
+}
+
+/// `unicodedata` constants for the spec-driven attribute lookup.
+pub(crate) fn constant(name: &str) -> i64 {
+    match name {
+        "unidata_version" => value::str_alloc(UNIDATA_VERSION.to_string()),
+        "ucd_3_2_0" => ucd_3_2_0(),
+        _ => exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("module 'unicodedata' has no attribute '{name}'"),
+        ),
+    }
+}
+
+fn ucd_arity(method: &str, expected: usize, given: usize) -> i64 {
+    type_error(&format!(
+        "UCD.{method}() takes exactly {expected} argument{} ({given} given)",
+        if expected == 1 { "" } else { "s" }
+    ))
+}
+
+fn ucd_char_argument(method: &str, candidate: i64) -> Result<char, i64> {
+    let Some(text) = value::as_str(candidate) else {
+        return Err(type_error(&format!(
+            "{method}() argument must be a unicode character, not {}",
+            value::type_name(candidate)
+        )));
+    };
+    let mut chars = text.chars();
+    let Some(ch) = chars.next() else {
+        return Err(type_error(&format!(
+            "{method}() argument must be a unicode character, not a string of length 0"
+        )));
+    };
+    if chars.next().is_some() {
+        return Err(type_error(&format!(
+            "{method}(): argument must be a unicode character, not a string of length {}",
+            text.chars().count()
+        )));
+    }
+    Ok(ch)
+}
+
+fn ucd_string_argument(method: &str, candidate: i64, position: usize) -> Result<&'static str, i64> {
+    match value::as_str(candidate) {
+        Some(text) => Ok(text),
+        None => Err(type_error(&format!(
+            "{method}() argument {position} must be str, not {}",
+            value::type_name(candidate)
+        ))),
+    }
+}
+
+fn ucd_char_method(method: &str, args: &[i64], action: fn(char) -> i64) -> i64 {
+    if args.len() != 2 {
+        return ucd_arity(method, 1, args.len().saturating_sub(1));
+    }
+    match ucd_char_argument(method, args[1]) {
+        Ok(ch) => action(ch),
+        Err(err) => err,
+    }
+}
+
+/// `numeric`/`digit`/`decimal` share the module's optional-default protocol.
+fn ucd_numeric_method(method: &str, args: &[i64]) -> i64 {
+    if args.len() < 2 || args.len() > 3 {
+        return type_error(&format!(
+            "{method} expected 1 to 2 arguments, got {}",
+            args.len().saturating_sub(1)
+        ));
+    }
+    let ch = match ucd_char_argument(method, args[1]) {
+        Ok(ch) => ch,
+        Err(err) => return err,
+    };
+    if method == "numeric" {
+        if let Some(value) = numeric_float_in(&V32, ch as u32) {
+            return value::float_new(value);
+        }
+    }
+    let missing = || match args.get(2).copied() {
+        Some(default) => default,
+        None => value_error(match method {
+            "numeric" => "not a numeric character",
+            "digit" => "not a digit",
+            _ => "not a decimal",
+        }),
+    };
+    let Some((digit, decimal, numerator, denominator)) = numeric_entry_in(&V32, ch as u32) else {
+        return missing();
+    };
+    match method {
+        "numeric" => {
+            if denominator == 0 {
+                missing()
+            } else {
+                value::float_new(numerator as f64 / denominator as f64)
+            }
+        }
+        "digit" => {
+            if digit < 0 {
+                missing()
+            } else {
+                value::encode_int(i64::from(digit))
+                    .unwrap_or_else(|| value_error("digit is out of range"))
+            }
+        }
+        _ => {
+            if decimal < 0 {
+                missing()
+            } else {
+                value::encode_int(i64::from(decimal))
+                    .unwrap_or_else(|| value_error("decimal is out of range"))
+            }
+        }
+    }
+}
+
+/// Dispatches one method of the `ucd_3_2_0` object.
+fn ucd32_call(function: &str, args: &[i64]) -> Option<i64> {
+    let method = function.strip_prefix("_ucd32_")?;
+    Some(match method {
+        "category" => ucd_char_method("category", args, |ch| {
+            value::str_alloc(category_in(&V32, ch).to_string())
+        }),
+        "bidirectional" => ucd_char_method("bidirectional", args, |ch| {
+            value::str_alloc(bidirectional_in(&V32, ch).to_string())
+        }),
+        "combining" => ucd_char_method("combining", args, |ch| {
+            value::encode_int(i64::from(combining_in(&V32, ch)))
+                .unwrap_or_else(|| value_error("combining class is out of range"))
+        }),
+        "decomposition" => ucd_char_method("decomposition", args, |ch| {
+            value::str_alloc(decomposition_string_in(&V32, ch))
+        }),
+        "east_asian_width" => ucd_char_method("east_asian_width", args, |ch| {
+            value::str_alloc(east_asian_width_in(&V32, ch).to_string())
+        }),
+        "mirrored" => ucd_char_method("mirrored", args, |ch| {
+            value::encode_int(i64::from(mirrored_in(&V32, ch)))
+                .unwrap_or_else(|| value_error("mirrored flag is out of range"))
+        }),
+        "name" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Some(type_error(&format!(
+                    "name expected 1 to 2 arguments, got {}",
+                    args.len().saturating_sub(1)
+                )));
+            }
+            let ch = match ucd_char_argument("name", args[1]) {
+                Ok(ch) => ch,
+                Err(err) => return Some(err),
+            };
+            match char_name_in(&V32, ch as u32) {
+                Some(name) => value::str_alloc(name),
+                None => match args.get(2).copied() {
+                    Some(default) => default,
+                    None => value_error("no such name"),
+                },
+            }
+        }
+        "lookup" => {
+            if args.len() != 2 {
+                return Some(ucd_arity("lookup", 1, args.len().saturating_sub(1)));
+            }
+            let Some(name) = value::as_str(args[1]) else {
+                return Some(type_error(&format!(
+                    "a bytes-like object is required, not '{}'",
+                    value::type_name(args[1])
+                )));
+            };
+            match lookup_name_in(&V32, name) {
+                Some(ch) => value::str_alloc(ch.to_string()),
+                None => {
+                    let message = value::str_alloc(format!("undefined character name '{name}'"));
+                    exc::raise(KEY_ERROR, message)
+                }
+            }
+        }
+        "normalize" | "is_normalized" => {
+            if args.len() != 3 {
+                return Some(ucd_arity(method, 2, args.len().saturating_sub(1)));
+            }
+            let form = match ucd_string_argument(method, args[1], 1) {
+                Ok(form) => form,
+                Err(err) => return Some(err),
+            };
+            if !valid_form(form) {
+                return Some(value_error("invalid normalization form"));
+            }
+            let text = match ucd_string_argument(method, args[2], 2) {
+                Ok(text) => text,
+                Err(err) => return Some(err),
+            };
+            if method == "normalize" {
+                value::str_alloc(normalize_in(&V32, form, text))
+            } else {
+                value::bool_value(normalize_in(&V32, form, text) == text)
+            }
+        }
+        "numeric" | "digit" | "decimal" => ucd_numeric_method(method, args),
+        _ => return None,
+    })
 }
 
 /// Dispatches one native call.
@@ -471,10 +867,13 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                 }
             }
         }
-        _ => exc::raise_with_message(
-            ATTRIBUTE_ERROR,
-            &format!("module 'unicodedata' has no attribute '{function}'"),
-        ),
+        _ => match ucd32_call(function, args) {
+            Some(result) => result,
+            None => exc::raise_with_message(
+                ATTRIBUTE_ERROR,
+                &format!("module 'unicodedata' has no attribute '{function}'"),
+            ),
+        },
     }
 }
 
@@ -20621,3 +21020,275 @@ static HANGUL_T: &[&str] = &[
     "", "G", "GG", "GS", "N", "NJ", "NH", "D", "L", "LG", "LM", "LB", "LS", "LT", "LP", "LH", "M",
     "B", "BS", "S", "SS", "NG", "J", "C", "K", "T", "P", "H",
 ];
+
+// ---------------------------------------------------------------------
+// Frozen Unicode 3.2.0 database (see `unicodedata_3_2_tables.rs`)
+// ---------------------------------------------------------------------
+
+include!("unicodedata_3_2_tables.rs");
+
+/// The Unicode 16.0.0 tables used by the module-level functions.
+static V16: Tables = Tables {
+    category_names: CATEGORY_NAMES,
+    category_starts: CATEGORY_STARTS,
+    category_ids: CATEGORY_IDS,
+    combining_starts: COMBINING_STARTS,
+    combining_ends: COMBINING_ENDS,
+    combining_values: COMBINING_VALUES,
+    eaw_names: EAW_NAMES,
+    eaw_starts: EAW_STARTS,
+    eaw_ids: EAW_IDS,
+    bidi_names: BIDI_NAMES,
+    bidi_starts: BIDI_STARTS,
+    bidi_ids: BIDI_IDS,
+    decomp_tag_names: DECOMP_TAG_NAMES,
+    decomp_keys: DECOMP_KEYS,
+    decomp_offsets: DECOMP_OFFSETS,
+    decomp_tags: DECOMP_TAGS,
+    decomp_data: DECOMP_DATA,
+    decomp_overrides: &[],
+    compose: COMPOSE,
+    num_keys: NUM_KEYS,
+    num_digits: NUM_DIGITS,
+    num_decimals: NUM_DECIMALS,
+    num_numerators: NUM_NUMERATORS,
+    num_denominators: NUM_DENOMINATORS,
+    numeric_floats: &[],
+    names: NAMES,
+    cjk_unified: CJK_UNIFIED,
+    cjk_compat: CJK_COMPAT,
+    mirrored: &[],
+};
+
+/// The Unicode 3.2.0 tables used by the `ucd_3_2_0` object.
+static V32: Tables = Tables {
+    category_names: UCD32_CATEGORY_NAMES,
+    category_starts: UCD32_CATEGORY_STARTS,
+    category_ids: UCD32_CATEGORY_IDS,
+    combining_starts: UCD32_COMBINING_STARTS,
+    combining_ends: UCD32_COMBINING_ENDS,
+    combining_values: UCD32_COMBINING_VALUES,
+    eaw_names: UCD32_EAW_NAMES,
+    eaw_starts: UCD32_EAW_STARTS,
+    eaw_ids: UCD32_EAW_IDS,
+    bidi_names: UCD32_BIDI_NAMES,
+    bidi_starts: UCD32_BIDI_STARTS,
+    bidi_ids: UCD32_BIDI_IDS,
+    decomp_tag_names: UCD32_DECOMP_TAG_NAMES,
+    decomp_keys: UCD32_DECOMP_KEYS,
+    decomp_offsets: UCD32_DECOMP_OFFSETS,
+    decomp_tags: UCD32_DECOMP_TAGS,
+    decomp_data: UCD32_DECOMP_DATA,
+    decomp_overrides: UCD32_DECOMP_OVERRIDES,
+    compose: UCD32_COMPOSE,
+    num_keys: UCD32_NUM_KEYS,
+    num_digits: UCD32_NUM_DIGITS,
+    num_decimals: UCD32_NUM_DECIMALS,
+    num_numerators: UCD32_NUM_NUMERATORS,
+    num_denominators: UCD32_NUM_DENOMINATORS,
+    numeric_floats: UCD32_NUM_FLOATS,
+    names: UCD32_NAMES,
+    cjk_unified: &[(0x3400, 0x4DB5), (0x4E00, 0x9FA5), (0x20000, 0x2A6D6)],
+    cjk_compat: &[(0xF900, 0xFA2D), (0xFA30, 0xFA6A), (0x2F800, 0x2FA1D)],
+    mirrored: UCD32_MIRRORED,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(raw: &str) -> i64 {
+        value::str_alloc(raw.to_string())
+    }
+
+    fn as_text(v: i64) -> String {
+        value::as_str(v).expect("string").to_string()
+    }
+
+    fn as_int(v: i64) -> i64 {
+        value::as_integer(v).expect("integer")
+    }
+
+    fn ucd(method: &str, args: &[i64]) -> i64 {
+        let mut full = Vec::with_capacity(args.len() + 1);
+        full.push(ucd_3_2_0());
+        full.extend_from_slice(args);
+        ucd32_call(method, &full).expect("known UCD method")
+    }
+
+    #[test]
+    fn ucd_3_2_0_is_a_cached_versioned_object() {
+        exc::init();
+        let instance = ucd_3_2_0();
+        assert!(!exc::pending());
+        assert_eq!(ucd_3_2_0(), instance, "the object is cached");
+        assert_eq!(value::instance_class_name(instance), Some("UCD"));
+        let version = value::instance_attr(instance, "unidata_version").expect("version");
+        assert_eq!(as_text(version), "3.2.0");
+        assert_eq!(UNIDATA_VERSION_3_2_0, "3.2.0");
+        assert_eq!(constant("ucd_3_2_0"), instance);
+        assert_eq!(as_text(constant("unidata_version")), "16.0.0");
+
+        // `category` is reachable through the normal class-method protocol.
+        let category =
+            crate::methods::call(instance, b"category".as_ptr(), 8, 1, [text("A")].as_ptr());
+        assert!(!exc::pending());
+        assert_eq!(as_text(category), "Lu");
+    }
+
+    #[test]
+    fn ucd_3_2_0_uses_the_frozen_3_2_database() {
+        exc::init();
+        // Emoji and later additions are unassigned in 3.2.
+        assert_eq!(as_text(ucd(UCD_CATEGORY, &[text("😀")])), "Cn");
+        assert_eq!(as_text(ucd(UCD_CATEGORY, &[text("\u{378}")])), "Cn");
+        assert_eq!(as_text(ucd(UCD_BIDIRECTIONAL, &[text("\u{378}")])), "");
+        assert_eq!(as_text(ucd(UCD_CATEGORY, &[text("A")])), "Lu");
+        assert_eq!(as_text(ucd(UCD_CATEGORY, &[text("中")])), "Lo");
+        assert_eq!(as_text(ucd(UCD_BIDIRECTIONAL, &[text("א")])), "R");
+        assert_eq!(as_text(ucd(UCD_EAST_ASIAN_WIDTH, &[text("中")])), "W");
+        // Unicode 3.2 also has the CJK compatibility supplement.
+        assert_eq!(
+            as_text(ucd(UCD_EAST_ASIAN_WIDTH, &[text("\u{2FA1E}")])),
+            "W"
+        );
+
+        assert_eq!(as_int(ucd(UCD_COMBINING, &[text("\u{301}")])), 230);
+        assert_eq!(as_int(ucd(UCD_COMBINING, &[text("A")])), 0);
+        assert_eq!(as_int(ucd(UCD_MIRRORED, &[text("(")])), 1);
+        assert_eq!(as_int(ucd(UCD_MIRRORED, &[text("A")])), 0);
+
+        assert_eq!(as_text(ucd(UCD_DECOMPOSITION, &[text("é")])), "0065 0301");
+        assert_eq!(
+            as_text(ucd(UCD_DECOMPOSITION, &[text("\u{FB01}")])),
+            "<compat> 0066 0069"
+        );
+        // Corrigendum #4: `decomposition()` reports the published 3.2.0
+        // mapping while normalization uses the corrected one.
+        assert_eq!(
+            as_text(ucd(UCD_DECOMPOSITION, &[text("\u{2F868}")])),
+            "36FC"
+        );
+        assert_eq!(
+            as_text(ucd(UCD_DECOMPOSITION, &[text("\u{AC00}")])),
+            "1100 1161"
+        );
+        assert_eq!(as_text(ucd(UCD_DECOMPOSITION, &[text("A")])), "");
+    }
+
+    #[test]
+    fn ucd_3_2_0_normalizes_with_the_3_2_tables() {
+        exc::init();
+        assert_eq!(
+            as_text(ucd(UCD_NORMALIZE, &[text("NFC"), text("e\u{301}")])),
+            "é"
+        );
+        assert_eq!(
+            as_text(ucd(UCD_NORMALIZE, &[text("NFD"), text("é")])),
+            "e\u{301}"
+        );
+        assert_eq!(
+            as_text(ucd(UCD_NORMALIZE, &[text("NFKC"), text("ﬁ")])),
+            "fi"
+        );
+        assert_eq!(
+            as_text(ucd(UCD_NORMALIZE, &[text("NFKD"), text("\u{FB01}")])),
+            "fi"
+        );
+        // Corrected canonical mapping (Corrigendum #4).
+        assert_eq!(
+            as_text(ucd(UCD_NORMALIZE, &[text("NFD"), text("\u{2F868}")])),
+            "\u{2136A}"
+        );
+        // Hangul algorithmic composition.
+        assert_eq!(
+            as_text(ucd(UCD_NORMALIZE, &[text("NFC"), text("\u{1100}\u{1161}")])),
+            "\u{AC00}"
+        );
+        assert_eq!(
+            ucd(UCD_IS_NORMALIZED, &[text("NFC"), text("é")]),
+            value::TRUE
+        );
+        assert_eq!(
+            ucd(UCD_IS_NORMALIZED, &[text("NFD"), text("é")]),
+            value::FALSE
+        );
+    }
+
+    #[test]
+    fn ucd_3_2_0_names_and_numbers() {
+        assert_eq!(
+            as_text(ucd(UCD_NAME, &[text("中")])),
+            "CJK UNIFIED IDEOGRAPH-4E2D"
+        );
+        assert_eq!(as_text(ucd(UCD_NAME, &[text("가")])), "HANGUL SYLLABLE GA");
+        assert_eq!(
+            as_text(ucd(UCD_LOOKUP, &[text("cjk unified ideograph-4e00")])),
+            "一"
+        );
+        assert_eq!(
+            as_text(ucd(UCD_LOOKUP, &[text("Hangul Syllable GA")])),
+            "가"
+        );
+
+        exc::init();
+        ucd(UCD_NAME, &[text("\u{378}")]);
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        exc::init();
+        assert_eq!(
+            as_text(ucd(UCD_NAME, &[text("\u{378}"), text("fallback")])),
+            "fallback"
+        );
+        assert!(!exc::pending());
+
+        let half = ucd(UCD_NUMERIC, &[text("½")]);
+        assert_eq!(value::as_float(half), Some(0.5));
+        // CJK numerals are present in 3.2 even though UnicodeData records
+        // only the ideograph range; 垓 exceeds the rational representation.
+        assert_eq!(value::as_float(ucd(UCD_NUMERIC, &[text("一")])), Some(1.0));
+        assert_eq!(
+            value::as_float(ucd(UCD_NUMERIC, &[text("\u{5793}")])),
+            Some(1e20)
+        );
+        assert_eq!(as_int(ucd(UCD_DIGIT, &[text("7")])), 7);
+        assert_eq!(as_int(ucd(UCD_DECIMAL, &[text("7")])), 7);
+        assert_eq!(as_text(ucd(UCD_DIGIT, &[text("A"), text("none")])), "none");
+
+        exc::init();
+        ucd(UCD_NUMERIC, &[text("A")]);
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+
+        exc::init();
+        ucd(UCD_LOOKUP, &[text("NO SUCH NAME")]);
+        assert_eq!(exc::pending_tag(), i64::from(KEY_ERROR));
+    }
+
+    #[test]
+    fn ucd_3_2_0_rejects_invalid_arguments() {
+        exc::init();
+        ucd(UCD_CATEGORY, &[value::encode_int(1).expect("int")]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+
+        exc::init();
+        ucd(UCD_CATEGORY, &[text("ab")]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+
+        exc::init();
+        ucd(UCD_NORMALIZE, &[text("XX"), text("a")]);
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+
+        exc::init();
+        ucd(
+            UCD_NORMALIZE,
+            &[value::encode_int(1).expect("int"), text("a")],
+        );
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+
+        exc::init();
+        ucd(UCD_CATEGORY, &[]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+
+        exc::init();
+        assert!(ucd32_call("_ucd32_unknown", &[ucd_3_2_0()]).is_none());
+    }
+}

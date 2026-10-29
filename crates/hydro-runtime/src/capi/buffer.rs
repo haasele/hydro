@@ -5,6 +5,9 @@
 //!
 //! - a read-only, contiguous, one-dimensional exporter for `bytes`
 //!   ([`BYTES_BUFFER_PROCS`]);
+//! - a writable/read-only, contiguous, one-dimensional exporter for
+//!   `bytearray` ([`BYTEARRAY_BUFFER_PROCS`]); C writes are committed back to
+//!   the object when the view is released;
 //! - `PyObject_CheckBuffer`, `PyObject_GetBuffer`, `PyBuffer_Release` and
 //!   `PyBuffer_FillInfo` with CPython 3.14 semantics;
 //! - validation of every field an extension exporter fills in. Writable,
@@ -28,7 +31,9 @@ use std::ptr;
 use std::sync::LazyLock;
 
 use super::types::{type_name, type_of};
-use super::{bytes_c_data, bytes_data, dec_ref, inc_ref, set_error, GilGuard, ShimObject};
+use super::{
+    bytes_c_data, bytes_data, dec_ref, inc_ref, kind_mut, set_error, GilGuard, ShimKind, ShimObject,
+};
 
 /// Mirrors `Py_buffer` from CPython 3.14 on x86_64 (`pybuffer.h`).
 #[repr(C)]
@@ -113,6 +118,21 @@ pub(crate) static BYTES_BUFFER_PROCS: LazyLock<PyBufferProcs> = LazyLock::new(||
     bf_releasebuffer: 0,
 });
 
+/// The `bytearray` type's buffer suite: one-dimensional, contiguous and
+/// writable, backed by the object's NUL-terminated byte storage.
+///
+/// Writes from C land in the object's `c_data` buffer (the same storage
+/// `PyByteArray_AsString` exposes). `bf_releasebuffer` copies those bytes back
+/// into the bytearray's logical `data`, so a view's lifetime defines when C
+/// mutations become visible to Hydro code. The object is referenced by the
+/// view (`PyBuffer_FillInfo`), so its storage cannot be freed while the view is
+/// alive; a bytearray never resizes in place in this host.
+pub(crate) static BYTEARRAY_BUFFER_PROCS: LazyLock<PyBufferProcs> =
+    LazyLock::new(|| PyBufferProcs {
+        bf_getbuffer: bytearray_getbuffer as *const () as usize,
+        bf_releasebuffer: bytearray_releasebuffer as *const () as usize,
+    });
+
 fn zero_view(view: *mut Py_buffer) {
     // SAFETY: `view` is either NULL (checked by callers) or points at a
     // caller-owned `Py_buffer`; all-zero is a valid bit pattern (null
@@ -154,6 +174,94 @@ pub(crate) extern "C" fn bytes_getbuffer(
         }
     };
     PyBuffer_FillInfo(view, object, pointer as *mut c_void, len, 1, flags)
+}
+
+/// `bytearray` exporter: one-dimensional, contiguous, writable.
+///
+/// The view is read-only only when the caller did not request
+/// `PyBUF_WRITABLE`, matching CPython's bytearray exporter. `buf` points at
+/// the object's NUL-terminated storage, so a zero-length bytearray still
+/// exposes a dereferenceable pointer.
+pub(crate) extern "C" fn bytearray_getbuffer(
+    object: *mut ShimObject,
+    view: *mut Py_buffer,
+    flags: c_int,
+) -> c_int {
+    if object.is_null() {
+        set_error("TypeError: expected a bytearray object, got NULL");
+        return -1;
+    }
+    // SAFETY: `kind_ref` validates the handle; taking the payload mutably is
+    // sound under the emulated GIL, which the buffer protocol entry points
+    // hold.
+    let (length, pointer) = match unsafe { kind_mut(object) } {
+        ShimKind::ByteArray { c_data, .. } => {
+            let length = c_data.len().saturating_sub(1);
+            (length, c_data.as_mut_ptr())
+        }
+        _ => {
+            set_error("TypeError: expected a bytearray object");
+            return -1;
+        }
+    };
+    let length = match isize::try_from(length) {
+        Ok(length) => length,
+        Err(_) => {
+            set_error("OverflowError: bytearray buffer is too large");
+            return -1;
+        }
+    };
+    let readonly = (flags & PYBUF_WRITABLE == 0) as c_int;
+    PyBuffer_FillInfo(
+        view,
+        object,
+        pointer as *mut c_void,
+        length,
+        readonly,
+        flags,
+    )
+}
+
+/// `bytearray` release hook: commits the bytes C wrote through the view.
+///
+/// Only a view whose `buf` is this object's own storage is committed; an
+/// exporter cannot alias a different address through this hook. The logical
+/// `data` and the NUL-terminated `c_data` are refreshed together so later
+/// Hydro reads, `PyByteArray_AsString` and subsequent views all observe the
+/// same content.
+pub(crate) extern "C" fn bytearray_releasebuffer(object: *mut ShimObject, view: *mut Py_buffer) {
+    if object.is_null() || view.is_null() {
+        return;
+    }
+    // SAFETY: the view was filled by `bytearray_getbuffer`, which checked the
+    // object. The buffer protocol guarantees `len >= 0` and a live `buf`.
+    let (length, buffer) = unsafe { ((*view).len, (*view).buf) };
+    if length <= 0 || buffer.is_null() {
+        return;
+    }
+    let length = length as usize;
+    // SAFETY: `kind_ref` validates the handle; the object is kept alive by the
+    // reference the view holds, and the emulated GIL is held by
+    // `PyBuffer_Release`.
+    let kind = unsafe { kind_mut(object) };
+    let ShimKind::ByteArray { data, c_data } = kind else {
+        return;
+    };
+    if buffer as *const u8 != c_data.as_ptr() || length > c_data.len().saturating_sub(1) {
+        return;
+    }
+    if data.len() != length {
+        // The host never resizes a bytearray in place, but a corrupt view must
+        // not make the two buffers disagree.
+        data.resize(length, 0);
+    }
+    data.copy_from_slice(&c_data[..length]);
+    c_data[..length].copy_from_slice(data);
+    if c_data.len() != length + 1 {
+        c_data.clear();
+        c_data.extend_from_slice(data);
+        c_data.push(0);
+    }
 }
 
 /// `PyObject_CheckBuffer`: 1 when the type exports a buffer.

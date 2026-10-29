@@ -1,0 +1,14 @@
+[package]
+name = "hydro-hna-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HNA v1 end-to-end test fixture (not a published binding)"
+publish = false
+
+[lib]
+name = "hydro_hna_fixture"
+crate-type = ["cdylib"]
+
+[dependencies]
+hydro-hna = { path = "../hydro-hna" }

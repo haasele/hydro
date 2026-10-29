@@ -48,6 +48,7 @@ use rustls_pki_types::{
     ServerName, UnixTime,
 };
 
+use crate::core::globals;
 use crate::exc::{self, ATTRIBUTE_ERROR, OS_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::heap;
 use crate::value::{self, NONE};
@@ -442,7 +443,9 @@ fn address_argument(v: i64) -> Result<Address, i64> {
 
 /// Decodes `None` or a non-negative number of seconds.
 fn timeout_argument(v: i64) -> Result<Option<Duration>, i64> {
-    if v == NONE {
+    // `_GLOBAL_DEFAULT_TIMEOUT` is a sentinel, not a duration: passing it
+    // means "use the module default", exactly like `None`.
+    if v == NONE || v == global_default_timeout() {
         return Ok(None);
     }
     let seconds = if let Some(integer) = value::as_integer(v) {
@@ -1113,9 +1116,28 @@ pub(crate) fn call_kw(
     call(module, function, &bound)
 }
 
+/// `socket._GLOBAL_DEFAULT_TIMEOUT`: the cached sentinel `CPython` uses when a
+/// wrapper's timeout argument was not supplied.
+///
+/// The value is a plain `object()` instance stored in the globals registry, so
+/// every module read returns the same identity. It is never interpreted as a
+/// duration: [`timeout_argument`] maps it to `None`.
+fn global_default_timeout() -> i64 {
+    const KEY: &str = "socket._GLOBAL_DEFAULT_TIMEOUT";
+    if let Some(value) = globals::registry_get(KEY) {
+        return value;
+    }
+    let sentinel = value::instance_new(value::object_class());
+    let roots = heap::root_values(&[sentinel]);
+    globals::registry_set(KEY, sentinel);
+    heap::release_roots(roots);
+    sentinel
+}
+
 /// Module-level constants shared by `socket` and `_socket`.
 pub(crate) fn constant(module: &str, name: &str) -> i64 {
     match name {
+        "_GLOBAL_DEFAULT_TIMEOUT" => global_default_timeout(),
         "AF_UNSPEC" => encode_int(AF_UNSPEC),
         "AF_UNIX" => encode_int(AF_UNIX),
         "AF_INET" => encode_int(AF_INET),
@@ -3273,5 +3295,32 @@ pub(crate) fn ssl_constant(name: &str) -> i64 {
             ATTRIBUTE_ERROR,
             &format!("module 'ssl' has no attribute '{name}'"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_default_timeout_is_a_cached_object_sentinel() {
+        exc::init();
+        let first = constant("socket", "_GLOBAL_DEFAULT_TIMEOUT");
+        let second = constant("_socket", "_GLOBAL_DEFAULT_TIMEOUT");
+        assert!(!exc::pending());
+        assert_eq!(first, second, "sentinel identity must be stable");
+        assert!(value::as_instance(first).is_some());
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn global_default_timeout_is_not_a_duration() {
+        exc::init();
+        let sentinel = global_default_timeout();
+        assert_eq!(timeout_argument(sentinel), Ok(None));
+        assert!(!exc::pending());
+        // `create_connection` accepts the sentinel where `timeout` belongs.
+        assert_eq!(timeout_argument(NONE), Ok(None));
+        assert!(!exc::pending());
     }
 }

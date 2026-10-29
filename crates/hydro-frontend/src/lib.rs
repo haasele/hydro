@@ -115,6 +115,17 @@ fn parse_module(
 /// modules whose initializer cannot fail inside the handler. Imported module
 /// bodies are compiled into the returned [`Program`] and run before the entry
 /// module (see [`Program::initializers`]).
+///
+/// Packages that expose members through PEP 562 `__getattr__` and
+/// `importlib.import_module` (pydantic's `_dynamic_imports`) are handled by a
+/// bounded discovery policy, not by compiling at runtime: relative module-name
+/// string literals carried by dispatch containers or call arguments of a
+/// **top-level** package initializer are resolved against that package and
+/// loaded like ordinary modules, so their initializers run before the program
+/// (see `dynamic_import_candidates`). Nested package initializers and plain
+/// modules keep their tables lazy, because CPython only reaches them after the
+/// enclosing package graph initialized. Missing, absolute, native and
+/// syntactically unrelated strings are ignored.
 pub fn check_file(path: &Path) -> Result<Program, Vec<Diagnostic>> {
     let mut loader = ModuleLoader::default();
     let display = path.to_path_buf();
@@ -131,13 +142,23 @@ pub fn check_file(path: &Path) -> Result<Program, Vec<Diagnostic>> {
         String::new(),
         root.clone(),
     );
-    if let Some(entry) = entry {
+    if entry.is_some() && loader.diags.is_empty() {
+        // Nested imports are deferred while the importing module is still
+        // being scanned. Once every dependency is initialized, a
+        // declaration-only site-packages module can be linked eagerly and
+        // its member becomes a normal import target at runtime.
+        loader.preload_deferred_site_modules(&root);
+        // A compiled extension imports Python modules from its own
+        // package while it initializes; link those support modules and put
+        // them before the unit that loads the extension.
+        loader.preload_extension_support_modules(&root);
+        // Honour the dependency edges added after the scan (extension
+        // support and deferred preloads) in the initializer order. The
+        // preload passes keep the entry unit last, so its index is the
+        // last unit — the index `load_file` returned may have moved.
         if loader.diags.is_empty() {
-            // Nested imports are deferred while the importing module is still
-            // being scanned. Once every dependency is initialized, a
-            // declaration-only site-packages module can be linked eagerly and
-            // its member becomes a normal import target at runtime.
-            loader.preload_deferred_site_modules(entry, &root);
+            let entry = loader.units.len() - 1;
+            loader.sort_units_by_dependencies(entry);
         }
     }
 
@@ -219,7 +240,14 @@ pub fn check_pytest_file(path: &Path) -> Result<Program, Vec<Diagnostic>> {
             }
         }
         if loader.diags.is_empty() {
-            loader.preload_deferred_site_modules(entry, &root);
+            loader.preload_deferred_site_modules(&root);
+            loader.preload_extension_support_modules(&root);
+            if loader.diags.is_empty() {
+                // The preload passes keep the entry unit last, so its index
+                // is the last unit even after they insert modules.
+                let entry = loader.units.len() - 1;
+                loader.sort_units_by_dependencies(entry);
+            }
         }
     }
 
@@ -269,6 +297,12 @@ struct LoadedModule {
     /// Module-level `from X import *` targets of this unit (see
     /// [`ImportScan::star_imports`]).
     star_imports: Vec<String>,
+    /// Compiled extensions this unit imports, as `(import name, shared
+    /// object path)`. A C extension's initializer may import Python modules
+    /// that no source statement names (`numpy._core._exceptions`), so the
+    /// loader links the declaration-only siblings of each referenced
+    /// extension (see [`ModuleLoader::preload_extension_support_modules`]).
+    extensions: Vec<(String, String)>,
 }
 
 /// One module's import scan: linked dependencies, failure state and the
@@ -291,6 +325,9 @@ struct ImportScan {
     /// the runtime `extend_all(module)` pattern NumPy uses to re-export whole
     /// dependency surfaces.
     star_imports: Vec<String>,
+    /// Compiled extensions imported at module level, as `(import name, shared
+    /// object path)`.
+    extensions: Vec<(String, String)>,
 }
 
 impl ImportScan {
@@ -308,6 +345,14 @@ impl ImportScan {
         let edge = (module.to_string(), member.map(str::to_string));
         if !self.deferred.contains(&edge) {
             self.deferred.push(edge);
+        }
+    }
+
+    /// Records a compiled extension imported by this unit.
+    fn record_extension(&mut self, module: &str, path: &str) {
+        let edge = (module.to_string(), path.to_string());
+        if !self.extensions.contains(&edge) {
+            self.extensions.push(edge);
         }
     }
 }
@@ -439,6 +484,7 @@ impl ModuleLoader {
             late: scan.late,
             deferred: scan.deferred,
             star_imports: scan.star_imports,
+            extensions: scan.extensions,
         });
         // The key is not registered in `loaded`: a session deliberately
         // compiles every fragment as a new unit, even when it reuses a
@@ -520,6 +566,14 @@ impl ModuleLoader {
             return None;
         }
 
+        // A top-level package may name its submodules only through a
+        // dynamic-import dispatch table (`pydantic._dynamic_imports`): the
+        // literals are collected before the unit joins the program and loaded
+        // immediately afterwards, so the submodules initialise after the
+        // package body — exactly like `importlib.import_module` at
+        // attribute-access time. Nested packages keep their tables lazy.
+        let dynamic = dynamic_import_candidates(&module, &name, &package);
+
         let index = self.units.len();
         self.units.push(LoadedModule {
             name: name.clone(),
@@ -532,9 +586,11 @@ impl ModuleLoader {
             late: scan.late,
             deferred: scan.deferred,
             star_imports: scan.star_imports,
+            extensions: scan.extensions,
         });
         self.loaded.insert(key, index);
         self.by_name.insert(name, index);
+        self.load_dynamic_import_modules(index, &dynamic, &importer_dir, &root);
         Some(index)
     }
 
@@ -607,6 +663,66 @@ impl ModuleLoader {
             // `Loaded` may be empty: the import succeeds without an
             // initializer.
             NamedLoad::Loaded(loaded)
+        }
+    }
+
+    /// Loads the submodules a top-level package names only through
+    /// dynamic-import dispatch.
+    ///
+    /// [`dynamic_import_candidates`] collects the relative names a top-level
+    /// package initializer spells out in dispatch tables and call arguments
+    /// (nested packages keep theirs lazy). Each one is resolved and loaded
+    /// *after* the naming unit is registered: CPython runs
+    /// `importlib.import_module` from `__getattr__` only once the package body
+    /// has finished, so the discovered units must initialize after their
+    /// package and before the program entry.
+    ///
+    /// The load is transactional per name: a module the frontend cannot read
+    /// or parse is rolled back and stays a runtime `ModuleNotFoundError`,
+    /// exactly like a module that was never discovered. A name that already
+    /// has a unit — a static import or another dispatch table already linked
+    /// it — is skipped, so it never compiles twice.
+    ///
+    /// Every newly loaded unit also depends on `importing`: the dispatch
+    /// literal is read by code that runs after the naming module body, so the
+    /// naming unit must initialize first even when the submodule does not
+    /// import its package explicitly. The submodule's own static imports are
+    /// ordinary dependency edges, and the topological pass keeps all of them.
+    fn load_dynamic_import_modules(
+        &mut self,
+        importing: usize,
+        candidates: &[String],
+        importer_dir: &Path,
+        module_root: &Path,
+    ) {
+        for name in candidates {
+            if self.by_name.contains_key(name) {
+                continue;
+            }
+            let units_before = self.units.len();
+            let diags_before = self.diags.len();
+            let loaded_before: Vec<PathBuf> = self.loaded.keys().cloned().collect();
+            let names_before: Vec<String> = self.by_name.keys().cloned().collect();
+            let namespaces_before = self.namespaces.clone();
+            let failed_before = self.failed.clone();
+            let loaded = self.load_named(name, importer_dir, module_root);
+            let succeeded =
+                matches!(loaded, NamedLoad::Loaded(_)) && self.diags.len() == diags_before;
+            if !succeeded {
+                self.diags.truncate(diags_before);
+                self.units.truncate(units_before);
+                self.loaded.retain(|path, _| loaded_before.contains(path));
+                self.by_name
+                    .retain(|existing, _| names_before.contains(existing));
+                self.namespaces = namespaces_before;
+                self.failed = failed_before;
+                continue;
+            }
+            for unit in self.units[units_before..].iter_mut() {
+                if !unit.deps.contains(&importing) {
+                    unit.deps.push(importing);
+                }
+            }
         }
     }
 
@@ -760,7 +876,7 @@ impl ModuleLoader {
     /// (`rich.console` <-> `rich.status`) are no longer initializing. Each
     /// candidate is transactional: a module that triggers diagnostics stays
     /// deferred and leaves the loader state untouched.
-    fn preload_deferred_site_modules(&mut self, entry: usize, root: &Path) {
+    fn preload_deferred_site_modules(&mut self, root: &Path) {
         let old_len = self.units.len();
         let candidates: Vec<String> = self
             .units
@@ -816,8 +932,230 @@ impl ModuleLoader {
             }
         }
         if self.units.len() > old_len {
-            self.reorder_preloaded(entry, old_len);
+            self.reorder_preloaded(old_len);
         }
+    }
+
+    /// Links Python modules that a compiled extension's initializer imports.
+    ///
+    /// A C extension's `PyInit_*` runs `IMPORT_GLOBAL`-style imports that no
+    /// Python source statement names: NumPy's `_multiarray_umath` imports
+    /// `numpy.exceptions`, `numpy._globals`, `numpy._core._exceptions` and
+    /// `numpy._core.printoptions` while it initializes. Hydro has no runtime
+    /// Python compiler, so those modules must already be linked.
+    ///
+    /// For every extension a unit imports, the loader walks the extension's
+    /// package chain (the directory holding the shared object, then each
+    /// ancestor that has an `__init__.py`) and adds a dependency edge from the
+    /// importing unit to every sibling module in those directories. Siblings
+    /// that are not linked yet are preloaded when they have no imports of their
+    /// own (a declaration-only module, safe to run early); a preload that
+    /// produces diagnostics is rolled back transactionally. Cycles are skipped
+    /// (for example `numpy._core.numeric` imports `umath`, so it cannot be
+    /// ordered before it).
+    fn preload_extension_support_modules(&mut self, root: &Path) {
+        let jobs: Vec<(usize, String, PathBuf)> = self
+            .units
+            .iter()
+            .enumerate()
+            .flat_map(|(index, unit)| {
+                unit.extensions.iter().filter_map(move |(module, path)| {
+                    let dir = Path::new(path).parent()?.to_path_buf();
+                    Some((index, module.clone(), dir))
+                })
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let old_len = self.units.len();
+        // Directory scans are shared: several units often import different
+        // extensions of the same package (`numpy._core`), and the ancestor
+        // package directory repeats for every job.
+        let mut scanned: std::collections::HashMap<(PathBuf, String), Vec<usize>> =
+            std::collections::HashMap::new();
+        for (importer, module, directory) in jobs {
+            // Dotted package of the extension (`numpy._core` for
+            // `numpy._core._multiarray_umath`).
+            let mut prefix = match module.rsplit_once('.') {
+                Some((prefix, _)) => prefix.to_string(),
+                None => continue,
+            };
+            let mut directory = directory;
+            loop {
+                let key = (directory.clone(), prefix.clone());
+                let support: Vec<usize> = if let Some(cached) = scanned.get(&key).cloned() {
+                    cached
+                } else {
+                    let support = self.scan_extension_support(&directory, &prefix, root);
+                    scanned.insert(key, support.clone());
+                    support
+                };
+                for index in support {
+                    if index == importer || self.units[importer].deps.contains(&index) {
+                        continue;
+                    }
+                    // A cycle means the support module already depends on the
+                    // importer (or on a unit ordered after it); keep the
+                    // original order then, exactly like the deferred preload.
+                    if self.depends_on(index, importer) {
+                        continue;
+                    }
+                    self.units[importer].deps.push(index);
+                }
+                if !directory.join("__init__.py").is_file() {
+                    break;
+                }
+                let Some(parent) = directory.parent() else {
+                    break;
+                };
+                let Some((outer, _)) = prefix.rsplit_once('.') else {
+                    break;
+                };
+                directory = parent.to_path_buf();
+                prefix = outer.to_string();
+            }
+        }
+        if self.units.len() > old_len {
+            self.reorder_preloaded(old_len);
+        }
+    }
+
+    /// Support modules of one package directory: the plain `.py` siblings,
+    /// preloading the ones that are not linked yet and have no imports of
+    /// their own.
+    fn scan_extension_support(
+        &mut self,
+        directory: &Path,
+        prefix: &str,
+        root: &Path,
+    ) -> Vec<usize> {
+        let mut names: Vec<String> = fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("py") {
+                    return None;
+                }
+                let stem = path.file_stem()?.to_str()?;
+                // Package initializers are units already (or the importer
+                // itself); only plain submodules are support candidates.
+                if stem == "__init__" {
+                    return None;
+                }
+                Some(format!("{prefix}.{stem}"))
+            })
+            .collect();
+        names.sort();
+        let mut support = Vec::with_capacity(names.len());
+        for name in names {
+            if let Some(&index) = self.by_name.get(&name) {
+                support.push(index);
+                continue;
+            }
+            if !self.import_free_module_with(&name, directory, root, false) {
+                continue;
+            }
+            // Preload transactionally: a module that produces a diagnostic
+            // keeps its runtime stub instead of failing the program.
+            let units_before = self.units.len();
+            let diags_before = self.diags.len();
+            let loaded_before: Vec<PathBuf> = self.loaded.keys().cloned().collect();
+            let names_before: Vec<String> = self.by_name.keys().cloned().collect();
+            let loaded = self.probe_named(&name, directory, root);
+            if self.diags.len() > diags_before {
+                self.diags.truncate(diags_before);
+                self.units.truncate(units_before);
+                self.loaded.retain(|path, _| loaded_before.contains(path));
+                self.by_name.retain(|name, _| names_before.contains(name));
+                continue;
+            }
+            if let Some(index) = loaded {
+                support.push(index);
+            }
+        }
+        support
+    }
+
+    /// Stable topological order of the units, dependencies first.
+    ///
+    /// Load order already places dependencies before their importers, so an
+    /// existing program keeps its exact order. Edges added after the scan
+    /// (extension support modules, deferred preloads) may point backwards;
+    /// this pass honours them while keeping the entry module last. A cycle
+    /// never traps units: those it cannot place keep their current order.
+    fn sort_units_by_dependencies(&mut self, entry: usize) {
+        let count = self.units.len();
+        if count < 2 || entry >= count {
+            return;
+        }
+        let mut indegree = vec![0usize; count];
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for (index, unit) in self.units.iter().enumerate() {
+            let mut seen: Vec<usize> = Vec::new();
+            for &dep in &unit.deps {
+                if dep >= count || dep == index || seen.contains(&dep) {
+                    continue;
+                }
+                seen.push(dep);
+                indegree[index] += 1;
+                dependents[dep].push(index);
+            }
+        }
+        let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> = (0..count)
+            .filter(|&index| index != entry && indegree[index] == 0)
+            .map(std::cmp::Reverse)
+            .collect();
+        let mut order: Vec<usize> = Vec::with_capacity(count);
+        let mut placed = vec![false; count];
+        while let Some(std::cmp::Reverse(index)) = ready.pop() {
+            order.push(index);
+            placed[index] = true;
+            for &dependent in &dependents[index] {
+                indegree[dependent] -= 1;
+                if indegree[dependent] == 0 && dependent != entry {
+                    ready.push(std::cmp::Reverse(dependent));
+                }
+            }
+        }
+        for (index, is_placed) in placed.iter().enumerate() {
+            if index != entry && !*is_placed {
+                order.push(index);
+            }
+        }
+        order.push(entry);
+        if order
+            .iter()
+            .enumerate()
+            .all(|(position, &index)| position == index)
+        {
+            return;
+        }
+        let mut new_index = vec![0usize; count];
+        for (position, &index) in order.iter().enumerate() {
+            new_index[index] = position;
+        }
+        let mut slots: Vec<Option<LoadedModule>> = self.units.drain(..).map(Some).collect();
+        let mut reordered: Vec<LoadedModule> = Vec::with_capacity(count);
+        for &index in &order {
+            reordered.push(slots[index].take().expect("unit"));
+        }
+        for unit in &mut reordered {
+            unit.deps = unit.deps.iter().map(|dep| new_index[*dep]).collect();
+            unit.deps.sort_unstable();
+            unit.deps.dedup();
+        }
+        let by_name = std::mem::take(&mut self.by_name);
+        for (name, index) in by_name {
+            self.by_name.insert(name, new_index[index]);
+        }
+        let loaded = std::mem::take(&mut self.loaded);
+        for (path, index) in loaded {
+            self.loaded.insert(path, new_index[index]);
+        }
+        self.units = reordered;
     }
 
     /// Places modules loaded after the entry module before the earliest unit
@@ -827,9 +1165,17 @@ impl ModuleLoader {
     /// of modules lowered before it. The loaded modules keep their own load
     /// order (dependencies first), and the insertion point is pushed behind
     /// every already-existing dependency.
-    fn reorder_preloaded(&mut self, entry: usize, old_len: usize) {
-        let old_entry = entry;
-        debug_assert_eq!(old_entry, old_len - 1);
+    ///
+    /// Every preload pass starts with the entry unit last (module loading
+    /// leaves it there and this function returns it there), so the entry of the
+    /// pass is `old_len - 1`. That index is derived here instead of being
+    /// passed in: a caller's entry index goes stale as soon as an earlier pass
+    /// reordered the units, and a stale index would overlap the old and new
+    /// ranges and drop a unit (`old unit` panic). The three consumed ranges —
+    /// `..old_len - 1`, `old_len - 1` and `old_len..` — partition every slot,
+    /// so each unit is taken exactly once.
+    fn reorder_preloaded(&mut self, old_len: usize) {
+        let old_entry = old_len - 1;
         let new_count = self.units.len() - old_len;
         if new_count == 0 {
             return;
@@ -904,6 +1250,23 @@ impl ModuleLoader {
     /// These data-only modules are safe to preload during scanning, even while
     /// another package module is still initializing.
     fn import_free_module(&self, name: &str, importer_dir: &Path, module_root: &Path) -> bool {
+        self.import_free_module_with(name, importer_dir, module_root, true)
+    }
+
+    /// [`Self::import_free_module`] with the site-tree gate made explicit.
+    ///
+    /// The scan only preloads modules from third-party site trees, but a
+    /// module sitting next to a compiled extension is part of that extension's
+    /// package even when the tree has another name (a vendored dependency, or
+    /// the project itself): the extension's initializer may import it, so the
+    /// support scan accepts it regardless.
+    fn import_free_module_with(
+        &self,
+        name: &str,
+        importer_dir: &Path,
+        module_root: &Path,
+        require_site: bool,
+    ) -> bool {
         let roots = module_search_roots(importer_dir, module_root);
         let Some(chain) = resolve_module(&roots, name) else {
             return false;
@@ -915,13 +1278,7 @@ impl ModuleLoader {
         if final_module.namespace {
             return false;
         }
-        let site_package = final_module.path.components().any(|component| {
-            matches!(
-                component.as_os_str().to_str(),
-                Some("site-packages") | Some("dist-packages")
-            )
-        });
-        if !site_package {
+        if require_site && !is_site_package_path(&final_module.path) {
             return false;
         }
         let Ok(source) = fs::read_to_string(&final_module.path) else {
@@ -961,13 +1318,7 @@ impl ModuleLoader {
         if final_module.namespace {
             return false;
         }
-        let site_package = final_module.path.components().any(|component| {
-            matches!(
-                component.as_os_str().to_str(),
-                Some("site-packages") | Some("dist-packages")
-            )
-        });
-        if !site_package {
+        if !is_site_package_path(&final_module.path) {
             return false;
         }
         let Ok(source) = fs::read_to_string(&final_module.path) else {
@@ -1257,6 +1608,7 @@ impl ModuleLoader {
                         self.resolve_import(
                             source,
                             display,
+                            package,
                             importer_dir,
                             root,
                             alias.name.as_str(),
@@ -1363,6 +1715,7 @@ impl ModuleLoader {
                         self.resolve_import(
                             source,
                             display,
+                            package,
                             importer_dir,
                             root,
                             &module_name,
@@ -1692,6 +2045,7 @@ impl ModuleLoader {
         &mut self,
         source: &str,
         display: &Path,
+        package: &str,
         importer_dir: &Path,
         module_root: &Path,
         name: &str,
@@ -1706,9 +2060,28 @@ impl ModuleLoader {
         // A compiled extension is resolved by the lowerer: it binds
         // aliases/members to `Callee::Extension` and needs no linked module
         // unit. Look it up before rejecting dotted names so `pkg.sub_ext`
-        // works without package Python code.
-        match lower::find_extension_for_source(display, name) {
-            lower::ExtensionLookup::Found(_) => return,
+        // works without package Python code. A relative import inside a
+        // subpackage spells the extension as an absolute dotted name, so a
+        // source-relative miss is retried from the package root (`pkg/sub.py`
+        // importing `.sub_ext` searches `<root>/pkg/sub_ext`, not
+        // `<root>/pkg/pkg/sub_ext`), exactly like `Lowerer::find_extension`.
+        // Without the retry the scan reports `module '...' not found` for an
+        // extension the lowerer would have bound.
+        let extension = match lower::find_extension_for_source(display, name) {
+            lower::ExtensionLookup::Missing => {
+                lower::extension_lookup_from_package(display, package, name)
+            }
+            found => found,
+        };
+        match extension {
+            lower::ExtensionLookup::Found { path, .. } => {
+                // The extension's initializer can import Python modules that
+                // no source statement names; remember it so the loader can
+                // link those support modules (see
+                // `preload_extension_support_modules`).
+                scan.record_extension(name, &path.to_string_lossy());
+                return;
+            }
             lower::ExtensionLookup::Incompatible { path, reason } => {
                 self.push_span(
                     source,
@@ -1719,6 +2092,28 @@ impl ModuleLoader {
                         "compiled extension '{}' is incompatible: {reason}",
                         path.display()
                     ),
+                );
+                scan.failed = true;
+                return;
+            }
+            lower::ExtensionLookup::Ambiguous { paths } => {
+                self.push_span(
+                    source,
+                    display,
+                    range,
+                    codes::UNSUPPORTED,
+                    lower::ambiguous_artifacts_message(&paths),
+                );
+                scan.failed = true;
+                return;
+            }
+            lower::ExtensionLookup::PackageInit { path, reason } => {
+                self.push_span(
+                    source,
+                    display,
+                    range,
+                    codes::UNSUPPORTED,
+                    lower::package_init_artifact_message(&path, &reason),
                 );
                 scan.failed = true;
                 return;
@@ -1797,6 +2192,45 @@ fn extension_referenced(source: &Path, package: &str, name: &str) -> bool {
         lower::extension_lookup_from_package(source, package, name),
         lower::ExtensionLookup::Missing
     )
+}
+
+/// Whether `path` lives inside a configured third-party site tree.
+///
+/// The pinned ecosystem tree is often named `site` (`HYDRO_SITE_PACKAGES` may
+/// point at any directory name), and venv layouts differ, so the check follows
+/// the configured roots instead of matching the literal `site-packages`/
+/// `dist-packages` directory names. `PYTHONPATH` entries and `HYDRO_STDLIB`
+/// are not site roots: those trees keep their eager import order.
+///
+/// Both sides are compared after canonicalization, so a symlinked site tree
+/// resolves exactly like the importer resolves it.
+fn is_site_package_path(path: &Path) -> bool {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if canonical.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("site-packages") | Some("dist-packages")
+        )
+    }) {
+        return true;
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(list) = std::env::var_os("HYDRO_SITE_PACKAGES") {
+        roots.extend(std::env::split_paths(&list));
+    }
+    for prefix in [
+        std::env::var_os("VIRTUAL_ENV").map(PathBuf::from),
+        std::env::var_os("CONDA_PREFIX").map(PathBuf::from),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        roots.extend(lower::prefix_site_packages(&prefix));
+    }
+    roots.iter().any(|root| {
+        let root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        canonical.starts_with(&root)
+    })
 }
 
 /// Directories searched for user modules, in order: the importing file's
@@ -2027,6 +2461,221 @@ fn resolve_module_in(root: &Path, parts: &[&str]) -> Option<Vec<ResolvedModule>>
         dir = package_dir;
     }
     None
+}
+
+/// Absolute module names a top-level package spells out for dynamic dispatch.
+///
+/// pydantic 2.x exposes its public API through PEP 562 `__getattr__` and a
+/// `_dynamic_imports` table whose values are relative module names
+/// (`'.main'`, `'.type_adapter'`, `'.deprecated.tools'`): the table is read at
+/// attribute-access time and `importlib.import_module` runs then, so no
+/// `import` statement names those modules and the loader would never compile
+/// them. This is the bounded static half of that pattern — module discovery for
+/// the AOT compiler, not runtime compilation:
+///
+/// * only a **top-level package initializer** is scanned: `pkg/__init__.py`
+///   whose package has no dot. Its table is the package's public API surface.
+///   A nested package (`numpy/_typing/__init__.py`, `pkg/sub/__init__.py`) or a
+///   plain module keeps its table lazy: CPython reaches those tables only after
+///   the enclosing package graph finished initializing, and eagerly compiling
+///   the targets would run internal annotation helpers before the parent
+///   publishes its re-exports (NumPy's `_typing._dtype_like` reads
+///   `numpy.dtype`, which `numpy._core` installs only when its own body runs);
+/// * only string constants that are elements or values of a `dict`, `list`,
+///   `tuple` or `set` display, or arguments of a call, are considered. A
+///   docstring, a bare `X = '.name'` assignment and every other string stay
+///   ordinary data;
+/// * the constant must be relative and name a real module: it is resolved
+///   against the unit's `__package__` exactly like a relative import (`pkg` for
+///   `pkg/__init__.py`), so absolute external names (`'pydantic_core'`),
+///   sentinel spellings (`'__module__'`) and literals with no file on the
+///   search path are dropped. A resolved target may itself be nested
+///   (`'.deprecated.tools'` -> `pkg.deprecated.tools`); the restriction is on
+///   the *naming* unit, not on the target;
+/// * the scan stops at function and class bodies: a literal there runs only
+///   when that code does, so it stays as lazy as a nested import;
+/// * a name already provided by a static import or by the native module table
+///   is dropped, so a module keeps one unit and one initializer.
+///
+/// Returns absolute names (`pkg.main`) in discovery order.
+fn dynamic_import_candidates(module: &ast::ModModule, current: &str, package: &str) -> Vec<String> {
+    // A top-level package initializer is the only dynamic-dispatch surface
+    // preloaded. Everything else (entry script, conftest, REPL fragment,
+    // nested package, plain module) has no package or no public table: its
+    // literals stay lazy so annotation and internal helpers cannot initialize
+    // before the enclosing package graph finishes.
+    if package.is_empty() || package.contains('.') || package != current {
+        return Vec::new();
+    }
+    let mut literals: Vec<String> = Vec::new();
+    collect_dynamic_dispatch_stmts(&module.body, current, &mut literals);
+    let mut candidates: Vec<String> = Vec::new();
+    for literal in literals {
+        let Some(name) = resolve_dynamic_module_literal(&literal, package) else {
+            continue;
+        };
+        if name == current
+            || hydro_ir::stdlib::module(&name).is_some()
+            || candidates.contains(&name)
+        {
+            continue;
+        }
+        candidates.push(name);
+    }
+    candidates
+}
+
+/// Resolves one relative dispatch literal against the naming unit's package.
+///
+/// Returns `None` for an absolute name, a literal that is only dots (the
+/// package itself), a malformed relative import, or a name that is not a valid
+/// dotted identifier. The caller decides whether the module exists.
+fn resolve_dynamic_module_literal(literal: &str, package: &str) -> Option<String> {
+    if package.is_empty() {
+        return None;
+    }
+    let dots = literal.bytes().take_while(|byte| *byte == b'.').count();
+    if dots == 0 || dots == literal.len() {
+        return None;
+    }
+    let level = u32::try_from(dots).ok()?;
+    let name = lower::resolve_import_name(level, Some(&literal[dots..]), package).ok()?;
+    for part in name.split('.') {
+        if part.is_empty() || !part.chars().all(|c| c == '_' || c.is_alphanumeric()) {
+            return None;
+        }
+    }
+    Some(name)
+}
+
+/// Collects dispatch literals from the module-level statements of a unit.
+///
+/// Module-level control flow executes while the module initialises, so a
+/// dispatch table inside it counts; function and class bodies run later and are
+/// not entered. `current` makes the same statically fixed branches as the
+/// import scan (`if TYPE_CHECKING:` never runs, `if __name__ == "__main__":`
+/// is false for an imported module).
+fn collect_dynamic_dispatch_stmts(stmts: &[ast::Stmt], current: &str, out: &mut Vec<String>) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Assign(s) => collect_dynamic_dispatch_expr(&s.value, out),
+            ast::Stmt::AnnAssign(s) => {
+                if let Some(value) = &s.value {
+                    collect_dynamic_dispatch_expr(value, out);
+                }
+            }
+            ast::Stmt::AugAssign(s) => collect_dynamic_dispatch_expr(&s.value, out),
+            ast::Stmt::Expr(s) => collect_dynamic_dispatch_expr(&s.value, out),
+            ast::Stmt::If(s) => {
+                let branch = lower::static_if_branch(&s.test, current);
+                if branch != Some(false) {
+                    collect_dynamic_dispatch_stmts(&s.body, current, out);
+                }
+                if branch != Some(true) {
+                    collect_dynamic_dispatch_stmts(&s.orelse, current, out);
+                }
+            }
+            ast::Stmt::For(s) => {
+                collect_dynamic_dispatch_stmts(&s.body, current, out);
+                collect_dynamic_dispatch_stmts(&s.orelse, current, out);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                collect_dynamic_dispatch_stmts(&s.body, current, out);
+                collect_dynamic_dispatch_stmts(&s.orelse, current, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_dynamic_dispatch_stmts(&s.body, current, out);
+                collect_dynamic_dispatch_stmts(&s.orelse, current, out);
+            }
+            ast::Stmt::With(s) => collect_dynamic_dispatch_stmts(&s.body, current, out),
+            ast::Stmt::AsyncWith(s) => collect_dynamic_dispatch_stmts(&s.body, current, out),
+            ast::Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_dynamic_dispatch_stmts(&case.body, current, out);
+                }
+            }
+            ast::Stmt::Try(s) => {
+                collect_dynamic_dispatch_stmts(&s.body, current, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_dynamic_dispatch_stmts(&handler.body, current, out);
+                }
+                collect_dynamic_dispatch_stmts(&s.orelse, current, out);
+                collect_dynamic_dispatch_stmts(&s.finalbody, current, out);
+            }
+            ast::Stmt::TryStar(s) => {
+                collect_dynamic_dispatch_stmts(&s.body, current, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_dynamic_dispatch_stmts(&handler.body, current, out);
+                }
+                collect_dynamic_dispatch_stmts(&s.orelse, current, out);
+                collect_dynamic_dispatch_stmts(&s.finalbody, current, out);
+            }
+            // Function and class bodies run later: their literals stay lazy,
+            // like nested imports. Imports and the remaining statements carry
+            // no dispatch table.
+            _ => {}
+        }
+    }
+}
+
+/// Collects dispatch literals from one module-level expression.
+///
+/// Only container displays and call arguments carry module names; a bare string
+/// expression (a docstring) or an unrelated constant is never inspected.
+fn collect_dynamic_dispatch_expr(expr: &ast::Expr, out: &mut Vec<String>) {
+    // A string expression statement is a docstring, not a dispatch table.
+    if matches!(expr, ast::Expr::Constant(_)) {
+        return;
+    }
+    collect_nested_dispatch_literals(expr, out);
+}
+
+/// Walks one dispatch container or call and records every relative string.
+///
+/// Dict keys are attribute names (`'Thing'`), so only values name modules. A
+/// nested container stays inside the dispatch context; anything else (a name,
+/// an f-string, an operation) is dynamic and cannot be resolved statically.
+fn collect_nested_dispatch_literals(expr: &ast::Expr, out: &mut Vec<String>) {
+    match expr {
+        ast::Expr::Dict(dict) => {
+            for value in &dict.values {
+                collect_nested_dispatch_literals(value, out);
+            }
+        }
+        ast::Expr::List(list) => {
+            for element in &list.elts {
+                collect_nested_dispatch_literals(element, out);
+            }
+        }
+        ast::Expr::Tuple(tuple) => {
+            for element in &tuple.elts {
+                collect_nested_dispatch_literals(element, out);
+            }
+        }
+        ast::Expr::Set(set) => {
+            for element in &set.elts {
+                collect_nested_dispatch_literals(element, out);
+            }
+        }
+        ast::Expr::Call(call) => {
+            for argument in &call.args {
+                collect_nested_dispatch_literals(argument, out);
+            }
+            for keyword in &call.keywords {
+                collect_nested_dispatch_literals(&keyword.value, out);
+            }
+        }
+        ast::Expr::Constant(constant) => {
+            if let ast::Constant::Str(value) = &constant.value {
+                if value.starts_with('.') {
+                    out.push(value.clone());
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Effective `__all__` of a loaded unit, including names a module re-exports
@@ -2439,6 +3088,15 @@ mod tests {
                     .collect();
                 panic!("function '{name}' not found; functions: {names:?}")
             }) as FunctionId
+    }
+
+    /// Names of the compiled module bodies in initializer order.
+    fn initializer_names(program: &Program) -> Vec<&str> {
+        program
+            .initializers
+            .iter()
+            .map(|id| program.functions[*id as usize].name.as_str())
+            .collect()
     }
 
     /// True when `expr` calls `id`, either linked directly or through the
@@ -3813,6 +4471,231 @@ def __getattr__(name):
     }
 
     #[test]
+    fn dynamic_import_dispatch_compiles_relative_submodules() {
+        // pydantic 2.x exposes its public API through PEP 562 `__getattr__`
+        // and a `_dynamic_imports` table of relative module names. No `import`
+        // statement names `.main`, so the loader itself must compile it for the
+        // runtime `importlib.import_module` call to find the module.
+        let dir = TestDir::new("dynamic-dispatch");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            r#"from importlib import import_module
+
+_dynamic_imports = {'Thing': (__spec__.parent, '.main')}
+
+def __getattr__(name):
+    if name not in _dynamic_imports:
+        raise AttributeError(name)
+    package, module_name = _dynamic_imports[name]
+    module = import_module(module_name, package=package)
+    return getattr(module, name)
+"#,
+        )
+        .expect("write package init");
+        fs::write(pkg.join("main.py"), "class Thing:\n    pass\n").expect("write submodule");
+        let main = dir.write("main.py", "from pkg import Thing\nvalue = Thing\n");
+        let program = program(&main);
+
+        let initializers = initializer_names(&program);
+        assert!(
+            initializers.contains(&"pkg.main.<module>"),
+            "the dispatched submodule must be compiled: {initializers:?}"
+        );
+        // The package body runs before the module it dispatches to, exactly
+        // like `import_module` at attribute-access time in CPython.
+        let package_at = initializers
+            .iter()
+            .position(|name| *name == "pkg.<module>")
+            .expect("the package must initialize");
+        let submodule_at = initializers
+            .iter()
+            .position(|name| *name == "pkg.main.<module>")
+            .expect("the submodule must initialize");
+        assert!(
+            package_at < submodule_at,
+            "the package must initialize first: {initializers:?}"
+        );
+
+        // `Thing` stays a runtime attribute read from the package value, so
+        // the PEP 562 hook resolves it when the program reads it.
+        use hydro_ir::{ExprKind, StmtKind};
+        let entry = program.main_function();
+        let value = entry
+            .body
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                StmtKind::Assign { target, value } if entry.local(*target).name == "value" => {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .expect("entry assigns value");
+        assert!(
+            matches!(
+                &value.kind,
+                ExprKind::ModuleAttr { module, name } if module == "pkg" && name == "Thing"
+            ),
+            "the missing member must be read from the package value, got {:?}",
+            value.kind
+        );
+    }
+
+    #[test]
+    fn dynamic_import_dispatch_skips_unresolvable_and_external_names() {
+        // Only relative literals that name a real module count as dispatch
+        // entries: a missing module (`.not_a_module`), a literal whose table
+        // entry names an external package base rather than this package
+        // (`('pydantic_core', '.core_schema')`), an absolute import name
+        // (`os`), a bare package reference (`.`) and unrelated strings are all
+        // ignored.
+        let dir = TestDir::new("dynamic-skip");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            r#""""Not a dispatch table: '.not_a_module'."""
+from importlib import import_module
+
+_suffixes = ['.py', '.not_a_module']
+_UNRELATED = '.also_not_a_module'
+_dynamic_imports = {
+    'Missing': (__spec__.parent, '.not_a_module'),
+    'External': ('pydantic_core', '.core_schema'),
+    'Absolute': (__spec__.parent, 'os'),
+    'Package': ('pydantic_core', '.'),
+}
+
+def _load(name):
+    # A table inside a function body runs only when that function is called,
+    # so it stays as lazy as a nested import.
+    hidden = {'Hidden': (__spec__.parent, '.hidden')}
+    return hidden[name]
+
+def __getattr__(name):
+    if name not in _dynamic_imports:
+        raise AttributeError(name)
+    package, module_name = _dynamic_imports[name]
+    return getattr(import_module(module_name, package=package), name)
+"#,
+        )
+        .expect("write package init");
+        fs::write(pkg.join("hidden.py"), "class Hidden:\n    pass\n").expect("write hidden");
+        let main = dir.write("main.py", "import pkg\nvalue = pkg\n");
+        let program = program(&main);
+
+        let initializers = initializer_names(&program);
+        assert_eq!(
+            initializers,
+            vec!["pkg.<module>"],
+            "only the package itself may initialize: {initializers:?}"
+        );
+        assert!(
+            !program.functions.iter().any(|function| {
+                function.name.contains("not_a_module")
+                    || function.name.contains("also_not_a_module")
+                    || function.name.contains("core_schema")
+                    || function.name.starts_with("pkg.hidden")
+                    || function.name.starts_with("os.")
+            }),
+            "unresolvable, external and function-local names must not pull modules"
+        );
+    }
+
+    #[test]
+    fn dynamic_import_dispatch_does_not_duplicate_a_static_submodule() {
+        // `from . import helper` already links `pkg.helper`; the dispatch
+        // table naming the same module must not compile a second unit.
+        let dir = TestDir::new("dynamic-duplicate");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            r#"from importlib import import_module
+
+from . import helper
+
+_dynamic_imports = {'Thing': (__spec__.parent, '.helper')}
+
+def __getattr__(name):
+    if name not in _dynamic_imports:
+        raise AttributeError(name)
+    package, module_name = _dynamic_imports[name]
+    return getattr(import_module(module_name, package=package), name)
+"#,
+        )
+        .expect("write package init");
+        fs::write(pkg.join("helper.py"), "Thing = 1\n").expect("write helper");
+        let main = dir.write("main.py", "from pkg import Thing\nvalue = Thing\n");
+        let program = program(&main);
+
+        let helpers = program
+            .functions
+            .iter()
+            .filter(|function| function.name == "pkg.helper.<module>")
+            .count();
+        assert_eq!(helpers, 1, "the submodule must stay one unit");
+        let helper_initializers = initializer_names(&program)
+            .iter()
+            .filter(|name| **name == "pkg.helper.<module>")
+            .count();
+        assert_eq!(helper_initializers, 1, "one initializer per unit");
+    }
+
+    #[test]
+    fn nested_package_dynamic_literals_stay_lazy() {
+        // A top-level package's table is preloaded (`pkg` -> `.sub`), but a
+        // nested package's table is not (`pkg.sub` -> `.leaf`). CPython only
+        // reaches a nested package's `__getattr__`/`import_module` after the
+        // enclosing package graph finished initializing, and eagerly compiling
+        // such targets runs internal helpers before their parent publishes the
+        // names they read (NumPy: `numpy._typing._dtype_like` reads
+        // `numpy.dtype`, which `numpy._core` installs when its own body runs).
+        let dir = TestDir::new("dynamic-nested");
+        let pkg = dir.path.join("pkg");
+        let sub = pkg.join("sub");
+        fs::create_dir_all(&sub).expect("create subpackage");
+        fs::write(
+            pkg.join("__init__.py"),
+            r#"from importlib import import_module
+
+_dynamic_imports = {'Thing': (__spec__.parent, '.sub')}
+
+def __getattr__(name):
+    package, module_name = _dynamic_imports[name]
+    return getattr(import_module(module_name, package=package), name)
+"#,
+        )
+        .expect("write package init");
+        fs::write(
+            sub.join("__init__.py"),
+            r#"from importlib import import_module
+
+_dynamic_imports = {'Leaf': (__spec__.parent, '.leaf')}
+
+def __getattr__(name):
+    package, module_name = _dynamic_imports[name]
+    return getattr(import_module(module_name, package=package), name)
+"#,
+        )
+        .expect("write subpackage init");
+        fs::write(sub.join("leaf.py"), "Leaf = 1\n").expect("write leaf");
+        let main = dir.write("main.py", "from pkg import Thing\nvalue = Thing\n");
+        let program = program(&main);
+
+        let initializers = initializer_names(&program);
+        assert!(
+            initializers.contains(&"pkg.sub.<module>"),
+            "the top-level package may dispatch to a nested package: {initializers:?}"
+        );
+        assert!(
+            !initializers.contains(&"pkg.sub.leaf.<module>"),
+            "a nested package's table stays lazy: {initializers:?}"
+        );
+    }
+
+    #[test]
     fn optional_try_star_import_links_a_present_module() {
         // A module-level `try` body runs in normal execution order: when the
         // star-imported module compiles, its exports are linked eagerly, so a
@@ -4718,6 +5601,196 @@ def __getattr__(name):
                 |stmt| matches!(&stmt.kind, StmtKind::If { then_body, .. } if !then_body.is_empty())
             ),
             "the entry's __main__ block must still be lowered"
+        );
+    }
+
+    /// Initializer slot of the module body `name` (`<dotted module>.<module>`).
+    fn initializer_slot(program: &Program, name: &str) -> Option<usize> {
+        program
+            .initializers
+            .iter()
+            .position(|id| program.functions[*id as usize].name == name)
+    }
+
+    #[test]
+    fn nested_site_package_import_links_when_the_site_directory_has_any_name() {
+        // The pinned ecosystem tree is called `site`, not `site-packages`.
+        // A submodule referenced only from a nested block must still be
+        // preloaded from that tree; before the fix the literal directory-name
+        // check skipped it and the runtime reported `No module named`.
+        let _env = env_lock();
+        let dir = TestDir::new("site-any-name");
+        let site = dir.path.join("site");
+        let project = dir.path.join("project");
+        fs::create_dir_all(site.join("pkg")).expect("create site package");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(
+            site.join("pkg").join("__init__.py"),
+            "def __getattr__(name):\n    import pkg.sub as sub\n    return sub\n",
+        )
+        .expect("write package init");
+        fs::write(site.join("pkg").join("sub.py"), "VALUE = 7\n").expect("write submodule");
+        let main = project.join("main.py");
+        fs::write(&main, "import pkg\nprint(pkg.sub.VALUE)\n").expect("write entry");
+
+        let _guard = EnvVar::set("HYDRO_SITE_PACKAGES", site.as_os_str());
+        let program = program(&main);
+        assert!(
+            initializer_slot(&program, "pkg.sub.<module>").is_some(),
+            "the nested submodule must be linked from a site tree with any name: {:?}",
+            program
+                .initializers
+                .iter()
+                .map(|id| &program.functions[*id as usize].name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn subpackage_relative_extension_import_resolves_from_the_package_root() {
+        // `from ._native import value` inside `pkg/sub/mod.py` names the
+        // absolute module `pkg.sub._native`, and the artifact lives next to
+        // the source (`pkg/sub/_native.abi3.so`). The source-relative scan
+        // would search `pkg/sub/pkg/sub/_native`, so the lookup must be
+        // retried from the package root exactly like the lowerer does;
+        // otherwise compilation fails with
+        // `module 'pkg.sub._native' not found` before the extension is bound
+        // and the extension-support pass never sees the declaration.
+        let dir = TestDir::new("subpackage-extension");
+        dir.add_extension("pkg/sub/_native.abi3.so");
+        dir.write("pkg/__init__.py", "");
+        dir.write("pkg/sub/__init__.py", "");
+        dir.write("pkg/sub/mod.py", "from ._native import value\n");
+        let main = dir.write("main.py", "import pkg.sub.mod\nprint('ok')\n");
+        let program = program(&main);
+
+        let extension_units = program
+            .functions
+            .iter()
+            .filter(|function| function.name.starts_with("pkg.sub._native"))
+            .count();
+        assert_eq!(
+            extension_units, 0,
+            "a compiled extension is bound by the lowerer, not compiled into a unit"
+        );
+        assert!(
+            initializer_slot(&program, "pkg.sub.mod.<module>").is_some(),
+            "the subpackage module must compile"
+        );
+    }
+
+    #[test]
+    fn extension_support_modules_initialize_before_the_extension_importer() {
+        // A compiled extension imports Python modules from its own package
+        // while it initializes, and no source statement names them. They must
+        // be linked and initialized before the unit that loads the extension.
+        let dir = TestDir::new("extension-support");
+        dir.add_extension("pkg/_core/_multiarray_umath.abi3.so");
+        dir.write("pkg/__init__.py", "from . import _core\n");
+        dir.write(
+            "pkg/exceptions.py",
+            "__all__ = [\"AxisError\"]\n\nclass AxisError(Exception):\n    pass\n",
+        );
+        dir.write("pkg/_core/__init__.py", "from . import umath\n");
+        dir.write("pkg/_core/umath.py", "from ._multiarray_umath import *\n");
+        dir.write(
+            "pkg/_core/_exceptions.py",
+            "__all__ = [\"AxisError\"]\n\nclass AxisError(Exception):\n    pass\n",
+        );
+        let main = dir.write("main.py", "import pkg\nprint('ok')\n");
+        let program = program(&main);
+
+        let names: Vec<&str> = program
+            .initializers
+            .iter()
+            .map(|id| program.functions[*id as usize].name.as_str())
+            .collect();
+        let umath = initializer_slot(&program, "pkg._core.umath.<module>")
+            .unwrap_or_else(|| panic!("umath must be an initializer: {names:?}"));
+        let support = initializer_slot(&program, "pkg._core._exceptions.<module>")
+            .unwrap_or_else(|| panic!("extension support module must be linked: {names:?}"));
+        let sibling = initializer_slot(&program, "pkg.exceptions.<module>")
+            .unwrap_or_else(|| panic!("package sibling must be linked: {names:?}"));
+        assert!(
+            support < umath,
+            "support module must initialize before the extension importer: {names:?}"
+        );
+        assert!(
+            sibling < umath,
+            "package sibling must initialize before the extension importer: {names:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_preload_and_extension_support_keep_unit_indices_disjoint() {
+        // Regression: the deferred-site preload runs first and moves the entry
+        // unit to the end. The extension-support pass then used to receive the
+        // entry's stale index, take an already-consumed slot and panic with
+        // `old unit` inside `reorder_preloaded` (reproduced by NumPy). One
+        // package carries all three triggers: a dynamic-import literal, a
+        // compiled extension with a support sibling, and a nested import of a
+        // site module, so both preload passes run and reorder.
+        let _env = env_lock();
+        let dir = TestDir::new("preload-reorder");
+        let site = dir.path.join("site");
+        fs::create_dir_all(site.join("pkg")).expect("create site package");
+        fs::write(
+            site.join("pkg").join("__init__.py"),
+            r#"from importlib import import_module
+
+from ._native import compute
+
+_dynamic_imports = {'Thing': (__spec__.parent, '.main')}
+
+def helper():
+    import lazy_helper
+    return lazy_helper.value()
+
+def __getattr__(name):
+    if name not in _dynamic_imports:
+        raise AttributeError(name)
+    package, module_name = _dynamic_imports[name]
+    return getattr(import_module(module_name, package=package), name)
+"#,
+        )
+        .expect("write package init");
+        fs::write(site.join("pkg").join("main.py"), "class Thing:\n    pass\n")
+            .expect("write dynamic submodule");
+        // A declaration-only sibling of the shared object: the
+        // extension-support pass links it before the importer.
+        fs::write(site.join("pkg").join("_support.py"), "SUPPORT = 1\n")
+            .expect("write extension support module");
+        // A nested import of a declaration-only site module: the
+        // deferred-site pass links it once the import graph is complete.
+        fs::write(
+            site.join("lazy_helper.py"),
+            "import math\n\ndef value():\n    return math.pi\n",
+        )
+        .expect("write nested module");
+        dir.add_extension("site/pkg/_native.abi3.so");
+
+        let main = dir.write("main.py", "from pkg import Thing\nvalue = Thing\n");
+        let _guard = EnvVar::set("HYDRO_SITE_PACKAGES", site.as_os_str());
+        let program = program(&main);
+
+        let names: Vec<&str> = program
+            .initializers
+            .iter()
+            .map(|id| program.functions[*id as usize].name.as_str())
+            .collect();
+        // Both preload passes insert a unit (each reordering once) and the
+        // dynamic literal compiles a third. Old and new unit indices partition
+        // disjointly, and the order stays deterministic: the deferred module
+        // before its importer, the extension support before the extension
+        // importer, and the package before the dynamically dispatched module.
+        assert_eq!(
+            names,
+            vec![
+                "lazy_helper.<module>",
+                "pkg._support.<module>",
+                "pkg.<module>",
+                "pkg.main.<module>",
+            ]
         );
     }
 }

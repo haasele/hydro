@@ -286,8 +286,20 @@ i64  hydro_uncaught(void);
 void hydro_runtime_init(void);
 void hydro_register_function(const uint8_t* name, size_t name_len,
                            const uint8_t* wrapper, size_t arity); // spawn/Pool
+void hydro_register_module_initializer(const uint8_t* name, size_t name_len,
+                           const uint8_t* entry); // compiled module body
+i64  hydro_initialize_module(const uint8_t* name, size_t name_len); // 1 = ran
 int32_t hydro_spawn_child(void);        // child mode after exec (-1 = normal)
 ```
+
+`hydro_register_module_initializer`/`hydro_initialize_module` are the
+on-demand bridge between compiled module bodies and C extensions: `hydro_main`
+registers every import body under its import name (the function name with the
+`.<module>` suffix removed) before running the startup initializer loop, and
+both that loop and `PyImport_ImportModule` run a body at most once through the
+same registry (return `1` when it executed, `0` for an unknown or already
+initialized name). A pending exception raised by the body is left for the
+caller.
 
 `op` codes (`hydro_binop`): `0 Add, 1 Sub, 2 Mul, 3 Div, 4 FloorDiv, 5 Mod,
 6 Pow, 7 Eq, 8 Ne, 9 Lt, 10 Le, 11 Gt, 12 Ge, 13 In, 14 NotIn, 15 Is,
@@ -1417,8 +1429,8 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
   socket echo, pathlib, build cache, `tea gc` and uv passthrough.
-- Generated stdlib import matrix (2026-10-29): **130/297 importable** (30
-  builtin/frozen, 88 pure, 12 extension; report in
+- Generated stdlib import matrix (2026-10-29): **145/297 importable** (31
+  builtin/frozen, 102 pure, 12 extension; report in
   [`COMPATIBILITY.md`](COMPATIBILITY.md)). The official CPython `Lib/test`
   differential baseline is **3/398** (`test_errno.py`, `test_int_literal.py`,
   `test_longexp.py`); see [`CPYTHON_TESTS.md`](CPYTHON_TESTS.md). `benchmarks/bench_all.py --only hydro`

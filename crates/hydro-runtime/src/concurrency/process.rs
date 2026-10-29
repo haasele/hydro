@@ -228,7 +228,9 @@ fn start_spawn(process: &ProcessState) -> Result<(), String> {
         | FunctionBody::Partial { .. }
         | FunctionBody::BoundMethod { .. }
         | FunctionBody::Host { .. }
-        | FunctionBody::Identity => {
+        | FunctionBody::Hna { .. }
+        | FunctionBody::Identity
+        | FunctionBody::Exec { .. } => {
             return Err(
                 "cannot spawn a derived callable; use a named module-level function".to_string(),
             )

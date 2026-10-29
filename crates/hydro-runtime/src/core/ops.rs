@@ -1450,6 +1450,15 @@ fn compare(op: u32, a: i64, b: i64) -> i64 {
             return ordered_result(op, sequence_order(x, y));
         }
     }
+    // `pathlib` values compare by their stored text (`PurePath('a') ==
+    // PurePath('a')`). The runtime stores one host path payload, so the
+    // platform flavour is implicit. A path is never equal to a plain string.
+    if matches!(op, OP_EQ | OP_NE) {
+        if let (Some(left), Some(right)) = (value::as_path(a), value::as_path(b)) {
+            let equal = left.path() == right.path();
+            return value::bool_value(if op == OP_EQ { equal } else { !equal });
+        }
+    }
     // Containers compare structurally (lists element-wise, dicts
     // order-insensitively); ordering is not defined for them in Phase 2.0.
     if matches!(op, OP_EQ | OP_NE) && (is_container(a) || is_container(b)) {

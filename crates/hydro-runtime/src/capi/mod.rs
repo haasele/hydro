@@ -14,14 +14,17 @@
 //!
 //! # Object model
 //!
-//! Every handle handed to an extension starts with CPython's `PyObject_HEAD`:
-//! `ob_refcnt` at offset 0 and `ob_type` at offset 8. Variable-size instances
-//! carry `ob_size` at offset 16. The layout of [`ShimObject`] (the private
-//! value carrier) therefore starts with the same header, and extension
-//! instances allocated through `PyType_GenericAlloc`/`PyObject_New` are raw
-//! `tp_basicsize` allocations with that header. [`types::TypeObject`] is a
-//! byte-compatible CPython 3.14 `PyTypeObject`; its CPython prefix is asserted
-//! at compile time.
+//! Every handle handed to an extension starts with CPython's `PyVarObject`:
+//! `ob_refcnt` at offset 0, `ob_type` at offset 8 and `ob_size` at offset 16.
+//! The word at offset 24 and the bytes after it follow CPython 3.14's
+//! per-type layouts for the macros that are supported inline (see
+//! [`tuple_layout`]): tuples store their item pointers inline at offset 32,
+//! lists store their `ob_item` pointer at offset 24, and `ob_size` carries the
+//! length of tuples, lists, bytes and bytearrays. Extension instances
+//! allocated through `PyType_GenericAlloc`/`PyObject_New` are raw
+//! `tp_basicsize` allocations with that same header. [`types::TypeObject`] is
+//! a byte-compatible CPython 3.14 `PyTypeObject`; its CPython prefix is
+//! asserted at compile time.
 //!
 //! Reference counts are real. `Py_IncRef`/`Py_DecRef` (and the `_Py_*` spellings
 //! used by 3.12+ limited-API headers), `Py_REFCNT`, container mutation and
@@ -119,13 +122,25 @@
 //! `PyObject_IS_GC` and the `Py_TPFLAGS_HAVE_GC`/`tp_is_gc` protocol are
 //! implemented. `PyType_GenericAlloc` tracks instances of GC types
 //! automatically; deallocation untracks. The tracked set records the handles
-//! this host owns. Because handles hold copies rather than Hydro heap
-//! references, the Hydro collector has no cross-heap edges to see; what the
-//! tracked set guarantees is that handle finalisation is ordered through the
-//! refcount and that no tracked object is freed without being untracked.
-//! `tp_traverse` is preserved in the type layout and returned by
-//! `PyType_GetSlot`; the tracked set does not walk extension instance
-//! internals, because there are no handle-to-Hydro edges for it to discover.
+//! this host owns. `tp_traverse` is preserved in the type layout, returned by
+//! `PyType_GetSlot`, and executable: `capi::types::gc_traverse` walks one
+//! instance's edges, and `capi::types::gc_walk_tracked` is the bridge a
+//! host-side collector uses to enumerate every tracked instance's references.
+//! A GC type must install `tp_traverse`; `PyType_Ready` rejects the
+//! `Py_TPFLAGS_HAVE_GC`/no-traverse combination with CPython's `SystemError`.
+//! Because Hydro values cross as rooted handles rather than raw heap
+//! pointers, a handle held by an extension already carries its own persistent
+//! root; there are no additional cross-heap edges the tracked set has to add.
+//! The default deallocation path (a GC type with no `tp_dealloc`) runs
+//! `tp_clear` exactly once before releasing the instance, so declared edges
+//! are dropped; a type with its own `tp_dealloc` owns that duty, as in CPython.
+//!
+//! Static C `PyTypeObject` declarations (`PyVarObject_HEAD_INIT(NULL, 0)` or
+//! `&PyType_Type`) are adopted by `PyType_Ready`: the object is linked to the
+//! metatype, its internal role is set to `Instance`, it is made immortal, and
+//! `tp_base`/`tp_bases`/`tp_mro`/`tp_dict` plus the unspecialised slots are
+//! filled from the base chain. Invalid layouts are rejected with a diagnostic
+//! and never written through.
 //!
 //! # Remaining limits
 //!
@@ -134,7 +149,10 @@
 //! evaluation are absent; the evaluation entry points fail with a tagged
 //! `RuntimeError` instead of resolving to nothing. `PyImport_ImportModule` and
 //! friends resolve extension modules loaded into the extension registry and
-//! Hydro native/user modules from the runtime registry; every other name
+//! Hydro native/user modules from the runtime registry; a name that matches a
+//! compiled module body registered by `hydro_main` runs that body on demand
+//! (see [`crate::module_init`]), so an extension can import a compiled module
+//! whose initializer has not reached the startup loop yet. Every other name
 //! fails with a tagged `ImportError`. Attribute access on a runtime-backed
 //! module resolves native functions and values; classes and other values with
 //! no C representation raise `AttributeError` instead of being fabricated.
@@ -173,6 +191,7 @@ pub(crate) mod container_api;
 pub(crate) mod descriptor_api;
 pub(crate) mod numeric_api;
 pub(crate) mod object_api;
+pub(crate) mod tuple_layout;
 #[path = "type.rs"]
 pub(crate) mod types;
 pub(crate) mod unicode_api;
@@ -207,9 +226,10 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Once, PoisonError};
 
+use tuple_layout::TupleItems;
 use types::{ensure_builtin_types, type_of, TypeObject as PyTypeObject};
 
 // ---------------------------------------------------------------------------
@@ -265,7 +285,7 @@ const PY_VECTORCALL_ARGUMENTS_OFFSET: usize = 1usize << (usize::BITS - 1);
 pub(crate) const PY_OBJECT_HEAD_SIZE: usize = 16;
 
 /// `sizeof(PyVarObject)`: the header plus `ob_size`.
-pub(crate) const MIN_VAR_BASICSIZE: usize = 24;
+pub(crate) const MIN_VAR_BASICSIZE: usize = tuple_layout::VAR_HEAD_SIZE;
 
 /// Sentinel stored in `ob_refcnt` for objects that must never be freed.
 ///
@@ -713,7 +733,10 @@ pub(crate) enum ShimKind {
         name: String,
     },
     List(Vec<usize>),
-    Tuple(Vec<usize>),
+    /// A tuple whose item pointers are stored inline in the handle allocation,
+    /// at the offset CPython's `PyTuple_GET_ITEM`/`PyTuple_SET_ITEM` use.
+    /// `TupleItems` only names that array; there is no second copy.
+    Tuple(TupleItems),
     Dict(Vec<(usize, usize)>),
     /// `destructor` is invoked when the capsule's reference count reaches zero.
     Capsule {
@@ -791,19 +814,41 @@ pub(crate) enum ShimKind {
     Error,
 }
 
-/// Private `#[repr(C)]` object handed to extensions as an opaque `PyObject *`.
+/// Private object handed to extensions as an opaque `PyObject *`.
 ///
-/// The CPython header comes first; the tagged payload follows.
+/// The CPython-compatible prefix comes first (`PyVarObject` plus the
+/// `PyVarObject`-trailing word), then the tagged payload. Tuples are the one
+/// exception to "payload at [`tuple_layout::PREFIX_SIZE`]": their item
+/// pointers are stored inline at that offset and the [`ShimKind`] follows the
+/// array, so `PyTuple_GET_ITEM`/`PyTuple_SET_ITEM` work. Every access to the
+/// payload therefore goes through [`kind_pointer`].
 #[repr(C)]
 pub(crate) struct ShimObject {
+    /// `ob_refcnt` at 0, `ob_type` at 8.
     pub(crate) head: PyObjectHead,
+    /// `ob_size` at 16: the length CPython's `Py_SIZE` and the container
+    /// `Py*_GET_SIZE` macros read.
+    pub(crate) ob_size: AtomicIsize,
+    /// The word at 24, interpreted per type: `ob_hash` for tuples and bytes
+    /// (CPython starts at -1), `ob_item` for lists (the data pointer), unused
+    /// (0) for every other kind.
+    pub(crate) aux: AtomicUsize,
+    /// The payload of a non-tuple handle, at offset 32.
     kind: ShimKind,
 }
 
 #[cfg(target_pointer_width = "64")]
 const _: () = {
-    assert!(std::mem::offset_of!(ShimObject, head) == 0);
-    assert!(std::mem::offset_of!(ShimObject, kind) == PY_OBJECT_HEAD_SIZE);
+    assert!(std::mem::offset_of!(ShimObject, head) == tuple_layout::REFCNT_OFFSET);
+    assert!(std::mem::offset_of!(ShimObject, ob_size) == tuple_layout::SIZE_OFFSET);
+    assert!(std::mem::offset_of!(ShimObject, aux) == tuple_layout::AUX_OFFSET);
+    assert!(std::mem::offset_of!(ShimObject, kind) == tuple_layout::PREFIX_SIZE);
+    assert!(tuple_layout::REFCNT_OFFSET == 0);
+    assert!(tuple_layout::TYPE_OFFSET == tuple_layout::REFCNT_OFFSET + 8);
+    assert!(tuple_layout::PREFIX_SIZE == 32);
+    // The inline tuple payload starts on an 8-byte boundary and `ShimKind`
+    // repeats every 8 bytes, so `tuple_kind_offset` needs no extra padding.
+    assert!(std::mem::align_of::<ShimKind>() == 8);
 };
 
 // A handle's payload is immutable while it is shared: mutation happens only
@@ -833,7 +878,18 @@ std::thread_local! {
     static GIL_DEPTH: Cell<usize> = const { Cell::new(0) };
     static GIL_GUARD: RefCell<Option<MutexGuard<'static, ()>>> =
         const { RefCell::new(None) };
+    /// Identity of the thread that owns this thread's depth/guard slot.
+    ///
+    /// The depth and guard are thread-local, so ownership already follows the
+    /// thread; the token makes that explicit and lets `PyGILState_Check`
+    /// distinguish "this thread holds the lock" from another thread's hold.
+    static GIL_OWNER: Cell<usize> = const { Cell::new(0) };
     static THREAD_STATE_TOKEN: u8 = const { 0 };
+}
+
+/// Stable per-thread identity used as the GIL owner token.
+fn gil_thread_token() -> usize {
+    THREAD_STATE_TOKEN.with(|token| token as *const u8 as usize)
 }
 
 /// Acquires the emulated GIL, reentrantly on the current thread.
@@ -842,6 +898,7 @@ pub(crate) fn gil_acquire() {
     if depth == 0 {
         let guard = GIL_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         GIL_GUARD.with(|slot| *slot.borrow_mut() = Some(guard));
+        GIL_OWNER.with(|owner| owner.set(gil_thread_token()));
     }
     GIL_DEPTH.with(|slot| slot.set(depth.saturating_add(1)));
 }
@@ -856,7 +913,13 @@ pub(crate) fn gil_release() {
     if depth == 1 {
         let guard = GIL_GUARD.with(|slot| slot.borrow_mut().take());
         drop(guard);
+        GIL_OWNER.with(|owner| owner.set(0));
     }
+}
+
+/// True when the calling thread currently holds the emulated GIL.
+pub(crate) fn gil_owned_by_current_thread() -> bool {
+    GIL_DEPTH.with(Cell::get) > 0 && GIL_OWNER.with(Cell::get) == gil_thread_token()
 }
 
 /// RAII guard for the emulated GIL. Reentrant, so nesting is safe.
@@ -890,6 +953,11 @@ fn thread_state_token() -> *mut PyThreadState {
 }
 
 /// `PyGILState_Ensure`: acquires the GIL and reports the previous state.
+///
+/// Every call increments the calling thread's nesting depth. The state it
+/// returns describes what the thread held *before* the call:
+/// `PyGILState_LOCKED` for a reentrant call, `PyGILState_UNLOCKED` for the
+/// call that acquired the lock.
 #[no_mangle]
 pub extern "C" fn PyGILState_Ensure() -> c_int {
     let previous = if GIL_DEPTH.with(Cell::get) > 0 {
@@ -902,11 +970,16 @@ pub extern "C" fn PyGILState_Ensure() -> c_int {
 }
 
 /// `PyGILState_Release`: balances `PyGILState_Ensure`.
+///
+/// Like CPython, each `Ensure` must be matched by one `Release`, including the
+/// reentrant ones that returned `PyGILState_LOCKED`; the physical lock is
+/// dropped when the depth returns to zero. An out-of-range state is a
+/// `SystemError` and leaves the depth untouched.
 #[no_mangle]
 pub extern "C" fn PyGILState_Release(state: c_int) {
-    if state == PY_GILSTATE_UNLOCKED {
+    if state == PY_GILSTATE_UNLOCKED || state == PY_GILSTATE_LOCKED {
         gil_release();
-    } else if state != PY_GILSTATE_LOCKED {
+    } else {
         set_error(format!(
             "SystemError: PyGILState_Release: invalid state {state}"
         ));
@@ -917,6 +990,16 @@ pub extern "C" fn PyGILState_Release(state: c_int) {
 #[no_mangle]
 pub extern "C" fn PyGILState_GetThisThreadState() -> *mut PyThreadState {
     thread_state_token()
+}
+
+/// `PyGILState_Check`: 1 when the calling thread holds the emulated GIL.
+///
+/// The state is thread-local: a thread that never called
+/// `PyGILState_Ensure` reports 0 even while another thread holds the lock,
+/// matching CPython's per-thread answer.
+#[no_mangle]
+pub extern "C" fn PyGILState_Check() -> c_int {
+    gil_owned_by_current_thread() as c_int
 }
 
 /// `PyThreadState_Get`: the current thread's token.
@@ -941,6 +1024,7 @@ pub extern "C" fn PyEval_SaveThread() -> *mut PyThreadState {
     GIL_DEPTH.with(|slot| slot.set(0));
     let guard = GIL_GUARD.with(|slot| slot.borrow_mut().take());
     drop(guard);
+    GIL_OWNER.with(|owner| owner.set(0));
     thread_state_token()
 }
 
@@ -955,15 +1039,168 @@ pub extern "C" fn PyEval_RestoreThread(_state: *mut PyThreadState) {
 // ---------------------------------------------------------------------------
 
 /// Creates a shim object and returns it with a reference count of one.
+///
+/// Tuples are built with [`new_tuple`] because their item array is stored
+/// inline and the payload moves past it.
 pub(crate) fn new_object(kind: ShimKind) -> *mut ShimObject {
+    assert!(
+        !matches!(&kind, ShimKind::Tuple(_)),
+        "tuples must be built with new_tuple"
+    );
     let type_object = kind_type(&kind);
+    let (ob_size, aux) = prefix_words(&kind);
     Box::into_raw(Box::new(ShimObject {
         head: PyObjectHead {
             ob_refcnt: AtomicIsize::new(1),
             ob_type: type_object,
         },
+        ob_size: AtomicIsize::new(ob_size),
+        aux: AtomicUsize::new(aux),
         kind,
     }))
+}
+
+/// Creates a tuple with its item pointers stored inline.
+///
+/// The allocation is `PyTupleObject`-shaped: `PyVarObject`, `ob_hash` and the
+/// item array at [`tuple_layout::TUPLE_ITEMS_OFFSET`]. The [`ShimKind`]
+/// payload follows the array, which is why [`kind_pointer`] must be used
+/// instead of the `kind` field for tuples.
+pub(crate) fn new_tuple(items: Vec<usize>) -> *mut ShimObject {
+    let count = items.len();
+    let size = tuple_layout::tuple_kind_offset(count) + std::mem::size_of::<ShimKind>();
+    let layout = std::alloc::Layout::from_size_align(size, std::mem::align_of::<ShimKind>())
+        .expect("tuple allocation size is representable");
+    // SAFETY: `layout` has a non-zero size (`ShimKind` is non-empty).
+    let memory = unsafe { std::alloc::alloc(layout) } as *mut ShimObject;
+    if memory.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    // SAFETY: `memory` is a fresh allocation of `layout`; every field is
+    // written before the handle escapes. The tuple prefix is written field by
+    // field because the `kind` field of `ShimObject` would overlap the inline
+    // item array.
+    unsafe {
+        ptr::write(
+            ptr::addr_of_mut!((*memory).head),
+            PyObjectHead {
+                ob_refcnt: AtomicIsize::new(1),
+                ob_type: ptr::addr_of_mut!(types::TUPLE_TYPE),
+            },
+        );
+        ptr::write(
+            ptr::addr_of_mut!((*memory).ob_size),
+            AtomicIsize::new(count as isize),
+        );
+        ptr::write(
+            ptr::addr_of_mut!((*memory).aux),
+            AtomicUsize::new(tuple_layout::TUPLE_HASH_UNSET as usize),
+        );
+        let items_pointer = (memory as *mut u8).add(tuple_layout::TUPLE_ITEMS_OFFSET) as *mut usize;
+        ptr::copy_nonoverlapping(items.as_ptr(), items_pointer, count);
+        let kind_pointer =
+            (memory as *mut u8).add(tuple_layout::tuple_kind_offset(count)) as *mut ShimKind;
+        ptr::write(kind_pointer, ShimKind::Tuple(TupleItems::new(memory)));
+    }
+    memory
+}
+
+/// The CPython prefix words of a non-tuple payload.
+///
+/// `ob_size` is the length CPython's macros read for tuples, lists, bytes and
+/// bytearrays. The word at offset 24 is `ob_shash` (-1, "not hashed") for
+/// bytes and the list data pointer for lists, matching CPython 3.14. Unicode
+/// objects carry no `ob_size` in CPython 3.14 (their length is a `PyASCIIObject`
+/// bit-field this host does not mirror), so it stays zero.
+fn prefix_words(kind: &ShimKind) -> (isize, usize) {
+    match kind {
+        ShimKind::List(items) => (items.len() as isize, list_items_pointer(items)),
+        ShimKind::Bytes { data, .. } => {
+            (data.len() as isize, tuple_layout::TUPLE_HASH_UNSET as usize)
+        }
+        ShimKind::ByteArray { data, .. } => (data.len() as isize, 0),
+        _ => (0, 0),
+    }
+}
+
+/// Address of a list's `ob_item` array for a shim `Vec`.
+///
+/// An empty list reports NULL, as CPython does when nothing is allocated.
+fn list_items_pointer(items: &[usize]) -> usize {
+    if items.is_empty() {
+        0
+    } else {
+        items.as_ptr() as usize
+    }
+}
+
+/// Address of a live handle's [`ShimKind`] payload.
+///
+/// Tuples keep their items inline at [`tuple_layout::TUPLE_ITEMS_OFFSET`] and
+/// the payload follows the array; every other kind keeps it at
+/// [`tuple_layout::PREFIX_SIZE`].
+///
+/// # Safety
+/// `object` must be a live shim handle (or a static constant object) whose
+/// `ob_type` is readable.
+pub(crate) unsafe fn kind_pointer(object: *mut ShimObject) -> *mut ShimKind {
+    let base = object as *mut u8;
+    // SAFETY: every handle starts with the CPython header.
+    let type_object = unsafe { (*object).head.ob_type };
+    if !type_object.is_null() && type_object == ptr::addr_of_mut!(types::TUPLE_TYPE) {
+        // SAFETY: a tuple's `ob_size` describes its inline array.
+        let count = unsafe { (*object).ob_size.load(Ordering::Relaxed) }.max(0) as usize;
+        return base.add(tuple_layout::tuple_kind_offset(count)) as *mut ShimKind;
+    }
+    base.add(tuple_layout::PREFIX_SIZE) as *mut ShimKind
+}
+
+/// Mutable access to a live handle's payload.
+///
+/// # Safety
+/// `object` must be a non-NULL live shim handle; the caller holds the GIL.
+pub(crate) unsafe fn kind_mut(object: *mut ShimObject) -> &'static mut ShimKind {
+    // SAFETY: delegated to the caller; the handle is heap-stable.
+    unsafe { &mut *kind_pointer(object) }
+}
+
+/// Re-reads a list's `ob_size` and `ob_item` from its `Vec`.
+///
+/// The prefix is what an extension's inline macros see, so every mutation of
+/// the `Vec` must republish both words before control returns to the
+/// extension. A `Vec` reallocation changes the data pointer; the append,
+/// insert, slice and sort paths call this afterwards.
+pub(crate) fn sync_list_prefix(object: *mut ShimObject) {
+    if object.is_null() {
+        return;
+    }
+    // SAFETY: the caller owns a reference and holds the GIL; the payload is
+    // at the fixed offset because this handle is a list, never a tuple.
+    unsafe {
+        if let ShimKind::List(items) = &*kind_pointer(object) {
+            (*object)
+                .ob_size
+                .store(items.len() as isize, Ordering::Relaxed);
+            (*object)
+                .aux
+                .store(list_items_pointer(items), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Allocation layout of a live handle, used to release it.
+fn object_layout(object: *mut ShimObject) -> std::alloc::Layout {
+    // SAFETY: every handle starts with the CPython header.
+    let type_object = unsafe { (*object).head.ob_type };
+    if !type_object.is_null() && type_object == ptr::addr_of_mut!(types::TUPLE_TYPE) {
+        // SAFETY: a tuple's `ob_size` describes its inline array.
+        let count = unsafe { (*object).ob_size.load(Ordering::Relaxed) }.max(0) as usize;
+        let size = tuple_layout::tuple_kind_offset(count) + std::mem::size_of::<ShimKind>();
+        std::alloc::Layout::from_size_align(size, std::mem::align_of::<ShimKind>())
+            .expect("tuple allocation size is representable")
+    } else {
+        std::alloc::Layout::new::<ShimObject>()
+    }
 }
 
 /// Maps a payload to its builtin type object (address only; the metatype patch
@@ -1003,8 +1240,12 @@ fn kind_type(kind: &ShimKind) -> *mut TypeObject {
         }
         // A Hydro value uses the opaque wrapper type: `tp_basicsize` names
         // this host's wrapper, never Hydro heap storage. The Python-visible
-        // type name comes from `object_type_name`.
-        ShimKind::Hydro(_) => ptr::addr_of_mut!(types::HYDRO_TYPE),
+        // type name comes from `object_type_name`. Date/time/timedelta/tzinfo
+        // values instead point at the `datetime_CAPI` class objects, so the
+        // CPython header macros (`PyDate_Check`, `PyDateTime_Check`, ...)
+        // answer exactly as they do for a CPython datetime instance.
+        ShimKind::Hydro(value) => types::datetime_capi_type_for(value.value())
+            .unwrap_or(ptr::addr_of_mut!(types::HYDRO_TYPE)),
         ShimKind::Error => ptr::addr_of_mut!(types::ERROR_TYPE),
     }
 }
@@ -1100,15 +1341,17 @@ fn free_object(object: *mut ShimObject) {
 
 /// Releases a shim payload's owned state, then its storage.
 fn free_shim_object(object: *mut ShimObject) {
-    // SAFETY: `object` is a `ShimObject` allocation created by `new_object`,
-    // and the reference count just reached zero, so this thread owns it. The
-    // allocation stays alive while `release_kind` runs so capsule destructors
-    // receive a valid (if dying) object, as in CPython.
-    let mut boxed = unsafe { Box::from_raw(object) };
-    let kind = std::mem::replace(&mut boxed.kind, ShimKind::None);
+    // SAFETY: `object` is a shim allocation created by `new_object` or
+    // `new_tuple`, and the reference count just reached zero, so this thread
+    // owns it. The allocation stays alive while `release_kind` runs so capsule
+    // destructors receive a valid (if dying) object, as in CPython.
+    let layout = object_layout(object);
+    let kind = unsafe { ptr::read(kind_pointer(object)) };
     drop_buffer_cache_entry(object as usize);
     release_kind(kind, object);
-    drop(boxed);
+    // SAFETY: nothing references the handle any more and `layout` is the one
+    // it was allocated with.
+    unsafe { std::alloc::dealloc(object as *mut u8, layout) };
 }
 
 /// Side storage for the raw buffers handed to extensions.
@@ -1144,7 +1387,7 @@ fn cached_buffer(object: *mut ShimObject, build: impl FnOnce() -> Vec<u8>) -> *c
 /// what serialises writes to the raw buffer.
 unsafe fn refresh_raw_unicode(object: *mut ShimObject) {
     // SAFETY: the caller upholds the liveness contract.
-    let kind = unsafe { &mut (*object).kind };
+    let kind = unsafe { kind_mut(object) };
     let ShimKind::Str {
         text,
         c_text,
@@ -1188,8 +1431,17 @@ unsafe fn refresh_raw_unicode(object: *mut ShimObject) {
 /// destructors.
 fn release_kind(kind: ShimKind, address: *mut ShimObject) {
     match kind {
-        ShimKind::List(items) | ShimKind::Tuple(items) => {
+        ShimKind::List(items) => {
             for item in items {
+                if item != 0 {
+                    dec_ref(item as *mut ShimObject);
+                }
+            }
+        }
+        // The items were read from the inline array; the allocation is still
+        // alive here, so the view is valid until `free_shim_object` deallocs.
+        ShimKind::Tuple(items) => {
+            for &item in items.as_slice() {
                 if item != 0 {
                     dec_ref(item as *mut ShimObject);
                 }
@@ -1386,6 +1638,8 @@ macro_rules! constant_objects {
                     ob_refcnt: AtomicIsize::new(IMMORTAL_REFCNT),
                     ob_type: ptr::null_mut(),
                 },
+                ob_size: AtomicIsize::new(0),
+                aux: AtomicUsize::new(0),
                 kind: $kind,
             };
         )+
@@ -1482,7 +1736,7 @@ static INTERNED: LazyLock<InternedConstants> = LazyLock::new(|| {
         data: Vec::new(),
         c_data: vec![0],
     })) as usize;
-    let empty_tuple = make_immortal(new_object(ShimKind::Tuple(Vec::new()))) as usize;
+    let empty_tuple = make_immortal(new_tuple(Vec::new())) as usize;
     InternedConstants {
         ints,
         empty_str,
@@ -1959,12 +2213,12 @@ pub(crate) fn value_object(value: ShimValue) -> *mut ShimObject {
             if items.is_empty() {
                 empty_tuple()
             } else {
-                new_object(ShimKind::Tuple(
+                new_tuple(
                     items
                         .into_iter()
                         .map(|item| value_object(item) as usize)
                         .collect(),
-                ))
+                )
             }
         }
         ShimValue::Dict(pairs) => new_object(ShimKind::Dict(
@@ -1996,13 +2250,13 @@ fn tuple_object(arguments: &[ShimValue]) -> *mut ShimObject {
     if arguments.is_empty() {
         return empty_tuple();
     }
-    new_object(ShimKind::Tuple(
+    new_tuple(
         arguments
             .iter()
             .cloned()
             .map(|value| value_object(value) as usize)
             .collect(),
-    ))
+    )
 }
 
 /// Borrows the kind of a live shim object.
@@ -2029,7 +2283,7 @@ pub(crate) fn kind_ref(object: *mut ShimObject) -> Option<&'static ShimKind> {
     // `PyUnicode_DATA`.
     unsafe {
         refresh_raw_unicode(object);
-        Some(&(*object).kind)
+        Some(&*kind_pointer(object))
     }
 }
 
@@ -2560,7 +2814,7 @@ fn list_slots_mut(object: *mut ShimObject) -> Result<&'static mut Vec<usize>, St
     }
     // SAFETY: shim objects are heap-stable; the caller holds a reference and
     // the GIL contract forbids concurrent mutation.
-    match unsafe { &mut (*object).kind } {
+    match unsafe { kind_mut(object) } {
         ShimKind::List(items) => Ok(items),
         _ => Err("TypeError: expected a list object".to_string()),
     }
@@ -2574,13 +2828,23 @@ fn tuple_slots(object: *mut ShimObject) -> Result<&'static [usize], String> {
     }
 }
 
-fn tuple_slots_mut(object: *mut ShimObject) -> Result<&'static mut Vec<usize>, String> {
+fn tuple_slots_mut(object: *mut ShimObject) -> Result<&'static mut [usize], String> {
     if object.is_null() {
         return Err("TypeError: expected a tuple object, got NULL".to_string());
     }
-    // SAFETY: see `list_slots_mut`.
-    match unsafe { &mut (*object).kind } {
-        ShimKind::Tuple(items) => Ok(items),
+    // SAFETY: shim objects are heap-stable; the caller holds a reference and
+    // the GIL contract forbids concurrent mutation.
+    match unsafe { kind_mut(object) } {
+        ShimKind::Tuple(items) => {
+            let length = items.len();
+            // SAFETY: the inline array owns `ob_size` pointer slots in the
+            // live allocation (zero before `PyTuple_SetItem` fills them).
+            Ok(unsafe {
+                let pointer =
+                    (object as *mut u8).add(tuple_layout::TUPLE_ITEMS_OFFSET) as *mut usize;
+                std::slice::from_raw_parts_mut(pointer, length)
+            })
+        }
         _ => Err("TypeError: expected a tuple object".to_string()),
     }
 }
@@ -2598,7 +2862,7 @@ fn dict_slots_mut(object: *mut ShimObject) -> Result<&'static mut Vec<(usize, us
         return Err("TypeError: expected a dict object, got NULL".to_string());
     }
     // SAFETY: see `list_slots_mut`.
-    match unsafe { &mut (*object).kind } {
+    match unsafe { kind_mut(object) } {
         ShimKind::Dict(pairs) => Ok(pairs),
         _ => Err("TypeError: expected a dict object".to_string()),
     }
@@ -4392,6 +4656,12 @@ pub extern "C" fn PyModule_GetDef(module: *mut ShimObject) -> *mut PyModuleDefMi
 #[no_mangle]
 pub extern "C" fn PyModule_GetState(module: *mut ShimObject) -> *mut c_void {
     match module_entry_pointer(module, |entry| entry.state) {
+        Ok(0) => {
+            // `m_size == 0`: the module declared no per-module state. CPython
+            // reports this instead of handing back a bogus pointer.
+            set_error("SystemError: module state is not available");
+            ptr::null_mut()
+        }
         Ok(state) => state as *mut c_void,
         Err(error) => {
             set_error(error);
@@ -4601,6 +4871,27 @@ fn import_loaded(name: &str) -> Result<*mut ShimObject, String> {
     // Not a loaded DSO: fall back to the Hydro runtime registry, which holds
     // every native stdlib module and every compiled user module.
     if crate::modules::registry_lookup(name).is_some() {
+        let (_, module) = create_runtime_module(name.to_string())?;
+        inc_ref(module);
+        return Ok(module);
+    }
+    // The name may be a compiled module whose body has not run yet. This is
+    // the dynamic-import bridge a C extension uses (`numpy.exceptions`): the
+    // startup loop has registered the body, run it on demand and return the
+    // module it populated. The body is Hydro user code, so it runs under the
+    // same (reentrant) emulated GIL as any other call from an extension.
+    let executed = {
+        let _gripper = GilGuard::new();
+        crate::module_init::initialize(name)
+    };
+    if executed != 0 {
+        if crate::exc::pending() {
+            return Err(take_hydro_error(&format!(
+                "initializing module '{name}' failed"
+            )));
+        }
+        // `initialize` published the module value in `sys.modules`; expose the
+        // same module through an extension-visible module object.
         let (_, module) = create_runtime_module(name.to_string())?;
         inc_ref(module);
         return Ok(module);
@@ -5546,13 +5837,73 @@ pub extern "C" fn PyType_GetModuleName(type_object: *mut ShimObject) -> *mut Shi
 }
 
 /// `PyType_FromModuleAndSpec`.
+///
+/// The module is validated and associated with the new heap type, so
+/// `PyType_GetModule`/`PyType_GetModuleState` return the module registered by
+/// `PyModuleDef_Init` instead of a stale or fabricated pointer.
 #[no_mangle]
 pub extern "C" fn PyType_FromModuleAndSpec(
-    _module: *mut ShimObject,
+    module: *mut ShimObject,
     spec: *mut types::PyTypeSpecMirror,
     bases: *mut ShimObject,
 ) -> *mut ShimObject {
-    PyType_FromSpecWithBases(spec, bases)
+    if !module.is_null() && module_entry_pointer(module, |_| ()).is_err() {
+        set_error("TypeError: PyType_FromModuleAndSpec: module is not a module object");
+        return ptr::null_mut();
+    }
+    let type_object = PyType_FromSpecWithBases(spec, bases);
+    if type_object.is_null() || module.is_null() {
+        return type_object;
+    }
+    types::associate_type_module(type_object as *mut TypeObject, module);
+    type_object
+}
+
+/// `PyType_GetModule`: the module associated with a heap type.
+///
+/// Returns a borrowed reference, as in CPython. A static type, a type created
+/// by plain `PyType_FromSpec`, or a type whose module association was never
+/// filled is rejected with `TypeError`; no garbage pointer is returned.
+#[no_mangle]
+pub extern "C" fn PyType_GetModule(type_object: *mut ShimObject) -> *mut ShimObject {
+    let type_object = match types::as_type(type_object) {
+        Ok(type_object) => type_object,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    // SAFETY: validated, live type object.
+    if unsafe { (*type_object).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0 {
+        set_error("TypeError: PyType_GetModule: type is not a heap type");
+        return ptr::null_mut();
+    }
+    match types::type_module(type_object) {
+        Some(module) => module,
+        None => {
+            set_error("TypeError: PyType_GetModule: type has no module");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `PyType_GetModuleState`: the module state block of a heap type's module.
+///
+/// Mirrors CPython: a type without a module, or a module whose
+/// `PyModuleDef.m_size` is zero, yields NULL with a `TypeError` naming the
+/// missing association instead of an arbitrary address.
+#[no_mangle]
+pub extern "C" fn PyType_GetModuleState(type_object: *mut ShimObject) -> *mut c_void {
+    let module = PyType_GetModule(type_object);
+    if module.is_null() {
+        // `PyType_GetModule` already set the diagnostic.
+        return ptr::null_mut();
+    }
+    let state = PyModule_GetState(module);
+    if state.is_null() && !error_pending() {
+        set_error("TypeError: PyType_GetModuleState(): module state is not available");
+    }
+    state
 }
 
 /// `PyType_FromMetaclass`.
@@ -5830,7 +6181,7 @@ pub extern "C" fn PyCapsule_SetPointer(capsule: *mut ShimObject, pointer: *mut c
         return -1;
     }
     // SAFETY: shim objects are heap-stable.
-    match unsafe { &mut (*capsule).kind } {
+    match unsafe { kind_mut(capsule) } {
         ShimKind::Capsule { ptr, .. } => {
             *ptr = pointer as usize;
             0
@@ -5959,6 +6310,7 @@ pub extern "C" fn PyList_Append(object: *mut ShimObject, item: *mut ShimObject) 
     }
     inc_ref(item);
     items.push(item as usize);
+    sync_list_prefix(object);
     0
 }
 
@@ -5981,7 +6333,7 @@ pub extern "C" fn PyTuple_New(size: isize) -> *mut ShimObject {
         return ptr::null_mut();
     }
     items.resize(count, 0);
-    new_object(ShimKind::Tuple(items))
+    new_tuple(items)
 }
 
 /// `PyTuple_Size`.
@@ -6319,9 +6671,7 @@ fn tuple_from_borrowed(values: &[*mut ShimObject]) -> *mut ShimObject {
     for &value in values {
         inc_ref(value);
     }
-    new_object(ShimKind::Tuple(
-        values.iter().map(|&value| value as usize).collect(),
-    ))
+    new_tuple(values.iter().map(|&value| value as usize).collect())
 }
 
 /// Builds a keyword dict from a name tuple and the matching vector values.
@@ -8441,7 +8791,7 @@ pub extern "C" fn PyException_SetCause(exception: *mut ShimObject, cause: *mut S
     }
     // SAFETY: the object is live, the GIL is held and only the cause slot is
     // written while this frame owns the exclusive borrow.
-    let ShimKind::Exception { cause: slot, .. } = (unsafe { &mut (*exception).kind }) else {
+    let ShimKind::Exception { cause: slot, .. } = (unsafe { kind_mut(exception) }) else {
         set_error("SystemError: PyException_SetCause: not an exception instance");
         return;
     };
@@ -8500,7 +8850,7 @@ pub extern "C" fn PyException_SetTraceback(
     // SAFETY: see `PyException_SetCause`; the kind was just validated.
     let ShimKind::Exception {
         traceback: slot, ..
-    } = (unsafe { &mut (*exception).kind })
+    } = (unsafe { kind_mut(exception) })
     else {
         unreachable!("kind validated above")
     };
@@ -8912,13 +9262,18 @@ fn iterable_elements(object: *mut ShimObject) -> Result<Vec<usize>, String> {
     }
     match kind_ref(object) {
         Some(ShimKind::List(items))
-        | Some(ShimKind::Tuple(items))
         | Some(ShimKind::Set(items))
         | Some(ShimKind::FrozenSet(items)) => {
             for &item in items {
                 inc_ref(item as *mut ShimObject);
             }
             Ok(items.clone())
+        }
+        Some(ShimKind::Tuple(items)) => {
+            for &item in items.iter() {
+                inc_ref(item as *mut ShimObject);
+            }
+            Ok(items.to_vec())
         }
         Some(ShimKind::Dict(pairs)) => {
             let keys: Vec<usize> = pairs.iter().map(|&(key, _)| key).collect();
@@ -9025,7 +9380,7 @@ fn set_slots_mut(object: *mut ShimObject) -> Option<&'static mut Vec<usize>> {
     }
     // SAFETY: the handle is live and the GIL forbids concurrent mutation.
     unsafe {
-        match &mut (*object).kind {
+        match kind_mut(object) {
             ShimKind::Set(items) => Some(items),
             _ => None,
         }
@@ -9137,7 +9492,7 @@ pub extern "C" fn PyList_AsTuple(object: *mut ShimObject) -> *mut ShimObject {
         }
         inc_ref(item as *mut ShimObject);
     }
-    new_object(ShimKind::Tuple(items.to_vec()))
+    new_tuple(items.to_vec())
 }
 
 /// `PyList_GetSlice`: a new list for the clamped `[low, high)` range.
@@ -10583,11 +10938,29 @@ pub extern "C" fn PyTraceBack_Print(traceback: *mut ShimObject, _file: *mut Shim
 
 /// The CPython `datetime` C API capsule exposed as `datetime.datetime_CAPI`.
 ///
-/// The structure layout is CPython 3.14's `PyDateTime_CAPI`. Hydro's native
-/// datetime classes are not C `PyDateTime` layouts yet, so the type slots
-/// point at `object` and the constructor/callback slots are null: the capsule
-/// exists so extension initialisers (PyO3, NumPy) can run, and no date
-/// construction is claimed through it.
+/// The structure layout is CPython 3.14's `PyDateTime_CAPI`. The five type
+/// slots are real type objects (`PyDateTimeAPI->DateType`, ...); the handles
+/// returned by the constructor callbacks use those same objects as `ob_type`,
+/// so the header macros `PyDate_Check`/`PyDateTime_Check`/`PyTime_Check`/
+/// `PyDelta_Check`/`PyTZInfo_Check` and `PyType_IsSubtype` answer correctly.
+///
+/// Every callback is backed by the native `datetime` module constructors:
+///
+/// | capsule slot | native constructor |
+/// |---|---|
+/// | `Date_FromDate` | `datetime.date(...)` |
+/// | `DateTime_FromDateAndTime` | `datetime.datetime(...)` |
+/// | `Time_FromTime` | `datetime.time(...)` |
+/// | `Delta_FromDelta` | `datetime.timedelta(...)` |
+/// | `DateTime_FromDateAndTimeAndFold` | `datetime.datetime(..., fold=...)` |
+/// | `Time_FromTimeAndFold` | `datetime.time(..., fold=...)` |
+/// | `DateTime_FromTimestamp` | `datetime.datetime.fromtimestamp(...)` |
+/// | `Date_FromTimestamp` | `datetime.datetime.fromtimestamp(...).date()` |
+/// | `TimeZone_FromTimeZone` | `datetime.timezone(offset, name)` |
+///
+/// `TimeZone_UTC` is the native `datetime.timezone.utc` singleton, held
+/// immortal by the capsule (a `tzinfo` subclass, so `PyTZInfo_Check` holds).
+/// No slot in the capsule is NULL.
 #[repr(C)]
 struct PyDateTimeCAPI {
     date_type: *mut types::TypeObject,
@@ -10607,31 +10980,534 @@ struct PyDateTimeCAPI {
     time_from_time_and_fold: *mut c_void,
 }
 
+/// Encodes a C integer argument as the tagged Hydro value the native
+/// datetime constructors expect.
+fn datetime_capi_int(value: c_int) -> i64 {
+    crate::value::encode_int(i64::from(value)).unwrap_or(crate::value::NONE)
+}
+
+/// Converts one C argument into a Hydro value, preserving the handle identity
+/// of Hydro objects (notably a tzinfo instance).
+fn datetime_capi_argument(argument: *mut ShimObject) -> Result<i64, String> {
+    if argument.is_null() {
+        return Ok(crate::value::NONE);
+    }
+    let shim = object_to_value(argument)?;
+    crate::modules::extension::shim_to_value(shim)
+}
+
+/// Decodes the optional `tzinfo` argument shared by the date/time
+/// constructors. `NULL` means "no tzinfo", as CPython's macros pass NULL for
+/// a naive value.
+fn datetime_capi_tzinfo(tzinfo: *mut ShimObject) -> Result<i64, String> {
+    if tzinfo.is_null() || tzinfo == ptr::addr_of_mut!(_Py_NoneStruct) {
+        return Ok(crate::value::NONE);
+    }
+    if let Some(handle) = hydro_handle(tzinfo) {
+        return Ok(handle.value());
+    }
+    Err("TypeError: tzinfo argument must be None or a datetime.tzinfo instance".to_string())
+}
+
+/// Validates the `cls` argument the capsule callbacks receive.
+///
+/// The macros pass the capsule's own type object. A subclass is not
+/// representable: the native `date`/`datetime` classes have no C-level
+/// subclass layout, so fabricating an instance of one would hand the extension
+/// memory that disagrees with its type. It is rejected with a diagnostic.
+fn datetime_capi_check_class(
+    class: *mut ShimObject,
+    expected: *mut types::TypeObject,
+    label: &str,
+) -> Result<(), String> {
+    if class.is_null() || class as *mut types::TypeObject == expected {
+        return Ok(());
+    }
+    if types::is_type_pointer(class) {
+        return Err(format!(
+            "TypeError: {label}: subclassing is not supported by this runtime (got '{}')",
+            types::type_name(class as *mut types::TypeObject)
+        ));
+    }
+    Err(format!("TypeError: {label}: class argument is not a type"))
+}
+
+/// Wraps a successfully constructed native datetime value.
+fn datetime_capi_wrap(result: i64) -> *mut ShimObject {
+    if result == crate::value::NONE || crate::exc::pending() {
+        if crate::exc::pending() {
+            let message = take_hydro_error("datetime constructor failed");
+            set_error(message);
+        } else {
+            set_error("SystemError: datetime constructor returned None");
+        }
+        return ptr::null_mut();
+    }
+    value_object(ShimValue::Hydro(HydroValue::new(result)))
+}
+
+/// Runs one of the native datetime constructors and converts the result.
+fn datetime_capi_construct(
+    class_name: &str,
+    positional: &[i64],
+    keywords: &[(String, i64)],
+) -> *mut ShimObject {
+    let class = crate::modules::datetime::constant(class_name);
+    let result = if keywords.is_empty() {
+        crate::modules::datetime::instantiate(class, positional)
+    } else {
+        crate::modules::datetime::instantiate_kw(class, positional, keywords)
+    };
+    let Some(result) = result else {
+        set_error(format!(
+            "SystemError: native datetime.{class_name} constructor is unavailable"
+        ));
+        return ptr::null_mut();
+    };
+    datetime_capi_wrap(result)
+}
+
+/// `PyDate_FromDate` (capsule `Date_FromDate`).
+unsafe extern "C" fn date_from_date(
+    year: c_int,
+    month: c_int,
+    day: c_int,
+    class: *mut ShimObject,
+) -> *mut ShimObject {
+    if let Err(error) = datetime_capi_check_class(
+        class,
+        ptr::addr_of_mut!(types::DATE_CAPI_TYPE),
+        "PyDate_FromDate",
+    ) {
+        set_error(error);
+        return ptr::null_mut();
+    }
+    let args = [
+        datetime_capi_int(year),
+        datetime_capi_int(month),
+        datetime_capi_int(day),
+    ];
+    datetime_capi_construct("date", &args, &[])
+}
+
+/// `PyDateTime_FromDateAndTime` (capsule `DateTime_FromDateAndTime`).
+unsafe extern "C" fn datetime_from_date_and_time(
+    year: c_int,
+    month: c_int,
+    day: c_int,
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    microsecond: c_int,
+    tzinfo: *mut ShimObject,
+    class: *mut ShimObject,
+) -> *mut ShimObject {
+    if let Err(error) = datetime_capi_check_class(
+        class,
+        ptr::addr_of_mut!(types::DATETIME_CAPI_TYPE),
+        "PyDateTime_FromDateAndTime",
+    ) {
+        set_error(error);
+        return ptr::null_mut();
+    }
+    let tzinfo = match datetime_capi_tzinfo(tzinfo) {
+        Ok(tzinfo) => tzinfo,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    let args = [
+        datetime_capi_int(year),
+        datetime_capi_int(month),
+        datetime_capi_int(day),
+        datetime_capi_int(hour),
+        datetime_capi_int(minute),
+        datetime_capi_int(second),
+        datetime_capi_int(microsecond),
+        tzinfo,
+    ];
+    datetime_capi_construct("datetime", &args, &[])
+}
+
+/// `PyDateTime_FromDateAndTimeAndFold` (capsule
+/// `DateTime_FromDateAndTimeAndFold`).
+unsafe extern "C" fn datetime_from_date_and_time_and_fold(
+    year: c_int,
+    month: c_int,
+    day: c_int,
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    microsecond: c_int,
+    tzinfo: *mut ShimObject,
+    fold: c_int,
+    class: *mut ShimObject,
+) -> *mut ShimObject {
+    if let Err(error) = datetime_capi_check_class(
+        class,
+        ptr::addr_of_mut!(types::DATETIME_CAPI_TYPE),
+        "PyDateTime_FromDateAndTimeAndFold",
+    ) {
+        set_error(error);
+        return ptr::null_mut();
+    }
+    let tzinfo = match datetime_capi_tzinfo(tzinfo) {
+        Ok(tzinfo) => tzinfo,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    let args = [
+        datetime_capi_int(year),
+        datetime_capi_int(month),
+        datetime_capi_int(day),
+        datetime_capi_int(hour),
+        datetime_capi_int(minute),
+        datetime_capi_int(second),
+        datetime_capi_int(microsecond),
+        tzinfo,
+    ];
+    let keywords = [("fold".to_string(), datetime_capi_int(fold))];
+    datetime_capi_construct("datetime", &args, &keywords)
+}
+
+/// `PyTime_FromTime` (capsule `Time_FromTime`).
+unsafe extern "C" fn time_from_time(
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    microsecond: c_int,
+    tzinfo: *mut ShimObject,
+    class: *mut ShimObject,
+) -> *mut ShimObject {
+    if let Err(error) = datetime_capi_check_class(
+        class,
+        ptr::addr_of_mut!(types::TIME_CAPI_TYPE),
+        "PyTime_FromTime",
+    ) {
+        set_error(error);
+        return ptr::null_mut();
+    }
+    let tzinfo = match datetime_capi_tzinfo(tzinfo) {
+        Ok(tzinfo) => tzinfo,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    let args = [
+        datetime_capi_int(hour),
+        datetime_capi_int(minute),
+        datetime_capi_int(second),
+        datetime_capi_int(microsecond),
+        tzinfo,
+    ];
+    datetime_capi_construct("time", &args, &[])
+}
+
+/// `PyTime_FromTimeAndFold` (capsule `Time_FromTimeAndFold`).
+unsafe extern "C" fn time_from_time_and_fold(
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    microsecond: c_int,
+    tzinfo: *mut ShimObject,
+    fold: c_int,
+    class: *mut ShimObject,
+) -> *mut ShimObject {
+    if let Err(error) = datetime_capi_check_class(
+        class,
+        ptr::addr_of_mut!(types::TIME_CAPI_TYPE),
+        "PyTime_FromTimeAndFold",
+    ) {
+        set_error(error);
+        return ptr::null_mut();
+    }
+    let tzinfo = match datetime_capi_tzinfo(tzinfo) {
+        Ok(tzinfo) => tzinfo,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    let args = [
+        datetime_capi_int(hour),
+        datetime_capi_int(minute),
+        datetime_capi_int(second),
+        datetime_capi_int(microsecond),
+        tzinfo,
+    ];
+    let keywords = [("fold".to_string(), datetime_capi_int(fold))];
+    datetime_capi_construct("time", &args, &keywords)
+}
+
+/// `PyDelta_FromDSU` (capsule `Delta_FromDelta`).
+///
+/// The native `timedelta` constructor always normalises its components; the
+/// capsule's `normalize` flag therefore cannot produce CPython's internal
+/// non-normalised representation, and the normalised value is returned in both
+/// cases.
+unsafe extern "C" fn delta_from_delta(
+    days: c_int,
+    seconds: c_int,
+    microseconds: c_int,
+    _normalize: c_int,
+    class: *mut ShimObject,
+) -> *mut ShimObject {
+    if let Err(error) = datetime_capi_check_class(
+        class,
+        ptr::addr_of_mut!(types::TIMEDELTA_CAPI_TYPE),
+        "PyDelta_FromDSU",
+    ) {
+        set_error(error);
+        return ptr::null_mut();
+    }
+    let args = [
+        datetime_capi_int(days),
+        datetime_capi_int(seconds),
+        datetime_capi_int(microseconds),
+    ];
+    datetime_capi_construct("timedelta", &args, &[])
+}
+
+/// Decoded `(positional, keyword)` arguments of a `DateTime_FromTimestamp`
+/// tuple/dict pair. Named so the decoder's return type stays readable (and
+/// clippy::type_complexity-quiet) without changing the calling convention.
+type TimestampArguments = (Vec<i64>, Vec<(String, i64)>);
+
+/// Decodes a `DateTime_FromTimestamp` argument tuple/dict pair.
+fn datetime_capi_timestamp_arguments(
+    args: *mut ShimObject,
+    keywords: *mut ShimObject,
+) -> Result<TimestampArguments, String> {
+    let mut positional: Vec<i64> = Vec::new();
+    if !args.is_null() {
+        match kind_ref(args) {
+            Some(ShimKind::Tuple(items)) => {
+                for &item in items {
+                    positional.push(datetime_capi_argument(item as *mut ShimObject)?);
+                }
+            }
+            _ => return Err("TypeError: timestamp arguments must be a tuple".to_string()),
+        }
+    }
+    let mut named: Vec<(String, i64)> = Vec::new();
+    if !keywords.is_null() {
+        for &(key, value) in dict_slots(keywords)? {
+            let Some(name) = as_string(key as *mut ShimObject) else {
+                return Err("TypeError: keyword names must be strings".to_string());
+            };
+            named.push((name, datetime_capi_argument(value as *mut ShimObject)?));
+        }
+    }
+    Ok((positional, named))
+}
+
+/// Shared body of `DateTime_FromTimestamp`/`Date_FromTimestamp`.
+fn datetime_capi_from_timestamp(
+    class: *mut ShimObject,
+    args: *mut ShimObject,
+    keywords: *mut ShimObject,
+    date_only: bool,
+) -> *mut ShimObject {
+    let label = if date_only {
+        "PyDate_FromTimestamp"
+    } else {
+        "PyDateTime_FromTimestamp"
+    };
+    let expected = if date_only {
+        ptr::addr_of_mut!(types::DATE_CAPI_TYPE)
+    } else {
+        ptr::addr_of_mut!(types::DATETIME_CAPI_TYPE)
+    };
+    if let Err(error) = datetime_capi_check_class(class, expected, label) {
+        set_error(error);
+        return ptr::null_mut();
+    }
+    let (mut positional, named) = match datetime_capi_timestamp_arguments(args, keywords) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    for (name, value) in named {
+        match name.as_str() {
+            // CPython's `fromtimestamp(timestamp, tz=None)`.
+            "tz" if positional.len() == 1 => positional.push(value),
+            other => {
+                set_error(format!(
+                    "TypeError: fromtimestamp() got an unexpected keyword argument '{other}'"
+                ));
+                return ptr::null_mut();
+            }
+        }
+    }
+    if positional.is_empty() {
+        set_error("TypeError: fromtimestamp() missing required argument 'timestamp'");
+        return ptr::null_mut();
+    }
+    let moment = crate::modules::datetime::call("_datetime_fromtimestamp", &positional);
+    if crate::exc::pending() {
+        let message = take_hydro_error("fromtimestamp() raised an exception");
+        set_error(message);
+        return ptr::null_mut();
+    }
+    if !date_only {
+        return datetime_capi_wrap(moment);
+    }
+    let date = crate::modules::datetime::call("_datetime_date", &[moment]);
+    datetime_capi_wrap(date)
+}
+
+/// `PyDateTime_FromTimestamp` (capsule `DateTime_FromTimestamp`).
+unsafe extern "C" fn datetime_from_timestamp(
+    class: *mut ShimObject,
+    args: *mut ShimObject,
+    keywords: *mut ShimObject,
+) -> *mut ShimObject {
+    datetime_capi_from_timestamp(class, args, keywords, false)
+}
+
+/// `PyDate_FromTimestamp` (capsule `Date_FromTimestamp`).
+unsafe extern "C" fn date_from_timestamp(
+    class: *mut ShimObject,
+    args: *mut ShimObject,
+) -> *mut ShimObject {
+    datetime_capi_from_timestamp(class, args, ptr::null_mut(), true)
+}
+
+/// `PyTimeZone_FromOffset`/`PyTimeZone_FromTimeZone` (capsule
+/// `TimeZone_FromTimeZone`).
+///
+/// `offset` is a native `datetime.timedelta` handle; `name` is a `str` or
+/// `NULL` (auto-generated from the offset), and `NULL` offset means the zero
+/// offset, matching `PyTimeZone_FromOffset(NULL)`'s documented UTC spelling.
+unsafe extern "C" fn timezone_from_timezone(
+    offset: *mut ShimObject,
+    name: *mut ShimObject,
+) -> *mut ShimObject {
+    let offset_value = if offset.is_null() {
+        let delta_class = crate::modules::datetime::constant("timedelta");
+        match crate::modules::datetime::instantiate(delta_class, &[datetime_capi_int(0)]) {
+            Some(value) if value != crate::value::NONE && !crate::exc::pending() => value,
+            _ => {
+                if crate::exc::pending() {
+                    let message = take_hydro_error("timedelta(0) failed");
+                    set_error(message);
+                } else {
+                    set_error("SystemError: native datetime.timedelta constructor is unavailable");
+                }
+                return ptr::null_mut();
+            }
+        }
+    } else {
+        match datetime_capi_argument(offset) {
+            Ok(value) => value,
+            Err(error) => {
+                set_error(error);
+                return ptr::null_mut();
+            }
+        }
+    };
+    let class = crate::modules::datetime::constant("timezone");
+    let result = if name.is_null() {
+        crate::modules::datetime::instantiate(class, &[offset_value])
+    } else {
+        let name_value = match datetime_capi_argument(name) {
+            Ok(value) => value,
+            Err(error) => {
+                set_error(error);
+                return ptr::null_mut();
+            }
+        };
+        crate::modules::datetime::instantiate_kw(
+            class,
+            &[offset_value],
+            &[("name".to_string(), name_value)],
+        )
+    };
+    let Some(result) = result else {
+        set_error("SystemError: native datetime.timezone constructor is unavailable");
+        return ptr::null_mut();
+    };
+    datetime_capi_wrap(result)
+}
+
+/// `PyDateTime_TimeZone_UTC`: the native `datetime.timezone.utc` singleton.
+///
+/// The capsule holds it for the process lifetime and marks it immortal, so an
+/// extension may `Py_DecRef` the borrowed pointer it receives. The wrapped type
+/// is `datetime.timezone`, a `tzinfo` subclass, so `PyTZInfo_Check` succeeds.
+fn datetime_capsule_utc() -> *mut ShimObject {
+    static UTC: LazyLock<usize> = LazyLock::new(|| {
+        let class = crate::modules::datetime::constant("timezone");
+        let utc = crate::methods::getattr(class, b"utc".as_ptr(), 3);
+        let lookup_failed = crate::exc::pending();
+        if lookup_failed {
+            crate::exc::clear();
+        }
+        let value = if lookup_failed || utc == crate::value::NONE {
+            // `timezone_class()` always publishes `utc`; fall back to a
+            // zero-offset zone rather than a NULL capsule slot.
+            match crate::modules::datetime::instantiate(
+                class,
+                &[
+                    match crate::modules::datetime::instantiate(
+                        crate::modules::datetime::constant("timedelta"),
+                        &[datetime_capi_int(0)],
+                    ) {
+                        Some(delta) => delta,
+                        None => crate::value::NONE,
+                    },
+                ],
+            ) {
+                Some(value) => value,
+                None => crate::value::NONE,
+            }
+        } else {
+            utc
+        };
+        if value == crate::value::NONE || crate::exc::pending() {
+            if crate::exc::pending() {
+                crate::exc::clear();
+            }
+            return 0;
+        }
+        // The capsule holds the only (process-lifetime) reference and
+        // extensions may decref what they receive, so it is immortal.
+        make_immortal(value_object(ShimValue::Hydro(HydroValue::new(value)))) as usize
+    });
+    *UTC as *mut ShimObject
+}
+
 /// Returns the `datetime_CAPI` capsule value (a new reference).
 pub(crate) fn datetime_capsule() -> i64 {
-    static ONCE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let pointer = *ONCE.get_or_init(|| {
+    static CAPI: LazyLock<usize> = LazyLock::new(|| {
         ensure_builtin_types();
         let capi = Box::new(PyDateTimeCAPI {
-            date_type: ptr::addr_of_mut!(types::OBJECT_TYPE),
-            datetime_type: ptr::addr_of_mut!(types::OBJECT_TYPE),
-            time_type: ptr::addr_of_mut!(types::OBJECT_TYPE),
-            delta_type: ptr::addr_of_mut!(types::OBJECT_TYPE),
-            tzinfo_type: ptr::addr_of_mut!(types::OBJECT_TYPE),
-            timezone_utc: ptr::null_mut(),
-            date_from_date: ptr::null_mut(),
-            datetime_from_date_and_time: ptr::null_mut(),
-            time_from_time: ptr::null_mut(),
-            delta_from_delta: ptr::null_mut(),
-            timezone_from_timezone: ptr::null_mut(),
-            datetime_from_timestamp: ptr::null_mut(),
-            date_from_timestamp: ptr::null_mut(),
-            datetime_from_date_and_time_and_fold: ptr::null_mut(),
-            time_from_time_and_fold: ptr::null_mut(),
+            date_type: ptr::addr_of_mut!(types::DATE_CAPI_TYPE),
+            datetime_type: ptr::addr_of_mut!(types::DATETIME_CAPI_TYPE),
+            time_type: ptr::addr_of_mut!(types::TIME_CAPI_TYPE),
+            delta_type: ptr::addr_of_mut!(types::TIMEDELTA_CAPI_TYPE),
+            tzinfo_type: ptr::addr_of_mut!(types::TZINFO_CAPI_TYPE),
+            timezone_utc: datetime_capsule_utc(),
+            date_from_date: date_from_date as *const () as *mut c_void,
+            datetime_from_date_and_time: datetime_from_date_and_time as *const () as *mut c_void,
+            time_from_time: time_from_time as *const () as *mut c_void,
+            delta_from_delta: delta_from_delta as *const () as *mut c_void,
+            timezone_from_timezone: timezone_from_timezone as *const () as *mut c_void,
+            datetime_from_timestamp: datetime_from_timestamp as *const () as *mut c_void,
+            date_from_timestamp: date_from_timestamp as *const () as *mut c_void,
+            datetime_from_date_and_time_and_fold: datetime_from_date_and_time_and_fold as *const ()
+                as *mut c_void,
+            time_from_time_and_fold: time_from_time_and_fold as *const () as *mut c_void,
         });
         Box::into_raw(capi) as usize
     });
-    crate::value::capsule_new(pointer, Some("datetime.datetime_CAPI".to_string()))
+    crate::value::capsule_new(*CAPI, Some("datetime.datetime_CAPI".to_string()))
 }
 
 /// `PyCapsule_Import`: resolves a dotted `module.attr...` name, verifies the
@@ -10838,7 +11714,7 @@ pub extern "C" fn PyCapsule_SetContext(capsule: *mut ShimObject, context: *mut c
         return -1;
     }
     // SAFETY: shim objects are heap-stable and the GIL serialises writes.
-    match unsafe { &mut (*capsule).kind } {
+    match unsafe { kind_mut(capsule) } {
         ShimKind::Capsule { context: slot, .. } => {
             *slot = context as usize;
             0
@@ -10866,7 +11742,7 @@ pub extern "C" fn PyCapsule_SetName(capsule: *mut ShimObject, name: *const c_cha
         return -1;
     };
     // SAFETY: see `PyCapsule_SetContext`.
-    match unsafe { &mut (*capsule).kind } {
+    match unsafe { kind_mut(capsule) } {
         ShimKind::Capsule { name: slot, .. } => {
             *slot = Some(name);
             0
@@ -11544,7 +12420,7 @@ pub extern "C" fn PyErr_Restore(
             exception_traceback as usize
         };
         // SAFETY: `instance` is a fresh or supplied exception instance.
-        if let ShimKind::Exception { traceback, .. } = unsafe { &mut (*instance).kind } {
+        if let ShimKind::Exception { traceback, .. } = unsafe { kind_mut(instance) } {
             let previous = std::mem::replace(traceback, stored);
             if previous != 0 && previous != stored {
                 dec_ref(previous as *mut ShimObject);
@@ -11575,7 +12451,7 @@ pub extern "C" fn PyException_SetContext(exception: *mut ShimObject, context: *m
         return;
     }
     // SAFETY: live object; the context slot is written under the GIL.
-    let ShimKind::Exception { context: slot, .. } = (unsafe { &mut (*exception).kind }) else {
+    let ShimKind::Exception { context: slot, .. } = (unsafe { kind_mut(exception) }) else {
         set_error("SystemError: PyException_SetContext: not an exception instance");
         return;
     };
@@ -12775,7 +13651,7 @@ pub extern "C" fn PyTuple_GetSlice(
         }
         inc_ref(item as *mut ShimObject);
     }
-    new_object(ShimKind::Tuple(slice.to_vec()))
+    new_tuple(slice.to_vec())
 }
 
 /// `PySequence_Fast`: a list (or the sequence itself) for fast indexing.
@@ -12829,10 +13705,10 @@ pub extern "C" fn PySequence_Tuple(object: *mut ShimObject) -> *mut ShimObject {
         for &item in items {
             inc_ref(item as *mut ShimObject);
         }
-        return new_object(ShimKind::Tuple(items.clone()));
+        return new_tuple(items.clone());
     }
     match iterable_elements(object) {
-        Ok(elements) => new_object(ShimKind::Tuple(elements)),
+        Ok(elements) => new_tuple(elements),
         Err(error) => {
             set_error(error);
             ptr::null_mut()
@@ -12875,7 +13751,7 @@ pub(crate) extern "C" fn seqiter_next(object: *mut ShimObject) -> *mut ShimObjec
         return ptr::null_mut();
     }
     // SAFETY: the payload was validated above and the GIL serialises access.
-    if let ShimKind::SeqIter { index, .. } = unsafe { &mut (*object).kind } {
+    if let ShimKind::SeqIter { index, .. } = unsafe { kind_mut(object) } {
         *index += 1;
     }
     item
@@ -13689,6 +14565,7 @@ pub(crate) fn anchor() {
         PyGILState_Ensure as *const (),
         PyGILState_Release as *const (),
         PyGILState_GetThisThreadState as *const (),
+        PyGILState_Check as *const (),
         PyEval_SaveThread as *const (),
         PyEval_RestoreThread as *const (),
         PyThreadState_Get as *const (),
@@ -13777,6 +14654,8 @@ pub(crate) fn anchor() {
         PyMutex_Unlock as *const (),
         PyMutex_IsLocked as *const (),
         PyType_GetModuleName as *const (),
+        PyType_GetModule as *const (),
+        PyType_GetModuleState as *const (),
         PyType_FromModuleAndSpec as *const (),
         PyType_FromMetaclass as *const (),
         PyObject_GenericGetAttr as *const (),
@@ -14115,7 +14994,10 @@ mod tests {
         assert_eq!(std::mem::offset_of!(PyObjectHead, ob_type), 8);
         assert_eq!(std::mem::size_of::<PyVarObjectHead>(), 24);
         assert_eq!(std::mem::offset_of!(PyVarObjectHead, ob_size), 16);
-        assert_eq!(std::mem::offset_of!(ShimObject, kind), 16);
+        assert_eq!(std::mem::offset_of!(ShimObject, head), 0);
+        assert_eq!(std::mem::offset_of!(ShimObject, ob_size), 16);
+        assert_eq!(std::mem::offset_of!(ShimObject, aux), 24);
+        assert_eq!(std::mem::offset_of!(ShimObject, kind), 32);
 
         assert_eq!(std::mem::size_of::<types::TypeObject>(), 416);
         assert_eq!(std::mem::offset_of!(types::TypeObject, ob_refcnt), 0);
@@ -14141,6 +15023,74 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Py_buffer, shape), 48);
         assert_eq!(std::mem::offset_of!(Py_buffer, strides), 56);
         assert_eq!(std::mem::offset_of!(Py_buffer, suboffsets), 64);
+    }
+
+    /// CPython's inline macros read raw offsets. This test performs exactly
+    /// those reads/writes so a layout regression fails here instead of in an
+    /// extension.
+    #[test]
+    fn tuple_and_list_prefix_is_cpython_shaped() {
+        anchor();
+        let first = new_int(11);
+        let second = new_int(22);
+        let tuple = new_tuple(vec![first as usize, second as usize]);
+        // SAFETY: `tuple` is a live handle; the offsets are the documented
+        // CPython 3.14 ones.
+        unsafe {
+            let base = tuple as *mut u8;
+            // `Py_SIZE`, `PyTuple_GET_SIZE`.
+            assert_eq!(*(base.add(16) as *const isize), 2);
+            // `PyTupleObject.ob_hash` starts at -1 in CPython 3.14.
+            assert_eq!(*(base.add(24) as *const isize), -1);
+            // `PyTuple_GET_ITEM`.
+            assert_eq!(*(base.add(32) as *const usize), first as usize);
+            assert_eq!(*(base.add(40) as *const usize), second as usize);
+        }
+
+        // `PyTuple_SET_ITEM` replacement is immediately visible, exactly like
+        // an extension writing the inline slot. Release the displaced
+        // reference like a caller that replaced a non-NULL slot.
+        let third = new_int(33);
+        unsafe {
+            let base = tuple as *mut u8;
+            *(base.add(32) as *mut usize) = third as usize;
+        }
+        dec_ref(first);
+        assert_eq!(PyTuple_GetItem(tuple, 0), third);
+        assert_eq!(PyTuple_Size(tuple), 2);
+        dec_ref(tuple);
+
+        let list = PyList_New(2);
+        assert!(!list.is_null());
+        let list_first = new_int(44);
+        let list_second = new_int(55);
+        // SAFETY: `list` is a live list handle.
+        unsafe {
+            let base = list as *mut u8;
+            // `PyList_GET_SIZE`.
+            assert_eq!(*(base.add(16) as *const isize), 2);
+            // `PyList_GET_ITEM` reads `ob_item` at 24.
+            let data = *(base.add(24) as *const *mut usize);
+            assert!(!data.is_null());
+            assert_eq!(*data, 0);
+            // `PyList_SET_ITEM`.
+            *data = list_first as usize;
+        }
+        assert_eq!(PyList_GetItem(list, 0), list_first);
+        // Appending can move the `Vec`; the prefix must be republished before
+        // control returns to the extension.
+        assert_eq!(PyList_Append(list, list_second), 0);
+        // SAFETY: as above.
+        unsafe {
+            let base = list as *mut u8;
+            assert_eq!(*(base.add(16) as *const isize), 3);
+            let data = *(base.add(24) as *const *mut usize);
+            assert_eq!(*data.add(0), list_first as usize);
+            assert_eq!(*data.add(2), list_second as usize);
+        }
+        dec_ref(list);
+        // The list took its own reference in `PyList_Append`.
+        dec_ref(list_second);
     }
 
     // -- refcounts and freeing -------------------------------------------
@@ -14481,6 +15431,72 @@ mod tests {
     }
 
     #[test]
+    fn datetime_capi_types_are_subclassable_bases() {
+        anchor();
+        let tzinfo = std::ptr::addr_of_mut!(types::TZINFO_CAPI_TYPE) as *mut ShimObject;
+        // pydantic-core's `TzInfo` is `#[pyclass(extends = PyTzInfo, frozen)]`:
+        // PyO3 passes the base in a `Py_tp_base` slot and a layout of one
+        // `PyObject` header plus its single `i32` field (24 bytes on x86_64).
+        let mut slots = [
+            PyTypeSlotMirror {
+                slot: 48, // Py_tp_base
+                pfunc: tzinfo as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 0,
+                pfunc: std::ptr::null_mut(),
+            },
+        ];
+        let mut spec = PyTypeSpecMirror {
+            name: c"probe.TzInfo".as_ptr(),
+            basicsize: 24,
+            itemsize: 0,
+            flags: 0,
+            slots: slots.as_mut_ptr(),
+        };
+        let subclass = PyType_FromSpec(&mut spec);
+        assert!(!subclass.is_null(), "{:?}", take_error());
+        assert_eq!(
+            types::PyType_IsSubtype(subclass, tzinfo),
+            1,
+            "the heap type derives from datetime.tzinfo"
+        );
+        let instance = PyType_GenericAlloc(subclass, 0);
+        assert!(!instance.is_null(), "{:?}", take_error());
+        assert_eq!(Py_TYPE(instance), subclass as *mut types::TypeObject);
+        assert!(
+            object_type_check(instance, tzinfo),
+            "PyTZInfo_Check accepts the subclass instance"
+        );
+        Py_DecRef(instance);
+        Py_DecRef(subclass);
+
+        // A Shim base that does not opt into subclassing stays rejected: the
+        // relaxation is limited to types CPython declares subclassable.
+        let mut unsupported_slots = [
+            PyTypeSlotMirror {
+                slot: 48,
+                pfunc: std::ptr::addr_of_mut!(types::NONE_TYPE) as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 0,
+                pfunc: std::ptr::null_mut(),
+            },
+        ];
+        let mut unsupported = PyTypeSpecMirror {
+            name: c"probe.BadTzInfo".as_ptr(),
+            basicsize: 24,
+            itemsize: 0,
+            flags: 0,
+            slots: unsupported_slots.as_mut_ptr(),
+        };
+        clear_error();
+        assert!(PyType_FromSpec(&mut unsupported).is_null());
+        let message = take_error().expect("shim base without Py_TPFLAGS_BASETYPE");
+        assert!(message.contains("cannot use"), "{message}");
+    }
+
+    #[test]
     fn generic_allocation_initialises_cpython_headers() {
         anchor();
         let mut slots = empty_slots();
@@ -14511,10 +15527,27 @@ mod tests {
         Py_DecRef(type_object);
     }
 
+    extern "C" fn noop_traverse(
+        _self: *mut ShimObject,
+        _visit: *mut c_void,
+        _argument: *mut c_void,
+    ) -> c_int {
+        0
+    }
+
     #[test]
     fn gc_types_track_and_untrack_instances() {
         anchor();
-        let mut slots = empty_slots();
+        let mut slots = [
+            PyTypeSlotMirror {
+                slot: 71, // Py_tp_traverse: required by the GC flag
+                pfunc: noop_traverse as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 0,
+                pfunc: std::ptr::null_mut(),
+            },
+        ];
         let type_object = make_type(c"probe.GC", 32, 0, PY_TPFLAGS_HAVE_GC as c_uint, &mut slots);
         let instance = PyType_GenericAlloc(type_object, 0);
         assert!(!instance.is_null());
@@ -15012,6 +16045,618 @@ mod tests {
         // Bare thread-state accessors return a stable non-NULL token.
         assert!(!PyThreadState_Get().is_null());
         assert_eq!(PyThreadState_Get(), PyGILState_GetThisThreadState());
+    }
+
+    #[test]
+    fn gil_state_is_per_thread_reentrant_and_balanced() {
+        anchor();
+        assert_eq!(PyGILState_Check(), 0);
+        let outer = PyGILState_Ensure();
+        assert_eq!(outer, PY_GILSTATE_UNLOCKED);
+        assert_eq!(PyGILState_Check(), 1);
+        let inner = PyGILState_Ensure();
+        assert_eq!(
+            inner, PY_GILSTATE_LOCKED,
+            "nested ensure sees the lock held"
+        );
+        PyGILState_Release(inner);
+        assert_eq!(PyGILState_Check(), 1, "inner release keeps the outer level");
+        PyGILState_Release(outer);
+        assert_eq!(PyGILState_Check(), 0);
+
+        // Save/restore drops every level and reacquires exactly one.
+        let token = PyEval_SaveThread();
+        assert_eq!(PyGILState_Check(), 0);
+        PyEval_RestoreThread(token);
+        assert_eq!(PyGILState_Check(), 1);
+        PyEval_SaveThread();
+        assert_eq!(PyGILState_Check(), 0);
+
+        // Concurrent threads must each see their own state and never
+        // deadlock on the shared lock.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<std::thread::JoinHandle<()>> = (0..4)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..32 {
+                        assert_eq!(PyGILState_Check(), 0);
+                        let state = PyGILState_Ensure();
+                        assert_eq!(PyGILState_Check(), 1);
+                        let nested = PyGILState_Ensure();
+                        assert_eq!(nested, PY_GILSTATE_LOCKED);
+                        PyGILState_Release(nested);
+                        PyGILState_Release(state);
+                        assert_eq!(PyGILState_Check(), 0);
+                        let token = PyEval_SaveThread();
+                        PyEval_RestoreThread(token);
+                        PyEval_SaveThread();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("gil thread");
+        }
+        assert_eq!(PyGILState_Check(), 0);
+    }
+
+    // -- static C PyTypeObject readiness ---------------------------------
+
+    static mut STATIC_NULL_HEAD: types::TypeObject =
+        types::TypeObject::builtin(c"probe.StaticNullHead".as_ptr(), types::TypeRole::Shim, 0);
+    static mut STATIC_LINKED_HEAD: types::TypeObject =
+        types::TypeObject::builtin(c"probe.StaticLinkedHead".as_ptr(), types::TypeRole::Shim, 0);
+    static mut STATIC_BAD: types::TypeObject =
+        types::TypeObject::builtin(c"probe.StaticBad".as_ptr(), types::TypeRole::Shim, 0);
+
+    #[test]
+    fn py_type_ready_adopts_static_c_type_objects() {
+        anchor();
+        // A `PyVarObject_HEAD_INIT(NULL, 0)` type: ob_type is NULL and the
+        // extension-owned storage has no completed metadata.
+        let pointer = std::ptr::addr_of_mut!(STATIC_NULL_HEAD);
+        unsafe {
+            (*pointer).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+            (*pointer).tp_flags = 0;
+        }
+        assert_eq!(
+            PyType_Ready(pointer as *mut ShimObject),
+            0,
+            "{:?}",
+            take_error()
+        );
+        unsafe {
+            assert_ne!((*pointer).tp_flags & types::PY_TPFLAGS_READY, 0);
+            assert_eq!(
+                (*pointer).tp_flags & PY_TPFLAGS_HEAPTYPE,
+                0,
+                "an adopted static type is not a heap type"
+            );
+            assert_eq!((*pointer).role, types::TypeRole::Instance);
+            assert_eq!((*pointer).ob_type, std::ptr::addr_of_mut!(types::TYPE_TYPE));
+            assert_eq!(
+                (*pointer).tp_base,
+                std::ptr::addr_of_mut!(types::OBJECT_TYPE)
+            );
+            assert_ne!((*pointer).tp_alloc, 0);
+            assert_ne!((*pointer).tp_free, 0);
+            assert_ne!((*pointer).tp_new, 0);
+            assert!(!(*pointer).tp_bases.is_null());
+            assert!(!(*pointer).tp_mro.is_null());
+            assert!(!(*pointer).tp_dict.is_null());
+            assert_eq!(
+                (*pointer).ob_refcnt.load(SEQ),
+                IMMORTAL_REFCNT,
+                "static types are immortal"
+            );
+        }
+        // The ready type allocates raw instances and ignores the type's own
+        // reference count.
+        let instance = PyType_GenericAlloc(pointer as *mut ShimObject, 0);
+        assert!(!instance.is_null(), "{:?}", take_error());
+        assert_eq!(Py_TYPE(instance), pointer);
+        Py_DecRef(instance);
+        Py_DecRef(pointer as *mut ShimObject);
+        unsafe {
+            assert_eq!((*pointer).ob_refcnt.load(SEQ), IMMORTAL_REFCNT);
+        }
+
+        // A static type whose initialiser already names `&PyType_Type` is
+        // adopted the same way; its internal tail is not trusted.
+        let linked = std::ptr::addr_of_mut!(STATIC_LINKED_HEAD);
+        unsafe {
+            (*linked).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+            (*linked).ob_type = std::ptr::addr_of_mut!(types::TYPE_TYPE);
+            (*linked).tp_flags = 0;
+        }
+        assert_eq!(
+            PyType_Ready(linked as *mut ShimObject),
+            0,
+            "{:?}",
+            take_error()
+        );
+        unsafe {
+            assert_eq!((*linked).role, types::TypeRole::Instance);
+            assert_eq!((*linked).ob_refcnt.load(SEQ), IMMORTAL_REFCNT);
+        }
+
+        // A static type with a negative layout is rejected with a diagnostic
+        // and left untouched.
+        let bad = std::ptr::addr_of_mut!(STATIC_BAD);
+        unsafe {
+            (*bad).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+            (*bad).tp_basicsize = -1;
+        }
+        assert_eq!(PyType_Ready(bad as *mut ShimObject), -1);
+        let message = take_error().expect("negative static layout");
+        assert!(message.contains("negative sizes"), "{message}");
+
+        // A non-type (an instance handle) is rejected instead of being
+        // overwritten.
+        let number = PyLong_FromLong(7);
+        assert_eq!(PyType_Ready(number), -1);
+        assert!(take_error().unwrap().contains("not a static type object"));
+        assert_eq!(PyLong_AsLong(number), 7, "the instance was not modified");
+        Py_DecRef(number);
+    }
+
+    // -- GC traverse / clear ----------------------------------------------
+
+    static GC_CLEAR_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static GC_CHILD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn probe_traverse(
+        _self: *mut ShimObject,
+        visit: *mut c_void,
+        argument: *mut c_void,
+    ) -> c_int {
+        if visit.is_null() {
+            return 0;
+        }
+        let visit: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
+            unsafe { std::mem::transmute(visit) };
+        // SAFETY: the visitor and its argument come from the host walker.
+        unsafe { visit(argument, GC_CHILD.load(SEQ) as *mut c_void) }
+    }
+
+    extern "C" fn probe_clear(_self: *mut ShimObject) {
+        GC_CLEAR_CALLS.fetch_add(1, SEQ);
+    }
+
+    #[test]
+    fn gc_traverse_enumerates_edges_and_default_dealloc_clears() {
+        anchor();
+        let mut slots = [
+            PyTypeSlotMirror {
+                slot: 71, // Py_tp_traverse
+                pfunc: probe_traverse as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 51, // Py_tp_clear
+                pfunc: probe_clear as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 0,
+                pfunc: std::ptr::null_mut(),
+            },
+        ];
+        let type_object = make_type(
+            c"probe.Traverse",
+            32,
+            0,
+            PY_TPFLAGS_HAVE_GC as c_uint,
+            &mut slots,
+        );
+        let instance = PyType_GenericAlloc(type_object, 0);
+        assert!(!instance.is_null(), "{:?}", take_error());
+        let child = PyLong_FromLong(11);
+        GC_CHILD.store(child as usize, SEQ);
+        GC_CLEAR_CALLS.store(0, SEQ);
+
+        let mut visited: Vec<*mut ShimObject> = Vec::new();
+        types::gc_traverse(instance, &mut |edge| {
+            visited.push(edge);
+            std::ops::ControlFlow::Continue(())
+        });
+        assert_eq!(visited, vec![child], "tp_traverse is called with the child");
+
+        Py_DecRef(instance);
+        assert_eq!(
+            GC_CLEAR_CALLS.load(SEQ),
+            1,
+            "tp_clear runs once at default dealloc"
+        );
+        Py_DecRef(child);
+        Py_DecRef(type_object);
+
+        // CPython rejects a GC type that cannot be traversed; so does this
+        // host, with the same diagnostic.
+        let mut bad_slots = empty_slots();
+        let mut bad_spec = PyTypeSpecMirror {
+            name: c"probe.GCNoTraverse".as_ptr(),
+            basicsize: 0,
+            itemsize: 0,
+            flags: PY_TPFLAGS_HAVE_GC as c_uint,
+            slots: bad_slots.as_mut_ptr(),
+        };
+        clear_error();
+        assert!(PyType_FromSpec(&mut bad_spec).is_null());
+        let message = take_error().expect("GC without traverse");
+        assert!(message.contains("has no tp_traverse function"), "{message}");
+    }
+
+    // -- bytearray buffer -------------------------------------------------
+
+    #[test]
+    fn bytearray_exports_a_writable_buffer_and_commits_on_release() {
+        anchor();
+        let bytearray = PyByteArray_FromStringAndSize(c"abc".as_ptr(), 3);
+        assert!(!bytearray.is_null());
+        assert_eq!(PyObject_CheckBuffer(bytearray), 1);
+
+        let mut view: super::Py_buffer = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            PyObject_GetBuffer(bytearray, &mut view, PYBUF_WRITABLE),
+            0,
+            "{:?}",
+            take_error()
+        );
+        assert_eq!(view.len, 3);
+        assert_eq!(view.readonly, 0, "PyBUF_WRITABLE yields a writable view");
+        assert_eq!(view.itemsize, 1);
+        assert_eq!(view.ndim, 1);
+        unsafe {
+            let data = view.buf as *mut u8;
+            *data = b'Z';
+            *data.add(2) = b'!';
+        }
+        PyBuffer_Release(&mut view);
+
+        // Writes through the view are visible after release, both through
+        // `PyByteArray_AsString` and the logical byte content.
+        let pointer = PyByteArray_AsString(bytearray);
+        assert!(!pointer.is_null());
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(pointer as *const u8, 3), b"Zb!");
+        }
+
+        // A read-only request reports readonly and cannot be modified.
+        let mut read_only: super::Py_buffer = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            PyObject_GetBuffer(bytearray, &mut read_only, PYBUF_SIMPLE),
+            0
+        );
+        assert_eq!(read_only.readonly, 1);
+        PyBuffer_Release(&mut read_only);
+        Py_DecRef(bytearray);
+    }
+
+    // -- datetime.datetime_CAPI -------------------------------------------
+
+    type DateFromDate =
+        unsafe extern "C" fn(c_int, c_int, c_int, *mut ShimObject) -> *mut ShimObject;
+    type DateTimeFromDateAndTime = unsafe extern "C" fn(
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        *mut ShimObject,
+        *mut ShimObject,
+    ) -> *mut ShimObject;
+    type TimeFromTime = unsafe extern "C" fn(
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        *mut ShimObject,
+        *mut ShimObject,
+    ) -> *mut ShimObject;
+    type DeltaFromDelta =
+        unsafe extern "C" fn(c_int, c_int, c_int, c_int, *mut ShimObject) -> *mut ShimObject;
+
+    fn object_type_check(object: *mut ShimObject, class: *mut ShimObject) -> bool {
+        Py_TYPE(object) == class as *mut types::TypeObject
+            || types::PyType_IsSubtype(Py_TYPE(object) as *mut ShimObject, class) == 1
+    }
+
+    #[test]
+    fn datetime_capsule_backs_all_constructors_with_native_classes() {
+        anchor();
+        let pointer = PyCapsule_Import(c"datetime.datetime_CAPI".as_ptr(), 0);
+        assert!(!pointer.is_null(), "{:?}", take_error());
+        // SAFETY: the capsule owns a live PyDateTimeCAPI for the process.
+        let capi = unsafe { &*(pointer as *const PyDateTimeCAPI) };
+        assert_eq!(
+            capi.date_type,
+            std::ptr::addr_of_mut!(types::DATE_CAPI_TYPE)
+        );
+        assert_eq!(
+            capi.datetime_type,
+            std::ptr::addr_of_mut!(types::DATETIME_CAPI_TYPE)
+        );
+        assert_eq!(
+            capi.time_type,
+            std::ptr::addr_of_mut!(types::TIME_CAPI_TYPE)
+        );
+        assert_eq!(
+            capi.delta_type,
+            std::ptr::addr_of_mut!(types::TIMEDELTA_CAPI_TYPE)
+        );
+        assert_eq!(
+            capi.tzinfo_type,
+            std::ptr::addr_of_mut!(types::TZINFO_CAPI_TYPE)
+        );
+        assert!(
+            !capi.timezone_utc.is_null(),
+            "TimeZone_UTC is a real tzinfo object"
+        );
+        assert!(object_type_check(
+            capi.timezone_utc,
+            capi.tzinfo_type as *mut ShimObject
+        ));
+
+        let date_from_date: DateFromDate = unsafe { std::mem::transmute(capi.date_from_date) };
+        let date = unsafe { date_from_date(2024, 2, 29, capi.date_type as *mut ShimObject) };
+        assert!(!date.is_null(), "{:?}", take_error());
+        assert_eq!(
+            Py_TYPE(date),
+            capi.date_type,
+            "PyDate_Check sees the date type"
+        );
+        assert!(object_type_check(date, capi.date_type as *mut ShimObject));
+        let year = PyObject_GetAttrString(date, c"year".as_ptr());
+        assert_eq!(PyLong_AsLong(year), 2024);
+        Py_DecRef(year);
+
+        let datetime_from_date_and_time: DateTimeFromDateAndTime =
+            unsafe { std::mem::transmute(capi.datetime_from_date_and_time) };
+        let moment = unsafe {
+            datetime_from_date_and_time(
+                2024,
+                2,
+                29,
+                1,
+                2,
+                3,
+                4,
+                std::ptr::null_mut(),
+                capi.datetime_type as *mut ShimObject,
+            )
+        };
+        assert!(!moment.is_null(), "{:?}", take_error());
+        assert_eq!(
+            Py_TYPE(moment),
+            capi.datetime_type,
+            "PyDateTime_Check sees the datetime type"
+        );
+        assert!(
+            types::PyType_IsSubtype(
+                Py_TYPE(moment) as *mut ShimObject,
+                capi.date_type as *mut ShimObject,
+            ) == 1,
+            "PyDate_Check accepts a datetime through subtyping"
+        );
+
+        let time_from_time: TimeFromTime = unsafe { std::mem::transmute(capi.time_from_time) };
+        let moment_time = unsafe {
+            time_from_time(
+                12,
+                34,
+                56,
+                789,
+                std::ptr::null_mut(),
+                capi.time_type as *mut ShimObject,
+            )
+        };
+        assert!(!moment_time.is_null(), "{:?}", take_error());
+        assert_eq!(Py_TYPE(moment_time), capi.time_type);
+        let hour = PyObject_GetAttrString(moment_time, c"hour".as_ptr());
+        assert_eq!(PyLong_AsLong(hour), 12);
+        Py_DecRef(hour);
+
+        let delta_from_delta: DeltaFromDelta =
+            unsafe { std::mem::transmute(capi.delta_from_delta) };
+        let delta = unsafe { delta_from_delta(1, 2, 3, 1, capi.delta_type as *mut ShimObject) };
+        assert!(!delta.is_null(), "{:?}", take_error());
+        assert_eq!(
+            Py_TYPE(delta),
+            capi.delta_type,
+            "PyDelta_Check sees the delta type"
+        );
+        let days = PyObject_GetAttrString(delta, c"days".as_ptr());
+        assert_eq!(PyLong_AsLong(days), 1);
+        Py_DecRef(days);
+
+        // Fold variants use the native keyword-only `fold` parameter.
+        let fold_variant: unsafe extern "C" fn(
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            *mut ShimObject,
+            c_int,
+            *mut ShimObject,
+        ) -> *mut ShimObject =
+            unsafe { std::mem::transmute(capi.datetime_from_date_and_time_and_fold) };
+        let folded = unsafe {
+            fold_variant(
+                2020,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                std::ptr::null_mut(),
+                1,
+                capi.datetime_type as *mut ShimObject,
+            )
+        };
+        assert!(!folded.is_null(), "{:?}", take_error());
+        let fold = PyObject_GetAttrString(folded, c"fold".as_ptr());
+        assert_eq!(PyLong_AsLong(fold), 1);
+        Py_DecRef(fold);
+
+        // Timestamp constructors delegate to datetime.fromtimestamp.
+        let args = PyTuple_New(1);
+        let stamp = PyLong_FromLong(0);
+        assert_eq!(PyTuple_SetItem(args, 0, stamp), 0);
+        let datetime_from_timestamp: unsafe extern "C" fn(
+            *mut ShimObject,
+            *mut ShimObject,
+            *mut ShimObject,
+        ) -> *mut ShimObject = unsafe { std::mem::transmute(capi.datetime_from_timestamp) };
+        let epoch = unsafe {
+            datetime_from_timestamp(
+                capi.datetime_type as *mut ShimObject,
+                args,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!epoch.is_null(), "{:?}", take_error());
+        let epoch_year = PyObject_GetAttrString(epoch, c"year".as_ptr());
+        assert_eq!(PyLong_AsLong(epoch_year), 1970);
+        Py_DecRef(epoch_year);
+
+        let date_from_timestamp: unsafe extern "C" fn(
+            *mut ShimObject,
+            *mut ShimObject,
+        ) -> *mut ShimObject = unsafe { std::mem::transmute(capi.date_from_timestamp) };
+        let epoch_date = unsafe { date_from_timestamp(capi.date_type as *mut ShimObject, args) };
+        assert!(!epoch_date.is_null(), "{:?}", take_error());
+        assert_eq!(Py_TYPE(epoch_date), capi.date_type);
+        Py_DecRef(args);
+
+        // Invalid values fail with the native constructor's exception.
+        clear_error();
+        let invalid = unsafe { date_from_date(2024, 13, 1, capi.date_type as *mut ShimObject) };
+        assert!(invalid.is_null());
+        let message = take_error().expect("month range error");
+        assert!(message.starts_with("ValueError: "), "{message}");
+
+        // The timezone slot builds the native timezone class; PyTZInfo_Check
+        // accepts it through the timezone -> tzinfo subtype edge.
+        let timezone_from_timezone: unsafe extern "C" fn(
+            *mut ShimObject,
+            *mut ShimObject,
+        ) -> *mut ShimObject = unsafe { std::mem::transmute(capi.timezone_from_timezone) };
+        let offset_delta =
+            unsafe { delta_from_delta(0, 3_600, 0, 1, capi.delta_type as *mut ShimObject) };
+        assert!(!offset_delta.is_null(), "{:?}", take_error());
+        let zone = unsafe { timezone_from_timezone(offset_delta, std::ptr::null_mut()) };
+        assert!(!zone.is_null(), "{:?}", take_error());
+        assert_eq!(
+            Py_TYPE(zone),
+            std::ptr::addr_of_mut!(types::TIMEZONE_CAPI_TYPE)
+        );
+        assert!(
+            types::PyType_IsSubtype(
+                Py_TYPE(zone) as *mut ShimObject,
+                capi.tzinfo_type as *mut ShimObject,
+            ) == 1,
+            "timezone is a tzinfo subclass"
+        );
+        // An aware datetime accepts the constructed zone as tzinfo.
+        let aware = unsafe {
+            datetime_from_date_and_time(
+                2024,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                zone,
+                capi.datetime_type as *mut ShimObject,
+            )
+        };
+        assert!(!aware.is_null(), "{:?}", take_error());
+
+        for object in [
+            date,
+            moment,
+            moment_time,
+            delta,
+            offset_delta,
+            folded,
+            epoch,
+            epoch_date,
+            zone,
+            aware,
+        ] {
+            Py_DecRef(object);
+        }
+    }
+
+    // -- module association ------------------------------------------------
+
+    #[test]
+    fn type_module_association_and_module_state_are_validated() {
+        anchor();
+        let mut definition = empty_definition();
+        definition.m_name = c"probe_stateful".as_ptr();
+        definition.m_size = 16;
+        let module = PyModule_Create2(&mut definition, 3);
+        assert!(!module.is_null(), "{:?}", take_error());
+
+        let mut slots = empty_slots();
+        let mut spec = PyTypeSpecMirror {
+            name: c"probe.Stateful".as_ptr(),
+            basicsize: 0,
+            itemsize: 0,
+            flags: 0,
+            slots: slots.as_mut_ptr(),
+        };
+        let type_object = PyType_FromModuleAndSpec(module, &mut spec, std::ptr::null_mut());
+        assert!(!type_object.is_null(), "{:?}", take_error());
+        assert_eq!(PyType_GetModule(type_object), module);
+        let state = PyType_GetModuleState(type_object);
+        assert!(!state.is_null());
+        assert_eq!(state, PyModule_GetState(module));
+
+        // A type created without a module has no association; asking for one
+        // reports the gap instead of returning garbage.
+        let plain = PyType_FromSpec(&mut spec);
+        assert!(!plain.is_null(), "{:?}", take_error());
+        clear_error();
+        assert!(PyType_GetModule(plain).is_null());
+        assert!(take_error().unwrap().contains("type has no module"));
+        clear_error();
+        assert!(PyType_GetModuleState(plain).is_null());
+        assert!(take_error().unwrap().contains("type has no module"));
+
+        // A module with `m_size == 0` has no state block; both spellings
+        // report it and never return a bogus pointer.
+        let mut stateless = empty_definition();
+        stateless.m_name = c"probe_stateless".as_ptr();
+        let stateless_module = PyModule_Create2(&mut stateless, 3);
+        assert!(!stateless_module.is_null(), "{:?}", take_error());
+        let associated =
+            PyType_FromModuleAndSpec(stateless_module, &mut spec, std::ptr::null_mut());
+        assert!(!associated.is_null(), "{:?}", take_error());
+        assert_eq!(PyType_GetModule(associated), stateless_module);
+        clear_error();
+        assert!(PyType_GetModuleState(associated).is_null());
+        assert!(take_error()
+            .unwrap()
+            .contains("module state is not available"));
+        clear_error();
+        assert!(PyModule_GetState(stateless_module).is_null());
+        assert!(take_error()
+            .unwrap()
+            .contains("module state is not available"));
+
+        Py_DecRef(plain);
+        Py_DecRef(type_object);
+        Py_DecRef(associated);
     }
 
     // -- parser accessors and errors --------------------------------------
@@ -16778,6 +18423,79 @@ long hydro_fixture_last_op(void) { return last_op; }
 
         dec_ref(gcd);
         dec_ref(module);
+    }
+
+    /// Serialises the on-demand initializer tests with `hydro_runtime_init`
+    /// calls in the ABI tests: the reset runs while holding the heap reset
+    /// lock, which it would need to clear the process-wide registry.
+    fn initializer_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::heap::heap_reset_test_guard()
+    }
+
+    static ON_DEMAND_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn on_demand_module_body() -> i64 {
+        ON_DEMAND_RUNS.fetch_add(1, SEQ);
+        crate::value::NONE
+    }
+
+    #[test]
+    fn import_initializes_a_compiled_module_on_demand() {
+        let _guard = initializer_test_guard();
+        anchor();
+        clear_error();
+        crate::module_init::register("hydro_dynamic_import_probe", on_demand_module_body);
+        ON_DEMAND_RUNS.store(0, SEQ);
+
+        let module = PyImport_ImportModule(c"hydro_dynamic_import_probe".as_ptr());
+        assert!(!module.is_null(), "{:?}", take_error());
+        assert_eq!(
+            ON_DEMAND_RUNS.load(SEQ),
+            1,
+            "the compiled module body must run before the module is returned"
+        );
+        // The module value and the extension-visible module object now exist.
+        assert!(crate::modules::registry_lookup("hydro_dynamic_import_probe").is_some());
+        assert_eq!(
+            crate::module_init::initialize("hydro_dynamic_import_probe"),
+            0,
+            "an import must not re-run the body"
+        );
+
+        // A second import resolves through the extension module registry.
+        let again = PyImport_ImportModule(c"hydro_dynamic_import_probe".as_ptr());
+        assert!(!again.is_null(), "{:?}", take_error());
+        assert_eq!(ON_DEMAND_RUNS.load(SEQ), 1);
+        dec_ref(again);
+        dec_ref(module);
+    }
+
+    unsafe extern "C" fn failing_module_body() -> i64 {
+        crate::exc::raise_with_message(crate::exc::VALUE_ERROR, "on-demand import failed")
+    }
+
+    #[test]
+    fn import_propagates_an_initializer_exception() {
+        let _guard = initializer_test_guard();
+        anchor();
+        clear_error();
+        crate::exc::clear();
+        crate::module_init::register("hydro_dynamic_import_failing", failing_module_body);
+
+        let module = PyImport_ImportModule(c"hydro_dynamic_import_failing".as_ptr());
+        assert!(module.is_null(), "a failing initializer yields no module");
+        assert_eq!(
+            take_error().as_deref(),
+            Some("ValueError: on-demand import failed")
+        );
+        assert!(
+            !crate::exc::pending(),
+            "the Hydro exception was translated into the C API error"
+        );
+        assert!(
+            crate::modules::registry_lookup("hydro_dynamic_import_failing").is_none(),
+            "a failed module body publishes no module value"
+        );
     }
 
     #[test]

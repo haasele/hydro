@@ -195,6 +195,7 @@ pub static MODULES: &[&ModuleSpec] = &[
     &HTTP,
     &POSTGRES,
     &MEMCACHED,
+    &HYDRO_SIDECAR,
 ];
 
 pub fn module(name: &str) -> Option<&'static ModuleSpec> {

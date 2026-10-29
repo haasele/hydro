@@ -240,7 +240,9 @@ fn encode_value(
             | FunctionBody::Partial { .. }
             | FunctionBody::BoundMethod { .. }
             | FunctionBody::Host { .. }
-            | FunctionBody::Identity => {
+            | FunctionBody::Hna { .. }
+            | FunctionBody::Identity
+            | FunctionBody::Exec { .. } => {
                 return Err(PickleError::Unsupported("function"));
             }
         };
@@ -694,7 +696,9 @@ mod tests {
             | crate::value::FunctionBody::Partial { .. }
             | crate::value::FunctionBody::BoundMethod { .. }
             | crate::value::FunctionBody::Host { .. }
-            | crate::value::FunctionBody::Identity => panic!("expected a wrapper"),
+            | crate::value::FunctionBody::Hna { .. }
+            | crate::value::FunctionBody::Identity
+            | crate::value::FunctionBody::Exec { .. } => panic!("expected a wrapper"),
         }
         assert_eq!(decoded.arity, 2);
         assert_eq!(decoded.name, "worker");

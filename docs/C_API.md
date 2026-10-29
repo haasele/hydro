@@ -3,8 +3,10 @@
 Status: **decided 2026-10-24** — Option B (Hydro-native CPython C-API/ABI
 layer). The **first abi3 slice is implemented and verified**: a limited-API
 extension (`.so`) next to a Hydro source file imports and calls under JIT and
-AOT with no `libpython` (see §3.1). The full surface, wheels/venvs and the
-ecosystem program remain open.
+AOT with no `libpython` (see §3.1). The full-ABI foundation is implemented
+through vectorcall, heap types, buffers, GC tracking, the CPython-compatible
+handle/tuple/list layout and pydantic import (§3.2–§3.3); full traverse/clear,
+GIL/thread certification and the NumPy/pandas ecosystem model remain open.
 
 This document records the decision basis for P4-04 and the follow-up items
 (P4-05/P4-06/P4-09/P4-10). It contains measured probe results and an explicit
@@ -153,6 +155,28 @@ explicitly unimplemented. The gate is still a real NumPy 2.5 array smoke and
 pydantic-core model validation; pydantic import is green, model evaluation is
 not yet claimed.
 
+### 3.3 Container layout and current ecosystem state (2026-10-29)
+
+- Every handle starts with the CPython 3.14 `PyVarObject` prefix
+  (`ob_refcnt`/`ob_type`/`ob_size`). `PyTupleObject` stores its items inline at
+  offset 32, exactly where `PyTuple_GET_ITEM`/`PyTuple_SET_ITEM` read and
+  write, and `PyListObject` exposes its `ob_item` pointer at offset 24, so
+  `PyList_GET_ITEM`/`PyList_SET_ITEM` work directly. This is what
+  `_pydantic_core` and other abi3/full-ABI wheels dereference without calling
+  the accessor functions. Direct-field macros for unicode/bytes/bytearray and
+  `PyListObject.allocated` are not faked and must use the API functions.
+- GIL emulation is active around extension entry points and callbacks; handles
+  carry real refcounts and are GC-tracked. `tp_traverse`/`tp_clear` are not
+  fully integrated for every heap type, and the threaded callback + GC stress
+  gate (P4-04d) is not yet certified.
+- pydantic 2.14.1 imports through `_pydantic_core`; model smoke still fails at
+  typed-dict class naming/annotations. NumPy fails at delayed dtype/module
+  initialization and pandas remains blocked behind those gaps. No CPython
+  runtime is embedded: `ldd` on Tea/AOT binaries shows no `libpython`.
+- The ABI inventory still reports 0 missing required CPython symbols across
+  the 68 pinned extension modules; the remaining failures are semantic, not
+  link-time.
+
 ### Scope of "full stdlib"
 
 CPython 3.14 `sys.stdlib_module_names` contains **297** modules:
@@ -192,7 +216,7 @@ machine-readable compatibility report, not by prose claims.
 |---|---|---|
 | P4-04a | `abi3` shim: module init, `PyArg_Parse*`, scalar/container constructors, error API, capsuled types, buffer basics | **Done for the defined subset:** module/scalar/container APIs, capsules, read-only bytes buffers, `PyExc_*`; fixture imports/runs under Hydro with no `libpython`. Further symbols are driven by P4-10 |
 | P4-04b | Extension loader: `dlopen` + `PyInit_*`, wheel ABI tags, package submodules, multi-phase init | **Done:** sibling/env/venv discovery, wheel tags validated at compile time, dotted package submodules, single- and multi-phase init (exec slots, clear slot errors), caching and error paths green |
-| P4-04c | Full 3.14 ABI: `PyTypeObject`, refcounts/GC integration, vectorcall, full buffer protocol | NumPy 2.5 smoke (array create/ops/dtype) and `pydantic-core` model validation |
+| P4-04c | Full 3.14 ABI: `PyTypeObject`, refcounts/GC integration, vectorcall, full buffer protocol | **Partial:** ABI inventory 0 missing symbols, CPython-compatible handle/tuple/list layout and pydantic import work; NumPy 2.5 smoke (array create/ops/dtype), `pydantic-core` model validation, full traverse/clear and pandas remain open |
 | P4-04d | GIL emulation and callback safety | threaded extension callbacks + GC stress; no deadlock/data race |
 | P4-05 | `ctypes`/`cffi` boundaries | `ctypes.CDLL` on libc, `cffi` ABI-mode smoke |
 | P4-09 | Stdlib parity (297 modules) | per-module matrix: import + CPython test subset pass, or documented unsupported reason |

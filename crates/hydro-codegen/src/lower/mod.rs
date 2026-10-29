@@ -272,6 +272,10 @@ struct Runtime {
     uncaught: FuncId,
     runtime_init: FuncId,
     register_function: FuncId,
+    /// Registers a compiled module body, keyed by import name.
+    register_module_initializer: FuncId,
+    /// Runs a registered module body once, on demand.
+    initialize_module: FuncId,
     spawn_child: FuncId,
     /// Function-entry profiling hook, declared only when
     /// [`CodegenOptions::collect_profile`] is set so default objects contain
@@ -757,6 +761,18 @@ impl Runtime {
                 "hydro_register_function",
                 &[ptr, ptr, ptr, ptr],
                 None,
+            )?,
+            register_module_initializer: declare_runtime(
+                module,
+                "hydro_register_module_initializer",
+                &[ptr, ptr, ptr],
+                None,
+            )?,
+            initialize_module: declare_runtime(
+                module,
+                "hydro_initialize_module",
+                &[ptr, ptr],
+                Some(i64t),
             )?,
             spawn_child: declare_runtime(module, "hydro_spawn_child", &[], Some(i32t))?,
             // Only declared when profiling is requested: an unused import
@@ -7847,6 +7863,42 @@ fn call_val_extern<M: Module>(
     builder.inst_results(inst)[0]
 }
 
+/// Import name of a module body: the generated `<module>.<module>` name with
+/// the `.<module>` suffix removed (`numpy.exceptions`).
+///
+/// Names that carry no suffix (defensive: codegen only emits prefixed module
+/// bodies) are returned unchanged.
+fn module_initializer_name(function: &Function) -> &str {
+    function
+        .name
+        .strip_suffix(".<module>")
+        .filter(|name| !name.is_empty())
+        .unwrap_or(function.name.as_str())
+}
+
+/// Startup initializer entries in program order, as `(import name, symbol)`.
+///
+/// Registration and the startup loop both consume this list, so a module body
+/// is registered under exactly the name the C API later asks for.
+fn initializer_entries<'a>(
+    program: &'a Program,
+    symbols: &HashMap<FunctionId, FuncId>,
+) -> Result<Vec<(&'a str, FuncId)>, CodegenError> {
+    program
+        .initializers
+        .iter()
+        .map(|&initializer| {
+            let function = program.functions.get(initializer as usize).ok_or_else(|| {
+                CodegenError::new(format!("module initializer {initializer} has no function"))
+            })?;
+            let symbol = *symbols.get(&initializer).ok_or_else(|| {
+                CodegenError::new(format!("module initializer {initializer} was not declared"))
+            })?;
+            Ok((module_initializer_name(function), symbol))
+        })
+        .collect()
+}
+
 fn build_hydro_main<M: Module>(
     module: &mut M,
     program: &Program,
@@ -7855,6 +7907,7 @@ fn build_hydro_main<M: Module>(
     wrappers: &HashMap<FunctionId, FuncId>,
     runtime: &Runtime,
 ) -> Result<(), CodegenError> {
+    let initializers = initializer_entries(program, symbols)?;
     let ptr_ty = module.target_config().pointer_type();
     let mut ctx = module.make_context();
     let signature = make_signature(module, &[], Some(types::I32));
@@ -7904,6 +7957,25 @@ fn build_hydro_main<M: Module>(
             );
         }
 
+        // Publish every compiled module body keyed by its import name before
+        // the startup loop (and before the spawn check, so a spawned child can
+        // initialize a module a C extension asks for). The registered pointer
+        // is the module body itself, not a capture wrapper: an initializer
+        // takes no arguments and returns the tagged dummy value.
+        for &(name, symbol) in &initializers {
+            let reference = declare_ref(module, &mut builder, symbol);
+            let entry = builder.ins().func_addr(ptr_ty, reference);
+            let (name_slot, name_len) = make_bytes_slot(&mut builder, name.as_bytes())?;
+            let name_ptr = builder.ins().stack_addr(ptr_ty, name_slot, 0);
+            let name_len = builder.ins().iconst(ptr_ty, name_len as i64);
+            call_void_extern(
+                module,
+                &mut builder,
+                runtime.register_module_initializer,
+                &[name_ptr, name_len, entry],
+            );
+        }
+
         // `-1` means this is a normal start; anything else is the exit code
         // of a spawned child that already ran its single target function.
         let child = call_val_extern(module, &mut builder, runtime.spawn_child, &[]);
@@ -7920,14 +7992,21 @@ fn build_hydro_main<M: Module>(
         builder.switch_to_block(body_block);
         // Imported module bodies run once, in dependency order, before the
         // entry module. A spawned child skipped this block entirely, so it
-        // never re-runs them.
+        // never re-runs them. Each body goes through the same on-demand
+        // registry the C API bridge uses, so a module initialized early by an
+        // extension is skipped here and one registered above runs exactly
+        // once.
         let init_error = builder.create_block();
-        for &initializer in &program.initializers {
-            let symbol = *symbols.get(&initializer).ok_or_else(|| {
-                CodegenError::new(format!("module initializer {initializer} was not declared"))
-            })?;
-            let reference = declare_ref(module, &mut builder, symbol);
-            builder.ins().call(reference, &[]);
+        for &(name, _) in &initializers {
+            let (name_slot, name_len) = make_bytes_slot(&mut builder, name.as_bytes())?;
+            let name_ptr = builder.ins().stack_addr(ptr_ty, name_slot, 0);
+            let name_len = builder.ins().iconst(ptr_ty, name_len as i64);
+            call_void_extern(
+                module,
+                &mut builder,
+                runtime.initialize_module,
+                &[name_ptr, name_len],
+            );
             // An exception raised while initializing an imported module must
             // stop the program before the next module body runs: a pending
             // exception would make that body skip the rest of its statements
@@ -8032,6 +8111,83 @@ mod tests {
             main: 0,
             initializers: Vec::new(),
         }
+    }
+
+    /// A module body with no locals and an empty body.
+    fn empty_module_body(name: &str) -> Function {
+        Function {
+            name: name.to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: Vec::new(),
+            body: Vec::new(),
+            is_async: false,
+            is_generator: false,
+        }
+    }
+
+    /// Entry module plus two imported module bodies, in dependency order.
+    fn program_with_initializers() -> Program {
+        Program {
+            source_name: "test.py".to_string(),
+            functions: vec![
+                empty_module_body("<module>"),
+                empty_module_body("numpy.exceptions.<module>"),
+                empty_module_body("pkg.helper.<module>"),
+            ],
+            main: 0,
+            initializers: vec![1, 2],
+        }
+    }
+
+    #[test]
+    fn module_initializer_names_strip_the_body_suffix() {
+        let program = program_with_initializers();
+        assert_eq!(
+            module_initializer_name(&program.functions[1]),
+            "numpy.exceptions"
+        );
+        // A name without the suffix is left alone (defensive; codegen only
+        // emits prefixed bodies).
+        let mut unprefixed = program.functions[1].clone();
+        unprefixed.name = "plain".to_string();
+        assert_eq!(module_initializer_name(&unprefixed), "plain");
+        // The bare entry body never strips to an empty import name.
+        let mut bare = program.functions[1].clone();
+        bare.name = "<module>".to_string();
+        assert_eq!(module_initializer_name(&bare), "<module>");
+    }
+
+    #[test]
+    fn module_initializers_register_by_import_name_in_dependency_order() {
+        let program = program_with_initializers();
+        let symbols: HashMap<FunctionId, FuncId> =
+            [(1, FuncId::from_u32(10)), (2, FuncId::from_u32(11))]
+                .into_iter()
+                .collect();
+        let entries = initializer_entries(&program, &symbols).expect("initializers resolve");
+        let names: Vec<&str> = entries.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, vec!["numpy.exceptions", "pkg.helper"]);
+        assert_eq!(entries[0].1, FuncId::from_u32(10));
+        assert_eq!(entries[1].1, FuncId::from_u32(11));
+    }
+
+    #[test]
+    fn startup_registers_every_module_body_and_initializes_through_the_registry() {
+        let program = program_with_initializers();
+        let object =
+            crate::compile_object(&program).expect("module initializers must lower to object code");
+        assert_eq!(
+            runtime_call_sites(&object, "hydro_register_module_initializer"),
+            2,
+            "each initializer must be registered once"
+        );
+        assert_eq!(
+            runtime_call_sites(&object, "hydro_initialize_module"),
+            2,
+            "the startup loop must initialize each module through the registry"
+        );
     }
 
     #[test]

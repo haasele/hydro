@@ -17,6 +17,7 @@ use hydro_runtime::abi::*;
 const VALUE_ERROR: i64 = 0;
 const TYPE_ERROR: i64 = 1;
 const RUNTIME_ERROR: i64 = 3;
+const KEY_ERROR: i64 = 7;
 const STOP_ITERATION: i64 = 8;
 
 const OP_EQ: u32 = 7;
@@ -42,6 +43,12 @@ fn text(value_in: &str) -> i64 {
 
 fn list(items: &[i64]) -> i64 {
     hydro_list_new(items.len(), items.as_ptr())
+}
+
+fn dict(entries: &[(&str, i64)]) -> i64 {
+    let keys: Vec<i64> = entries.iter().map(|entry| text(entry.0)).collect();
+    let values: Vec<i64> = entries.iter().map(|entry| entry.1).collect();
+    hydro_dict_new(keys.len(), keys.as_ptr(), values.as_ptr())
 }
 
 fn module_get(module_name: &str, name: &str) -> i64 {
@@ -158,12 +165,32 @@ fn assert_true(actual: i64) {
     assert_eq!(actual, hydro_true(), "expected True");
 }
 
+fn assert_false(actual: i64) {
+    assert_no_error();
+    assert_eq!(actual, hydro_false(), "expected False");
+}
+
+/// Renders a value with `repr` and copies the text back as a Rust string, so
+/// assertion messages show the value instead of the returned string handle.
+fn render(value_in: i64) -> String {
+    let text = hydro_to_repr(value_in);
+    let mut needed = 0u64;
+    hydro_str_copy(text, std::ptr::null_mut(), 0, &mut needed);
+    let mut buffer = vec![0u8; needed as usize];
+    let mut written = 0u64;
+    hydro_str_copy(text, buffer.as_mut_ptr(), buffer.len() as u64, &mut written);
+    buffer.truncate(written as usize);
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
 fn assert_int(actual: i64, expected: i64) {
     assert_no_error();
     assert!(
         same(actual, int(expected)),
-        "value mismatch, got {:?}",
-        hydro_to_str(actual)
+        "value mismatch: expected {}, got {} (raw {:#x})",
+        expected,
+        render(actual),
+        actual
     );
 }
 
@@ -386,4 +413,91 @@ fn iter_next_and_type_surfaces() {
     assert_str(getattr(class_of_thing, "__name__"), "Thing");
     assert!(same_object(class_of_thing, base));
     assert_true(call(builtin("isinstance"), &[thing, class_of_thing]));
+}
+
+#[test]
+fn frozendict_is_a_constructible_immutable_mapping() {
+    let _guard = setup();
+    // pydantic's `from builtins import frozendict` resolves the name and the
+    // cached class identity is stable across reads.
+    let class = module_get("builtins", "frozendict");
+    assert_no_error();
+    assert_str(getattr(class, "__name__"), "frozendict");
+    assert!(same_object(module_get("builtins", "frozendict"), class));
+
+    // Construction from a mapping copies its entries.
+    let source = dict(&[("a", int(1)), ("b", int(2))]);
+    let frozen = call(class, &[source]);
+    assert_no_error();
+    assert!(same_object(getattr(frozen, "__class__"), class));
+    assert_true(call(builtin("isinstance"), &[frozen, class]));
+    assert_int(hydro_len(frozen), 2);
+    assert_int(method(frozen, "__getitem__", &[text("a")]), 1);
+    assert_int(method(frozen, "get", &[text("b")]), 2);
+    assert_eq!(method(frozen, "get", &[text("missing")]), hydro_none());
+    assert_true(method(frozen, "__contains__", &[text("b")]));
+    assert_false(method(frozen, "__contains__", &[text("z")]));
+    assert_str(
+        call(builtin("str"), &[frozen]),
+        "frozendict({'a': 1, 'b': 2})",
+    );
+
+    // Iteration, keys and values work; `list()` drives `__iter__`.
+    assert!(same(
+        call(builtin("list"), &[frozen]),
+        list(&[text("a"), text("b")])
+    ));
+    assert!(same(
+        method(frozen, "keys", &[]),
+        list(&[text("a"), text("b")])
+    ));
+    assert!(same(method(frozen, "values", &[]), list(&[int(1), int(2)])));
+
+    // A missing key raises KeyError with the key's repr.
+    let _ = method(frozen, "__getitem__", &[text("z")]);
+    assert_error(KEY_ERROR, "'z'");
+
+    // Keyword entries layer over the positional source.
+    let built = call_kw(class, &[source], &[("c", int(3))]);
+    assert_no_error();
+    assert_int(hydro_len(built), 3);
+    assert_int(method(built, "__getitem__", &[text("c")]), 3);
+    assert!(same(
+        method(built, "keys", &[]),
+        list(&[text("a"), text("b"), text("c")])
+    ));
+
+    // Values compare by content, including against a plain dict.
+    let copy = call(class, &[dict(&[("a", int(1)), ("b", int(2))])]);
+    let different = call(class, &[dict(&[("a", int(9))])]);
+    assert_no_error();
+    assert!(same(frozen, copy));
+    assert!(!same(frozen, different));
+    assert!(same(frozen, dict(&[("a", int(1)), ("b", int(2))])));
+
+    // Every mutating mapping operation is rejected and leaves the value
+    // unchanged.
+    let _ = method(frozen, "__setitem__", &[text("c"), int(3)]);
+    assert_error(
+        TYPE_ERROR,
+        "'frozendict' object does not support item assignment",
+    );
+    let _ = method(frozen, "update", &[dict(&[("c", int(3))])]);
+    assert_error(TYPE_ERROR, "'frozendict' object is immutable");
+    let _ = method(frozen, "pop", &[text("a")]);
+    assert_error(TYPE_ERROR, "'frozendict' object is immutable");
+    let _ = method(frozen, "clear", &[]);
+    assert_error(TYPE_ERROR, "'frozendict' object is immutable");
+    assert_int(hydro_len(frozen), 2);
+    assert_int(method(frozen, "__getitem__", &[text("a")]), 1);
+
+    // Constructor diagnostics.
+    let _ = call(class, &[int(1)]);
+    assert_error(
+        TYPE_ERROR,
+        "frozendict() argument must be a mapping, not int",
+    );
+    let _ = call(class, &[source, source]);
+    assert_error(TYPE_ERROR, "frozendict expected at most 1 argument, got 2");
+    assert_int(hydro_len(call(class, &[hydro_none()])), 0);
 }

@@ -422,8 +422,8 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`); `required`
       stays empty until a never-regress subset is pinned. It grows only from
       real `hydro_pass` results.
-      Stdlib import baseline 2026-10-29: **130/297 importable** (30
-      builtin/frozen, 88 pure, 12 extension; 9 `cpython_failed`). Batch A of
+      Stdlib import baseline 2026-10-29: **145/297 importable** (31
+      builtin/frozen, 102 pure, 12 extension; 9 `cpython_failed`). Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
       `_heapq`/`heapq`, `colorsys`, `keyword`, `_stat`/`stat`,
       `_operator`, `_functools`, `_io`), the Batch B native core
@@ -794,8 +794,8 @@ code, span, help and stable exit code; `--json` is documented and tested.
 Goal: the CPython 3.14.9 standard library works on the Hydro runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
-from it). Status 2026-10-29: **130/297 modules importable**, **167 failed**
-(22 builtin/frozen, 88 pure Python, 51 extension, 8 unknown/platform),
+from it). Status 2026-10-29: **145/297 modules importable**, **152 failed**
+(21 builtin/frozen, 72 pure Python, 51 extension, 8 unknown/platform),
 including 9 modules where CPython 3.14.9 itself fails on this host.
 
 The package/site-packages loader (P7-01) is in place: packages with
@@ -1054,7 +1054,7 @@ marks a module CPython ships only for a
 platform Hydro does not target on this host (Windows/Apple), tracked as
 platform-unsupported rather than implemented.
 
-Current matrix: 130/297 importable, 167 failed (22 builtin/frozen, 88 pure,
+Current matrix: 145/297 importable, 152 failed (21 builtin/frozen, 72 pure,
 51 extension, 8 platform). The ledger is the work list for the failed entries;
 checked entries count as delivered slices, not as complete parity.
 
@@ -1353,6 +1353,52 @@ CPython 3.14.9, and its mapped `Lib/test/test_*.py` subset green — or
 documented platform-unsupported. `[x]` in the ledger marks the import/API
 slice only; parity is decided by P7-05, never by an import alone. The
 generated compatibility matrix must show the same status and counts.
+
+## Native Bindings (NB)
+
+Umbrella program for compiled bindings, the CPython ABI layer and foreign
+runtimes. The normative contract and acceptance gates live in
+[`NATIVE_BINDINGS.md`](NATIVE_BINDINGS.md) §8; HNA is specified in §3 and
+`include/hydro_native.h`. Tier 3 rules are in [`C_API.md`](C_API.md) and the
+current stdlib matrix in [`COMPATIBILITY.md`](COMPATIBILITY.md). Statuses here
+mirror that table and do not upgrade it: Tier 3/NB-4 is partial, Tier 2/NB-2
+is implemented for the v1 slice, and Tier 4/NB-6 is a tested pilot.
+
+- [x] NB-0 Baseline: Tier 0 importer, Tier 1 module table, Tier 3 abi3 slice +
+      loader, no `libpython`.
+- [x] NB-2 HNA v1: `hydro_native.h`, `hydro-hna` descriptor crate, loader and
+      `.hna.so` discovery, persistent `hydro_root_hold`/`hydro_root_release`
+      roots, typed projections, version/platform/name validation, manifest
+      verification when present, panic containment, Rust/C/Go fixtures under
+      JIT and AOT, strict-GC loop, `ldd` clean; boundary cost measured at
+      677.5 ns/call JIT and 680.9 ns/call AOT (release, 1M calls).
+- [x] NB-3 Bindgen (delivered slice): `hydro-bindgen generate|check`, libclang
+      header ingestion, C type table, generated descriptor/spec/manifest and
+      JSON report, byte-for-byte `--check`, generated libm differential and
+      handwritten sqlite HNA differential under JIT/AOT.
+- [x] NB-3 panic fixture: a deliberately panicking HNA Rust fixture aborts
+      the process (SIGABRT) without unwinding into Hydro.
+- [x] NB-5 Packaging and coexistence: manifest parsing/verification, `hydro1_0`
+      wheel tag, verbatim upstream `RECORD`, ambiguity diagnostics and mixed
+      `.py`/`.hna.so`/CPython-extension artifact tests (Tea).
+- [x] NB-6 Foreign runtime bridge (pilot): `_hydro_sidecar` protocol v1
+      (`spawn`/`call`/`restart`/`close`/`alive`) with a CPython worker, plus a
+      C HNA adapter fixture; no JVM/.NET/Node adapter.
+- [ ] NB-1 Tier 1 completeness: every native stdlib module has one `ModuleSpec`
+      entry, a Rust implementation and a CPython differential test; Batch A
+      and selected later modules are delivered.
+- [ ] NB-4 Tier 3 completion (ecosystem):
+      - [x] Link-time symbol surface for the pinned wheels; CPython-compatible
+            handle/tuple/list layout; pydantic 2.14.1 import.
+      - [ ] pydantic model smoke: typed-dict class naming/annotations still
+            fail.
+      - [ ] NumPy 2.5 import/smoke: delayed dtype/module init still fails.
+      - [ ] pandas 3.1 import/smoke: still blocked by earlier semantic gaps.
+      - [ ] Full `tp_traverse`/`tp_clear`, GIL/thread integration and the
+            threaded callback + GC stress gate.
+- [ ] NB-7 Stdlib parity: 145/297 importable; 297/297 must be accounted for
+      (import + mapped `Lib/test` subset green, or documented unsupported).
+      Tracked by P7 above; P7 is **not** complete.
 
 ## Risks / open decisions
 

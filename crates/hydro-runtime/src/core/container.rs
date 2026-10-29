@@ -531,6 +531,7 @@ const HASH_TUPLE: u64 = FNV_OFFSET ^ 0x04;
 const HASH_RANGE: u64 = FNV_OFFSET ^ 0x05;
 const HASH_NONE: u64 = FNV_OFFSET ^ 0x06;
 const HASH_IDENTITY: u64 = FNV_OFFSET ^ 0x07;
+const HASH_PATH: u64 = FNV_OFFSET ^ 0x08;
 
 #[inline]
 fn fnv_mix(hash: u64, word: u64) -> u64 {
@@ -558,6 +559,10 @@ pub(crate) fn key_hash(v: i64) -> u64 {
     }
     if let Some(bytes) = value::as_bytes(v) {
         return fnv_bytes(HASH_BYTES, bytes);
+    }
+    // Paths hash by their stored text, the same rule as `equals`.
+    if let Some(path) = value::as_path(v) {
+        return fnv_bytes(HASH_PATH, path.path().as_bytes());
     }
     if let Some(items) = value::as_tuple(v) {
         let mut hash = fnv_mix(HASH_TUPLE, items.len() as u64);
@@ -2016,6 +2021,11 @@ fn equals_depth(a: i64, b: i64, depth: usize) -> bool {
     }
     if let (Some(s), Some(t)) = (value::as_bytes(a), value::as_bytes(b)) {
         return s == t;
+    }
+    // `pathlib` values compare by their stored text, so paths nested in
+    // tuples/lists/dicts follow the same equality rule as `==`.
+    if let (Some(s), Some(t)) = (value::as_path(a), value::as_path(b)) {
+        return s.path() == t.path();
     }
     // `memoryview` compares by format, shape and content; a view also compares
     // equal to the bytes it exposes.

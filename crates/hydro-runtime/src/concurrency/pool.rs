@@ -371,7 +371,9 @@ fn validate_callable(function: i64) -> Result<(), String> {
         | value::FunctionBody::Partial { .. }
         | value::FunctionBody::BoundMethod { .. }
         | value::FunctionBody::Host { .. }
-        | value::FunctionBody::Identity => {
+        | value::FunctionBody::Hna { .. }
+        | value::FunctionBody::Identity
+        | value::FunctionBody::Exec { .. } => {
             return Err(
                 "cannot run a derived callable in a Pool; use a named module-level function"
                     .to_string(),

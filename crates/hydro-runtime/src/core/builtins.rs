@@ -1565,6 +1565,9 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
             crate::host::call_slots(*token, captures, args, func.flags, &func.name)
         }
         FunctionBody::Native { module, name } => modules::call_native(module, name, argc, argv),
+        FunctionBody::Hna { module, index } => {
+            crate::native::call_function(*module, *index, argc, argv)
+        }
         FunctionBody::BoundMethod { receiver, method } => {
             crate::core::methods::call(*receiver, method.as_ptr(), method.len(), argc, argv)
         }
@@ -1610,7 +1613,82 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
             // SAFETY: exactly one argument was checked above.
             unsafe { *argv }
         }
+        FunctionBody::Exec {
+            check,
+            globals,
+            locals,
+            ..
+        } => exec_check_call(&func.name, check, *globals, *locals, argc, argv),
     }
+}
+
+/// Runs one function compiled by the [`exec_builtin`] subset.
+///
+/// Exactly one positional argument is accepted; the call has no keyword or
+/// default slots. Names in the check expression resolve in `globals` first and
+/// then `locals` (the bounded exec semantics), and a missing name raises the
+/// same `NameError` an ordinary function would.
+fn exec_check_call(
+    function_name: &str,
+    check: &value::ExecCheck,
+    globals_ns: i64,
+    locals_ns: i64,
+    argc: usize,
+    argv: *const i64,
+) -> i64 {
+    if argc != 1 || argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{function_name}() takes exactly 1 positional argument ({argc} given)"),
+        );
+    }
+    // SAFETY: exactly one argument was checked above.
+    let argument = unsafe { *argv };
+    match check {
+        value::ExecCheck::AlwaysFalse => value::FALSE,
+        value::ExecCheck::Identity { name } => {
+            let Some(target) = exec_lookup(globals_ns, locals_ns, name) else {
+                return exec_name_error(name);
+            };
+            ops::binop(BinOp::Is.code(), argument, target)
+        }
+        value::ExecCheck::IdentityEither { first, second } => {
+            let Some(target) = exec_lookup(globals_ns, locals_ns, first) else {
+                return exec_name_error(first);
+            };
+            if ops::binop(BinOp::Is.code(), argument, target) == value::TRUE {
+                return value::TRUE;
+            }
+            let Some(target) = exec_lookup(globals_ns, locals_ns, second) else {
+                return exec_name_error(second);
+            };
+            ops::binop(BinOp::Is.code(), argument, target)
+        }
+        value::ExecCheck::IsInstance { name } => {
+            let Some(target) = exec_lookup(globals_ns, locals_ns, name) else {
+                return exec_name_error(name);
+            };
+            let roots = crate::heap::root_values(&[argument, target]);
+            let result = isinstance(argument, target);
+            crate::heap::release_roots(roots);
+            result
+        }
+    }
+}
+
+/// Looks a name up in the mappings an exec-compiled function captured.
+fn exec_lookup(globals_ns: i64, locals_ns: i64, name: &str) -> Option<i64> {
+    namespace_get(globals_ns, name).or_else(|| {
+        if locals_ns == globals_ns {
+            None
+        } else {
+            namespace_get(locals_ns, name)
+        }
+    })
+}
+
+fn exec_name_error(name: &str) -> i64 {
+    exc::raise_with_message(NAME_ERROR, &format!("name '{name}' is not defined"))
 }
 
 /// Calls `target` with `args` plus keyword pairs bound by parameter name.
@@ -1958,6 +2036,23 @@ pub(crate) fn call_kw(
         if let Some(base) = value::extension_class_base(class) {
             return modules::extension::ext_object_call_kw(base, argc, argv, kwargc, kw_argv);
         }
+        if crate::modules::typing::is_typeddict_class(class) {
+            let args = if argc == 0 {
+                Vec::new()
+            } else {
+                // SAFETY: checked above; caller contract.
+                unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
+            };
+            let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+            let mut keywords = Vec::with_capacity(kwargc);
+            for pair in pairs.as_chunks::<2>().0 {
+                let Some(keyword) = value::as_str(pair[0]) else {
+                    return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+                };
+                keywords.push((keyword.to_string(), pair[1]));
+            }
+            return typed_dict_construct(&args, &keywords);
+        }
         let args = if argc == 0 {
             Vec::new()
         } else {
@@ -1992,6 +2087,25 @@ pub(crate) fn call_kw(
         // `family`/`type`/`proto` bound by name.
         if value::class_display_name(class) == Some("socket") && value::socket_class() == class {
             return crate::modules::socket::call_kw("socket", "socket", &args, keywords);
+        }
+        // The cached `builtins.frozendict` class builds an immutable mapping
+        // instance (its keywords are data entries) instead of a blank native
+        // instance.
+        if value::class_display_name(class) == Some("frozendict")
+            && globals::registry_get("builtins.frozendict") == Some(class)
+        {
+            return crate::modules::builtins::frozendict_instantiate(&args, &keywords);
+        }
+        // The `pathlib` pure-path classes construct the same native `Path`
+        // value as `pathlib.Path`; the helper validates the identity and the
+        // platform-specific `PosixPath`/`WindowsPath` rules.
+        if matches!(
+            value::class_display_name(class),
+            Some("PurePath" | "PosixPath" | "WindowsPath" | "PurePosixPath" | "PureWindowsPath")
+        ) {
+            if let Some(result) = modules::pathlib_instantiate(class, &args, &keywords) {
+                return result;
+            }
         }
         let instance = value::instance_new(class);
         let Some((kind, init)) = value::class_member(class, "__init__") else {
@@ -2051,6 +2165,9 @@ pub(crate) fn call_kw(
         }
     }
     if let Some(func) = value::as_function(function) {
+        if let FunctionBody::Hna { module, index } = &func.body {
+            return crate::native::call_function_kw(*module, *index, argc, argv, kwargc, kw_argv);
+        }
         if let FunctionBody::BoundMethod { receiver, method } = &func.body {
             return methods::call_kw(
                 *receiver,
@@ -2730,7 +2847,13 @@ pub(crate) fn deferred_import(module: &str, member: Option<&str>, path: Option<&
         // object through the extension ABI exactly like `ext.member`.
         return match member {
             Some(member) => modules::extension::import_member(module, path, member),
-            None => modules::extension_module_value(module, path),
+            None => {
+                if crate::native::is_hna_path(path) {
+                    crate::native::extension_module_value(module, path)
+                } else {
+                    modules::extension_module_value(module, path)
+                }
+            }
         };
     }
     let Some(member) = member else {
@@ -3038,6 +3161,40 @@ fn derived_exception_payload(tag: u32, argc: usize, argv: *const i64) -> i64 {
     exc::exception_value(tag, &message, rendered)
 }
 
+/// Constructs a TypedDict class call. TypedDict classes are annotation-only
+/// classes, but CPython's runtime constructor is `dict`: positional mappings
+/// are copied and keyword arguments become entries.
+fn typed_dict_construct(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if args.len() > 1 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "TypedDict() takes at most 1 positional argument ({} given)",
+                args.len()
+            ),
+        );
+    }
+    let result = if let Some(&mapping) = args.first() {
+        if mapping == NONE {
+            value::dict_new(Vec::new())
+        } else {
+            dict_from(mapping)
+        }
+    } else {
+        value::dict_new(Vec::new())
+    };
+    if exc::pending() {
+        return NONE;
+    }
+    let roots = crate::heap::root_values(&[result]);
+    for (name, value) in keywords {
+        let key = value::str_alloc(name.clone());
+        crate::container::dict_set(result, key, *value);
+    }
+    crate::heap::release_roots(roots);
+    result
+}
+
 fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && argv.is_null() {
         return exc::raise_with_message(
@@ -3047,6 +3204,15 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     }
     if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
         return exc::raise_with_message(TYPE_ERROR, "class instantiation has too many arguments");
+    }
+    if crate::modules::typing::is_typeddict_class(class) {
+        let args: &[i64] = if argc == 0 {
+            &[]
+        } else {
+            // SAFETY: checked above for NULL; caller contract.
+            unsafe { std::slice::from_raw_parts(argv, argc) }
+        };
+        return typed_dict_construct(args, &[]);
     }
     // The universal base class has CPython's zero-argument constructor.
     if value::is_object_class(class) {
@@ -3091,6 +3257,36 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
             unsafe { std::slice::from_raw_parts(argv, argc) }
         };
         return slice_new(args);
+    }
+    // `builtins.frozendict` is a cached native class whose constructor builds
+    // an immutable mapping instance instead of allocating a blank instance.
+    if native_name == Some("frozendict")
+        && globals::registry_get("builtins.frozendict") == Some(class)
+    {
+        let args: &[i64] = if argc == 0 {
+            &[]
+        } else {
+            // SAFETY: argc > 0 implies a non-null, readable buffer.
+            unsafe { std::slice::from_raw_parts(argv, argc) }
+        };
+        return modules::builtins::frozendict_instantiate(args, &[]);
+    }
+    // The `pathlib` pure-path classes construct the same native `Path` value
+    // as `pathlib.Path`; the helper validates the identity and the
+    // platform-specific `PosixPath`/`WindowsPath` rules.
+    if matches!(
+        native_name,
+        Some("PurePath" | "PosixPath" | "WindowsPath" | "PurePosixPath" | "PureWindowsPath")
+    ) {
+        let args: &[i64] = if argc == 0 {
+            &[]
+        } else {
+            // SAFETY: argc > 0 implies a non-null, readable buffer.
+            unsafe { std::slice::from_raw_parts(argv, argc) }
+        };
+        if let Some(result) = modules::pathlib_instantiate(class, args, &[]) {
+            return result;
+        }
     }
     // `socket.SocketType`/`socket.socket` is the cached class `type()` reports
     // for sockets; calling it runs the socket factory instead of allocating a
@@ -4456,22 +4652,330 @@ fn parse_integer(digits: &str, radix: u32) -> EvalResult {
     }
 }
 
-/// `exec(...)`: no runtime statement compiler exists, so fail loudly.
+/// Parsed form of the single generated function definition `exec` accepts.
+struct ExecSource {
+    name: String,
+    param: String,
+    check: value::ExecCheck,
+}
+
+/// `exec(source[, globals[, locals]])`.
+///
+/// Hydro has no runtime statement compiler. The one generated source shape the
+/// standard library builds at runtime is the pair of factories in
+/// `typing_inspection`: a single function definition whose body returns an
+/// identity or `isinstance` check against a cached typing object. That shape is
+/// compiled into a [`FunctionBody::Exec`] value and installed in the locals
+/// mapping (or in globals when locals is omitted). Every other statement
+/// raises a `NotImplementedError` naming the rejected construct instead of
+/// silently doing nothing.
 fn exec_builtin(args: &[i64]) -> i64 {
     if args.is_empty() || args.len() > 3 {
         return builtin_arity_error("exec", "1 to 3", args.len());
     }
-    let snippet = value::as_str(args[0])
-        .map(source_snippet)
-        .unwrap_or_else(|| "<non-string source>".to_string());
-    exc::raise_with_message(
-        NOT_IMPLEMENTED_ERROR,
-        &format!(
-            "exec() cannot execute Python source at runtime in Hydro: '{}' \
-             (whole programs are compiled ahead of time)",
-            snippet
-        ),
-    )
+    let Some(source) = value::as_str(args[0]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "exec() arg 1 must be a str, not '{}'",
+                value::type_name(args[0])
+            ),
+        );
+    };
+    let provided_globals = args.get(1).copied();
+    let provided_locals = args.get(2).copied();
+    // Namespaces must be real dicts before anything is compiled.
+    for (label, namespace) in [("globals", provided_globals), ("locals", provided_locals)] {
+        if let Some(namespace) = namespace {
+            if namespace != NONE && value::as_dict(namespace).is_none() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "exec() {label} must be a dict, not '{}'",
+                        value::type_name(namespace)
+                    ),
+                );
+            }
+        }
+    }
+    let parsed = match parse_exec_source(source) {
+        Ok(parsed) => parsed,
+        Err(construct) => {
+            return exc::raise_with_message(
+                NOT_IMPLEMENTED_ERROR,
+                &format!(
+                    "exec() cannot compile Python source at runtime in Hydro: {construct} \
+                     (source: '{}'); supported source is a single function definition \
+                     returning `PARAM is NAME`, `PARAM is NAME or PARAM is NAME`, \
+                     `isinstance(PARAM, NAME)` or `False`",
+                    source_snippet(source)
+                ),
+            )
+        }
+    };
+    let globals_ns = match provided_globals {
+        None | Some(NONE) => value::dict_new(Vec::new()),
+        Some(namespace) => namespace,
+    };
+    let locals_ns = match provided_locals {
+        None | Some(NONE) => globals_ns,
+        Some(namespace) => namespace,
+    };
+    let roots = crate::heap::root_values(&[globals_ns, locals_ns]);
+    let key = value::str_alloc(parsed.name.clone());
+    let key_root = crate::heap::root_values(&[key]);
+    let function = value::exec_function_new(
+        parsed.name,
+        parsed.param,
+        parsed.check,
+        globals_ns,
+        locals_ns,
+    );
+    let live = crate::heap::root_values(&[key, function]);
+    container::dict_set(locals_ns, key, function);
+    crate::heap::release_roots(live);
+    crate::heap::release_roots(key_root);
+    crate::heap::release_roots(roots);
+    NONE
+}
+
+/// Parses the bounded `exec` grammar.
+///
+/// Accepted shape, ignoring surrounding whitespace:
+///
+/// ```text
+/// def NAME(PARAM: ANNOTATION, /) -> ANNOTATION:
+///     return EXPR
+/// ```
+///
+/// where `EXPR` is one of `PARAM is NAME`, `PARAM is NAME or PARAM is NAME`,
+/// `isinstance(PARAM, NAME)` or `False`. Annotations may name anything; they
+/// are validated only enough to find the end of the header. Every rejection
+/// returns a description of the unsupported construct.
+fn parse_exec_source(source: &str) -> Result<ExecSource, String> {
+    let text = source.trim();
+    if text.is_empty() {
+        return Err("an empty source string".to_string());
+    }
+    let rest = text
+        .strip_prefix("def")
+        .ok_or_else(|| "a source that is not a single 'def' statement".to_string())?;
+    if !rest.starts_with(char::is_whitespace) {
+        return Err("a source that is not a single 'def' statement".to_string());
+    }
+    let rest = rest.trim_start();
+    let name_len = rest
+        .find(|ch: char| !(ch == '_' || ch.is_alphanumeric()))
+        .unwrap_or(rest.len());
+    let name = &rest[..name_len];
+    if !is_exec_identifier(name) {
+        return Err("a function definition without a valid name".to_string());
+    }
+    let after_name = rest[name_len..].trim_start();
+    let Some(after_open) = after_name.strip_prefix('(') else {
+        return Err("a function header without a parameter list".to_string());
+    };
+    let Some(close) = exec_closing_paren(after_open) else {
+        return Err("a function header without a closing ')'".to_string());
+    };
+    let param = parse_exec_parameter(&after_open[..close])?;
+    let after_params = after_open[close + 1..].trim_start();
+    let colon = exec_header_colon(after_params)?;
+    let body = after_params[colon + 1..].trim();
+    if body.is_empty() {
+        return Err("a function definition without a body".to_string());
+    }
+    if body.chars().any(|ch| matches!(ch, '\n' | '\r')) {
+        return Err("a function body with more than one statement".to_string());
+    }
+    let Some(expression) = body.strip_prefix("return") else {
+        return Err("a function body that is not a single 'return' statement".to_string());
+    };
+    if !expression.starts_with(' ') && !expression.starts_with('\t') {
+        return Err("a function body that is not a single 'return' statement".to_string());
+    }
+    let expression = expression.trim();
+    if expression.is_empty() {
+        return Err("a 'return' statement without an expression".to_string());
+    }
+    if expression.contains(';') {
+        return Err("a function body with more than one statement".to_string());
+    }
+    let check = parse_exec_check(expression, &param)?;
+    Ok(ExecSource {
+        name: name.to_string(),
+        param,
+        check,
+    })
+}
+
+/// Parses `PARAM: ANNOTATION, /` (the comma and `/` are mandatory).
+fn parse_exec_parameter(text: &str) -> Result<String, String> {
+    let text = text.trim();
+    let Some(before_slash) = text.strip_suffix('/') else {
+        return Err("a parameter list without the positional-only '/' marker".to_string());
+    };
+    let before_slash = before_slash.trim_end();
+    let Some(parameter) = before_slash.strip_suffix(',') else {
+        return Err("a positional-only parameter without the separating comma".to_string());
+    };
+    let parameter = parameter.trim_end();
+    if parameter.is_empty() {
+        return Err("a function definition without a parameter".to_string());
+    }
+    if exec_find_top_level(parameter, ',').is_some() {
+        return Err("a function definition with more than one parameter".to_string());
+    }
+    let (name, annotation) = match parameter.split_once(':') {
+        Some((name, annotation)) => (name.trim(), Some(annotation.trim())),
+        None => (parameter, None),
+    };
+    if !is_exec_identifier(name) {
+        return Err("a parameter that is not a single positional-only name".to_string());
+    }
+    if annotation.is_some_and(str::is_empty) {
+        return Err("a parameter with an empty annotation".to_string());
+    }
+    Ok(name.to_string())
+}
+
+/// Parses the return expression forms `typing_inspection` generates.
+fn parse_exec_check(expression: &str, param: &str) -> Result<value::ExecCheck, String> {
+    let normalized = expression.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized == "False" {
+        return Ok(value::ExecCheck::AlwaysFalse);
+    }
+    if let Some(arguments) = normalized
+        .strip_prefix("isinstance(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let Some((value_text, target_text)) = arguments.split_once(',') else {
+            return Err(format!("the return expression '{normalized}'"));
+        };
+        let value_text = value_text.trim();
+        let target_text = target_text.trim();
+        if value_text != param
+            || !is_exec_identifier(target_text)
+            || exec_find_top_level(target_text, ',').is_some()
+        {
+            return Err(format!("the return expression '{normalized}'"));
+        }
+        return Ok(value::ExecCheck::IsInstance {
+            name: target_text.to_string(),
+        });
+    }
+    let parts: Vec<&str> = normalized.split(" or ").collect();
+    match parts.as_slice() {
+        [single] => Ok(value::ExecCheck::Identity {
+            name: parse_exec_identity(single, param, &normalized)?,
+        }),
+        [first, second] => Ok(value::ExecCheck::IdentityEither {
+            first: parse_exec_identity(first, param, &normalized)?,
+            second: parse_exec_identity(second, param, &normalized)?,
+        }),
+        _ => Err(format!("the return expression '{normalized}'")),
+    }
+}
+
+/// Parses `PARAM is NAME` and returns `NAME`.
+fn parse_exec_identity(text: &str, param: &str, expression: &str) -> Result<String, String> {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    match parts.as_slice() {
+        [left, "is", right] if *left == param && is_exec_identifier(right) => {
+            Ok((*right).to_string())
+        }
+        _ => Err(format!("the return expression '{expression}'")),
+    }
+}
+
+/// Whether `text` is a Python identifier: a letter or `_` followed by
+/// letters, digits or `_`.
+fn is_exec_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first != '_' && !first.is_alphabetic() {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+}
+
+/// Index of the `)` that closes the parameter list, ignoring parentheses and
+/// brackets inside annotations (including those inside string literals).
+fn exec_closing_paren(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, ch) in text.char_indices() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' if depth == 0 => return Some(index),
+            ')' => depth -= 1,
+            ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Finds the first `target` at bracket depth zero, outside string literals.
+fn exec_find_top_level(text: &str, target: char) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, ch) in text.char_indices() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ if ch == target && depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Index of the `:` that ends the function header.
+fn exec_header_colon(text: &str) -> Result<usize, String> {
+    let has_newline = |text: &str| text.chars().any(|ch| matches!(ch, '\n' | '\r'));
+    match exec_find_top_level(text, ':') {
+        Some(index) => {
+            if has_newline(&text[..index]) {
+                Err("a function header spanning more than one line".to_string())
+            } else {
+                Ok(index)
+            }
+        }
+        None => {
+            if has_newline(text) {
+                Err("a function header spanning more than one line".to_string())
+            } else {
+                Err("a function header without a trailing ':'".to_string())
+            }
+        }
+    }
 }
 
 /// `compile(...)`: no bytecode compiler exists, so fail loudly.
@@ -9077,6 +9581,293 @@ mod tests {
         );
         assert_eq!(exc::pending_tag(), NOT_IMPLEMENTED_ERROR as i64);
         exc::clear();
+    }
+
+    /// Runs the bounded `exec` compiler and returns the locals namespace.
+    fn install_exec(source: &str, globals: i64, locals: i64) -> i64 {
+        let _ = builtin_call(Builtin::Exec, &[string(source), globals, locals]);
+        assert!(!exc::pending(), "{}", pending_message());
+        locals
+    }
+
+    fn installed_function(namespace: i64, name: &str) -> i64 {
+        namespace_get(namespace, name).expect("exec installed the function")
+    }
+
+    fn call_one(function: i64, argument: i64) -> i64 {
+        call(function, 1, [argument].as_ptr())
+    }
+
+    #[test]
+    fn exec_compiles_the_typing_inspection_check_forms() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        globals::reset();
+        let target = value::list_new(vec![int(1)]);
+        let other = value::list_new(vec![int(2)]);
+        let third = value::list_new(vec![int(3)]);
+
+        let globals = value::dict_new(vec![(string("_obj"), target)]);
+        let locals = value::dict_new(Vec::new());
+        install_exec(
+            "def is_obj(obj: Any, /) -> bool:\n    return obj is _obj",
+            globals,
+            locals,
+        );
+        let function = installed_function(locals, "is_obj");
+        assert_eq!(value::function_name(function), "is_obj");
+        assert_eq!(value::function_posonly_count(function), 1);
+        assert_eq!(call_one(function, target), TRUE);
+        assert_eq!(call_one(function, other), FALSE);
+
+        // Either identity check, as generated when `typing` and
+        // `typing_extensions` expose different objects.
+        let globals = value::dict_new(vec![(string("_t_obj"), target), (string("_te_obj"), other)]);
+        let locals = value::dict_new(Vec::new());
+        install_exec(
+            "def is_either(obj: Any, /) -> bool:\n    return obj is _t_obj or obj is _te_obj",
+            globals,
+            locals,
+        );
+        let function = installed_function(locals, "is_either");
+        assert_eq!(call_one(function, target), TRUE);
+        assert_eq!(call_one(function, other), TRUE);
+        assert_eq!(call_one(function, third), FALSE);
+
+        // `isinstance` against one cached type and against a tuple of types.
+        let int_type = value::type_class(int(1));
+        let str_type = value::type_class(string("x"));
+        let globals = value::dict_new(vec![(string("_obj"), int_type)]);
+        let locals = value::dict_new(Vec::new());
+        install_exec(
+            "\ndef is_int(obj: Any, /) -> 'TypeIs[int]':\n    return isinstance(obj, _obj)\n",
+            globals,
+            locals,
+        );
+        let function = installed_function(locals, "is_int");
+        assert_eq!(call_one(function, int(3)), TRUE);
+        assert_eq!(call_one(function, string("3")), FALSE);
+
+        let globals = value::dict_new(vec![(
+            string("_objs"),
+            value::tuple_new(vec![int_type, str_type]),
+        )]);
+        let locals = value::dict_new(Vec::new());
+        install_exec(
+            "def is_int_or_str(obj: Any, /) -> bool:\n    return isinstance(obj, _objs)",
+            globals,
+            locals,
+        );
+        let function = installed_function(locals, "is_int_or_str");
+        assert_eq!(call_one(function, int(3)), TRUE);
+        assert_eq!(call_one(function, string("3")), TRUE);
+        assert_eq!(call_one(function, value::list_new(Vec::new())), FALSE);
+
+        // The fallback form when neither module exposes the member.
+        let globals = value::dict_new(Vec::new());
+        let locals = value::dict_new(Vec::new());
+        install_exec(
+            "def never(obj: Any, /) -> bool:\n    return False",
+            globals,
+            locals,
+        );
+        let function = installed_function(locals, "never");
+        assert_eq!(call_one(function, target), FALSE);
+    }
+
+    #[test]
+    fn exec_resolves_names_from_globals_and_locals_and_reports_errors() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        globals::reset();
+        let target = value::list_new(vec![int(1)]);
+
+        // The name lives only in the explicit locals mapping.
+        let globals = value::dict_new(Vec::new());
+        let locals = value::dict_new(vec![(string("_obj"), target)]);
+        install_exec(
+            "def from_locals(obj: Any, /) -> bool:\n    return obj is _obj",
+            globals,
+            locals,
+        );
+        let function = installed_function(locals, "from_locals");
+        assert_eq!(call_one(function, target), TRUE);
+
+        // The name lives only in globals.
+        let globals = value::dict_new(vec![(string("_obj"), target)]);
+        let locals = value::dict_new(Vec::new());
+        install_exec(
+            "def from_globals(obj: Any, /) -> bool:\n    return obj is _obj",
+            globals,
+            locals,
+        );
+        let function = installed_function(locals, "from_globals");
+        assert_eq!(call_one(function, target), TRUE);
+
+        // With locals omitted the definition is installed in globals.
+        let globals = value::dict_new(vec![(string("_obj"), target)]);
+        let _ = builtin_call(
+            Builtin::Exec,
+            &[
+                string("def in_globals(obj: Any, /) -> bool:\n    return obj is _obj"),
+                globals,
+            ],
+        );
+        assert!(!exc::pending(), "{}", pending_message());
+        let function = installed_function(globals, "in_globals");
+        assert_eq!(call_one(function, target), TRUE);
+
+        // A missing name is a real NameError when the function runs.
+        let globals = value::dict_new(Vec::new());
+        let locals = value::dict_new(Vec::new());
+        install_exec(
+            "def missing(obj: Any, /) -> bool:\n    return obj is _missing",
+            globals,
+            locals,
+        );
+        let function = installed_function(locals, "missing");
+        assert_eq!(call_one(function, target), NONE);
+        assert_eq!(exc::pending_tag(), NAME_ERROR as i64);
+        assert_eq!(pending_message(), "name '_missing' is not defined");
+        exc::clear();
+
+        // Arity and keyword calls are rejected, not silently accepted.
+        assert_eq!(call(function, 0, std::ptr::null()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+        let two = [target, target];
+        assert_eq!(call(function, 2, two.as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+        let keyword = [string("obj"), target];
+        assert_eq!(
+            call_kw(function, 0, std::ptr::null(), 1, keyword.as_ptr()),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+
+        // Non-dict namespaces and non-string source are type errors.
+        let _ = builtin_call(
+            Builtin::Exec,
+            &[string("def f(obj, /): return False"), int(1)],
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+        let _ = builtin_call(Builtin::Exec, &[int(1)]);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn exec_function_is_a_real_function_and_rejects_unsupported_source() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        globals::reset();
+        let globals = value::dict_new(vec![(string("_obj"), value::list_new(vec![int(1)]))]);
+        let locals = value::dict_new(Vec::new());
+        install_exec(
+            "def is_obj(obj: Any, /) -> bool:\n    return obj is _obj",
+            globals,
+            locals,
+        );
+        let function = installed_function(locals, "is_obj");
+
+        // `type(f)` is the runtime's cached `function` class, and the function
+        // accepts the writable metadata `typing_inspection` assigns.
+        let class = builtin_call(Builtin::Type, &[function]);
+        assert!(value::as_class(class).is_some());
+        assert_eq!(value::class_display_name(class), Some("function"));
+        assert!(value::function_setattr(function, "__doc__", string("doc")));
+        assert_eq!(rendered(value::function_doc(function)), "doc");
+        assert_eq!(
+            value::function_signature(function)
+                .iter()
+                .map(|param| param.kind)
+                .collect::<Vec<_>>(),
+            vec![ParamKind::PosOnly]
+        );
+
+        for source in [
+            "x = 1",
+            "def f(obj, /):\n    pass",
+            "def f(obj, /):\n    return obj.attr",
+            "def f(obj, /):\n    return obj is _obj\n    x = 1",
+            "def f(obj):\n    return obj is _obj",
+            "def f(obj, other, /):\n    return obj is _obj",
+        ] {
+            let _ = builtin_call(
+                Builtin::Exec,
+                &[
+                    string(source),
+                    value::dict_new(Vec::new()),
+                    value::dict_new(Vec::new()),
+                ],
+            );
+            assert_eq!(
+                exc::pending_tag(),
+                NOT_IMPLEMENTED_ERROR as i64,
+                "source should be rejected: {source}"
+            );
+            let message = pending_message();
+            assert!(
+                message.contains("exec() cannot compile Python source at runtime in Hydro"),
+                "{message}"
+            );
+            exc::clear();
+        }
+    }
+
+    /// Builds a function whose only reference to the globals mapping is the
+    /// function's own GC edge.
+    #[inline(never)]
+    fn build_exec_gc_function() -> i64 {
+        let target = value::list_new(vec![int(1)]);
+        let globals = value::dict_new(vec![(string("_obj"), target)]);
+        let locals = value::dict_new(Vec::new());
+        let source = string("def gc_check(obj: Any, /) -> bool:\n    return obj is _obj");
+        let _ = builtin_call(Builtin::Exec, &[source, globals, locals]);
+        assert!(!exc::pending(), "{}", pending_message());
+        namespace_get(locals, "gc_check").expect("installed")
+    }
+
+    /// Overwrites stale tagged values left by [`build_exec_gc_function`] so
+    /// the conservative scan cannot keep the mapping alive by accident.
+    #[inline(never)]
+    fn scrub_exec_stack() {
+        let mut buffer = [0u8; 64 * 1024];
+        std::hint::black_box(&mut buffer);
+        buffer[0] = 0;
+        std::hint::black_box(&buffer);
+    }
+
+    #[test]
+    fn exec_function_keeps_its_globals_mapping_alive() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        globals::reset();
+        let function = build_exec_gc_function();
+        let roots = crate::heap::root_values(&[function]);
+        scrub_exec_stack();
+        for _ in 0..128 {
+            let _ = string("garbage");
+        }
+        crate::heap::collect();
+
+        let func = value::as_function(function).expect("function value");
+        let (globals_ns, locals_ns) = match &func.body {
+            FunctionBody::Exec {
+                globals, locals, ..
+            } => (*globals, *locals),
+            _ => panic!("expected an exec-compiled function"),
+        };
+        let target = namespace_get(globals_ns, "_obj").expect("globals entry survived");
+        assert_eq!(namespace_get(locals_ns, "gc_check"), Some(function));
+        assert_eq!(call_one(function, target), TRUE);
+        assert!(!exc::pending(), "{}", pending_message());
+        let other = value::list_new(vec![int(2)]);
+        assert_eq!(call_one(function, other), FALSE);
+        crate::heap::release_roots(roots);
     }
 
     #[test]

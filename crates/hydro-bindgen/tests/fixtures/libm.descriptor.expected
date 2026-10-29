@@ -1,0 +1,12 @@
+// Expected descriptor-table fragment for tests/fixtures/libm.h.
+// Each non-empty line must appear verbatim in the generated src/lib.rs.
+name: b"dm_sqrt\0".as_ptr() as *const c_char,
+min_args: 1,
+max_args: 1,
+params: b"x\0".as_ptr() as *const c_char,
+call: Some(hydro_bg_fn_0_call as HydroCallFn),
+name: b"dm_hypot\0".as_ptr() as *const c_char,
+min_args: 2,
+max_args: 2,
+params: b"x,y\0".as_ptr() as *const c_char,
+call: Some(hydro_bg_fn_1_call as HydroCallFn),

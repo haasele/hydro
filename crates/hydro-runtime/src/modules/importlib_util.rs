@@ -39,6 +39,7 @@ const LAZY_EXEC_MODULE: &str = "_lazy_exec_module";
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         "find_spec" => find_spec(args),
+        "_find_spec_from_path" => find_spec_from_path(args),
         "spec_from_file_location" => spec_from_file_location(args),
         "module_from_spec" => module_from_spec(args),
         "resolve_name" => resolve_name(args),
@@ -53,15 +54,46 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
+/// CPython's `PYC_MAGIC_NUMBER` for the emulated interpreter version.
+///
+/// `_imp.pyc_magic_number_token` is `PYC_MAGIC_NUMBER | '\r' << 16 | '\n' <<
+/// 24`; `importlib._bootstrap_external` derives `MAGIC_NUMBER` with
+/// `_imp.pyc_magic_number_token.to_bytes(4, 'little')`, so the exported bytes
+/// are `2B 0E 0D 0A` for 3627 (`0x0E2B`).
+///
+/// The runtime's `_imp` module does not expose the token yet, so this constant
+/// is the single definition: when `_imp.pyc_magic_number_token` is added it
+/// must re-export this value (and [`MAGIC_NUMBER_BYTES`] must not be restated
+/// elsewhere).
+pub(crate) const PYC_MAGIC_NUMBER: u32 = 3627;
+
+/// `importlib.util.MAGIC_NUMBER`, in the byte order `.pyc` headers use.
+pub(crate) const MAGIC_NUMBER_BYTES: [u8; 4] =
+    (PYC_MAGIC_NUMBER | ((b'\r' as u32) << 16) | ((b'\n' as u32) << 24)).to_le_bytes();
+
 /// Materialises a `importlib.util` module constant.
 pub(crate) fn constant(name: &str) -> i64 {
     match name {
         "LazyLoader" => lazy_loader_class(),
+        "MAGIC_NUMBER" => magic_number(),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module '{MODULE}' has no attribute '{name}'"),
         ),
     }
+}
+
+/// The cached `MAGIC_NUMBER` bytes object.
+fn magic_number() -> i64 {
+    const KEY: &str = "importlib.util.MAGIC_NUMBER";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let bytes = value::bytes_new(MAGIC_NUMBER_BYTES.to_vec());
+    let roots = crate::heap::root_values(&[bytes]);
+    globals::registry_set(KEY, bytes);
+    crate::heap::release_roots(roots);
+    bytes
 }
 
 // -------------------------------------------------------------------------
@@ -141,6 +173,16 @@ fn found_spec(found: &FoundSpec) -> i64 {
 /// Resolves `name` to a module spec without consulting the caller's package
 /// context. `None` means no module exists on the search path.
 pub(crate) fn resolve_module(name: &str) -> Option<FoundSpec> {
+    resolve_module_with_path(name, None)
+}
+
+/// [`resolve_module`] with an explicit finder path.
+///
+/// `None` searches `sys.path`; `Some(dirs)` replaces only the filesystem
+/// finder's path, exactly as `importlib._bootstrap._find_spec(name, path)`
+/// forwards `path` to `PathFinder`. Built-in modules and modules compiled into
+/// the program are still found, because their finders ignore `path`.
+fn resolve_module_with_path(name: &str, path: Option<&[String]>) -> Option<FoundSpec> {
     if hydro_ir::stdlib::module(name).is_some() {
         return Some(FoundSpec {
             name: name.to_string(),
@@ -149,7 +191,15 @@ pub(crate) fn resolve_module(name: &str) -> Option<FoundSpec> {
             loader: LoaderKind::Builtin,
         });
     }
-    if let Some(found) = filesystem_module(name) {
+    let default_path;
+    let search: &[String] = match path {
+        Some(path) => path,
+        None => {
+            default_path = super::search_path();
+            &default_path
+        }
+    };
+    if let Some(found) = filesystem_module_in(name, search) {
         return Some(found);
     }
     // A module compiled into the program but not installed as a file (for
@@ -208,14 +258,15 @@ fn is_package_init(path: &Path) -> bool {
     path.file_name() == Some(std::ffi::OsStr::new("__init__.py"))
 }
 
-/// Looks for `name` in the documented `sys.path` order.
-fn filesystem_module(name: &str) -> Option<FoundSpec> {
+/// Looks for `name` in `search`, which is the documented `sys.path` order for
+/// the default resolution path.
+fn filesystem_module_in(name: &str, search: &[String]) -> Option<FoundSpec> {
     if name.is_empty() || name.split('.').any(str::is_empty) {
         return None;
     }
     let parts: Vec<&str> = name.split('.').collect();
     let mut namespaces: Vec<String> = Vec::new();
-    for dir in super::search_path() {
+    for dir in search {
         let mut base = PathBuf::from(&dir);
         for part in &parts {
             base.push(part);
@@ -331,28 +382,121 @@ fn find_spec(args: &[i64]) -> i64 {
     if name.is_empty() || name.split('.').any(str::is_empty) {
         return NONE;
     }
-    // `sys.modules` wins, exactly like CPython: a loaded module's `__spec__`
-    // is authoritative.
+    match spec_for_name(&name, None) {
+        Ok(spec) => spec,
+        Err(raised) => raised,
+    }
+}
+
+/// `importlib.util._find_spec_from_path(name, path=None, target=None)`.
+///
+/// CPython's helper is `_find_spec(name, path)` plus the `sys.modules`
+/// pre-check; `path` is forwarded to the finders and `target` is only a hint
+/// for reload-aware finders (Hydro's finders need neither). Relative names are
+/// not resolved here, matching `_bootstrap._find_spec`.
+fn find_spec_from_path(args: &[i64]) -> i64 {
+    let name = match str_arg(args, 0, "_find_spec_from_path", "name") {
+        Ok(name) => name,
+        Err(raised) => return raised,
+    };
+    let path = match path_arg(args.get(1).copied().unwrap_or(NONE)) {
+        Ok(path) => path,
+        Err(raised) => return raised,
+    };
+    if name.is_empty() || name.split('.').any(str::is_empty) {
+        return NONE;
+    }
+    // The util helper checks `sys.modules` itself and treats a missing or
+    // `None` `__spec__` as an error, unlike `find_spec` (which falls through
+    // to the finders). Any other loaded module returns its stored spec.
     if let Some(module) = super::registry_lookup(&name) {
+        if module == NONE {
+            return NONE;
+        }
         if let Some(pairs) = value::as_namespace(module) {
-            if let Some((_, spec)) = pairs.iter().find(|(key, _)| key.as_str() == "__spec__") {
-                if *spec == NONE {
-                    return exc::raise_with_message(
-                        VALUE_ERROR,
-                        &format!("{name}.__spec__ is set to None"),
-                    );
+            return match pairs.iter().find(|(key, _)| key.as_str() == "__spec__") {
+                Some((_, spec)) if *spec == NONE => {
+                    exc::raise_with_message(VALUE_ERROR, &format!("{name}.__spec__ is None"))
                 }
-                return *spec;
-            }
+                Some((_, spec)) => *spec,
+                None => {
+                    exc::raise_with_message(VALUE_ERROR, &format!("{name}.__spec__ is not set"))
+                }
+            };
         }
         if hydro_ir::stdlib::module(&name).is_some() {
             return native_spec(&name);
         }
     }
-    match resolve_module(&name) {
+    match resolve_module_with_path(&name, path.as_deref()) {
         Some(found) => found_spec(&found),
         None => NONE,
     }
+}
+
+/// Decodes the `path` argument of `_find_spec_from_path`.
+///
+/// `None` selects `sys.path`; a list/tuple of `str` replaces it. Anything else
+/// reports the same `TypeError` the bootstrap finders produce for an invalid
+/// path sequence.
+fn path_arg(argument: i64) -> Result<Option<Vec<String>>, i64> {
+    if argument == NONE {
+        return Ok(None);
+    }
+    let Some(items) = value::as_list(argument).or_else(|| value::as_tuple(argument)) else {
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "_find_spec_from_path() argument 'path' must be a list or tuple of str, not '{}'",
+                value::type_name(argument)
+            ),
+        ));
+    };
+    let mut path = Vec::with_capacity(items.len());
+    for &item in items {
+        match value::as_str(item) {
+            Some(text) => path.push(text.to_string()),
+            None => {
+                return Err(exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "_find_spec_from_path() argument 'path' must contain only str, not '{}'",
+                        value::type_name(item)
+                    ),
+                ))
+            }
+        }
+    }
+    Ok(Some(path))
+}
+
+/// Resolves `name` honouring an already-loaded module's authoritative
+/// `__spec__`, then falls back to the finders over `path` (`None` = `sys.path`).
+///
+/// The `Err` side is the already-raised `ValueError` for a `None` `__spec__`.
+fn spec_for_name(name: &str, path: Option<&[String]>) -> Result<i64, i64> {
+    // `sys.modules` wins, exactly like CPython: a loaded module's `__spec__`
+    // is authoritative.
+    if let Some(module) = super::registry_lookup(name) {
+        if let Some(pairs) = value::as_namespace(module) {
+            if let Some((_, spec)) = pairs.iter().find(|(key, _)| key.as_str() == "__spec__") {
+                if *spec == NONE {
+                    return Err(exc::raise_with_message(
+                        VALUE_ERROR,
+                        &format!("{name}.__spec__ is set to None"),
+                    ));
+                }
+                return Ok(*spec);
+            }
+        }
+        if hydro_ir::stdlib::module(name).is_some() {
+            return Ok(native_spec(name));
+        }
+    }
+    Ok(match resolve_module_with_path(name, path) {
+        Some(found) => found_spec(&found),
+        None => NONE,
+    })
 }
 
 /// `spec_from_file_location(name, location=None, loader=None,
@@ -847,4 +991,69 @@ fn lazy_create_module(args: &[i64]) -> i64 {
 
 fn lazy_exec_module(args: &[i64]) -> i64 {
     machinery::exec_loaded_module(args[1])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn text(item: &str) -> i64 {
+        value::str_alloc(item.to_string())
+    }
+
+    #[test]
+    fn magic_number_matches_cpython_314_bytes() {
+        exc::init();
+        let first = constant("MAGIC_NUMBER");
+        let second = constant("MAGIC_NUMBER");
+        assert!(!exc::pending());
+        assert_eq!(first, second, "MAGIC_NUMBER identity must be stable");
+        let bytes = value::as_bytes(first).expect("bytes");
+        // `_imp.pyc_magic_number_token.to_bytes(4, 'little')` for 3627.
+        assert_eq!(bytes.to_vec(), vec![0x2B, 0x0E, 0x0D, 0x0A]);
+    }
+
+    #[test]
+    fn find_spec_from_path_searches_only_the_given_path() {
+        exc::init();
+        let dir = std::env::temp_dir().join(format!(
+            "hydro-importlib-util-{}-{}",
+            std::process::id(),
+            "find-spec"
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let module = dir.join("hydro_probe_module.py");
+        fs::write(&module, b"value = 1\n").expect("write module");
+
+        let path = value::list_new(vec![text(&dir.to_string_lossy())]);
+        let args = [text("hydro_probe_module"), path];
+        let spec = call("_find_spec_from_path", &args);
+        assert!(!exc::pending());
+        assert!(machinery::is_spec(spec));
+        assert_eq!(
+            machinery::spec_name(spec).as_deref(),
+            Some("hydro_probe_module")
+        );
+
+        // A missing module on the explicit path stays `None`.
+        let missing_args = [text("hydro_probe_absent"), value::list_new(Vec::new())];
+        assert_eq!(call("_find_spec_from_path", &missing_args), NONE);
+        assert!(!exc::pending());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_spec_from_path_rejects_invalid_path_sequences() {
+        exc::init();
+        let args = [
+            text("hydro_probe_module"),
+            value::encode_int(1).expect("small int"),
+        ];
+        assert_eq!(call("_find_spec_from_path", &args), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
 }

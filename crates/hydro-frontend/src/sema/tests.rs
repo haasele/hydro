@@ -3414,6 +3414,132 @@ fn docstring_only_bodies_are_declared_stubs() {
 }
 
 #[test]
+fn mixed_bare_and_value_returns_are_allowed() {
+    // A bare `return` returns `None`, and CPython allows one function to mix
+    // it with value returns. The inferred result is the dynamic join, no
+    // matter which form the body checks first. This is `uuid._parse_mac`'s
+    // shape: a guard that returns early and a value return at the end.
+    let source = "\
+def leading(flag):
+    if flag:
+        return
+    return 1
+
+def trailing(flag):
+    if flag:
+        return 1
+    return
+";
+    let program =
+        crate::check_source(source, "test.py").expect("mixed bare and value returns typecheck");
+    assert_eq!(program_function(&program, "leading").ret_ty, Type::Any);
+    assert_eq!(program_function(&program, "trailing").ret_ty, Type::Any);
+
+    // The bare `return` still lowers to a `None` return, so the branch that
+    // takes it produces `None` at runtime.
+    let leading = program_function(&program, "leading");
+    let StmtKind::If { then_body, .. } = &leading.body[0].kind else {
+        panic!("expected an if statement, got {:?}", leading.body[0].kind);
+    };
+    assert!(matches!(then_body[0].kind, StmtKind::Return(None)));
+}
+
+#[test]
+fn bare_return_inside_a_loop_mixes_with_value_returns() {
+    // uuid._parse_mac returns `int(...)` at the end and `None` from the
+    // guards; the guards may sit inside a loop or a `try` block.
+    let source = "\
+def first_positive(values):
+    for value in values:
+        if value <= 0:
+            return
+        return value
+    return 0
+
+def parse_mac(value):
+    if value is None:
+        return None
+    for part in value:
+        if part == ':':
+            return
+    try:
+        return int(value, 16)
+    except ValueError:
+        return
+";
+    let program = crate::check_source(source, "test.py")
+        .expect("loops and guarded returns mix with value returns");
+    assert_eq!(
+        program_function(&program, "first_positive").ret_ty,
+        Type::Any
+    );
+    assert_eq!(program_function(&program, "parse_mac").ret_ty, Type::Any);
+}
+
+#[test]
+fn a_declared_return_type_tolerates_a_bare_return() {
+    // The annotation stays the contract for value returns; a bare return on
+    // one path is legal Python and must not be reported as inconsistent.
+    let source = "def f(flag: bool) -> int:\n    if flag:\n        return\n    return 1\n";
+    let program =
+        crate::check_source(source, "test.py").expect("a bare return is legal with an annotation");
+    assert_eq!(program_function(&program, "f").ret_ty, Type::Int);
+}
+
+#[test]
+fn bare_returns_only_infer_none() {
+    let program = crate::check_source(
+        "def stop(flag):\n    if flag:\n        return\n    return\n",
+        "test.py",
+    )
+    .expect("only bare returns typecheck");
+    assert_eq!(program_function(&program, "stop").ret_ty, Type::None);
+}
+
+#[test]
+fn a_declared_return_type_still_rejects_bare_return_only_bodies() {
+    // `return` alone never produces the declared value, so the missing-return
+    // diagnostic stays.
+    let diags =
+        check_diags("def f(flag: bool) -> int:\n    if flag:\n        return\n    return\n");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::CONTROL);
+    assert_eq!(
+        diags[0].message,
+        "function 'f' is declared to return int, but has no return value"
+    );
+}
+
+#[test]
+fn generator_bare_returns_keep_yield_semantics() {
+    // A generator's `return` value is its result; a bare one is unchanged.
+    let source = "\
+def gen(flag):
+    yield 1
+    if flag:
+        return
+    return 2
+";
+    let program =
+        crate::check_source(source, "test.py").expect("generators allow both return forms");
+    let g = program_function(&program, "gen");
+    assert!(g.is_generator, "{:?}", g.body);
+}
+
+#[test]
+fn value_return_type_mismatches_are_still_reported() {
+    // Relaxing the mixed-return check must not hide an incompatible value
+    // return against a declared annotation.
+    let diags = check_diags("def f() -> int:\n    return 'x'\n");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::TYPE);
+    assert_eq!(
+        diags[0].message,
+        "return type str does not match declared return type int"
+    );
+}
+
+#[test]
 fn unannotated_parameter_sequence_body_stays_dynamic() {
     // The caller passes a marker (`bool`) where the helper uses `parameters`
     // as a sequence. The parameter is unannotated, so the call site must not

@@ -114,6 +114,15 @@ fn urlsafe_b64decode(args: &[i64]) -> i64 {
         Ok(data) => data,
         Err(error) => return error,
     };
+    // CPython 3.15 adds `padded`; pydantic uses `padded=True` in a version
+    // branch that is unreachable on the 3.14 target, but the call still has
+    // to type-check. Accepting the keyword here keeps that forward-compatible
+    // call valid and restores padding only when requested.
+    if flag_argument(argument(args, 1), false) {
+        while data.len() % 4 != 0 {
+            data.push(b'=');
+        }
+    }
     for byte in data.iter_mut() {
         match *byte {
             b'-' => *byte = b'+',

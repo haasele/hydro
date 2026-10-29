@@ -29,6 +29,20 @@ fn call(module: &str, function: &str, args: &[i64]) -> i64 {
     )
 }
 
+/// Calls a first-class runtime value (for example a cached class constant)
+/// through the normal call protocol instead of module dispatch.
+fn call_value(callable: i64, args: &[i64]) -> i64 {
+    hydro_call(
+        callable,
+        args.len(),
+        if args.is_empty() {
+            std::ptr::null()
+        } else {
+            args.as_ptr()
+        },
+    )
+}
+
 fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
     hydro_method(obj, name.as_ptr(), name.len(), args.len(), args.as_ptr())
 }
@@ -58,6 +72,39 @@ fn path(value: &str) -> i64 {
 
 fn same(a: i64, b: i64) -> bool {
     call("operator", "eq", &[a, b]) == hydro_true()
+}
+
+const OP_IS: u32 = 15;
+
+fn is_same(a: i64, b: i64) -> bool {
+    hydro_binop(OP_IS, a, b) == hydro_true()
+}
+
+fn get(module: &str, name: &str) -> i64 {
+    hydro_module_get(module.as_ptr(), module.len(), name.as_ptr(), name.len())
+}
+
+fn getattr(object: i64, name: &str) -> i64 {
+    hydro_getattr(object, name.as_ptr(), name.len())
+}
+
+fn call_kw(callable: i64, args: &[i64], kwargs: &[(&str, i64)]) -> i64 {
+    let mut pairs = Vec::with_capacity(kwargs.len() * 2);
+    for (key, value_in) in kwargs {
+        pairs.push(text(key));
+        pairs.push(*value_in);
+    }
+    hydro_call_kw(
+        callable,
+        args.len(),
+        if args.is_empty() {
+            std::ptr::null()
+        } else {
+            args.as_ptr()
+        },
+        kwargs.len(),
+        pairs.as_ptr(),
+    )
 }
 
 fn assert_no_error() {
@@ -641,4 +688,124 @@ fn paths_survive_collection() {
 
     // The path string remains usable after the collection.
     assert_str(method(target, "read_text", &[]), "kept");
+}
+
+#[test]
+fn pure_path_classes_construct_and_compare() {
+    hydro_runtime_init();
+    assert_no_error();
+    // Pydantic 2.14 looks every class up by identity and uses it as a dict
+    // key/annotation origin; repeated reads must return the cached class.
+    for name in [
+        "PurePath",
+        "PosixPath",
+        "WindowsPath",
+        "PurePosixPath",
+        "PureWindowsPath",
+    ] {
+        let class = get("pathlib", name);
+        assert_no_error();
+        assert!(
+            is_same(class, get("pathlib", name)),
+            "pathlib.{name} identity is not cached"
+        );
+        assert_str(getattr(class, "__name__"), name);
+    }
+
+    // `PurePath` shares the native path value factory with `Path`.
+    let pure = get("pathlib", "PurePath");
+    let first = call_value(pure, &[text("a/b")]);
+    assert_no_error();
+    assert_path(first, "a/b");
+    assert_str(call("os", "fspath", &[first]), "a/b");
+    assert_str(method(first, "__fspath__", &[]), "a/b");
+
+    // Construction from another path copies it; equality is textual.
+    let copy = call_value(pure, &[first]);
+    assert_no_error();
+    assert_path(copy, "a/b");
+    assert!(same(first, copy));
+    assert!(same(first, call_value(pure, &[text("a/b")])));
+    assert!(!same(first, call_value(pure, &[text("a/c")])));
+    assert!(!same(first, text("a/b")), "a path never equals a str");
+
+    // Omitted/`None` arguments select ".", like `pathlib.Path`.
+    assert_path(call_value(pure, &[]), ".");
+    assert_path(call_value(pure, &[hydro_none()]), ".");
+
+    // The concrete classes follow the host platform, matching CPython's
+    // `cannot instantiate ... on your system` check.
+    if cfg!(windows) {
+        let _ = call_value(get("pathlib", "PosixPath"), &[text("a")]);
+        assert_eq!(error_tag(), 32);
+        assert_error_text(
+            error_message(),
+            "cannot instantiate 'PosixPath' on your system",
+        );
+        clear_error();
+        assert_path(call_value(get("pathlib", "WindowsPath"), &[text("a")]), "a");
+    } else {
+        assert_path(call_value(get("pathlib", "PosixPath"), &[text("a")]), "a");
+        let _ = call_value(get("pathlib", "WindowsPath"), &[text("a")]);
+        assert_eq!(error_tag(), 32);
+        assert_error_text(
+            error_message(),
+            "cannot instantiate 'WindowsPath' on your system",
+        );
+        clear_error();
+    }
+
+    // The pure classes are platform-independent. Windows text is preserved
+    // verbatim: this runtime does not re-parse it (documented limitation).
+    assert_path(
+        call_value(get("pathlib", "PureWindowsPath"), &[text("C:\\x")]),
+        "C:\\x",
+    );
+    assert_path(
+        call_value(get("pathlib", "PurePosixPath"), &[text("a/b")]),
+        "a/b",
+    );
+
+    // Constructor diagnostics: wrong type, too many segments, keywords.
+    let _ = call_value(pure, &[hydro_int(1)]);
+    assert_eq!(error_tag(), 1);
+    assert_error_text(error_message(), "PurePath() argument must be str, not int");
+    clear_error();
+    let _ = call_value(pure, &[text("a"), text("b")]);
+    assert_eq!(error_tag(), 1);
+    assert_error_text(
+        error_message(),
+        "PurePath() expected at most 1 argument, got 2",
+    );
+    clear_error();
+    let _ = call_kw(pure, &[], &[("path", text("a"))]);
+    assert_eq!(error_tag(), 1);
+    assert_error_text(error_message(), "PurePath() takes no keyword arguments");
+    clear_error();
+}
+
+#[test]
+fn pure_path_values_compare_nested_and_survive_collection() {
+    hydro_runtime_init();
+    let pure = get("pathlib", "PurePosixPath");
+    let left = [call_value(pure, &[text("x/y")])];
+    let right = [call_value(pure, &[text("x/y")])];
+    assert_no_error();
+    assert!(same(left[0], right[0]));
+
+    // Nested in a tuple the same textual equality applies.
+    let left_tuple = hydro_tuple_new(1, left.as_ptr());
+    let right_tuple = hydro_tuple_new(1, right.as_ptr());
+    assert!(same(left_tuple, right_tuple));
+
+    // Paths held only by containers survive a collection.
+    let values = [left[0]];
+    let list = hydro_list_new(1, values.as_ptr());
+    for _ in 0..200 {
+        let _ = hydro_str_new(b"garbage".as_ptr(), 7);
+    }
+    hydro_gc_collect();
+    let recovered = hydro_subscript(list, hydro_int(0));
+    assert_path(recovered, "x/y");
+    assert_str(method(recovered, "as_posix", &[]), "x/y");
 }

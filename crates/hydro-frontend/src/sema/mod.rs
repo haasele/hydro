@@ -1221,6 +1221,10 @@ impl<'a> Checker<'a> {
     }
 
     fn check_function(&mut self, f: &HFunction) {
+        // An unannotated return type starts as a fresh inference variable and
+        // an annotation starts concrete; only the inferred slot may be
+        // widened by the body, so record its shape before the walk binds it.
+        let inferred_return = matches!(f.ret_ty, Ty::Var(_));
         let mut has_value = false;
         let mut has_bare = false;
         for stmt in &f.body {
@@ -1237,16 +1241,17 @@ impl<'a> Checker<'a> {
             return;
         }
         if has_value {
-            if has_bare {
-                self.error_code(
-                    f.line,
-                    f.col,
-                    codes::CONTROL,
-                    format!(
-                        "inconsistent return in function '{}': mix of value and bare returns",
-                        f.name
-                    ),
-                );
+            if has_bare && inferred_return {
+                // A bare `return` returns `None`, and CPython allows a
+                // function to mix it with value returns. An inferred result
+                // type is a single static type, so the join of the value type
+                // and `None` is dynamic; a result that is already `None`
+                // (only `return None` plus bare returns) stays precise.
+                // Declared return types are left as written: their value
+                // returns were checked against the annotation above.
+                if !matches!(self.inf.resolve(f.ret_ty), Ty::Concrete(Type::None)) {
+                    self.force_any(f.ret_ty);
+                }
             }
         } else {
             // A stub body (`...`, `pass`, or just a docstring) returns `None`
