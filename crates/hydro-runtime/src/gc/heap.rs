@@ -115,13 +115,37 @@ mod alloc;
 
 use self::alloc::ObjectPool;
 
-/// Default collection threshold (ARCHITECTURE §7).
+/// Default (and minimum) collection threshold (ARCHITECTURE §7).
 ///
 /// Deliberately conservative: every collection pays a fixed cost (two
 /// stop-the-world root snapshots plus the registry walk), which dominates
-/// for mostly small heaps. `HYDRO_GC_THRESHOLD` overrides it; high-allocation
-/// deployments may raise it to amortize that overhead.
+/// for mostly small heaps. Unlike the earlier fixed default, this value now
+/// seeds the adaptive controller: it is the floor and the starting point.
+/// `HYDRO_GC_THRESHOLD` pins the threshold exactly and disables adaptation.
 const DEFAULT_THRESHOLD: usize = 10_000;
+
+/// Upper bound of the adaptive threshold (`HYDRO_GC_MAX_THRESHOLD`).
+///
+/// Bounds the heap growth the controller may trade for a lower collection
+/// rate, so a long pause between collections cannot grow without limit.
+const DEFAULT_MAX_THRESHOLD: usize = 131_072;
+
+/// Target share of wall time spent in completed collections, percent
+/// (`HYDRO_GC_OVERHEAD_PERCENT`, accepted range 1..=50).
+const DEFAULT_TARGET_OVERHEAD_PERCENT: u32 = 5;
+
+/// Samples shorter than this are ignored: startup and tight allocation
+/// bursts would otherwise swing the threshold on noise.
+const MIN_ADAPTIVE_INTERVAL_US: u64 = 1_000;
+
+/// Fixed-point scale of the adaptive adjustment factor.
+const FACTOR_SCALE: u128 = 1_000;
+/// Lower clamp of the adjustment factor (0.75×).
+const MIN_FACTOR: u128 = 750;
+/// Upper clamp of the adjustment factor (1.5×).
+const MAX_FACTOR: u128 = 1_500;
+/// Dead zone: factors within 10% of 1 leave the threshold untouched.
+const FACTOR_DEAD_ZONE: u128 = 100;
 
 /// Point-in-time snapshot of the collector's cumulative statistics.
 ///
@@ -143,8 +167,16 @@ pub struct GcStats {
     pub freed_total: u64,
     /// Objects registered at snapshot time.
     pub live_objects: u64,
-    /// Effective `HYDRO_GC_THRESHOLD` (or the built-in default).
+    /// Current effective collection threshold.
+    ///
+    /// In adaptive mode this is the controller's current value, not the
+    /// configured default; it changes between collections.
     pub threshold: u64,
+    /// Whether the adaptive threshold controller is active.
+    ///
+    /// False when `HYDRO_GC_THRESHOLD` pins the threshold or
+    /// `HYDRO_GC_ADAPTIVE=0` disables tuning.
+    pub adaptive: bool,
     /// Whether `HYDRO_GC_STRESS=1` is active.
     pub stress: bool,
     /// Whether `HYDRO_GC_PRECISE=1` (strict precise-root mode) is active.
@@ -201,10 +233,13 @@ fn record_collection(pause: Duration, mark: Duration, sweep: Duration, freed: us
 /// Returns a snapshot of the collector statistics.
 ///
 /// `live_objects` is read under the heap lock (shared mode) or from the
-/// thread-local registry, exactly like `objects()`. `threshold` and `stress`
-/// reflect the environment configuration in effect at snapshot time.
+/// thread-local registry, exactly like `objects()`. `threshold` and
+/// `adaptive` report the current heap's effective configuration (in adaptive
+/// mode the value adapted so far); `stress` reflects the environment
+/// configuration in effect at snapshot time.
 pub fn gc_stats() -> GcStats {
-    let (threshold, stress) = read_config();
+    let (threshold, adaptive) = current_threshold();
+    let stress = read_config().stress;
     GcStats {
         collections: STAT_COLLECTIONS.load(Ordering::Relaxed),
         pause_total_us: STAT_PAUSE_TOTAL_US.load(Ordering::Relaxed),
@@ -214,6 +249,7 @@ pub fn gc_stats() -> GcStats {
         freed_total: STAT_FREED_TOTAL.load(Ordering::Relaxed),
         live_objects: objects() as u64,
         threshold: threshold as u64,
+        adaptive,
         stress,
         precise: precise_mode(),
         precise_frames: STAT_PRECISE_FRAMES.load(Ordering::Relaxed),
@@ -303,7 +339,23 @@ struct HeapState {
     /// since the last collection. Using growth instead of an absolute size is
     /// essential for a large live set: otherwise every allocation after a
     /// collection would trigger another full mark of the same live graph.
+    ///
+    /// In adaptive mode this is the controller's *current* value; it changes
+    /// between collections (see [`HeapState::record_collection_timing`]).
     threshold: usize,
+    /// Lower bound of an adaptive adjustment ([`DEFAULT_THRESHOLD`]).
+    min_threshold: usize,
+    /// Upper bound of an adaptive adjustment.
+    max_threshold: usize,
+    /// Target collection overhead, percent.
+    target_overhead_percent: u32,
+    /// Whether the adaptive controller may change `threshold`.
+    adaptive: bool,
+    /// Collections fed to the controller (diagnostic).
+    adaptive_samples: u64,
+    /// Completion time of the previous collection; the next sample measures
+    /// its interval from here. `None` until the first collection.
+    last_collection_at: Option<Instant>,
     /// Number of live objects observed at the end of the last collection.
     last_collection_objects: usize,
     /// Collect before every allocation (`HYDRO_GC_STRESS=1`).
@@ -312,22 +364,66 @@ struct HeapState {
 
 impl HeapState {
     fn new() -> HeapState {
-        let (threshold, stress) = read_config();
+        let config = read_config();
         HeapState {
             objects: Vec::new(),
             addresses: AddressSet::default(),
             pool: ObjectPool::new(),
-            threshold,
+            threshold: config.threshold,
+            min_threshold: config.min_threshold,
+            max_threshold: config.max_threshold,
+            target_overhead_percent: config.target_overhead_percent,
+            adaptive: config.adaptive,
+            adaptive_samples: 0,
+            last_collection_at: None,
             last_collection_objects: 0,
-            stress,
+            stress: config.stress,
         }
     }
 
     /// Re-applies the environment configuration after a reset.
+    ///
+    /// A reset starts a new program run, so the adaptive controller restarts
+    /// from the configured (initial) threshold as well.
     fn refresh_config(&mut self) {
-        let (threshold, stress) = read_config();
-        self.threshold = threshold;
-        self.stress = stress;
+        let config = read_config();
+        self.threshold = config.threshold;
+        self.min_threshold = config.min_threshold;
+        self.max_threshold = config.max_threshold;
+        self.target_overhead_percent = config.target_overhead_percent;
+        self.adaptive = config.adaptive;
+        self.adaptive_samples = 0;
+        self.last_collection_at = None;
+        self.stress = config.stress;
+    }
+
+    /// Feeds one completed collection to the adaptive threshold controller.
+    ///
+    /// `total_us` is the collection's total work (local mode) or its whole
+    /// elapsed cycle (shared mode); `now` is when it completed. The first
+    /// sample only records the timestamp: it has no interval to compare
+    /// against. Stress mode and an explicit `HYDRO_GC_THRESHOLD` skip
+    /// adaptation entirely, as does a sample shorter than 1 ms.
+    fn record_collection_timing(&mut self, total_us: u64, now: Instant) {
+        let Some(previous) = self.last_collection_at.replace(now) else {
+            return;
+        };
+        if !self.adaptive || self.stress {
+            return;
+        }
+        let interval_us = micros(now.saturating_duration_since(previous));
+        if interval_us < MIN_ADAPTIVE_INTERVAL_US {
+            return;
+        }
+        self.adaptive_samples = self.adaptive_samples.saturating_add(1);
+        self.threshold = adapt_threshold(
+            self.threshold,
+            self.min_threshold,
+            self.max_threshold,
+            self.target_overhead_percent,
+            total_us,
+            interval_us,
+        );
     }
 
     /// Whether a collection is due. Growth since the last collection keeps
@@ -1821,17 +1917,111 @@ pub(crate) fn shared_mode() -> bool {
     shared()
 }
 
+/// Collector configuration read from the environment.
+struct GcConfig {
+    /// Threshold the heap starts with: the explicit pin, or the floor when
+    /// the controller is adaptive.
+    threshold: usize,
+    /// Whether the adaptive controller adjusts the threshold after each
+    /// collection. False for an explicit `HYDRO_GC_THRESHOLD`, for
+    /// `HYDRO_GC_ADAPTIVE=0`, and in stress mode (which ignores it anyway).
+    adaptive: bool,
+    /// Lower bound of an adaptive adjustment (always [`DEFAULT_THRESHOLD`]).
+    min_threshold: usize,
+    /// Upper bound of an adaptive adjustment.
+    max_threshold: usize,
+    /// Target share of wall time spent collecting, percent.
+    target_overhead_percent: u32,
+    /// Collect before every allocation (`HYDRO_GC_STRESS=1`).
+    stress: bool,
+}
+
 /// Reads the collector configuration. Defensive: malformed values fall back
 /// to the defaults and an unusable threshold is ignored.
-fn read_config() -> (usize, bool) {
-    let threshold = std::env::var("HYDRO_GC_THRESHOLD")
+///
+/// `HYDRO_GC_THRESHOLD` is an explicit pin: when it parses, the threshold is
+/// exactly that value and adaptation is disabled. Otherwise the threshold
+/// starts at [`DEFAULT_THRESHOLD`] and the controller tunes it between that
+/// floor and `HYDRO_GC_MAX_THRESHOLD` (default [`DEFAULT_MAX_THRESHOLD`])
+/// toward `HYDRO_GC_OVERHEAD_PERCENT` (default
+/// [`DEFAULT_TARGET_OVERHEAD_PERCENT`], accepted 1..=50).
+fn read_config() -> GcConfig {
+    let explicit = std::env::var("HYDRO_GC_THRESHOLD")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    let adaptive_enabled = std::env::var("HYDRO_GC_ADAPTIVE")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true);
+    let max_threshold = std::env::var("HYDRO_GC_MAX_THRESHOLD")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_THRESHOLD);
+        .unwrap_or(DEFAULT_MAX_THRESHOLD)
+        .max(DEFAULT_THRESHOLD);
+    let target_overhead_percent = std::env::var("HYDRO_GC_OVERHEAD_PERCENT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|percent| (1..=50).contains(percent))
+        .unwrap_or(DEFAULT_TARGET_OVERHEAD_PERCENT);
     let stress = std::env::var("HYDRO_GC_STRESS")
         .map(|value| value.trim() == "1")
         .unwrap_or(false);
-    (threshold, stress)
+    GcConfig {
+        threshold: explicit.unwrap_or(DEFAULT_THRESHOLD),
+        adaptive: explicit.is_none() && adaptive_enabled && !stress,
+        min_threshold: DEFAULT_THRESHOLD,
+        max_threshold,
+        target_overhead_percent,
+        stress,
+    }
+}
+
+/// Desired adjustment factor for one sample, in thousandths.
+///
+/// `total_us` is the collection work and `interval_us` the wall time between
+/// two completed collections, so `total/interval` is the collected overhead.
+/// The factor is `ratio / target`, clamped to 0.75..=1.5. Integer arithmetic
+/// only: the ratio is scaled by 10^5 and the target by 10^3, which keeps the
+/// division exact for every realistic duration.
+fn adaptive_factor(total_us: u64, interval_us: u64, target_percent: u32) -> u128 {
+    debug_assert!(interval_us > 0);
+    debug_assert!(target_percent > 0);
+    // total/interval / (target/100), in 1/1000 units.
+    let factor = (total_us as u128)
+        .saturating_mul(100 * FACTOR_SCALE)
+        .checked_div((interval_us as u128).saturating_mul(target_percent as u128))
+        .unwrap_or(MAX_FACTOR);
+    factor.clamp(MIN_FACTOR, MAX_FACTOR)
+}
+
+/// One step of the adaptive threshold controller.
+///
+/// Pure and deterministic (no clock, no environment), so the policy can be
+/// unit-tested in isolation. Returns `current` unchanged for a too-short
+/// sample or when the overhead is already within 10% of the target; otherwise
+/// scales it by [`adaptive_factor`] and clamps to `min..=max`.
+fn adapt_threshold(
+    current: usize,
+    min: usize,
+    max: usize,
+    target_percent: u32,
+    total_us: u64,
+    interval_us: u64,
+) -> usize {
+    let max = max.max(min);
+    if interval_us < MIN_ADAPTIVE_INTERVAL_US {
+        return current;
+    }
+    let current = current.clamp(min, max);
+    let factor = adaptive_factor(total_us, interval_us, target_percent);
+    // At most 10% off target: leave the threshold alone to avoid churn
+    // between collections that are only marginally over or under budget.
+    if factor.abs_diff(FACTOR_SCALE) <= FACTOR_DEAD_ZONE {
+        return current;
+    }
+    // Round half up, then clamp. The clamp happens in u128 so a huge current
+    // value can never overflow the cast.
+    let scaled = (current as u128 * factor + FACTOR_SCALE / 2) / FACTOR_SCALE;
+    scaled.clamp(min as u128, max as u128) as usize
 }
 
 /// Whether strict precise-root mode is active (`HYDRO_GC_PRECISE=1`).
@@ -1968,6 +2158,20 @@ pub(crate) fn objects() -> usize {
         lock_global().objects.len()
     } else {
         HEAP.with(|cell| cell.borrow().objects.len())
+    }
+}
+
+/// The current heap's effective threshold and whether the adaptive
+/// controller drives it. Mirrors [`objects`]' local/shared split.
+fn current_threshold() -> (usize, bool) {
+    if shared() {
+        let heap = lock_global();
+        (heap.threshold, heap.adaptive)
+    } else {
+        HEAP.with(|cell| {
+            let heap = cell.borrow();
+            (heap.threshold, heap.adaptive)
+        })
     }
 }
 
@@ -2600,10 +2804,21 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
     let sweep_time = sweep_start.elapsed();
     record_collection(pause, mark_time, sweep_time, freed);
 
+    // Adaptive threshold: the whole cycle is the collection's cost in shared
+    // mode. The update needs the heap lock but nothing else: the collector
+    // lock was released above and no other GC lock is held.
+    let (threshold, adaptive, samples) = {
+        let total_us = micros(started.elapsed());
+        let mut heap = lock_global();
+        heap.record_collection_timing(total_us, Instant::now());
+        (heap.threshold, heap.adaptive, heap.adaptive_samples)
+    };
+
     if stats {
         eprintln!(
             "hydro-gc: pause_ms={:.3} mark_ms={:.3} sweep_ms={:.3} freed={} \
-             slabs={} capacity={} live={} reused={} precise={} precise_frames={}",
+             slabs={} capacity={} live={} reused={} threshold={} adaptive={} \
+             samples={} precise={} precise_frames={}",
             pause.as_secs_f64() * 1000.0,
             mark_time.as_secs_f64() * 1000.0,
             sweep_time.as_secs_f64() * 1000.0,
@@ -2612,6 +2827,9 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
             pool_stats.capacity,
             pool_stats.live,
             pool_stats.reused,
+            threshold,
+            adaptive,
+            samples,
             if strict { "strict" } else { "mixed" },
             STAT_PRECISE_FRAMES.load(Ordering::Relaxed)
         );
@@ -2938,7 +3156,10 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
     heap.last_collection_objects = heap.objects.len();
     // Local mode has no separate stop-the-world window: the whole collection
     // runs with the only thread stopped, so `pause` is the total time.
-    record_collection(started.elapsed(), mark_time, sweep_time, freed);
+    let finished = Instant::now();
+    let total = finished.saturating_duration_since(started);
+    record_collection(total, mark_time, sweep_time, freed);
+    heap.record_collection_timing(micros(total), finished);
     freed
 }
 
@@ -4288,5 +4509,121 @@ mod tests {
             before.collections,
             after.collections
         );
+    }
+
+    // ---- adaptive threshold controller ----
+
+    const MIN: usize = 10_000;
+    const MAX: usize = 131_072;
+
+    #[test]
+    fn adaptive_factor_is_clamped() {
+        // Massive overhead (1 s per 1 ms) clamps to the upper factor.
+        assert_eq!(adaptive_factor(1_000_000, 1_000, 5), MAX_FACTOR);
+        // No overhead (10 s interval) clamps to the lower factor.
+        assert_eq!(adaptive_factor(0, 10_000_000, 5), MIN_FACTOR);
+        // Exactly the target gives 1.0.
+        assert_eq!(adaptive_factor(500, 10_000, 5), FACTOR_SCALE);
+        // 2% overhead against a 5% target is 0.4, clamped up to 0.75.
+        assert_eq!(adaptive_factor(100, 10_000, 5), MIN_FACTOR);
+        // 10% overhead at a 5% target is 2.0, clamped to 1.5.
+        assert_eq!(adaptive_factor(1_000, 10_000, 5), MAX_FACTOR);
+        // 10% overhead at a 20% target is 0.5, clamped up to 0.75.
+        assert_eq!(adaptive_factor(1_000, 10_000, 20), MIN_FACTOR);
+    }
+
+    #[test]
+    fn adaptive_threshold_raises_on_high_overhead() {
+        // 20% of the interval spent collecting against a 5% target.
+        let next = adapt_threshold(MIN, MIN, MAX, 5, 2_000, 10_000);
+        assert_eq!(next, 15_000);
+    }
+
+    #[test]
+    fn adaptive_threshold_lowers_on_low_overhead() {
+        // 1% of the interval spent collecting against a 5% target.
+        let next = adapt_threshold(20_000, 1_000, MAX, 5, 100, 10_000);
+        assert_eq!(next, 15_000);
+    }
+
+    #[test]
+    fn adaptive_threshold_keeps_the_dead_zone() {
+        // Exactly on target.
+        assert_eq!(adapt_threshold(20_000, 1_000, MAX, 5, 500, 10_000), 20_000);
+        // 10% above target: still inside the dead zone.
+        assert_eq!(adapt_threshold(20_000, 1_000, MAX, 5, 550, 10_000), 20_000);
+        // 10% below target.
+        assert_eq!(adapt_threshold(20_000, 1_000, MAX, 5, 450, 10_000), 20_000);
+        // More than 10% below target does adjust.
+        assert_eq!(adapt_threshold(20_000, 1_000, MAX, 5, 400, 10_000), 16_000);
+    }
+
+    #[test]
+    fn adaptive_threshold_clamps_to_bounds() {
+        // A large upward step is capped at the maximum.
+        assert_eq!(adapt_threshold(100_000, MIN, MAX, 5, 9_000, 10_000), MAX);
+        // A large downward step is floored at the minimum.
+        assert_eq!(adapt_threshold(MIN, MIN, MAX, 5, 10, 10_000), MIN);
+        // Malformed bounds (max below min) collapse to the lower bound and
+        // never produce an out-of-range value.
+        assert_eq!(
+            adapt_threshold(50_000, 20_000, 5_000, 5, 9_000, 10_000),
+            20_000
+        );
+    }
+
+    #[test]
+    fn adaptive_threshold_ignores_short_intervals() {
+        assert_eq!(adapt_threshold(20_000, MIN, MAX, 5, 9_000, 999), 20_000);
+        assert_eq!(adapt_threshold(20_000, MIN, MAX, 5, 9_000, 0), 20_000);
+        // At the boundary the sample is used.
+        assert_eq!(adapt_threshold(20_000, MIN, MAX, 5, 9_000, 1_000), 30_000);
+    }
+
+    #[test]
+    fn adaptive_state_skips_first_and_short_samples() {
+        let mut heap = HeapState::new();
+        heap.adaptive = true;
+        heap.stress = false;
+        heap.min_threshold = MIN;
+        heap.max_threshold = MAX;
+        heap.target_overhead_percent = 5;
+        heap.threshold = 20_000;
+
+        let start = Instant::now();
+        heap.record_collection_timing(2_000, start);
+        // The first sample only starts the clock.
+        assert_eq!(heap.threshold, 20_000);
+        assert_eq!(heap.adaptive_samples, 0);
+        // Less than 1 ms since the last collection: no sample is taken.
+        heap.record_collection_timing(2_000, start + Duration::from_micros(500));
+        assert_eq!(heap.threshold, 20_000);
+        assert_eq!(heap.adaptive_samples, 0);
+        // 20% overhead over the interval: clamped 1.5× step up.
+        heap.record_collection_timing(2_000, start + Duration::from_millis(10));
+        assert_eq!(heap.adaptive_samples, 1);
+        assert_eq!(heap.threshold, 30_000);
+        // A pinned/fixed controller leaves the adapted value alone.
+        heap.adaptive = false;
+        heap.record_collection_timing(10_000, start + Duration::from_millis(20));
+        assert_eq!(heap.adaptive_samples, 1);
+        assert_eq!(heap.threshold, 30_000);
+    }
+
+    #[test]
+    fn collection_due_uses_the_current_threshold() {
+        let mut heap = HeapState::new();
+        heap.stress = false;
+        heap.last_collection_objects = 0;
+        heap.threshold = 3;
+        for label in ["a", "b", "c"] {
+            register_test_object(&mut heap, label);
+        }
+        assert!(!heap.collection_due());
+        register_test_object(&mut heap, "d");
+        assert!(heap.collection_due());
+        // The controller raised the threshold: the same registry is fine now.
+        heap.threshold = 10;
+        assert!(!heap.collection_due());
     }
 }

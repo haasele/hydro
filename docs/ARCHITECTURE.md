@@ -1249,20 +1249,37 @@ collector as an interim**:
   mark the new child if the parent is already BLACK;
   container mutation and marker are serialized by a graph lock per payload. In
   local mode the lock is omitted.
-- Trigger on growth since the last collection: `live + HYDRO_GC_THRESHOLD`
-  (default 10000), not on absolute object count. `HYDRO_GC_THRESHOLD`
-  overrides the value at startup. The default is deliberately conservative
-  because every collection pays a fixed cost regardless of garbage volume:
-  two stop-the-world root snapshots (stacks, registers, pending, thread
-  roots) plus the registry walk. High-allocation deployments (HTTP servers,
-  JSON/parser paths) can raise `HYDRO_GC_THRESHOLD` to amortize that overhead
-  across far more allocations per collection, accepting a larger heap. `HYDRO_GC_STRESS=1` collects
-  before every allocation. `HYDRO_GC_STATS=1` reports pause, mark and sweep time
-  as well as frees per collection on stderr.
+- Trigger on growth since the last collection: `live + threshold`, not on
+  absolute object count. **The threshold is self-tuning by default.** It
+  starts at 10000 and, after every completed collection, the controller
+  compares the collection's total work (pause + mark + sweep; the whole
+  cycle in shared mode) with the wall time since the previous completed
+  collection. The measured overhead share is steered toward a target of 5%
+  by scaling the threshold, with each step clamped to 0.75×–1.5×, applied
+  only when the overhead is more than 10% away from the target (to avoid
+  churn), and ignored for samples with an interval below 1 ms. The threshold
+  is bounded by 10000 and a maximum of 131072, so the heap may grow to trade
+  allocation throughput for fewer pauses, but not without limit.
+  - `HYDRO_GC_THRESHOLD=<n>` is an **explicit fixed override**: when it
+    parses, the threshold is exactly `n` and adaptation is disabled (all
+    existing tests use this pin).
+  - `HYDRO_GC_ADAPTIVE=0` disables adaptation and keeps the threshold at the
+    configured initial value (10000 unless pinned).
+  - `HYDRO_GC_MAX_THRESHOLD=<n>` sets the adaptive upper bound (default
+    131072, never below the 10000 floor).
+  - `HYDRO_GC_OVERHEAD_PERCENT=<1..50>` sets the target collection overhead
+    share (default 5; out-of-range values fall back to the default).
+  These settings are read once at heap construction and again on
+  `hydro_runtime_init`/reset; `HYDRO_GC_STRESS=1` collects before every
+  allocation and never adapts. `HYDRO_GC_STATS=1` reports pause, mark and
+  sweep time as well as frees, the effective threshold and whether the
+  controller is active per collection on stderr.
 - `hydro_runtime::gc_stats()` returns a `GcStats` snapshot
   (`collections`, `pause_total_us`, `pause_max_us`, `mark_total_us`,
-  `sweep_total_us`, `freed_total`, `live_objects`, `threshold`, `stress`,
-  `precise`, `precise_frames`); `precise` reports strict mode and
+  `sweep_total_us`, `freed_total`, `live_objects`, `threshold`, `adaptive`,
+  `stress`, `precise`, `precise_frames`); `threshold` is the current
+  *effective* value (the adapted one in adaptive mode), `adaptive` reports
+  whether the controller is active, `precise` reports strict mode and
   `precise_frames` the frames marked by the latest collection. The
   `HYDRO_GC_STATS=1` line carries the same `precise=mixed|strict` and
   `precise_frames=` fields. `reset_gc_stats()` resets the counters.

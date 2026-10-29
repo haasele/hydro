@@ -8,6 +8,27 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Performance — 2026-10-29 adaptive GC and native POST response
+
+- Added a self-tuning GC threshold controller. Without an explicit override it
+  starts at 10,000 objects, measures collection work (pause + mark + sweep)
+  against wall time between collections, and steers the threshold between
+  10,000 and 131,072 toward 5% collection overhead. Steps are clamped to
+  0.75×–1.5×, with a ±10% dead zone and a 1 ms minimum sample interval.
+  `HYDRO_GC_THRESHOLD` remains an exact pin; `HYDRO_GC_ADAPTIVE=0`,
+  `HYDRO_GC_MAX_THRESHOLD` and `HYDRO_GC_OVERHEAD_PERCENT` are explicit
+  controls. `GcStats` now exposes `adaptive`, and `threshold` is the current
+  effective value.
+- Added `postgres.insert_device(handle, table, mac, firmware) -> (id, uuid)`,
+  which lets PostgreSQL generate the UUID (`gen_random_uuid()`) and returns
+  both columns in one exchange.
+- The benchmark app now uses `insert_device` and builds the 201 JSON/header
+  responses directly from bytes; it no longer performs Python UUID formatting,
+  creates a response dict, or serializes that dict.
+- Measured effect: fixed 1k POST p99 5.72–5.76 ms at 0.18–0.19 CPU cores and
+  20–26 MiB RSS; uncapped POST reaches the 10k cap at p99 11.5–13.7 ms and
+  ~3.5 cores. The benchmark app no longer sets `HYDRO_GC_THRESHOLD`.
+
 ### Performance — 2026-10-29 native I/O parking and benchmark gate
 
 - Native `postgres` and `memcached` clients now park the collector once per

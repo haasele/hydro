@@ -3704,11 +3704,17 @@ pub static HTTP: ModuleSpec = ModuleSpec {
 /// `postgres`: native PostgreSQL v3 client used by the benchmark app.
 ///
 /// Connections are capsule-backed and reconnect lazily. `insert` returns the
-/// integer `id` from `RETURNING id`; SQL identifiers are restricted and string
-/// values are escaped by the runtime, so callers do not splice SQL.
+/// integer `id` from `RETURNING id`; `insert_device` lets the server generate
+/// the UUID and returns the `(id, uuid)` tuple from `RETURNING id, uuid`.
+/// SQL identifiers are restricted and string values are escaped by the
+/// runtime, so callers do not splice SQL.
 pub static POSTGRES: ModuleSpec = ModuleSpec {
     name: "postgres",
-    functions: &[f("connect", 4, 4, Type::Any), f("insert", 5, 5, Type::Int)],
+    functions: &[
+        f("connect", 4, 4, Type::Any),
+        f("insert", 5, 5, Type::Int),
+        f("insert_device", 4, 4, Type::Any),
+    ],
     constants: &[],
 };
 
