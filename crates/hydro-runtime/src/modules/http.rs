@@ -1,28 +1,62 @@
 //! `http`: a native HTTP/1.1 server with a static-response fast path.
 //!
-//! `http.serve(port, routes, handler, max_connections)` binds one listener and
-//! blocks for the rest of the process. A single OS thread owns the listener,
-//! every accepted socket, and every read buffer: it runs a level-triggered
-//! `epoll` loop together with an `eventfd` that the dynamic worker pool uses to
-//! wake it. A request whose exact `(method, path)` pair (the query string is
-//! stripped) appears in `routes` is answered from the event-loop thread by
-//! copying the pre-built response bytes to the socket and never enters Python.
-//! Every other request is queued to a bounded pool of native worker threads
-//! that call the Python `handler(method, path, body)` and hand the returned
-//! `bytes` object back through a completion queue plus the `eventfd`. A
-//! connection has at most one dynamic job in flight, so pipelined requests are
-//! served in order and no socket is read ahead while a handler is running.
+//! `http.serve(port, routes, handler, max_connections)` binds one or more
+//! listeners and blocks for the rest of the process. Each listener is owned by
+//! exactly one OS thread that also owns every socket it accepted and every read
+//! buffer: the thread runs a level-triggered `epoll` loop together with an
+//! `eventfd` that its dynamic worker pool uses to wake it. A request whose
+//! exact `(method, path)` pair (the query string is stripped) appears in
+//! `routes` is answered from the event-loop thread by copying the pre-built
+//! response bytes to the socket and never enters Python. Every other request
+//! is queued to a bounded pool of native worker threads that call the Python
+//! `handler(method, path, body)` and hand the returned `bytes` object back
+//! through a completion queue plus the `eventfd`. A connection has at most one
+//! dynamic job in flight, so pipelined requests are served in order and no
+//! socket is read ahead while a handler is running.
+//!
+//! ## Shards
+//!
+//! The `HYDRO_HTTP_LOOPS` environment variable selects the number of event-loop
+//! shards (default 4, clamped to `1..=8`):
+//!
+//! * `HYDRO_HTTP_LOOPS=1` is the compatible single-loop path: one
+//!   `TcpListener::bind`, no `SO_REUSEPORT`, one epoll thread and the full
+//!   `min(max_connections, 64)` worker budget.
+//! * A value above one binds that many sockets to the same `0.0.0.0:port` with
+//!   `SO_REUSEPORT` and `SO_REUSEADDR` set before `bind`, so the kernel spreads
+//!   incoming connections across shards. Every shard has its own epoll set,
+//!   eventfd, connection map, accept loop and worker pool; nothing is shared
+//!   between shards except the immutable route table, the rooted handler and
+//!   the GC runtime.
+//!
+//! All shard listeners are bound before [`heap::enable_shared`] and before any
+//! worker exists, and every shard's epoll set and eventfd are created there
+//! too; a bind or setup failure closes everything created so far and raises
+//! `OSError` without spawning a worker. The connection budget is split so the
+//! per-shard caps sum to exactly `max_connections`: shard `i` gets
+//! `max_connections / loops` plus one while `i < max_connections % loops`. The
+//! dynamic worker budget is `max(1, MAX_WORKERS / loops)` per shard using
+//! integer division, so the total is at most 64 and rounding down leaves a few
+//! idle slots for loop counts that do not divide 64 (for example 5 loops get 12
+//! workers each, 60 in total). The single-loop path keeps the historical
+//! `min(max_connections, 64)` pool.
+//!
+//! One shard runs on the calling thread and the other `loops - 1` shards each
+//! run on a spawned native thread, so the Python caller never blocks in
+//! `join`. If spawning a loop thread fails, every pool created so far is told
+//! to stop and `OSError` is raised instead of continuing with fewer loops.
 //!
 //! ## Event loop
 //!
-//! * The listener and every connection socket are non-blocking. The listen
-//!   backlog is raised to 1024 and one `epoll_wait` batch carries up to 1024
-//!   events, so a 1024-connection burst is accepted and serviced in one pass.
-//!   The accept path drains the backlog until `WouldBlock`; once
-//!   `max_connections` live connections exist the listener's `EPOLLIN`
-//!   interest is disarmed and re-armed when a connection closes, so the loop
-//!   never spins or blocks. Every accepted socket gets `TCP_NODELAY` so small
-//!   responses are not held back by Nagle's algorithm.
+//! * A shard's listener and every connection socket are non-blocking. The
+//!   listen backlog is raised to 1024 and one `epoll_wait` batch carries up to
+//!   1024 events, so a 1024-connection burst is accepted and serviced in one
+//!   pass per shard.
+//!   The accept path drains the backlog until `WouldBlock`; once the shard's
+//!   connection cap is reached the listener's `EPOLLIN` interest is disarmed
+//!   and re-armed when a connection closes, so the loop never spins or blocks.
+//!   Every accepted socket gets `TCP_NODELAY` so small responses are not held
+//!   back by Nagle's algorithm.
 //! * Each connection owns its read buffer, so a partial head or body never
 //!   blocks other connections. Responses are written with partial-write
 //!   handling: `EPOLLOUT` stays armed while bytes remain queued, and the next
@@ -43,7 +77,7 @@
 //! * The handler is installed as a process-wide root
 //!   ([`heap::add_global_root`]) before any worker starts, so it stays alive
 //!   across collections and after the calling thread's registration ends.
-//! * The pool holds `min(max_connections, 64)` workers (at least one). Each
+//! * Each shard's pool holds `max(1, MAX_WORKERS / loops)` workers. Each
 //!   worker follows the `_thread.start_new_thread` protocol: `enter_thread`
 //!   before the OS thread exists, then `register_thread` (with no
 //!   out-of-stack roots) and a safepoint as its first action, and
@@ -71,7 +105,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -93,6 +127,11 @@ const MAX_WORKERS: usize = 64;
 const MAX_EVENTS: usize = 1024;
 /// Accept backlog requested after bind, matching [`MAX_EVENTS`].
 const ACCEPT_BACKLOG: i32 = 1024;
+/// Default number of event-loop shards, used when `HYDRO_HTTP_LOOPS` is unset
+/// or unparsable.
+const DEFAULT_LOOPS: usize = 4;
+/// Upper bound on `HYDRO_HTTP_LOOPS`.
+const MAX_LOOPS: usize = 8;
 
 /// Events every connection registration carries: a half-close or a fatal
 /// error must always wake the loop.
@@ -147,6 +186,173 @@ fn io_error(error: io::Error) -> i64 {
         Some(code) => exc::raise_with_message(OS_ERROR, &format!("[Errno {code}] {error}")),
         None => exc::raise_with_message(OS_ERROR, &error.to_string()),
     }
+}
+
+/// Number of event-loop shards requested through `HYDRO_HTTP_LOOPS`.
+///
+/// Unset or unparsable values fall back to [`DEFAULT_LOOPS`]; the result is
+/// clamped to `1..=MAX_LOOPS`.
+fn http_loops() -> usize {
+    std::env::var("HYDRO_HTTP_LOOPS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|loops| loops.clamp(1, MAX_LOOPS))
+        .unwrap_or(DEFAULT_LOOPS)
+}
+
+/// The compatible single-loop listener: the platform bind, no reuse options.
+fn bind_single_listener(port: u16) -> io::Result<TcpListener> {
+    let listener = TcpListener::bind(("0.0.0.0", port))?;
+    listener.set_nonblocking(true)?;
+    // `TcpListener::bind` uses a small platform default backlog; raise it so a
+    // 1024-connection burst is not truncated before the accept loop runs.
+    // Failure is not fatal: the default backlog still accepts connections.
+    unsafe {
+        libc::listen(listener.as_raw_fd(), ACCEPT_BACKLOG);
+    }
+    Ok(listener)
+}
+
+/// Binds one `SO_REUSEPORT` listener for a sharded event loop.
+///
+/// The socket is created by hand so `SO_REUSEADDR` and `SO_REUSEPORT` are set
+/// before `bind` and the backlog is exact. Every failure path closes the
+/// descriptor; on success the listener owns it.
+fn bind_shard_listener(port: u16) -> io::Result<TcpListener> {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if let Err(error) = configure_shard_socket(fd, port) {
+        close_fd(fd);
+        return Err(error);
+    }
+    let listener = unsafe { TcpListener::from_raw_fd(fd) };
+    // Ownership sits in the listener from here on, so a failure just drops it.
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+/// Sets the reuse options on `fd`, then binds and listens on `0.0.0.0:port`.
+fn configure_shard_socket(fd: RawFd, port: u16) -> io::Result<()> {
+    setsockopt_flag(fd, libc::SO_REUSEADDR)?;
+    setsockopt_flag(fd, libc::SO_REUSEPORT)?;
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: libc::INADDR_ANY,
+        },
+        sin_zero: [0; 8],
+    };
+    let bound = unsafe {
+        libc::bind(
+            fd,
+            (&address as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if bound == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::listen(fd, ACCEPT_BACKLOG) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Enables one boolean `SOL_SOCKET` option.
+fn setsockopt_flag(fd: RawFd, option: libc::c_int) -> io::Result<()> {
+    let enable: libc::c_int = 1;
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            (&enable as *const libc::c_int).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// The epoll set and wake eventfd owned by one shard's event loop.
+///
+/// Dropping closes both, including when a `Server` is dropped because its loop
+/// thread could not be spawned.
+struct LoopFds {
+    epoll: RawFd,
+    wake: RawFd,
+}
+
+impl LoopFds {
+    /// Creates the epoll set and eventfd and registers the listener and the
+    /// eventfd on it. Every failure closes what was created so far.
+    fn new(listener_fd: RawFd) -> io::Result<Self> {
+        let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epoll == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if wake == -1 {
+            let error = io::Error::last_os_error();
+            close_fd(epoll);
+            return Err(error);
+        }
+        if let Err(error) = epoll_ctl(
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            listener_fd,
+            libc::EPOLLIN as u32,
+            listener_fd as u64,
+        ) {
+            close_fd(wake);
+            close_fd(epoll);
+            return Err(error);
+        }
+        if let Err(error) = epoll_ctl(
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            wake,
+            libc::EPOLLIN as u32,
+            wake as u64,
+        ) {
+            close_fd(wake);
+            close_fd(epoll);
+            return Err(error);
+        }
+        Ok(Self { epoll, wake })
+    }
+}
+
+impl Drop for LoopFds {
+    fn drop(&mut self) {
+        close_fd(self.wake);
+        close_fd(self.epoll);
+    }
+}
+
+/// Tells every worker pool created so far to drain and exit.
+fn stop_pools(pools: &[Arc<Shared>]) {
+    for pool in pools {
+        pool.stop();
+    }
+}
+
+/// Runs one shard's event loop on a dedicated thread.
+///
+/// The thread performs no Python allocation and is not a registered GC thread;
+/// it only parks in `epoll_wait` through `blocking_enter`/`blocking_leave`,
+/// which is a no-op for it.
+fn spawn_loop(server: Server, index: usize) -> io::Result<()> {
+    thread::Builder::new()
+        .name(format!("hydro-http-loop-{index}"))
+        .spawn(move || server.run())
+        .map(|_| ())
 }
 
 /// Native module dispatch for `http`.
@@ -212,56 +418,37 @@ fn serve(args: &[i64]) -> i64 {
     }
     let max_connections = usize::try_from(max_connections).unwrap_or(usize::MAX);
 
-    // Bind before switching the runtime to the shared heap: a bind failure is
-    // a plain Python exception with no side effects.
-    let listener = match TcpListener::bind(("0.0.0.0", port as u16)) {
-        Ok(listener) => listener,
-        Err(error) => return io_error(error),
-    };
-    if let Err(error) = listener.set_nonblocking(true) {
-        return io_error(error);
-    }
-    let listener_fd = listener.as_raw_fd();
-    // `TcpListener::bind` uses a small platform default backlog; raise it so a
-    // 1024-connection burst is not truncated before the accept loop runs.
-    // Failure is not fatal: the default backlog still accepts connections.
-    unsafe {
-        libc::listen(listener_fd, ACCEPT_BACKLOG);
-    }
+    // `HYDRO_HTTP_LOOPS=1` keeps the compatible single-listener path, while a
+    // larger value binds that many `SO_REUSEPORT` listeners on the same port.
+    let loops = http_loops();
 
-    let epoll = match unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) } {
-        -1 => return io_error(io::Error::last_os_error()),
-        fd => fd,
-    };
-    let wake = match unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) } {
-        -1 => {
-            let error = io::Error::last_os_error();
-            close_fd(epoll);
-            return io_error(error);
+    // Bind every shard listener before switching the runtime to the shared
+    // heap: a bind failure is a plain Python exception with no side effects,
+    // and every listener created so far is closed on the error return.
+    let listeners = if loops == 1 {
+        match bind_single_listener(port as u16) {
+            Ok(listener) => vec![listener],
+            Err(error) => return io_error(error),
         }
-        fd => fd,
+    } else {
+        let mut listeners = Vec::with_capacity(loops);
+        for _ in 0..loops {
+            match bind_shard_listener(port as u16) {
+                Ok(listener) => listeners.push(listener),
+                Err(error) => return io_error(error),
+            }
+        }
+        listeners
     };
-    if let Err(error) = epoll_ctl(
-        epoll,
-        libc::EPOLL_CTL_ADD,
-        listener_fd,
-        libc::EPOLLIN as u32,
-        listener_fd as u64,
-    ) {
-        close_fd(wake);
-        close_fd(epoll);
-        return io_error(error);
-    }
-    if let Err(error) = epoll_ctl(
-        epoll,
-        libc::EPOLL_CTL_ADD,
-        wake,
-        libc::EPOLLIN as u32,
-        wake as u64,
-    ) {
-        close_fd(wake);
-        close_fd(epoll);
-        return io_error(error);
+
+    // Each shard's epoll set and eventfd also exist before the first worker or
+    // loop thread, so a setup failure still leaves the heap untouched.
+    let mut loop_fds = Vec::with_capacity(loops);
+    for listener in &listeners {
+        match LoopFds::new(listener.as_raw_fd()) {
+            Ok(fds) => loop_fds.push(fds),
+            Err(error) => return io_error(error),
+        }
     }
 
     // Every object created so far (including the handler) moves into the
@@ -272,27 +459,52 @@ fn serve(args: &[i64]) -> i64 {
     heap::add_global_root(handler);
 
     let config = Arc::new(Config { routes });
-    let shared = Arc::new(Shared::new(wake));
-    let workers = max_connections.clamp(1, MAX_WORKERS);
-    if let Err(error) = spawn_workers(&shared, handler, workers) {
-        close_fd(wake);
-        close_fd(epoll);
-        return io_error(error);
+    // Integer division rounds each shard's pool down; `max(1, ..)` keeps every
+    // shard able to run a handler and bounds the total by `MAX_WORKERS`. The
+    // compatible single-loop path keeps its historical pool size.
+    let workers = if loops == 1 {
+        max_connections.clamp(1, MAX_WORKERS)
+    } else {
+        (MAX_WORKERS / loops).max(1)
+    };
+    let mut shards = Vec::with_capacity(loops);
+    let mut pools = Vec::with_capacity(loops);
+    for (index, (listener, fds)) in listeners.into_iter().zip(loop_fds).enumerate() {
+        // The caps sum to exactly `max_connections`: shard `index` gets one
+        // extra connection while it is below the remainder.
+        let capacity = max_connections / loops
+            + (if index < max_connections % loops {
+                1
+            } else {
+                0
+            });
+        let server = Server::build(listener, fds, Arc::clone(&config), capacity);
+        if let Err(error) = spawn_workers(&server.shared, handler, workers) {
+            // `spawn_workers` already stopped this pool; stop the rest so no
+            // worker outlives the failed `serve` call.
+            stop_pools(&pools);
+            return io_error(error);
+        }
+        pools.push(Arc::clone(&server.shared));
+        shards.push(server);
     }
 
-    let server = Server {
-        listener,
-        listener_fd,
-        epoll,
-        wake_fd: wake,
-        config,
-        shared,
-        conns: HashMap::new(),
-        max_connections,
-        next_id: 1,
-        listener_armed: true,
+    // One shard runs on the calling thread and the others on their own threads,
+    // so the Python caller never blocks in `join`.
+    let mut shards = shards.into_iter();
+    let Some(main_shard) = shards.next() else {
+        stop_pools(&pools);
+        return io_error(io::Error::other("no event loop shard to run"));
     };
-    server.run();
+    for (offset, shard) in shards.enumerate() {
+        if let Err(error) = spawn_loop(shard, offset + 1) {
+            // Shards already running on their own threads cannot be reclaimed
+            // from here, but no worker pool is left running.
+            stop_pools(&pools);
+            return io_error(error);
+        }
+    }
+    main_shard.run();
     NONE
 }
 
@@ -566,12 +778,13 @@ fn close_fd(fd: RawFd) {
     }
 }
 
-/// The listener, the epoll set, and every live connection.
+/// One shard: its listener, epoll set, wake eventfd, and every live connection
+/// accepted by this shard.
 struct Server {
     listener: TcpListener,
     listener_fd: RawFd,
-    epoll: RawFd,
-    wake_fd: RawFd,
+    /// This shard's epoll set and eventfd; dropping closes both.
+    fds: LoopFds,
     config: Arc<Config>,
     shared: Arc<Shared>,
     conns: HashMap<RawFd, Conn>,
@@ -583,6 +796,27 @@ struct Server {
 }
 
 impl Server {
+    /// Assembles one shard around an already-bound listener and its loop fds.
+    fn build(
+        listener: TcpListener,
+        fds: LoopFds,
+        config: Arc<Config>,
+        max_connections: usize,
+    ) -> Self {
+        let listener_fd = listener.as_raw_fd();
+        Self {
+            listener,
+            listener_fd,
+            shared: Arc::new(Shared::new(fds.wake)),
+            fds,
+            config,
+            conns: HashMap::new(),
+            max_connections,
+            next_id: 1,
+            listener_armed: true,
+        }
+    }
+
     /// Runs until `epoll_wait` fails for a reason other than a signal.
     fn run(mut self) {
         let mut events = [EpollEvent { events: 0, data: 0 }; MAX_EVENTS];
@@ -590,7 +824,7 @@ impl Server {
             heap::blocking_enter();
             let ready = unsafe {
                 libc::epoll_wait(
-                    self.epoll,
+                    self.fds.epoll,
                     events.as_mut_ptr() as *mut libc::epoll_event,
                     MAX_EVENTS as i32,
                     -1,
@@ -611,7 +845,7 @@ impl Server {
                 // Copy the packed fields out before comparing them.
                 let flags = event.events;
                 let data = event.data;
-                if data == self.wake_fd as u64 {
+                if data == self.fds.wake as u64 {
                     self.drain_wake();
                     self.drain_completions();
                 } else if data == self.listener_fd as u64 {
@@ -629,7 +863,7 @@ impl Server {
         loop {
             let read = unsafe {
                 libc::read(
-                    self.wake_fd,
+                    self.fds.wake,
                     &mut value as *mut u64 as *mut libc::c_void,
                     std::mem::size_of::<u64>(),
                 )
@@ -695,8 +929,14 @@ impl Server {
                         continue;
                     }
                     let fd = stream.as_raw_fd();
-                    if epoll_ctl(self.epoll, libc::EPOLL_CTL_ADD, fd, CONN_EVENTS, fd as u64)
-                        .is_err()
+                    if epoll_ctl(
+                        self.fds.epoll,
+                        libc::EPOLL_CTL_ADD,
+                        fd,
+                        CONN_EVENTS,
+                        fd as u64,
+                    )
+                    .is_err()
                     {
                         // Dropping the stream closes the descriptor.
                         continue;
@@ -721,7 +961,7 @@ impl Server {
         }
         let events = if armed { libc::EPOLLIN as u32 } else { 0 };
         if epoll_ctl(
-            self.epoll,
+            self.fds.epoll,
             libc::EPOLL_CTL_MOD,
             self.listener_fd,
             events,
@@ -772,7 +1012,7 @@ impl Server {
             }
             None => return,
         };
-        if epoll_ctl(self.epoll, libc::EPOLL_CTL_MOD, fd, changed, fd as u64).is_err() {
+        if epoll_ctl(self.fds.epoll, libc::EPOLL_CTL_MOD, fd, changed, fd as u64).is_err() {
             // A descriptor that cannot be modified is unusable.
             self.close(fd);
         }
@@ -783,7 +1023,7 @@ impl Server {
         if !self.conns.contains_key(&fd) {
             return;
         }
-        let _ = epoll_ctl(self.epoll, libc::EPOLL_CTL_DEL, fd, 0, fd as u64);
+        let _ = epoll_ctl(self.fds.epoll, libc::EPOLL_CTL_DEL, fd, 0, fd as u64);
         self.conns.remove(&fd);
         self.sync_listener();
     }

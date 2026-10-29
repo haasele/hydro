@@ -8,6 +8,20 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Performance — 2026-10-29 multithreaded epoll HTTP
+
+- `http.serve` can now run multiple `SO_REUSEPORT` listener/epoll shards
+  (`HYDRO_HTTP_LOOPS`, default 4, range 1..8). Each shard owns its listener,
+  eventfd, connection map and dynamic worker pool; connection caps split
+  exactly across shards and the total dynamic worker count stays at 64.
+  `HYDRO_HTTP_LOOPS=1` preserves the original single-listener path.
+- Eight epoll shards with 2048 connections certify **84.8k GET/s** on both
+  AOT and JIT (p99 21–29 ms, 0.75–0.78 CPU cores) versus 77.9k for four shards
+  and 68.4k for the single-loop/1024-budget configuration. Static GET still
+  bypasses Python; POST and GC rooting semantics are unchanged.
+- Added pre-bind `SO_REUSEADDR`/`SO_REUSEPORT` raw socket setup with complete
+  fd cleanup on bind/epoll/eventfd/thread-spawn failures.
+
 ### Performance — 2026-10-29 adaptive GC and native POST response
 
 - Added a self-tuning GC threshold controller. Without an explicit override it
