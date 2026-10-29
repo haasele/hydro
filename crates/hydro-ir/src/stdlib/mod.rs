@@ -193,6 +193,8 @@ pub static MODULES: &[&ModuleSpec] = &[
     &ZLIB,
     &MMAP,
     &HTTP,
+    &POSTGRES,
+    &MEMCACHED,
 ];
 
 pub fn module(name: &str) -> Option<&'static ModuleSpec> {

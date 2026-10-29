@@ -3701,6 +3701,27 @@ pub static HTTP: ModuleSpec = ModuleSpec {
     constants: &[],
 };
 
+/// `postgres`: native PostgreSQL v3 client used by the benchmark app.
+///
+/// Connections are capsule-backed and reconnect lazily. `insert` returns the
+/// integer `id` from `RETURNING id`; SQL identifiers are restricted and string
+/// values are escaped by the runtime, so callers do not splice SQL.
+pub static POSTGRES: ModuleSpec = ModuleSpec {
+    name: "postgres",
+    functions: &[f("connect", 4, 4, Type::Any), f("insert", 5, 5, Type::Int)],
+    constants: &[],
+};
+
+/// `memcached`: native ASCII protocol client used by the benchmark app.
+///
+/// A connection is a capsule; `set` returns `True` after a `STORED` reply and
+/// reconnects lazily after I/O or protocol failure.
+pub static MEMCACHED: ModuleSpec = ModuleSpec {
+    name: "memcached",
+    functions: &[f("connect", 2, 2, Type::Any), f("set", 4, 4, Type::Bool)],
+    constants: &[],
+};
+
 /// `inspect`: native introspection over the runtime's function/class/module
 /// representations.
 ///

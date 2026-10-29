@@ -8,6 +8,26 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Performance — 2026-10-29 event loop and native DB/cache
+
+- Replaced the native `http` thread-per-connection acceptor with a
+  level-triggered epoll event loop plus a 64-worker dynamic-request pool.
+  Static routes stay entirely on the event-loop thread; one dynamic request
+  per connection is queued, keep-alive/pipelining and partial writes are
+  preserved, and the connection cap disarms accept interest instead of
+  spinning.
+- Added native `postgres` and `memcached` modules: capsule-backed, lazily
+  reconnecting clients with bounded protocol reads, identifier/SQL-value
+  validation, GC-safe blocking socket calls, and no Python wire framing on
+  the benchmark POST path.
+- Benchmark impact (same-host, six-app harness): fixed 10k GET p99
+  0.64–0.65 ms at 0.10 CPU cores and 7–10 MiB RSS; fixed 1k POST p99
+  5.49–5.70 ms. POST capacity rose from 3.0–3.5k to 7.5–8.5k req/s; static
+  GET capacity is 35.9–43.9k, trading some peak GET throughput for the
+  event-loop/POST gains (six-app benchmark repository, `README.md`).
+- Added native parser and client protocol tests; workspace total is now
+  2322 tests (2321 run, 1 skipped).
+
 ### Performance — 2026-10-29 native HTTP fast path
 
 - Added native Rust `http.serve(port, routes, handler, max_connections)`:

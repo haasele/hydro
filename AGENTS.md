@@ -44,8 +44,8 @@ the `datetime.datetime_CAPI` capsule, keyword calls through vectorcall and
 `types.SimpleNamespace(**kwargs)` are fixed. pydantic model smoke still stops on
 lazy `pydantic.main` imports and unimplemented walrus-in-generator/dataclasses
 surface. These are semantic/object-model blockers, not link-time symbol gaps.
-**All-core gate:** `cargo nextest run --workspace` runs 2310 tests in ~3 s
-(2310 pass, 1 skipped; 2311 total) and is the default in `scripts/verify.sh`/CI; Cargo test
+**All-core gate:** `cargo nextest run --workspace` runs 2321 tests in ~3 s
+(2321 pass, 1 skipped; 2322 total) and is the default in `scripts/verify.sh`/CI; Cargo test
 binaries are no longer serial.
 
 **2026-10-26 checkpoint:** the four open construction sites received a
@@ -58,14 +58,14 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-10-29: **2310 tests run
-(2310 pass, 1 skipped)**; the per-crate listing totals 2311 including the
+`cargo nextest run --workspace` on 2026-10-29: **2321 tests run
+(2321 pass, 1 skipped)**; the per-crate listing totals 2322 including the
 skipped test:
 
 | Crate | Tests |
 |---|---:|
 | frontend | 755 |
-| runtime (unit + integration) | 1391 |
+| runtime (unit + integration) | 1402 |
 | codegen | 73 |
 | IR | 49 |
 | interpreter | 24 |

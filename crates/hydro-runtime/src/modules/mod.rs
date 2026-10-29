@@ -65,9 +65,11 @@ pub(crate) mod itertools;
 pub(crate) mod keyword;
 pub(crate) mod locale;
 pub(crate) mod marshal;
+pub(crate) mod memcached;
 pub(crate) mod mimetypes;
 pub(crate) mod mmap_mod;
 pub(crate) mod opcode;
+pub(crate) mod postgres;
 pub(crate) mod pytest;
 pub(crate) mod quopri;
 pub(crate) mod re;
@@ -2414,6 +2416,8 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "pickle" => pickle_call(function, args),
         "html" => html_call(function, args),
         "http" => http::call(function, args),
+        "postgres" => postgres::call(function, args),
+        "memcached" => memcached::call(function, args),
         "json" => json_call(function, args),
         "csv" => csv_call(function, args),
         "io" | "_io" => io_call(function, args),

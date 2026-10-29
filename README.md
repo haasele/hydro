@@ -295,8 +295,8 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 - `./scripts/verify.sh`: `cargo fmt --check`, Clippy (`-D warnings`), runtime
   build, **`cargo nextest run --workspace` on all cores**, fuzz smoke and the
-  offline CPython manifest check. The 2026-10-29 run covers 2310 tests
-  (2310 pass, 1 skipped; 2311 total). CLI/E2E/AOT gates live in the Tea repository.
+  offline CPython manifest check. The 2026-10-29 run covers 2321 tests
+  (2321 pass, 1 skipped; 2322 total). CLI/E2E/AOT gates live in the Tea repository.
 - CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Ubuntu, stable
   Rust, fmt/clippy/nextest/verify, no secrets).
 - Benchmarks: [`benchmarks/HYDRO.md`](benchmarks/HYDRO.md) describes readiness and

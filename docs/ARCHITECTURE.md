@@ -775,7 +775,8 @@ Central specification in `hydro_ir::stdlib` (`MODULES` in
 `os.path`, `_thread`, `threading`, `queue`, `multiprocessing`, `pickle`,
 `argparse`, `collections`, `re`, `socket`, `asyncio`, `errno`, `unittest`,
 `dataclasses`, `datetime`, `typing`, `abc`, `types`, `itertools`,
-`ast`, `fractions`, `importlib`, `http` and `__future__`.
+`ast`, `fractions`, `importlib`, `http`, `postgres`, `memcached` and
+`__future__`.
 
 Pure-Python standard library modules that need no native ABI are vendored from
 CPython 3.14.9 in the repository's `stdlib/` directory and imported like any
