@@ -3685,8 +3685,48 @@ pub(crate) fn as_interpolation(
 }
 
 /// The Python-visible name of a class object.
+///
+/// `ClassState.name` is frozen at creation, but `Cls.__name__ = name` is a
+/// writable slot in CPython (metaclasses such as `typing_extensions`'s
+/// `_TypedDictMeta` allocate a class under a placeholder name and rename it
+/// immediately). The runtime assignment lands in the overlay as a `str`
+/// value, so the display name reports it first and falls back to the frozen
+/// definition name. Strings are immutable, so the borrowed `'static` payload
+/// stays valid as long as the class keeps the overlay entry alive.
 pub(crate) fn class_display_name(v: i64) -> Option<&'static str> {
-    as_class(v).map(|state| state.name.as_str())
+    let state = as_class(v)?;
+    // Only the runtime assignment slot renames the class: a `__name__` entry
+    // in the class body is ordinary class data, shadowed by the metatype's
+    // `__name__` descriptor in CPython.
+    if let Some(name) = state.overlay.get("__name__") {
+        if let Some(text) = as_str(name) {
+            return Some(text);
+        }
+    }
+    Some(state.name.as_str())
+}
+
+/// `Cls.__qualname__`: the assigned qualname, else the display name.
+pub(crate) fn class_qualname(v: i64) -> Option<&'static str> {
+    as_class(v)?;
+    if let Some(ClassEntry::Attr(name)) = class_own_lookup(v, "__qualname__") {
+        if let Some(text) = as_str(name) {
+            return Some(text);
+        }
+    }
+    class_display_name(v)
+}
+
+/// `Cls.__annotate__`: the class's own PEP 649 annotation callable, or `NONE`
+/// when it declares none.
+///
+/// Like CPython's `type.__annotate__` getset, the lookup never walks the base
+/// chain: a subclass's annotations come from its own callable only.
+pub(crate) fn class_annotate(class: i64) -> i64 {
+    match class_own_lookup(class, "__annotate__") {
+        Some(ClassEntry::Attr(annotate)) | Some(ClassEntry::Method(_, annotate)) => annotate,
+        None => NONE,
+    }
 }
 
 /// True when `v` is an opaque handle naming an extension type object.
@@ -3729,7 +3769,7 @@ pub(crate) enum ClassEntry {
 
 /// Looks up `name` in the namespace of `class` only, honoring the
 /// post-creation overlay and deletion tombstones.
-fn own_class_lookup(class: i64, name: &str) -> Option<ClassEntry> {
+pub(crate) fn class_own_lookup(class: i64, name: &str) -> Option<ClassEntry> {
     let state = as_class(class)?;
     if state.is_deleted(name) {
         return None;
@@ -3754,12 +3794,12 @@ fn own_class_lookup(class: i64, name: &str) -> Option<ClassEntry> {
 /// defensive against a malformed heap object.
 pub(crate) fn class_lookup(class: i64, name: &str) -> Option<ClassEntry> {
     let state = as_class(class)?;
-    if let Some(entry) = own_class_lookup(class, name) {
+    if let Some(entry) = class_own_lookup(class, name) {
         return Some(entry);
     }
     if !state.mro.is_empty() {
         for &ancestor in &state.mro {
-            if let Some(entry) = own_class_lookup(ancestor, name) {
+            if let Some(entry) = class_own_lookup(ancestor, name) {
                 return Some(entry);
             }
         }
@@ -3772,7 +3812,7 @@ pub(crate) fn class_lookup(class: i64, name: &str) -> Option<ClassEntry> {
         if current == NONE {
             return None;
         }
-        if let Some(entry) = own_class_lookup(current, name) {
+        if let Some(entry) = class_own_lookup(current, name) {
             return Some(entry);
         }
         current = as_class(current)?.base;
@@ -3787,14 +3827,14 @@ pub(crate) fn class_lookup(class: i64, name: &str) -> Option<ClassEntry> {
 /// `type` default it inherits.
 pub(crate) fn class_lookup_owner(class: i64, name: &str) -> Option<i64> {
     let state = as_class(class)?;
-    if own_class_lookup(class, name).is_some() {
+    if class_own_lookup(class, name).is_some() {
         return Some(class);
     }
     state
         .mro
         .iter()
         .copied()
-        .find(|&ancestor| own_class_lookup(ancestor, name).is_some())
+        .find(|&ancestor| class_own_lookup(ancestor, name).is_some())
 }
 
 /// Looks up `name` in the MRO of `class` after the position of `start`.
@@ -3809,7 +3849,7 @@ pub(crate) fn class_lookup_after(class: i64, start: i64, name: &str) -> Option<C
         state.mro.iter().position(|&ancestor| ancestor == start)? + 1
     };
     for &ancestor in &state.mro[position.min(state.mro.len())..] {
-        if let Some(entry) = own_class_lookup(ancestor, name) {
+        if let Some(entry) = class_own_lookup(ancestor, name) {
             return Some(entry);
         }
     }
@@ -7616,7 +7656,7 @@ pub(crate) fn annotations_descriptor() -> i64 {
 /// return the same dictionary. Returns `None` when `class` is not a class.
 pub(crate) fn class_annotations(class: i64) -> Option<i64> {
     as_class(class)?;
-    match own_class_lookup(class, "__annotations__") {
+    match class_own_lookup(class, "__annotations__") {
         Some(ClassEntry::Attr(value)) => return Some(value),
         // A method-style entry is not an annotation mapping; never shadow it.
         Some(ClassEntry::Method(_, _)) => return None,
@@ -7916,9 +7956,7 @@ fn call_instance_dunder(instance: i64, function: i64) -> i64 {
 /// Deterministic default rendering of an instance: `<ClassName object>`.
 /// The heap address is deliberately omitted so output is reproducible.
 fn instance_default_repr(state: &InstanceState) -> String {
-    let name = as_class(state.class)
-        .map(|class| class.name.as_str())
-        .unwrap_or("instance");
+    let name = class_display_name(state.class).unwrap_or("instance");
     format!("<{name} object>")
 }
 
@@ -8160,7 +8198,10 @@ pub(crate) fn to_string(v: i64) -> String {
                     format!("<re.Match object; pattern={}>", quote_str(&state.pattern))
                 }
                 ObjDataRef::Socket(state) => state.render(),
-                ObjDataRef::Class(state) => format!("<class '{}'>", state.name),
+                ObjDataRef::Class(state) => format!(
+                    "<class '{}'>",
+                    class_display_name(v).unwrap_or(state.name.as_str())
+                ),
                 ObjDataRef::Instance(state) => {
                     let class = state.class;
                     if let Some(ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
@@ -8332,7 +8373,10 @@ fn repr_depth(v: i64, depth: usize) -> String {
         return format!("{class}({})", quote_str(state.path()));
     }
     if let Some(state) = as_class(v) {
-        return format!("<class '{}'>", state.name);
+        return format!(
+            "<class '{}'>",
+            class_display_name(v).unwrap_or(state.name.as_str())
+        );
     }
     if let Some(state) = as_module(v) {
         return format!("<module '{}'>", state.name);

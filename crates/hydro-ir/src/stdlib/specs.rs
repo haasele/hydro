@@ -23,6 +23,8 @@ pub static MATH: ModuleSpec = ModuleSpec {
         f("ceil", 1, 1, Type::Int),
         f("trunc", 1, 1, Type::Int),
         f("fabs", 1, 1, Type::Float),
+        // `modf(x)`: the `(fractional, integral)` pair, both as floats.
+        f("modf", 1, 1, Type::Tuple),
         // `copysign(x, y)`: magnitude of `x` with the sign of `y`.
         f("copysign", 2, 2, Type::Float),
         // `isqrt(n)`: integer square root of a non-negative integer.
@@ -168,6 +170,9 @@ const OPERATOR_FUNCTIONS: &[FunctionSpec] = &[
     f("ge", 2, 2, Type::Bool),
     // `operator.or_(a, b)`: bitwise/logical OR (`a | b`).
     f("or_", 2, 2, Type::Any),
+    // `operator.and_(a, b)` / `operator.xor(a, b)`: bitwise AND/XOR (`&`, `^`).
+    f("and_", 2, 2, Type::Any),
+    f("xor", 2, 2, Type::Any),
     f("neg", 1, 1, Type::Any),
     f("not_", 1, 1, Type::Bool),
     f("truth", 1, 1, Type::Bool),
@@ -218,6 +223,12 @@ pub static TIME: ModuleSpec = ModuleSpec {
         // `strftime(format[, t])`: formats either the given `struct_time` or
         // the current local time. Both parameters may be passed by name.
         kw("strftime", 1, 2, Type::Str, &["format", "t"]),
+        // `ctime([secs])`: the `asctime(localtime(secs))` spelling with an
+        // optional epoch-seconds argument.
+        f("ctime", 0, 1, Type::Str),
+        // `mktime(t)`: the inverse of `localtime`, an epoch-seconds float for
+        // a nine-field `struct_time` sequence.
+        f("mktime", 1, 1, Type::Float),
         f("tzset", 0, 0, Type::None),
     ],
     constants: &[
@@ -399,8 +410,33 @@ pub static OS_PATH: ModuleSpec = ModuleSpec {
         // keyword is parsed by the runtime).
         f("normcase", 1, 1, Type::Str),
         kw_dynamic("realpath", 1, 2, Type::Str, &["filename", "strict"]),
+        // `expandvars(path)`: `$name`/`${name}` expansion against the
+        // environment; str in, str out (bytes in, bytes out).
+        f("expandvars", 1, 1, Type::Any),
+        // `lexists(path)`: whether the path exists, without following a
+        // broken final symlink.
+        f("lexists", 1, 1, Type::Bool),
+        // `commonpath(paths)`/`commonprefix(paths)`: the result follows the
+        // operand flavour (`str` or `bytes`), so the type is dynamic.
+        f("commonpath", 1, 1, Type::Any),
+        f("commonprefix", 1, 1, Type::Any),
+        // `relpath(path, start=os.curdir)`: a relative path; bytes operands
+        // return bytes, hence the dynamic result type. `start` binds by name.
+        kw("relpath", 1, 2, Type::Any, &["path", "start"]),
     ],
-    constants: &[],
+    constants: &[
+        // The path-flavour constants, shared with `os` on POSIX.
+        c("sep", Type::Str),
+        // `altsep` is `None` on POSIX and `/` on Windows.
+        c("altsep", Type::Any),
+        c("pathsep", Type::Str),
+        c("extsep", Type::Str),
+        c("curdir", Type::Str),
+        c("pardir", Type::Str),
+        // CPython 3.14's `os.path.ALLOW_MISSING` sentinel: a unique instance
+        // used to distinguish "argument omitted" from an explicit `None`.
+        c("ALLOW_MISSING", Type::Any),
+    ],
 };
 
 pub static OS: ModuleSpec = ModuleSpec {
@@ -410,6 +446,8 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("getppid", 0, 0, Type::Int),
         f("cpu_count", 0, 0, Type::Int),
         f("getcwd", 0, 0, Type::Str),
+        // `getcwdb()`: the current directory as bytes.
+        f("getcwdb", 0, 0, Type::Bytes),
         f("getenv", 1, 2, Type::Any),
         // `os.fspath(path)`: str/bytes pass through, other objects are asked
         // for `__fspath__`. The result is str or bytes, which the runtime
@@ -419,6 +457,10 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("waitpid", 2, 2, Type::Tuple),
         f("_exit", 1, 1, Type::None),
         f("remove", 1, 1, Type::None),
+        // `unlink(path)`: the file-removal spelling. The runtime additionally
+        // accepts `dir_fd` through its supplemental member spec, but only the
+        // portable single-argument form is declared here.
+        f("unlink", 1, 1, Type::None),
         f("rename", 2, 2, Type::None),
         f("access", 2, 2, Type::Bool),
         // `os.urandom(n)`: `n` bytes from the OS entropy source.
@@ -460,6 +502,9 @@ pub static OS: ModuleSpec = ModuleSpec {
         // `os.makedirs(name, mode=0o777, exist_ok=False)`: recursive directory
         // creation. `exist_ok` tolerates only an existing directory.
         kw("makedirs", 1, 3, Type::None, &["name", "mode", "exist_ok"]),
+        // `os.mkdir(path, mode=0o777, *, dir_fd=None)`: a single directory
+        // level, created through `mkdir(2)` so `mode` is honoured.
+        kw("mkdir", 1, 3, Type::None, &["path", "mode", "dir_fd"]),
         // `os.system(command)`: runs a shell command and returns its wait
         // status.
         f("system", 1, 1, Type::Any),
@@ -476,6 +521,44 @@ pub static OS: ModuleSpec = ModuleSpec {
         // `os.stat_result`-shaped namespace.
         f("close", 1, 1, Type::None),
         f("fstat", 1, 1, Type::Any),
+        // `isatty(fd)`/`read(fd, n)`/`write(fd, data)`: descriptor-level
+        // queries and I/O. Every parameter of these C-level functions is
+        // positional-only, so no keyword names are declared.
+        f("isatty", 1, 1, Type::Bool),
+        f("read", 2, 2, Type::Bytes),
+        f("write", 2, 2, Type::Int),
+        // `fdopen(fd, mode='r', buffering=-1, encoding=None, errors=None,
+        // newline=None, closefd=True, opener=None)`: CPython's Python-level
+        // wrapper exposes all eight names. The runtime consumes the first
+        // three and ignores the rest, which stay declared so call sites bind.
+        kw(
+            "fdopen",
+            1,
+            8,
+            Type::Any,
+            &[
+                "fd",
+                "mode",
+                "buffering",
+                "encoding",
+                "errors",
+                "newline",
+                "closefd",
+                "opener",
+            ],
+        ),
+        // `readlink(path, *, dir_fd=None)`: the link target. `dir_fd` has a
+        // positional slot for the frontend binder; the runtime accepts it at
+        // that slot but only supports `None` (no descriptor-relative lookup).
+        kw("readlink", 1, 2, Type::Any, &["path", "dir_fd"]),
+        // `strerror(code)`: the system message for an errno value.
+        f("strerror", 1, 1, Type::Str),
+        // `scandir(path='.')`: an iterator of `os.DirEntry` values. The
+        // argument may be passed by name (CPython's wrapper is Python code).
+        kw("scandir", 0, 1, Type::Any, &["path"]),
+        // Descriptor inheritance flags.
+        f("set_inheritable", 2, 2, Type::None),
+        f("get_inheritable", 1, 1, Type::Bool),
     ],
     constants: &[
         c("name", Type::Str),
@@ -490,6 +573,8 @@ pub static OS: ModuleSpec = ModuleSpec {
         // search path.
         c("altsep", Type::Any),
         c("defpath", Type::Str),
+        // `os.extsep`: the extension separator (`.`).
+        c("extsep", Type::Str),
         // `os.WNOHANG`: the non-blocking flag for the `waitpid` family.
         c("WNOHANG", Type::Int),
         c("F_OK", Type::Int),
@@ -505,6 +590,527 @@ pub static OS: ModuleSpec = ModuleSpec {
         c("O_APPEND", Type::Int),
         c("O_CLOEXEC", Type::Int),
         c("O_NOCTTY", Type::Int),
+        // The remaining `os.open` flags.
+        c("O_EXCL", Type::Int),
+        c("O_NOFOLLOW", Type::Int),
+        c("O_DIRECTORY", Type::Int),
+        c("O_SYNC", Type::Int),
+        c("O_DSYNC", Type::Int),
+        c("O_ASYNC", Type::Int),
+        c("O_NONBLOCK", Type::Int),
+        c("O_NDELAY", Type::Int),
+        c("O_ACCMODE", Type::Int),
+    ],
+};
+
+/// `pwd`: the Unix password database. Every query returns a `struct_passwd`
+/// namespace (`pw_name`, `pw_passwd`, `pw_uid`, `pw_gid`, `pw_gecos`,
+/// `pw_dir`, `pw_shell`), which is why the result type is dynamic.
+pub static PWD: ModuleSpec = ModuleSpec {
+    name: "pwd",
+    functions: &[
+        // `struct_passwd(sequence)`: builds the namespace from the seven
+        // documented fields, which the runtime requires as one sequence.
+        f("struct_passwd", 1, 1, Type::Any),
+        f("getpwnam", 1, 1, Type::Any),
+        f("getpwuid", 1, 1, Type::Any),
+        f("getpwall", 0, 0, Type::List),
+    ],
+    constants: &[],
+};
+
+/// `grp`: the Unix group database. Queries return a `struct_group` namespace
+/// (`gr_name`, `gr_passwd`, `gr_gid`, `gr_mem`); `getgrall` returns a list of
+/// them.
+pub static GRP: ModuleSpec = ModuleSpec {
+    name: "grp",
+    functions: &[
+        f("struct_group", 1, 1, Type::Any),
+        f("getgrnam", 1, 1, Type::Any),
+        f("getgrgid", 1, 1, Type::Any),
+        f("getgrall", 0, 0, Type::List),
+    ],
+    constants: &[],
+};
+
+/// `resource`: process resource limits and usage. `getrlimit` returns the
+/// `(soft, hard)` pair and `getrusage` a `struct_rusage` namespace; every
+/// constant is an integer selector or limit value.
+pub static RESOURCE: ModuleSpec = ModuleSpec {
+    name: "resource",
+    functions: &[
+        f("getrlimit", 1, 1, Type::Tuple),
+        f("setrlimit", 2, 2, Type::None),
+        f("getrusage", 1, 1, Type::Any),
+        f("getpagesize", 0, 0, Type::Int),
+    ],
+    constants: &[
+        c("RLIM_INFINITY", Type::Int),
+        // Limits available on every supported Unix.
+        c("RLIMIT_CPU", Type::Int),
+        c("RLIMIT_FSIZE", Type::Int),
+        c("RLIMIT_DATA", Type::Int),
+        c("RLIMIT_STACK", Type::Int),
+        c("RLIMIT_CORE", Type::Int),
+        c("RLIMIT_RSS", Type::Int),
+        c("RLIMIT_NPROC", Type::Int),
+        c("RLIMIT_NOFILE", Type::Int),
+        c("RLIMIT_MEMLOCK", Type::Int),
+        c("RLIMIT_AS", Type::Int),
+        // Linux/Android extras.
+        c("RLIMIT_LOCKS", Type::Int),
+        c("RLIMIT_SIGPENDING", Type::Int),
+        c("RLIMIT_MSGQUEUE", Type::Int),
+        c("RLIMIT_NICE", Type::Int),
+        c("RLIMIT_RTPRIO", Type::Int),
+        c("RLIMIT_RTTIME", Type::Int),
+        // `getrusage` selectors.
+        c("RUSAGE_SELF", Type::Int),
+        c("RUSAGE_CHILDREN", Type::Int),
+        c("RUSAGE_THREAD", Type::Int),
+    ],
+};
+
+/// `fcntl`: descriptor control, advisory locks and `ioctl`. The commands are
+/// integer constants from the platform C library.
+pub static FCNTL: ModuleSpec = ModuleSpec {
+    name: "fcntl",
+    functions: &[
+        f("fcntl", 2, 3, Type::Any),
+        f("ioctl", 2, 4, Type::Any),
+        f("flock", 2, 2, Type::None),
+        f("lockf", 2, 5, Type::None),
+    ],
+    constants: &[
+        c("F_DUPFD", Type::Int),
+        c("F_GETFD", Type::Int),
+        c("F_SETFD", Type::Int),
+        c("F_GETFL", Type::Int),
+        c("F_SETFL", Type::Int),
+        c("F_GETLK", Type::Int),
+        c("F_SETLK", Type::Int),
+        c("F_SETLKW", Type::Int),
+        c("F_GETOWN", Type::Int),
+        c("F_SETOWN", Type::Int),
+        // Linux/Android extras beyond the portable set.
+        c("F_GETSIG", Type::Int),
+        c("F_SETSIG", Type::Int),
+        c("F_SETLEASE", Type::Int),
+        c("F_GETLEASE", Type::Int),
+        c("F_NOTIFY", Type::Int),
+        c("F_DUPFD_CLOEXEC", Type::Int),
+        c("F_SETPIPE_SZ", Type::Int),
+        c("F_GETPIPE_SZ", Type::Int),
+        c("F_ADD_SEALS", Type::Int),
+        c("F_GET_SEALS", Type::Int),
+        // Descriptor flag and `flock(2)` operation bits.
+        c("FD_CLOEXEC", Type::Int),
+        c("LOCK_SH", Type::Int),
+        c("LOCK_EX", Type::Int),
+        c("LOCK_NB", Type::Int),
+        c("LOCK_UN", Type::Int),
+    ],
+};
+
+/// `syslog`: the Unix system logger. Constants are the priorities, facilities
+/// and `openlog` options.
+pub static SYSLOG: ModuleSpec = ModuleSpec {
+    name: "syslog",
+    functions: &[
+        f("openlog", 0, 3, Type::None),
+        f("syslog", 1, 2, Type::None),
+        f("closelog", 0, 0, Type::None),
+        f("setlogmask", 1, 1, Type::Int),
+    ],
+    constants: &[
+        // Priorities.
+        c("LOG_EMERG", Type::Int),
+        c("LOG_ALERT", Type::Int),
+        c("LOG_CRIT", Type::Int),
+        c("LOG_ERR", Type::Int),
+        c("LOG_WARNING", Type::Int),
+        c("LOG_NOTICE", Type::Int),
+        c("LOG_INFO", Type::Int),
+        c("LOG_DEBUG", Type::Int),
+        // Facilities.
+        c("LOG_KERN", Type::Int),
+        c("LOG_USER", Type::Int),
+        c("LOG_MAIL", Type::Int),
+        c("LOG_DAEMON", Type::Int),
+        c("LOG_AUTH", Type::Int),
+        c("LOG_SYSLOG", Type::Int),
+        c("LOG_LPR", Type::Int),
+        c("LOG_NEWS", Type::Int),
+        c("LOG_UUCP", Type::Int),
+        c("LOG_CRON", Type::Int),
+        c("LOG_AUTHPRIV", Type::Int),
+        c("LOG_FTP", Type::Int),
+        c("LOG_LOCAL0", Type::Int),
+        c("LOG_LOCAL1", Type::Int),
+        c("LOG_LOCAL2", Type::Int),
+        c("LOG_LOCAL3", Type::Int),
+        c("LOG_LOCAL4", Type::Int),
+        c("LOG_LOCAL5", Type::Int),
+        c("LOG_LOCAL6", Type::Int),
+        c("LOG_LOCAL7", Type::Int),
+        // `openlog` options.
+        c("LOG_PID", Type::Int),
+        c("LOG_CONS", Type::Int),
+        c("LOG_ODELAY", Type::Int),
+        c("LOG_NDELAY", Type::Int),
+        c("LOG_NOWAIT", Type::Int),
+        c("LOG_PERROR", Type::Int),
+    ],
+};
+
+/// `_signal`: the C accelerator behind `signal`. All functions are
+/// positional-only, as in CPython's C module; `SIGRTMIN`/`SIGRTMAX`/`NSIG` are
+/// computed by the runtime, and `ItimerError` is an exception class.
+pub static _SIGNAL: ModuleSpec = ModuleSpec {
+    name: "_signal",
+    functions: &[
+        f("signal", 2, 2, Type::Any),
+        f("getsignal", 1, 1, Type::Any),
+        f("raise_signal", 1, 1, Type::None),
+        f("strsignal", 1, 1, Type::Any),
+        f("valid_signals", 0, 0, Type::Set),
+        f("pthread_sigmask", 2, 2, Type::Set),
+        // `sigwait(sigset)`: blocks until a signal from the set arrives and
+        // returns its number.
+        f("sigwait", 1, 1, Type::Int),
+        f("alarm", 1, 1, Type::Int),
+        f("pause", 0, 0, Type::None),
+        f("setitimer", 2, 3, Type::Tuple),
+        f("getitimer", 1, 1, Type::Tuple),
+        f("siginterrupt", 2, 2, Type::None),
+        // `sigpending()`: the set of signals pending delivery to the thread.
+        f("sigpending", 0, 0, Type::Set),
+        // `default_int_handler(signum, frame)` always raises
+        // `KeyboardInterrupt`, so it never returns.
+        f("default_int_handler", 2, 2, Type::Never),
+    ],
+    constants: &[
+        c("SIGHUP", Type::Int),
+        c("SIGINT", Type::Int),
+        c("SIGQUIT", Type::Int),
+        c("SIGILL", Type::Int),
+        c("SIGTRAP", Type::Int),
+        c("SIGABRT", Type::Int),
+        c("SIGIOT", Type::Int),
+        c("SIGBUS", Type::Int),
+        c("SIGFPE", Type::Int),
+        c("SIGKILL", Type::Int),
+        c("SIGUSR1", Type::Int),
+        c("SIGSEGV", Type::Int),
+        c("SIGUSR2", Type::Int),
+        c("SIGPIPE", Type::Int),
+        c("SIGALRM", Type::Int),
+        c("SIGTERM", Type::Int),
+        c("SIGSTKFLT", Type::Int),
+        c("SIGCHLD", Type::Int),
+        c("SIGCLD", Type::Int),
+        c("SIGCONT", Type::Int),
+        c("SIGSTOP", Type::Int),
+        c("SIGTSTP", Type::Int),
+        c("SIGTTIN", Type::Int),
+        c("SIGTTOU", Type::Int),
+        c("SIGURG", Type::Int),
+        c("SIGXCPU", Type::Int),
+        c("SIGXFSZ", Type::Int),
+        c("SIGVTALRM", Type::Int),
+        c("SIGPROF", Type::Int),
+        c("SIGWINCH", Type::Int),
+        c("SIGIO", Type::Int),
+        c("SIGPOLL", Type::Int),
+        c("SIGPWR", Type::Int),
+        c("SIGSYS", Type::Int),
+        c("SIG_DFL", Type::Int),
+        c("SIG_IGN", Type::Int),
+        c("SIG_BLOCK", Type::Int),
+        c("SIG_UNBLOCK", Type::Int),
+        c("SIG_SETMASK", Type::Int),
+        c("ITIMER_REAL", Type::Int),
+        c("ITIMER_VIRTUAL", Type::Int),
+        c("ITIMER_PROF", Type::Int),
+        c("SIGRTMIN", Type::Int),
+        c("SIGRTMAX", Type::Int),
+        c("NSIG", Type::Int),
+        c("ItimerError", Type::Any),
+    ],
+};
+
+/// `termios`: the POSIX terminal control interface. Every flag, speed and
+/// control-character index is an integer constant; `error` is the exception
+/// class raised for terminal failures.
+pub static TERMIOS: ModuleSpec = ModuleSpec {
+    name: "termios",
+    functions: &[
+        f("tcgetattr", 1, 1, Type::List),
+        f("tcsetattr", 3, 3, Type::None),
+        f("tcsendbreak", 2, 2, Type::None),
+        f("tcdrain", 1, 1, Type::None),
+        f("tcflush", 2, 2, Type::None),
+        f("tcflow", 2, 2, Type::None),
+        f("tcgetwinsize", 1, 1, Type::Tuple),
+        f("tcsetwinsize", 2, 2, Type::None),
+    ],
+    constants: &[
+        // Input flags.
+        c("IGNBRK", Type::Int),
+        c("BRKINT", Type::Int),
+        c("IGNPAR", Type::Int),
+        c("PARMRK", Type::Int),
+        c("INPCK", Type::Int),
+        c("ISTRIP", Type::Int),
+        c("INLCR", Type::Int),
+        c("IGNCR", Type::Int),
+        c("ICRNL", Type::Int),
+        c("IUCLC", Type::Int),
+        c("IXON", Type::Int),
+        c("IXANY", Type::Int),
+        c("IXOFF", Type::Int),
+        c("IMAXBEL", Type::Int),
+        c("IUTF8", Type::Int),
+        c("OPOST", Type::Int),
+        // Output flags and delays.
+        c("OLCUC", Type::Int),
+        c("ONLCR", Type::Int),
+        c("OCRNL", Type::Int),
+        c("ONOCR", Type::Int),
+        c("ONLRET", Type::Int),
+        c("OFILL", Type::Int),
+        c("OFDEL", Type::Int),
+        c("NLDLY", Type::Int),
+        c("NL0", Type::Int),
+        c("NL1", Type::Int),
+        c("CRDLY", Type::Int),
+        c("CR0", Type::Int),
+        c("CR1", Type::Int),
+        c("CR2", Type::Int),
+        c("CR3", Type::Int),
+        c("TABDLY", Type::Int),
+        c("TAB0", Type::Int),
+        c("TAB1", Type::Int),
+        c("TAB2", Type::Int),
+        c("TAB3", Type::Int),
+        c("XTABS", Type::Int),
+        c("BSDLY", Type::Int),
+        c("BS0", Type::Int),
+        c("BS1", Type::Int),
+        c("VTDLY", Type::Int),
+        c("VT0", Type::Int),
+        c("VT1", Type::Int),
+        c("FFDLY", Type::Int),
+        c("FF0", Type::Int),
+        c("FF1", Type::Int),
+        c("CBAUD", Type::Int),
+        c("CBAUDEX", Type::Int),
+        c("CIBAUD", Type::Int),
+        c("CSIZE", Type::Int),
+        c("CS5", Type::Int),
+        c("CS6", Type::Int),
+        c("CS7", Type::Int),
+        c("CS8", Type::Int),
+        c("CSTOPB", Type::Int),
+        c("CREAD", Type::Int),
+        // Control modes.
+        c("PARENB", Type::Int),
+        c("PARODD", Type::Int),
+        c("HUPCL", Type::Int),
+        c("CLOCAL", Type::Int),
+        c("CRTSCTS", Type::Int),
+        c("ISIG", Type::Int),
+        c("ICANON", Type::Int),
+        c("XCASE", Type::Int),
+        c("ECHO", Type::Int),
+        c("ECHOE", Type::Int),
+        c("ECHOK", Type::Int),
+        c("ECHONL", Type::Int),
+        c("NOFLSH", Type::Int),
+        c("TOSTOP", Type::Int),
+        c("ECHOCTL", Type::Int),
+        c("ECHOPRT", Type::Int),
+        c("ECHOKE", Type::Int),
+        c("FLUSHO", Type::Int),
+        c("PENDIN", Type::Int),
+        c("IEXTEN", Type::Int),
+        c("EXTPROC", Type::Int),
+        c("VINTR", Type::Int),
+        c("VQUIT", Type::Int),
+        c("VERASE", Type::Int),
+        // Control-character indices.
+        c("VKILL", Type::Int),
+        c("VEOF", Type::Int),
+        c("VTIME", Type::Int),
+        c("VMIN", Type::Int),
+        c("VSWTC", Type::Int),
+        c("VSWTCH", Type::Int),
+        c("VSTART", Type::Int),
+        c("VSTOP", Type::Int),
+        c("VSUSP", Type::Int),
+        c("VEOL", Type::Int),
+        c("VREPRINT", Type::Int),
+        c("VDISCARD", Type::Int),
+        c("VWERASE", Type::Int),
+        c("VLNEXT", Type::Int),
+        c("VEOL2", Type::Int),
+        c("CINTR", Type::Int),
+        c("CQUIT", Type::Int),
+        c("CERASE", Type::Int),
+        c("CKILL", Type::Int),
+        c("CEOF", Type::Int),
+        c("CEOL", Type::Int),
+        c("CEOT", Type::Int),
+        c("CSTART", Type::Int),
+        c("CSTOP", Type::Int),
+        c("CSUSP", Type::Int),
+        c("CDSUSP", Type::Int),
+        c("CRPRNT", Type::Int),
+        c("CWERASE", Type::Int),
+        c("CFLUSH", Type::Int),
+        c("CLNEXT", Type::Int),
+        c("_POSIX_VDISABLE", Type::Int),
+        c("B0", Type::Int),
+        // Baud rates.
+        c("B50", Type::Int),
+        c("B75", Type::Int),
+        c("B110", Type::Int),
+        c("B134", Type::Int),
+        c("B150", Type::Int),
+        c("B200", Type::Int),
+        c("B300", Type::Int),
+        c("B600", Type::Int),
+        c("B1200", Type::Int),
+        c("B1800", Type::Int),
+        c("B2400", Type::Int),
+        c("B4800", Type::Int),
+        c("B9600", Type::Int),
+        c("B19200", Type::Int),
+        c("B38400", Type::Int),
+        c("EXTA", Type::Int),
+        c("EXTB", Type::Int),
+        c("B57600", Type::Int),
+        c("B115200", Type::Int),
+        c("B230400", Type::Int),
+        c("B460800", Type::Int),
+        c("B500000", Type::Int),
+        c("B576000", Type::Int),
+        c("B921600", Type::Int),
+        c("B1000000", Type::Int),
+        c("B1152000", Type::Int),
+        c("B1500000", Type::Int),
+        c("B2000000", Type::Int),
+        c("B2500000", Type::Int),
+        c("B3000000", Type::Int),
+        c("B3500000", Type::Int),
+        c("B4000000", Type::Int),
+        c("B7200", Type::Int),
+        c("B14400", Type::Int),
+        c("B28800", Type::Int),
+        c("B76800", Type::Int),
+        // Line disciplines, queue selectors and ioctl request numbers.
+        c("NCCS", Type::Int),
+        c("N_TTY", Type::Int),
+        c("N_SLIP", Type::Int),
+        c("N_MOUSE", Type::Int),
+        c("N_PPP", Type::Int),
+        c("N_STRIP", Type::Int),
+        c("TCSANOW", Type::Int),
+        c("TCSADRAIN", Type::Int),
+        c("TCSAFLUSH", Type::Int),
+        c("TCIFLUSH", Type::Int),
+        c("TCOFLUSH", Type::Int),
+        c("TCIOFLUSH", Type::Int),
+        c("TCOOFF", Type::Int),
+        c("TCOON", Type::Int),
+        c("TCIOFF", Type::Int),
+        c("TCION", Type::Int),
+        c("TCGETS", Type::Int),
+        c("TCSETS", Type::Int),
+        c("TCSETSW", Type::Int),
+        c("TCSETSF", Type::Int),
+        c("TCGETA", Type::Int),
+        c("TCSETA", Type::Int),
+        c("TCSETAW", Type::Int),
+        c("TCSETAF", Type::Int),
+        c("TCSBRK", Type::Int),
+        c("TCXONC", Type::Int),
+        c("TCFLSH", Type::Int),
+        c("TCSBRKP", Type::Int),
+        c("TIOCEXCL", Type::Int),
+        c("TIOCNXCL", Type::Int),
+        c("TIOCSCTTY", Type::Int),
+        c("TIOCGPGRP", Type::Int),
+        c("TIOCSPGRP", Type::Int),
+        c("TIOCOUTQ", Type::Int),
+        c("TIOCSTI", Type::Int),
+        c("TIOCGWINSZ", Type::Int),
+        c("TIOCSWINSZ", Type::Int),
+        c("TIOCNOTTY", Type::Int),
+        c("TIOCMGET", Type::Int),
+        c("TIOCMSET", Type::Int),
+        c("FIONREAD", Type::Int),
+        c("TIOCINQ", Type::Int),
+        c("FIONBIO", Type::Int),
+        c("FIOCLEX", Type::Int),
+        c("FIONCLEX", Type::Int),
+        c("FIOASYNC", Type::Int),
+        // `termios.error`: the exception class for terminal failures.
+        c("error", Type::Any),
+    ],
+};
+
+/// `array`: the compact homogeneous array type. The constructor is keyword
+/// dynamic (`array(typecode[, initializer])`), and `typecodes` is the module's
+/// supported type-code string.
+pub static ARRAY: ModuleSpec = ModuleSpec {
+    name: "array",
+    functions: &[kw_dynamic("array", 1, 2, Type::Any, &[])],
+    constants: &[c("typecodes", Type::Str)],
+};
+
+/// `cmath`: complex-number versions of the `math` functions. Unary functions
+/// return `complex` (even for real results), `phase` returns a float,
+/// `polar` a `(r, phi)` pair and `rect` a complex value; the constants mirror
+/// `math` plus the imaginary `infj`/`nanj`.
+pub static CMATH: ModuleSpec = ModuleSpec {
+    name: "cmath",
+    functions: &[
+        f("acos", 1, 1, Type::Complex),
+        f("acosh", 1, 1, Type::Complex),
+        f("asin", 1, 1, Type::Complex),
+        f("asinh", 1, 1, Type::Complex),
+        f("atan", 1, 1, Type::Complex),
+        f("atanh", 1, 1, Type::Complex),
+        f("cos", 1, 1, Type::Complex),
+        f("cosh", 1, 1, Type::Complex),
+        f("exp", 1, 1, Type::Complex),
+        f("sin", 1, 1, Type::Complex),
+        f("sinh", 1, 1, Type::Complex),
+        f("sqrt", 1, 1, Type::Complex),
+        f("tan", 1, 1, Type::Complex),
+        f("tanh", 1, 1, Type::Complex),
+        f("log10", 1, 1, Type::Complex),
+        // `log(z[, base])`: the optional base keeps the complex result type.
+        f("log", 1, 2, Type::Complex),
+        f("phase", 1, 1, Type::Float),
+        f("polar", 1, 1, Type::Tuple),
+        f("rect", 2, 2, Type::Complex),
+        f("isfinite", 1, 1, Type::Bool),
+        f("isinf", 1, 1, Type::Bool),
+        f("isnan", 1, 1, Type::Bool),
+        // `isclose(a, b, *, rel_tol=1e-09, abs_tol=0.0)`: both tolerances are
+        // keyword-only, so the runtime binds them (`dynamic_keywords`).
+        kw_dynamic("isclose", 2, 4, Type::Bool, &[]),
+    ],
+    constants: &[
+        c("pi", Type::Float),
+        c("e", Type::Float),
+        c("tau", Type::Float),
+        c("inf", Type::Float),
+        c("nan", Type::Float),
+        c("infj", Type::Complex),
+        c("nanj", Type::Complex),
     ],
 };
 
@@ -526,6 +1132,9 @@ pub static THREADING: ModuleSpec = ModuleSpec {
         f("_threadbase_join", 1, 2, Type::None),
         f("_threadbase_is_alive", 1, 1, Type::Bool),
         f("_threadbase_run", 1, 1, Type::None),
+        // `threading.settrace(func)`: install the per-thread trace hook. It
+        // exists for imports; Hydro has no trace callback machinery.
+        f("settrace", 1, 1, Type::None),
     ],
     constants: &[
         // Empty base class; Hydro has no per-thread attribute storage.
@@ -624,6 +1233,26 @@ pub static PICKLE: ModuleSpec = ModuleSpec {
             Type::Any,
             &["file", "fix_imports", "encoding", "errors", "buffers"],
         ),
+        // `Pickler(file, protocol=None, *, fix_imports=True,
+        // buffer_callback=None)`: the streaming writer class. Declared as a
+        // module function so `pickle.Pickler(...)` lowers as a module call;
+        // the runtime value is the class.
+        kw("Pickler", 1, 2, Type::Any, &["file", "protocol"]),
+        // `pickle._Pickler`: CPython's pure-Python writer; HYD1 has one
+        // writer, so both spellings are the same class.
+        kw("_Pickler", 1, 2, Type::Any, &["file", "protocol"]),
+        // `Unpickler(file, *, fix_imports=True, encoding="ASCII",
+        // errors="strict", buffers=None)`: the streaming reader. Declared as
+        // a module function so `pickle.Unpickler(...)` lowers as a module
+        // call; the runtime value is the cached class and applies its own
+        // defaults for the keyword-only options.
+        kw(
+            "Unpickler",
+            1,
+            5,
+            Type::Any,
+            &["file", "fix_imports", "encoding", "errors", "buffers"],
+        ),
         // `decode_long(data, bytes=None)`: the `pickletools` helper that
         // rebuilds a little-endian two's-complement integer. `bytes` is a
         // keyword-only compatibility slot.
@@ -631,8 +1260,19 @@ pub static PICKLE: ModuleSpec = ModuleSpec {
     ],
     constants: &[
         // `pickle.DEFAULT_PROTOCOL`: the protocol `dump`/`dumps` use when none
-        // is given.
+        // is given; `HIGHEST_PROTOCOL` is the newest one this runtime writes.
         c("DEFAULT_PROTOCOL", Type::Int),
+        c("HIGHEST_PROTOCOL", Type::Int),
+        // `pickle.__all__`: the exported name list (`from pickle import *`).
+        c("__all__", Type::List),
+        // The pickling exception classes; the runtime maps all three to its
+        // cached pickling-error class.
+        c("PickleError", Type::Any),
+        c("PicklingError", Type::Any),
+        c("UnpicklingError", Type::Any),
+        // `pickle.bytes_types`: the byte-like types `loads` accepts
+        // (`(bytes, bytearray)` in CPython).
+        c("bytes_types", Type::Any),
     ],
 };
 
@@ -644,6 +1284,9 @@ pub static SYS: ModuleSpec = ModuleSpec {
         // the exception being handled; `sys.excepthook` is the default hook
         // `sys.excepthook(type, value, traceback)`.
         f("exc_info", 0, 0, Type::Tuple),
+        // `sys.exception()`: the instance of the exception being handled
+        // (`None` outside a handler), the `exc_info()[1]` shorthand.
+        f("exception", 0, 0, Type::Any),
         f("excepthook", 3, 3, Type::None),
         // Process-wide recursion limit. `setrecursionlimit` validates the new
         // limit like CPython (integer, above the current recursion depth) and
@@ -673,9 +1316,16 @@ pub static SYS: ModuleSpec = ModuleSpec {
         f("get_int_max_str_digits", 0, 0, Type::Int),
         f("getswitchinterval", 0, 0, Type::Float),
         f("setswitchinterval", 1, 1, Type::None),
+        // `settrace(function)` / `setprofile(function)`: install (or clear,
+        // with `None`) the global trace/profile callbacks. Hydro's runtime
+        // has no callback hooks yet, so the names exist for imports.
+        f("settrace", 1, 1, Type::None),
+        f("setprofile", 1, 1, Type::None),
     ],
     constants: &[
         c("argv", Type::List),
+        // `sys.float_info`: the platform IEEE-754 binary64 limits.
+        c("float_info", Type::Any),
         // Process-wide importer cache; native modules and path entries may
         // stay absent, but the dict identity is stable.
         c("path_importer_cache", Type::Dict),
@@ -712,6 +1362,11 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("path", Type::List),
         c("modules", Type::Dict),
         c("builtin_module_names", Type::Tuple),
+        // `sys.stdlib_module_names`: the frozenset of standard-library module
+        // names this interpreter knows.
+        c("stdlib_module_names", Type::Set),
+        // `sys.path_hooks`: the path-entry finder hook list.
+        c("path_hooks", Type::List),
         // `sys.flags`: the interpreter's command-line flag namespace.
         c("flags", Type::Any),
         // `sys.monitoring`/`sys.meta_path`: the monitor tool registry and the
@@ -752,7 +1407,9 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("repr", 1, 1, Type::Str),
         f("ascii", 1, 1, Type::Str),
         f("hash", 1, 1, Type::Int),
-        f("int", 0, 2, Type::Int),
+        // `int(x=0, base=10)`: `base` is keyword-bindable (CPython rejects a
+        // keyword `x`, but the slot binder cannot express that split).
+        kw("int", 0, 2, Type::Int, &["x", "base"]),
         f("float", 0, 1, Type::Float),
         f("abs", 1, 1, Type::Any),
         f("bool", 0, 1, Type::Bool),
@@ -780,7 +1437,9 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         // entry layered on top (`dict(a=1)`, `dict({'a': 1}, b=2)`).
         kw_dynamic("dict", 0, 1, Type::Dict, &[]),
         f("sum", 1, 2, Type::Any),
-        f("enumerate", 1, 2, Type::Any),
+        // `enumerate(iterable, start=0)`: the starting count may be passed by
+        // name.
+        kw("enumerate", 1, 2, Type::Any, &["iterable", "start"]),
         f("zip", 0, usize::MAX, Type::Any),
         f("map", 2, usize::MAX, Type::Any),
         f("filter", 2, 2, Type::Any),
@@ -794,7 +1453,9 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("min", 1, usize::MAX, Type::Any),
         f("sorted", 1, 1, Type::List),
         f("round", 1, 2, Type::Any),
-        f("format", 2, 2, Type::Str),
+        // `format(value, format_spec='')`: the specification defaults to the
+        // empty string.
+        kw("format", 1, 2, Type::Str, &["value", "format_spec"]),
         f("isinstance", 2, 2, Type::Bool),
         f("all", 1, 1, Type::Bool),
         f("any", 1, 1, Type::Bool),
@@ -834,9 +1495,41 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("vars", 0, 1, Type::Dict),
         f("globals", 0, 0, Type::Dict),
         f("locals", 0, 0, Type::Dict),
-        f("compile", 3, 6, Type::Any),
+        // `compile(source, filename, mode, flags=0, dont_inherit=False,
+        // optimize=-1, *, _feature_version=-1)`: every parameter binds by
+        // name.
+        kw(
+            "compile",
+            3,
+            6,
+            Type::Any,
+            &[
+                "source",
+                "filename",
+                "mode",
+                "flags",
+                "dont_inherit",
+                "optimize",
+            ],
+        ),
         f("issubclass", 2, 2, Type::Bool),
-        f("open", 1, 5, Type::Any),
+        // The builtins spelling of `io.open`; same CPython parameter list.
+        kw(
+            "open",
+            1,
+            8,
+            Type::Any,
+            &[
+                "file",
+                "mode",
+                "buffering",
+                "encoding",
+                "errors",
+                "newline",
+                "closefd",
+                "opener",
+            ],
+        ),
         // Internal native method bodies attached to the cached object/scalar
         // classes. They are not part of CPython's builtins namespace, but the
         // module dispatcher must be able to resolve a bound method value.
@@ -877,6 +1570,8 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         c("ConnectionRefusedError", Type::Any),
         c("ConnectionResetError", Type::Any),
         c("DeprecationWarning", Type::Any),
+        // Python 3.10's encoding warning, also re-exported by `warnings`.
+        c("EncodingWarning", Type::Any),
         c("EOFError", Type::Any),
         c("ExceptionGroup", Type::Any),
         c("FileExistsError", Type::Any),
@@ -956,12 +1651,24 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
 
 /// `io` and `_io` share the same function table.
 const IO_FUNCTIONS: &[FunctionSpec] = &[
+    // `open(file, mode='r', buffering=-1, encoding=None, errors=None,
+    // newline=None, closefd=True, opener=None)`: every CPython parameter is
+    // declared in signature order so keyword calls bind to the right slot.
     kw(
         "open",
         1,
-        5,
+        8,
         Type::Any,
-        &["file", "mode", "encoding", "newline", "errors"],
+        &[
+            "file",
+            "mode",
+            "buffering",
+            "encoding",
+            "errors",
+            "newline",
+            "closefd",
+            "opener",
+        ],
     ),
     // In-memory text and binary streams. Declared as functions so
     // `io.StringIO(...)` lowers as a module call; the runtime value is the
@@ -1074,6 +1781,9 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
     ],
     constants: &[
         c("SUPPRESS", Type::Any),
+        // `argparse.REMAINDER`: the `nargs` sentinel string that collects all
+        // remaining arguments.
+        c("REMAINDER", Type::Str),
         c("HelpFormatter", Type::Any),
         c("RawTextHelpFormatter", Type::Any),
         c("RawDescriptionHelpFormatter", Type::Any),
@@ -1119,6 +1829,13 @@ pub static COLLECTIONS: ModuleSpec = ModuleSpec {
         c("abc", Type::Any),
         c("deque", Type::Any),
         c("ChainMap", Type::Any),
+        // `collections.UserDict`: the pure-Python dict wrapper used as a base
+        // class by libraries that need dict behaviour with extra state.
+        c("UserDict", Type::Any),
+        // The list/str wrappers from the same `collections` surface; the
+        // runtime serves them as class values with native methods.
+        c("UserList", Type::Any),
+        c("UserString", Type::Any),
     ],
 };
 
@@ -1128,10 +1845,18 @@ const SOCKET_FUNCTIONS: &[FunctionSpec] = &[
     // parameter list empty (the frontend still validates the arity).
     kw_dynamic("socket", 0, 3, Type::Any, &[]),
     kw_dynamic("create_connection", 0, 2, Type::Any, &[]),
+    // `create_server(address, *, family=AF_INET, backlog=None,
+    // reuse_port=False, dualstack_ipv6=False)`: a listening socket. The
+    // runtime binds the keyword-only options itself, like
+    // `create_connection`.
+    kw_dynamic("create_server", 1, 1, Type::Any, &[]),
     f("gethostname", 0, 0, Type::Str),
     f("socketpair", 0, 3, Type::Any),
     f("getaddrinfo", 2, 6, Type::List),
     f("gethostbyname", 1, 1, Type::Str),
+    // `getfqdn([name])`: the fully qualified domain name; the optional name
+    // binds by keyword in CPython's Python-level wrapper.
+    kw("getfqdn", 0, 1, Type::Str, &["name"]),
     f("inet_pton", 2, 2, Type::Bytes),
     f("inet_ntop", 2, 2, Type::Str),
 ];
@@ -1158,6 +1883,27 @@ const SOCKET_CONSTANTS: &[ConstantSpec] = &[
     c("IPPROTO_IP", Type::Int),
     c("IPPROTO_TCP", Type::Int),
     c("IPPROTO_UDP", Type::Int),
+    // TCP-level options (`setsockopt(IPPROTO_TCP, ...)`). The Linux/Android
+    // extras are the knobs long-lived clients tune.
+    c("TCP_NODELAY", Type::Int),
+    c("TCP_MAXSEG", Type::Int),
+    c("TCP_CORK", Type::Int),
+    c("TCP_KEEPIDLE", Type::Int),
+    c("TCP_KEEPINTVL", Type::Int),
+    c("TCP_KEEPCNT", Type::Int),
+    c("TCP_SYNCNT", Type::Int),
+    c("TCP_LINGER2", Type::Int),
+    c("TCP_DEFER_ACCEPT", Type::Int),
+    c("TCP_WINDOW_CLAMP", Type::Int),
+    c("TCP_INFO", Type::Int),
+    c("TCP_QUICKACK", Type::Int),
+    c("TCP_CONGESTION", Type::Int),
+    c("TCP_USER_TIMEOUT", Type::Int),
+    c("TCP_FASTOPEN", Type::Int),
+    c("TCP_FASTOPEN_CONNECT", Type::Int),
+    c("TCP_ULP", Type::Int),
+    c("TCP_NOTSENT_LOWAT", Type::Int),
+    c("TCP_INQ", Type::Int),
     c("SHUT_RD", Type::Int),
     c("SHUT_WR", Type::Int),
     c("SHUT_RDWR", Type::Int),
@@ -1324,7 +2070,64 @@ pub static RE: ModuleSpec = ModuleSpec {
         // and `isinstance(m, re.Match)` hold; neither can be instantiated.
         c("Pattern", Type::Any),
         c("Match", Type::Any),
+        // The private namespaces the deprecated `sre_compile`/
+        // `sre_constants`/`sre_parse` wrappers import.
+        c("_compiler", Type::Any),
+        c("_constants", Type::Any),
+        c("_parser", Type::Any),
     ],
+};
+
+/// Constants shared by the three private `re` namespaces.
+///
+/// CPython's `re/_compiler.py` and `re/_parser.py` start with
+/// `from ._constants import *`, so the SRE limits, the flag bits and the
+/// error class are present in all of them.
+const RE_CONSTANTS: &[ConstantSpec] = &[
+    c("MAGIC", Type::Int),
+    c("MAXREPEAT", Type::Int),
+    c("MAXGROUPS", Type::Int),
+    c("SRE_FLAG_IGNORECASE", Type::Int),
+    c("SRE_FLAG_LOCALE", Type::Int),
+    c("SRE_FLAG_MULTILINE", Type::Int),
+    c("SRE_FLAG_DOTALL", Type::Int),
+    c("SRE_FLAG_UNICODE", Type::Int),
+    c("SRE_FLAG_VERBOSE", Type::Int),
+    c("SRE_FLAG_DEBUG", Type::Int),
+    c("SRE_FLAG_ASCII", Type::Int),
+    c("SRE_INFO_PREFIX", Type::Int),
+    c("SRE_INFO_LITERAL", Type::Int),
+    c("SRE_INFO_CHARSET", Type::Int),
+    c("PatternError", Type::Any),
+    c("error", Type::Any),
+];
+
+/// `re._constants`: the SRE limits, flag bits and error class.
+pub static RE_CONSTANTS_MODULE: ModuleSpec = ModuleSpec {
+    name: "re._constants",
+    functions: &[],
+    constants: RE_CONSTANTS,
+};
+
+/// `re._compiler`: the pattern compiler facade. `compile` is the engine
+/// `re.compile` exposes and `isstring` the pattern-type predicate; the SRE
+/// parse-tree builders are not provided.
+pub static RE_COMPILER: ModuleSpec = ModuleSpec {
+    name: "re._compiler",
+    functions: &[
+        f("compile", 1, 2, Type::Any),
+        f("isstring", 1, 1, Type::Bool),
+    ],
+    constants: RE_CONSTANTS,
+};
+
+/// `re._parser`: the SRE parser facade. Hydro hands patterns straight to its
+/// regex engine and builds no SRE parse tree, so the module exposes the shared
+/// constants only.
+pub static RE_PARSER: ModuleSpec = ModuleSpec {
+    name: "re._parser",
+    functions: &[],
+    constants: RE_CONSTANTS,
 };
 
 /// Cooperative asyncio layer over stackful coroutine fibers.
@@ -1391,6 +2194,7 @@ pub static ERRNO: ModuleSpec = ModuleSpec {
         c("ENOSPC", Type::Int),
         c("EPIPE", Type::Int),
         c("ECONNREFUSED", Type::Int),
+        c("ENOTCONN", Type::Int),
         c("ETIMEDOUT", Type::Int),
         c("EAGAIN", Type::Int),
         c("EWOULDBLOCK", Type::Int),
@@ -1754,6 +2558,9 @@ pub static FNMATCH: ModuleSpec = ModuleSpec {
         f("filter", 2, 2, Type::List),
         f("filterfalse", 2, 2, Type::List),
         f("translate", 1, 1, Type::Str),
+        // `_translate(pat, star, question_mark)`: the two-wildcard translator
+        // `glob` uses; returns `(fragments, star_indices)`.
+        f("_translate", 3, 3, Type::Tuple),
     ],
     constants: &[],
 };
@@ -1850,12 +2657,32 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
                 "args", "stdin", "input", "stderr", "cwd", "timeout", "text", "env",
             ],
         ),
+        // `Popen(args, cwd=None, stdout=None, stderr=None, text=None,
+        // env=None, close_fds=True, start_new_session=False, stdin=None,
+        // encoding=None, errors=None, preexec_fn=None)`: the trailing names
+        // are keyword-only in CPython and declared so call sites bind. The
+        // runtime consumes `close_fds`/`start_new_session`; `stdin`,
+        // `encoding`, `errors` and `preexec_fn` are accepted for signature
+        // compatibility.
         kw(
             "Popen",
             1,
-            6,
+            12,
             Type::Any,
-            &["args", "cwd", "stdout", "stderr", "text", "env"],
+            &[
+                "args",
+                "cwd",
+                "stdout",
+                "stderr",
+                "text",
+                "env",
+                "close_fds",
+                "start_new_session",
+                "stdin",
+                "encoding",
+                "errors",
+                "preexec_fn",
+            ],
         ),
         f("_popen_wait", 1, 2, Type::Int),
         f("_popen_poll", 1, 1, Type::Int),
@@ -1933,22 +2760,106 @@ pub static SHUTIL: ModuleSpec = ModuleSpec {
 
 /// `textwrap`: text wrapping and indentation helpers.
 ///
-/// The `TextWrapper` class is intentionally not provided; only the
-/// module-level convenience functions are available.
+/// `wrap`/`fill`/`shorten` accept the full `TextWrapper` keyword set, and
+/// `TextWrapper` is declared as a constructor function (its runtime value is
+/// the cached native class). Parameter order matches the runtime slot layout:
+/// `width`, `initial_indent`, `subsequent_indent`, `expand_tabs`,
+/// `replace_whitespace`, `fix_sentence_endings`, `break_long_words`,
+/// `break_on_hyphens`, `drop_whitespace`, `tabsize`, `max_lines`,
+/// `placeholder`. The maximum arity equals the parameter count because
+/// compiled keyword calls pad every slot with `None`.
 pub static TEXTWRAP: ModuleSpec = ModuleSpec {
     name: "textwrap",
     functions: &[
         f("dedent", 1, 1, Type::Str),
         kw("indent", 2, 3, Type::Str, &["text", "prefix", "predicate"]),
-        kw("wrap", 1, 2, Type::List, &["text", "width"]),
-        kw("fill", 1, 2, Type::Str, &["text", "width"]),
+        kw(
+            "wrap",
+            1,
+            13,
+            Type::List,
+            &[
+                "text",
+                "width",
+                "initial_indent",
+                "subsequent_indent",
+                "expand_tabs",
+                "replace_whitespace",
+                "fix_sentence_endings",
+                "break_long_words",
+                "break_on_hyphens",
+                "drop_whitespace",
+                "tabsize",
+                "max_lines",
+                "placeholder",
+            ],
+        ),
+        kw(
+            "fill",
+            1,
+            13,
+            Type::Str,
+            &[
+                "text",
+                "width",
+                "initial_indent",
+                "subsequent_indent",
+                "expand_tabs",
+                "replace_whitespace",
+                "fix_sentence_endings",
+                "break_long_words",
+                "break_on_hyphens",
+                "drop_whitespace",
+                "tabsize",
+                "max_lines",
+                "placeholder",
+            ],
+        ),
         kw(
             "shorten",
             2,
-            3,
+            13,
             Type::Str,
-            &["text", "width", "placeholder"],
+            &[
+                "text",
+                "width",
+                "initial_indent",
+                "subsequent_indent",
+                "expand_tabs",
+                "replace_whitespace",
+                "fix_sentence_endings",
+                "break_long_words",
+                "break_on_hyphens",
+                "drop_whitespace",
+                "tabsize",
+                "max_lines",
+                "placeholder",
+            ],
         ),
+        kw(
+            "TextWrapper",
+            0,
+            12,
+            Type::Any,
+            &[
+                "width",
+                "initial_indent",
+                "subsequent_indent",
+                "expand_tabs",
+                "replace_whitespace",
+                "fix_sentence_endings",
+                "break_long_words",
+                "break_on_hyphens",
+                "drop_whitespace",
+                "tabsize",
+                "max_lines",
+                "placeholder",
+            ],
+        ),
+        // `TextWrapper.wrap`/`fill` instance methods: the receiver and the
+        // text are the only arguments; the options come from the instance.
+        f("_textwrapper_wrap", 2, 2, Type::List),
+        f("_textwrapper_fill", 2, 2, Type::Str),
     ],
     constants: &[],
 };
@@ -2501,6 +3412,9 @@ pub static ITERTOOLS: ModuleSpec = ModuleSpec {
         kw_dynamic("product", 0, usize::MAX, Type::List, &[]),
         f("takewhile", 2, 2, Type::List),
         f("dropwhile", 2, 2, Type::List),
+        // `groupby(iterable, key=None)`: consecutive keys. `key` may be
+        // passed by name.
+        kw("groupby", 1, 2, Type::Any, &["iterable", "key"]),
     ],
     constants: &[],
 };
@@ -2539,6 +3453,70 @@ pub static AST: ModuleSpec = ModuleSpec {
         kw_dynamic("FunctionDef", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("AsyncFunctionDef", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("ClassDef", 0, usize::MAX, Type::Any, &[]),
+        // Statement and helper nodes. The runtime serves them as real classes
+        // (with CPython field order) and accepts every field by keyword, so
+        // each constructor is keyword-dynamic.
+        kw_dynamic("Return", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("If", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Else", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("For", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("While", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Try", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("ExceptHandler", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Raise", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Assert", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Import", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("ImportFrom", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("With", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("AsyncWith", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Match", 0, usize::MAX, Type::Any, &[]),
+        // CPython spells this one lowercase (`ast.match_case`); `MatchCase`
+        // is the alias the runtime maps to the same class.
+        kw_dynamic("match_case", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("MatchCase", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("AugAssign", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Delete", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Global", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Nonlocal", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Pass", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Break", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Continue", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Yield", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("YieldFrom", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Await", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Lambda", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("JoinedStr", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("FormattedValue", 0, usize::MAX, Type::Any, &[]),
+        // Helper nodes (`comprehension`, `arguments`, `alias`, `withitem`)
+        // and the PEP 695 type-parameter nodes.
+        kw_dynamic("comprehension", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("Comprehension", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("arguments", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("alias", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("withitem", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("TypeAlias", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("TypeVar", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("ParamSpec", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("TypeVarTuple", 0, usize::MAX, Type::Any, &[]),
+        // Assignment, walrus, type-comment and comprehension nodes.
+        kw_dynamic("Assign", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("NamedExpr", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("TypeIgnore", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("TryStar", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("AsyncFor", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("ListComp", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("SetComp", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("DictComp", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("GeneratorExp", 0, usize::MAX, Type::Any, &[]),
+        // `match` pattern nodes.
+        kw_dynamic("MatchValue", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("MatchSingleton", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("MatchSequence", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("MatchMapping", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("MatchClass", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("MatchStar", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("MatchAs", 0, usize::MAX, Type::Any, &[]),
+        kw_dynamic("MatchOr", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("Tuple", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("List", 0, usize::MAX, Type::Any, &[]),
         kw_dynamic("Set", 0, usize::MAX, Type::Any, &[]),
@@ -2601,10 +3579,16 @@ pub static AST: ModuleSpec = ModuleSpec {
         c("operator", Type::Any),
         c("unaryop", Type::Any),
         c("cmpop", Type::Any),
+        // `pattern` (the `match` base) and `type_ignore` (type-comment base).
+        c("pattern", Type::Any),
+        c("type_ignore", Type::Any),
         c("comprehension", Type::Any),
         c("excepthandler", Type::Any),
         c("arguments", Type::Any),
         c("alias", Type::Any),
+        // PEP 695's `ast.type_param` union base for `TypeVar`/`ParamSpec`/
+        // `TypeVarTuple`.
+        c("type_param", Type::Any),
         c("Interpolation", Type::Any),
         c("TemplateStr", Type::Any),
         c("Add", Type::Any),
@@ -2667,6 +3651,12 @@ pub static IMPORTLIB: ModuleSpec = ModuleSpec {
         c("machinery", Type::Any),
         c("metadata", Type::Any),
         c("resources", Type::Any),
+        // `importlib._bootstrap`: the frozen bootstrap module `pkgutil` reads
+        // (`_bootstrap._find_spec`); the runtime serves the module value.
+        c("_bootstrap", Type::Any),
+        // `importlib._bootstrap_external`: the frozen external bootstrap
+        // module, whose public surface is `importlib.machinery`.
+        c("_bootstrap_external", Type::Any),
     ],
 };
 
@@ -2700,6 +3690,18 @@ pub static IMPORTLIB_UTIL: ModuleSpec = ModuleSpec {
         // `_find_spec_from_path(name, path=None)`: the internal helper
         // `pyclbr` calls with the two positional arguments.
         f("_find_spec_from_path", 2, 2, Type::Any),
+        // `cache_from_source(path, debug_override=None, *,
+        // optimization=None)`: the `__pycache__` `.pyc` path.
+        kw(
+            "cache_from_source",
+            1,
+            3,
+            Type::Str,
+            &["path", "debug_override", "optimization"],
+        ),
+        // `source_hash(source_bytes)`: the SipHash-1-3 digest a `.pyc` header
+        // records.
+        f("source_hash", 1, 1, Type::Bytes),
     ],
     constants: &[
         c("LazyLoader", Type::Any),
@@ -2738,6 +3740,23 @@ pub static IMPORTLIB_MACHINERY: ModuleSpec = ModuleSpec {
         f("_frozen_invalidate_caches", 1, 1, Type::None),
         // `all_suffixes()`: the concatenation of the three suffix lists.
         f("all_suffixes", 0, 0, Type::List),
+        // `_install(bootstrap_module)`: registers the path finder with
+        // `sys.meta_path` and publishes the bootstrap module.
+        f("_install", 1, 1, Type::None),
+        // `_bootstrap_external._classify_pyc(data, name, exc_details)`: the
+        // pyc header validator `modulefinder` calls.
+        f("_classify_pyc", 3, 3, Type::Any),
+        // `PathFinder.find_spec(fullname, path=None, target=None)` and its
+        // cache hook.
+        f("_path_finder_find_spec", 2, 4, Type::Any),
+        f("_path_finder_invalidate_caches", 1, 1, Type::None),
+        // `FileFinder(path, *loader_details)` and its instance methods. The
+        // receiver is the first argument, as for every native method.
+        f("_file_finder_init", 2, usize::MAX, Type::None),
+        f("_file_finder_path_hook", 1, usize::MAX, Type::Any),
+        f("_file_finder_hook", 1, 1, Type::Any),
+        f("_file_finder_find_spec", 2, 3, Type::Any),
+        f("_file_finder_invalidate_caches", 1, 1, Type::None),
     ],
     constants: &[
         c("ModuleSpec", Type::Any),
@@ -2746,6 +3765,15 @@ pub static IMPORTLIB_MACHINERY: ModuleSpec = ModuleSpec {
         c("ExtensionFileLoader", Type::Any),
         c("BuiltinImporter", Type::Any),
         c("FrozenImporter", Type::Any),
+        // The path-based finder and the loaders `pkgutil`/`importlib` expose
+        // from this module.
+        c("PathFinder", Type::Any),
+        c("FileFinder", Type::Any),
+        c("SourcelessFileLoader", Type::Any),
+        c("AppleFrameworkLoader", Type::Any),
+        // `zipimport._zip_directory_cache`: the shared zip directory cache
+        // (empty, because Hydro imports no zip archives).
+        c("_zip_directory_cache", Type::Dict),
         // Module-name suffix lists, cached lists at runtime so mutation
         // (`SOURCE_SUFFIXES.append(...)`) and identity behave like CPython.
         c("SOURCE_SUFFIXES", Type::List),
@@ -2777,6 +3805,10 @@ pub static IMPORTLIB_METADATA: ModuleSpec = ModuleSpec {
         c("PackageNotFoundError", Type::Any),
         c("Distribution", Type::Any),
         c("EntryPoint", Type::Any),
+        // The `importlib.abc.MetaPathFinder` implementation that discovers
+        // installed distributions; imported by `importlib.metadata` users and
+        // by `importlib.util.find_spec` shims.
+        c("MetadataPathFinder", Type::Any),
     ],
 };
 
@@ -2912,7 +3944,11 @@ pub static _CODECS: ModuleSpec = ModuleSpec {
         f("ignore_errors", 1, 1, Type::Any),
         f("replace_errors", 1, 1, Type::Any),
     ],
-    constants: &[],
+    constants: &[
+        // The accelerator exports the same `CodecInfo` class object as
+        // `codecs`.
+        c("CodecInfo", Type::Any),
+    ],
 };
 
 /// `codecs`: the pure-Python wrapper surface over the native `_codecs`
@@ -2920,8 +3956,29 @@ pub static _CODECS: ModuleSpec = ModuleSpec {
 /// exports; the byte-order marks carry their real CPython values.
 pub static CODECS: ModuleSpec = ModuleSpec {
     name: "codecs",
-    functions: &[f("lookup", 1, 1, Type::Any)],
+    functions: &[
+        f("lookup", 1, 1, Type::Any),
+        // `encode(obj, encoding='utf-8', errors='strict')` and
+        // `decode(obj, encoding='utf-8', errors='strict')`.
+        f("encode", 1, 3, Type::Bytes),
+        f("decode", 1, 3, Type::Str),
+        // The codec-search registry. `register` takes a callable search
+        // function; `unregister` removes matching callables.
+        f("register", 1, 1, Type::None),
+        f("unregister", 1, 1, Type::None),
+        // The error-handler registry.
+        f("register_error", 2, 2, Type::None),
+        f("lookup_error", 1, 1, Type::Any),
+        // `escape_decode(data, errors='strict')`: the `unicode_escape` /
+        // `raw_unicode_escape` decoder shared with `_codecs`.
+        f("escape_decode", 1, 2, Type::Tuple),
+    ],
     constants: &[
+        // `CodecInfo(encode, decode, streamreader=None, streamwriter=None,
+        // incrementalencoder=None, incrementaldecoder=None, name=None, *,
+        // _is_text_encoding=None)`: the registry-entry class `encodings`
+        // constructs and checks with `isinstance`.
+        c("CodecInfo", Type::Any),
         c("BOM_UTF8", Type::Bytes),
         c("BOM_UTF16_LE", Type::Bytes),
         c("BOM_UTF16_BE", Type::Bytes),
@@ -3116,8 +4173,15 @@ pub static WARNINGS: ModuleSpec = ModuleSpec {
     functions: WARNING_FUNCTIONS,
     // `warnings.deprecated` is a class (usable in type aliases and as a
     // decorator), exposed as a dynamic constant so calls take the runtime
-    // class path with keyword arguments.
-    constants: &[c("filters", Type::List), c("deprecated", Type::Any)],
+    // class path with keyword arguments. `_DEPRECATED_MSG` is the format
+    // string its implementation builds deprecation messages from, and
+    // `EncodingWarning` is re-exported here by CPython's module.
+    constants: &[
+        c("filters", Type::List),
+        c("deprecated", Type::Any),
+        c("_DEPRECATED_MSG", Type::Str),
+        c("EncodingWarning", Type::Any),
+    ],
 };
 
 /// `_warnings`: the accelerator alias. The same registry and filters are
@@ -3348,6 +4412,10 @@ pub static GC: ModuleSpec = ModuleSpec {
         f("freeze", 0, 0, Type::None),
         f("unfreeze", 0, 0, Type::None),
         kw("get_objects", 0, 1, Type::List, &["generation"]),
+        // `get_referrers(*objs)`: objects referring to any argument. The
+        // runtime has no heap enumeration, so it raises NotImplementedError;
+        // the name is declared so imports and attribute reads resolve.
+        f("get_referrers", 0, usize::MAX, Type::List),
     ],
     constants: &[],
 };
@@ -3869,6 +4937,14 @@ pub static ZLIB: ModuleSpec = ModuleSpec {
         c("Z_VERSION_ERROR", Type::Int),
         c("ZLIB_VERSION", Type::Str),
         c("ZLIB_RUNTIME_VERSION", Type::Str),
+        // `_ZlibDecompressor`: the raw decompressor class `gzip` uses as its
+        // `_decomp_factory` (`_ZlibDecompressor(wbits=-MAX_WBITS)`). It is a
+        // class value, not a module function, so calls take the class
+        // construction path.
+        c("_ZlibDecompressor", Type::Any),
+        // `_ZlibCompressor`: the mirror incremental-compression class, also
+        // routed by the runtime module.
+        c("_ZlibCompressor", Type::Any),
     ],
 };
 
@@ -4075,6 +5151,10 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
         f("currentframe", 0, 0, Type::Any),
         kw("stack", 0, 1, Type::List, &["context"]),
         kw("getclosurevars", 1, 1, Type::Any, &["func"]),
+        // `getmodulename(path)`: the module name for a file name, or `None`
+        // when the suffix is not an import suffix (`path` may be passed by
+        // name, like the Python-level wrapper).
+        kw("getmodulename", 1, 1, Type::Any, &["path"]),
     ],
     constants: &[
         c("empty", Type::Any),
@@ -4108,6 +5188,413 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
         c("CO_HAS_DOCSTRING", Type::Int),
         c("CO_METHOD", Type::Int),
     ],
+};
+
+// ---------------------------------------------------------------------------
+// Hashing, HMAC and UUID
+// ---------------------------------------------------------------------------
+//
+// `hashlib` and the C accelerator surfaces (`_hashlib`, `_sha1`, `_sha2`,
+// `_md5`, `_blake2`, `_hmac`, `_uuid`) are implemented by one runtime module.
+// The constructors accept their documented keyword names; the digest objects
+// themselves are `HASH`/`HMAC` class instances whose methods are runtime
+// supplemental entries.
+
+/// `hashlib`: digest constructors, PBKDF2, HMAC helpers and the UUID
+/// generators the runtime implements natively.
+pub static HASHLIB: ModuleSpec = ModuleSpec {
+    name: "hashlib",
+    functions: &[
+        // `new(name, data=b'', *, usedforsecurity=True)`: the named-constructor
+        // form. Keyword-dynamic so `usedforsecurity` (and future options) reach
+        // the runtime, which validates the names itself.
+        kw_dynamic("new", 1, 2, Type::Any, &["name", "data"]),
+        // `md5(data=b'', *, usedforsecurity=True)` and the other constructors.
+        // BLAKE2 additionally accepts its full parameter set, so the entries
+        // are keyword-dynamic rather than a fixed keyword list.
+        kw_dynamic("md5", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("sha1", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("sha224", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("sha256", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("sha384", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("sha512", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("blake2b", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("blake2s", 0, 1, Type::Any, &["data"]),
+        kw(
+            "pbkdf2_hmac",
+            4,
+            5,
+            Type::Bytes,
+            &["hash_name", "password", "salt", "iterations", "dklen"],
+        ),
+        kw("compare_digest", 2, 2, Type::Bool, &["a", "b"]),
+        kw("hmac_new", 1, 3, Type::Any, &["key", "msg", "digestmod"]),
+        kw(
+            "hmac_digest",
+            3,
+            3,
+            Type::Bytes,
+            &["key", "msg", "digestmod"],
+        ),
+        kw("file_digest", 2, 2, Type::Any, &["fileobj", "digest"]),
+        f("get_fips_mode", 0, 0, Type::Int),
+        f("_is_fips_mode", 0, 0, Type::Bool),
+        kw("uuid1", 0, 2, Type::Bytes, &["node", "clock_seq"]),
+        f("uuid4", 0, 0, Type::Bytes),
+        kw("uuid5", 2, 2, Type::Bytes, &["namespace", "name"]),
+        f("generate_time_safe", 0, 0, Type::Tuple),
+    ],
+    constants: &[
+        c("algorithms_guaranteed", Type::Set),
+        c("algorithms_available", Type::Set),
+        c("HASH", Type::Any),
+        c("HMAC", Type::Any),
+        c("openssl_md_meth_names", Type::Set),
+        c("UnsupportedDigestmodError", Type::Any),
+    ],
+};
+
+/// `_hashlib`: the OpenSSL-backed accelerator. It exposes the named
+/// constructor, the `openssl_*` constructors, HMAC helpers, FIPS queries and
+/// PBKDF2.
+pub static _HASHLIB: ModuleSpec = ModuleSpec {
+    name: "_hashlib",
+    functions: &[
+        kw("new", 1, 2, Type::Any, &["name", "data"]),
+        kw("hmac_new", 1, 3, Type::Any, &["key", "msg", "digestmod"]),
+        kw(
+            "hmac_digest",
+            3,
+            3,
+            Type::Bytes,
+            &["key", "msg", "digestmod"],
+        ),
+        kw("compare_digest", 2, 2, Type::Bool, &["a", "b"]),
+        f("get_fips_mode", 0, 0, Type::Int),
+        f("_is_fips_mode", 0, 0, Type::Bool),
+        kw(
+            "pbkdf2_hmac",
+            4,
+            5,
+            Type::Bytes,
+            &["hash_name", "password", "salt", "iterations", "dklen"],
+        ),
+        kw("openssl_md5", 0, 1, Type::Any, &["data"]),
+        kw("openssl_sha1", 0, 1, Type::Any, &["data"]),
+        kw("openssl_sha224", 0, 1, Type::Any, &["data"]),
+        kw("openssl_sha256", 0, 1, Type::Any, &["data"]),
+        kw("openssl_sha384", 0, 1, Type::Any, &["data"]),
+        kw("openssl_sha512", 0, 1, Type::Any, &["data"]),
+        kw("openssl_blake2b512", 0, 1, Type::Any, &["data"]),
+        kw("openssl_blake2s256", 0, 1, Type::Any, &["data"]),
+    ],
+    constants: &[
+        c("HASH", Type::Any),
+        c("HMAC", Type::Any),
+        c("UnsupportedDigestmodError", Type::Any),
+        c("openssl_md_meth_names", Type::Set),
+    ],
+};
+
+/// `_sha1`: the SHA-1 accelerator constructor.
+pub static _SHA1: ModuleSpec = ModuleSpec {
+    name: "_sha1",
+    functions: &[kw("sha1", 0, 1, Type::Any, &["data"])],
+    constants: &[],
+};
+
+/// `_sha2`: the SHA-2 accelerator constructors.
+pub static _SHA2: ModuleSpec = ModuleSpec {
+    name: "_sha2",
+    functions: &[
+        kw("sha224", 0, 1, Type::Any, &["data"]),
+        kw("sha256", 0, 1, Type::Any, &["data"]),
+        kw("sha384", 0, 1, Type::Any, &["data"]),
+        kw("sha512", 0, 1, Type::Any, &["data"]),
+    ],
+    constants: &[],
+};
+
+/// `_md5`: the MD5 accelerator constructor.
+pub static _MD5: ModuleSpec = ModuleSpec {
+    name: "_md5",
+    functions: &[kw("md5", 0, 1, Type::Any, &["data"])],
+    constants: &[],
+};
+
+/// `_blake2`: the BLAKE2 accelerator constructors.
+pub static _BLAKE2: ModuleSpec = ModuleSpec {
+    name: "_blake2",
+    functions: &[
+        kw("blake2b", 0, 1, Type::Any, &["data"]),
+        kw("blake2s", 0, 1, Type::Any, &["data"]),
+    ],
+    constants: &[],
+};
+
+/// `_hmac`: the HMAC accelerator. `new` builds the streaming object,
+/// `compute_digest` the one-shot form of `hmac_digest`; the unknown digest
+/// error is exposed as a class value.
+pub static _HMAC: ModuleSpec = ModuleSpec {
+    name: "_hmac",
+    functions: &[
+        kw("new", 1, 3, Type::Any, &["key", "msg", "digestmod"]),
+        // `compute_digest(key, msg, digestmod)`: the one-shot digest.
+        f("compute_digest", 3, 3, Type::Bytes),
+    ],
+    constants: &[
+        c("UnknownHashError", Type::Any),
+        // `_hmac.HMAC`: the cached HMAC class value.
+        c("HMAC", Type::Any),
+    ],
+};
+
+/// `_uuid`: the native UUID time generator and its capability flags.
+pub static _UUID: ModuleSpec = ModuleSpec {
+    name: "_uuid",
+    functions: &[f("generate_time_safe", 0, 0, Type::Tuple)],
+    constants: &[
+        c("has_uuid_generate_time_safe", Type::Bool),
+        c("has_stable_extractable_node", Type::Bool),
+        // The RFC 4122 namespace UUIDs, rendered as canonical strings.
+        c("NAMESPACE_DNS", Type::Str),
+        c("NAMESPACE_URL", Type::Str),
+        c("NAMESPACE_OID", Type::Str),
+        c("NAMESPACE_X500", Type::Str),
+    ],
+};
+
+// ---------------------------------------------------------------------------
+// Module aliases
+// ---------------------------------------------------------------------------
+//
+// CPython exposes several standard modules under two spellings: the C
+// accelerator and its Python wrapper (`_abc`/`abc`, `_datetime`/`datetime`),
+// a platform-specific path module (`posixpath`), or the frozen bootstrap
+// modules (`_frozen_importlib`). Each alias reuses the target's tables so the
+// two spellings never drift; the module name is the only difference. Runtime
+// dispatch must forward the alias name to the target implementation.
+
+/// `_abc`: the C accelerator behind `abc`.
+pub static _ABC: ModuleSpec = ModuleSpec {
+    name: "_abc",
+    functions: ABC.functions,
+    constants: ABC.constants,
+};
+
+/// `_datetime`: the C accelerator behind `datetime`.
+pub static _DATETIME: ModuleSpec = ModuleSpec {
+    name: "_datetime",
+    functions: DATETIME.functions,
+    constants: DATETIME.constants,
+};
+
+/// `_locale`: the C accelerator behind `locale`.
+pub static _LOCALE: ModuleSpec = ModuleSpec {
+    name: "_locale",
+    functions: LOCALE.functions,
+    constants: LOCALE.constants,
+};
+
+/// `_types`: the C accelerator behind `types`.
+pub static _TYPES: ModuleSpec = ModuleSpec {
+    name: "_types",
+    functions: TYPES.functions,
+    constants: TYPES.constants,
+};
+
+/// `_typing`: the C accelerator behind `typing`.
+pub static _TYPING: ModuleSpec = ModuleSpec {
+    name: "_typing",
+    functions: TYPING.functions,
+    constants: TYPING.constants,
+};
+
+/// `_sre`: the C implementation behind `re`. The expression-building
+/// functions and the compiled-pattern surface are shared with `re`.
+pub static _SRE: ModuleSpec = ModuleSpec {
+    name: "_sre",
+    functions: RE.functions,
+    constants: RE.constants,
+};
+
+/// `posix`: the Unix flavour of `os`. The table is `os`'s, so the platform
+/// spelling resolves the same names.
+pub static POSIX: ModuleSpec = ModuleSpec {
+    name: "posix",
+    functions: OS.functions,
+    constants: OS.constants,
+};
+
+/// `posixpath`: the POSIX `os.path` implementation. `os.path` already is the
+/// POSIX module, so the names are shared. (`ntpath` below aliases the same
+/// table: the function surface is identical; only Windows path syntax would
+/// differ.)
+pub static POSIXPATH: ModuleSpec = ModuleSpec {
+    name: "posixpath",
+    functions: OS_PATH.functions,
+    constants: OS_PATH.constants,
+};
+
+/// `ntpath`: the Windows `os.path` implementation, aliased to the same
+/// function surface as `posixpath`.
+pub static NTPATH: ModuleSpec = ModuleSpec {
+    name: "ntpath",
+    functions: OS_PATH.functions,
+    constants: OS_PATH.constants,
+};
+
+/// `_frozen_importlib`: the frozen `importlib` bootstrap module.
+pub static _FROZEN_IMPORTLIB: ModuleSpec = ModuleSpec {
+    name: "_frozen_importlib",
+    functions: IMPORTLIB.functions,
+    constants: IMPORTLIB.constants,
+};
+
+/// `_frozen_importlib_external`: the frozen `importlib._bootstrap_external`
+/// module, whose public surface is `importlib.machinery`.
+pub static _FROZEN_IMPORTLIB_EXTERNAL: ModuleSpec = ModuleSpec {
+    name: "_frozen_importlib_external",
+    functions: IMPORTLIB_MACHINERY.functions,
+    constants: IMPORTLIB_MACHINERY.constants,
+};
+
+/// `importlib._bootstrap_external`: the Python spelling of the frozen external
+/// bootstrap module. Literal imports of this name must compile, so it shares
+/// the `importlib.machinery` surface like `_frozen_importlib_external`.
+pub static IMPORTLIB_BOOTSTRAP_EXTERNAL: ModuleSpec = ModuleSpec {
+    name: "importlib._bootstrap_external",
+    functions: IMPORTLIB_MACHINERY.functions,
+    constants: IMPORTLIB_MACHINERY.constants,
+};
+
+/// `zipimport`: the zip-file importer. Hydro has no zip import machinery, so
+/// the table exposes the shared finder/loader surface from
+/// `importlib.machinery` and nothing extra.
+pub static ZIPIMPORT: ModuleSpec = ModuleSpec {
+    name: "zipimport",
+    functions: IMPORTLIB_MACHINERY.functions,
+    constants: IMPORTLIB_MACHINERY.constants,
+};
+
+/// `_sysconfig`: the C accelerator behind `sysconfig`.
+pub static _SYSCONFIG: ModuleSpec = ModuleSpec {
+    name: "_sysconfig",
+    functions: SYSCONFIG.functions,
+    constants: SYSCONFIG.constants,
+};
+
+/// `faulthandler`: registered so imports resolve. Hydro installs no signal
+/// handlers and has no fault-reporting API, so the module exposes no names.
+pub static FAULTHANDLER: ModuleSpec = ModuleSpec {
+    name: "faulthandler",
+    functions: &[],
+    constants: &[],
+};
+
+/// `_suggestions`: registered so imports resolve. The typo-suggestion helper
+/// has no callable surface in Hydro, so the module exposes no names.
+pub static _SUGGESTIONS: ModuleSpec = ModuleSpec {
+    name: "_suggestions",
+    functions: &[],
+    constants: &[],
+};
+
+/// `runpy`: the module runner. Hydro has no module execution ABI, so
+/// `run_module` is the only declared entry point; the runtime raises an
+/// explicit error when it cannot execute the target.
+pub static RUNPY: ModuleSpec = ModuleSpec {
+    name: "runpy",
+    functions: &[
+        kw(
+            "run_module",
+            1,
+            4,
+            Type::Any,
+            &["mod_name", "init_globals", "run_name", "alter_sys"],
+        ),
+        // `_get_module_details(mod_name)`: the internal helper that resolves
+        // the module metadata `run_module` executes.
+        f("_get_module_details", 1, 1, Type::Any),
+    ],
+    constants: &[],
+};
+
+// Accelerator aliases for the standard-library modules whose C implementation
+// shares the Python surface. Each reuses the target's tables so the two
+// spellings cannot drift. (`_bisect`, `_heapq` and `_struct` already have
+// their own alias specs above.)
+
+/// `_json`: the C accelerator behind `json`. Only the encoder/decoder helpers
+/// are C-level in CPython; sharing the whole table keeps both spellings
+/// consistent here.
+pub static _JSON: ModuleSpec = ModuleSpec {
+    name: "_json",
+    functions: JSON.functions,
+    constants: JSON.constants,
+};
+
+/// `_csv`: the C accelerator behind `csv`.
+pub static _CSV: ModuleSpec = ModuleSpec {
+    name: "_csv",
+    functions: CSV.functions,
+    constants: CSV.constants,
+};
+
+/// `_pickle`: the C accelerator behind `pickle`.
+pub static _PICKLE: ModuleSpec = ModuleSpec {
+    name: "_pickle",
+    functions: PICKLE.functions,
+    constants: PICKLE.constants,
+};
+
+/// `_random`: the C accelerator behind `random`.
+pub static _RANDOM: ModuleSpec = ModuleSpec {
+    name: "_random",
+    functions: RANDOM.functions,
+    constants: RANDOM.constants,
+};
+
+/// `_statistics`: the C accelerator behind `statistics`.
+pub static _STATISTICS: ModuleSpec = ModuleSpec {
+    name: "_statistics",
+    functions: STATISTICS.functions,
+    constants: STATISTICS.constants,
+};
+
+/// `_queue`: the C accelerator behind `queue`.
+pub static _QUEUE: ModuleSpec = ModuleSpec {
+    name: "_queue",
+    functions: QUEUE.functions,
+    constants: QUEUE.constants,
+};
+
+/// `_asyncio`: the C accelerator behind `asyncio`.
+pub static _ASYNCIO: ModuleSpec = ModuleSpec {
+    name: "_asyncio",
+    functions: ASYNCIO.functions,
+    constants: ASYNCIO.constants,
+};
+
+/// `_multiprocessing`: the C accelerator behind `multiprocessing`.
+pub static _MULTIPROCESSING: ModuleSpec = ModuleSpec {
+    name: "_multiprocessing",
+    functions: MULTIPROCESSING.functions,
+    constants: MULTIPROCESSING.constants,
+};
+
+/// `_zoneinfo`: the C accelerator behind `zoneinfo`.
+pub static _ZONEINFO: ModuleSpec = ModuleSpec {
+    name: "_zoneinfo",
+    functions: ZONEINFO.functions,
+    constants: ZONEINFO.constants,
+};
+
+/// `_ast`: the C accelerator behind `ast`.
+pub static _AST: ModuleSpec = ModuleSpec {
+    name: "_ast",
+    functions: AST.functions,
+    constants: AST.constants,
 };
 
 #[cfg(test)]
@@ -4876,6 +6363,89 @@ mod tests {
         assert_eq!(function("ast", "literal_eval").unwrap().max_args, 1);
         assert!(function("ast", "arg").is_some(), "ast.arg constructor");
         assert_eq!(constant("ast", "arguments").unwrap().ty, Type::Any);
+        // Statement/helper node constructors are keyword-dynamic and shared
+        // with `_ast`.
+        for name in [
+            "Return",
+            "If",
+            "Else",
+            "For",
+            "While",
+            "Try",
+            "ExceptHandler",
+            "Raise",
+            "Assert",
+            "Import",
+            "ImportFrom",
+            "FunctionDef",
+            "AsyncFunctionDef",
+            "ClassDef",
+            "With",
+            "AsyncWith",
+            "Match",
+            "match_case",
+            "MatchCase",
+            "AugAssign",
+            "Delete",
+            "Global",
+            "Nonlocal",
+            "Pass",
+            "Break",
+            "Continue",
+            "Yield",
+            "YieldFrom",
+            "Await",
+            "Lambda",
+            "JoinedStr",
+            "FormattedValue",
+            "comprehension",
+            "Comprehension",
+            "arguments",
+            "alias",
+            "withitem",
+            "TypeAlias",
+            "TypeVar",
+            "ParamSpec",
+            "TypeVarTuple",
+            "Assign",
+            "NamedExpr",
+            "TypeIgnore",
+            "TryStar",
+            "AsyncFor",
+            "MatchValue",
+            "MatchSingleton",
+            "MatchSequence",
+            "MatchMapping",
+            "MatchClass",
+            "MatchStar",
+            "MatchAs",
+            "MatchOr",
+            "ListComp",
+            "SetComp",
+            "DictComp",
+            "GeneratorExp",
+        ] {
+            for module in ["ast", "_ast"] {
+                let spec = function(module, name).unwrap_or_else(|| panic!("{module}.{name}"));
+                assert_eq!(
+                    (spec.min_args, spec.max_args, spec.ret),
+                    (0, usize::MAX, Type::Any),
+                    "{module}.{name}"
+                );
+                assert!(spec.dynamic_keywords, "{module}.{name} accepts keywords");
+            }
+        }
+        assert_eq!(
+            constant("ast", "type_param").expect("type_param").ty,
+            Type::Any
+        );
+        for name in ["pattern", "type_ignore"] {
+            assert_eq!(
+                constant("ast", name).expect(name).ty,
+                Type::Any,
+                "ast.{name}"
+            );
+        }
         let fraction = function("fractions", "Fraction").unwrap();
         assert_eq!((fraction.min_args, fraction.max_args), (1, 2));
         assert_eq!(fraction.ret, Type::Float);
@@ -5669,5 +7239,1128 @@ mod tests {
         assert_eq!((path.min_args, path.max_args), (0, 1));
         assert_eq!(path.params, &["path"][..]);
         assert!(function("pathlib", "PurePath").is_none());
+    }
+
+    #[test]
+    fn import_matrix_tier_one_declarations_are_registered() {
+        // os: descriptor helpers and the bytes spelling of getcwd.
+        for (name, min, max, ret) in [
+            ("isatty", 1, 1, Type::Bool),
+            ("getcwdb", 0, 0, Type::Bytes),
+            ("read", 2, 2, Type::Bytes),
+            ("write", 2, 2, Type::Int),
+        ] {
+            let spec = function("os", name).unwrap_or_else(|| panic!("os.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (min, max, ret));
+            assert!(spec.params.is_empty(), "os.{name} is positional-only");
+        }
+        let fdopen = function("os", "fdopen").expect("os.fdopen");
+        assert_eq!((fdopen.min_args, fdopen.max_args), (1, 8));
+        assert_eq!(
+            fdopen.params,
+            &[
+                "fd",
+                "mode",
+                "buffering",
+                "encoding",
+                "errors",
+                "newline",
+                "closefd",
+                "opener",
+            ][..]
+        );
+        assert_eq!(fdopen.ret, Type::Any);
+        let mkdir = function("os", "mkdir").expect("os.mkdir");
+        assert_eq!(
+            (mkdir.min_args, mkdir.max_args, mkdir.ret),
+            (1, 3, Type::None)
+        );
+        assert_eq!(mkdir.params, &["path", "mode", "dir_fd"][..]);
+        let readlink = function("os", "readlink").expect("os.readlink");
+        assert_eq!(
+            (readlink.min_args, readlink.max_args, readlink.ret),
+            (1, 2, Type::Any)
+        );
+        assert_eq!(readlink.params, &["path", "dir_fd"][..]);
+        let strerror = function("os", "strerror").expect("os.strerror");
+        assert_eq!(
+            (strerror.min_args, strerror.max_args, strerror.ret),
+            (1, 1, Type::Str)
+        );
+        let scandir = function("os", "scandir").expect("os.scandir");
+        assert_eq!(
+            (scandir.min_args, scandir.max_args, scandir.ret),
+            (0, 1, Type::Any)
+        );
+        assert_eq!(scandir.params, &["path"][..]);
+        for (name, min, max, ret) in [
+            ("set_inheritable", 2, 2, Type::None),
+            ("get_inheritable", 1, 1, Type::Bool),
+        ] {
+            let spec = function("os", name).unwrap_or_else(|| panic!("os.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (min, max, ret));
+            assert!(spec.params.is_empty(), "os.{name} is positional-only");
+        }
+        let lexists = function("os.path", "lexists").expect("os.path.lexists");
+        assert_eq!(
+            (lexists.min_args, lexists.max_args, lexists.ret),
+            (1, 1, Type::Bool)
+        );
+        for name in ["commonpath", "commonprefix"] {
+            let spec = function("os.path", name).unwrap_or_else(|| panic!("os.path.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (1, 1, Type::Any));
+        }
+        let relpath = function("os.path", "relpath").expect("os.path.relpath");
+        assert_eq!(
+            (relpath.min_args, relpath.max_args, relpath.ret),
+            (1, 2, Type::Any)
+        );
+        assert_eq!(relpath.params, &["path", "start"][..]);
+        // The file-removal spelling and the remaining `os.open` flags.
+        let unlink = function("os", "unlink").expect("os.unlink");
+        assert_eq!(
+            (unlink.min_args, unlink.max_args, unlink.ret),
+            (1, 1, Type::None)
+        );
+        for name in [
+            "O_EXCL",
+            "O_NOFOLLOW",
+            "O_DIRECTORY",
+            "O_SYNC",
+            "O_DSYNC",
+            "O_ASYNC",
+            "O_NONBLOCK",
+            "O_NDELAY",
+            "O_ACCMODE",
+        ] {
+            assert_eq!(constant("os", name).expect(name).ty, Type::Int, "os.{name}");
+        }
+        // Path-flavour constants resolve through both `os` and `os.path`.
+        for name in ["sep", "pathsep", "extsep", "curdir", "pardir"] {
+            assert_eq!(constant("os", name).expect(name).ty, Type::Str, "os.{name}");
+            assert_eq!(
+                constant("os.path", name).expect(name).ty,
+                Type::Str,
+                "os.path.{name}"
+            );
+        }
+        for module in ["os", "os.path"] {
+            assert_eq!(
+                constant(module, "altsep").expect("altsep").ty,
+                Type::Any,
+                "{module}.altsep is None on POSIX"
+            );
+        }
+        assert_eq!(
+            constant("os.path", "ALLOW_MISSING")
+                .expect("ALLOW_MISSING")
+                .ty,
+            Type::Any
+        );
+
+        // io/builtins open uses CPython's full parameter list.
+        let cpython_open = [
+            "file",
+            "mode",
+            "buffering",
+            "encoding",
+            "errors",
+            "newline",
+            "closefd",
+            "opener",
+        ];
+        for module in ["io", "_io", "builtins"] {
+            let spec = function(module, "open").unwrap_or_else(|| panic!("{module}.open"));
+            assert_eq!((spec.min_args, spec.max_args), (1, 8), "{module}");
+            assert_eq!(spec.params, &cpython_open[..], "{module}");
+        }
+
+        // builtins keyword spellings.
+        let int = function("builtins", "int").expect("builtins.int");
+        assert_eq!((int.min_args, int.max_args, int.ret), (0, 2, Type::Int));
+        assert_eq!(int.params, &["x", "base"][..]);
+        let enumerate = function("builtins", "enumerate").expect("builtins.enumerate");
+        assert_eq!((enumerate.min_args, enumerate.max_args), (1, 2));
+        assert_eq!(enumerate.params, &["iterable", "start"][..]);
+        let format = function("builtins", "format").expect("builtins.format");
+        assert_eq!((format.min_args, format.max_args), (1, 2));
+        assert_eq!(format.params, &["value", "format_spec"][..]);
+        let compile = function("builtins", "compile").expect("builtins.compile");
+        assert_eq!(
+            compile.params,
+            &[
+                "source",
+                "filename",
+                "mode",
+                "flags",
+                "dont_inherit",
+                "optimize"
+            ][..]
+        );
+        assert_eq!(
+            constant("builtins", "EncodingWarning")
+                .expect("EncodingWarning")
+                .ty,
+            Type::Any
+        );
+
+        // socket/time/math.
+        let create_server = function("socket", "create_server").expect("socket.create_server");
+        assert_eq!((create_server.min_args, create_server.max_args), (1, 1));
+        assert!(create_server.dynamic_keywords);
+        for (name, min, max, ret) in [("ctime", 0, 1, Type::Str), ("mktime", 1, 1, Type::Float)] {
+            let spec = function("time", name).unwrap_or_else(|| panic!("time.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (min, max, ret));
+        }
+        let modf = function("math", "modf").expect("math.modf");
+        assert_eq!(
+            (modf.min_args, modf.max_args, modf.ret),
+            (1, 1, Type::Tuple)
+        );
+
+        // Object models and serialisation.
+        let getmodulename = function("inspect", "getmodulename").expect("inspect.getmodulename");
+        assert_eq!((getmodulename.min_args, getmodulename.max_args), (1, 1));
+        assert_eq!(getmodulename.params, &["path"][..]);
+        let pickler = function("pickle", "Pickler").expect("pickle.Pickler");
+        assert_eq!((pickler.min_args, pickler.max_args), (1, 2));
+        assert_eq!(pickler.params, &["file", "protocol"][..]);
+        // `zlib._ZlibDecompressor` is the class value `gzip` instantiates.
+        assert_eq!(
+            constant("zlib", "_ZlibDecompressor")
+                .expect("zlib._ZlibDecompressor")
+                .ty,
+            Type::Any
+        );
+        // `code_page_encode` is Windows-only in CPython and is deliberately
+        // absent here.
+        let escape_decode = function("codecs", "escape_decode").expect("codecs.escape_decode");
+        assert_eq!(
+            (
+                escape_decode.min_args,
+                escape_decode.max_args,
+                escape_decode.ret
+            ),
+            (1, 2, Type::Tuple)
+        );
+        assert!(function("codecs", "code_page_encode").is_none());
+
+        // Constants and tracing hooks.
+        for (module, name, ty) in [
+            ("importlib.metadata", "MetadataPathFinder", Type::Any),
+            ("warnings", "_DEPRECATED_MSG", Type::Str),
+            ("warnings", "EncodingWarning", Type::Any),
+            ("errno", "ENOTCONN", Type::Int),
+            ("pickle", "HIGHEST_PROTOCOL", Type::Int),
+            ("pickle", "PickleError", Type::Any),
+            ("pickle", "PicklingError", Type::Any),
+            ("pickle", "UnpicklingError", Type::Any),
+            ("importlib", "_bootstrap_external", Type::Any),
+            ("sys", "stdlib_module_names", Type::Set),
+            ("pickle", "bytes_types", Type::Any),
+            ("collections", "UserDict", Type::Any),
+            ("collections", "UserList", Type::Any),
+            ("collections", "UserString", Type::Any),
+            ("zlib", "_ZlibCompressor", Type::Any),
+        ] {
+            assert_eq!(
+                constant(module, name)
+                    .unwrap_or_else(|| panic!("{module}.{name}"))
+                    .ty,
+                ty,
+                "{module}.{name}"
+            );
+        }
+        for (module, name) in [
+            ("sys", "settrace"),
+            ("sys", "setprofile"),
+            ("threading", "settrace"),
+        ] {
+            let spec = function(module, name).unwrap_or_else(|| panic!("{module}.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (1, 1, Type::None));
+        }
+        let sys_exception = function("sys", "exception").expect("sys.exception");
+        assert_eq!(
+            (
+                sys_exception.min_args,
+                sys_exception.max_args,
+                sys_exception.ret
+            ),
+            (0, 0, Type::Any),
+            "sys.exception() returns the handled instance or None"
+        );
+        let unpickler = function("pickle", "Unpickler").expect("pickle.Unpickler");
+        assert_eq!((unpickler.min_args, unpickler.max_args), (1, 5));
+        assert_eq!(
+            unpickler.params,
+            &["file", "fix_imports", "encoding", "errors", "buffers"][..]
+        );
+        assert!(function("pickle", "Pickler").is_some());
+        let referrers = function("gc", "get_referrers").expect("gc.get_referrers");
+        assert_eq!(
+            (referrers.min_args, referrers.max_args, referrers.ret),
+            (0, usize::MAX, Type::List)
+        );
+
+        // The Unix password/group database queries return `struct_*`
+        // namespaces (`getpwall`/`getgrall` return lists of them).
+        for (module, name, min, max, ret) in [
+            ("pwd", "struct_passwd", 1, 1, Type::Any),
+            ("pwd", "getpwnam", 1, 1, Type::Any),
+            ("pwd", "getpwuid", 1, 1, Type::Any),
+            ("pwd", "getpwall", 0, 0, Type::List),
+            ("grp", "struct_group", 1, 1, Type::Any),
+            ("grp", "getgrnam", 1, 1, Type::Any),
+            ("grp", "getgrgid", 1, 1, Type::Any),
+            ("grp", "getgrall", 0, 0, Type::List),
+            ("resource", "getrlimit", 1, 1, Type::Tuple),
+            ("resource", "setrlimit", 2, 2, Type::None),
+            ("resource", "getrusage", 1, 1, Type::Any),
+            ("resource", "getpagesize", 0, 0, Type::Int),
+            ("fcntl", "fcntl", 2, 3, Type::Any),
+            ("fcntl", "ioctl", 2, 4, Type::Any),
+            ("fcntl", "flock", 2, 2, Type::None),
+            ("fcntl", "lockf", 2, 5, Type::None),
+            ("syslog", "openlog", 0, 3, Type::None),
+            ("syslog", "syslog", 1, 2, Type::None),
+            ("syslog", "closelog", 0, 0, Type::None),
+            ("syslog", "setlogmask", 1, 1, Type::Int),
+        ] {
+            let spec = function(module, name).unwrap_or_else(|| panic!("{module}.{name}"));
+            assert_eq!(
+                (spec.min_args, spec.max_args, spec.ret),
+                (min, max, ret),
+                "{module}.{name}"
+            );
+            assert!(spec.params.is_empty(), "{module}.{name} is positional-only");
+        }
+
+        // Every `resource`, `fcntl` and `syslog` constant is an integer
+        // selector/flag.
+        for (module, names) in [
+            (
+                "resource",
+                &[
+                    "RLIM_INFINITY",
+                    "RLIMIT_CPU",
+                    "RLIMIT_FSIZE",
+                    "RLIMIT_DATA",
+                    "RLIMIT_STACK",
+                    "RLIMIT_CORE",
+                    "RLIMIT_RSS",
+                    "RLIMIT_NPROC",
+                    "RLIMIT_NOFILE",
+                    "RLIMIT_MEMLOCK",
+                    "RLIMIT_AS",
+                    "RLIMIT_LOCKS",
+                    "RLIMIT_SIGPENDING",
+                    "RLIMIT_MSGQUEUE",
+                    "RLIMIT_NICE",
+                    "RLIMIT_RTPRIO",
+                    "RLIMIT_RTTIME",
+                    "RUSAGE_SELF",
+                    "RUSAGE_CHILDREN",
+                    "RUSAGE_THREAD",
+                ][..],
+            ),
+            (
+                "fcntl",
+                &[
+                    "F_DUPFD",
+                    "F_GETFD",
+                    "F_SETFD",
+                    "F_GETFL",
+                    "F_SETFL",
+                    "F_GETLK",
+                    "F_SETLK",
+                    "F_SETLKW",
+                    "F_GETOWN",
+                    "F_SETOWN",
+                    "F_GETSIG",
+                    "F_SETSIG",
+                    "F_SETLEASE",
+                    "F_GETLEASE",
+                    "F_NOTIFY",
+                    "F_DUPFD_CLOEXEC",
+                    "F_SETPIPE_SZ",
+                    "F_GETPIPE_SZ",
+                    "F_ADD_SEALS",
+                    "F_GET_SEALS",
+                    "FD_CLOEXEC",
+                    "LOCK_SH",
+                    "LOCK_EX",
+                    "LOCK_NB",
+                    "LOCK_UN",
+                ][..],
+            ),
+            (
+                "syslog",
+                &[
+                    "LOG_EMERG",
+                    "LOG_ALERT",
+                    "LOG_CRIT",
+                    "LOG_ERR",
+                    "LOG_WARNING",
+                    "LOG_NOTICE",
+                    "LOG_INFO",
+                    "LOG_DEBUG",
+                    "LOG_KERN",
+                    "LOG_USER",
+                    "LOG_MAIL",
+                    "LOG_DAEMON",
+                    "LOG_AUTH",
+                    "LOG_SYSLOG",
+                    "LOG_LPR",
+                    "LOG_NEWS",
+                    "LOG_UUCP",
+                    "LOG_CRON",
+                    "LOG_AUTHPRIV",
+                    "LOG_FTP",
+                    "LOG_LOCAL0",
+                    "LOG_LOCAL1",
+                    "LOG_LOCAL2",
+                    "LOG_LOCAL3",
+                    "LOG_LOCAL4",
+                    "LOG_LOCAL5",
+                    "LOG_LOCAL6",
+                    "LOG_LOCAL7",
+                    "LOG_PID",
+                    "LOG_CONS",
+                    "LOG_ODELAY",
+                    "LOG_NDELAY",
+                    "LOG_NOWAIT",
+                    "LOG_PERROR",
+                ][..],
+            ),
+        ] {
+            for &name in names {
+                assert_eq!(
+                    constant(module, name)
+                        .unwrap_or_else(|| panic!("{module}.{name}"))
+                        .ty,
+                    Type::Int,
+                    "{module}.{name}"
+                );
+            }
+        }
+
+        // `subprocess.Popen` declares the keyword-only options after the
+        // leading six slots.
+        let popen = function("subprocess", "Popen").expect("subprocess.Popen");
+        assert_eq!((popen.min_args, popen.max_args), (1, 12));
+        assert_eq!(
+            popen.params,
+            &[
+                "args",
+                "cwd",
+                "stdout",
+                "stderr",
+                "text",
+                "env",
+                "close_fds",
+                "start_new_session",
+                "stdin",
+                "encoding",
+                "errors",
+                "preexec_fn",
+            ][..]
+        );
+        assert_eq!(
+            constant("argparse", "REMAINDER")
+                .expect("argparse.REMAINDER")
+                .ty,
+            Type::Str
+        );
+        assert_eq!(
+            constant("pickle", "__all__").expect("pickle.__all__").ty,
+            Type::List
+        );
+
+        // `socket.getfqdn` and the TCP-level option constants (shared with
+        // `_socket`).
+        let getfqdn = function("socket", "getfqdn").expect("socket.getfqdn");
+        assert_eq!(
+            (getfqdn.min_args, getfqdn.max_args, getfqdn.ret),
+            (0, 1, Type::Str)
+        );
+        assert_eq!(getfqdn.params, &["name"][..]);
+        for name in [
+            "TCP_NODELAY",
+            "TCP_MAXSEG",
+            "TCP_CORK",
+            "TCP_KEEPIDLE",
+            "TCP_KEEPINTVL",
+            "TCP_KEEPCNT",
+            "TCP_SYNCNT",
+            "TCP_LINGER2",
+            "TCP_DEFER_ACCEPT",
+            "TCP_WINDOW_CLAMP",
+            "TCP_INFO",
+            "TCP_QUICKACK",
+            "TCP_CONGESTION",
+            "TCP_USER_TIMEOUT",
+            "TCP_FASTOPEN",
+            "TCP_FASTOPEN_CONNECT",
+            "TCP_ULP",
+            "TCP_NOTSENT_LOWAT",
+            "TCP_INQ",
+        ] {
+            for module in ["socket", "_socket"] {
+                assert_eq!(
+                    constant(module, name).expect(name).ty,
+                    Type::Int,
+                    "{module}.{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alias_modules_share_their_target_tables() {
+        for (alias, target) in [
+            ("_abc", "abc"),
+            ("_datetime", "datetime"),
+            ("_locale", "locale"),
+            ("_types", "types"),
+            ("_typing", "typing"),
+            ("_sre", "re"),
+            ("posix", "os"),
+            ("posixpath", "os.path"),
+            ("ntpath", "os.path"),
+            ("_frozen_importlib", "importlib"),
+            ("_frozen_importlib_external", "importlib.machinery"),
+            ("importlib._bootstrap_external", "importlib.machinery"),
+            ("zipimport", "importlib.machinery"),
+            ("_sysconfig", "sysconfig"),
+            ("_json", "json"),
+            ("_csv", "csv"),
+            ("_pickle", "pickle"),
+            ("_random", "random"),
+            ("_statistics", "statistics"),
+            ("_queue", "queue"),
+            ("_asyncio", "asyncio"),
+            ("_multiprocessing", "multiprocessing"),
+            ("_zoneinfo", "zoneinfo"),
+            ("_ast", "ast"),
+        ] {
+            let alias_spec = module(alias).unwrap_or_else(|| panic!("{alias}"));
+            let target_spec = module(target).unwrap_or_else(|| panic!("{target}"));
+            assert_eq!(alias_spec.name, alias);
+            assert!(
+                std::ptr::eq(alias_spec.functions, target_spec.functions),
+                "{alias}.functions must be the {target} table"
+            );
+            assert!(
+                std::ptr::eq(alias_spec.constants, target_spec.constants),
+                "{alias}.constants must be the {target} table"
+            );
+        }
+        for name in ["faulthandler", "_suggestions"] {
+            let spec = module(name).unwrap_or_else(|| panic!("{name}"));
+            assert!(spec.functions.is_empty(), "{name}");
+            assert!(spec.constants.is_empty(), "{name}");
+        }
+        // `runpy` is no longer empty: it declares its real entry points.
+        let run_module = function("runpy", "run_module").expect("runpy.run_module");
+        assert_eq!((run_module.min_args, run_module.max_args), (1, 4));
+        assert_eq!(
+            run_module.params,
+            &["mod_name", "init_globals", "run_name", "alter_sys"][..]
+        );
+        let details = function("runpy", "_get_module_details").expect("runpy._get_module_details");
+        assert_eq!(
+            (details.min_args, details.max_args, details.ret),
+            (1, 1, Type::Any)
+        );
+        // Every alias is registered exactly once.
+        for name in [
+            "_abc",
+            "_datetime",
+            "_locale",
+            "_types",
+            "_typing",
+            "_sre",
+            "posix",
+            "posixpath",
+            "ntpath",
+            "_frozen_importlib",
+            "_frozen_importlib_external",
+            "importlib._bootstrap_external",
+            "zipimport",
+            "_sysconfig",
+            "faulthandler",
+            "_suggestions",
+            "runpy",
+            "_json",
+            "_csv",
+            "_pickle",
+            "_random",
+            "_statistics",
+            "_queue",
+            "_asyncio",
+            "_multiprocessing",
+            "_zoneinfo",
+            "_ast",
+            // Pre-existing accelerators, kept here to prove they are not
+            // registered a second time.
+            "_bisect",
+            "_heapq",
+            "_struct",
+        ] {
+            let count = crate::stdlib::MODULES
+                .iter()
+                .filter(|spec| spec.name == name)
+                .count();
+            assert_eq!(count, 1, "{name} must be registered exactly once");
+        }
+    }
+
+    #[test]
+    fn module_and_member_names_are_unique() {
+        let mut modules: Vec<&str> = crate::stdlib::MODULES
+            .iter()
+            .map(|spec| spec.name)
+            .collect();
+        modules.sort_unstable();
+        let total = modules.len();
+        modules.dedup();
+        assert_eq!(modules.len(), total, "duplicate module name in MODULES");
+        for spec in crate::stdlib::MODULES {
+            let mut functions: Vec<&str> = spec.functions.iter().map(|f| f.name).collect();
+            functions.sort_unstable();
+            let total = functions.len();
+            functions.dedup();
+            assert_eq!(
+                functions.len(),
+                total,
+                "duplicate function in {}",
+                spec.name
+            );
+            let mut constants: Vec<&str> = spec.constants.iter().map(|c| c.name).collect();
+            constants.sort_unstable();
+            let total = constants.len();
+            constants.dedup();
+            assert_eq!(
+                constants.len(),
+                total,
+                "duplicate constant in {}",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn unix_signal_termios_and_operator_specs_are_registered() {
+        for (name, min, max, ret) in [
+            ("signal", 2, 2, Type::Any),
+            ("getsignal", 1, 1, Type::Any),
+            ("raise_signal", 1, 1, Type::None),
+            ("strsignal", 1, 1, Type::Any),
+            ("valid_signals", 0, 0, Type::Set),
+            ("pthread_sigmask", 2, 2, Type::Set),
+            ("alarm", 1, 1, Type::Int),
+            ("pause", 0, 0, Type::None),
+            ("setitimer", 2, 3, Type::Tuple),
+            ("getitimer", 1, 1, Type::Tuple),
+            ("siginterrupt", 2, 2, Type::None),
+            ("sigpending", 0, 0, Type::Set),
+            ("default_int_handler", 2, 2, Type::Never),
+        ] {
+            let spec = function("_signal", name).unwrap_or_else(|| panic!("_signal.{name}"));
+            assert_eq!(
+                (spec.min_args, spec.max_args, spec.ret),
+                (min, max, ret),
+                "_signal.{name}"
+            );
+            assert!(spec.params.is_empty(), "_signal.{name} is positional-only");
+        }
+        for name in [
+            "SIGHUP",
+            "SIGINT",
+            "SIGKILL",
+            "SIGTERM",
+            "SIG_DFL",
+            "SIG_IGN",
+            "SIG_BLOCK",
+            "SIG_SETMASK",
+            "ITIMER_REAL",
+            "ITIMER_PROF",
+            "SIGRTMIN",
+            "SIGRTMAX",
+            "NSIG",
+        ] {
+            assert_eq!(
+                constant("_signal", name).expect(name).ty,
+                Type::Int,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            constant("_signal", "ItimerError").expect("ItimerError").ty,
+            Type::Any
+        );
+
+        for (name, arity, ret) in [
+            ("tcgetattr", 1, Type::List),
+            ("tcsetattr", 3, Type::None),
+            ("tcsendbreak", 2, Type::None),
+            ("tcdrain", 1, Type::None),
+            ("tcflush", 2, Type::None),
+            ("tcflow", 2, Type::None),
+            ("tcgetwinsize", 1, Type::Tuple),
+            ("tcsetwinsize", 2, Type::None),
+        ] {
+            let spec = function("termios", name).unwrap_or_else(|| panic!("termios.{name}"));
+            assert_eq!(
+                (spec.min_args, spec.max_args, spec.ret),
+                (arity, arity, ret)
+            );
+        }
+        // Every constant the runtime exposes (194 integers) plus `error`.
+        let termios = module("termios").expect("termios");
+        assert_eq!(termios.constants.len(), 195);
+        for &name in &["IGNBRK", "ICANON", "VINTR", "B9600", "TCSANOW", "FIOASYNC"] {
+            assert_eq!(
+                constant("termios", name).expect(name).ty,
+                Type::Int,
+                "{name}"
+            );
+        }
+        assert_eq!(constant("termios", "error").expect("error").ty, Type::Any);
+
+        for name in ["and_", "xor"] {
+            let spec = function("operator", name).unwrap_or_else(|| panic!("operator.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (2, 2, Type::Any));
+        }
+        let groupby = function("itertools", "groupby").expect("itertools.groupby");
+        assert_eq!((groupby.min_args, groupby.max_args), (1, 2));
+        assert_eq!(groupby.params, &["iterable", "key"][..]);
+    }
+
+    #[test]
+    fn array_and_cmath_specs_are_registered() {
+        let constructor = function("array", "array").expect("array.array");
+        assert_eq!(
+            (constructor.min_args, constructor.max_args, constructor.ret),
+            (1, 2, Type::Any)
+        );
+        assert!(
+            constructor.dynamic_keywords,
+            "array(typecode[, initializer]) forwards keyword names"
+        );
+        assert_eq!(
+            constant("array", "typecodes").expect("typecodes").ty,
+            Type::Str
+        );
+
+        for name in [
+            "acos", "acosh", "asin", "asinh", "atan", "atanh", "cos", "cosh", "exp", "sin", "sinh",
+            "sqrt", "tan", "tanh", "log10", "rect",
+        ] {
+            let spec = function("cmath", name).unwrap_or_else(|| panic!("cmath.{name}"));
+            assert_eq!(spec.ret, Type::Complex, "cmath.{name}");
+        }
+        let log = function("cmath", "log").expect("cmath.log");
+        assert_eq!((log.min_args, log.max_args, log.ret), (1, 2, Type::Complex));
+        let phase = function("cmath", "phase").expect("cmath.phase");
+        assert_eq!(
+            (phase.min_args, phase.max_args, phase.ret),
+            (1, 1, Type::Float)
+        );
+        let polar = function("cmath", "polar").expect("cmath.polar");
+        assert_eq!(
+            (polar.min_args, polar.max_args, polar.ret),
+            (1, 1, Type::Tuple)
+        );
+        let rect = function("cmath", "rect").expect("cmath.rect");
+        assert_eq!(
+            (rect.min_args, rect.max_args, rect.ret),
+            (2, 2, Type::Complex)
+        );
+        for name in ["isfinite", "isinf", "isnan"] {
+            let spec = function("cmath", name).unwrap_or_else(|| panic!("cmath.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (1, 1, Type::Bool));
+        }
+        let isclose = function("cmath", "isclose").expect("cmath.isclose");
+        assert_eq!(
+            (isclose.min_args, isclose.max_args, isclose.ret),
+            (2, 4, Type::Bool)
+        );
+        assert!(isclose.dynamic_keywords);
+        for (name, ty) in [
+            ("pi", Type::Float),
+            ("e", Type::Float),
+            ("tau", Type::Float),
+            ("inf", Type::Float),
+            ("nan", Type::Float),
+            ("infj", Type::Complex),
+            ("nanj", Type::Complex),
+        ] {
+            assert_eq!(
+                constant("cmath", name)
+                    .unwrap_or_else(|| panic!("cmath.{name}"))
+                    .ty,
+                ty,
+                "cmath.{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn textwrap_specs_cover_the_textwrapper_keyword_surface() {
+        const OPTIONS: &[&str] = &[
+            "width",
+            "initial_indent",
+            "subsequent_indent",
+            "expand_tabs",
+            "replace_whitespace",
+            "fix_sentence_endings",
+            "break_long_words",
+            "break_on_hyphens",
+            "drop_whitespace",
+            "tabsize",
+            "max_lines",
+            "placeholder",
+        ];
+
+        let dedent = function("textwrap", "dedent").expect("textwrap.dedent");
+        assert_eq!(
+            (dedent.min_args, dedent.max_args, dedent.ret),
+            (1, 1, Type::Str)
+        );
+        let indent = function("textwrap", "indent").expect("textwrap.indent");
+        assert_eq!((indent.min_args, indent.max_args), (2, 3));
+        assert_eq!(indent.params, &["text", "prefix", "predicate"][..]);
+
+        for (name, ret) in [("wrap", Type::List), ("fill", Type::Str)] {
+            let spec = function("textwrap", name).unwrap_or_else(|| panic!("textwrap.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (1, 13, ret));
+            assert_eq!(spec.params.len(), 13, "{name} pads every option slot");
+            assert_eq!(spec.params[0], "text");
+            assert_eq!(&spec.params[1..], OPTIONS, "{name}");
+        }
+        let shorten = function("textwrap", "shorten").expect("textwrap.shorten");
+        assert_eq!(
+            (shorten.min_args, shorten.max_args, shorten.ret),
+            (2, 13, Type::Str)
+        );
+        assert_eq!(&shorten.params[1..], OPTIONS);
+
+        let wrapper = function("textwrap", "TextWrapper").expect("textwrap.TextWrapper");
+        assert_eq!(
+            (wrapper.min_args, wrapper.max_args, wrapper.ret),
+            (0, 12, Type::Any)
+        );
+        assert_eq!(wrapper.params, OPTIONS);
+
+        let method_wrap = function("textwrap", "_textwrapper_wrap").expect("_textwrapper_wrap");
+        assert_eq!(
+            (method_wrap.min_args, method_wrap.max_args, method_wrap.ret),
+            (2, 2, Type::List)
+        );
+        let method_fill = function("textwrap", "_textwrapper_fill").expect("_textwrapper_fill");
+        assert_eq!(
+            (method_fill.min_args, method_fill.max_args, method_fill.ret),
+            (2, 2, Type::Str)
+        );
+    }
+
+    #[test]
+    fn hashlib_accelerator_specs_are_registered() {
+        for (name, min, max, ret, params) in [
+            ("new", 1, 2, Type::Any, &["name", "data"][..]),
+            ("md5", 0, 1, Type::Any, &["data"][..]),
+            ("sha1", 0, 1, Type::Any, &["data"][..]),
+            ("sha224", 0, 1, Type::Any, &["data"][..]),
+            ("sha256", 0, 1, Type::Any, &["data"][..]),
+            ("sha384", 0, 1, Type::Any, &["data"][..]),
+            ("sha512", 0, 1, Type::Any, &["data"][..]),
+            ("blake2b", 0, 1, Type::Any, &["data"][..]),
+            ("blake2s", 0, 1, Type::Any, &["data"][..]),
+            (
+                "pbkdf2_hmac",
+                4,
+                5,
+                Type::Bytes,
+                &["hash_name", "password", "salt", "iterations", "dklen"][..],
+            ),
+            ("compare_digest", 2, 2, Type::Bool, &["a", "b"][..]),
+            (
+                "hmac_new",
+                1,
+                3,
+                Type::Any,
+                &["key", "msg", "digestmod"][..],
+            ),
+            (
+                "hmac_digest",
+                3,
+                3,
+                Type::Bytes,
+                &["key", "msg", "digestmod"][..],
+            ),
+            ("file_digest", 2, 2, Type::Any, &["fileobj", "digest"][..]),
+            ("get_fips_mode", 0, 0, Type::Int, &[][..]),
+            ("_is_fips_mode", 0, 0, Type::Bool, &[][..]),
+            ("uuid1", 0, 2, Type::Bytes, &["node", "clock_seq"][..]),
+            ("uuid4", 0, 0, Type::Bytes, &[][..]),
+            ("uuid5", 2, 2, Type::Bytes, &["namespace", "name"][..]),
+            ("generate_time_safe", 0, 0, Type::Tuple, &[][..]),
+        ] {
+            let spec = function("hashlib", name).unwrap_or_else(|| panic!("hashlib.{name}"));
+            assert_eq!(
+                (spec.min_args, spec.max_args, spec.ret),
+                (min, max, ret),
+                "hashlib.{name}"
+            );
+            assert_eq!(spec.params, params, "hashlib.{name}");
+        }
+        // `usedforsecurity` (and BLAKE2's extra parameters) are accepted as
+        // dynamic keywords by the runtime binder.
+        for name in [
+            "new", "md5", "sha1", "sha224", "sha256", "sha384", "sha512", "blake2b", "blake2s",
+        ] {
+            assert!(
+                function("hashlib", name).expect(name).dynamic_keywords,
+                "hashlib.{name} accepts usedforsecurity"
+            );
+        }
+        for (name, ty) in [
+            ("algorithms_guaranteed", Type::Set),
+            ("algorithms_available", Type::Set),
+            ("HASH", Type::Any),
+            ("HMAC", Type::Any),
+            ("openssl_md_meth_names", Type::Set),
+            ("UnsupportedDigestmodError", Type::Any),
+        ] {
+            assert_eq!(
+                constant("hashlib", name).expect(name).ty,
+                ty,
+                "hashlib.{name}"
+            );
+        }
+
+        // `_hashlib`: named/openssl constructors, HMAC helpers and FIPS.
+        for name in [
+            "new",
+            "hmac_new",
+            "hmac_digest",
+            "compare_digest",
+            "get_fips_mode",
+            "_is_fips_mode",
+            "pbkdf2_hmac",
+            "openssl_md5",
+            "openssl_sha1",
+            "openssl_sha224",
+            "openssl_sha256",
+            "openssl_sha384",
+            "openssl_sha512",
+            "openssl_blake2b512",
+            "openssl_blake2s256",
+        ] {
+            assert!(
+                function("_hashlib", name).is_some(),
+                "_hashlib.{name} is declared"
+            );
+        }
+        for name in ["HASH", "HMAC", "UnsupportedDigestmodError"] {
+            assert_eq!(
+                constant("_hashlib", name).expect(name).ty,
+                Type::Any,
+                "_hashlib.{name}"
+            );
+        }
+        assert_eq!(
+            constant("_hashlib", "openssl_md_meth_names")
+                .expect("openssl_md_meth_names")
+                .ty,
+            Type::Set
+        );
+
+        // Per-algorithm accelerators.
+        for (module, names) in [
+            ("_sha1", &["sha1"][..]),
+            ("_sha2", &["sha224", "sha256", "sha384", "sha512"][..]),
+            ("_md5", &["md5"][..]),
+            ("_blake2", &["blake2b", "blake2s"][..]),
+        ] {
+            for name in names {
+                let spec = function(module, name).unwrap_or_else(|| panic!("{module}.{name}"));
+                assert_eq!((spec.min_args, spec.max_args, spec.ret), (0, 1, Type::Any));
+                assert_eq!(spec.params, &["data"][..]);
+            }
+        }
+        let hmac_new = function("_hmac", "new").expect("_hmac.new");
+        assert_eq!(
+            (hmac_new.min_args, hmac_new.max_args, hmac_new.ret),
+            (1, 3, Type::Any)
+        );
+        assert_eq!(hmac_new.params, &["key", "msg", "digestmod"][..]);
+        let compute_digest = function("_hmac", "compute_digest").expect("_hmac.compute_digest");
+        assert_eq!(
+            (
+                compute_digest.min_args,
+                compute_digest.max_args,
+                compute_digest.ret
+            ),
+            (3, 3, Type::Bytes)
+        );
+        assert_eq!(
+            constant("_hmac", "UnknownHashError")
+                .expect("UnknownHashError")
+                .ty,
+            Type::Any
+        );
+        assert_eq!(constant("_hmac", "HMAC").expect("_hmac.HMAC").ty, Type::Any);
+        let time_safe = function("_uuid", "generate_time_safe").expect("_uuid.generate_time_safe");
+        assert_eq!(
+            (time_safe.min_args, time_safe.max_args, time_safe.ret),
+            (0, 0, Type::Tuple)
+        );
+        for name in ["has_uuid_generate_time_safe", "has_stable_extractable_node"] {
+            assert_eq!(
+                constant("_uuid", name).expect(name).ty,
+                Type::Bool,
+                "_uuid.{name}"
+            );
+        }
+        for name in [
+            "NAMESPACE_DNS",
+            "NAMESPACE_URL",
+            "NAMESPACE_OID",
+            "NAMESPACE_X500",
+        ] {
+            assert_eq!(
+                constant("_uuid", name).expect(name).ty,
+                Type::Str,
+                "_uuid.{name}"
+            );
+        }
+
+        for name in [
+            "hashlib", "_hashlib", "_sha1", "_sha2", "_md5", "_blake2", "_hmac", "_uuid",
+        ] {
+            assert!(module(name).is_some(), "{name} is registered");
+        }
+    }
+
+    #[test]
+    fn re_private_submodule_specs_are_registered() {
+        // `re._constants` / `re._compiler` / `re._parser` share one constant
+        // table (`from ._constants import *` in CPython).
+        let constants = module("re._constants").expect("re._constants");
+        let compiler = module("re._compiler").expect("re._compiler");
+        let parser = module("re._parser").expect("re._parser");
+        assert!(constants.functions.is_empty());
+        assert!(parser.functions.is_empty());
+        assert!(std::ptr::eq(constants.constants, compiler.constants));
+        assert!(std::ptr::eq(constants.constants, parser.constants));
+
+        for (name, ty) in [
+            ("MAGIC", Type::Int),
+            ("MAXREPEAT", Type::Int),
+            ("MAXGROUPS", Type::Int),
+            ("SRE_FLAG_IGNORECASE", Type::Int),
+            ("SRE_FLAG_ASCII", Type::Int),
+            ("SRE_INFO_PREFIX", Type::Int),
+            ("SRE_INFO_CHARSET", Type::Int),
+            ("PatternError", Type::Any),
+            ("error", Type::Any),
+        ] {
+            for module_name in ["re._constants", "re._compiler", "re._parser"] {
+                assert_eq!(
+                    constant(module_name, name)
+                        .unwrap_or_else(|| panic!("{module_name}.{name}"))
+                        .ty,
+                    ty,
+                    "{module_name}.{name}"
+                );
+            }
+        }
+
+        let compile = function("re._compiler", "compile").expect("re._compiler.compile");
+        assert_eq!(
+            (compile.min_args, compile.max_args, compile.ret),
+            (1, 2, Type::Any)
+        );
+        let isstring = function("re._compiler", "isstring").expect("re._compiler.isstring");
+        assert_eq!(
+            (isstring.min_args, isstring.max_args, isstring.ret),
+            (1, 1, Type::Bool)
+        );
+
+        // `re` re-exports the three private namespaces as module values.
+        for name in ["_compiler", "_constants", "_parser"] {
+            assert_eq!(constant("re", name).expect(name).ty, Type::Any, "re.{name}");
+        }
+    }
+
+    #[test]
+    fn importlib_machinery_and_util_specs_cover_pkgutil() {
+        for (name, min, max, ret) in [
+            ("_install", 1, 1, Type::None),
+            ("_path_finder_find_spec", 2, 4, Type::Any),
+            ("_path_finder_invalidate_caches", 1, 1, Type::None),
+            ("_file_finder_init", 2, usize::MAX, Type::None),
+            ("_file_finder_path_hook", 1, usize::MAX, Type::Any),
+            ("_file_finder_hook", 1, 1, Type::Any),
+            ("_file_finder_find_spec", 2, 3, Type::Any),
+            ("_file_finder_invalidate_caches", 1, 1, Type::None),
+        ] {
+            let spec = function("importlib.machinery", name)
+                .unwrap_or_else(|| panic!("importlib.machinery.{name}"));
+            assert_eq!(
+                (spec.min_args, spec.max_args, spec.ret),
+                (min, max, ret),
+                "importlib.machinery.{name}"
+            );
+        }
+        for name in [
+            "PathFinder",
+            "FileFinder",
+            "SourcelessFileLoader",
+            "AppleFrameworkLoader",
+        ] {
+            assert_eq!(
+                constant("importlib.machinery", name).expect(name).ty,
+                Type::Any,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            constant("importlib.machinery", "_zip_directory_cache")
+                .expect("_zip_directory_cache")
+                .ty,
+            Type::Dict
+        );
+
+        let cache_from_source =
+            function("importlib.util", "cache_from_source").expect("cache_from_source");
+        assert_eq!(
+            (
+                cache_from_source.min_args,
+                cache_from_source.max_args,
+                cache_from_source.ret
+            ),
+            (1, 3, Type::Str)
+        );
+        assert_eq!(
+            cache_from_source.params,
+            &["path", "debug_override", "optimization"][..]
+        );
+        let source_hash = function("importlib.util", "source_hash").expect("source_hash");
+        assert_eq!(
+            (source_hash.min_args, source_hash.max_args, source_hash.ret),
+            (1, 1, Type::Bytes)
+        );
+
+        assert_eq!(
+            constant("sys", "path_hooks").expect("path_hooks").ty,
+            Type::List
+        );
+        assert_eq!(
+            constant("importlib", "_bootstrap").expect("_bootstrap").ty,
+            Type::Any
+        );
     }
 }

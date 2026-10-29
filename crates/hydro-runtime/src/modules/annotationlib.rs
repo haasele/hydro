@@ -220,8 +220,10 @@ fn get_annotations(args: &[i64], keywords: &[(String, i64)]) -> i64 {
 
     // A class may install a PEP 649 `__annotate__` callable. Use it for the
     // STRING format (source text is only available from the callable) and as
-    // the fallback when the class has no stored annotations yet.
-    let annotate = try_getattr(obj, "__annotate__");
+    // the fallback when the class has no stored annotations yet. An absent
+    // callable reads as `None` (CPython's `type.__annotate__` getset), which
+    // is not callable and must fall through to the stored mapping.
+    let annotate = try_getattr(obj, "__annotate__").filter(|annotate| *annotate != NONE);
     if let Some(annotate) = annotate {
         if format == FORMAT_STRING {
             return call_annotate_value(annotate, format);
@@ -335,13 +337,18 @@ fn call_annotate_value(annotate: i64, format: i64) -> i64 {
 ///
 /// `value::class_annotations` consults this before creating its lazy empty
 /// mapping, so `Class.__annotations__` observes the deferred annotations that
-/// the frontend emits for class bodies.
+/// the frontend emits for class bodies. Only the class's *own* callable is
+/// considered, matching `type.__annotate__`: a subclass without annotations
+/// reports `{}`, never the base's mapping.
 pub(crate) fn evaluate_class_annotate(class: i64) -> Option<i64> {
-    let annotate = match value::class_lookup(class, "__annotate__") {
+    let annotate = match value::class_own_lookup(class, "__annotate__") {
         Some(value::ClassEntry::Attr(annotate)) => annotate,
         Some(value::ClassEntry::Method(_, annotate)) => annotate,
         None => return None,
     };
+    if annotate == NONE {
+        return None;
+    }
     let result = call_annotate_value(annotate, FORMAT_VALUE);
     if crate::exc::pending() {
         return None;
@@ -580,6 +587,56 @@ mod tests {
         // SAFETY: `call_annotate` passes exactly one format argument.
         let _format = unsafe { *argv };
         dict_new(vec![(text("x"), integer(1))])
+    }
+
+    extern "C" fn two_key_annotate(_argv: *const i64) -> i64 {
+        dict_new(vec![(text("x"), integer(1))])
+    }
+
+    #[test]
+    fn class_annotate_is_evaluated_once_and_cached() {
+        exc::init();
+        let annotate = value::function_new_with_flags(
+            two_key_annotate as *const () as usize,
+            1,
+            "annotate".to_string(),
+            0,
+        );
+        let roots = heap::root_values(&[annotate]);
+        let class = value::class_new("Protocol".to_string(), NONE, Vec::new());
+        let class_roots = heap::root_values(&[class]);
+        value::class_set_attr(class, "__annotate__".to_string(), annotate);
+
+        let first = value::class_annotations(class).expect("evaluated mapping");
+        assert!(!exc::pending());
+        assert_eq!(pair(first, "x"), Some(integer(1)));
+        match value::class_own_lookup(class, "__annotations__") {
+            Some(value::ClassEntry::Attr(cached)) => {
+                assert_eq!(
+                    cached, first,
+                    "the evaluated mapping is cached on the class"
+                )
+            }
+            _ => panic!("`__annotations__` must be stored after evaluation"),
+        }
+        assert_eq!(value::class_annotations(class), Some(first));
+
+        // `get_annotations` reports the cached mapping through a fresh copy.
+        let copy = get_annotations(&[class], &[]);
+        assert_eq!(pair(copy, "x"), Some(integer(1)));
+        assert_ne!(copy, first);
+
+        // The callable is per-class: a subclass reports its own empty mapping
+        // instead of inheriting the base's annotations or `__annotate__`.
+        let child = value::class_new("Child".to_string(), class, Vec::new());
+        let child_roots = heap::root_values(&[child]);
+        let child_annotations = value::class_annotations(child).expect("empty mapping");
+        assert!(as_dict(child_annotations).is_some_and(<[(i64, i64)]>::is_empty));
+        assert!(!exc::pending());
+
+        heap::release_roots(child_roots);
+        heap::release_roots(class_roots);
+        heap::release_roots(roots);
     }
 
     #[test]

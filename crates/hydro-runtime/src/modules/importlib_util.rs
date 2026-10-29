@@ -33,6 +33,8 @@ const MODULE: &str = "importlib.util";
 const LAZY_INIT: &str = "_lazy_init";
 const LAZY_CREATE_MODULE: &str = "_lazy_create_module";
 const LAZY_EXEC_MODULE: &str = "_lazy_exec_module";
+const CACHE_FROM_SOURCE: &str = "cache_from_source";
+const SOURCE_HASH: &str = "source_hash";
 
 /// Dispatches a native `importlib.util` function. Arity is enforced by the
 /// central spec before this point.
@@ -44,6 +46,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "module_from_spec" => module_from_spec(args),
         "resolve_name" => resolve_name(args),
         "decode_source" => decode_source(args),
+        CACHE_FROM_SOURCE => cache_from_source(args),
+        SOURCE_HASH => source_hash(args),
         LAZY_INIT => lazy_init(args),
         LAZY_CREATE_MODULE => lazy_create_module(args),
         LAZY_EXEC_MODULE => lazy_exec_module(args),
@@ -67,9 +71,13 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
 /// elsewhere).
 pub(crate) const PYC_MAGIC_NUMBER: u32 = 3627;
 
+/// `_imp.pyc_magic_number_token`: the magic number with the `\r\n` terminator
+/// in the high bytes, the key `_imp.source_hash` hashes sources with.
+pub(crate) const PYC_MAGIC_NUMBER_TOKEN: u32 =
+    PYC_MAGIC_NUMBER | ((b'\r' as u32) << 16) | ((b'\n' as u32) << 24);
+
 /// `importlib.util.MAGIC_NUMBER`, in the byte order `.pyc` headers use.
-pub(crate) const MAGIC_NUMBER_BYTES: [u8; 4] =
-    (PYC_MAGIC_NUMBER | ((b'\r' as u32) << 16) | ((b'\n' as u32) << 24)).to_le_bytes();
+pub(crate) const MAGIC_NUMBER_BYTES: [u8; 4] = PYC_MAGIC_NUMBER_TOKEN.to_le_bytes();
 
 /// Materialises a `importlib.util` module constant.
 pub(crate) fn constant(name: &str) -> i64 {
@@ -94,6 +102,156 @@ fn magic_number() -> i64 {
     globals::registry_set(KEY, bytes);
     crate::heap::release_roots(roots);
     bytes
+}
+
+/// `cache_from_source(path, debug_override=None, *, optimization=None)`.
+///
+/// The `__pycache__` location, cache tag (`cpython-314`) and optional
+/// `.opt-<level>` infix are CPython's; Hydro reports optimization level 0 for
+/// `sys.flags.optimize`, so the default name is the unoptimized `.pyc`.
+fn cache_from_source(args: &[i64]) -> i64 {
+    let path_arg = args.first().copied().unwrap_or(NONE);
+    let Some(path) = value::as_str(path_arg) else {
+        if value::as_bytes(path_arg).is_some() {
+            // CPython's byte-path path fails the same way (`str.partition`
+            // on a bytes filename).
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "argument should be integer or bytes-like object, not 'str'",
+            );
+        }
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "expected str, bytes or os.PathLike object, not {}",
+                value::type_name(path_arg)
+            ),
+        );
+    };
+    let debug_override = args.get(1).copied().unwrap_or(NONE);
+    let mut optimization = args.get(2).copied().unwrap_or(NONE);
+    if debug_override != NONE {
+        if optimization != NONE {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "debug_override or optimization must be set to None",
+            );
+        }
+        optimization = if value::truthy(debug_override) {
+            value::str_alloc(String::new())
+        } else {
+            crate::ops::int_result(1)
+        };
+    }
+    // `sys.flags.optimize` is 0, so `None` means the unoptimized tag.
+    let optimization = if optimization == NONE {
+        String::new()
+    } else if let Some(text) = value::as_str(optimization) {
+        text.to_string()
+    } else {
+        value::to_string(optimization)
+    };
+    let mut tag = hydro_ir::PYTHON_ABI_TAG.to_string();
+    if !optimization.is_empty() {
+        if !optimization.chars().all(char::is_alphanumeric) {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("'{optimization}' is not alphanumeric"),
+            );
+        }
+        tag.push_str(".opt-");
+        tag.push_str(&optimization);
+    }
+    let (head, tail) = split_tail(path);
+    let (base, sep, rest) = match tail.rfind('.') {
+        Some(index) => (&tail[..index], ".", &tail[index + 1..]),
+        None => ("", "", tail),
+    };
+    let stem = if base.is_empty() { rest } else { base };
+    let filename = format!("{stem}{sep}{tag}{}", BYTECODE_SUFFIX);
+    let cached = if head.is_empty() {
+        Path::new("__pycache__").join(filename)
+    } else {
+        Path::new(head).join("__pycache__").join(filename)
+    };
+    value::str_alloc(cached.to_string_lossy().into_owned())
+}
+
+/// The first bytecode suffix (`BYTECODE_SUFFIXES[0]`) without allocating the
+/// module's list.
+const BYTECODE_SUFFIX: &str = ".pyc";
+
+/// `os.path.split` for a `str` path: the last component and its directory.
+fn split_tail(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(index) => (&path[..index], &path[index + 1..]),
+        None => ("", path),
+    }
+}
+
+/// `source_hash(source_bytes)`: CPython's keyed SipHash-1-3 of the source,
+/// keyed with `_imp.pyc_magic_number_token`, as the eight bytes hash-based
+/// `.pyc` files store.
+fn source_hash(args: &[i64]) -> i64 {
+    let source_arg = args.first().copied().unwrap_or(NONE);
+    let Some(source) = value::as_bytes(source_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "a bytes-like object is required, not '{}'",
+                value::type_name(source_arg)
+            ),
+        );
+    };
+    let hash = siphash13(u64::from(PYC_MAGIC_NUMBER_TOKEN), 0, source);
+    value::bytes_new(hash.to_le_bytes().to_vec())
+}
+
+/// CPython's `_Py_KeyedHash` (SipHash-1-3), used by `_imp.source_hash`.
+// `as_chunks` needs Rust 1.88; the workspace MSRV is 1.85.
+#[allow(clippy::chunks_exact_to_as_chunks)]
+fn siphash13(k0: u64, k1: u64, source: &[u8]) -> u64 {
+    let mut b = (source.len() as u64) << 56;
+    let mut v0 = k0 ^ 0x736f_6d65_7073_6575;
+    let mut v1 = k1 ^ 0x646f_7261_6e64_6f6d;
+    let mut v2 = k0 ^ 0x6c79_6765_6e65_7261;
+    let mut v3 = k1 ^ 0x7465_6462_7974_6573;
+    let mut chunks = source.chunks_exact(8);
+    for chunk in &mut chunks {
+        let mut block = [0u8; 8];
+        block.copy_from_slice(chunk);
+        let mi = u64::from_le_bytes(block);
+        v3 ^= mi;
+        single_round(&mut v0, &mut v1, &mut v2, &mut v3);
+        v0 ^= mi;
+    }
+    let remainder = chunks.remainder();
+    let mut tail = [0u8; 8];
+    tail[..remainder.len()].copy_from_slice(remainder);
+    b |= u64::from_le_bytes(tail);
+    v3 ^= b;
+    single_round(&mut v0, &mut v1, &mut v2, &mut v3);
+    v0 ^= b;
+    v2 ^= 0xff;
+    for _ in 0..3 {
+        single_round(&mut v0, &mut v1, &mut v2, &mut v3);
+    }
+    (v0 ^ v1) ^ (v2 ^ v3)
+}
+
+/// One SipHash round pair (`SINGLE_ROUND` in CPython's `pyhash.c`).
+fn single_round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
+    half_round(v0, v1, v2, v3, 13, 16);
+    half_round(v2, v1, v0, v3, 17, 21);
+}
+
+/// One `HALF_ROUND` in CPython's `pyhash.c`.
+fn half_round(a: &mut u64, b: &mut u64, c: &mut u64, d: &mut u64, s: u32, t: u32) {
+    *a = (*a).wrapping_add(*b);
+    *c = (*c).wrapping_add(*d);
+    *b = (*b).rotate_left(s) ^ *a;
+    *d = (*d).rotate_left(t) ^ *c;
+    *a = (*a).rotate_left(32);
 }
 
 // -------------------------------------------------------------------------
@@ -182,7 +340,16 @@ pub(crate) fn resolve_module(name: &str) -> Option<FoundSpec> {
 /// finder's path, exactly as `importlib._bootstrap._find_spec(name, path)`
 /// forwards `path` to `PathFinder`. Built-in modules and modules compiled into
 /// the program are still found, because their finders ignore `path`.
-fn resolve_module_with_path(name: &str, path: Option<&[String]>) -> Option<FoundSpec> {
+/// Finder entry point shared with `importlib.machinery.PathFinder`: resolves
+/// `name` against the explicit finder path (or `sys.path` when `None`),
+/// including native modules and modules compiled into the program.
+pub(crate) fn resolve_module_with_path(name: &str, path: Option<&[String]>) -> Option<FoundSpec> {
+    if name == "__main__" {
+        // CPython always has a `__main__` module: the entry program. Materialise
+        // its module value so the registry branch below describes it even when
+        // the program has not bound a global yet.
+        super::module_value_by_name("__main__");
+    }
     if hydro_ir::stdlib::module(name).is_some() {
         return Some(FoundSpec {
             name: name.to_string(),
@@ -256,6 +423,16 @@ fn is_extension_path(path: &Path) -> bool {
 /// Whether a source path is a package initializer.
 fn is_package_init(path: &Path) -> bool {
     path.file_name() == Some(std::ffi::OsStr::new("__init__.py"))
+}
+
+/// Filesystem-only discovery for `importlib.machinery.FileFinder` and the
+/// `FileFinder` path hook: native modules and modules that exist only in the
+/// runtime registry are not found through a directory finder.
+pub(crate) fn filesystem_spec(name: &str, dirs: &[String]) -> Option<FoundSpec> {
+    if name.is_empty() || name.split('.').any(str::is_empty) {
+        return None;
+    }
+    filesystem_module_in(name, dirs)
 }
 
 /// Looks for `name` in `search`, which is the documented `sys.path` order for
@@ -1012,6 +1189,102 @@ mod tests {
         let bytes = value::as_bytes(first).expect("bytes");
         // `_imp.pyc_magic_number_token.to_bytes(4, 'little')` for 3627.
         assert_eq!(bytes.to_vec(), vec![0x2B, 0x0E, 0x0D, 0x0A]);
+    }
+
+    #[test]
+    fn cache_from_source_matches_cpython_layout() {
+        exc::init();
+        let cases = [
+            ("/tmp/a.py", "/tmp/__pycache__/a.cpython-314.pyc"),
+            ("a.py", "__pycache__/a.cpython-314.pyc"),
+            (
+                "/tmp/pkg/__init__.py",
+                "/tmp/pkg/__pycache__/__init__.cpython-314.pyc",
+            ),
+            ("/tmp/noext", "/tmp/__pycache__/noextcpython-314.pyc"),
+            ("/tmp/a.pyc", "/tmp/__pycache__/a.cpython-314.pyc"),
+        ];
+        for (path, expected) in cases {
+            let cached = call(CACHE_FROM_SOURCE, &[text(path)]);
+            assert!(
+                !exc::pending(),
+                "{path}: {}",
+                value::to_string(exc::pending_value())
+            );
+            assert_eq!(value::as_str(cached), Some(expected), "{path}");
+        }
+
+        // An explicit optimization level becomes the `.opt-<level>` infix.
+        let optimized = call(CACHE_FROM_SOURCE, &[text("/tmp/a.py"), NONE, text("2")]);
+        assert_eq!(
+            value::as_str(optimized),
+            Some("/tmp/__pycache__/a.cpython-314.opt-2.pyc")
+        );
+        exc::clear();
+        call(CACHE_FROM_SOURCE, &[text("/tmp/a.py"), NONE, text("x-y")]);
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "'x-y' is not alphanumeric"
+        );
+
+        // A non-path argument reports CPython's `os.fspath` error.
+        exc::clear();
+        call(CACHE_FROM_SOURCE, &[crate::ops::int_result(1)]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::clear();
+    }
+
+    #[test]
+    fn source_hash_matches_cpython_siphash13() {
+        exc::init();
+        // Oracle values from `_imp.source_hash(_imp.pyc_magic_number_token, b)`.
+        let cases: [(&[u8], [u8; 8]); 4] = [
+            (b"", [0x61, 0xf5, 0xb7, 0xcb, 0x65, 0x3a, 0x6a, 0xa4]),
+            (b"a", [0x97, 0x13, 0xde, 0xd0, 0xc3, 0x32, 0x43, 0x73]),
+            (b"abc", [0x6e, 0x46, 0x1b, 0xf6, 0xa5, 0xe9, 0x7b, 0x4a]),
+            (
+                b"def f():\n    return 1\n",
+                [0x34, 0x85, 0x3d, 0x99, 0x3c, 0xed, 0x1a, 0x39],
+            ),
+        ];
+        for (source, expected) in cases {
+            let digest = call(SOURCE_HASH, &[value::bytes_new(source.to_vec())]);
+            assert!(
+                !exc::pending(),
+                "{}",
+                value::to_string(exc::pending_value())
+            );
+            let bytes = value::as_bytes(digest).expect("bytes digest");
+            assert_eq!(bytes, &expected[..], "{source:?}");
+        }
+
+        // Only bytes-like sources are accepted.
+        exc::clear();
+        call(SOURCE_HASH, &[text("abc")]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "a bytes-like object is required, not 'str'"
+        );
+        exc::clear();
+    }
+
+    #[test]
+    fn find_spec_describes_the_entry_module() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
+        crate::core::globals::reset();
+        exc::init();
+        let spec = call("find_spec", &[text("__main__")]);
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        assert!(machinery::is_spec(spec));
+        assert_eq!(machinery::spec_name(spec).as_deref(), Some("__main__"));
+        crate::core::globals::reset();
+        exc::init();
     }
 
     #[test]

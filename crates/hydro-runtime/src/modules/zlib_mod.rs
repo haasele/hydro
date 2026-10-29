@@ -299,23 +299,88 @@ fn compress_class() -> i64 {
     })
 }
 
+/// Methods shared by `zlib.Decompress` (the `decompressobj()` type) and the
+/// `_ZlibDecompressor` type gzip instantiates with `wbits=-MAX_WBITS`.
+///
+/// The `__init__` method carries a real signature (`wbits=MAX_WBITS,
+/// zdict=b''`) so keyword binding works; `decompressobj()` allocates the same
+/// state directly without going through it.
+fn decompress_methods() -> Vec<(String, i64)> {
+    let init = value::native_function_new("zlib", "_zlib_decompress_init", usize::MAX);
+    value::function_set_signature(
+        init,
+        vec![
+            value::ParamMeta {
+                name: "self".to_string(),
+                kind: hydro_ir::ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "wbits".to_string(),
+                kind: hydro_ir::ParamKind::Positional,
+                default: Some(encode_int(MAX_WBITS)),
+            },
+            value::ParamMeta {
+                name: "zdict".to_string(),
+                kind: hydro_ir::ParamKind::Positional,
+                default: Some(NONE),
+            },
+        ],
+    );
+    value::function_set_full_entry(init, decompress_init_entry as *const () as usize);
+    vec![
+        ("__init__".to_string(), init),
+        (
+            "decompress".to_string(),
+            value::native_function_new("zlib", "_zlib_decompress", usize::MAX),
+        ),
+        (
+            "flush".to_string(),
+            value::native_function_new("zlib", "_zlib_decompress_flush", usize::MAX),
+        ),
+        (
+            "copy".to_string(),
+            value::native_function_new("zlib", "_zlib_decompress_copy", usize::MAX),
+        ),
+    ]
+}
+
+/// `type(decompressobj())`: CPython names this class `zlib.Decompress`.
 fn decompress_class() -> i64 {
     cached_class("zlib.Decompress", || {
-        let methods = vec![
-            (
-                "decompress".to_string(),
-                value::native_function_new("zlib", "_zlib_decompress", usize::MAX),
-            ),
-            (
-                "flush".to_string(),
-                value::native_function_new("zlib", "_zlib_decompress_flush", usize::MAX),
-            ),
-            (
-                "copy".to_string(),
-                value::native_function_new("zlib", "_zlib_decompress_copy", usize::MAX),
-            ),
-        ];
-        value::class_new("Decompress".to_string(), NONE, methods)
+        value::class_new("Decompress".to_string(), NONE, decompress_methods())
+    })
+}
+
+/// `zlib._ZlibDecompressor`: the type gzip's `DecompressReader` uses as its
+/// `_decomp_factory` (`zlib._ZlibDecompressor(wbits=-MAX_WBITS)`).
+fn private_decompressor_class() -> i64 {
+    cached_class("zlib._ZlibDecompressor", || {
+        value::class_new("_ZlibDecompressor".to_string(), NONE, decompress_methods())
+    })
+}
+
+/// `zlib._ZlibCompressor`: the mirror type for incremental compression.
+fn private_compressor_class() -> i64 {
+    cached_class("zlib._ZlibCompressor", || {
+        value::class_new(
+            "_ZlibCompressor".to_string(),
+            NONE,
+            vec![
+                (
+                    "compress".to_string(),
+                    value::native_function_new("zlib", "_zlib_compress", usize::MAX),
+                ),
+                (
+                    "flush".to_string(),
+                    value::native_function_new("zlib", "_zlib_flush", usize::MAX),
+                ),
+                (
+                    "copy".to_string(),
+                    value::native_function_new("zlib", "_zlib_copy", usize::MAX),
+                ),
+            ],
+        )
     })
 }
 
@@ -442,12 +507,23 @@ fn attribute_snapshot(state: &InflateStream) -> (Vec<u8>, Vec<u8>, bool) {
 /// Stores the derived `Decompress` attributes. The first new string object is
 /// rooted across the second allocation.
 fn store_attributes(instance: i64, unused: Vec<u8>, tail: Vec<u8>, eof: bool) {
+    // `_ZlibDecompressor.needs_input` is true while no unconsumed input is
+    // buffered. Only instances constructed through that class carry the
+    // attribute; `decompressobj()` instances keep CPython's attribute set.
+    let needs_input = tail.is_empty();
     let unused = value::bytes_new(unused);
     let roots = heap::root_values(&[unused]);
     let tail = value::bytes_new(tail);
     value::instance_setattr(instance, "unused_data".to_string(), unused);
     value::instance_setattr(instance, "unconsumed_tail".to_string(), tail);
     value::instance_setattr(instance, "eof".to_string(), value::bool_value(eof));
+    if value::instance_attr(instance, "needs_input").is_some() {
+        value::instance_setattr(
+            instance,
+            "needs_input".to_string(),
+            value::bool_value(needs_input),
+        );
+    }
     heap::release_roots(roots);
 }
 
@@ -817,17 +893,43 @@ fn decompressobj(args: &[i64]) -> i64 {
             Err(error) => return error,
         },
     };
+    inflate_object(wbits, zdict, false)
+}
+
+/// Allocates a `Decompress` instance for `wbits`/`zdict`.
+///
+/// `incremental` selects the `_ZlibDecompressor` shape: gzip's
+/// `DecompressReader` reads `needs_input`, which `zlib.decompressobj()`
+/// instances do not expose in CPython, so it is only installed for that class.
+fn inflate_object(wbits: i64, zdict: Vec<u8>, incremental: bool) -> i64 {
+    let handle = match inflate_state(wbits, zdict) {
+        Ok(handle) => handle,
+        Err(error) => return error,
+    };
+    let instance = value::instance_new(decompress_class());
+    attach_handle(instance, handle);
+    // Initial attribute values, matching a fresh `zlib.Decompress`.
+    store_attributes(instance, Vec::new(), Vec::new(), false);
+    if incremental {
+        value::instance_setattr(instance, "needs_input".to_string(), value::TRUE);
+    }
+    instance
+}
+
+/// Initialises and registers an inflate stream for `wbits`, feeding `zdict` to
+/// raw (`wbits < 0`) streams up front.
+fn inflate_state(wbits: i64, zdict: Vec<u8>) -> Result<u64, i64> {
     let stream = match init_inflate(wbits as c_int) {
         Ok(stream) => stream,
         Err(failure) => {
-            return match failure.status {
+            return Err(match failure.status {
                 Z_STREAM_ERROR => value_error("Invalid initialization option"),
                 Z_MEM_ERROR => exc::raise_with_message(
                     MEMORY_ERROR,
                     "Can't allocate memory for decompression object",
                 ),
                 _ => stream_error(&failure, "creating decompression object"),
-            };
+            });
         }
     };
     let mut state = InflateStream {
@@ -850,16 +952,42 @@ fn decompressobj(args: &[i64]) -> i64 {
         };
         if status != Z_OK {
             let failure = Failure::from_stream(&state.stream, status);
-            return stream_error(&failure, "preparing to decompress data");
+            return Err(stream_error(&failure, "preparing to decompress data"));
         }
     }
-    let handle = register(Stream::Inflate(state));
-    let class = decompress_class();
-    let instance = value::instance_new(class);
+    Ok(register(Stream::Inflate(state)))
+}
+
+/// `_ZlibDecompressor.__init__(self, wbits=MAX_WBITS, zdict=b'')`.
+extern "C" fn decompress_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes the signature's three slots.
+    decompress_init(unsafe { *argv }, unsafe { *argv.add(1) }, unsafe {
+        *argv.add(2)
+    })
+}
+
+fn decompress_init(instance: i64, wbits: i64, zdict: i64) -> i64 {
+    let Some(wbits) = value::as_integer(wbits) else {
+        return type_error(&format!(
+            "wbits must be an integer, not {}",
+            value::type_name(wbits)
+        ));
+    };
+    let zdict = match zdict {
+        NONE => Vec::new(),
+        value_arg => match bytes_argument(value_arg, "zdict") {
+            Ok(dictionary) => dictionary,
+            Err(error) => return error,
+        },
+    };
+    let handle = match inflate_state(wbits, zdict) {
+        Ok(handle) => handle,
+        Err(error) => return error,
+    };
     attach_handle(instance, handle);
-    // Initial attribute values, matching a fresh `zlib.Decompress`.
     store_attributes(instance, Vec::new(), Vec::new(), false);
-    instance
+    value::instance_setattr(instance, "needs_input".to_string(), value::TRUE);
+    NONE
 }
 
 // -------------------------------------------------------------------------
@@ -1308,6 +1436,8 @@ pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
 pub(crate) fn constant(name: &str) -> i64 {
     match name {
         "error" => error_class(),
+        "_ZlibDecompressor" => private_decompressor_class(),
+        "_ZlibCompressor" => private_compressor_class(),
         "Z_NO_COMPRESSION" => encode_int(Z_NO_COMPRESSION),
         "Z_BEST_SPEED" => encode_int(Z_BEST_SPEED),
         "Z_BEST_COMPRESSION" => encode_int(Z_BEST_COMPRESSION),
@@ -1521,6 +1651,57 @@ mod tests {
             data(call("decompress", &[gzip, int(47)])),
             b"hello world".to_vec()
         );
+    }
+
+    #[test]
+    fn private_decompressor_class_constructs_and_streams() {
+        exc::init();
+        // `zlib._ZlibDecompressor` is a real class value.
+        let class = constant("_ZlibDecompressor");
+        assert_eq!(
+            value::as_class(class)
+                .map(|state| state.name.clone())
+                .as_deref(),
+            Some("_ZlibDecompressor")
+        );
+        assert!(value::as_class(constant("_ZlibCompressor")).is_some());
+        assert_eq!(class, constant("_ZlibDecompressor"));
+
+        // Build a raw-deflate payload, then instantiate the class the way
+        // gzip does: `_ZlibDecompressor(wbits=-MAX_WBITS)`.
+        let encoder = call("compressobj", &[int(6), int(8), int(-15)]);
+        let body = call("_zlib_compress", &[encoder, bytes(b"hello world")]);
+        let tail = call("_zlib_flush", &[encoder]);
+        let mut payload = data(body);
+        payload.extend_from_slice(&data(tail));
+        assert!(!exc::pending());
+
+        let instance = crate::builtins::call(class, 1, [int(-15)].as_ptr());
+        assert!(!exc::pending());
+        assert_eq!(value::type_name_of(instance), "_ZlibDecompressor");
+        assert_eq!(
+            value::instance_attr(instance, "needs_input"),
+            Some(value::TRUE)
+        );
+
+        // A limited first call reports `needs_input = False`; the buffered
+        // remainder is drained with an empty input, like gzip's reader.
+        let first = call(
+            "_zlib_decompress",
+            &[instance, value::bytes_new(payload.clone()), int(5)],
+        );
+        assert_eq!(data(first), b"hello".to_vec());
+        assert_eq!(
+            value::instance_attr(instance, "needs_input"),
+            Some(value::FALSE)
+        );
+        let second = call("_zlib_decompress", &[instance, bytes(b"")]);
+        assert_eq!(data(second), b" world".to_vec());
+        assert_eq!(
+            value::instance_attr(instance, "needs_input"),
+            Some(value::TRUE)
+        );
+        assert_eq!(value::instance_attr(instance, "eof"), Some(value::TRUE));
     }
 
     #[test]

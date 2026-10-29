@@ -564,9 +564,13 @@ const DICT_METHODS: &[(&str, MethodSig)] = &[
         "get",
         MethodSig::new(1, 2, &[ArgKind::Any, ArgKind::Any], Type::Any),
     ),
-    ("keys", MethodSig::new(0, 0, &[], Type::List)),
-    ("values", MethodSig::new(0, 0, &[], Type::List)),
-    ("items", MethodSig::new(0, 0, &[], Type::List)),
+    // `keys()`/`values()`/`items()` return live runtime views, not lists:
+    // `dict_keys`/`dict_items` compare and combine as sets, while
+    // `dict_values` is only iterable. Their element kind is not tracked, so
+    // the static type stays dynamic and the runtime protocol decides.
+    ("keys", MethodSig::new(0, 0, &[], Type::Any)),
+    ("values", MethodSig::new(0, 0, &[], Type::Any)),
+    ("items", MethodSig::new(0, 0, &[], Type::Any)),
     (
         "pop",
         MethodSig::new(1, 2, &[ArgKind::Any, ArgKind::Any], Type::Any),
@@ -584,6 +588,12 @@ const DICT_METHODS: &[(&str, MethodSig)] = &[
 
 const TUPLE_METHODS: &[(&str, MethodSig)] = &[
     ("count", MethodSig::new(1, 1, &[ArgKind::Any], Type::Int)),
+    ("index", MethodSig::new(1, 1, &[ArgKind::Any], Type::Int)),
+];
+
+const RANGE_METHODS: &[(&str, MethodSig)] = &[
+    // `range.index(value)` returns the position of `value`, raising
+    // ValueError when it is absent. The result is always an int.
     ("index", MethodSig::new(1, 1, &[ArgKind::Any], Type::Int)),
 ];
 
@@ -2179,6 +2189,18 @@ impl<'a> Checker<'a> {
             HExprKind::BoolOp { lhs, rhs, .. } => {
                 self.check_expr(lhs, f);
                 self.check_expr(rhs, f);
+                // A gradual operand (an unannotated parameter) may hold either
+                // branch's value; unifying it with the other operand would pin
+                // it to that type. CPython's `key or None` in `configparser`
+                // is a dynamic `str | None` expression, not a constant `None`,
+                // so widen it and keep the result dynamic instead of reporting
+                // a bogus `str + None`.
+                if self.inf.is_gradual(lhs.ty) || self.inf.is_gradual(rhs.ty) {
+                    self.widen_gradual(lhs.ty);
+                    self.widen_gradual(rhs.ty);
+                    self.force_any(expr.ty);
+                    return;
+                }
                 // `and`/`or` return one of their operands; a shared type
                 // narrows the result, mixed operands stay dynamic.
                 match self.inf.unify(lhs.ty, rhs.ty) {
@@ -2882,6 +2904,7 @@ impl<'a> Checker<'a> {
                     Type::List => LIST_METHODS,
                     Type::Dict => DICT_METHODS,
                     Type::Tuple => TUPLE_METHODS,
+                    Type::Range => RANGE_METHODS,
                     Type::Set => SET_METHODS,
                     _ => {
                         self.error_no_method(expr, receiver, method, None);

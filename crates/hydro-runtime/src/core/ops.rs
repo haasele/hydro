@@ -230,6 +230,138 @@ fn complex_pow(a: i64, b: i64) -> Option<i64> {
 // Binary operators
 // -------------------------------------------------------------------------
 
+/// Whether `v` is an opaque handle for an extension module's type object
+/// (`PyTypeObject`, e.g. `pydantic_core.SchemaValidator`).
+fn is_extension_type(v: i64) -> bool {
+    value::ext_object_pointer(v).is_some_and(crate::capi::object_is_type)
+}
+
+/// Whether `v` is a generic alias: the runtime's native
+/// `typing._GenericAlias`/`_ConcatenateGenericAlias` instances that stand in
+/// for CPython's `types.GenericAlias` (`tuple[int, ...]`, `list[str]`) and
+/// `typing` aliases (`Literal[...]`, `Annotated[...]`, `C[int]`).
+///
+/// The class-name gate runs before any typing lookup so a property `|` on an
+/// ordinary instance cannot materialise (and allocate) the placeholder classes
+/// while the operands are only borrowed.
+fn is_generic_alias(v: i64) -> bool {
+    matches!(
+        value::instance_class_name(v),
+        Some("_GenericAlias" | "_ConcatenateGenericAlias")
+    ) && value::instance_attr(v, "__origin__").is_some()
+}
+
+/// Whether `v` may be a member of a PEP 604 union.
+///
+/// Mirrors the member kinds of
+/// [`types::union_binary_or`](crate::modules::types::union_binary_or) and adds
+/// opaque extension type handles and generic aliases. A compiled extension's
+/// classes are real types to CPython, so `SchemaValidator | SchemaSerializer`
+/// composes even though the handle is not one of this runtime's `Class`
+/// values; aliases such as `tuple['_HashableJsonValue', ...]` are equally
+/// valid union members and stay members themselves (their origin is not
+/// substituted).
+fn is_union_operand(v: i64) -> bool {
+    value::as_class(v).is_some()
+        || v == value::NONE
+        || value::as_function(v).is_some()
+        || crate::modules::types::is_union(v)
+        || crate::modules::typing::is_type_alias_value(v)
+        || is_extension_type(v)
+        || is_generic_alias(v)
+}
+
+/// Appends the flattened members of `v` to `out`: an existing native union
+/// contributes its `__args__`, every other value is one member.
+fn collect_union_members(v: i64, out: &mut Vec<i64>) {
+    if crate::modules::types::is_union(v) {
+        if let Some(args) = value::instance_attr(v, "__args__").and_then(value::as_tuple) {
+            for item in args {
+                collect_union_members(*item, out);
+            }
+            return;
+        }
+    }
+    out.push(v);
+}
+
+/// Union-member identity for deduplication: tagged-value identity, except
+/// that two handles for the same extension type object name the same member.
+/// `A | A` therefore collapses to `A` even when the operands are distinct
+/// wrappers around one `PyTypeObject`.
+fn same_union_member(a: i64, b: i64) -> bool {
+    if a == b {
+        return true;
+    }
+    match (value::ext_object_pointer(a), value::ext_object_pointer(b)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// `A | B` for type-like operands, including opaque extension type handles.
+///
+/// [`types::union_binary_or`](crate::modules::types::union_binary_or) owns the
+/// runtime's native member kinds. This wrapper extends it with the extension
+/// types it does not model, flattens either operand when it already is a union,
+/// and deduplicates extension members by `PyTypeObject` identity. `None` means
+/// "not a type union", leaving the bitwise path to report its usual
+/// `TypeError`.
+fn type_union_or(left: i64, right: i64) -> Option<i64> {
+    if let Some(result) = crate::modules::types::union_binary_or(left, right) {
+        return Some(result);
+    }
+    if !is_union_operand(left) || !is_union_operand(right) {
+        return None;
+    }
+    let mut members: Vec<i64> = Vec::with_capacity(4);
+    collect_union_members(left, &mut members);
+    collect_union_members(right, &mut members);
+    let mut unique: Vec<i64> = Vec::with_capacity(members.len());
+    for member in members {
+        if !unique
+            .iter()
+            .any(|existing| same_union_member(*existing, member))
+        {
+            unique.push(member);
+        }
+    }
+    // A one-member union is that member (`A | A is A`). Returning the existing
+    // handle keeps the identity, including for opaque extension types where a
+    // rebuilt handle would compare equal but not be the same value.
+    if unique.len() == 1 {
+        return Some(unique[0]);
+    }
+    // `union_new` allocates: root the collected members so a collection during
+    // the allocation cannot reclaim them.
+    let roots = crate::heap::root_values(&unique);
+    let result = crate::modules::types::union_new(&unique);
+    crate::heap::release_roots(roots);
+    Some(result)
+}
+
+/// `TypeError` for a `|` whose operands are not both type-like.
+///
+/// A `PyTypeObject` handle is a class, so it is named `type` in the message
+/// even though the opaque storage otherwise reports `object`.
+fn type_union_error(a: i64, b: i64) -> i64 {
+    fn operand(v: i64) -> String {
+        if is_extension_type(v) {
+            "type".to_string()
+        } else {
+            value::type_name_of(v)
+        }
+    }
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "unsupported operand type(s) for |: '{}' and '{}'",
+            operand(a),
+            operand(b)
+        ),
+    )
+}
+
 pub(crate) fn binop(op: u32, a: i64, b: i64) -> i64 {
     // `str % args` is Python's printf-style formatting, not a numeric
     // operation. The template is copied out before any allocation.
@@ -247,12 +379,19 @@ pub(crate) fn binop(op: u32, a: i64, b: i64) -> i64 {
     if op == OP_DIV && value::as_path(a).is_some() {
         return path_join_op(a, b);
     }
-    // PEP 604 type unions: `A | B` for class values, `None` and existing
-    // union values (`types.UnionType`). Non-type operands fall through to the
-    // native bitwise path and report its usual `TypeError`.
+    // PEP 604 type unions: `A | B` for type-like values (classes, `None`,
+    // function values, existing unions, PEP 695 aliases and extension type
+    // handles). Non-type operands fall through to the native bitwise path and
+    // report its usual `TypeError`.
     if op == OP_BIT_OR {
-        if let Some(result) = crate::modules::types::union_binary_or(a, b) {
+        if let Some(result) = type_union_or(a, b) {
             return result;
+        }
+        // A pair rejected above that still names an extension type is a type
+        // union with a non-type operand; report it as such instead of letting
+        // the opaque handle degrade to `object` in the bitwise message.
+        if is_extension_type(a) || is_extension_type(b) {
+            return type_union_error(a, b);
         }
     }
     // Set operators over sets and live `dict` views (`dict_keys`/`dict_items`).
@@ -1693,6 +1832,47 @@ mod tests {
         value::to_string(exc::pending_value())
     }
 
+    fn class(name: &str) -> i64 {
+        value::class_new(name.to_string(), NONE, Vec::new())
+    }
+
+    /// One `PyTypeObject`, as a compiled extension module owns it.
+    fn extension_type_pointer(name: &str) -> *mut crate::capi::ShimObject {
+        let pointer = crate::capi::types::allocate_named_type(name, 0);
+        assert!(!pointer.is_null(), "extension type allocation failed");
+        pointer as *mut crate::capi::ShimObject
+    }
+
+    /// An opaque handle around an extension type object, as the import bridge
+    /// materialises it.
+    fn extension_type_handle(pointer: *mut crate::capi::ShimObject, name: &str) -> i64 {
+        value::ext_object_new(pointer, name.to_string())
+    }
+
+    fn extension_type(name: &str) -> i64 {
+        extension_type_handle(extension_type_pointer(name), name)
+    }
+
+    fn union_args(value_arg: i64) -> Vec<i64> {
+        value::instance_attr(value_arg, "__args__")
+            .and_then(value::as_tuple)
+            .expect("union arguments")
+            .to_vec()
+    }
+
+    /// `tuple[args...]`, the runtime's `_GenericAlias` standing in for a
+    /// CPython `types.GenericAlias`.
+    fn tuple_alias(args: Vec<i64>) -> i64 {
+        let origin = value::builtin_function_new(hydro_ir::Builtin::Tuple);
+        let origin_roots = crate::heap::root_values(&[origin]);
+        let args = value::tuple_new(args);
+        let args_roots = crate::heap::root_values(&[args]);
+        let alias = crate::container::subscript(origin, args);
+        crate::heap::release_roots(args_roots);
+        crate::heap::release_roots(origin_roots);
+        alias
+    }
+
     #[test]
     fn integer_arithmetic() {
         exc::init();
@@ -2472,5 +2652,170 @@ mod tests {
         assert_eq!(binop(OP_ADD, enormous, value::float_new(1.0)), NONE);
         assert_eq!(exc::pending_tag(), OVERFLOW_ERROR as i64);
         assert_eq!(pending_message(), "int too large to convert to float");
+    }
+
+    #[test]
+    fn type_or_composes_left_associative_chains() {
+        exc::init();
+        let a = class("UnionA");
+        let b = class("UnionB");
+        let c = class("UnionC");
+        let d = class("UnionD");
+
+        let two = binop(OP_BIT_OR, a, b);
+        assert_eq!(union_args(two), vec![a, b]);
+        assert_eq!(value::repr(two), "UnionA | UnionB");
+
+        // Left-associative chains keep appending: `(A | B) | C`.
+        let three = binop(OP_BIT_OR, two, c);
+        assert_eq!(union_args(three), vec![a, b, c]);
+        assert_eq!(value::repr(three), "UnionA | UnionB | UnionC");
+
+        // Four operands, with the right-nested spelling flattening identically.
+        let four = binop(OP_BIT_OR, three, d);
+        assert_eq!(union_args(four), vec![a, b, c, d]);
+        let right_nested = binop(OP_BIT_OR, a, binop(OP_BIT_OR, b, c));
+        assert_eq!(union_args(right_nested), vec![a, b, c]);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn type_or_accepts_extension_type_handles() {
+        exc::init();
+        let validator = extension_type("pydantic_core.SchemaValidator");
+        let serializer = extension_type("pydantic_core.SchemaSerializer");
+        let pluggable = class("PluggableSchemaValidator");
+
+        // `SchemaValidator | PluggableSchemaValidator | SchemaSerializer`, the
+        // pydantic `ValSer` type-variable bound.
+        let bound = binop(OP_BIT_OR, validator, pluggable);
+        assert_eq!(union_args(bound), vec![validator, pluggable]);
+        let chain = binop(OP_BIT_OR, bound, serializer);
+        assert_eq!(union_args(chain), vec![validator, pluggable, serializer]);
+        assert!(!exc::pending());
+
+        // `typing.Union[A, B]` is a native union; an extension type composes
+        // on either operand side.
+        let typing_union = crate::modules::types::union_new(&[pluggable, serializer]);
+        let left = binop(OP_BIT_OR, typing_union, validator);
+        assert_eq!(union_args(left), vec![pluggable, serializer, validator]);
+        let right = binop(OP_BIT_OR, validator, typing_union);
+        assert_eq!(union_args(right), vec![validator, pluggable, serializer]);
+        assert!(!exc::pending());
+
+        // `None` joins like any other member.
+        let optional = binop(OP_BIT_OR, validator, NONE);
+        assert_eq!(union_args(optional), vec![validator, NONE]);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn type_or_accepts_generic_alias_operands() {
+        exc::init();
+        let json_tuple = tuple_alias(vec![value::str_from_bytes(b"_HashableJsonValue"), NONE]);
+        assert_eq!(
+            value::instance_class_name(json_tuple),
+            Some("_GenericAlias")
+        );
+
+        // `tuple['_HashableJsonValue', ...] | None`: the alias is a member
+        // itself, never replaced by its origin.
+        let optional = binop(OP_BIT_OR, json_tuple, NONE);
+        assert_eq!(union_args(optional), vec![json_tuple, NONE]);
+        assert_eq!(union_args(optional)[0], json_tuple);
+        assert!(!exc::pending());
+
+        // Mixed chain, left-associative: class | alias | nested alias | None.
+        let a = class("UnionA");
+        let nested = tuple_alias(vec![
+            value::tuple_new(vec![value::str_from_bytes(b"str"), json_tuple]),
+            NONE,
+        ]);
+        let chain = binop(OP_BIT_OR, a, json_tuple);
+        assert_eq!(union_args(chain), vec![a, json_tuple]);
+        let chain = binop(OP_BIT_OR, chain, nested);
+        assert_eq!(union_args(chain), vec![a, json_tuple, nested]);
+        let chain = binop(OP_BIT_OR, chain, NONE);
+        assert_eq!(union_args(chain), vec![a, json_tuple, nested, NONE]);
+        assert!(!exc::pending());
+
+        // The alias also composes from the left, and repeating the same alias
+        // value keeps its identity (`A | A is A`).
+        let reverse = binop(OP_BIT_OR, json_tuple, a);
+        assert_eq!(union_args(reverse), vec![json_tuple, a]);
+        assert_eq!(binop(OP_BIT_OR, json_tuple, json_tuple), json_tuple);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn type_or_flattens_and_deduplicates_members() {
+        exc::init();
+        let a = class("UnionA");
+        let b = class("UnionB");
+
+        // A repeated class collapses, and a one-member union is its member.
+        assert_eq!(binop(OP_BIT_OR, a, a), a);
+        let repeated = binop(OP_BIT_OR, binop(OP_BIT_OR, a, b), a);
+        assert_eq!(union_args(repeated), vec![a, b]);
+
+        // Two handles for *one* extension type object are the same member:
+        // `A | A` keeps the first handle instead of building a new union.
+        let validator_type = extension_type_pointer("pydantic_core.SchemaValidator");
+        let first = extension_type_handle(validator_type, "pydantic_core.SchemaValidator");
+        let second = extension_type_handle(validator_type, "pydantic_core.SchemaValidator");
+        assert_ne!(first, second);
+        assert_eq!(binop(OP_BIT_OR, first, second), first);
+        assert_eq!(binop(OP_BIT_OR, second, first), second);
+        let mixed = binop(OP_BIT_OR, binop(OP_BIT_OR, first, b), second);
+        assert_eq!(union_args(mixed), vec![first, b]);
+
+        // Distinct `PyTypeObject`s are distinct members even when they share a
+        // name: CPython deduplicates types by identity, not by spelling.
+        let other = extension_type("pydantic_core.SchemaValidator");
+        let distinct = binop(OP_BIT_OR, first, other);
+        assert_eq!(union_args(distinct), vec![first, other]);
+
+        // A union used as an operand is spliced, never nested.
+        let nested = binop(OP_BIT_OR, binop(OP_BIT_OR, a, b), binop(OP_BIT_OR, b, a));
+        assert_eq!(union_args(nested), vec![a, b]);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn type_or_rejects_non_types() {
+        exc::init();
+        let validator = extension_type("pydantic_core.SchemaValidator");
+
+        // An extension type is a class: the operator error names `type`.
+        assert_eq!(binop(OP_BIT_OR, validator, int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "unsupported operand type(s) for |: 'type' and 'int'"
+        );
+
+        exc::init();
+        assert_eq!(binop(OP_BIT_OR, int(1), validator), NONE);
+        assert_eq!(
+            pending_message(),
+            "unsupported operand type(s) for |: 'int' and 'type'"
+        );
+
+        // Native classes keep the same message on the bitwise fallback.
+        exc::init();
+        let a = class("UnionA");
+        assert_eq!(binop(OP_BIT_OR, a, int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "unsupported operand type(s) for |: 'type' and 'int'"
+        );
+
+        exc::init();
+        assert_eq!(binop(OP_BIT_OR, value::str_from_bytes(b"x"), int(1)), NONE);
+        assert_eq!(
+            pending_message(),
+            "unsupported operand type(s) for |: 'str' and 'int'"
+        );
     }
 }

@@ -8,6 +8,34 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-10-30 NB-1/NB-4 continuation
+
+- Stdlib import matrix advanced from 145/297 to **210/297** (124 pure, 50
+  builtin/frozen, 35 extension, 1 CPython-failing). Added Tier-1 `_signal`,
+  `termios`, `pwd`, `grp`, `resource`, `fcntl`, `syslog`, `array`, `cmath`,
+  `hashlib`/`_hashlib`/`_sha*`/`_blake2`/`_hmac`/`_uuid`, plus real
+  `uuid` helpers and SHA/MD5/BLAKE2/HMAC/PBKDF2 implementations with known
+  vectors.
+- Runtime/import surface: `os.scandir`/`DirEntry`, fd inheritance,
+  `os.path` commonpath/commonprefix/relpath/expandvars, `os.mkdir`, AST
+  statement/helper nodes (`Assign`, `Return`, match patterns, comprehensions),
+  `codecs.CodecInfo/register`, `importlib.machinery` finders/loaders,
+  `importlib._bootstrap_external`, `runpy.run_module`, textwrap options,
+  `pickle` protocol/error classes, `sys.exception`/`float_info`/
+  `stdlib_module_names`, `io.open` CPython keyword slots, `int(x, base=)`,
+  `int.from_bytes` iterables, `bytes.fromhex`, `range.index`, builtin
+  `__repr__` wrappers and dictionary-subclass keyword handling.
+- CPython C-API: fixed the `visitproc` argument order (real C `tp_traverse`
+  callbacks no longer crash), added `PyGC_Collect` production collection with
+  one-shot `tp_clear`, exposed runtime `sys` values (including `sys.flags`) to
+  extensions, made `PyContextVar_New` accept arbitrary defaults and relaxed
+  `PyType_Ready` for static types with adopted metatypes; added threaded
+  callback/GC and pydantic-core/NumPy ABI probes.
+- Pydantic 2.14.1 imports through the vendored `enum`/typing surface; model
+  smoke remains blocked on lazy `pydantic.main` dynamic imports. NumPy 2.5
+  progresses through `_multiarray_umath` init to `Py_BuildValue`; pandas is
+  still blocked by earlier gaps. No ecosystem pass is claimed.
+
 ### Native bindings — 2026-10-29 HNA v1
 
 - Added HNA v1: the C99 header `include/hydro_native.h`, the `hydro-hna`

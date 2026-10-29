@@ -909,6 +909,18 @@ fn lookup(args: &[i64]) -> i64 {
         if result == NONE {
             continue;
         }
+        // A search function may return a plain 4-tuple or a
+        // `codecs.CodecInfo` entry (what `encodings.search_function` builds).
+        if value::instance_class_value(result) == Some(crate::modules::codecs_codecinfo_class()) {
+            let encode = value::instance_attr(result, "encode").unwrap_or(NONE);
+            let decode = value::instance_attr(result, "decode").unwrap_or(NONE);
+            if !value::truthy(core_builtins::callable(encode))
+                || !value::truthy(core_builtins::callable(decode))
+            {
+                return type_error("incompatible codecs in CodecInfo");
+            }
+            return result;
+        }
         let Some(items) = value::as_tuple(result) else {
             return type_error("codec search functions must return 4-tuples");
         };

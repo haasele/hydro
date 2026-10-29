@@ -41,11 +41,25 @@
 //! alias base to its origin (`class D(C[int])`), and a subclass inherits the
 //! parameters like CPython's inherited `__class_getitem__`.
 //!
-//! Most class constants allocate a fresh class per access, matching CPython's
-//! stable identity semantics closely enough for subclassing. `ForwardRef`,
-//! `TypeAliasType`, `TypeVar`, `ParamSpec` and `TypeVarTuple` are the
-//! exceptions: they are cached classes because `isinstance` checks and
-//! construction must share one identity.
+//! `Literal[...]`, `Union[...]`, `Optional[...]` and `Annotated[...]` are
+//! special forms with truthful runtime metadata, because pydantic and
+//! `typing_inspection` introspect them:
+//!
+//! * `Literal[a, b].__args__` is the flattened, `(value, type)`-deduplicated
+//!   tuple of literal values, nested `Literal` forms included;
+//! * `Union[a, b]` follows CPython 3.14's unified `typing.Union` and builds a
+//!   native union value (`a | b`) with flattened, deduplicated members;
+//!   `Optional[T]` is `Union[T, None]`;
+//! * `Annotated[T, m...]` is a `_GenericAlias` whose `__origin__` is `T`,
+//!   `__args__` is `(T,)` and `__metadata__` is the flattened annotation
+//!   tuple; `get_args` reports `(T, m...)`.
+//!
+//! All [`CLASSES`] placeholders are identity-stable per heap generation
+//! ([`placeholder_class`]): `typing.Literal is typing.Literal` holds, which is
+//! what `typing_extensions`/`typing_inspection` identity checks rely on.
+//! `ForwardRef`, `TypeAliasType`, `TypeVar`, `ParamSpec` and `TypeVarTuple`
+//! are cached the same way because `isinstance` checks and construction must
+//! share one identity.
 //!
 //! Two runtime helpers from CPython 3.14's `typing` are implemented for
 //! `annotationlib`:
@@ -477,6 +491,35 @@ fn cached_class(name: &str) -> i64 {
     class
 }
 
+/// One typing placeholder from [`CLASSES`], identity-stable per heap
+/// generation.
+///
+/// CPython exposes `typing.Literal` and friends as module singletons, and
+/// `typing_inspection`/pydantic compare `get_origin(alias)` against the module
+/// attribute with `is` (`typing_objects.is_literal`, `is_union`,
+/// `is_annotated`). Allocating a fresh class per attribute read made those
+/// identity checks false, so the placeholder is cached in the runtime
+/// registry (a process-wide GC root) and tagged with the heap generation:
+/// `hydro_runtime_init`/`heap::reset` free the heap, and a stale cached class
+/// from the previous run must never be handed out again.
+fn placeholder_class(name: &str) -> i64 {
+    let key = format!("typing.placeholder.{name}");
+    let generation_key = format!("{key}.generation");
+    let generation =
+        value::encode_int(i64::try_from(heap::generation()).unwrap_or(i64::MAX)).unwrap_or(NONE);
+    if crate::core::globals::registry_get(&generation_key) == Some(generation) {
+        if let Some(class) = crate::core::globals::registry_get(&key) {
+            return class;
+        }
+    }
+    let class = value::class_new(name.to_string(), NONE, Vec::new());
+    let roots = heap::root_values(&[class]);
+    crate::core::globals::registry_set(&key, class);
+    crate::core::globals::registry_set(&generation_key, generation);
+    heap::release_roots(roots);
+    class
+}
+
 /// `typing._GenericAlias`: an alias value carrying `__origin__`/`__args__`
 /// and rendering like CPython's aliases (`tuple[int, ...]`, `Vector[int]`).
 ///
@@ -519,9 +562,35 @@ extern "C" fn generic_alias_repr_entry(argv: *const i64) -> i64 {
 /// are elided as `...`; guards against pathological alias graphs.
 const MAX_ALIAS_REPR_DEPTH: usize = 16;
 
+/// The metadata tuple of an `Annotated[...]` alias, or `None`.
+///
+/// Only Hydro's `_GenericAlias` carries `__metadata__`, so a user object with
+/// a same-named attribute is not mistaken for an annotated alias.
+fn annotated_metadata(v: i64) -> Option<&'static [i64]> {
+    let metadata = value::instance_attr(v, "__metadata__")?;
+    if value::instance_class_value(v)? != cached_class("_GenericAlias") {
+        return None;
+    }
+    value::as_tuple(metadata)
+}
+
 /// Renders an alias as `origin[arg, ...]`, or just `origin` without
 /// arguments.
 fn generic_alias_text(instance: i64, depth: usize) -> String {
+    // An `Annotated[...]` alias stores the annotated type in `__origin__`,
+    // so its repr puts the origin back inside the brackets followed by the
+    // metadata values.
+    if let Some(metadata) = annotated_metadata(instance) {
+        let origin = value::instance_attr(instance, "__origin__").unwrap_or(NONE);
+        let mut rendered = String::from("Annotated[");
+        rendered.push_str(&alias_arg_text(origin, depth + 1));
+        for item in metadata {
+            rendered.push_str(", ");
+            rendered.push_str(&value::repr(*item));
+        }
+        rendered.push(']');
+        return rendered;
+    }
     let origin = value::instance_attr(instance, "__origin__").unwrap_or(NONE);
     let origin_text = alias_origin_text(origin);
     let Some(args) = value::instance_attr(instance, "__args__").and_then(value::as_tuple) else {
@@ -839,10 +908,13 @@ pub(crate) fn is_typeddict_class(tp: i64) -> bool {
 }
 
 fn is_typeddict(tp: i64) -> bool {
-    let Some(state) = value::as_class(tp) else {
+    if value::as_class(tp).is_none() {
         return false;
-    };
-    state.name != "TypedDict"
+    }
+    // Compare the *visible* name: `_TypedDictMeta` renames every class it
+    // creates, so the frozen placeholder name `"Protocol"` never identifies
+    // the result.
+    value::class_display_name(tp) != Some("TypedDict")
         && (class_chain_contains(tp, "TypedDict")
             || class_chain_contains(tp, "_TypedDict")
             || value::class_lookup(tp, "__required_keys__").is_some()
@@ -853,10 +925,10 @@ fn is_typeddict(tp: i64) -> bool {
 /// sets the marker explicitly) or one deriving from `Protocol`. `Protocol`
 /// itself is not a protocol.
 fn is_protocol(tp: i64) -> bool {
-    let Some(state) = value::as_class(tp) else {
+    if value::as_class(tp).is_none() {
         return false;
-    };
-    if state.name == "Protocol" {
+    }
+    if value::class_display_name(tp) == Some("Protocol") {
         return false;
     }
     if let Some(value::ClassEntry::Attr(marker)) = value::class_lookup(tp, "_is_protocol") {
@@ -1503,7 +1575,7 @@ pub(crate) fn constant(name: &str) -> i64 {
         return sentinel(name);
     }
     if CLASSES.contains(&name) {
-        return value::class_new(name.to_string(), NONE, Vec::new());
+        return placeholder_class(name);
     }
     if CACHED_CLASSES.contains(&name) {
         return cached_class(name);
@@ -2147,6 +2219,22 @@ pub(crate) fn builtin_generic_subscript(obj: i64, index: i64) -> Option<i64> {
 /// `__class_getitem__`/`__type_params__` are inherited, so a subclass of a
 /// generic class specializes its base's parameters.
 pub(crate) fn generic_class_subscript(class: i64, index: i64) -> Option<i64> {
+    // The special forms pydantic introspects answer with real alias
+    // metadata. The name gate keeps the identity lookups off ordinary class
+    // subscripts; the identity check keeps a user class that merely shares a
+    // name (`class Literal: ...`) out of the special forms.
+    if let Some(name) = value::class_display_name(class) {
+        let special = match name {
+            "Literal" if class == placeholder_class("Literal") => Some(literal_alias(class, index)),
+            "Union" if class == placeholder_class("Union") => Some(union_alias(class, index)),
+            "Optional" if class == placeholder_class("Optional") => Some(optional_alias(index)),
+            "Annotated" if class == placeholder_class("Annotated") => Some(annotated_alias(index)),
+            _ => None,
+        };
+        if let Some(alias) = special {
+            return Some(alias);
+        }
+    }
     let params = match value::class_lookup(class, "__type_params__")? {
         value::ClassEntry::Attr(params) => params,
         value::ClassEntry::Method(..) => return None,
@@ -2155,6 +2243,192 @@ pub(crate) fn generic_class_subscript(class: i64, index: i64) -> Option<i64> {
         return None;
     }
     Some(generic_alias_of(class, index))
+}
+
+/// One argument list of a class subscription.
+///
+/// `X[a, b]` passes the tuple `(a, b)`, while `X[a]` passes `a` itself, so a
+/// single-argument subscription must not be mistaken for a one-element tuple.
+fn subscript_args(index: i64) -> Vec<i64> {
+    match value::as_tuple(index) {
+        Some(items) => items.to_vec(),
+        None => vec![index],
+    }
+}
+
+/// Whether two literal/union members are the same value *and* runtime type.
+///
+/// CPython's `Literal`/`Union` deduplication keys on `(value, type(value))`,
+/// so `Literal[True, 1]` keeps both entries while two equal strings keep one.
+fn same_member(a: i64, b: i64) -> bool {
+    a == b || (container::equals(a, b) && value::type_class(a) == value::type_class(b))
+}
+
+/// `types.NoneType`, the class of `None` and a `Union` member.
+fn none_type() -> i64 {
+    crate::modules::types::constant("NoneType")
+}
+
+/// `Literal[...]`: a `_GenericAlias` whose arguments are the literal values.
+///
+/// Nested `Literal` aliases are spliced into the outer argument list and exact
+/// `(value, type)` duplicates are dropped, matching CPython 3.14's
+/// `_flatten_literal_params` plus `_deduplicate`.
+fn literal_alias(origin: i64, index: i64) -> i64 {
+    let args = subscript_args(index);
+    let input_roots = heap::root_values(&args);
+    let mut flattened: Vec<i64> = Vec::new();
+    for item in args {
+        if generic_alias_origin(item) == Some(origin) {
+            if let Some(inner) = value::instance_attr(item, "__args__").and_then(value::as_tuple) {
+                flattened.extend_from_slice(inner);
+                continue;
+            }
+        }
+        flattened.push(item);
+    }
+    let mut unique: Vec<i64> = Vec::with_capacity(flattened.len());
+    for item in flattened {
+        if !unique.iter().any(|existing| same_member(*existing, item)) {
+            unique.push(item);
+        }
+    }
+    let member_roots = heap::root_values(&unique);
+    let alias = generic_alias_of(origin, value::tuple_new(unique));
+    heap::release_roots(member_roots);
+    heap::release_roots(input_roots);
+    alias
+}
+
+/// Appends one `Union` member, splicing nested `Union` aliases and native
+/// `A | B` unions into the outer argument list.
+fn flatten_union_member(item: i64, origin: i64, out: &mut Vec<i64>) {
+    if generic_alias_origin(item) == Some(origin) {
+        if let Some(inner) = value::instance_attr(item, "__args__").and_then(value::as_tuple) {
+            out.extend_from_slice(inner);
+            return;
+        }
+    }
+    if crate::modules::types::is_union(item) {
+        if let Some(inner) = value::instance_attr(item, "__args__").and_then(value::as_tuple) {
+            out.extend_from_slice(inner);
+            return;
+        }
+    }
+    out.push(item);
+}
+
+/// `Union[...]`: flatten nested unions, drop duplicates and collapse to the
+/// single member like CPython 3.14.
+///
+/// Multi-member results are native `types.UnionType` values (`int | str`),
+/// which is what CPython 3.14 produces since `typing.Union` and
+/// `types.UnionType` were unified; the instance also reports the `Union` class
+/// as `__origin__` and its collected `__parameters__`.
+fn union_alias(origin: i64, index: i64) -> i64 {
+    let args = subscript_args(index);
+    let input_roots = heap::root_values(&args);
+    let mut members: Vec<i64> = Vec::new();
+    for item in args {
+        flatten_union_member(item, origin, &mut members);
+    }
+    let mut unique: Vec<i64> = Vec::with_capacity(members.len());
+    for member in members {
+        // `None` and `NoneType` name the same union member.
+        let candidate = if member == NONE { none_type() } else { member };
+        let duplicate = unique.iter().any(|existing| {
+            let existing = if *existing == NONE {
+                none_type()
+            } else {
+                *existing
+            };
+            same_member(existing, candidate)
+        });
+        if !duplicate {
+            unique.push(member);
+        }
+    }
+    let result = match unique.len() {
+        0 => type_error("Cannot take a Union of no types."),
+        1 => {
+            if unique[0] == NONE {
+                none_type()
+            } else {
+                unique[0]
+            }
+        }
+        _ => {
+            let member_roots = heap::root_values(&unique);
+            let union = crate::modules::types::union_new(&unique);
+            let union_roots = heap::root_values(&[union]);
+            if union != NONE && !exc::pending() {
+                if let Some(arguments) = value::instance_attr(union, "__args__") {
+                    value::instance_setattr(union, "__origin__".to_string(), origin);
+                    let parameters = collect_type_vars(arguments);
+                    value::instance_setattr(union, "__parameters__".to_string(), parameters);
+                }
+            }
+            heap::release_roots(union_roots);
+            heap::release_roots(member_roots);
+            union
+        }
+    };
+    heap::release_roots(input_roots);
+    result
+}
+
+/// `Optional[...]`: `Union[T, NoneType]`.
+fn optional_alias(index: i64) -> i64 {
+    let args = subscript_args(index);
+    if args.len() != 1 {
+        return type_error("typing.Optional requires a single type.");
+    }
+    let members = value::tuple_new(vec![args[0], NONE]);
+    let roots = heap::root_values(&[members]);
+    let result = union_alias(placeholder_class("Union"), members);
+    heap::release_roots(roots);
+    result
+}
+
+/// `Annotated[...]`: a `_GenericAlias` whose `__origin__` is the annotated
+/// type, `__args__` the one-element type tuple and `__metadata__` the
+/// annotation values.
+///
+/// Nested `Annotated` forms flatten their metadata into the outer alias
+/// (`Annotated[Annotated[int, "a"], "b"]` reports `("a", "b")`), matching
+/// CPython.
+fn annotated_alias(index: i64) -> i64 {
+    let args = subscript_args(index);
+    if args.len() < 2 {
+        return type_error(
+            "Annotated[...] should be used with at least two arguments (a type and an annotation).",
+        );
+    }
+    let input_roots = heap::root_values(&args);
+    let mut base = args[0];
+    let mut metadata: Vec<i64> = Vec::new();
+    if let Some(inner) = annotated_metadata(base) {
+        metadata.extend_from_slice(inner);
+        base = value::instance_attr(base, "__origin__").unwrap_or(base);
+    }
+    metadata.extend_from_slice(&args[1..]);
+    let class = cached_class("_GenericAlias");
+    let inner = value::tuple_new(vec![base]);
+    let inner_roots = heap::root_values(&[class, inner]);
+    let meta = value::tuple_new(metadata);
+    let meta_roots = heap::root_values(&[meta]);
+    let parameters = collect_type_vars(inner);
+    let parameter_roots = heap::root_values(&[parameters]);
+    let instance = value::instance_new(class);
+    value::instance_setattr(instance, "__origin__".to_string(), base);
+    value::instance_setattr(instance, "__args__".to_string(), inner);
+    value::instance_setattr(instance, "__metadata__".to_string(), meta);
+    value::instance_setattr(instance, "__parameters__".to_string(), parameters);
+    heap::release_roots(parameter_roots);
+    heap::release_roots(meta_roots);
+    heap::release_roots(inner_roots);
+    heap::release_roots(input_roots);
+    instance
 }
 
 /// The origin of a `typing._GenericAlias` value (`C` in `C[int]`), or `None`
@@ -2210,7 +2484,43 @@ fn collect_type_vars_into(value_arg: i64, collected: &mut Vec<i64>, depth: usize
 
 /// `typing.get_args(tp)`: the alias arguments when the value carries
 /// `__args__`, otherwise an empty tuple.
+///
+/// `Annotated[...]` reports `(type, *metadata)` and a native `A | B` union
+/// reports `NoneType` where its stored argument list holds `None`, both
+/// matching CPython 3.14. A `TypeVar` carries no `__args__`, so it reports the
+/// empty tuple like CPython.
 fn alias_args(value_arg: i64) -> i64 {
+    if let Some(metadata) = annotated_metadata(value_arg) {
+        let origin = value::instance_attr(value_arg, "__origin__").unwrap_or(NONE);
+        let mut items = Vec::with_capacity(metadata.len() + 1);
+        items.push(origin);
+        items.extend_from_slice(metadata);
+        let roots = heap::root_values(&items);
+        let result = value::tuple_new(items);
+        heap::release_roots(roots);
+        return result;
+    }
+    if crate::modules::types::is_union(value_arg) {
+        if let Some(args) = value::instance_attr(value_arg, "__args__") {
+            if let Some(items) = value::as_tuple(args) {
+                let mut normalized: Vec<i64> = items.to_vec();
+                let mut changed = false;
+                for item in &mut normalized {
+                    if *item == NONE {
+                        *item = none_type();
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let roots = heap::root_values(&normalized);
+                    let result = value::tuple_new(normalized);
+                    heap::release_roots(roots);
+                    return result;
+                }
+                return args;
+            }
+        }
+    }
     if let Some(args) = value::instance_attr(value_arg, "__args__") {
         if value::as_tuple(args).is_some() {
             return args;
@@ -2219,8 +2529,18 @@ fn alias_args(value_arg: i64) -> i64 {
     value::tuple_new(Vec::new())
 }
 
-/// `typing.get_origin(tp)`: the `__origin__` of an alias, otherwise `None`.
+/// `typing.get_origin(tp)`: the alias origin, otherwise `None`.
+///
+/// An `Annotated` alias reports the canonical `Annotated` class, and a native
+/// `A | B` union reports the canonical `Union` class, like CPython 3.14's
+/// unified `typing.Union`/`types.UnionType`.
 fn alias_origin(value_arg: i64) -> i64 {
+    if annotated_metadata(value_arg).is_some() {
+        return placeholder_class("Annotated");
+    }
+    if crate::modules::types::is_union(value_arg) {
+        return placeholder_class("Union");
+    }
     if let Some(origin) = value::instance_attr(value_arg, "__origin__") {
         return origin;
     }
@@ -2462,6 +2782,197 @@ mod tests {
         let class = value::class_new("Plain".to_string(), NONE, Vec::new());
         assert_eq!(crate::core::container::subscript(class, index), class);
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn literal_aliases_carry_their_values() {
+        exc::init();
+        let literal = constant("Literal");
+        assert_eq!(
+            constant("Literal"),
+            literal,
+            "placeholder identity is stable (`typing.Literal is typing.Literal`)"
+        );
+        let alias = crate::core::container::subscript(
+            literal,
+            value::tuple_new(vec![text("a"), text("b")]),
+        );
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(value::repr(alias), "Literal['a', 'b']");
+        assert_eq!(call("get_origin", &[alias]), literal);
+        let args = as_tuple(call("get_args", &[alias])).expect("args").to_vec();
+        let rendered: Vec<&str> = args
+            .iter()
+            .filter_map(|item| value::as_str(*item))
+            .collect();
+        assert_eq!(rendered, vec!["a", "b"]);
+
+        // Exact `(value, type)` duplicates collapse; a different runtime type
+        // is a different literal (`Literal[1, True]` keeps both).
+        let one = value::encode_int(1).expect("representable int");
+        let duplicated = crate::core::container::subscript(
+            literal,
+            value::tuple_new(vec![text("a"), text("a"), one, TRUE]),
+        );
+        let args = as_tuple(call("get_args", &[duplicated]))
+            .expect("args")
+            .to_vec();
+        assert_eq!(args.len(), 3, "one `a`, the int 1 and True");
+        assert_eq!(value::as_str(args[0]), Some("a"));
+        assert_eq!(args[1], one);
+        assert_eq!(args[2], TRUE);
+        assert_eq!(value::repr(duplicated), "Literal['a', 1, True]");
+
+        // Nested `Literal` arguments are spliced into the outer alias.
+        let nested = crate::core::container::subscript(literal, alias);
+        let args = as_tuple(call("get_args", &[nested]))
+            .expect("args")
+            .to_vec();
+        assert_eq!(args.len(), 2);
+        assert_eq!(value::repr(nested), "Literal['a', 'b']");
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn union_aliases_flatten_and_report_cpython_metadata() {
+        exc::init();
+        let union = constant("Union");
+        let int_class = value::class_new("int".to_string(), NONE, Vec::new());
+        let str_class = value::class_new("str".to_string(), NONE, Vec::new());
+        let combined =
+            crate::core::container::subscript(union, value::tuple_new(vec![int_class, str_class]));
+        assert!(!exc::pending(), "{:?}", pending_message());
+        // CPython 3.14 unifies `typing.Union` with `types.UnionType`, so the
+        // result is a native `int | str` union.
+        assert_eq!(value::repr(combined), "int | str");
+        assert_eq!(call("get_origin", &[combined]), union);
+        let args = as_tuple(call("get_args", &[combined]))
+            .expect("args")
+            .to_vec();
+        assert_eq!(args, vec![int_class, str_class]);
+
+        // Nested unions flatten, duplicates collapse, and a one-member union
+        // decays to that member.
+        let nested =
+            crate::core::container::subscript(union, value::tuple_new(vec![combined, str_class]));
+        assert_eq!(
+            as_tuple(call("get_args", &[nested])).map(|items| items.len()),
+            Some(2)
+        );
+        // A one-member union decays to that member.
+        let single = crate::core::container::subscript(union, int_class);
+        assert_eq!(single, int_class);
+
+        // `Optional[T]` is `Union[T, None]`; `get_args` reports `NoneType`
+        // while the repr keeps CPython's `None` spelling.
+        let optional = crate::core::container::subscript(constant("Optional"), int_class);
+        assert_eq!(value::repr(optional), "int | None");
+        assert_eq!(call("get_origin", &[optional]), union);
+        let optional_args = as_tuple(call("get_args", &[optional]))
+            .expect("args")
+            .to_vec();
+        assert_eq!(optional_args, vec![int_class, value::type_class(NONE)]);
+
+        // A PEP 604 union reports the same origin and `NoneType` argument.
+        let native = crate::modules::types::union_binary_or(int_class, NONE).expect("union");
+        assert_eq!(call("get_origin", &[native]), union);
+        let native_args = as_tuple(call("get_args", &[native]))
+            .expect("args")
+            .to_vec();
+        assert_eq!(native_args, vec![int_class, value::type_class(NONE)]);
+
+        // `Union[T, int]` keeps the type parameter visible through
+        // `get_args` and `__parameters__`, which pydantic's generic handling
+        // substitutes against.
+        let typevar = call("TypeVar", &[text("T")]);
+        let parameterized =
+            crate::core::container::subscript(union, value::tuple_new(vec![typevar, int_class]));
+        assert_eq!(
+            as_tuple(call("get_args", &[parameterized])).map(|items| items.to_vec()),
+            Some(vec![typevar, int_class])
+        );
+        assert_eq!(
+            as_tuple(
+                value::instance_attr(parameterized, "__parameters__").expect("__parameters__")
+            )
+            .map(|items| items.to_vec()),
+            Some(vec![typevar])
+        );
+
+        // An empty subscription is rejected, and a user class named like the
+        // placeholder is not treated as the special form.
+        crate::core::container::subscript(union, value::tuple_new(Vec::new()));
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+        let user_union = value::class_new("Union".to_string(), NONE, Vec::new());
+        assert_eq!(
+            crate::core::container::subscript(user_union, int_class),
+            user_union
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn annotated_aliases_expose_origin_metadata_and_args() {
+        exc::init();
+        let annotated_class = constant("Annotated");
+        let int_class = value::class_new("int".to_string(), NONE, Vec::new());
+        let alias = crate::core::container::subscript(
+            annotated_class,
+            value::tuple_new(vec![int_class, text("meta")]),
+        );
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(value::repr(alias), "Annotated[int, 'meta']");
+        assert_eq!(call("get_origin", &[alias]), annotated_class);
+        assert_eq!(value::instance_attr(alias, "__origin__"), Some(int_class));
+        assert_eq!(
+            as_tuple(value::instance_attr(alias, "__args__").expect("__args__"))
+                .map(|items| items.to_vec()),
+            Some(vec![int_class])
+        );
+        let metadata = as_tuple(value::instance_attr(alias, "__metadata__").expect("__metadata__"))
+            .expect("metadata");
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(value::as_str(metadata[0]), Some("meta"));
+        // `get_args` prepends the annotated type, like CPython.
+        let args = as_tuple(call("get_args", &[alias])).expect("args").to_vec();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], int_class);
+        assert_eq!(value::as_str(args[1]), Some("meta"));
+
+        // Nested annotations flatten their metadata.
+        let nested = crate::core::container::subscript(
+            annotated_class,
+            value::tuple_new(vec![alias, text("outer")]),
+        );
+        assert_eq!(call("get_origin", &[nested]), annotated_class);
+        assert_eq!(value::instance_attr(nested, "__origin__"), Some(int_class));
+        let metadata =
+            as_tuple(value::instance_attr(nested, "__metadata__").expect("__metadata__"))
+                .expect("metadata");
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(value::as_str(metadata[0]), Some("meta"));
+        assert_eq!(value::as_str(metadata[1]), Some("outer"));
+
+        // A single argument is rejected.
+        crate::core::container::subscript(annotated_class, int_class);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(pending_message().contains("at least two arguments"));
+        exc::clear();
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn typevars_have_no_args_like_cpython() {
+        exc::init();
+        let typevar = call("TypeVar", &[text("T")]);
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(
+            as_tuple(call("get_args", &[typevar])).map(|items| items.len()),
+            Some(0)
+        );
+        assert_eq!(value::instance_attr(typevar, "__args__"), None);
+        assert_eq!(call("get_origin", &[typevar]), NONE);
     }
 
     #[test]
@@ -3512,5 +4023,58 @@ mod tests {
         assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
         assert!(pending_message().contains("is not a Protocol"));
         exc::clear();
+    }
+
+    #[test]
+    fn typed_dict_metadata_and_rename_match_the_typing_extensions_shape() {
+        exc::init();
+        let typed_dict_base = constant("TypedDict");
+        // `_TypedDictMeta.__new__` allocates under the placeholder name
+        // `Protocol` and immediately renames the class. The writable name slot
+        // must win over the frozen definition name everywhere it is observed.
+        let class = value::class_new("Protocol".to_string(), typed_dict_base, Vec::new());
+        assert!(value::class_set_attr(
+            class,
+            "__name__".to_string(),
+            text("ConfigDict")
+        ));
+        assert_eq!(value::class_display_name(class), Some("ConfigDict"));
+        assert_eq!(value::class_qualname(class), Some("ConfigDict"));
+        assert_eq!(value::repr(class), "<class 'ConfigDict'>");
+
+        // The metaclass publishes the field mapping and key sets afterwards.
+        let int_field = value::class_new("int".to_string(), NONE, Vec::new());
+        let annotations = value::dict_new(vec![(text("x"), int_field)]);
+        value::class_set_attr(class, "__annotations__".to_string(), annotations);
+        value::class_set_attr(
+            class,
+            "__required_keys__".to_string(),
+            value::set_new(vec![text("x")]),
+        );
+        value::class_set_attr(
+            class,
+            "__optional_keys__".to_string(),
+            value::set_new(vec![text("y")]),
+        );
+        assert_eq!(value::class_annotations(class), Some(annotations));
+
+        // `is_typeddict` follows the TypedDict ancestry, never the placeholder
+        // name that was overwritten by the rename.
+        assert_eq!(call("is_typeddict", &[class]), TRUE);
+        assert_eq!(call("is_typeddict", &[typed_dict_base]), FALSE);
+        let plain = value::class_new("Plain".to_string(), NONE, Vec::new());
+        assert_eq!(call("is_typeddict", &[plain]), FALSE);
+        assert!(!exc::pending());
+
+        // `ConfigDict(x=1)` builds a dict through the TypedDict fallback: a
+        // real dict, not an instance of the class.
+        let keywords = [text("x"), value::encode_int(1).expect("representable int")];
+        let keyword_roots = crate::heap::root_values(&keywords);
+        let built =
+            crate::core::builtins::call_kw(class, 0, std::ptr::null(), 1, keywords.as_ptr());
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(value::repr(built), "{'x': 1}");
+        assert_ne!(value::instance_class_value(built), Some(class));
+        crate::heap::release_roots(keyword_roots);
     }
 }

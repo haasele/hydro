@@ -1429,8 +1429,8 @@ benchmarks are tracked as P4-01…P4-11 in [`TODO.md`](TODO.md).
   (`fibers.rs`), user modules, `unittest` runner, stdlib Batches A/B/bench,
   `argparse`/`defaultdict`/`re`,
   socket echo, pathlib, build cache, `tea gc` and uv passthrough.
-- Generated stdlib import matrix (2026-10-29): **145/297 importable** (31
-  builtin/frozen, 102 pure, 12 extension; report in
+- Generated stdlib import matrix (2026-10-30): **210/297 importable** (50
+  builtin/frozen, 124 pure, 35 extension, 1 CPython-failing; report in
   [`COMPATIBILITY.md`](COMPATIBILITY.md)). The official CPython `Lib/test`
   differential baseline is **3/398** (`test_errno.py`, `test_int_literal.py`,
   `test_longexp.py`); see [`CPYTHON_TESTS.md`](CPYTHON_TESTS.md). `benchmarks/bench_all.py --only hydro`

@@ -29,6 +29,7 @@ use crate::core::globals;
 pub(crate) mod abc;
 pub(crate) mod annotationlib;
 pub(crate) mod argparse;
+pub(crate) mod array_mod;
 pub(crate) mod ast;
 pub(crate) mod asyncio;
 pub(crate) mod atexit;
@@ -36,6 +37,7 @@ pub(crate) mod base64;
 pub(crate) mod binascii;
 pub(crate) mod bisect;
 pub(crate) mod builtins;
+pub(crate) mod cmath;
 pub(crate) mod codecs;
 pub(crate) mod collections;
 pub(crate) mod collections_abc;
@@ -46,12 +48,15 @@ pub(crate) mod datetime;
 pub(crate) mod decimal;
 pub(crate) mod errno;
 pub(crate) mod extension;
+pub(crate) mod fcntl;
 pub(crate) mod fnmatch;
 pub(crate) mod fractions;
 pub(crate) mod functools;
 pub(crate) mod future;
 pub(crate) mod gc;
 pub(crate) mod getopt;
+pub(crate) mod grp;
+pub(crate) mod hashlib;
 pub(crate) mod heapq;
 pub(crate) mod http;
 pub(crate) mod imp;
@@ -70,12 +75,15 @@ pub(crate) mod mimetypes;
 pub(crate) mod mmap_mod;
 pub(crate) mod opcode;
 pub(crate) mod postgres;
+pub(crate) mod pwd;
 pub(crate) mod pytest;
 pub(crate) mod quopri;
 pub(crate) mod re;
+pub(crate) mod resource;
 pub(crate) mod select;
 pub(crate) mod shutil;
 pub(crate) mod sidecar;
+pub(crate) mod signal_mod;
 pub(crate) mod site;
 pub(crate) mod socket;
 pub(crate) mod stat;
@@ -84,7 +92,9 @@ pub(crate) mod struct_mod;
 pub(crate) mod subprocess;
 pub(crate) mod sys;
 pub(crate) mod sysconfig;
+pub(crate) mod syslog;
 pub(crate) mod tempfile;
+pub(crate) mod termios;
 pub(crate) mod textwrap;
 pub(crate) mod timeit;
 pub(crate) mod tokenize;
@@ -99,8 +109,8 @@ pub(crate) mod zoneinfo;
 
 use crate::container;
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, INDEX_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR, OVERFLOW_ERROR,
-    RECURSION_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR, VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, IMPORT_ERROR, INDEX_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR,
+    OVERFLOW_ERROR, RECURSION_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::iter;
@@ -223,12 +233,40 @@ const fn native_member(
     min_args: usize,
     max_args: usize,
 ) -> stdlib::FunctionSpec {
+    native_member_ret(name, min_args, max_args, hydro_ir::Type::Any)
+}
+
+/// [`native_member`] with an explicit result type.
+const fn native_member_ret(
+    name: &'static str,
+    min_args: usize,
+    max_args: usize,
+    ret: hydro_ir::Type,
+) -> stdlib::FunctionSpec {
+    stdlib::FunctionSpec {
+        name,
+        min_args,
+        max_args,
+        ret,
+        params: &[],
+        dynamic_keywords: false,
+    }
+}
+
+/// [`native_member_ret`] with named parameters, so the runtime keyword binder
+/// can move a named argument into its positional slot.
+const fn native_keyword_member(
+    name: &'static str,
+    min_args: usize,
+    max_args: usize,
+    params: &'static [&'static str],
+) -> stdlib::FunctionSpec {
     stdlib::FunctionSpec {
         name,
         min_args,
         max_args,
         ret: hydro_ir::Type::Any,
-        params: &[],
+        params,
         dynamic_keywords: false,
     }
 }
@@ -1172,6 +1210,717 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         "sys._monitoring_restart_events",
         native_member("_monitoring_restart_events", 0, 0),
     ),
+    // `pickle.Pickler`'s instance methods. The class value lives in this
+    // module; the methods take `self` plus their declared argument.
+    ("pickle.Pickler.dump", native_member("Pickler.dump", 2, 2)),
+    (
+        "pickle.Pickler.clear_memo",
+        native_member("Pickler.clear_memo", 1, 1),
+    ),
+    // `collections.UserDict`'s native method bodies. The class table names
+    // them `UserDict.<method>`; `collections::call` strips the prefix.
+    (
+        "collections.UserDict.__getitem__",
+        native_member("UserDict.__getitem__", 2, 2),
+    ),
+    (
+        "collections.UserDict.__setitem__",
+        native_member("UserDict.__setitem__", 3, 3),
+    ),
+    (
+        "collections.UserDict.__delitem__",
+        native_member("UserDict.__delitem__", 2, 2),
+    ),
+    (
+        "collections.UserDict.__iter__",
+        native_member("UserDict.__iter__", 1, 1),
+    ),
+    (
+        "collections.UserDict.__len__",
+        native_member("UserDict.__len__", 1, 1),
+    ),
+    (
+        "collections.UserDict.__contains__",
+        native_member("UserDict.__contains__", 2, 2),
+    ),
+    (
+        "collections.UserDict.__eq__",
+        native_member("UserDict.__eq__", 2, 2),
+    ),
+    (
+        "collections.UserDict.__repr__",
+        native_member("UserDict.__repr__", 1, 1),
+    ),
+    (
+        "collections.UserDict.get",
+        native_member("UserDict.get", 2, 3),
+    ),
+    (
+        "collections.UserDict.keys",
+        native_member("UserDict.keys", 1, 1),
+    ),
+    (
+        "collections.UserDict.values",
+        native_member("UserDict.values", 1, 1),
+    ),
+    (
+        "collections.UserDict.items",
+        native_member("UserDict.items", 1, 1),
+    ),
+    (
+        "collections.UserDict.update",
+        native_member("UserDict.update", 1, 2),
+    ),
+    (
+        "collections.UserDict.pop",
+        native_member("UserDict.pop", 2, 3),
+    ),
+    (
+        "collections.UserDict.popitem",
+        native_member("UserDict.popitem", 1, 2),
+    ),
+    (
+        "collections.UserDict.setdefault",
+        native_member("UserDict.setdefault", 2, 3),
+    ),
+    (
+        "collections.UserDict.copy",
+        native_member("UserDict.copy", 1, 1),
+    ),
+    (
+        "collections.UserDict.clear",
+        native_member("UserDict.clear", 1, 1),
+    ),
+    // `collections.UserList`'s native method bodies (arity includes `self`).
+    (
+        "collections.UserList.__init__",
+        native_member("UserList.__init__", 1, 2),
+    ),
+    (
+        "collections.UserList.__repr__",
+        native_member("UserList.__repr__", 1, 1),
+    ),
+    (
+        "collections.UserList.__len__",
+        native_member("UserList.__len__", 1, 1),
+    ),
+    (
+        "collections.UserList.__iter__",
+        native_member("UserList.__iter__", 1, 1),
+    ),
+    (
+        "collections.UserList.__contains__",
+        native_member("UserList.__contains__", 2, 2),
+    ),
+    (
+        "collections.UserList.__getitem__",
+        native_member("UserList.__getitem__", 2, 2),
+    ),
+    (
+        "collections.UserList.__setitem__",
+        native_member("UserList.__setitem__", 3, 3),
+    ),
+    (
+        "collections.UserList.__delitem__",
+        native_member("UserList.__delitem__", 2, 2),
+    ),
+    (
+        "collections.UserList.__eq__",
+        native_member("UserList.__eq__", 2, 2),
+    ),
+    (
+        "collections.UserList.__add__",
+        native_member("UserList.__add__", 2, 2),
+    ),
+    (
+        "collections.UserList.__radd__",
+        native_member("UserList.__radd__", 2, 2),
+    ),
+    (
+        "collections.UserList.__iadd__",
+        native_member("UserList.__iadd__", 2, 2),
+    ),
+    (
+        "collections.UserList.__mul__",
+        native_member("UserList.__mul__", 2, 2),
+    ),
+    (
+        "collections.UserList.__rmul__",
+        native_member("UserList.__rmul__", 2, 2),
+    ),
+    (
+        "collections.UserList.__imul__",
+        native_member("UserList.__imul__", 2, 2),
+    ),
+    (
+        "collections.UserList.__copy__",
+        native_member("UserList.__copy__", 1, 1),
+    ),
+    (
+        "collections.UserList.append",
+        native_member("UserList.append", 2, 2),
+    ),
+    (
+        "collections.UserList.insert",
+        native_member("UserList.insert", 3, 3),
+    ),
+    (
+        "collections.UserList.pop",
+        native_member("UserList.pop", 1, 2),
+    ),
+    (
+        "collections.UserList.remove",
+        native_member("UserList.remove", 2, 2),
+    ),
+    (
+        "collections.UserList.clear",
+        native_member("UserList.clear", 1, 1),
+    ),
+    (
+        "collections.UserList.copy",
+        native_member("UserList.copy", 1, 1),
+    ),
+    (
+        "collections.UserList.count",
+        native_member("UserList.count", 2, 2),
+    ),
+    (
+        "collections.UserList.index",
+        native_member("UserList.index", 2, 4),
+    ),
+    (
+        "collections.UserList.reverse",
+        native_member("UserList.reverse", 1, 1),
+    ),
+    (
+        "collections.UserList.sort",
+        native_member("UserList.sort", 1, 3),
+    ),
+    (
+        "collections.UserList.extend",
+        native_member("UserList.extend", 2, 2),
+    ),
+    // `collections.UserString`'s native method bodies.
+    (
+        "collections.UserString.__init__",
+        native_member("UserString.__init__", 1, 2),
+    ),
+    (
+        "collections.UserString.__str__",
+        native_member("UserString.__str__", 1, 1),
+    ),
+    (
+        "collections.UserString.__repr__",
+        native_member("UserString.__repr__", 1, 1),
+    ),
+    (
+        "collections.UserString.__len__",
+        native_member("UserString.__len__", 1, 1),
+    ),
+    (
+        "collections.UserString.__iter__",
+        native_member("UserString.__iter__", 1, 1),
+    ),
+    (
+        "collections.UserString.__contains__",
+        native_member("UserString.__contains__", 2, 2),
+    ),
+    (
+        "collections.UserString.__getitem__",
+        native_member("UserString.__getitem__", 2, 2),
+    ),
+    (
+        "collections.UserString.__eq__",
+        native_member("UserString.__eq__", 2, 2),
+    ),
+    (
+        "collections.UserString.__add__",
+        native_member("UserString.__add__", 2, 2),
+    ),
+    (
+        "collections.UserString.__radd__",
+        native_member("UserString.__radd__", 2, 2),
+    ),
+    (
+        "collections.UserString.__mul__",
+        native_member("UserString.__mul__", 2, 2),
+    ),
+    (
+        "collections.UserString.__rmul__",
+        native_member("UserString.__rmul__", 2, 2),
+    ),
+    (
+        "collections.UserString.capitalize",
+        native_member("UserString.capitalize", 1, 4),
+    ),
+    (
+        "collections.UserString.casefold",
+        native_member("UserString.casefold", 1, 4),
+    ),
+    (
+        "collections.UserString.center",
+        native_member("UserString.center", 1, 4),
+    ),
+    (
+        "collections.UserString.count",
+        native_member("UserString.count", 1, 4),
+    ),
+    (
+        "collections.UserString.encode",
+        native_member("UserString.encode", 1, 4),
+    ),
+    (
+        "collections.UserString.endswith",
+        native_member("UserString.endswith", 1, 4),
+    ),
+    (
+        "collections.UserString.expandtabs",
+        native_member("UserString.expandtabs", 1, 4),
+    ),
+    (
+        "collections.UserString.find",
+        native_member("UserString.find", 1, 4),
+    ),
+    (
+        "collections.UserString.index",
+        native_member("UserString.index", 1, 4),
+    ),
+    (
+        "collections.UserString.isalnum",
+        native_member("UserString.isalnum", 1, 4),
+    ),
+    (
+        "collections.UserString.isalpha",
+        native_member("UserString.isalpha", 1, 4),
+    ),
+    (
+        "collections.UserString.isascii",
+        native_member("UserString.isascii", 1, 4),
+    ),
+    (
+        "collections.UserString.isdecimal",
+        native_member("UserString.isdecimal", 1, 4),
+    ),
+    (
+        "collections.UserString.isdigit",
+        native_member("UserString.isdigit", 1, 4),
+    ),
+    (
+        "collections.UserString.isidentifier",
+        native_member("UserString.isidentifier", 1, 4),
+    ),
+    (
+        "collections.UserString.islower",
+        native_member("UserString.islower", 1, 4),
+    ),
+    (
+        "collections.UserString.isnumeric",
+        native_member("UserString.isnumeric", 1, 4),
+    ),
+    (
+        "collections.UserString.isprintable",
+        native_member("UserString.isprintable", 1, 4),
+    ),
+    (
+        "collections.UserString.isspace",
+        native_member("UserString.isspace", 1, 4),
+    ),
+    (
+        "collections.UserString.istitle",
+        native_member("UserString.istitle", 1, 4),
+    ),
+    (
+        "collections.UserString.isupper",
+        native_member("UserString.isupper", 1, 4),
+    ),
+    (
+        "collections.UserString.join",
+        native_member("UserString.join", 1, 4),
+    ),
+    (
+        "collections.UserString.ljust",
+        native_member("UserString.ljust", 1, 4),
+    ),
+    (
+        "collections.UserString.lower",
+        native_member("UserString.lower", 1, 4),
+    ),
+    (
+        "collections.UserString.lstrip",
+        native_member("UserString.lstrip", 1, 4),
+    ),
+    (
+        "collections.UserString.partition",
+        native_member("UserString.partition", 1, 4),
+    ),
+    (
+        "collections.UserString.removeprefix",
+        native_member("UserString.removeprefix", 1, 4),
+    ),
+    (
+        "collections.UserString.removesuffix",
+        native_member("UserString.removesuffix", 1, 4),
+    ),
+    (
+        "collections.UserString.replace",
+        native_member("UserString.replace", 1, 4),
+    ),
+    (
+        "collections.UserString.rfind",
+        native_member("UserString.rfind", 1, 4),
+    ),
+    (
+        "collections.UserString.rindex",
+        native_member("UserString.rindex", 1, 4),
+    ),
+    (
+        "collections.UserString.rjust",
+        native_member("UserString.rjust", 1, 4),
+    ),
+    (
+        "collections.UserString.rpartition",
+        native_member("UserString.rpartition", 1, 4),
+    ),
+    (
+        "collections.UserString.rsplit",
+        native_member("UserString.rsplit", 1, 4),
+    ),
+    (
+        "collections.UserString.rstrip",
+        native_member("UserString.rstrip", 1, 4),
+    ),
+    (
+        "collections.UserString.split",
+        native_member("UserString.split", 1, 4),
+    ),
+    (
+        "collections.UserString.splitlines",
+        native_member("UserString.splitlines", 1, 4),
+    ),
+    (
+        "collections.UserString.startswith",
+        native_member("UserString.startswith", 1, 4),
+    ),
+    (
+        "collections.UserString.strip",
+        native_member("UserString.strip", 1, 4),
+    ),
+    (
+        "collections.UserString.swapcase",
+        native_member("UserString.swapcase", 1, 4),
+    ),
+    (
+        "collections.UserString.title",
+        native_member("UserString.title", 1, 4),
+    ),
+    (
+        "collections.UserString.translate",
+        native_member("UserString.translate", 1, 4),
+    ),
+    (
+        "collections.UserString.upper",
+        native_member("UserString.upper", 1, 4),
+    ),
+    (
+        "collections.UserString.zfill",
+        native_member("UserString.zfill", 1, 4),
+    ),
+    // `array.array`'s native method bodies. The class table names them
+    // `array.<method>`; `array_mod::call` dispatches them.
+    ("array.append", native_member("array.append", 2, 2)),
+    (
+        "array.extend",
+        native_member_ret("array.extend", 2, 2, hydro_ir::Type::None),
+    ),
+    (
+        "array.insert",
+        native_member_ret("array.insert", 3, 3, hydro_ir::Type::None),
+    ),
+    ("array.pop", native_member("array.pop", 1, 2)),
+    (
+        "array.remove",
+        native_member_ret("array.remove", 2, 2, hydro_ir::Type::None),
+    ),
+    (
+        "array.count",
+        native_member_ret("array.count", 2, 2, hydro_ir::Type::Int),
+    ),
+    (
+        "array.index",
+        native_member_ret("array.index", 2, 4, hydro_ir::Type::Int),
+    ),
+    (
+        "array.reverse",
+        native_member_ret("array.reverse", 1, 1, hydro_ir::Type::None),
+    ),
+    (
+        "array.tobytes",
+        native_member_ret("array.tobytes", 1, 1, hydro_ir::Type::Bytes),
+    ),
+    (
+        "array.frombytes",
+        native_member_ret("array.frombytes", 2, 2, hydro_ir::Type::None),
+    ),
+    (
+        "array.tolist",
+        native_member_ret("array.tolist", 1, 1, hydro_ir::Type::List),
+    ),
+    (
+        "array.byteswap",
+        native_member_ret("array.byteswap", 1, 1, hydro_ir::Type::None),
+    ),
+    (
+        "array.__init__",
+        native_member_ret("array.__init__", 1, 3, hydro_ir::Type::None),
+    ),
+    (
+        "array.__getitem__",
+        native_member("array.__getitem__", 2, 2),
+    ),
+    (
+        "array.__setitem__",
+        native_member_ret("array.__setitem__", 3, 3, hydro_ir::Type::None),
+    ),
+    (
+        "array.__len__",
+        native_member_ret("array.__len__", 1, 1, hydro_ir::Type::Int),
+    ),
+    ("array.__iter__", native_member("array.__iter__", 1, 1)),
+    (
+        "array.__contains__",
+        native_member_ret("array.__contains__", 2, 2, hydro_ir::Type::Bool),
+    ),
+    (
+        "array.__repr__",
+        native_member_ret("array.__repr__", 1, 1, hydro_ir::Type::Str),
+    ),
+    (
+        "array.__eq__",
+        native_member_ret("array.__eq__", 2, 2, hydro_ir::Type::Bool),
+    ),
+    // `posixpath`/`genericpath` resolve these through `os`; the static `os`
+    // table predates them, so the runtime owns their arity.
+    ("os.readlink", native_member("readlink", 1, 2)),
+    ("os.strerror", native_member("strerror", 1, 1)),
+    // `os.unlink(path, *, dir_fd=None)`: the removal is `os.remove`; a
+    // non-`None` `dir_fd` is rejected because there is no descriptor-relative
+    // lookup, exactly like `os.stat`/`os.lstat`.
+    (
+        "os.unlink",
+        native_keyword_member("unlink", 1, 2, &["path", "dir_fd"]),
+    ),
+    // `sys.exception()` returns the exception whose handler is active.
+    ("sys.exception", native_member("exception", 0, 0)),
+    // `pickle.Unpickler.load()` streams the HYD1 payload back through the same
+    // decoder as `pickle.load`.
+    (
+        "pickle.Unpickler.load",
+        native_member("Unpickler.load", 1, 1),
+    ),
+    // `runpy._get_module_details(mod_name, error=ImportError)`: `trace` asks
+    // for the module spec before executing it.
+    (
+        "runpy._get_module_details",
+        native_member("_get_module_details", 1, 2),
+    ),
+    // `hashlib`'s hash/HMAC instance method bodies. The class tables store
+    // the bare native names; the receiver's hidden state selects HASH vs
+    // HMAC inside `hashlib::bare_method_dispatch`.
+    // `importlib._bootstrap_external._classify_pyc(data, name, exc_details)`:
+    // the pyc header validator `modulefinder` calls.
+    (
+        "importlib.machinery._classify_pyc",
+        native_member("_classify_pyc", 3, 3),
+    ),
+    ("hashlib.update", native_member("update", 2, 2)),
+    ("hashlib.digest", native_member("digest", 1, 1)),
+    ("hashlib.hexdigest", native_member("hexdigest", 1, 1)),
+    ("hashlib.copy", native_member("copy", 1, 1)),
+    // `runpy.run_module(mod_name, init_globals=None, run_name=None,
+    // alter_sys=False)`: the module runner is implemented by the importlib
+    // machinery but the static `runpy` spec is still empty.
+    (
+        "runpy.run_module",
+        native_keyword_member(
+            "run_module",
+            1,
+            4,
+            &["mod_name", "init_globals", "run_name", "alter_sys"],
+        ),
+    ),
+    // `__repr__` bodies of the placeholder `collections` classes. Stored as
+    // class attributes so `pprint`'s dispatch keys keep their identity.
+    (
+        "collections.defaultdict.__repr__",
+        native_member("defaultdict.__repr__", 1, 1),
+    ),
+    (
+        "collections.deque.__repr__",
+        native_member("deque.__repr__", 1, 1),
+    ),
+    (
+        "collections.ChainMap.__repr__",
+        native_member("ChainMap.__repr__", 1, 1),
+    ),
+    // `os.scandir(path='.')`: the static `os` table predates it, so the
+    // runtime owns its arity and the `path` keyword slot.
+    (
+        "os.scandir",
+        native_keyword_member("scandir", 0, 1, &["path"]),
+    ),
+    // `os.set_inheritable(fd, inheritable)` / `os.get_inheritable(fd)`: the
+    // real `fcntl(F_GETFD/F_SETFD)` descriptor flag, not a table value.
+    ("os.set_inheritable", native_member("set_inheritable", 2, 2)),
+    ("os.get_inheritable", native_member("get_inheritable", 1, 1)),
+    // `os.path` helpers `glob`/`tarfile` read on their class bodies or call
+    // through the module value. They are absent from the static table.
+    ("os.path.lexists", native_member("lexists", 1, 1)),
+    ("os.path.commonpath", native_member("commonpath", 1, 1)),
+    ("os.path.commonprefix", native_member("commonprefix", 1, 1)),
+    (
+        "os.path.relpath",
+        native_keyword_member("relpath", 1, 2, &["path", "start"]),
+    ),
+    // `os.DirEntry` methods. Keyword calls through
+    // `methods::call_kw` reach `call_native_kw` only for a spec with
+    // `dynamic_keywords`, and the named `follow_symlinks` slot then binds
+    // positionally before `os_call` sees the call.
+    (
+        "os.DirEntry.is_dir",
+        stdlib::FunctionSpec {
+            name: "DirEntry.is_dir",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::Bool,
+            params: &["self", "follow_symlinks"],
+            dynamic_keywords: true,
+        },
+    ),
+    (
+        "os.DirEntry.is_file",
+        stdlib::FunctionSpec {
+            name: "DirEntry.is_file",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::Bool,
+            params: &["self", "follow_symlinks"],
+            dynamic_keywords: true,
+        },
+    ),
+    (
+        "os.DirEntry.is_symlink",
+        stdlib::FunctionSpec {
+            name: "DirEntry.is_symlink",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Bool,
+            params: &["self"],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "os.DirEntry.inode",
+        stdlib::FunctionSpec {
+            name: "DirEntry.inode",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Int,
+            params: &["self"],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "os.DirEntry.stat",
+        stdlib::FunctionSpec {
+            name: "DirEntry.stat",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::Any,
+            params: &["self", "follow_symlinks"],
+            dynamic_keywords: true,
+        },
+    ),
+    (
+        "os.DirEntry.__fspath__",
+        stdlib::FunctionSpec {
+            name: "DirEntry.__fspath__",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Any,
+            params: &["self"],
+            dynamic_keywords: false,
+        },
+    ),
+    // `os.scandir`'s iterator protocol. `next(it)` cannot reach an
+    // `Instance`'s `__next__`, but `iter(it)`/`list(it)`/`for` do (see
+    // `iter_new`), which is how `glob`, `shutil` and `pathlib` consume it.
+    (
+        "os.ScandirIterator.__enter__",
+        native_member("ScandirIterator.__enter__", 1, 1),
+    ),
+    (
+        "os.ScandirIterator.__exit__",
+        native_member("ScandirIterator.__exit__", 4, 4),
+    ),
+    (
+        "os.ScandirIterator.__iter__",
+        native_member("ScandirIterator.__iter__", 1, 1),
+    ),
+    (
+        "os.ScandirIterator.__next__",
+        native_member("ScandirIterator.__next__", 1, 1),
+    ),
+    (
+        "os.ScandirIterator.close",
+        native_member("ScandirIterator.close", 1, 1),
+    ),
+    // The `random.Random` proxy exposes the generator's methods on the class
+    // value. Constructing through it runs the real generator factory.
+    (
+        "random.Random.__call__",
+        stdlib::FunctionSpec {
+            name: "Random.__call__",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::Any,
+            params: &["self", "seed"],
+            dynamic_keywords: true,
+        },
+    ),
+    (
+        "random.Random.getrandbits",
+        native_member("Random.getrandbits", 2, 2),
+    ),
+    ("random.Random.random", native_member("Random.random", 1, 1)),
+    ("random.Random.seed", native_member("Random.seed", 1, 2)),
+    (
+        "random.Random.randint",
+        native_member("Random.randint", 3, 3),
+    ),
+    (
+        "random.Random.randrange",
+        native_member("Random.randrange", 2, 4),
+    ),
+    ("random.Random.choice", native_member("Random.choice", 2, 2)),
+    (
+        "random.Random.uniform",
+        native_member("Random.uniform", 3, 3),
+    ),
+    (
+        "random.Random.shuffle",
+        native_member("Random.shuffle", 2, 2),
+    ),
+    ("random.Random.sample", native_member("Random.sample", 3, 3)),
+    // `re._compiler`'s functions, reached as module attributes of the
+    // deprecated `sre_compile` facade. They dispatch through `re`'s table.
+    (
+        "re._compiler_compile",
+        native_member("_compiler_compile", 1, 1),
+    ),
+    (
+        "re._compiler_isstring",
+        native_member("_compiler_isstring", 1, 1),
+    ),
 ];
 
 /// Resolves a [`SUPPLEMENTAL_FUNCTIONS`] entry by module and member name.
@@ -1179,9 +1928,14 @@ fn supplemental_function(module: &str, function: &str) -> Option<&'static stdlib
     SUPPLEMENTAL_FUNCTIONS
         .iter()
         .find(|(qualified, _)| {
+            // The module name may itself contain dots (`os.path`), so match
+            // the longest module prefix rather than splitting at the first
+            // separator (`os.DirEntry.stat` is `module == "os"`,
+            // `function == "DirEntry.stat"`).
             qualified
-                .split_once('.')
-                .is_some_and(|(owner, name)| owner == module && name == function)
+                .strip_prefix(module)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|name| name == function)
         })
         .map(|(_, spec)| spec)
 }
@@ -1434,6 +2188,53 @@ pub(crate) fn module_get_by_name(module: &str, name: &str) -> i64 {
     module_get_named(module, name)
 }
 
+/// Accelerator/platform spelling of a native module, mapped to the module
+/// that implements it.
+///
+/// The central spec gives each alias its own `ModuleSpec` (so imports and
+/// arity validation resolve), but the values must be the target's: classes
+/// compare by identity, and calls must dispatch to one implementation. The
+/// alias name itself stays visible through `__name__`.
+fn alias_target(module: &str) -> Option<&'static str> {
+    Some(match module {
+        "_abc" => "abc",
+        "_datetime" => "datetime",
+        "_locale" => "locale",
+        "_types" => "types",
+        "_typing" => "typing",
+        "_sre" => "re",
+        "posix" => "os",
+        "ntpath" | "posixpath" => "os.path",
+        "_frozen_importlib" => "importlib",
+        "_frozen_importlib_external" => "importlib.machinery",
+        // `importlib` re-exports the frozen external bootstrap module under
+        // its Python spelling; both names expose `importlib.machinery`.
+        "importlib._bootstrap_external" => "importlib.machinery",
+        // `zipimport` shares the finder/loader surface of
+        // `importlib.machinery`; Hydro has no zip import machinery of its own.
+        "zipimport" => "importlib.machinery",
+        "_sysconfig" => "sysconfig",
+        // C accelerator modules whose Python wrapper is the implementation
+        // here. Their specs share the target's table, so imports and arity
+        // checks are identical; routing keeps class/value identity and sends
+        // calls to the one implementation.
+        "_json" => "json",
+        "_csv" => "csv",
+        "_pickle" => "pickle",
+        "_random" => "random",
+        "_statistics" => "statistics",
+        "_queue" => "queue",
+        "_bisect" => "bisect",
+        "_heapq" => "heapq",
+        "_struct" => "struct",
+        "_asyncio" => "asyncio",
+        "_multiprocessing" => "multiprocessing",
+        "_zoneinfo" => "zoneinfo",
+        "_ast" => "ast",
+        _ => return None,
+    })
+}
+
 fn module_get_named(module: &str, name: &str) -> i64 {
     // A program assignment (`module.name = value`) shadows the native spec
     // default: reads, calls and constants all resolve the override first.
@@ -1467,6 +2268,22 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
             "__loader__" => return importlib_machinery::builtin_importer_class(),
             _ => {}
         }
+    }
+    // Accelerator and platform alias modules (`_abc`, `_types`, `posix`,
+    // `posixpath`, `_frozen_importlib_external`, ...) expose the members of
+    // the module that implements them. `__name__`, `__dict__` and the import
+    // metadata above still describe the alias spelling; every other attribute
+    // is resolved through the target so classes keep their identity and calls
+    // reach the target's implementation.
+    if let Some(target) = alias_target(module) {
+        return module_get_named(target, name);
+    }
+    // Constants the runtime serves without a static spec entry: the
+    // platform's `os.open` flags, the `os.path` path-flavour names and the
+    // pickle protocol numbers are computed by this build rather than the
+    // metadata table, so they resolve before the spec lookup.
+    if let Some(value) = runtime_extra_constant(module, name) {
+        return value;
     }
     // `errno` attributes are platform-defined names resolved on demand; the
     // static spec table cannot enumerate them.
@@ -1514,12 +2331,21 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     // must expose the same `defaultdict`/`OrderedDict`/`Counter` objects.
     if matches!(module, "collections" | "_collections") {
         match name {
-            "defaultdict" => return collections::defaultdict_function(),
+            // A class value with a stable `__repr__` member, not the bare
+            // constructor: `pprint` keys `_collections.defaultdict.__repr__`.
+            // Calls still arrive as module calls and reach the constructor.
+            "defaultdict" => return collections_defaultdict_class(),
             // Declared as a function so calls lower as module calls, but the
             // value is the cached class: `isinstance` and method binding need
             // a class, exactly like `io.StringIO`.
             "OrderedDict" => return collections::ordereddict_class(),
             "Counter" => return collections::counter_class(),
+            // `UserDict` is a pure-Python wrapper class; `pprint` looks up
+            // `_collections.UserDict.__repr__`, so the value must be the
+            // cached class and the class table routes to `collections::call`.
+            "UserDict" => return collections::userdict_class(),
+            "UserList" => return collections::userlist_class(),
+            "UserString" => return collections::userstring_class(),
             "deque" => return collections_placeholder_class("deque"),
             "ChainMap" => return collections_placeholder_class("ChainMap"),
             _ => {}
@@ -1564,6 +2390,23 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if let Some(class) = types::class_value(module, name) {
         return class;
     }
+    // `types.FunctionType` is a class in CPython but is declared as a
+    // constructor function for call lowering. Return the cached class (also
+    // callable) so `is` holds across `types`/`_types`.
+    if module == "types" && name == "FunctionType" {
+        return types::constant(name);
+    }
+    // `datetime`'s value classes are constants too; the spec also lists them
+    // as constructors, so resolve the cached class before falling back to a
+    // fresh native function value (identity across `datetime`/`_datetime`).
+    if module == "datetime"
+        && matches!(
+            name,
+            "date" | "time" | "datetime" | "timedelta" | "tzinfo" | "timezone"
+        )
+    {
+        return datetime::constant(name);
+    }
     if let Some(class) = inspect::class_value(module, name) {
         return class;
     }
@@ -1583,6 +2426,61 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     }
     if let Some(class) = zlib_mod::class_value(module, name) {
         return class;
+    }
+    // `gzip` uses these as incremental stream classes. The spec declares them
+    // as constructors so calls lower as module calls; the value itself is the
+    // cached class (the constructors are dispatched by `zlib_mod::call`).
+    if module == "zlib" && matches!(name, "_ZlibDecompressor" | "_ZlibCompressor") {
+        return zlib_mod::constant(name);
+    }
+    // `array.array` is the module's class (construction, `isinstance` and
+    // method binding); the spec may declare it as a constructor function.
+    if module == "array" && name == "array" {
+        return array_mod::array_class();
+    }
+    // `pickle.Pickler` is declared as a module function so construction lowers
+    // as a module call; the value itself is the cached class so `type()` and
+    // `isinstance` observe a class.
+    if module == "pickle" && name == "Pickler" {
+        return pickle_pickler_class();
+    }
+    // `pickle._Pickler` is CPython's pure-Python implementation of the same
+    // class; HYD1 has one writer, so both spellings share the cached class.
+    if module == "pickle" && name == "_Pickler" {
+        return pickle_pickler_class();
+    }
+    // `pickle.Unpickler` is the streaming reader counterpart; same cached
+    // class treatment so `type()` and `isinstance` observe a class.
+    if module == "pickle" && name == "Unpickler" {
+        return pickle_unpickler_class();
+    }
+    // `random.Random` is a class in CPython: callers read its methods from the
+    // class value (`Random.getrandbits`) and only then instantiate it. The
+    // runtime value is a cached proxy instance whose class carries those
+    // methods and whose `__call__` runs the real generator factory, so both
+    // spellings work without a second generator representation.
+    if module == "random" && name == "Random" {
+        return random_class_proxy();
+    }
+    // `pickle`'s three exception classes are part of its `__all__` and are
+    // raised by CPython's implementation; expose the real subclass chain
+    // instead of listing names that do not resolve.
+    if module == "pickle" && matches!(name, "PickleError" | "PicklingError" | "UnpicklingError") {
+        return pickle_exception_class(name);
+    }
+    // Deprecated `sre_compile`/`sre_constants`/`sre_parse` facades read the
+    // `_compiler`/`_constants`/`_parser` namespaces through `vars()` and then
+    // use their constants. Those submodules have no static spec entry, so the
+    // names come straight from the `re` facade table. `re._compiler`'s two
+    // functions are native values whose call path stays inside `re`.
+    if matches!(module, "re._compiler" | "re._constants" | "re._parser") {
+        return match (module, name) {
+            ("re._compiler", "compile") => value::native_function_new("re", "_compiler_compile", 1),
+            ("re._compiler", "isstring") => {
+                value::native_function_new("re", "_compiler_isstring", 1)
+            }
+            _ => re::submodule_constant(module, name),
+        };
     }
     // A nested native module (`asyncio.coroutines`, `os.path`, ...) is an
     // attribute of its parent package. Resolve it to the exact `sys.modules`
@@ -1730,6 +2628,30 @@ fn supplemental_value(module: &str, name: &str) -> Option<i64> {
         ("builtins", "eval") => Some(value::builtin_function_new(hydro_ir::Builtin::Eval)),
         ("builtins", "exec") => Some(value::builtin_function_new(hydro_ir::Builtin::Exec)),
         ("types", "CellType") => Some(types::cell_type_class()),
+        // OS helpers used by the stdlib path modules but absent from the
+        // static `os` table.
+        ("os", "readlink") => Some(value::native_function_new("os", "readlink", 2)),
+        ("os", "strerror") => Some(value::native_function_new("os", "strerror", 1)),
+        ("os", "unlink") => Some(value::native_function_new("os", "unlink", 2)),
+        // Directory iteration and descriptor inheritance: real filesystem and
+        // `fcntl` operations the static `os` table predates.
+        ("os", "scandir") => Some(value::native_function_new("os", "scandir", 1)),
+        ("os", "set_inheritable") => Some(value::native_function_new("os", "set_inheritable", 2)),
+        ("os", "get_inheritable") => Some(value::native_function_new("os", "get_inheritable", 1)),
+        // `os.path` helpers consumed by `glob`/`tarfile`/`shutil`.
+        ("os.path", "lexists") => Some(value::native_function_new("os.path", "lexists", 1)),
+        ("os.path", "commonpath") => Some(value::native_function_new("os.path", "commonpath", 1)),
+        ("os.path", "commonprefix") => {
+            Some(value::native_function_new("os.path", "commonprefix", 1))
+        }
+        ("os.path", "relpath") => Some(value::native_function_new("os.path", "relpath", 2)),
+        ("sys", "exception") => Some(value::native_function_new("sys", "exception", 0)),
+        ("runpy", "run_module") => Some(value::native_function_new("runpy", "run_module", 4)),
+        ("runpy", "_get_module_details") => Some(value::native_function_new(
+            "runpy",
+            "_get_module_details",
+            2,
+        )),
         _ => None,
     }
 }
@@ -2001,7 +2923,11 @@ fn call_native_kw_at(
         keywords.push((name.to_string(), pair[1]));
     }
     // A fixed leading parameter may be passed by name; it takes its positional
-    // slot so the dispatcher sees the usual layout.
+    // slot so the dispatcher sees the usual layout. Omitted slots before a
+    // named one are padded with `None`, matching the compiler's keyword
+    // lowering: `io.open(file, encoding="utf-8")` therefore leaves `mode` and
+    // `buffering` as `None` rather than shifting `encoding` into `mode`.
+    let mut supplied = vec![true; args.len()];
     for (index, param) in spec.params.iter().enumerate() {
         if args.len() > index {
             continue;
@@ -2011,7 +2937,26 @@ fn call_native_kw_at(
             .position(|(name, _)| name.as_str() == *param)
         {
             let (_, value) = keywords.remove(position);
+            while args.len() < index {
+                args.push(NONE);
+                supplied.push(false);
+            }
             args.push(value);
+            supplied.push(true);
+        }
+    }
+    // A required parameter that was neither positional nor named is a missing
+    // argument, not a call with an implicit `None`.
+    for index in 0..spec.min_args.min(spec.params.len()) {
+        if !supplied.get(index).copied().unwrap_or(false) {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "{module_name}.{function_name}() missing required argument '{}' (pos {})",
+                    spec.params[index],
+                    index + 1
+                ),
+            );
         }
     }
     if args.len() < spec.min_args || args.len() > spec.max_args {
@@ -2036,9 +2981,11 @@ fn call_native_kw_at(
 /// Keyword-aware dispatch; `functools.partial` and `dataclasses.replace` bind
 /// names.
 fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    let module = alias_target(module).unwrap_or(module);
     match module {
         "math" => math_call_kw(function, args, keywords),
-        "builtins" => builtins::call_kw(function, args, &keywords),
+        "cmath" => cmath::call_kw(function, args, &keywords),
+        "builtins" => builtins_dispatch_kw(function, args, &keywords),
         "datetime" => datetime::call_kw(function, args, &keywords),
         "functools" | "_functools" => functools_call_kw(function, args, keywords),
         "collections" | "_collections" => collections::call_kw(function, args, &keywords),
@@ -2055,10 +3002,25 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         "annotationlib" => annotationlib::call_kw(function, args, &keywords),
         "contextlib" => contextlib_call_kw(function, args, &keywords),
         "types" => types::call_kw(function, args, &keywords),
+        "io" | "_io" => io_call_kw(function, args, &keywords),
         "os" => os_call_kw(function, args, keywords),
         "os.path" => os_path_call_kw(function, args, &keywords),
+        // `random.Random.__call__(seed=...)` through the proxy value.
+        "random" => random_call(function, args),
         "itertools" => itertools_call_kw(function, args, keywords),
         "time" => time_call_kw(function, args, keywords),
+        // `textwrap`'s `wrap`/`fill`/`shorten`/`TextWrapper` take the
+        // `TextWrapper` keyword set (`width`, `initial_indent`, ...).
+        "textwrap" => textwrap::call_kw(function, args, &keywords),
+        // `runpy.run_module(mod_name, init_globals, run_name, alter_sys)`: the
+        // keyword binder has already moved declared names into their slots.
+        "runpy" => importlib::runpy_call_kw(function, args, &keywords),
+        // `importlib.util`'s helpers take their keyword names positionally
+        // after the generic binder (and `_find_spec_from_path` takes two).
+        "importlib.util" => importlib_util::call(function, args),
+        "hashlib" | "_hashlib" | "_sha1" | "_sha2" | "_md5" | "_blake2" | "_hmac" | "_uuid" => {
+            hashlib::call_named_kw(module, function, args, &keywords)
+        }
         "importlib.metadata" => importlib_metadata::call_kw(function, args, &keywords),
         // A spec with named parameters and no module-specific keyword
         // semantics (base64's `padded`) binds them into the positional
@@ -2108,6 +3070,7 @@ fn itertools_call(function: &str, args: &[i64]) -> i64 {
         "product" => itertools_product(args, 1),
         "takewhile" => itertools_takewhile(args),
         "dropwhile" => itertools_dropwhile(args),
+        "groupby" => itertools_groupby(args),
         _ => itertools::call(function, args),
     }
 }
@@ -2115,6 +3078,25 @@ fn itertools_call(function: &str, args: &[i64]) -> i64 {
 /// Keyword-aware `itertools` dispatch: `product` is the only combinator with
 /// a keyword-only parameter (`repeat`).
 fn itertools_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    if function == "groupby" {
+        let mut bound = args.to_vec();
+        for (name, item) in keywords {
+            if name != "key" {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("groupby() got an unexpected keyword argument '{name}'"),
+                );
+            }
+            if bound.len() > 1 {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "groupby() got multiple values for argument 'key'",
+                );
+            }
+            bound.push(item);
+        }
+        return itertools_groupby(&bound);
+    }
     if function == "zip_longest" {
         let mut fill = NONE;
         for (name, argument) in keywords {
@@ -2499,9 +3481,148 @@ fn itertools_dropwhile(args: &[i64]) -> i64 {
     result
 }
 
+/// Builds one `(key, group)` result: the group is itself an iterator over the
+/// consecutive run of equal keys.
+fn itertools_group_pair(key: i64, items: &mut Vec<i64>) -> i64 {
+    let members = value::list_new(std::mem::take(items));
+    let group = iter::iter_of(members);
+    if exc::pending() {
+        return NONE;
+    }
+    value::tuple_new(vec![key, group])
+}
+
+/// `groupby(iterable, key=None)`: consecutive runs of equal keys.
+///
+/// The runtime materialises the grouping eagerly (Hydro iterators are not
+/// user-subclassable); every group is a real iterator over its members, so
+/// `for key, group in groupby(...)` and `list(group)` match CPython's values.
+fn itertools_groupby(args: &[i64]) -> i64 {
+    let iterator = iter::iter_of(args[0]);
+    if exc::pending() {
+        return NONE;
+    }
+    let key_function = args.get(1).copied().unwrap_or(NONE);
+    // Root every produced key/member explicitly: the bookkeeping vectors live
+    // on the Rust heap and are invisible to the conservative scanner.
+    let mark = heap::root_values(&[]);
+    let result = value::list_new(Vec::new());
+    heap::add_thread_root(result);
+    let mut current_key = NONE;
+    let mut group: Vec<i64> = Vec::new();
+    let mut open = false;
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            heap::release_roots(mark);
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        heap::add_thread_root(item);
+        let key = if key_function == NONE {
+            item
+        } else {
+            let produced = crate::builtins::call(key_function, 1, [item].as_ptr());
+            if exc::pending() {
+                heap::release_roots(mark);
+                return produced;
+            }
+            heap::add_thread_root(produced);
+            produced
+        };
+        let same = if open {
+            let equal = ops::binop(ops::OP_EQ, current_key, key);
+            if exc::pending() {
+                heap::release_roots(mark);
+                return NONE;
+            }
+            value::truthy(equal)
+        } else {
+            false
+        };
+        if open && !same {
+            let pair = itertools_group_pair(current_key, &mut group);
+            if exc::pending() {
+                heap::release_roots(mark);
+                return NONE;
+            }
+            container::list_append(result, pair);
+        }
+        if !open || !same {
+            current_key = key;
+            open = true;
+        }
+        group.push(item);
+    }
+    if open {
+        let pair = itertools_group_pair(current_key, &mut group);
+        if exc::pending() {
+            heap::release_roots(mark);
+            return NONE;
+        }
+        container::list_append(result, pair);
+    }
+    heap::release_roots(mark);
+    iter::iter_of(result)
+}
+
+/// `builtins` positional dispatch plus the runtime-only shape `format(value)`
+/// (CPython's `format_spec` defaults to the empty string).
+fn builtins_dispatch(function: &str, args: &[i64]) -> i64 {
+    if function == "format" && args.len() == 1 {
+        let argv = [args[0], value::str_from_bytes(b"")];
+        return crate::builtins::call_builtin(hydro_ir::Builtin::Format, 2, argv.as_ptr());
+    }
+    builtins::call(function, args)
+}
+
+/// Keyword dispatch for `builtins`.
+///
+/// The generic binder moves declared leading parameters into their positional
+/// slots, so an empty keyword list means "call the positional implementation".
+/// The remaining names are either duplicate spellings of a declared parameter
+/// or the keyword-only `compile(..., _feature_version=...)`.
+fn builtins_dispatch_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if keywords.is_empty() {
+        return builtins_dispatch(function, args);
+    }
+    let mut bound = args.to_vec();
+    for (name, item) in keywords {
+        let slot = match (function, name.as_str()) {
+            ("enumerate", "start") => 1,
+            ("format", "value") => 0,
+            ("format", "format_spec") => 1,
+            // `compile`'s only keyword-only parameter; the runtime compiler
+            // is unavailable, so the value is accepted and then the call
+            // raises the truthful NotImplementedError. Every other parameter
+            // was already bound to its positional slot.
+            ("compile", "_feature_version") => continue,
+            // `dict(**kwargs)` and `type(name, bases, ns, **kwds)` keep their
+            // dynamic names for the module's keyword dispatcher; for any
+            // other builtin it reports the unexpected name.
+            _ => return builtins::call_kw(function, args, keywords),
+        };
+        while bound.len() <= slot {
+            bound.push(NONE);
+        }
+        if bound[slot] != NONE {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("{function}() got multiple values for argument '{name}'"),
+            );
+        }
+        bound[slot] = *item;
+    }
+    builtins_dispatch(function, &bound)
+}
+
 fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
+    let module = alias_target(module).unwrap_or(module);
     match module {
-        "builtins" => builtins::call(function, args),
+        "builtins" => builtins_dispatch(function, args),
         "math" => math_call(function, args),
         "functools" | "_functools" => functools_call(function, args),
         "operator" | "_operator" => operator_call(function, args),
@@ -2510,8 +3631,22 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "annotationlib" => annotationlib::call(function, args),
         "fractions" => fractions::call(function, args),
         "importlib" => importlib::call(function, args),
+        // The native `runpy` surface (`run_module`) resolves modules through
+        // the same registry/spec machinery as `importlib`.
+        "runpy" => match runpy_details_call(function, args) {
+            Some(result) => result,
+            None => importlib::runpy_call(function, args),
+        },
         "importlib.util" => importlib_util::call(function, args),
-        "importlib.machinery" => importlib_machinery::call(function, args),
+        "importlib.machinery" => match importlib_bootstrap_external_call(function, args) {
+            Some(result) => result,
+            None => importlib_machinery::call(function, args),
+        },
+        // `hashlib`, its accelerator aliases and the `_hmac`/`_uuid`
+        // accelerators share one native implementation.
+        "hashlib" | "_hashlib" | "_sha1" | "_sha2" | "_md5" | "_blake2" | "_hmac" | "_uuid" => {
+            hashlib::call_named(module, function, args)
+        }
         "importlib.metadata" => importlib_metadata::call(function, args),
         "importlib.resources" => importlib_resources::call(function, args),
         "types" => types::call(function, args),
@@ -2519,6 +3654,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "bisect" | "_bisect" => bisect::call(function, args),
         "heapq" | "_heapq" => heapq::call(function, args),
         "colorsys" => colorsys::call(function, args),
+        "cmath" => cmath::call(function, args),
         "keyword" => keyword::call(function, args),
         "stat" | "_stat" => stat::call(function, args),
         "time" => time_call(function, args),
@@ -2543,10 +3679,22 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "platform" => platform_call(function),
         "statistics" => statistics_call(function, args),
         "argparse" => argparse::call(function, args),
-        "_collections" => collections::call(function, args),
-        "collections" => collections::call(function, args),
-        "re" => re::call(function, args),
+        "_collections" | "collections" => match collections_repr_call(function, args) {
+            Some(result) => result,
+            None => collections::call(function, args),
+        },
+        "re" => match function {
+            // `re._compiler.compile`/`isstring` are read as module attributes
+            // but dispatched through `re`'s table (the facade has no spec).
+            "_compiler_compile" => re::submodule_call("re._compiler", "compile", args),
+            "_compiler_isstring" => re::submodule_call("re._compiler", "isstring", args),
+            _ => re::call(function, args),
+        },
+        "re._compiler" => re::submodule_call("re._compiler", function, args),
         "socket" | "_socket" => socket::call(module, function, args),
+        "array" => array_mod::call(function, args),
+        "signal" | "_signal" => signal_mod::call(function, args),
+        "termios" => termios::call(function, args),
         "select" => select::call(function, args),
         "selectors" => select::selectors_call(function, args),
         "ssl" => socket::ssl_call(function, args),
@@ -2587,6 +3735,11 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "site" => site::call(function, args),
         "ctypes" | "_ctypes" => ctypes::call(function, args),
         "locale" => locale::call(function, args),
+        "pwd" => pwd::call(function, args),
+        "grp" => grp::call(function, args),
+        "resource" => resource::call(function, args),
+        "fcntl" => fcntl::call(function, args),
+        "syslog" => syslog::call(function, args),
         "sysconfig" => sysconfig::call(function, args),
         "zoneinfo" => zoneinfo::call(function, args),
         "decimal" | "_decimal" => decimal::call(function, args),
@@ -2689,6 +3842,14 @@ pub(crate) fn registry_lookup(name: &str) -> Option<i64> {
 /// that is not registered yet is inserted so later `sys.modules` reads and
 /// materialisations observe the same value.
 pub(crate) fn module_value_by_name(name: &str) -> i64 {
+    // CPython's `_frozen_importlib_external` and `importlib._bootstrap_external`
+    // are the same module object (the importlib initializer installs the
+    // frozen module under the Python spelling). Keep that identity here too.
+    if name == "_frozen_importlib_external" {
+        let module = importlib_bootstrap_external_module();
+        publish_module(name, module);
+        return module;
+    }
     if let Some(existing) = registry_lookup(name) {
         return existing;
     }
@@ -3118,6 +4279,703 @@ fn builtin_module_names() -> i64 {
 
 // Constants
 
+/// `sys.stdlib_module_names`: every module name CPython 3.14.9 reports.
+///
+/// Generated from the oracle interpreter's `sys.stdlib_module_names`; the
+/// set is a fixed property of the target version, so it is embedded rather
+/// than discovered at runtime.
+const STDLIB_MODULE_NAMES: &[&str] = &[
+    "__future__",
+    "_abc",
+    "_aix_support",
+    "_android_support",
+    "_apple_support",
+    "_ast",
+    "_ast_unparse",
+    "_asyncio",
+    "_bisect",
+    "_blake2",
+    "_bz2",
+    "_codecs",
+    "_codecs_cn",
+    "_codecs_hk",
+    "_codecs_iso2022",
+    "_codecs_jp",
+    "_codecs_kr",
+    "_codecs_tw",
+    "_collections",
+    "_collections_abc",
+    "_colorize",
+    "_compat_pickle",
+    "_contextvars",
+    "_csv",
+    "_ctypes",
+    "_curses",
+    "_curses_panel",
+    "_datetime",
+    "_dbm",
+    "_decimal",
+    "_elementtree",
+    "_frozen_importlib",
+    "_frozen_importlib_external",
+    "_functools",
+    "_gdbm",
+    "_hashlib",
+    "_heapq",
+    "_hmac",
+    "_imp",
+    "_interpchannels",
+    "_interpqueues",
+    "_interpreters",
+    "_io",
+    "_ios_support",
+    "_json",
+    "_locale",
+    "_lsprof",
+    "_lzma",
+    "_markupbase",
+    "_md5",
+    "_multibytecodec",
+    "_multiprocessing",
+    "_opcode",
+    "_opcode_metadata",
+    "_operator",
+    "_osx_support",
+    "_overlapped",
+    "_pickle",
+    "_posixshmem",
+    "_posixsubprocess",
+    "_py_abc",
+    "_py_warnings",
+    "_pydatetime",
+    "_pydecimal",
+    "_pyio",
+    "_pylong",
+    "_pyrepl",
+    "_queue",
+    "_random",
+    "_remote_debugging",
+    "_scproxy",
+    "_sha1",
+    "_sha2",
+    "_sha3",
+    "_signal",
+    "_sitebuiltins",
+    "_socket",
+    "_sqlite3",
+    "_sre",
+    "_ssl",
+    "_stat",
+    "_statistics",
+    "_string",
+    "_strptime",
+    "_struct",
+    "_suggestions",
+    "_symtable",
+    "_sysconfig",
+    "_thread",
+    "_threading_local",
+    "_tkinter",
+    "_tokenize",
+    "_tracemalloc",
+    "_types",
+    "_typing",
+    "_uuid",
+    "_warnings",
+    "_weakref",
+    "_weakrefset",
+    "_winapi",
+    "_wmi",
+    "_zoneinfo",
+    "_zstd",
+    "abc",
+    "annotationlib",
+    "antigravity",
+    "argparse",
+    "array",
+    "ast",
+    "asyncio",
+    "atexit",
+    "base64",
+    "bdb",
+    "binascii",
+    "bisect",
+    "builtins",
+    "bz2",
+    "cProfile",
+    "calendar",
+    "cmath",
+    "cmd",
+    "code",
+    "codecs",
+    "codeop",
+    "collections",
+    "colorsys",
+    "compileall",
+    "compression",
+    "concurrent",
+    "configparser",
+    "contextlib",
+    "contextvars",
+    "copy",
+    "copyreg",
+    "csv",
+    "ctypes",
+    "curses",
+    "dataclasses",
+    "datetime",
+    "dbm",
+    "decimal",
+    "difflib",
+    "dis",
+    "doctest",
+    "email",
+    "encodings",
+    "ensurepip",
+    "enum",
+    "errno",
+    "faulthandler",
+    "fcntl",
+    "filecmp",
+    "fileinput",
+    "fnmatch",
+    "fractions",
+    "ftplib",
+    "functools",
+    "gc",
+    "genericpath",
+    "getopt",
+    "getpass",
+    "gettext",
+    "glob",
+    "graphlib",
+    "grp",
+    "gzip",
+    "hashlib",
+    "heapq",
+    "hmac",
+    "html",
+    "http",
+    "idlelib",
+    "imaplib",
+    "importlib",
+    "inspect",
+    "io",
+    "ipaddress",
+    "itertools",
+    "json",
+    "keyword",
+    "linecache",
+    "locale",
+    "logging",
+    "lzma",
+    "mailbox",
+    "marshal",
+    "math",
+    "mimetypes",
+    "mmap",
+    "modulefinder",
+    "msvcrt",
+    "multiprocessing",
+    "netrc",
+    "nt",
+    "ntpath",
+    "nturl2path",
+    "numbers",
+    "opcode",
+    "operator",
+    "optparse",
+    "os",
+    "pathlib",
+    "pdb",
+    "pickle",
+    "pickletools",
+    "pkgutil",
+    "platform",
+    "plistlib",
+    "poplib",
+    "posix",
+    "posixpath",
+    "pprint",
+    "profile",
+    "pstats",
+    "pty",
+    "pwd",
+    "py_compile",
+    "pyclbr",
+    "pydoc",
+    "pydoc_data",
+    "pyexpat",
+    "queue",
+    "quopri",
+    "random",
+    "re",
+    "readline",
+    "reprlib",
+    "resource",
+    "rlcompleter",
+    "runpy",
+    "sched",
+    "secrets",
+    "select",
+    "selectors",
+    "shelve",
+    "shlex",
+    "shutil",
+    "signal",
+    "site",
+    "smtplib",
+    "socket",
+    "socketserver",
+    "sqlite3",
+    "sre_compile",
+    "sre_constants",
+    "sre_parse",
+    "ssl",
+    "stat",
+    "statistics",
+    "string",
+    "stringprep",
+    "struct",
+    "subprocess",
+    "symtable",
+    "sys",
+    "sysconfig",
+    "syslog",
+    "tabnanny",
+    "tarfile",
+    "tempfile",
+    "termios",
+    "textwrap",
+    "this",
+    "threading",
+    "time",
+    "timeit",
+    "tkinter",
+    "token",
+    "tokenize",
+    "tomllib",
+    "trace",
+    "traceback",
+    "tracemalloc",
+    "tty",
+    "turtle",
+    "turtledemo",
+    "types",
+    "typing",
+    "unicodedata",
+    "unittest",
+    "urllib",
+    "uuid",
+    "venv",
+    "warnings",
+    "wave",
+    "weakref",
+    "webbrowser",
+    "winreg",
+    "winsound",
+    "wsgiref",
+    "xml",
+    "xmlrpc",
+    "zipapp",
+    "zipfile",
+    "zipimport",
+    "zlib",
+    "zoneinfo",
+];
+
+/// Constants the runtime computes that the static spec table does not list.
+///
+/// Everything here is a real property of this build: the `O_*` values are the
+/// C library's flags used by `os.open`, the `os.path` names mirror the
+/// platform separator rules `os.path.join`/`normpath` already implement, and
+/// the pickle protocol numbers are the ones `pickle.dumps` validates against.
+fn runtime_extra_constant(module: &str, name: &str) -> Option<i64> {
+    match module {
+        "os" => os_flag_constant(name),
+        "os.path" => os_path_constant(name),
+        "pickle" => match name {
+            "HIGHEST_PROTOCOL" => Some(encode_int(PICKLE_HIGHEST_PROTOCOL)),
+            "DEFAULT_PROTOCOL" => Some(pickle_default_protocol()),
+            "bytes_types" => Some(pickle_bytes_types()),
+            _ => None,
+        },
+        // `sys.path_hooks`: the mutable list `pkgutil` iterates when it scans
+        // `sys.path`. Hydro installs no path hooks, so the cached list is
+        // permanently empty (and identity-stable, like `sys.path`).
+        "sys" if name == "float_info" => Some(sys_float_info()),
+        "sys" if name == "stdlib_module_names" => Some(sys_stdlib_module_names()),
+        "sys" if name == "path_hooks" => Some(sys_path_hooks()),
+        // `codecs.CodecInfo`: a class value served by the runtime; the spec
+        // entry only has to declare the name.
+        "codecs" | "_codecs" if name == "CodecInfo" => Some(codecs_codecinfo_class()),
+        // `hashlib` constants resolve before the static spec lookup so the
+        // native module surface works while the spec table is still being
+        // populated.
+        "hashlib" | "_hashlib" | "_sha1" | "_sha2" | "_md5" | "_blake2" | "_hmac" | "_uuid" => {
+            hashlib::constant_named(module, name)
+        }
+        // `importlib._bootstrap`: the frozen bootstrap module `pkgutil` reads
+        // `_load` from. It is a module value so attribute access reaches the
+        // runtime importer surface instead of failing at the constant.
+        "importlib" if name == "_bootstrap" => Some(importlib_bootstrap_module()),
+        // `importlib._bootstrap_external`: the external bootstrap module
+        // (`modulefinder` reads `_classify_pyc` from it).
+        "importlib" if name == "_bootstrap_external" => Some(importlib_bootstrap_external_module()),
+        // `importlib._bootstrap_external`: the frozen C bootstrap alias of
+        // `_frozen_importlib_external`. `pydoc`, `py_compile` and
+        // `modulefinder` reach the loader/pyc helpers through this attribute.
+        "importlib" if name == "_bootstrap_external" => Some(importlib_bootstrap_external_module()),
+        "importlib.machinery" => {
+            if matches!(
+                name,
+                "ModuleSpec"
+                    | "Loader"
+                    | "SourceFileLoader"
+                    | "ExtensionFileLoader"
+                    | "BuiltinImporter"
+                    | "FrozenImporter"
+                    | "PathFinder"
+                    | "FileFinder"
+                    | "SourcelessFileLoader"
+                    | "AppleFrameworkLoader"
+                    | "_zip_directory_cache"
+                    | "SOURCE_SUFFIXES"
+                    | "BYTECODE_SUFFIXES"
+                    | "EXTENSION_SUFFIXES"
+            ) {
+                Some(importlib_machinery::constant(name))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Cached `codecs.CodecInfo` class value.
+///
+/// CPython's `CodecInfo` is a `tuple` subclass carrying the first four codec
+/// functions as its sequence and the remaining fields as attributes. Hydro
+/// has one native instance representation, so the class stores every field as
+/// an instance attribute; `isinstance(entry, codecs.CodecInfo)` and attribute
+/// reads behave like CPython, and `codecs.lookup` accepts these entries from
+/// registered search functions.
+pub(crate) fn codecs_codecinfo_class() -> i64 {
+    const KEY: &str = "codecs.CodecInfo.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let class = value::class_new_full(
+        "CodecInfo".to_string(),
+        NONE,
+        Vec::new(),
+        // CPython's class-level default: codecs are text encodings unless a
+        // constructor argument overrides it.
+        vec![("_is_text_encoding".to_string(), TRUE)],
+    );
+    globals::registry_set(KEY, class);
+    class
+}
+
+/// `CodecInfo(encode, decode, streamreader=None, streamwriter=None,
+/// incrementalencoder=None, incrementaldecoder=None, name=None,
+/// *, _is_text_encoding=None)`.
+///
+/// Every argument is stored on the instance, including the defaulted `None`
+/// slots; `_is_text_encoding` defaults to `True` like the class attribute in
+/// CPython (`None` leaves it unset, so the class default applies).
+pub(crate) fn codecs_codecinfo_new(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if args.len() < 2 || args.len() > 7 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "CodecInfo() takes 2 to 7 positional arguments ({} given)",
+                args.len()
+            ),
+        );
+    }
+    let mut slots = args.to_vec();
+    slots.resize(7, NONE);
+    let mut is_text = NONE;
+    for (name, item) in keywords {
+        let slot = match name.as_str() {
+            "encode" => 0,
+            "decode" => 1,
+            "streamreader" => 2,
+            "streamwriter" => 3,
+            "incrementalencoder" => 4,
+            "incrementaldecoder" => 5,
+            "name" => 6,
+            "_is_text_encoding" => {
+                is_text = *item;
+                continue;
+            }
+            _ => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("CodecInfo() got an unexpected keyword argument '{name}'"),
+                )
+            }
+        };
+        while slots.len() <= slot {
+            slots.push(NONE);
+        }
+        if slot < args.len() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("CodecInfo() got multiple values for argument '{name}'"),
+            );
+        }
+        slots[slot] = *item;
+    }
+    let instance = value::instance_new(codecs_codecinfo_class());
+    let roots = heap::root_values(&[instance]);
+    let mut values = slots.clone();
+    if is_text != NONE {
+        values.push(is_text);
+    }
+    let value_roots = heap::root_values(&values);
+    for (name, item) in [
+        ("encode", slots[0]),
+        ("decode", slots[1]),
+        ("streamreader", slots[2]),
+        ("streamwriter", slots[3]),
+        ("incrementalencoder", slots[4]),
+        ("incrementaldecoder", slots[5]),
+        ("name", slots[6]),
+    ] {
+        value::instance_setattr(instance, name.to_string(), item);
+    }
+    if is_text != NONE {
+        value::instance_setattr(instance, "_is_text_encoding".to_string(), is_text);
+    }
+    heap::release_roots(value_roots);
+    heap::release_roots(roots);
+    instance
+}
+
+/// Cached `sys.stdlib_module_names` set.
+fn sys_stdlib_module_names() -> i64 {
+    const KEY: &str = "sys.stdlib_module_names";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let mark = heap::root_values(&[]);
+    let mut items: Vec<i64> = Vec::with_capacity(STDLIB_MODULE_NAMES.len());
+    for name in STDLIB_MODULE_NAMES {
+        let item = value::str_alloc((*name).to_string());
+        // The vector lives in Rust memory the collector does not scan.
+        heap::add_thread_root(item);
+        items.push(item);
+    }
+    let set = value::set_new(items);
+    let set_roots = heap::root_values(&[set]);
+    globals::registry_set(KEY, set);
+    heap::release_roots(set_roots);
+    heap::release_roots(mark);
+    set
+}
+
+/// Cached `sys.float_info` namespace.
+///
+/// The values are the C `<float.h>` limits of an IEEE-754 binary64 `double`,
+/// which is what CPython reports on every platform Hydro targets.
+fn sys_float_info() -> i64 {
+    const KEY: &str = "sys.float_info";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let info = value::namespace_new(vec![
+        ("max".to_string(), value::float_new(f64::MAX)),
+        ("max_exp".to_string(), encode_int(1024)),
+        ("max_10_exp".to_string(), encode_int(308)),
+        ("min".to_string(), value::float_new(f64::MIN_POSITIVE)),
+        ("min_exp".to_string(), encode_int(-1021)),
+        ("min_10_exp".to_string(), encode_int(-307)),
+        ("dig".to_string(), encode_int(15)),
+        ("mant_dig".to_string(), encode_int(53)),
+        ("epsilon".to_string(), value::float_new(f64::EPSILON)),
+        ("radix".to_string(), encode_int(2)),
+        ("rounds".to_string(), encode_int(1)),
+    ]);
+    globals::registry_set(KEY, info);
+    info
+}
+
+/// Functions that belong to `importlib._bootstrap_external` but are dispatched
+/// through the `importlib.machinery` alias. Only the pyc header validator is
+/// needed by the stdlib (`modulefinder`).
+fn importlib_bootstrap_external_call(function: &str, args: &[i64]) -> Option<i64> {
+    if function != "_classify_pyc" {
+        return None;
+    }
+    if args.len() != 3 {
+        return Some(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("_classify_pyc() takes 3 arguments ({} given)", args.len()),
+        ));
+    }
+    let Some(data) = value::as_bytes(args[0])
+        .map(|bytes| bytes.to_vec())
+        .or_else(|| value::as_bytearray(args[0]).cloned())
+    else {
+        return Some(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "a bytes-like object is required, not '{}'",
+                value::type_name_of(args[0])
+            ),
+        ));
+    };
+    let name = match value::as_str(args[1]) {
+        Some(name) => name,
+        None => {
+            return Some(exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("name must be str, not {}", value::type_name_of(args[1])),
+            ))
+        }
+    };
+    // Pyc magic is the four-byte little-endian token `importlib.util`
+    // publishes; anything else (including a short buffer) is a bad magic.
+    if data.len() < 4 || data[..4] != importlib_util::MAGIC_NUMBER_BYTES {
+        let magic = value::bytes_new(data[..data.len().min(4)].to_vec());
+        return Some(exc::raise_with_message(
+            exc::IMPORT_ERROR,
+            &format!(
+                "bad magic number in {}: {}",
+                value::repr(value::str_alloc(name.to_string())),
+                value::repr(magic)
+            ),
+        ));
+    }
+    if data.len() < 16 {
+        return Some(exc::raise_with_message(
+            exc::EOF_ERROR,
+            &format!(
+                "reached EOF while reading pyc header of {}",
+                value::repr(value::str_alloc(name.to_string()))
+            ),
+        ));
+    }
+    let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    if flags & !0b11 != 0 {
+        return Some(exc::raise_with_message(
+            exc::IMPORT_ERROR,
+            &format!(
+                "invalid flags {flags} in {}",
+                value::repr(value::str_alloc(name.to_string()))
+            ),
+        ));
+    }
+    Some(encode_int(i64::from(flags)))
+}
+
+/// Cached `sys.path_hooks` list. Hydro has no filesystem path-hook entries,
+/// so the list stays empty; callers that append observe a real list.
+fn sys_path_hooks() -> i64 {
+    const KEY: &str = "sys.path_hooks";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let hooks = value::list_new(Vec::new());
+    globals::registry_set(KEY, hooks);
+    hooks
+}
+
+/// Cached `importlib._bootstrap` module value, so repeated reads share
+/// identity (pkgutil compares/reads it as a module).
+fn importlib_bootstrap_module() -> i64 {
+    const KEY: &str = "importlib._bootstrap.module";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let module = value::module_value("importlib._bootstrap".to_string());
+    globals::registry_set(KEY, module);
+    module
+}
+
+/// Cached `importlib._bootstrap_external` module value.
+///
+/// The runtime has no separate external bootstrap implementation: its surface
+/// is `importlib.machinery`, which [`alias_target`] routes every attribute to.
+/// The value keeps the Python spelling so `__name__` and `sys.modules` agree
+/// with CPython, and repeated reads share identity.
+fn importlib_bootstrap_external_module() -> i64 {
+    const KEY: &str = "importlib._bootstrap_external.module";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let module = module_value_by_name("importlib._bootstrap_external");
+    globals::registry_set(KEY, module);
+    module
+}
+
+/// Additional `os.open` flags. The static `os` spec declares the core eight;
+/// the rest are the C library values this build links against, so a caller
+/// passing them to `os.open` gets the descriptor the kernel would create.
+fn os_flag_constant(name: &str) -> Option<i64> {
+    Some(encode_int(match name {
+        "O_EXCL" => libc::O_EXCL as i64,
+        "O_NOFOLLOW" => libc::O_NOFOLLOW as i64,
+        "O_DIRECTORY" => libc::O_DIRECTORY as i64,
+        "O_SYNC" => libc::O_SYNC as i64,
+        "O_DSYNC" => libc::O_DSYNC as i64,
+        "O_ASYNC" => libc::O_ASYNC as i64,
+        "O_NONBLOCK" | "O_NDELAY" => libc::O_NONBLOCK as i64,
+        "O_ACCMODE" => (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR) as i64,
+        _ => return None,
+    }))
+}
+
+/// `os.path`'s path-flavour constants. `os.path` on POSIX follows the same
+/// separator rules as `os`; `altsep` is `None` and `extsep` is `.`.
+fn os_path_constant(name: &str) -> Option<i64> {
+    Some(match name {
+        "sep" => {
+            let sep = if cfg!(windows) { "\\" } else { "/" };
+            value::str_from_bytes(sep.as_bytes())
+        }
+        "altsep" => {
+            if cfg!(windows) {
+                value::str_from_bytes(b"/")
+            } else {
+                NONE
+            }
+        }
+        "pathsep" => {
+            let pathsep = if cfg!(windows) { ";" } else { ":" };
+            value::str_from_bytes(pathsep.as_bytes())
+        }
+        "extsep" => value::str_from_bytes(b"."),
+        "curdir" => value::str_from_bytes(b"."),
+        "pardir" => value::str_from_bytes(b".."),
+        // CPython 3.14's `os.path.ALLOW_MISSING`: a unique sentinel that
+        // `pathlib` passes to distinguish "argument omitted" from an explicit
+        // `None`. It is a cached instance so identity comparisons hold across
+        // `os.path`/`posixpath`/`ntpath` spellings.
+        "ALLOW_MISSING" => os_path_allow_missing(),
+        _ => return None,
+    })
+}
+
+/// Cached `os.path.ALLOW_MISSING` sentinel.
+fn os_path_allow_missing() -> i64 {
+    const KEY: &str = "os.path.ALLOW_MISSING";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let class = value::class_new("ALLOW_MISSING".to_string(), NONE, Vec::new());
+    let class_roots = heap::root_values(&[class]);
+    let sentinel = value::instance_new(class);
+    let sentinel_roots = heap::root_values(&[sentinel]);
+    globals::registry_set(KEY, sentinel);
+    heap::release_roots(sentinel_roots);
+    heap::release_roots(class_roots);
+    sentinel
+}
+
 fn constant_value(module: &str, name: &str) -> i64 {
     match (module, name) {
         ("__future__", name) => future::constant(name),
@@ -3139,6 +4997,9 @@ fn constant_value(module: &str, name: &str) -> i64 {
                 value::bytes_new(vec![0xFE, 0xFF])
             }
         }
+        // `codecs.CodecInfo`: the tuple-like registry entry `encodings` builds
+        // with `CodecInfo(*entry)` and checks with `isinstance`.
+        ("codecs" | "_codecs", "CodecInfo") => codecs_codecinfo_class(),
         ("types", name) => types::constant(name),
         ("json", "JSONDecodeError") => crate::exc::exception_class(crate::exc::VALUE_ERROR),
         ("annotationlib", name) => annotationlib::constant(name),
@@ -3149,6 +5010,14 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("math", "tau") => value::float_new(std::f64::consts::TAU),
         ("math", "inf") => value::float_new(f64::INFINITY),
         ("math", "nan") => value::float_new(f64::NAN),
+        ("cmath", name) => {
+            cmath::constant(name).unwrap_or_else(|| missing_attribute("cmath", name))
+        }
+        // `sys.float_info`: the platform's IEEE-754 binary64 limits, exposed
+        // as the struct-sequence attributes CPython documents.
+        ("sys", "float_info") => sys_float_info(),
+        // `sys.stdlib_module_names`: the fixed CPython 3.14.9 module set.
+        ("sys", "stdlib_module_names") => sys_stdlib_module_names(),
         ("sys", "argv") => argv_list(),
         // Runtime module registry (identity-stable for repeated reads).
         ("sys", "path") => sys_path(),
@@ -3230,6 +5099,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // directly when joining relative paths.
         ("os", "pardir") => value::str_from_bytes(b".."),
         ("os", "curdir") => value::str_from_bytes(b"."),
+        ("os", "extsep") => value::str_from_bytes(b"."),
         // The `PATH` list separator, `:` on POSIX and `;` on Windows.
         ("os", "pathsep") => {
             let pathsep = if cfg!(windows) { ";" } else { ":" };
@@ -3301,7 +5171,8 @@ fn constant_value(module: &str, name: &str) -> i64 {
             | "HelpFormatter"
             | "Action"
             | "BooleanOptionalAction"
-            | "SUPPRESS"),
+            | "SUPPRESS"
+            | "REMAINDER"),
         ) => argparse::constant(name),
         ("asyncio", "CancelledError") => exc::exception_class(exc::CANCELLED_ERROR),
         ("asyncio.coroutines", "_is_coroutine") => asyncio::coroutines_constant("_is_coroutine")
@@ -3318,6 +5189,11 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("keyword", "softkwlist") => keyword::softkwlist(),
         ("stat" | "_stat", name) => stat::constant(name),
         ("re", name) => re::constant(name),
+        // `re._compiler`/`_constants`/`_parser` constants (the deprecated
+        // `sre_*` facades re-export them).
+        ("re._compiler" | "re._constants" | "re._parser", name) => {
+            re::submodule_constant(module, name)
+        }
         ("mimetypes", name) => mimetypes::constant(name),
         ("mmap", name) => mmap_mod::constant(name),
         ("zlib", name) => zlib_mod::constant(name),
@@ -3329,6 +5205,10 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("pathlib", name) => {
             pathlib_class_value(name).unwrap_or_else(|| missing_attribute("pathlib", name))
         }
+        // `EncodingWarning` is a `Warning` subclass shared by `builtins` and
+        // `warnings`; `warnings` owns the cached class so both spellings
+        // compare by identity.
+        ("builtins", "EncodingWarning") => warnings::constant("EncodingWarning"),
         ("builtins", name) => builtins::constant(name),
         ("_opcode", name) => opcode::constant(name),
         ("_weakref" | "weakref", name) => weakref::constant(name),
@@ -3352,9 +5232,29 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // the module-wide constant table below.
         ("collections" | "collections.abc", "abc") => collections_abc_module(),
         ("_collections_abc" | "collections.abc", name) => collections_abc::constant(name),
+        // Module classes (`UserDict`, `UserList`, `UserString`, ...): the
+        // module_get class table answers these directly; this is the constant
+        // path used when a spec declares the name.
+        ("collections" | "_collections", name) => collections::constant(name),
         ("site", name) => site::constant(name),
         ("ctypes" | "_ctypes", name) => ctypes::constant(name),
         ("locale", name) => locale::constant(name),
+        ("pwd", name) => pwd::constant(name).unwrap_or_else(|| missing_attribute("pwd", name)),
+        ("grp", name) => grp::constant(name).unwrap_or_else(|| missing_attribute("grp", name)),
+        ("resource", name) => {
+            resource::constant(name).unwrap_or_else(|| missing_attribute("resource", name))
+        }
+        ("fcntl", name) => {
+            fcntl::constant(name).unwrap_or_else(|| missing_attribute("fcntl", name))
+        }
+        ("array", name) => {
+            array_mod::constant(name).unwrap_or_else(|| missing_attribute("array", name))
+        }
+        ("signal" | "_signal", name) => signal_mod::constant(name),
+        ("termios", name) => termios::constant(name),
+        ("syslog", name) => {
+            syslog::constant(name).unwrap_or_else(|| missing_attribute("syslog", name))
+        }
         ("sysconfig", name) => sysconfig::constant(name),
         ("zoneinfo", name) => zoneinfo::constant(name),
         ("decimal" | "_decimal", name) => decimal::constant(name),
@@ -3367,9 +5267,21 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("time", "tzname") => time_tzname(),
         ("time", "daylight") => encode_int(time_daylight()),
         ("time", "_STRUCT_TM_ITEMS") => time_struct_tm_items(),
+        // `pickle`'s exception classes.
+        ("pickle", name @ ("PickleError" | "PicklingError" | "UnpicklingError")) => {
+            pickle_exception_class(name)
+        }
+        // `pickle.__all__`: CPython's exported-name list, cached so repeated
+        // reads share identity.
+        ("pickle", "__all__") => pickle_all_list(),
         // `pickle.DEFAULT_PROTOCOL`: the protocol `dump`/`dumps` use when none
         // is given.
-        ("pickle", "DEFAULT_PROTOCOL") => encode_int(pickle_default_protocol()),
+        ("pickle", "DEFAULT_PROTOCOL") => pickle_default_protocol(),
+        // `pickle.bytes_types`: the buffer types the protocol treats as raw
+        // bytes. CPython's value is `(bytes, bytearray)`; `memoryview` exposes
+        // bytes-like data through the same buffer protocol here, so the tuple
+        // names the two concrete classes.
+        ("pickle", "bytes_types") => pickle_bytes_types(),
         // The `@dataclass` decorator is expanded by the frontend; the runtime
         // value only has to exist for the import.
         ("dataclasses", "dataclass") => NONE,
@@ -3383,6 +5295,24 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("dataclasses", "_HAS_DEFAULT_FACTORY") => dataclasses_has_default_factory(),
         ("contextlib", name) => contextlib_class_value("contextlib", name)
             .unwrap_or_else(|| missing_attribute("contextlib", name)),
+        // Constants the runtime computes (see [`runtime_extra_constant`]); the
+        // arms also serve a spec that declares them, because the spec only
+        // decides that the name exists.
+        ("os", name) => os_flag_constant(name).unwrap_or_else(|| missing_attribute("os", name)),
+        ("os.path", name) => {
+            os_path_constant(name).unwrap_or_else(|| missing_attribute("os.path", name))
+        }
+        ("pickle", name) => runtime_extra_constant("pickle", name)
+            .unwrap_or_else(|| missing_attribute("pickle", name)),
+        // `hashlib`'s constant names (`algorithms_guaranteed`, `HASH`,
+        // `HMAC`, the UUID namespaces and the `_hmac`/`_uuid` capability
+        // flags) are computed by the native implementation.
+        (
+            "hashlib" | "_hashlib" | "_sha1" | "_sha2" | "_md5" | "_blake2" | "_hmac" | "_uuid",
+            name,
+        ) => {
+            hashlib::constant_named(module, name).unwrap_or_else(|| missing_attribute(module, name))
+        }
         ("_hydro_sidecar", name) => match sidecar::constant(name) {
             Some(value) => value,
             None => missing_attribute("_hydro_sidecar", name),
@@ -3398,9 +5328,80 @@ fn collections_placeholder_class(name: &str) -> i64 {
     if let Some(cached) = globals::registry_get(&key) {
         return cached;
     }
-    let class = value::class_new(name.to_string(), NONE, Vec::new());
+    // `pprint` keys its dispatch table by `_collections.ChainMap.__repr__` and
+    // `_collections.deque.__repr__`, so the placeholder class needs a stable
+    // `__repr__` value (stored as an attribute, not a bound method, so every
+    // read returns the same object). Hydro has no element storage for either
+    // type, so the renderer reports the empty form that is the only truthful
+    // state of a placeholder.
+    let (module, repr_name) = match name {
+        "deque" => ("collections", "deque.__repr__"),
+        _ => ("collections", "ChainMap.__repr__"),
+    };
+    let repr = value::native_function_new(module, repr_name, 1);
+    let roots = heap::root_values(&[repr]);
+    let class = value::class_new_full(
+        name.to_string(),
+        NONE,
+        Vec::new(),
+        vec![("__repr__".to_string(), repr)],
+    );
+    let class_roots = heap::root_values(&[class]);
     globals::registry_set(&key, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
     class
+}
+
+/// Cached `collections.defaultdict` class value.
+///
+/// The constructor call still lowers to the module's `defaultdict` function
+/// (`collections::defaultdict_function`), but the *value* the module exposes
+/// must be a class carrying a `__repr__` member: `pprint` reads
+/// `_collections.defaultdict.__repr__` and compares it with
+/// `type(defaultdict_instance).__repr__`. The cached class is the very value
+/// `type()` reports for a defaultdict, and the `__repr__` attribute is stored
+/// as plain data, so both reads share one identity.
+fn collections_defaultdict_class() -> i64 {
+    const KEY: &str = "collections.defaultdict.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    // Use the exact class value `type()` reports for a defaultdict, so
+    // `type(value) is collections.defaultdict` holds. A probe materialises the
+    // value layer's cached class; the probe itself is released normally.
+    let probe = value::defaultdict_new(NONE, Vec::new());
+    let probe_roots = heap::root_values(&[probe]);
+    let class = value::type_class(probe);
+    heap::release_roots(probe_roots);
+    let repr = value::native_function_new("collections", "defaultdict.__repr__", 1);
+    let roots = heap::root_values(&[repr, class]);
+    let _ = value::class_set_attr(class, "__repr__".to_string(), repr);
+    globals::registry_set(KEY, class);
+    heap::release_roots(roots);
+    class
+}
+
+/// Instance `__repr__` bodies for the placeholder `collections` classes.
+///
+/// They are stored as class attributes, so a read through the class returns
+/// the same function value (the shape `pprint` keys its dispatch table by).
+fn collections_repr_call(function: &str, args: &[i64]) -> Option<i64> {
+    let text = match function {
+        "defaultdict.__repr__" => {
+            let Some(&obj) = args.first() else {
+                return Some(exc::raise_with_message(
+                    TYPE_ERROR,
+                    "descriptor '__repr__' needs an argument",
+                ));
+            };
+            return Some(value::str_alloc(value::repr(obj)));
+        }
+        "deque.__repr__" => "deque([])",
+        "ChainMap.__repr__" => "ChainMap({})",
+        _ => return None,
+    };
+    Some(value::str_alloc(text.to_string()))
 }
 
 /// `contextlib.AbstractContextManager` / `AbstractAsyncContextManager`.
@@ -4881,7 +6882,87 @@ fn random_operation(rng: &value::RandomState, function: &str, args: &[i64]) -> i
     }
 }
 
+/// Cached proxy value for `random.Random`.
+///
+/// CPython's `Random` is a class, so `Random.getrandbits` is a real attribute
+/// of the class value. Hydro's generator is a native `RandomState`, which a
+/// class cannot construct (the generic class path allocates an instance), so
+/// the module exposes a cached instance whose class carries the generator
+/// methods and whose `__call__` returns a real `RandomState`.
+fn random_class_proxy() -> i64 {
+    const KEY: &str = "random.Random.proxy";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    // `native_function_new` stores `&'static str`, so the qualified names are
+    // a fixed table rather than formatted per call.
+    let names: [(&str, &'static str); 10] = [
+        ("__call__", "Random.__call__"),
+        ("getrandbits", "Random.getrandbits"),
+        ("random", "Random.random"),
+        ("seed", "Random.seed"),
+        ("randint", "Random.randint"),
+        ("randrange", "Random.randrange"),
+        ("choice", "Random.choice"),
+        ("uniform", "Random.uniform"),
+        ("shuffle", "Random.shuffle"),
+        ("sample", "Random.sample"),
+    ];
+    let methods: Vec<(String, i64)> = names
+        .iter()
+        .map(|&(name, qualified)| {
+            (
+                name.to_string(),
+                value::native_function_new("random", qualified, usize::MAX),
+            )
+        })
+        .collect();
+    let method_values: Vec<i64> = methods.iter().map(|(_, function)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new("Random".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    let proxy = value::instance_new(class);
+    let proxy_roots = heap::root_values(std::slice::from_ref(&proxy));
+    globals::registry_set(KEY, proxy);
+    heap::release_roots(proxy_roots);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    proxy
+}
+
+/// Shared arity-checked dispatch for a `Random` method operating on the global
+/// generator (the proxy's bound methods cannot reach a per-instance state).
+fn random_global_method(method: &str, args: &[i64]) -> i64 {
+    let (min, max) = match method {
+        "seed" => (0, 1),
+        "random" => (0, 0),
+        "randint" => (2, 2),
+        "randrange" => (1, 3),
+        "choice" => (1, 1),
+        "uniform" => (2, 2),
+        "shuffle" => (1, 1),
+        "getrandbits" => (1, 1),
+        "sample" => (2, 2),
+        _ => return missing_attribute("random.Random", method),
+    };
+    if let Some(err) = check_random_arity(method, args.len(), min, max) {
+        return err;
+    }
+    random_operation(&GLOBAL_RANDOM, method, args)
+}
+
 fn random_call(function: &str, args: &[i64]) -> i64 {
+    // Methods reached through the `random.Random` proxy value: the receiver is
+    // the cached proxy, and the remaining arguments use the module-level
+    // generator (`Random(...)` still returns a real generator).
+    if let Some(method) = function.strip_prefix("Random.") {
+        if method == "__call__" {
+            let seed = if args.len() > 1 { &args[1..] } else { &[][..] };
+            return random_call("Random", seed);
+        }
+        let method_args = args.get(1..).unwrap_or(&[]);
+        return random_global_method(method, method_args);
+    }
     if function == "Random" {
         let seed = match args.first().copied() {
             None => None,
@@ -5441,6 +7522,27 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
         }
         "fabs" => match number(args[0]) {
             Ok(x) => value::float_new(x.abs()),
+            Err(err) => err,
+        },
+        // `modf(x)`: the fractional and integral parts, both floats and both
+        // carrying the sign of `x`. C's `modf` maps infinities to `(±0.0,
+        // ±inf)` and NaN to `(nan, nan)`; Rust's `fract` would turn an
+        // infinity into NaN, so those cases are explicit.
+        "modf" => match number(args[0]) {
+            Ok(x) if x.is_nan() => {
+                let nan = value::float_new(x);
+                value::tuple_new(vec![nan, nan])
+            }
+            Ok(x) if x.is_infinite() => {
+                let fraction = value::float_new(if x.is_sign_negative() { -0.0 } else { 0.0 });
+                let integral = value::float_new(x);
+                value::tuple_new(vec![fraction, integral])
+            }
+            Ok(x) => {
+                let fraction = value::float_new(x.fract());
+                let integral = value::float_new(x.trunc());
+                value::tuple_new(vec![fraction, integral])
+            }
             Err(err) => err,
         },
         // `copysign(x, y)`: x's magnitude (including a NaN payload) with y's
@@ -6087,7 +8189,9 @@ fn operator_call(function: &str, args: &[i64]) -> i64 {
         "le" => Some(ops::OP_LE),
         "gt" => Some(ops::OP_GT),
         "ge" => Some(ops::OP_GE),
+        "and_" => Some(ops::OP_BIT_AND),
         "or_" => Some(ops::OP_BIT_OR),
+        "xor" => Some(ops::OP_BIT_XOR),
         _ => None,
     };
     if let Some(op) = binary {
@@ -6429,6 +8533,167 @@ fn time_gmtime(args: &[i64]) -> i64 {
         exc::raise_with_message(
             exc::NOT_IMPLEMENTED_ERROR,
             "time.gmtime is not supported on this platform",
+        )
+    }
+}
+
+/// Broken-down local time for `time.ctime`/`time.mktime` support.
+#[cfg(unix)]
+fn local_tm(seconds: f64) -> Result<libc::tm, i64> {
+    let stamp = time_t_from_seconds(seconds)?;
+    // SAFETY: `tm` is a plain C struct and `stamp` is a valid time_t;
+    // `localtime_r` fills the buffer.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&stamp, &mut tm) }.is_null() {
+        return Err(exc::raise_with_message(
+            OS_ERROR,
+            "ctime: failed to convert the timestamp",
+        ));
+    }
+    Ok(tm)
+}
+
+/// `time.ctime([secs])`: the local time in `asctime` form, always ending in a
+/// newline. `None` (and an omitted argument) means "now".
+fn time_ctime(args: &[i64]) -> i64 {
+    let seconds = match args.first().copied() {
+        None | Some(NONE) => current_time_t() as f64,
+        Some(argument) => match number(argument) {
+            Ok(seconds) => seconds,
+            Err(err) => return err,
+        },
+    };
+    #[cfg(unix)]
+    {
+        const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let tm = match local_tm(seconds) {
+            Ok(tm) => tm,
+            Err(err) => return err,
+        };
+        let weekday = WEEKDAYS[(tm.tm_wday.rem_euclid(7)) as usize];
+        let month = MONTHS[(tm.tm_mon.rem_euclid(12)) as usize];
+        // CPython's `asctime` uses `%3d` for the day and an unpadded year.
+        value::str_alloc(format!(
+            "{weekday} {month}{:3} {:02}:{:02}:{:02} {}\n",
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+            i64::from(tm.tm_year) + 1900
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = seconds;
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "time.ctime is not supported on this platform",
+        )
+    }
+}
+
+/// Converts one `mktime` field to a C `int`, raising CPython's conversion
+/// error for an out-of-range value.
+fn mktime_field(fields: &[i64; 9], index: usize) -> Result<libc::c_int, i64> {
+    let Some(value) = value::as_integer(fields[index]) else {
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "an integer is required (got type {})",
+                value::type_name(fields[index])
+            ),
+        ));
+    };
+    i32::try_from(value).map_err(|_| {
+        exc::raise_with_message(OVERFLOW_ERROR, "Python int too large to convert to C int")
+    })
+}
+
+/// `time.mktime(t)`: epoch seconds for a nine-field local time sequence.
+fn time_mktime(args: &[i64]) -> i64 {
+    let Some(argument) = args.first().copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "mktime() missing required argument 't' (pos 1)",
+        );
+    };
+    let fields = if let Some(fields) = struct_time_fields(argument) {
+        fields
+    } else if let Some(items) = value::as_tuple(argument) {
+        if items.len() != 9 {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "mktime() argument must be a sequence of 9 items",
+            );
+        }
+        let mut fields = [NONE; 9];
+        fields.copy_from_slice(items);
+        fields
+    } else if let Some(items) = value::as_list(argument) {
+        if items.len() != 9 {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "mktime() argument must be a sequence of 9 items",
+            );
+        }
+        let mut fields = [NONE; 9];
+        fields.copy_from_slice(items);
+        fields
+    } else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "mktime() argument must be a sequence of 9 items",
+        );
+    };
+    #[cfg(unix)]
+    {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        tm.tm_year = match mktime_field(&fields, 0) {
+            Ok(year) => year - 1900,
+            Err(err) => return err,
+        };
+        tm.tm_mon = match mktime_field(&fields, 1) {
+            Ok(month) => month - 1,
+            Err(err) => return err,
+        };
+        for (index, slot) in [
+            (2usize, 0usize),
+            (3, 1),
+            (4, 2),
+            (5, 3),
+            (6, 4),
+            (7, 5),
+            (8, 6),
+        ] {
+            let field = match mktime_field(&fields, index) {
+                Ok(field) => field,
+                Err(err) => return err,
+            };
+            match slot {
+                0 => tm.tm_mday = field,
+                1 => tm.tm_hour = field,
+                2 => tm.tm_min = field,
+                3 => tm.tm_sec = field,
+                4 => tm.tm_wday = field,
+                5 => tm.tm_yday = field,
+                _ => tm.tm_isdst = field,
+            }
+        }
+        // SAFETY: `tm` is a fully initialised C struct; `mktime` normalises
+        // the fields and may return `-1` for either a real pre-epoch instant
+        // or an overflow, so the value is returned as C reports it.
+        let seconds = unsafe { libc::mktime(&mut tm) };
+        value::float_new(seconds as f64)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fields;
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "time.mktime is not supported on this platform",
         )
     }
 }
@@ -6839,6 +9104,8 @@ fn time_call(function: &str, args: &[i64]) -> i64 {
         "process_time" => time_process_time(),
         "localtime" => time_localtime(args),
         "gmtime" => time_gmtime(args),
+        "mktime" => time_mktime(args),
+        "ctime" => time_ctime(args),
         "strftime" => time_strftime(args[0], args.get(1).copied().unwrap_or(NONE)),
         "tzset" => time_tzset(),
         "_struct_time_init" => struct_time_init(args),
@@ -7718,13 +9985,256 @@ fn pickle_call(function: &str, args: &[i64]) -> i64 {
         }
         "load" => pickle_load(args),
         "decode_long" => pickle_decode_long(args),
+        "Pickler" | "_Pickler" => pickle_pickler_new(args),
+        "Pickler.dump" => pickle_pickler_dump(args),
+        "Pickler.clear_memo" => pickle_pickler_clear_memo(args),
+        "Unpickler" => pickle_unpickler_new(args),
+        "Unpickler.load" => pickle_unpickler_load(args),
         _ => missing_attribute("pickle", function),
     }
 }
 
-/// `pickle.DEFAULT_PROTOCOL` for Hydro's HYD1 payloads.
+/// Cached `pickle.Pickler` class.
+///
+/// The streaming writer is an instance-backed class: `Pickler(file, protocol)`
+/// stores both operands and `dump` delegates to the module-level `dump`
+/// implementation, so the payload bytes match `pickle.dump` exactly.
+fn pickle_pickler_class() -> i64 {
+    const KEY: &str = "pickle.Pickler";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let methods = vec![
+        (
+            "dump".to_string(),
+            value::native_function_new("pickle", "Pickler.dump", 2),
+        ),
+        (
+            "clear_memo".to_string(),
+            value::native_function_new("pickle", "Pickler.clear_memo", 1),
+        ),
+    ];
+    let method_values: Vec<i64> = methods.iter().map(|(_, method)| *method).collect();
+    let roots = heap::root_values(&method_values);
+    let class = value::class_new("Pickler".to_string(), NONE, methods);
+    let class_roots = heap::root_values(&[class]);
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    class
+}
+
+/// `pickle.Pickler(file, protocol=None)`: builds a writer over `file`.
+fn pickle_pickler_new(args: &[i64]) -> i64 {
+    let file = args.first().copied().unwrap_or(NONE);
+    if value::as_file(file).is_none() {
+        let ty = value::type_name(file);
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("file must be a writable file object, not {ty}"),
+        );
+    }
+    let protocol = args.get(1).copied().unwrap_or(NONE);
+    if let Err(raised) = pickle_check_protocol(protocol) {
+        return raised;
+    }
+    let protocol = if protocol == NONE {
+        pickle_default_protocol()
+    } else {
+        protocol
+    };
+    let instance = value::instance_new(pickle_pickler_class());
+    let memo = value::dict_new(Vec::new());
+    let roots = heap::root_values(&[instance, file, protocol, memo]);
+    value::instance_setattr(instance, "file".to_string(), file);
+    value::instance_setattr(instance, "protocol".to_string(), protocol);
+    value::instance_setattr(instance, "memo".to_string(), memo);
+    value::instance_setattr(instance, "fast".to_string(), FALSE);
+    value::instance_setattr(instance, "dispatch_table".to_string(), NONE);
+    value::instance_setattr(instance, "persistent_id".to_string(), NONE);
+    heap::release_roots(roots);
+    instance
+}
+
+/// `Pickler.dump(obj)`: writes the HYD1 payload through the module `dump`.
+fn pickle_pickler_dump(args: &[i64]) -> i64 {
+    let Some(instance) = args.first().copied() else {
+        return exc::raise_with_message(TYPE_ERROR, "Pickler.dump() missing self");
+    };
+    let Some(obj) = args.get(1).copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "dump() missing required argument 'obj' (pos 1)",
+        );
+    };
+    let file = value::instance_attr(instance, "file").unwrap_or(NONE);
+    let protocol = value::instance_attr(instance, "protocol").unwrap_or(NONE);
+    pickle_call("dump", &[obj, file, protocol])
+}
+
+/// `Pickler.clear_memo()`: drops the memo mapping.
+fn pickle_pickler_clear_memo(args: &[i64]) -> i64 {
+    let Some(instance) = args.first().copied() else {
+        return exc::raise_with_message(TYPE_ERROR, "Pickler.clear_memo() missing self");
+    };
+    let memo = value::dict_new(Vec::new());
+    let roots = heap::root_values(&[memo]);
+    value::instance_setattr(instance, "memo".to_string(), memo);
+    heap::release_roots(roots);
+    NONE
+}
+
+/// Cached `pickle.Unpickler` class.
+///
+/// The streaming reader mirrors `Pickler`: the instance stores its source file
+/// and `load` delegates to the module-level `pickle.load`, so the accepted
+/// payload and the errors are exactly those of the function form.
+fn pickle_unpickler_class() -> i64 {
+    const KEY: &str = "pickle.Unpickler";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let load = value::native_function_new("pickle", "Unpickler.load", 1);
+    let roots = heap::root_values(&[load]);
+    let class = value::class_new(
+        "Unpickler".to_string(),
+        NONE,
+        vec![("load".to_string(), load)],
+    );
+    let class_roots = heap::root_values(&[class]);
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    class
+}
+
+/// Whether `source` is one of the readable streams [`pickle_read_source`]
+/// understands: a native file, an `io.TextIOWrapper` around one, or an
+/// in-memory `StringIO`/`BytesIO`.
+fn pickle_source_readable(source: i64) -> bool {
+    value::as_file(source).is_some()
+        || tw_file(source).is_some()
+        || value::instance_attr(source, IO_DATA).is_some()
+}
+
+/// `pickle.Unpickler(file, *, fix_imports=True, encoding='ASCII',
+/// errors='strict', buffers=())`: builds a reader over `file`.
+///
+/// The keyword-only options are stored for attribute parity; HYD1 carries its
+/// own encoding and has no import table or out-of-band buffers, so `load`
+/// ignores them, exactly like the module-level `pickle.load`.
+fn pickle_unpickler_new(args: &[i64]) -> i64 {
+    let file = args.first().copied().unwrap_or(NONE);
+    if !pickle_source_readable(file) {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "file must have 'read' and 'readline' attributes",
+        );
+    }
+    let instance = value::instance_new(pickle_unpickler_class());
+    let memo = value::dict_new(Vec::new());
+    let encoding = value::str_from_bytes(b"ASCII");
+    let errors = value::str_from_bytes(b"strict");
+    let buffers = value::tuple_new(Vec::new());
+    let roots = heap::root_values(&[instance, file, memo, encoding, errors, buffers]);
+    value::instance_setattr(instance, "file".to_string(), file);
+    value::instance_setattr(instance, "fix_imports".to_string(), TRUE);
+    value::instance_setattr(instance, "encoding".to_string(), encoding);
+    value::instance_setattr(instance, "errors".to_string(), errors);
+    value::instance_setattr(instance, "buffers".to_string(), buffers);
+    value::instance_setattr(instance, "memo".to_string(), memo);
+    value::instance_setattr(instance, "persistent_load".to_string(), NONE);
+    heap::release_roots(roots);
+    instance
+}
+
+/// `Unpickler.load()`: decodes the next HYD1 payload from the stored file.
+fn pickle_unpickler_load(args: &[i64]) -> i64 {
+    let Some(instance) = args.first().copied() else {
+        return exc::raise_with_message(TYPE_ERROR, "Unpickler.load() missing self");
+    };
+    if value::as_instance(instance).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "descriptor 'load' requires an 'Unpickler' object but received a '{}'",
+                value::type_name(instance)
+            ),
+        );
+    }
+    let file = value::instance_attr(instance, "file").unwrap_or(NONE);
+    pickle_load(&[file])
+}
+
+/// Cached `pickle` exception class (`PickleError` and its two subclasses).
+fn pickle_exception_class(name: &str) -> i64 {
+    let key = format!("pickle.{name}");
+    if let Some(cached) = globals::registry_get(&key) {
+        return cached;
+    }
+    let base = if name == "PickleError" {
+        exc::exception_class(crate::exc::EXCEPTION)
+    } else {
+        pickle_exception_class("PickleError")
+    };
+    let class = value::class_new(name.to_string(), base, Vec::new());
+    let roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(&key, class);
+    heap::release_roots(roots);
+    class
+}
+
+/// `pickle.__all__`: CPython's exported names, cached for identity.
+fn pickle_all_list() -> i64 {
+    const KEY: &str = "pickle.__all__";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let names = [
+        "PickleError",
+        "PicklingError",
+        "UnpicklingError",
+        "Pickler",
+        "Unpickler",
+        "dump",
+        "dumps",
+        "load",
+        "loads",
+        "HIGHEST_PROTOCOL",
+        "DEFAULT_PROTOCOL",
+    ];
+    let values: Vec<i64> = names
+        .iter()
+        .map(|name| value::str_alloc((*name).to_string()))
+        .collect();
+    let roots = heap::root_values(&values);
+    let list = value::list_new(values);
+    let list_roots = heap::root_values(&[list]);
+    globals::registry_set(KEY, list);
+    heap::release_roots(list_roots);
+    heap::release_roots(roots);
+    list
+}
+
+/// `pickle.bytes_types`: `(bytes, bytearray)`, cached for identity.
+fn pickle_bytes_types() -> i64 {
+    const KEY: &str = "pickle.bytes_types";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let bytes_class = value::type_class(value::bytes_new(Vec::new()));
+    let bytearray_class = value::type_class(value::bytearray_new(Vec::new()));
+    let roots = heap::root_values(&[bytes_class, bytearray_class]);
+    let tuple = value::tuple_new(vec![bytes_class, bytearray_class]);
+    globals::registry_set(KEY, tuple);
+    heap::release_roots(roots);
+    tuple
+}
+
+/// `pickle.DEFAULT_PROTOCOL` for Hydro's HYD1 payloads, already encoded as a
+/// tagged integer so every call site can return it directly.
 fn pickle_default_protocol() -> i64 {
-    5
+    encode_int(PICKLE_HIGHEST_PROTOCOL)
 }
 
 /// `pickle.decode_long(data)`: little-endian two's-complement integer.
@@ -9053,6 +11563,11 @@ fn os_path_call(function: &str, args: &[i64]) -> i64 {
         "realpath" => os_path_realpath(args[0], args.get(1).is_some_and(|v| value::truthy(*v))),
         "expanduser" => os_path_expanduser(args[0]),
         "islink" => os_path_islink(args[0]),
+        "lexists" => os_path_lexists(args[0]),
+        "commonpath" => os_path_commonpath(args[0]),
+        "commonprefix" => os_path_commonprefix(args[0]),
+        "relpath" => os_path_relpath(args),
+        "expandvars" => os_path_expandvars(args[0]),
         _ => missing_attribute("os.path", function),
     }
 }
@@ -9559,6 +12074,283 @@ fn os_fstat(args: &[i64]) -> i64 {
     }
 }
 
+/// `os.isatty(fd)`: whether the descriptor refers to a terminal.
+fn os_isatty(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    #[cfg(unix)]
+    {
+        // SAFETY: `isatty` only inspects the descriptor; an invalid one yields
+        // 0 and sets errno, exactly like CPython's "not a tty" result.
+        value::bool_value(unsafe { libc::isatty(fd) } == 1)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        FALSE
+    }
+}
+
+/// `os.getcwdb()`: the current working directory as `bytes`.
+fn os_getcwdb() -> i64 {
+    let Ok(path) = std::env::current_dir() else {
+        return exc::raise_with_message(OS_ERROR, "getcwdb: failed to read the current directory");
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        value::bytes_new(path.as_os_str().as_bytes().to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        value::bytes_new(path.to_string_lossy().as_bytes().to_vec())
+    }
+}
+
+/// `os.read(fd, n)`: up to `n` bytes from the descriptor. A short result is
+/// normal; end of file is `b""`.
+fn os_read(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let Some(length) = value::as_integer(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    if length < 0 {
+        return exc::raise_with_message(OS_ERROR, "[Errno 22] Invalid argument");
+    }
+    let length = usize::try_from(length).unwrap_or(usize::MAX);
+    if length == 0 {
+        return value::bytes_new(Vec::new());
+    }
+    let mut buffer = Vec::new();
+    if buffer.try_reserve_exact(length).is_err() {
+        return exc::raise_with_message(exc::MEMORY_ERROR, "os.read: out of memory");
+    }
+    buffer.resize(length, 0);
+    #[cfg(unix)]
+    {
+        loop {
+            // SAFETY: the buffer is allocated for `length` bytes and `fd` is
+            // validated by the kernel.
+            let read = unsafe {
+                libc::read(
+                    fd,
+                    buffer.as_mut_ptr() as *mut libc::c_void,
+                    length as libc::size_t,
+                )
+            };
+            if read < 0 {
+                let error = std::io::Error::last_os_error();
+                // PEP 475: a signal before any data is transferred retries.
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return os_error_from_io("read", error, None);
+            }
+            buffer.truncate(read as usize);
+            return value::bytes_new(buffer);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "os.read is not supported on this platform",
+        )
+    }
+}
+
+/// `os.write(fd, data)`: writes the bytes-like payload and returns the number
+/// of bytes written.
+fn os_write(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let Some(data) = value::as_bytes(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "a bytes-like object is required, not '{}'",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    if data.is_empty() {
+        return encode_int(0);
+    }
+    #[cfg(unix)]
+    {
+        loop {
+            // SAFETY: the slice is valid for `data.len()` bytes and `fd` is
+            // validated by the kernel.
+            let written = unsafe {
+                libc::write(
+                    fd,
+                    data.as_ptr() as *const libc::c_void,
+                    data.len() as libc::size_t,
+                )
+            };
+            if written < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return os_error_from_io("write", error, None);
+            }
+            return encode_int(written as i64);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "os.write is not supported on this platform",
+        )
+    }
+}
+
+/// `os.fdopen(fd, mode="r", buffering=-1)`: wraps an existing descriptor in
+/// the runtime's file object.
+///
+/// Write/append modes hand the descriptor to the file body, so closing the
+/// stream closes the descriptor (CPython's default `closefd=True`). Read modes
+/// have no seekable descriptor body in this runtime: the descriptor is read to
+/// end of file immediately and the returned text/binary file streams that
+/// snapshot, then closes the descriptor.
+fn os_fdopen(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let mode_text = match args.get(1).copied() {
+        None | Some(NONE) => "r".to_string(),
+        Some(mode) => match value::as_str(mode) {
+            Some(text) => text.to_string(),
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "fdopen() argument 'mode' must be str, not {}",
+                        value::type_name(mode)
+                    ),
+                )
+            }
+        },
+    };
+    let mode = match parse_mode(&mode_text) {
+        Ok(mode) => mode,
+        Err(message) => return exc::raise_with_message(VALUE_ERROR, &message),
+    };
+    if let Some(buffering) = args.get(2).copied() {
+        if buffering != NONE && value::as_integer(buffering).is_none() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "fdopen() argument 'buffering' must be an integer, not {}",
+                    value::type_name(buffering)
+                ),
+            );
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::io::FromRawFd;
+        // SAFETY: the caller transfers ownership of `fd` to the stream,
+        // matching `closefd=True`; it must not be used after `fdopen`.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let name = format!("<fd {fd}>");
+        if mode.base == 'r' && !mode.plus {
+            let mut content = Vec::new();
+            if let Err(error) = file.read_to_end(&mut content) {
+                return os_error_from_io("fdopen", error, None);
+            }
+            if mode.binary {
+                return value::file_new_read_bytes(name, content);
+            }
+            match String::from_utf8(content) {
+                Ok(text) => value::file_new_read(name, text),
+                Err(error) => exc::raise_with_message(
+                    VALUE_ERROR,
+                    &format!("invalid UTF-8 in input: '{name}': {error}"),
+                ),
+            }
+        } else {
+            value::file_new_write(name, mode.base, file, mode.binary)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fd, mode);
+        exc::raise_with_message(
+            exc::NOT_IMPLEMENTED_ERROR,
+            "os.fdopen is not supported on this platform",
+        )
+    }
+}
+
+/// `os.readlink(path, *, dir_fd=None)`: the target of a symbolic link.
+fn os_readlink(args: &[i64]) -> i64 {
+    let Some(path) = value::as_path_like(args[0]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "readlink() argument must be a path string, not {}",
+                value::type_name(args[0])
+            ),
+        );
+    };
+    if let Some(dir_fd) = args.get(1).copied() {
+        if dir_fd != NONE {
+            return exc::raise_with_message(
+                exc::NOT_IMPLEMENTED_ERROR,
+                "os.readlink: dir_fd is not supported",
+            );
+        }
+    }
+    match std::fs::read_link(path) {
+        Ok(target) => value::str_alloc(target.to_string_lossy().into_owned()),
+        Err(error) => os_error_from_io("readlink", error, Some(path)),
+    }
+}
+
+/// `os.strerror(code)`: the system message for an errno value.
+fn os_strerror(args: &[i64]) -> i64 {
+    let Some(code) = value::as_integer(args[0]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(args[0])
+            ),
+        );
+    };
+    let Ok(code) = i32::try_from(code) else {
+        return exc::raise_with_message(OVERFLOW_ERROR, "Python int too large to convert to C int");
+    };
+    // `std` renders the platform message with a trailing `" (os error N)"`
+    // suffix; CPython's `strerror` returns only the message.
+    let text = std::io::Error::from_raw_os_error(code).to_string();
+    let message = text
+        .split_once(" (os error")
+        .map(|(message, _)| message)
+        .unwrap_or(text.as_str());
+    value::str_alloc(message.to_string())
+}
+
 /// Builds the `stat_result` namespace from a raw `struct stat`. The field set
 /// matches [`stat_result`] so `os.stat` and `os.fstat` agree.
 #[cfg(unix)]
@@ -9617,6 +12409,131 @@ fn stat_nanoseconds(metadata: &libc::stat) -> (i128, i128, i128) {
         i128::from(metadata.st_mtime) * 1_000_000_000,
         i128::from(metadata.st_ctime) * 1_000_000_000,
     )
+}
+
+/// `posixpath.expandvars(path)`: replaces `$name` and `${name}` references
+/// with environment values.
+///
+/// A name must start with a letter or `_` and continue with alphanumerics or
+/// `_`; an undefined reference (and any `$` not forming one) is left
+/// unchanged, exactly like CPython's `posixpath._varprog`. `bytes` operands
+/// produce `bytes`, using the raw environment bytes on Unix.
+fn os_path_expandvars(arg: i64) -> i64 {
+    if let Some(text) = value::as_str(arg) {
+        return value::str_alloc(expand_vars_str(text));
+    }
+    if let Some(bytes) = value::as_bytes(arg) {
+        return value::bytes_new(expand_vars_bytes(bytes));
+    }
+    os_path_arg("expandvars", arg);
+    NONE
+}
+
+fn expand_vars_str(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '$' {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        if index + 1 < chars.len() && chars[index + 1] == '{' {
+            if let Some(close) = chars[index + 2..].iter().position(|ch| *ch == '}') {
+                let name: String = chars[index + 2..index + 2 + close].iter().collect();
+                if let Ok(expanded) = std::env::var(&name) {
+                    out.push_str(&expanded);
+                    index += close + 3;
+                    continue;
+                }
+            }
+            out.push('$');
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while end < chars.len()
+            && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+            && !(end == start && chars[end].is_ascii_digit())
+        {
+            end += 1;
+        }
+        if end == start {
+            out.push('$');
+            index += 1;
+            continue;
+        }
+        let name: String = chars[start..end].iter().collect();
+        if let Ok(expanded) = std::env::var(&name) {
+            out.push_str(&expanded);
+        } else {
+            for ch in &chars[index..end] {
+                out.push(*ch);
+            }
+        }
+        index = end;
+    }
+    out
+}
+
+fn expand_vars_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'$' {
+            out.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 1 < bytes.len() && bytes[index + 1] == b'{' {
+            if let Some(close) = bytes[index + 2..].iter().position(|byte| *byte == b'}') {
+                let name = &bytes[index + 2..index + 2 + close];
+                if let Some(expanded) = env_bytes_value(name) {
+                    out.extend_from_slice(&expanded);
+                    index += close + 3;
+                    continue;
+                }
+            }
+            out.push(b'$');
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while end < bytes.len()
+            && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+            && !(end == start && bytes[end].is_ascii_digit())
+        {
+            end += 1;
+        }
+        if end == start {
+            out.push(b'$');
+            index += 1;
+            continue;
+        }
+        match env_bytes_value(&bytes[start..end]) {
+            Some(expanded) => out.extend_from_slice(&expanded),
+            None => out.extend_from_slice(&bytes[index..end]),
+        }
+        index = end;
+    }
+    out
+}
+
+/// Environment value for a raw byte name, if present.
+#[cfg(unix)]
+fn env_bytes_value(name: &[u8]) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let os_name = std::ffi::OsStr::from_bytes(name);
+    std::env::var_os(os_name).map(|value| value.as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn env_bytes_value(name: &[u8]) -> Option<Vec<u8>> {
+    let name = std::str::from_utf8(name).ok()?;
+    std::env::var_os(name).map(|value| value.to_string_lossy().into_owned().into_bytes())
 }
 
 /// `os.path.expanduser(path)`: expands a leading `~` or `~user`.
@@ -9728,6 +12645,270 @@ fn os_path_islink(arg: i64) -> i64 {
     }
 }
 
+/// `os.path.lexists(path)`: whether the path exists, without following a final
+/// symbolic link (a dangling link still exists).
+fn os_path_lexists(arg: i64) -> i64 {
+    let Some(operand) = os_path_operand("lexists", arg) else {
+        return NONE;
+    };
+    let path = match operand {
+        OsPathOperand::Text(path) => PathBuf::from(path),
+        OsPathOperand::Bytes(path) => PathBuf::from(os_string_from_bytes(&path)),
+    };
+    value::bool_value(std::fs::symlink_metadata(path).is_ok())
+}
+
+/// The path operands of a `commonpath`/`commonprefix` argument.
+///
+/// CPython accepts any sequence; Hydro accepts the sequence types the runtime
+/// materialises without consuming user iterators (`list` and `tuple`).
+fn os_path_sequence(function: &str, arg: i64) -> Option<Vec<i64>> {
+    if let Some(items) = value::as_list(arg) {
+        return Some(items.to_vec());
+    }
+    if let Some(items) = value::as_tuple(arg) {
+        return Some(items.to_vec());
+    }
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "{function}() argument must be a sequence, not {}",
+            value::type_name(arg)
+        ),
+    );
+    None
+}
+
+/// Converts every element of a path sequence to its raw bytes plus whether the
+/// sequence is the `bytes` flavour. Mixed flavours report CPython's TypeError.
+fn os_path_sequence_bytes(function: &str, items: &[i64]) -> Option<(Vec<Vec<u8>>, bool)> {
+    let mut paths = Vec::with_capacity(items.len());
+    let mut bytes_mode: Option<bool> = None;
+    for &item in items {
+        let operand = os_path_operand(function, item)?;
+        let (raw, is_bytes) = match operand {
+            OsPathOperand::Text(path) => (path.as_bytes().to_vec(), false),
+            OsPathOperand::Bytes(path) => (path, true),
+        };
+        if let Some(mode) = bytes_mode {
+            if mode != is_bytes {
+                exc::raise_with_message(
+                    TYPE_ERROR,
+                    "Can't mix strings and bytes in path components",
+                );
+                return None;
+            }
+        } else {
+            bytes_mode = Some(is_bytes);
+        }
+        paths.push(raw);
+    }
+    Some((paths, bytes_mode.unwrap_or(false)))
+}
+
+/// `os.path.commonprefix(paths)`: the character-wise common leading substring,
+/// not a path-component prefix.
+///
+/// An empty sequence returns the empty string, as CPython's wrapper does. The
+/// result keeps the operand flavour (`bytes` in, `bytes` out).
+fn os_path_commonprefix(arg: i64) -> i64 {
+    let Some(items) = os_path_sequence("commonprefix", arg) else {
+        return NONE;
+    };
+    if items.is_empty() {
+        return value::str_alloc(String::new());
+    }
+    let Some((paths, bytes_mode)) = os_path_sequence_bytes("commonprefix", &items) else {
+        return NONE;
+    };
+    if bytes_mode {
+        let mut prefix = paths[0].clone();
+        for path in &paths[1..] {
+            let length = prefix
+                .iter()
+                .zip(path)
+                .take_while(|(left, right)| left == right)
+                .count();
+            prefix.truncate(length);
+        }
+        value::bytes_new(prefix)
+    } else {
+        let mut prefix = String::from_utf8_lossy(&paths[0]).into_owned();
+        for path in &paths[1..] {
+            let other = String::from_utf8_lossy(path);
+            let length = prefix
+                .chars()
+                .zip(other.chars())
+                .take_while(|(left, right)| left == right)
+                .count();
+            let cut = prefix
+                .char_indices()
+                .nth(length)
+                .map_or(prefix.len(), |(index, _)| index);
+            prefix.truncate(cut);
+        }
+        value::str_alloc(prefix)
+    }
+}
+
+/// Non-empty path components of an already-normalised POSIX path.
+fn posix_components(path: &[u8]) -> Vec<&[u8]> {
+    path.split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty())
+        .collect()
+}
+
+/// `os.path.commonpath(paths)`: the longest common path-component prefix.
+///
+/// Empty input is a `ValueError`, and absolute and relative spellings cannot
+/// be mixed, exactly like CPython's `posixpath.commonpath`.
+fn os_path_commonpath(arg: i64) -> i64 {
+    let Some(items) = os_path_sequence("commonpath", arg) else {
+        return NONE;
+    };
+    if items.is_empty() {
+        return exc::raise_with_message(VALUE_ERROR, "commonpath() arg is an empty sequence");
+    }
+    let Some((paths, bytes_mode)) = os_path_sequence_bytes("commonpath", &items) else {
+        return NONE;
+    };
+    if paths.len() == 1 {
+        return if bytes_mode {
+            value::bytes_new(paths[0].clone())
+        } else {
+            value::str_alloc(String::from_utf8_lossy(&paths[0]).into_owned())
+        };
+    }
+    let absolute = paths[0].first() == Some(&b'/');
+    if paths
+        .iter()
+        .any(|path| (path.first() == Some(&b'/')) != absolute)
+    {
+        return exc::raise_with_message(VALUE_ERROR, "Can't mix absolute and relative paths");
+    }
+    let normalized: Vec<Vec<u8>> = paths
+        .iter()
+        .map(|path| posix_normpath_bytes(path))
+        .collect();
+    let split: Vec<Vec<&[u8]>> = normalized
+        .iter()
+        .map(|path| posix_components(path))
+        .collect();
+    let mut prefix_len = 0usize;
+    'outer: for index in 0..split[0].len() {
+        let component = split[0][index];
+        for components in &split[1..] {
+            if components.get(index).copied() != Some(component) {
+                break 'outer;
+            }
+        }
+        prefix_len += 1;
+    }
+    let mut result: Vec<u8> = Vec::new();
+    if absolute {
+        result.push(b'/');
+    }
+    for (index, component) in split[0][..prefix_len].iter().enumerate() {
+        if index > 0 {
+            result.push(b'/');
+        }
+        result.extend_from_slice(component);
+    }
+    if bytes_mode {
+        value::bytes_new(result)
+    } else {
+        value::str_alloc(String::from_utf8_lossy(&result).into_owned())
+    }
+}
+
+/// Absolute, lexically normalised POSIX path bytes (`posixpath.abspath`).
+fn os_path_absolute_bytes(path: &[u8]) -> Option<Vec<u8>> {
+    if path.first() == Some(&b'/') {
+        return Some(posix_normpath_bytes(path));
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let mut joined = os_str_bytes(cwd.as_os_str());
+    if !path.is_empty() {
+        joined.push(b'/');
+        joined.extend_from_slice(path);
+    }
+    Some(posix_normpath_bytes(&joined))
+}
+
+/// `os.path.relpath(path, start=os.curdir)`: the relative path from `start`.
+///
+/// Both operands are made absolute lexically (no symlink resolution), then the
+/// common directory components are dropped and the remaining `start`
+/// components become `..`, matching `posixpath.relpath`. The result keeps the
+/// `path` operand's flavour.
+fn os_path_relpath(args: &[i64]) -> i64 {
+    let path_arg = args[0];
+    let Some(operand) = os_path_operand("relpath", path_arg) else {
+        return NONE;
+    };
+    let (path, bytes_mode) = match operand {
+        OsPathOperand::Text(path) => (path.as_bytes().to_vec(), false),
+        OsPathOperand::Bytes(path) => (path, true),
+    };
+    let start_arg = args.get(1).copied().unwrap_or(NONE);
+    let start = if start_arg == NONE {
+        b".".to_vec()
+    } else {
+        let Some(start_operand) = os_path_operand("relpath", start_arg) else {
+            return NONE;
+        };
+        match start_operand {
+            OsPathOperand::Text(text) if !bytes_mode => text.as_bytes().to_vec(),
+            OsPathOperand::Bytes(bytes) if bytes_mode => bytes,
+            _ => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "Can't mix strings and bytes in path components",
+                )
+            }
+        }
+    };
+    let (Some(path_abs), Some(start_abs)) = (
+        os_path_absolute_bytes(&path),
+        os_path_absolute_bytes(&start),
+    ) else {
+        return exc::raise_with_message(OS_ERROR, "relpath: cannot read the current directory");
+    };
+    let path_parts = posix_components(&path_abs);
+    let start_parts = posix_components(&start_abs);
+    let mut common = 0usize;
+    while common < path_parts.len()
+        && common < start_parts.len()
+        && path_parts[common] == start_parts[common]
+    {
+        common += 1;
+    }
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    for _ in common..start_parts.len() {
+        parts.push(b"..".to_vec());
+    }
+    for part in &path_parts[common..] {
+        parts.push(part.to_vec());
+    }
+    let result = if parts.is_empty() {
+        b".".to_vec()
+    } else {
+        let mut joined = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            if index > 0 {
+                joined.push(b'/');
+            }
+            joined.extend_from_slice(part);
+        }
+        joined
+    };
+    if bytes_mode {
+        value::bytes_new(result)
+    } else {
+        value::str_alloc(String::from_utf8_lossy(&result).into_owned())
+    }
+}
+
 /// Keyword-aware `os` dispatch. Only `os.listdir` declares dynamic keywords;
 /// its single `path` parameter has already been moved into the positional
 /// slot by the binder, so any remaining name is unknown.
@@ -9759,6 +12940,94 @@ fn os_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64
         );
     }
     os_call(function, args)
+}
+
+/// `os.mkdir(path, mode=0o777, *, dir_fd=None)`: creates one directory with
+/// the requested permission bits (subject to the process umask), through
+/// `mkdir(2)` so `mode` is honoured instead of using `std::fs` defaults.
+fn os_mkdir(args: &[i64]) -> i64 {
+    if let Some(&dir_fd) = args.get(2) {
+        if dir_fd != NONE {
+            return exc::raise_with_message(
+                NOT_IMPLEMENTED_ERROR,
+                "os.mkdir: dir_fd is not supported",
+            );
+        }
+    }
+    let Some(path) = value::as_path_like(args[0]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "mkdir() argument must be a path string, not {}",
+                value::type_name(args[0])
+            ),
+        );
+    };
+    let mode = match args.get(1).copied() {
+        None | Some(NONE) => 0o777,
+        Some(mode) => match value::as_integer(mode) {
+            Some(mode) => mode,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "mkdir() mode must be an integer, not {}",
+                        value::type_name(mode)
+                    ),
+                )
+            }
+        },
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = CString::new(std::ffi::OsStr::new(path).as_bytes()) else {
+            return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+        };
+        // SAFETY: `c_path` is a valid NUL-terminated path for this call.
+        let result = unsafe { libc::mkdir(c_path.as_ptr(), mode as libc::mode_t) };
+        if result != 0 {
+            return os_error_from_io("mkdir", std::io::Error::last_os_error(), Some(path));
+        }
+        NONE
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        match std::fs::create_dir(path) {
+            Ok(()) => NONE,
+            Err(error) => os_error_from_io("mkdir", error, Some(path)),
+        }
+    }
+}
+
+/// `os.remove(path, *, dir_fd=None)` / `os.unlink(path, *, dir_fd=None)`:
+/// removes one file. `dir_fd` is accepted only as `None`; descriptor-relative
+/// lookup has no runtime representation, matching `os.stat`/`os.lstat`.
+fn os_remove_path(function: &str, args: &[i64]) -> i64 {
+    if let Some(&dir_fd) = args.get(1) {
+        if dir_fd != NONE {
+            return exc::raise_with_message(
+                NOT_IMPLEMENTED_ERROR,
+                &format!("os.{function}: dir_fd is not supported"),
+            );
+        }
+    }
+    let Some(path) = value::as_path_like(args[0]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{function}() argument must be a path string, not {}",
+                value::type_name(args[0])
+            ),
+        );
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => NONE,
+        Err(error) => {
+            exc::raise_with_message(OS_ERROR, &format!("{function}: {error}: '{}'", path))
+        }
+    }
 }
 
 fn os_call(function: &str, args: &[i64]) -> i64 {
@@ -9825,24 +13094,11 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
             };
             process::exit_now(code as i32)
         }
-        "remove" => {
-            let Some(path) = value::as_path_like(args[0]) else {
-                return exc::raise_with_message(
-                    TYPE_ERROR,
-                    &format!(
-                        "remove() argument must be a path string, not {}",
-                        value::type_name(args[0])
-                    ),
-                );
-            };
-            match std::fs::remove_file(path) {
-                Ok(()) => NONE,
-                Err(error) => exc::raise_with_message(
-                    crate::exc::OS_ERROR,
-                    &format!("remove: {error}: '{}'", path),
-                ),
-            }
-        }
+        "mkdir" => os_mkdir(args),
+        // `os.remove` and `os.unlink` are the same operation in CPython; the
+        // reported error keeps the spelling the caller used.
+        "remove" => os_remove_path("remove", args),
+        "unlink" => os_remove_path("unlink", args),
         "rename" => {
             let (Some(from), Some(to)) =
                 (value::as_path_like(args[0]), value::as_path_like(args[1]))
@@ -9873,6 +13129,24 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "putenv" => os_putenv(args),
         "unsetenv" => os_unsetenv(args),
         "listdir" => os_listdir(args),
+        "scandir" => os_scandir(args),
+        // `os.DirEntry` method bodies. The receiver is `args[0]`.
+        "DirEntry.is_dir" => os_dir_entry_is_dir(args[0], args),
+        "DirEntry.is_file" => os_dir_entry_is_file(args[0], args),
+        "DirEntry.is_symlink" => os_dir_entry_is_symlink(args[0]),
+        "DirEntry.inode" => os_dir_entry_inode(args[0]),
+        "DirEntry.stat" => os_dir_entry_stat(args[0], args),
+        "DirEntry.__fspath__" => value::instance_attr(args[0], "path")
+            .unwrap_or_else(|| exc::raise_with_message(ATTRIBUTE_ERROR, "'DirEntry' has no path")),
+        // `os.scandir` iterator protocol. The directory is read eagerly, so
+        // `close`/`__exit__` have nothing to release but keep the CPython
+        // contract and return values.
+        "ScandirIterator.__enter__" | "ScandirIterator.__iter__" => args[0],
+        "ScandirIterator.__exit__" => FALSE,
+        "ScandirIterator.close" => NONE,
+        "ScandirIterator.__next__" => os_scandir_next(args[0]),
+        "set_inheritable" => os_set_inheritable(args),
+        "get_inheritable" => os_get_inheritable(args),
         "makedirs" => os_makedirs(args),
         "system" => os_system(args),
         "fsencode" => os_fsencode(args),
@@ -9883,6 +13157,13 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "getegid" => os_credential("getegid"),
         "close" => os_close(args),
         "fstat" => os_fstat(args),
+        "isatty" => os_isatty(args),
+        "getcwdb" => os_getcwdb(),
+        "read" => os_read(args),
+        "write" => os_write(args),
+        "fdopen" => os_fdopen(args),
+        "readlink" => os_readlink(args),
+        "strerror" => os_strerror(args),
         _ => missing_attribute("os", function),
     }
 }
@@ -10099,6 +13380,379 @@ fn os_listdir(args: &[i64]) -> i64 {
     }
     crate::heap::release_roots(roots);
     list
+}
+
+/// Cached `os.DirEntry` class value.
+///
+/// A directory entry carries `name`, `path` and the metadata probes as
+/// methods; Hydro has no dedicated object kind for it, so it is a native class
+/// instance. The class is cached because `type(entry)` and method binding must
+/// observe one class object.
+fn os_dir_entry_class() -> i64 {
+    const KEY: &str = "os.DirEntry.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let methods = vec![
+        (
+            "is_dir".to_string(),
+            value::native_function_new("os", "DirEntry.is_dir", 2),
+        ),
+        (
+            "is_file".to_string(),
+            value::native_function_new("os", "DirEntry.is_file", 2),
+        ),
+        (
+            "is_symlink".to_string(),
+            value::native_function_new("os", "DirEntry.is_symlink", 1),
+        ),
+        (
+            "inode".to_string(),
+            value::native_function_new("os", "DirEntry.inode", 1),
+        ),
+        (
+            "stat".to_string(),
+            value::native_function_new("os", "DirEntry.stat", 2),
+        ),
+        (
+            "__fspath__".to_string(),
+            value::native_function_new("os", "DirEntry.__fspath__", 1),
+        ),
+    ];
+    let method_values: Vec<i64> = methods.iter().map(|(_, function)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new("DirEntry".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// Cached `os.scandir` iterator class. It is a real iterator (`__iter__` /
+/// `__next__`) and a context manager (`__enter__` / `__exit__` / `close`).
+fn os_scandir_class() -> i64 {
+    const KEY: &str = "os.ScandirIterator.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let methods = vec![
+        (
+            "__enter__".to_string(),
+            value::native_function_new("os", "ScandirIterator.__enter__", 1),
+        ),
+        (
+            "__exit__".to_string(),
+            value::native_function_new("os", "ScandirIterator.__exit__", 4),
+        ),
+        (
+            "__iter__".to_string(),
+            value::native_function_new("os", "ScandirIterator.__iter__", 1),
+        ),
+        (
+            "__next__".to_string(),
+            value::native_function_new("os", "ScandirIterator.__next__", 1),
+        ),
+        (
+            "close".to_string(),
+            value::native_function_new("os", "ScandirIterator.close", 1),
+        ),
+    ];
+    let method_values: Vec<i64> = methods.iter().map(|(_, function)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new("ScandirIterator".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// Directory argument of `os.scandir`, preserving the `str`/`bytes` flavour.
+fn os_scandir_path(argument: i64) -> Option<(PathBuf, bool)> {
+    if argument == NONE {
+        return Some((PathBuf::from("."), false));
+    }
+    if let Some(text) = value::as_str(argument) {
+        return Some((PathBuf::from(text), false));
+    }
+    if let Some(bytes) = os_bytes_operand(argument) {
+        return Some((PathBuf::from(os_string_from_bytes(&bytes)), true));
+    }
+    if let Some(path) = value::as_path(argument) {
+        return Some((PathBuf::from(path.path()), false));
+    }
+    None
+}
+
+/// `os.scandir(path='.')`: read the directory and return an iterator over real
+/// `DirEntry` values.
+///
+/// The directory is read eagerly, so an unreadable path raises `OSError` from
+/// the `scandir` call itself (CPython opens the directory there too). Each
+/// entry exposes `name`, `path` and the `is_dir`/`is_file`/`is_symlink`/
+/// `inode`/`stat` surface; `bytes` paths keep bytes names and paths.
+fn os_scandir(args: &[i64]) -> i64 {
+    let argument = args.first().copied().unwrap_or(NONE);
+    if value::as_integer(argument).is_some() {
+        return exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            "os.scandir() does not support file descriptors",
+        );
+    }
+    let Some((path, bytes_names)) = os_scandir_path(argument) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "scandir: path should be string, bytes, os.PathLike or integer, not {}",
+                value::type_name(argument)
+            ),
+        );
+    };
+    let directory = path.to_string_lossy().into_owned();
+    let entries = match std::fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(error) => return os_stat_error(error, &directory),
+    };
+    let entries_list = value::list_new(Vec::new());
+    let roots = heap::root_values(&[entries_list]);
+    let class = os_dir_entry_class();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                heap::release_roots(roots);
+                return os_stat_error(error, &directory);
+            }
+        };
+        let name_os = entry.file_name();
+        let name = if bytes_names {
+            value::bytes_new(os_str_bytes(&name_os))
+        } else {
+            value::str_alloc(name_os.to_string_lossy().into_owned())
+        };
+        let entry_path = path.join(&name_os);
+        let path_value = if bytes_names {
+            value::bytes_new(os_str_bytes(entry_path.as_os_str()))
+        } else {
+            value::str_alloc(entry_path.to_string_lossy().into_owned())
+        };
+        let instance = value::instance_new(class);
+        let item_roots = heap::root_values(&[instance, name, path_value]);
+        value::instance_setattr(instance, "name".to_string(), name);
+        value::instance_setattr(instance, "path".to_string(), path_value);
+        container::list_append(entries_list, instance);
+        heap::release_roots(item_roots);
+    }
+    let iterator = value::instance_new(os_scandir_class());
+    let iterator_roots = heap::root_values(&[iterator]);
+    value::instance_setattr(iterator, "_entries".to_string(), entries_list);
+    value::instance_setattr(iterator, "_index".to_string(), encode_int(0));
+    value::instance_setattr(iterator, "_closed".to_string(), FALSE);
+    heap::release_roots(iterator_roots);
+    heap::release_roots(roots);
+    iterator
+}
+
+/// `DirEntry`/`ScandirIterator` path operand: the stored `path` attribute as a
+/// filesystem path. `None` means the attribute is missing (a fabricated
+/// instance), which callers report as an `AttributeError`.
+fn os_dir_entry_path(entry: i64) -> Option<PathBuf> {
+    let path = value::instance_attr(entry, "path")?;
+    if let Some(text) = value::as_str(path) {
+        return Some(PathBuf::from(text));
+    }
+    if let Some(bytes) = value::as_bytes(path) {
+        return Some(PathBuf::from(os_string_from_bytes(bytes)));
+    }
+    None
+}
+
+/// Reads `follow_symlinks` from a `DirEntry` method call (`args[1]` after the
+/// receiver), defaulting to `True`.
+fn os_dir_entry_follow(args: &[i64]) -> bool {
+    match args.get(1).copied() {
+        None | Some(NONE) => true,
+        Some(flag) => value::truthy(flag),
+    }
+}
+
+/// `DirEntry.is_dir(*, follow_symlinks=True)`: `False` when the entry vanished
+/// or the lookup fails, like CPython's cached `d_type` fallback.
+fn os_dir_entry_is_dir(entry: i64, args: &[i64]) -> i64 {
+    let Some(path) = os_dir_entry_path(entry) else {
+        return FALSE;
+    };
+    let metadata = if os_dir_entry_follow(args) {
+        std::fs::metadata(&path)
+    } else {
+        std::fs::symlink_metadata(&path)
+    };
+    match metadata {
+        Ok(metadata) if metadata.is_dir() => TRUE,
+        _ => FALSE,
+    }
+}
+
+/// `DirEntry.is_file(*, follow_symlinks=True)`.
+fn os_dir_entry_is_file(entry: i64, args: &[i64]) -> i64 {
+    let Some(path) = os_dir_entry_path(entry) else {
+        return FALSE;
+    };
+    let metadata = if os_dir_entry_follow(args) {
+        std::fs::metadata(&path)
+    } else {
+        std::fs::symlink_metadata(&path)
+    };
+    match metadata {
+        Ok(metadata) if metadata.is_file() => TRUE,
+        _ => FALSE,
+    }
+}
+
+/// `DirEntry.is_symlink()`: whether the entry itself is a symbolic link.
+fn os_dir_entry_is_symlink(entry: i64) -> i64 {
+    let Some(path) = os_dir_entry_path(entry) else {
+        return FALSE;
+    };
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => TRUE,
+        _ => FALSE,
+    }
+}
+
+/// `DirEntry.inode()`: the entry's inode number (`stat(follow_symlinks=True)`).
+fn os_dir_entry_inode(entry: i64) -> i64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Some(path) = os_dir_entry_path(entry) else {
+            return exc::raise_with_message(
+                ATTRIBUTE_ERROR,
+                "'DirEntry' object has no attribute 'path'",
+            );
+        };
+        match std::fs::metadata(&path) {
+            Ok(metadata) => stat_int(i128::from(metadata.ino())),
+            Err(error) => os_stat_error(error, &path.to_string_lossy()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = entry;
+        encode_int(0)
+    }
+}
+
+/// `DirEntry.stat(*, follow_symlinks=True)`: the `os.stat_result` namespace.
+fn os_dir_entry_stat(entry: i64, args: &[i64]) -> i64 {
+    let Some(path) = os_dir_entry_path(entry) else {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "'DirEntry' object has no attribute 'path'",
+        );
+    };
+    let path_value = value::str_alloc(path.to_string_lossy().into_owned());
+    let follow = if os_dir_entry_follow(args) {
+        TRUE
+    } else {
+        FALSE
+    };
+    os_stat(&[path_value, NONE, follow])
+}
+
+/// `ScandirIterator.__next__`: yields the next `DirEntry` or raises
+/// `StopIteration` after the last one.
+fn os_scandir_next(iterator: i64) -> i64 {
+    let Some(entries) = value::instance_attr(iterator, "_entries") else {
+        return exc::raise_with_message(ATTRIBUTE_ERROR, "invalid scandir iterator");
+    };
+    let index = value::instance_attr(iterator, "_index")
+        .and_then(value::as_integer)
+        .unwrap_or(0);
+    let Some(items) = value::as_list(entries) else {
+        return exc::raise_with_message(ATTRIBUTE_ERROR, "invalid scandir iterator");
+    };
+    let Some(item) = items.get(index as usize).copied() else {
+        return exc::raise_with_message(STOP_ITERATION, "");
+    };
+    let roots = heap::root_values(&[iterator, item]);
+    value::instance_setattr(iterator, "_index".to_string(), encode_int(index + 1));
+    heap::release_roots(roots);
+    item
+}
+
+/// `os.get_inheritable(fd)`: whether `FD_CLOEXEC` is clear.
+#[cfg(unix)]
+fn os_get_inheritable(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    // SAFETY: `fd` is an integer descriptor; `fcntl` only reads its flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return os_fcntl_error();
+    }
+    if flags & libc::FD_CLOEXEC == 0 {
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+#[cfg(not(unix))]
+fn os_get_inheritable(_args: &[i64]) -> i64 {
+    exc::raise_with_message(
+        NOT_IMPLEMENTED_ERROR,
+        "os.get_inheritable() is only implemented on POSIX",
+    )
+}
+
+/// `os.set_inheritable(fd, inheritable)`: sets or clears `FD_CLOEXEC`.
+#[cfg(unix)]
+fn os_set_inheritable(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let inheritable = value::truthy(args[1]);
+    // SAFETY: `fd` is an integer descriptor; `fcntl` only reads its flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return os_fcntl_error();
+    }
+    let flags = if inheritable {
+        flags & !libc::FD_CLOEXEC
+    } else {
+        flags | libc::FD_CLOEXEC
+    };
+    // SAFETY: `fd` is an integer descriptor and `flags` is its current
+    // descriptor-flag set with only `FD_CLOEXEC` changed.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } < 0 {
+        return os_fcntl_error();
+    }
+    NONE
+}
+
+#[cfg(not(unix))]
+fn os_set_inheritable(_args: &[i64]) -> i64 {
+    exc::raise_with_message(
+        NOT_IMPLEMENTED_ERROR,
+        "os.set_inheritable() is only implemented on POSIX",
+    )
+}
+
+/// Reports the pending `fcntl` failure as CPython's `OSError`.
+#[cfg(unix)]
+fn os_fcntl_error() -> i64 {
+    let error = std::io::Error::last_os_error();
+    let detail = error.to_string();
+    let detail = detail.split(" (os error").next().unwrap_or(detail.as_str());
+    match error.raw_os_error() {
+        Some(code) => exc::raise_with_message(OS_ERROR, &format!("[Errno {code}] {detail}")),
+        None => exc::raise_with_message(OS_ERROR, detail),
+    }
 }
 
 /// Configuration names accepted by `os.sysconf`. `None` means the name is
@@ -10564,13 +14218,70 @@ fn os_fspath(path: i64) -> i64 {
     )
 }
 
+/// `runpy._get_module_details(mod_name, error=ImportError)`.
+///
+/// Hydro compiles whole programs and has no bytecode objects, so this resolves
+/// the importing metadata truthfully (relative names, missing modules and
+/// packages are diagnosed like CPython) and reports the missing code object
+/// instead of fabricating one.
+fn runpy_details_call(function: &str, args: &[i64]) -> Option<i64> {
+    if function != "_get_module_details" {
+        return None;
+    }
+    Some(runpy_get_module_details(args))
+}
+
+fn runpy_get_module_details(args: &[i64]) -> i64 {
+    let Some(name) = args.first().and_then(|arg| value::as_str(*arg)) else {
+        return exc::raise_with_message(TYPE_ERROR, "_get_module_details() requires a str name");
+    };
+    if name.starts_with('.') {
+        return exc::raise_with_message(IMPORT_ERROR, "Relative module names not supported");
+    }
+    let name_value = value::str_alloc(name.to_string());
+    let roots = heap::root_values(&[name_value]);
+    let spec = importlib_util::call("find_spec", &[name_value]);
+    heap::release_roots(roots);
+    if exc::pending() {
+        return NONE;
+    }
+    if spec == NONE {
+        return exc::raise_with_message(IMPORT_ERROR, &format!("No module named {name}"));
+    }
+    let locations = value::instance_attr(spec, "submodule_search_locations").unwrap_or(NONE);
+    if locations != NONE {
+        return exc::raise_with_message(
+            IMPORT_ERROR,
+            &format!("{name} is a package and cannot be directly executed"),
+        );
+    }
+    exc::raise_with_message(
+        IMPORT_ERROR,
+        &format!("No code object available for {name}"),
+    )
+}
+
 // sys
 
 fn sys_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "exit" => sys_exit(args),
         "exc_info" => exc::exc_info(),
+        // `sys.exception()` (3.11+): the exception instance whose handler is
+        // active, or `None` outside `except`. CPython derives it from the same
+        // per-thread exception state that backs `exc_info`, so reuse that
+        // triple instead of duplicating the handler stack.
+        "exception" => match value::as_tuple(exc::exc_info()).and_then(|triple| triple.get(1)) {
+            Some(&handled) => handled,
+            None => NONE,
+        },
         "excepthook" => sys_excepthook(args),
+        // `sys.settrace`/`sys.setprofile` install per-thread callbacks in
+        // CPython. Hydro's compiled frames have no interpreted callback hooks,
+        // so installing one would silently never fire; the names are declared
+        // for imports (the `threading`/`unittest` bootstraps call them) and
+        // report `None` like CPython's installers.
+        "settrace" | "setprofile" => NONE,
         "getrecursionlimit" => sys_getrecursionlimit(),
         "setrecursionlimit" => sys_setrecursionlimit(args),
         "_getframemodulename" => sys::getframemodulename(args),
@@ -11125,6 +14836,23 @@ fn io_call(function: &str, args: &[i64]) -> i64 {
         "open_code" => io_open_code(args),
         _ => missing_attribute("io", function),
     }
+}
+
+/// Keyword-aware `io` dispatch.
+///
+/// `io.open`'s declared parameters are bound into positional slots by the ABI
+/// binder (with `None` padding for omitted ones), so normally no keyword name
+/// reaches this point. A name that remains is either a duplicate of a
+/// positional parameter or unknown; both are rejected the way CPython's
+/// argument clinic does.
+fn io_call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if let Some((name, _)) = keywords.first() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{function}() got an unexpected keyword argument '{name}'"),
+        );
+    }
+    io_call(function, args)
 }
 
 /// `io.__all__`: the names this runtime's `io` module actually resolves.
@@ -12916,10 +16644,12 @@ pub(crate) fn io_open(args: &[i64]) -> i64 {
     if mode.binary {
         // CPython rejects every text-only argument in binary mode instead of
         // ignoring it, so a caller cannot assume an encoding was applied.
+        // Slot 2 is `buffering`; encoding/errors/newline follow in CPython's
+        // declared order.
         for (slot, name, article) in [
-            (2usize, "encoding", "an"),
-            (3usize, "newline", "a"),
+            (3usize, "encoding", "an"),
             (4usize, "errors", "an"),
+            (5usize, "newline", "a"),
         ] {
             if let Some(&arg) = args.get(slot) {
                 if arg != NONE {
@@ -12931,7 +16661,20 @@ pub(crate) fn io_open(args: &[i64]) -> i64 {
             }
         }
     } else {
+        // Slot 2 is `buffering`; an integer (or `None`) is accepted and the
+        // runtime's own buffering is used.
         if let Some(arg) = args.get(2).copied() {
+            if arg != NONE && value::as_integer(arg).is_none() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "open() argument 'buffering' must be an integer, not {}",
+                        value::type_name(arg)
+                    ),
+                );
+            }
+        }
+        if let Some(arg) = args.get(3).copied() {
             if arg != NONE {
                 match value::as_str(arg) {
                     Some(encoding) => {
@@ -12955,9 +16698,9 @@ pub(crate) fn io_open(args: &[i64]) -> i64 {
                 }
             }
         }
-        // `newline` and `errors` are accepted for API compatibility; text mode
+        // `errors` and `newline` are accepted for API compatibility; text mode
         // reads and writes the file unchanged, so they only need type checking.
-        for (slot, name) in [(3usize, "newline"), (4usize, "errors")] {
+        for (slot, name) in [(4usize, "errors"), (5usize, "newline")] {
             if let Some(&arg) = args.get(slot) {
                 if arg != NONE && value::as_str(arg).is_none() {
                     return exc::raise_with_message(
@@ -14164,7 +17907,11 @@ mod tests {
         assert_eq!(call("operator", "le", &[int(2), int(2)]), TRUE);
         assert_eq!(call("operator", "gt", &[int(3), int(2)]), TRUE);
         assert_eq!(call("operator", "ge", &[int(2), int(3)]), FALSE);
-        // `or_` is bitwise `|` for integers and set union for sets.
+        // `and_`/`or_`/`xor` are the bitwise operators (and set operations).
+        assert_eq!(as_int(call("operator", "and_", &[int(6), int(3)])), 2);
+        assert_eq!(as_int(call("operator", "xor", &[int(6), int(3)])), 5);
+        assert_eq!(call("operator", "and_", &[TRUE, FALSE]), FALSE);
+        assert_eq!(call("operator", "xor", &[TRUE, TRUE]), FALSE);
         assert_eq!(as_int(call("operator", "or_", &[int(6), int(3)])), 7);
         assert_eq!(as_int(call("operator", "or_", &[int(0), int(5)])), 5);
         let left = value::set_new(vec![int(1), int(2)]);
@@ -15551,6 +19298,314 @@ mod tests {
         assert_eq!(exc::pending_tag(), crate::exc::NOT_IMPLEMENTED_ERROR as i64);
 
         std::fs::remove_dir_all(&root).expect("remove scratch directory");
+    }
+
+    #[test]
+    fn os_scandir_yields_real_dir_entries() {
+        exc::init();
+        let root = temp_root("os-scandir");
+        make_dir(&root.join("sub"));
+        std::fs::write(root.join("alpha.txt"), b"alpha").expect("write file");
+        let path = root.to_string_lossy().into_owned();
+
+        let iterator = call("os", "scandir", &[string(&path)]);
+        assert!(!exc::pending(), "{}", message());
+        assert!(value::as_instance(iterator).is_some());
+        // The module attribute is a callable value too (the stdlib calls
+        // `os.scandir` through its attribute table).
+        let scandir = get("os", "scandir");
+        assert!(value::as_function(scandir).is_some());
+        let by_value = call_value(scandir, &[string(&path)]);
+        assert!(!exc::pending(), "{}", message());
+        assert!(value::as_instance(by_value).is_some());
+        // Context manager: __enter__ is the iterator itself, __exit__ does not
+        // suppress an exception.
+        assert_eq!(method(iterator, "__enter__", &[]), iterator);
+        assert_eq!(method(iterator, "__exit__", &[NONE, NONE, NONE]), FALSE);
+        assert_eq!(method(iterator, "close", &[]), NONE);
+        assert!(!exc::pending());
+        assert_ne!(call("os", "scandir", &[string(".")]), NONE);
+        assert!(!exc::pending());
+
+        // Drain through the iterator protocol (`for`/`list` use it).
+        exc::init();
+        let iterator = call("os", "scandir", &[string(&path)]);
+        let mut entries = Vec::new();
+        loop {
+            let entry = method(iterator, "__next__", &[]);
+            if exc::pending() {
+                assert_eq!(exc::pending_tag(), crate::exc::STOP_ITERATION as i64);
+                let _ = exc::clear();
+                break;
+            }
+            entries.push(entry);
+        }
+        assert_eq!(entries.len(), 2);
+        let by_name = |wanted: &str| {
+            entries.iter().copied().find(|entry| {
+                value::instance_attr(*entry, "name").and_then(value::as_str) == Some(wanted)
+            })
+        };
+        let alpha = by_name("alpha.txt").expect("file entry");
+        let sub = by_name("sub").expect("directory entry");
+        let expected_path = root.join("alpha.txt").to_string_lossy().into_owned();
+        assert_eq!(
+            value::instance_attr(alpha, "path").and_then(value::as_str),
+            Some(expected_path.as_str())
+        );
+        assert_eq!(method(alpha, "is_file", &[]), TRUE);
+        assert_eq!(method(alpha, "is_dir", &[]), FALSE);
+        assert_eq!(method(alpha, "is_symlink", &[]), FALSE);
+        assert_eq!(
+            method_kw(alpha, "is_file", &[], &[("follow_symlinks", FALSE)]),
+            TRUE
+        );
+        assert_eq!(method(sub, "is_dir", &[]), TRUE);
+        assert_eq!(method(sub, "is_file", &[]), FALSE);
+        let metadata = method(alpha, "stat", &[]);
+        assert!(!exc::pending(), "{}", message());
+        let inode = namespace_value(metadata, "st_ino").expect("st_ino");
+        assert_eq!(method(alpha, "inode", &[]), inode);
+        assert!(method_kw(alpha, "stat", &[], &[("follow_symlinks", FALSE)]).ne(&NONE));
+        let fspath = crate::core::methods::getattr(alpha, b"__fspath__".as_ptr(), 10);
+        assert!(!exc::pending(), "{}", message());
+        let resolved = call_value(fspath, &[]);
+        assert_eq!(
+            value::as_str(resolved),
+            value::instance_attr(alpha, "path").and_then(value::as_str)
+        );
+
+        // A missing directory is an OSError with CPython's wording.
+        exc::init();
+        let missing = root.join("does-not-exist");
+        assert_eq!(
+            call("os", "scandir", &[string(&missing.to_string_lossy())]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), crate::exc::FILE_NOT_FOUND_ERROR as i64);
+        let missing_text = missing.to_string_lossy().into_owned();
+        assert!(message().contains(missing_text.as_str()));
+    }
+
+    #[test]
+    fn os_path_common_helpers_match_posixpath() {
+        exc::init();
+        let sequence = |items: &[&str]| {
+            value::list_new(items.iter().map(|item| string(item)).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            value::as_str(call(
+                "os.path",
+                "commonprefix",
+                &[sequence(&["abc", "abd"])]
+            )),
+            Some("ab")
+        );
+        assert_eq!(
+            value::as_str(call("os.path", "commonprefix", &[sequence(&[])])),
+            Some("")
+        );
+        let raw = call(
+            "os.path",
+            "commonprefix",
+            &[value::list_new(vec![
+                value::bytes_new(b"abc".to_vec()),
+                value::bytes_new(b"abd".to_vec()),
+            ])],
+        );
+        assert_eq!(value::as_bytes(raw), Some(&b"ab"[..]));
+
+        assert_eq!(
+            value::as_str(call(
+                "os.path",
+                "commonpath",
+                &[sequence(&["/usr/lib", "/usr/local"])]
+            )),
+            Some("/usr")
+        );
+        assert_eq!(
+            value::as_str(call("os.path", "commonpath", &[sequence(&["/a", "/b"])])),
+            Some("/")
+        );
+        assert_eq!(
+            value::as_str(call("os.path", "commonpath", &[sequence(&["a", "b"])])),
+            Some("")
+        );
+        assert_eq!(
+            value::as_str(call("os.path", "commonpath", &[sequence(&["a/b", "a/c"])])),
+            Some("a")
+        );
+        exc::init();
+        assert_eq!(call("os.path", "commonpath", &[sequence(&[])]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::init();
+        assert_eq!(
+            call("os.path", "commonpath", &[sequence(&["a", "/b"])]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+
+        assert_eq!(
+            value::as_str(call("os.path", "relpath", &[string("a/b"), string("a")])),
+            Some("b")
+        );
+        assert_eq!(
+            value::as_str(call("os.path", "relpath", &[string("a/b"), string("a/c")])),
+            Some("../b")
+        );
+        assert_eq!(
+            value::as_str(call("os.path", "relpath", &[string("a"), string("b")])),
+            Some("../a")
+        );
+        // The alias spelling shares `os.path`'s dispatch.
+        assert_eq!(
+            value::as_str(call(
+                "posixpath",
+                "commonpath",
+                &[sequence(&["/usr/lib", "/usr/local"])]
+            )),
+            Some("/usr")
+        );
+
+        let root = temp_root("os-path-lexists");
+        let existing = root.join("present");
+        std::fs::write(&existing, b"x").expect("write file");
+        assert_eq!(
+            call("os.path", "lexists", &[string(&existing.to_string_lossy())]),
+            TRUE
+        );
+        assert_eq!(
+            call_value(
+                get("os.path", "lexists"),
+                &[string(&existing.to_string_lossy())]
+            ),
+            TRUE
+        );
+        assert_eq!(
+            call(
+                "os.path",
+                "lexists",
+                &[string(&root.join("absent").to_string_lossy())]
+            ),
+            FALSE
+        );
+        // ALLOW_MISSING is one cached sentinel across every path spelling.
+        let sentinel = get("os.path", "ALLOW_MISSING");
+        assert_eq!(sentinel, get("posixpath", "ALLOW_MISSING"));
+        assert_eq!(sentinel, get("ntpath", "ALLOW_MISSING"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_inheritable_round_trips_fd_cloexec() {
+        use std::os::fd::AsRawFd;
+        exc::init();
+        let root = temp_root("os-inheritable");
+        let file = std::fs::File::create(root.join("fd.txt")).expect("create file");
+        let fd = file.as_raw_fd();
+        assert_eq!(
+            call("os", "set_inheritable", &[int(i64::from(fd)), TRUE]),
+            NONE
+        );
+        assert_eq!(call("os", "get_inheritable", &[int(i64::from(fd))]), TRUE);
+        assert_eq!(
+            call("os", "set_inheritable", &[int(i64::from(fd)), FALSE]),
+            NONE
+        );
+        assert_eq!(call("os", "get_inheritable", &[int(i64::from(fd))]), FALSE);
+        assert!(!exc::pending());
+        exc::init();
+        assert_eq!(call("os", "get_inheritable", &[int(-1)]), NONE);
+        assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+    }
+
+    #[test]
+    fn importlib_bootstrap_external_is_the_machinery_alias() {
+        exc::init();
+        let external = get("importlib", "_bootstrap_external");
+        assert_eq!(external, get("importlib", "_bootstrap_external"));
+        let module = value::as_module(external).expect("module value");
+        assert_eq!(module.name(), "importlib._bootstrap_external");
+        // CPython installs one object under both spellings.
+        assert_eq!(external, module_value_by_name("_frozen_importlib_external"));
+        // Attribute reads dispatch through `importlib.machinery`.
+        let loader = crate::core::methods::getattr(external, b"SourceFileLoader".as_ptr(), 16);
+        assert!(!exc::pending(), "{}", message());
+        assert!(value::as_class(loader).is_some());
+        assert_eq!(
+            crate::core::methods::getattr(external, b"SOURCE_SUFFIXES".as_ptr(), 15),
+            get("importlib.machinery", "SOURCE_SUFFIXES")
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn random_class_value_exposes_generator_methods() {
+        exc::init();
+        let proxy = get("random", "Random");
+        assert_eq!(proxy, get("random", "Random"));
+        assert!(value::as_instance(proxy).is_some());
+        // The class value carries the methods, and reading one yields a bound
+        // callable.
+        let getrandbits = crate::core::methods::getattr(proxy, b"getrandbits".as_ptr(), 11);
+        assert!(!exc::pending(), "{}", message());
+        assert!(value::as_function(getrandbits).is_some());
+        // Calling the class value constructs a real generator.
+        let rng = call_value(proxy, &[int(7)]);
+        assert!(!exc::pending(), "{}", message());
+        assert!(value::as_random(rng).is_some());
+        let first = method(rng, "getrandbits", &[int(32)]);
+        assert!(!exc::pending(), "{}", message());
+        assert!(value::as_integer(first).is_some());
+        // Methods reached through the class value use the module generator and
+        // stay callable.
+        let drawn = method(proxy, "getrandbits", &[int(16)]);
+        assert!(!exc::pending(), "{}", message());
+        assert!((0..(1 << 16)).contains(&as_int(drawn)));
+    }
+
+    #[test]
+    fn re_private_facades_expose_constants_and_compiler_calls() {
+        exc::init();
+        let compiler = get("re", "_compiler");
+        assert!(value::as_module(compiler).is_some());
+        assert_eq!(
+            get("re", "_compiler"),
+            get("re", "_compiler"),
+            "module identity"
+        );
+        assert!(value::as_integer(get("re._constants", "MAGIC")).is_some());
+        assert_eq!(
+            get("re._constants", "PatternError"),
+            get("re._parser", "error")
+        );
+        let compile = get("re._compiler", "compile");
+        assert!(!exc::pending(), "{}", message());
+        let pattern = call_value(compile, &[string("a+")]);
+        assert!(!exc::pending(), "{}", message());
+        assert!(value::as_pattern(pattern).is_some());
+    }
+
+    #[test]
+    fn argparse_remainder_and_pickle_all_are_exposed() {
+        exc::init();
+        assert_eq!(value::as_str(get("argparse", "REMAINDER")), Some("..."));
+        let all = get("pickle", "__all__");
+        assert_eq!(all, get("pickle", "__all__"));
+        let names: Vec<&str> = value::as_list(all)
+            .expect("__all__ list")
+            .iter()
+            .filter_map(|name| value::as_str(*name))
+            .collect();
+        assert!(names.contains(&"Pickler"));
+        assert!(names.contains(&"dumps"));
+        // Every exported name resolves on the module.
+        for name in names {
+            exc::init();
+            let item = get("pickle", name);
+            assert!(!exc::pending(), "{name}: {}", message());
+            assert_ne!(item, NONE, "{name}");
+        }
     }
 
     #[test]
@@ -19508,6 +23563,51 @@ mod tests {
     }
 
     #[test]
+    fn itertools_groupby_groups_consecutive_equal_keys() {
+        exc::init();
+        fn drain(iterator: i64) -> Vec<i64> {
+            let mut items = Vec::new();
+            loop {
+                let mut item = NONE;
+                if iter::iter_next(iterator, &mut item) == 0 {
+                    return items;
+                }
+                items.push(item);
+            }
+        }
+
+        let input = value::list_new(vec![int(1), int(1), int(2), int(3), int(3), int(3)]);
+        let grouped = call("itertools", "groupby", &[input]);
+        assert!(!exc::pending());
+        let mut runs = Vec::new();
+        for pair in drain(grouped) {
+            let pair = value::as_tuple(pair).expect("group pair");
+            let key = as_int(pair[0]);
+            let members: Vec<i64> = drain(pair[1]).into_iter().map(as_int).collect();
+            runs.push((key, members));
+        }
+        assert_eq!(
+            runs,
+            vec![(1, vec![1, 1]), (2, vec![2]), (3, vec![3, 3, 3]),]
+        );
+
+        // The key function groups by the computed key, preserving input order.
+        let input = value::list_new(vec![int(-1), int(1), int(-2), int(2), int(3)]);
+        let absolute = value::builtin_function_new(hydro_ir::Builtin::Abs);
+        let grouped = call("itertools", "groupby", &[input, absolute]);
+        assert!(!exc::pending());
+        let mut keys = Vec::new();
+        let mut sizes = Vec::new();
+        for pair in drain(grouped) {
+            let pair = value::as_tuple(pair).expect("group pair");
+            keys.push(as_int(pair[0]));
+            sizes.push(drain(pair[1]).len());
+        }
+        assert_eq!(keys, vec![1, 2, 3]);
+        assert_eq!(sizes, vec![2, 2, 1]);
+    }
+
+    #[test]
     fn itertools_pairwise_dispatches_through_the_module() {
         exc::init();
         let input = value::list_new(vec![int(1), int(2), int(3)]);
@@ -20409,5 +24509,924 @@ mod tests {
                 "{name} missing from module.__dict__"
             );
         }
+    }
+
+    #[test]
+    fn os_descriptor_io_helpers_cover_read_write_isatty_and_fdopen() {
+        exc::init();
+        let root = temp_root("os-descriptor");
+        let path = root.join("data.bin");
+        let path_text = path.to_string_lossy().into_owned();
+        let write_flags = libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC;
+        let fd = as_int(call(
+            "os",
+            "open",
+            &[string(&path_text), int(i64::from(write_flags)), int(0o600)],
+        ));
+        let payload = value::bytes_new(b"abc".to_vec());
+        assert_eq!(as_int(call("os", "write", &[int(fd), payload])), 3);
+        call("os", "close", &[int(fd)]);
+
+        let read_fd = as_int(call(
+            "os",
+            "open",
+            &[string(&path_text), int(i64::from(libc::O_RDONLY))],
+        ));
+        let data = call("os", "read", &[int(read_fd), int(16)]);
+        assert_eq!(value::as_bytes(data), Some(b"abc".as_slice()));
+        call("os", "close", &[int(read_fd)]);
+
+        // `isatty` reports a bool for any descriptor, including a plain file.
+        let tty = call("os", "isatty", &[int(read_fd)]);
+        assert!(tty == TRUE || tty == FALSE);
+
+        let cwd = call("os", "getcwdb", &[]);
+        assert!(value::as_bytes(cwd).is_some());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let expected = std::env::current_dir().expect("cwd");
+            assert_eq!(value::as_bytes(cwd), Some(expected.as_os_str().as_bytes()));
+        }
+
+        // `fdopen` in write mode hands the descriptor to the file body.
+        let fd = as_int(call(
+            "os",
+            "open",
+            &[string(&path_text), int(i64::from(write_flags)), int(0o600)],
+        ));
+        let stream = call_kw("os", "fdopen", &[int(fd)], &[("mode", string("wb"))]);
+        assert!(value::as_file(stream).is_some());
+        method(stream, "write", &[value::bytes_new(b"xyz".to_vec())]);
+        method(stream, "close", &[]);
+        assert_eq!(std::fs::read(&path).expect("read back"), b"xyz");
+
+        // Read mode snapshots the descriptor and decodes it as requested.
+        let fd = as_int(call(
+            "os",
+            "open",
+            &[string(&path_text), int(i64::from(libc::O_RDONLY))],
+        ));
+        let stream = call_kw("os", "fdopen", &[int(fd)], &[("mode", string("rb"))]);
+        let data = method(stream, "read", &[]);
+        assert_eq!(value::as_bytes(data), Some(b"xyz".as_slice()));
+        method(stream, "close", &[]);
+
+        assert_eq!(
+            value::as_str(call("os", "strerror", &[int(2)])),
+            Some("No such file or directory")
+        );
+        #[cfg(unix)]
+        {
+            let link = root.join("link.bin");
+            std::os::unix::fs::symlink(&path, &link).expect("symlink");
+            let link_text = link.to_string_lossy().into_owned();
+            let target = call("os", "readlink", &[string(&link_text)]);
+            assert_eq!(value::as_str(target), Some(path_text.as_str()));
+        }
+    }
+
+    #[test]
+    fn time_ctime_and_mktime_round_trip_local_time() {
+        exc::init();
+        let text = call("time", "ctime", &[int(0)]);
+        let rendered = value::as_str(text).expect("ctime str");
+        assert!(rendered.ends_with('\n'));
+        assert_eq!(rendered.len(), 25, "asctime shape: {rendered:?}");
+        assert!(rendered.contains(':'));
+
+        let local = call("time", "localtime", &[int(1_234_567_890)]);
+        let seconds = as_float(call("time", "mktime", &[local]));
+        assert!((seconds - 1_234_567_890.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn math_modf_splits_finite_infinite_and_nan_operands() {
+        exc::init();
+        let pair = call("math", "modf", &[value::float_new(3.5)]);
+        let items = value::as_tuple(pair).expect("modf tuple");
+        assert_eq!(as_float(items[0]), 0.5);
+        assert_eq!(as_float(items[1]), 3.0);
+
+        let pair = call("math", "modf", &[value::float_new(-1.25)]);
+        let items = value::as_tuple(pair).expect("modf tuple");
+        assert_eq!(as_float(items[0]), -0.25);
+        assert_eq!(as_float(items[1]), -1.0);
+
+        let pair = call("math", "modf", &[value::float_new(f64::INFINITY)]);
+        let items = value::as_tuple(pair).expect("modf tuple");
+        assert_eq!(as_float(items[0]), 0.0);
+        assert!(as_float(items[1]).is_infinite());
+
+        let pair = call("math", "modf", &[value::float_new(f64::NAN)]);
+        let items = value::as_tuple(pair).expect("modf tuple");
+        assert!(as_float(items[0]).is_nan());
+        assert!(as_float(items[1]).is_nan());
+    }
+
+    #[test]
+    fn io_open_keyword_binding_places_encoding_after_buffering() {
+        exc::init();
+        let root = temp_root("io-keywords");
+        let input = root.join("input.txt");
+        std::fs::write(&input, "héllo").expect("write fixture");
+        let input_text = input.to_string_lossy().into_owned();
+        let file = call_kw(
+            "io",
+            "open",
+            &[string(&input_text)],
+            &[("encoding", string("utf-8"))],
+        );
+        assert!(value::as_file(file).is_some());
+        let text = method(file, "read", &[]);
+        assert_eq!(value::as_str(text), Some("héllo"));
+        method(file, "close", &[]);
+
+        let output = root.join("output.txt");
+        let output_text = output.to_string_lossy().into_owned();
+        let file = call_kw(
+            "io",
+            "open",
+            &[string(&output_text)],
+            &[("mode", string("w")), ("encoding", string("utf-8"))],
+        );
+        method(file, "write", &[string("wörld")]);
+        method(file, "close", &[]);
+        assert_eq!(
+            std::fs::read_to_string(&output).expect("written file"),
+            "wörld"
+        );
+
+        // Binary mode rejects a text-only keyword even after keyword binding.
+        let result = call_kw(
+            "io",
+            "open",
+            &[string(&output_text), string("rb")],
+            &[("encoding", string("utf-8"))],
+        );
+        assert_eq!(result, NONE);
+        assert!(message().contains("binary mode doesn't take an encoding argument"));
+    }
+
+    #[test]
+    fn builtins_enumerate_start_format_and_compile_keywords() {
+        exc::init();
+        let items = value::list_new(vec![string("a"), string("b")]);
+        let enumerated = call_kw("builtins", "enumerate", &[items], &[("start", int(5))]);
+        assert!(!exc::pending());
+        // The runtime's `enumerate` builds its result eagerly; wrap it in the
+        // standard iterator protocol before draining.
+        let iterator = iter::iter_of(enumerated);
+        let mut seen = Vec::new();
+        loop {
+            let mut item = NONE;
+            if iter::iter_next(iterator, &mut item) == 0 {
+                break;
+            }
+            let pair = value::as_tuple(item).expect("enumerate pair");
+            seen.push((
+                as_int(pair[0]),
+                value::as_str(pair[1]).unwrap_or_default().to_string(),
+            ));
+        }
+        assert_eq!(seen, vec![(5, "a".to_string()), (6, "b".to_string())]);
+
+        assert_eq!(
+            value::as_str(call("builtins", "format", &[int(7)])),
+            Some("7")
+        );
+        assert_eq!(
+            value::as_str(call_kw(
+                "builtins",
+                "format",
+                &[int(255)],
+                &[("format_spec", string("x"))],
+            )),
+            Some("ff")
+        );
+
+        let result = call_kw(
+            "builtins",
+            "compile",
+            &[string("x = 1"), string("<test>"), string("exec")],
+            &[("optimize", int(1))],
+        );
+        assert_eq!(result, NONE);
+        assert!(message().contains("compile() is not supported"));
+    }
+
+    #[test]
+    fn alias_modules_keep_their_name_and_share_target_values() {
+        exc::init();
+        for (alias, target) in [
+            ("_abc", "abc"),
+            ("_types", "types"),
+            ("_typing", "typing"),
+            ("_sre", "re"),
+            ("_datetime", "datetime"),
+            ("_locale", "locale"),
+            ("_sysconfig", "sysconfig"),
+        ] {
+            assert_eq!(
+                value::as_str(get(alias, "__name__")),
+                Some(alias),
+                "{alias} lost its __name__"
+            );
+            assert!(
+                stdlib::module(target).is_some(),
+                "{target} implementation module missing"
+            );
+        }
+        // Cached class/constant values keep identity across the alias.
+        assert_eq!(get("_abc", "ABC"), get("abc", "ABC"));
+        assert_eq!(get("_types", "FunctionType"), get("types", "FunctionType"));
+        assert_eq!(get("_typing", "ForwardRef"), get("typing", "ForwardRef"));
+        assert_eq!(get("_datetime", "datetime"), get("datetime", "datetime"));
+        assert_ne!(get("_locale", "LC_ALL"), NONE);
+        assert_ne!(get("_sysconfig", "get_paths"), NONE);
+        assert_eq!(
+            get("_frozen_importlib_external", "ModuleSpec"),
+            get("importlib.machinery", "ModuleSpec")
+        );
+        assert_eq!(
+            get("zipimport", "ModuleSpec"),
+            get("importlib.machinery", "ModuleSpec")
+        );
+        let pattern = call("_sre", "compile", &[string("a+")]);
+        assert_ne!(pattern, NONE);
+
+        // Calls reach the target implementation through the alias spelling.
+        assert_eq!(
+            as_int(call("posix", "getpid", &[])),
+            as_int(call("os", "getpid", &[]))
+        );
+        let joined = call("posixpath", "join", &[string("a"), string("b")]);
+        assert_eq!(value::as_str(joined), Some("a/b"));
+        let joined = call("ntpath", "join", &[string("a"), string("b")]);
+        assert_eq!(value::as_str(joined), Some("a/b"));
+        assert_eq!(value::as_str(get("posix", "sep")), Some("/"));
+    }
+
+    #[test]
+    fn accelerator_aliases_route_attributes_and_calls() {
+        exc::init();
+        // Constant identity survives the alias spelling.
+        assert_eq!(
+            get("_json", "JSONDecodeError"),
+            get("json", "JSONDecodeError")
+        );
+        assert_eq!(
+            get("_pickle", "DEFAULT_PROTOCOL"),
+            get("pickle", "DEFAULT_PROTOCOL")
+        );
+        assert_eq!(get("_struct", "error"), get("struct", "error"));
+        // Calls reach the target implementation.
+        assert_eq!(value::as_str(call("_json", "dumps", &[int(3)])), Some("3"));
+        let sorted = value::list_new(vec![int(1), int(3)]);
+        assert_eq!(
+            as_int(call("_bisect", "bisect_right", &[sorted, int(2)])),
+            1
+        );
+        let heap = value::list_new(vec![int(3), int(1)]);
+        assert_eq!(call("_heapq", "heapify", &[heap]), NONE);
+        assert_eq!(as_int(call("_heapq", "heappop", &[heap])), 1);
+        assert_eq!(as_int(call("_random", "getrandbits", &[int(0)])), 0);
+        assert_eq!(value::as_str(get("_json", "__name__")), Some("_json"));
+        // A missing member still raises AttributeError; the alias spelling is
+        // only guaranteed for the module's own name.
+        let _ = get("_json", "not_a_member");
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+        assert!(message().contains("json"));
+    }
+
+    #[test]
+    fn os_open_flags_and_os_path_constants_resolve() {
+        exc::init();
+        assert_eq!(as_int(get("os", "O_EXCL")), libc::O_EXCL as i64);
+        assert_eq!(as_int(get("os", "O_NOFOLLOW")), libc::O_NOFOLLOW as i64);
+        assert_eq!(as_int(get("os", "O_ACCMODE")), 3);
+        assert_eq!(value::as_str(get("os.path", "sep")), Some("/"));
+        assert_eq!(get("os.path", "altsep"), NONE);
+        assert_eq!(value::as_str(get("os.path", "pathsep")), Some(":"));
+        assert_eq!(value::as_str(get("os.path", "extsep")), Some("."));
+        assert_eq!(value::as_str(get("os.path", "curdir")), Some("."));
+        assert_eq!(value::as_str(get("os.path", "pardir")), Some(".."));
+        // `os.path.join`/`normpath` still work with the new constants present.
+        let joined = call("os.path", "join", &[string("a"), string("b")]);
+        assert_eq!(value::as_str(joined), Some("a/b"));
+        assert_eq!(
+            value::as_str(call("os.path", "normpath", &[string("a//b/../c")])),
+            Some("a/c")
+        );
+        // One sentinel identity across every path-module spelling.
+        let sentinel = get("os.path", "ALLOW_MISSING");
+        assert!(value::as_instance(sentinel).is_some());
+        assert_eq!(get("posixpath", "ALLOW_MISSING"), sentinel);
+        assert_eq!(get("ntpath", "ALLOW_MISSING"), sentinel);
+    }
+
+    #[test]
+    fn os_unlink_removes_files_and_honours_dir_fd() {
+        exc::init();
+        let root = temp_root("unlink");
+        let path = root.join("gone.txt");
+        std::fs::write(&path, b"x").expect("write scratch file");
+        let argument = string(path.to_str().expect("utf-8 path"));
+        assert_eq!(call("os", "unlink", &[argument]), NONE);
+        assert!(!path.exists());
+        assert_eq!(call("os", "remove", &[argument]), NONE);
+        assert_eq!(exc::pending_tag(), exc::OS_ERROR as i64);
+        exc::clear();
+        // A non-None dir_fd has no descriptor-relative form here.
+        assert_eq!(call("os", "unlink", &[argument, int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), exc::NOT_IMPLEMENTED_ERROR as i64);
+        exc::clear();
+        std::fs::remove_dir_all(&root).expect("remove scratch directory");
+    }
+
+    #[test]
+    fn sys_exception_reports_the_handled_exception() {
+        exc::init();
+        assert_eq!(call("sys", "exception", &[]), NONE);
+        let error = exc::exception_value(VALUE_ERROR, "boom", vec!["boom".to_string()]);
+        exc::handler_push(error);
+        assert_eq!(call("sys", "exception", &[]), error);
+        exc::handler_push(NONE);
+        assert_eq!(call("sys", "exception", &[]), error);
+        exc::handler_pop();
+        exc::handler_pop();
+        assert_eq!(call("sys", "exception", &[]), NONE);
+        // The installers are declared no-ops in this runtime.
+        assert_eq!(call("sys", "settrace", &[NONE]), NONE);
+        assert_eq!(call("sys", "setprofile", &[NONE]), NONE);
+    }
+
+    #[test]
+    fn pickle_protocols_and_unpickler_round_trip() {
+        exc::init();
+        // Both protocol names are real tagged integers, not raw scalars.
+        let highest = get("pickle", "HIGHEST_PROTOCOL");
+        let default = get("pickle", "DEFAULT_PROTOCOL");
+        assert!(value::as_integer(highest).is_some());
+        assert!(value::as_integer(default).is_some());
+        assert_eq!(as_int(highest), 5);
+        assert_eq!(as_int(default), 5);
+        assert_eq!(value::type_name(highest), "int");
+        assert_eq!(value::type_name(default), "int");
+        // `__all__` is a cached list of exported names.
+        let all = get("pickle", "__all__");
+        assert_eq!(all, get("pickle", "__all__"));
+        assert_eq!(value::as_list(all).map(|names| names.len()), Some(11));
+        // The alias inherits the same encoded constants.
+        assert_eq!(get("_pickle", "HIGHEST_PROTOCOL"), highest);
+        assert_eq!(get("_pickle", "DEFAULT_PROTOCOL"), default);
+
+        let payload = call(
+            "pickle",
+            "dumps",
+            &[value::list_new(vec![int(1), string("x")])],
+        );
+        let text = value::as_str(payload).expect("hex payload").to_string();
+        let stream = call("io", "BytesIO", &[value::bytes_new(text.into_bytes())]);
+        assert!(!exc::pending(), "BytesIO construction raised");
+
+        let reader = pickle_unpickler_new(&[stream]);
+        assert!(value::as_instance(reader).is_some());
+        let decoded = method(reader, "load", &[]);
+        let items = value::as_list(decoded).expect("list payload");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], int(1));
+        assert_eq!(value::as_str(items[1]), Some("x"));
+        // The class value keeps identity across reads.
+        assert_eq!(get("pickle", "Unpickler"), get("pickle", "Unpickler"));
+    }
+
+    #[test]
+    fn stdlib_import_fixes_resolve() {
+        exc::init();
+        // `sys.float_info` carries the binary64 limits with stable identity.
+        let info = get("sys", "float_info");
+        assert_eq!(get("sys", "float_info"), info);
+        assert_eq!(as_int(namespace_value(info, "radix").unwrap()), 2);
+        assert_eq!(as_int(namespace_value(info, "mant_dig").unwrap()), 53);
+        assert_eq!(as_int(namespace_value(info, "min_exp").unwrap()), -1021);
+        assert!(value::as_float(namespace_value(info, "max").unwrap()).is_some());
+        assert_eq!(
+            value::as_float(namespace_value(info, "epsilon").unwrap()),
+            Some(f64::EPSILON)
+        );
+
+        // `os.path.expandvars`: defined, undefined, malformed and bytes forms.
+        let path = std::env::var("PATH").unwrap_or_default();
+        assert_eq!(
+            value::as_str(call("os.path", "expandvars", &[string("$PATH")])),
+            Some(path.as_str())
+        );
+        assert_eq!(
+            value::as_str(call(
+                "os.path",
+                "expandvars",
+                &[string("${HYDRO_NO_SUCH_VAR_XYZ}/x")]
+            )),
+            Some("${HYDRO_NO_SUCH_VAR_XYZ}/x")
+        );
+        assert_eq!(
+            value::as_str(call("os.path", "expandvars", &[string("a$1b$")])),
+            Some("a$1b$")
+        );
+        let bytes_expanded = call(
+            "os.path",
+            "expandvars",
+            &[value::bytes_new(b"$PATH".to_vec())],
+        );
+        assert_eq!(
+            value::as_bytes(bytes_expanded).map(|bytes| bytes.to_vec()),
+            std::env::var_os("PATH").map(|value| {
+                use std::os::unix::ffi::OsStrExt;
+                value.as_bytes().to_vec()
+            })
+        );
+
+        // `sys.stdlib_module_names`: the fixed set contains real modules.
+        let names = get("sys", "stdlib_module_names");
+        let name_set = value::as_set(names).expect("stdlib name set");
+        assert!(name_set
+            .iter()
+            .any(|item| value::as_str(*item) == Some("json")));
+        assert!(name_set
+            .iter()
+            .any(|item| value::as_str(*item) == Some("zipimport")));
+        assert_eq!(name_set.len(), 297);
+
+        // `pickle.bytes_types` is `(bytes, bytearray)`.
+        let bytes_types = value::as_tuple(get("pickle", "bytes_types")).expect("tuple");
+        assert_eq!(bytes_types.len(), 2);
+        assert_eq!(value::class_display_name(bytes_types[0]), Some("bytes"));
+        assert_eq!(value::class_display_name(bytes_types[1]), Some("bytearray"));
+
+        // `os.mkdir` honours the mode keyword slot and creates one level.
+        let root = temp_root("mkdir");
+        let first = root.join("one");
+        assert_eq!(
+            call(
+                "os",
+                "mkdir",
+                &[string(first.to_str().expect("utf-8 path"))]
+            ),
+            NONE
+        );
+        assert!(first.is_dir());
+        let second = root.join("two");
+        assert_eq!(
+            call_kw(
+                "os",
+                "mkdir",
+                &[string(second.to_str().expect("utf-8 path"))],
+                &[("mode", int(0o700))]
+            ),
+            NONE
+        );
+        assert!(second.is_dir());
+        std::fs::remove_dir_all(&root).expect("remove scratch directory");
+
+        // `hashlib.compare_digest` and the `_hashlib` accelerator agree.
+        assert_eq!(
+            call(
+                "hashlib",
+                "compare_digest",
+                &[
+                    value::bytes_new(b"ab".to_vec()),
+                    value::bytes_new(b"ab".to_vec())
+                ]
+            ),
+            TRUE
+        );
+        assert_eq!(
+            call(
+                "_hashlib",
+                "compare_digest",
+                &[
+                    value::bytes_new(b"ab".to_vec()),
+                    value::bytes_new(b"ac".to_vec())
+                ]
+            ),
+            FALSE
+        );
+        assert!(stdlib::function("_signal", "sigwait").is_some());
+
+        // `runpy._get_module_details` diagnoses a missing module truthfully.
+        assert_eq!(
+            call(
+                "runpy",
+                "_get_module_details",
+                &[string("hydro_no_such_module_xyz")]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), exc::IMPORT_ERROR as i64);
+        exc::clear();
+
+        // `pickle._Pickler` is the cached `Pickler` class.
+        assert_eq!(get("pickle", "_Pickler"), get("pickle", "Pickler"));
+
+        // `fnmatch._translate` returns (fragments, star_indices).
+        let translated = call(
+            "fnmatch",
+            "_translate",
+            &[string("a*b"), string("[^/]*"), string("[^/]")],
+        );
+        let pair = value::as_tuple(translated).expect("pair");
+        let fragments: Vec<String> = value::as_list(pair[0])
+            .expect("fragments")
+            .iter()
+            .map(|item| value::as_str(*item).expect("str").to_string())
+            .collect();
+        assert_eq!(fragments, vec!["a", "[^/]*", "b"]);
+        assert_eq!(
+            value::as_list(pair[1])
+                .expect("indices")
+                .iter()
+                .map(|item| as_int(*item))
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        // `importlib._bootstrap_external._classify_pyc`: valid header, flags,
+        // bad magic and truncation.
+        let magic = crate::modules::importlib_util::MAGIC_NUMBER_BYTES;
+        let mut valid = magic.to_vec();
+        valid.extend_from_slice(&3u32.to_le_bytes());
+        valid.extend_from_slice(&[0; 8]);
+        assert_eq!(
+            as_int(call(
+                "importlib.machinery",
+                "_classify_pyc",
+                &[
+                    value::bytes_new(valid.clone()),
+                    string("mod"),
+                    value::dict_new(Vec::new())
+                ]
+            )),
+            3
+        );
+        let mut bad_flags = valid.clone();
+        bad_flags[4] = 4;
+        assert_eq!(
+            call(
+                "importlib.machinery",
+                "_classify_pyc",
+                &[
+                    value::bytes_new(bad_flags),
+                    string("mod"),
+                    value::dict_new(Vec::new())
+                ]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), exc::IMPORT_ERROR as i64);
+        exc::clear();
+        assert_eq!(
+            call(
+                "importlib.machinery",
+                "_classify_pyc",
+                &[
+                    value::bytes_new(magic.to_vec()),
+                    string("mod"),
+                    value::dict_new(Vec::new())
+                ]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), exc::EOF_ERROR as i64);
+        exc::clear();
+        assert_eq!(
+            call(
+                "importlib.machinery",
+                "_classify_pyc",
+                &[
+                    value::bytes_new(vec![0, 0, 0, 0]),
+                    string("mod"),
+                    value::dict_new(Vec::new())
+                ]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), exc::IMPORT_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn import_fixups_surface() {
+        exc::init();
+        // `sys.stdlib_module_names`: the fixed CPython 3.14.9 set.
+        let names = get("sys", "stdlib_module_names");
+        let name_set = value::as_set(names).expect("stdlib name set");
+        assert_eq!(name_set.len(), 297);
+        assert!(name_set
+            .iter()
+            .any(|item| value::as_str(*item) == Some("json")));
+        assert!(name_set
+            .iter()
+            .any(|item| value::as_str(*item) == Some("zipimport")));
+
+        // `pickle.bytes_types` is `(bytes, bytearray)`.
+        let bytes_types = value::as_tuple(get("pickle", "bytes_types")).expect("tuple");
+        assert_eq!(bytes_types.len(), 2);
+        assert_eq!(value::class_display_name(bytes_types[0]), Some("bytes"));
+        assert_eq!(value::class_display_name(bytes_types[1]), Some("bytearray"));
+
+        // `os.mkdir` creates one level and honours the mode keyword.
+        let root = temp_root("mkdir");
+        let first = root.join("one");
+        assert_eq!(
+            call(
+                "os",
+                "mkdir",
+                &[string(first.to_str().expect("utf-8 path"))]
+            ),
+            NONE
+        );
+        assert!(first.is_dir());
+        let second = root.join("two");
+        assert_eq!(
+            call_kw(
+                "os",
+                "mkdir",
+                &[string(second.to_str().expect("utf-8 path"))],
+                &[("mode", int(0o700))]
+            ),
+            NONE
+        );
+        assert!(second.is_dir());
+        std::fs::remove_dir_all(&root).expect("remove scratch directory");
+
+        // `hashlib.compare_digest` and the `_hashlib` accelerator.
+        assert_eq!(
+            call(
+                "hashlib",
+                "compare_digest",
+                &[
+                    value::bytes_new(b"ab".to_vec()),
+                    value::bytes_new(b"ab".to_vec())
+                ]
+            ),
+            TRUE
+        );
+        assert_eq!(
+            call(
+                "_hashlib",
+                "compare_digest",
+                &[
+                    value::bytes_new(b"ab".to_vec()),
+                    value::bytes_new(b"ac".to_vec())
+                ]
+            ),
+            FALSE
+        );
+        assert!(stdlib::function("_signal", "sigwait").is_some());
+
+        // `runpy._get_module_details` diagnoses a missing module truthfully.
+        assert_eq!(
+            call(
+                "runpy",
+                "_get_module_details",
+                &[string("hydro_no_such_module_xyz")]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), exc::IMPORT_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn hashlib_surface_routes_through_module_dispatch() {
+        exc::init();
+        let input = value::bytes_new(b"abc".to_vec());
+
+        // Constructor + instance methods (dotted native names are what the
+        // class tables store for the HASH/HMAC methods).
+        let digest = dispatch("hashlib", "sha256", &[input]);
+        assert!(!exc::pending());
+        let hex = hashlib::call("hashlib.hexdigest", &[digest]);
+        assert_eq!(
+            value::as_str(hex),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        let copied = hashlib::call("hashlib.copy", &[digest]);
+        assert!(!exc::pending());
+        hashlib::call("hashlib.update", &[copied, value::bytes_new(b"d".to_vec())]);
+        let copied_hex = hashlib::call("hashlib.hexdigest", &[copied]);
+        assert_eq!(
+            value::as_str(copied_hex),
+            Some("88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589")
+        );
+
+        // Accelerator spellings share the implementation.
+        let alias_digest = dispatch("_sha2", "sha256", &[input]);
+        let alias_hex = hashlib::call("hashlib.hexdigest", &[alias_digest]);
+        assert_eq!(value::as_str(alias_hex), value::as_str(hex));
+
+        // Constants come from `constant_named`, including classes and sets.
+        assert!(value::as_set(constant_value("hashlib", "algorithms_guaranteed")).is_some());
+        assert!(value::as_class(constant_value("hashlib", "HASH")).is_some());
+        assert_eq!(
+            value::as_str(constant_value("_uuid", "NAMESPACE_DNS")),
+            Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+        );
+
+        // Keyword dispatch reaches the same `pbkdf2_hmac` binder.
+        let positional = dispatch(
+            "hashlib",
+            "pbkdf2_hmac",
+            &[
+                string("sha256"),
+                value::bytes_new(b"pw".to_vec()),
+                value::bytes_new(b"salt".to_vec()),
+                int(1),
+            ],
+        );
+        let keyword = dispatch_kw(
+            "hashlib",
+            "pbkdf2_hmac",
+            &[],
+            vec![
+                ("hash_name".to_string(), string("sha256")),
+                ("password".to_string(), value::bytes_new(b"pw".to_vec())),
+                ("salt".to_string(), value::bytes_new(b"salt".to_vec())),
+                ("iterations".to_string(), int(1)),
+            ],
+        );
+        assert!(!exc::pending());
+        assert_eq!(value::as_bytes(keyword), value::as_bytes(positional));
+    }
+
+    #[test]
+    fn codecs_codecinfo_is_a_real_class_entry() {
+        exc::init();
+        let class = get("codecs", "CodecInfo");
+        assert!(value::as_class(class).is_some());
+        assert_eq!(get("_codecs", "CodecInfo"), class);
+
+        // `CodecInfo(*entry)` builds a class instance with every field.
+        let encode = get("codecs", "utf_8_encode");
+        let decode = get("codecs", "utf_8_decode");
+        let entry = call_value(class, &[encode, decode]);
+        assert!(value::as_instance(entry).is_some());
+        assert_eq!(value::instance_class_value(entry), Some(class));
+        assert_eq!(value::instance_attr(entry, "encode"), Some(encode));
+        assert_eq!(value::instance_attr(entry, "decode"), Some(decode));
+        assert_eq!(value::instance_attr(entry, "streamreader"), Some(NONE));
+        assert_eq!(value::instance_attr(entry, "name"), Some(NONE));
+
+        // Keyword construction fills the named slots in CPython order.
+        let named = crate::modules::codecs_codecinfo_new(
+            &[encode, decode],
+            &[("name".to_string(), string("utf-8"))],
+        );
+        assert_eq!(
+            value::as_str(value::instance_attr(named, "name").unwrap_or(NONE)),
+            Some("utf-8")
+        );
+
+        // The built-in registry still answers with a four-tuple entry.
+        let looked_up = call("codecs", "lookup", &[string("utf-8")]);
+        assert_eq!(value::as_tuple(looked_up).map(|items| items.len()), Some(4));
+    }
+
+    #[test]
+    fn importlib_frozen_surface_and_textwrap_keywords_are_wired() {
+        exc::init();
+        // `sys.path_hooks` is a real, identity-stable empty list.
+        let hooks = get("sys", "path_hooks");
+        assert!(value::as_list(hooks).is_some());
+        assert!(value::as_list(hooks).expect("list").is_empty());
+        assert_eq!(get("sys", "path_hooks"), hooks);
+
+        // `importlib._bootstrap` is a module-like value.
+        let bootstrap = get("importlib", "_bootstrap");
+        assert_eq!(
+            value::as_module(bootstrap).map(|module| module.name()),
+            Some("importlib._bootstrap")
+        );
+        assert_eq!(get("importlib", "_bootstrap"), bootstrap);
+
+        // Machinery loader/finder classes and the zip cache resolve, also
+        // through the accelerator alias spellings.
+        for name in ["PathFinder", "FileFinder", "SourcelessFileLoader"] {
+            assert!(
+                value::as_class(get("importlib.machinery", name)).is_some(),
+                "{name}"
+            );
+        }
+        let cache = get("importlib.machinery", "_zip_directory_cache");
+        assert!(value::as_dict(cache).is_some());
+        assert_eq!(
+            get("_frozen_importlib_external", "_zip_directory_cache"),
+            cache
+        );
+
+        // `textwrap` accepts the wrapper keywords through dispatch_kw.
+        let text = string("one two three four five");
+        let keyword_call = call_kw("textwrap", "wrap", &[text], &[("width", int(10))]);
+        let positional = call("textwrap", "wrap", &[text, int(10)]);
+        assert_eq!(
+            value::repr(keyword_call),
+            value::repr(positional),
+            "keyword and positional wrap differ"
+        );
+
+        // `runpy` calls reach the importlib runner (missing module surfaces as
+        // an import failure, not an AttributeError for the function name).
+        let _ = call(
+            "runpy",
+            "run_module",
+            &[string("hydro_no_such_runpy_module")],
+        );
+        assert!(exc::pending());
+        exc::clear();
+    }
+
+    #[test]
+    fn collections_pprint_dispatch_classes_expose_stable_reprs() {
+        exc::init();
+        // `defaultdict` is a class value, not the bare constructor function.
+        let class = get("collections", "defaultdict");
+        assert!(value::as_class(class).is_some());
+        assert_eq!(get("_collections", "defaultdict"), class);
+        let repr_function = attribute(class, "__repr__");
+        assert!(value::as_function(repr_function).is_some());
+        // The attribute is stored as plain data, so repeated reads share
+        // identity (pprint keys its dispatch table by this value).
+        assert_eq!(attribute(class, "__repr__"), repr_function);
+        // `type(defaultdict_value).__repr__` is the same object.
+        let mapping = call("collections", "defaultdict", &[NONE]);
+        assert!(value::as_defaultdict(mapping).is_some());
+        let runtime_class = value::type_class(mapping);
+        assert_eq!(attribute(runtime_class, "__repr__"), repr_function);
+        assert_eq!(value::repr(mapping), "defaultdict(None, {})");
+        // Calling the class value still constructs a real defaultdict.
+        let constructed = call_value(class, &[NONE]);
+        assert!(value::as_defaultdict(constructed).is_some());
+        let constructed = call_value(class, &[NONE, value::dict_new(vec![(string("a"), int(1))])]);
+        assert!(value::as_defaultdict(constructed).is_some());
+
+        // The placeholders expose the same stable attribute shape.
+        for (name, expected) in [("deque", "deque([])"), ("ChainMap", "ChainMap({})")] {
+            let placeholder = get("collections", name);
+            assert!(value::as_class(placeholder).is_some(), "{name}");
+            let repr_function = attribute(placeholder, "__repr__");
+            assert!(value::as_function(repr_function).is_some(), "{name}");
+            assert_eq!(attribute(placeholder, "__repr__"), repr_function);
+            let instance = value::instance_new(placeholder);
+            assert_eq!(
+                value::as_str(call_value(repr_function, &[instance])),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn collections_userdict_is_a_class_with_native_methods() {
+        exc::init();
+        let class = get("collections", "UserDict");
+        assert!(value::as_class(class).is_some());
+        assert_eq!(class, get("_collections", "UserDict"));
+        let source = value::dict_new(vec![(string("a"), int(1))]);
+        let instance = call_value(class, &[source]);
+        assert!(value::as_instance(instance).is_some());
+        let stored = method(instance, "get", &[string("a")]);
+        assert_eq!(as_int(stored), 1);
+        let length = method(instance, "__len__", &[]);
+        assert_eq!(as_int(length), 1);
+    }
+
+    #[test]
+    fn builtins_encoding_warning_is_the_warnings_class() {
+        exc::init();
+        let builtin = get("builtins", "EncodingWarning");
+        assert!(value::as_class(builtin).is_some());
+        assert_eq!(builtin, get("warnings", "EncodingWarning"));
+        assert_eq!(
+            value::as_class(builtin).map(|class| class.name.clone()),
+            Some("EncodingWarning".to_string())
+        );
+    }
+
+    #[test]
+    fn pickle_pickler_class_dumps_through_the_module_helper() {
+        exc::init();
+        let root = temp_root("pickle-pickler");
+        let path = root.join("payload.txt");
+        let path_text = path.to_string_lossy().into_owned();
+        let file = call("io", "open", &[string(&path_text), string("wb")]);
+        let pickler = call("pickle", "Pickler", &[file]);
+        assert!(value::as_instance(pickler).is_some());
+        method(pickler, "dump", &[int(42)]);
+        method(file, "close", &[]);
+
+        let payload = std::fs::read_to_string(&path).expect("pickle payload");
+        let restored = call("pickle", "loads", &[string(&payload)]);
+        assert_eq!(as_int(restored), 42);
+        assert!(value::as_class(get("pickle", "Pickler")).is_some());
     }
 }

@@ -23,7 +23,9 @@
 //! * `disable()` — automatic collection is unconditional in this collector;
 //! * `set_threshold()` — the threshold is fixed at heap construction;
 //! * `freeze()` / `unfreeze()` — there is no permanent generation;
-//! * `get_objects()` — module code cannot enumerate raw heap objects.
+//! * `get_objects()` — module code cannot enumerate raw heap objects;
+//! * `get_referrers()` — finding referring containers requires the same
+//!   enumeration.
 //!
 //! These names are declared in the central spec so callers receive the
 //! documented error rather than an `AttributeError`. A later collector
@@ -124,6 +126,17 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             }
             unsupported("get_objects")
         }
+        // Finding the containers that refer to an object needs a scan of every
+        // heap object's outgoing edges. The collector keeps its object pools
+        // private (only allocation, marking and sweeping are exposed), so the
+        // runtime cannot enumerate containers and a partial answer from roots
+        // alone would be wrong. Report the limitation instead of returning a
+        // fabricated list.
+        "get_referrers" => exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            "gc.get_referrers() is not supported: the collector exposes no heap-object \
+             enumeration, so referring containers cannot be found",
+        ),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'gc' has no attribute '{function}'"),

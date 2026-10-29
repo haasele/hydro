@@ -42,6 +42,24 @@ fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
     hydro_method(obj, name.as_ptr(), name.len(), args.len(), args.as_ptr())
 }
 
+fn call_kw(module: &str, function: &str, args: &[i64], kwargs: &[(&str, i64)]) -> i64 {
+    let mut pairs = Vec::with_capacity(kwargs.len() * 2);
+    for (key, value) in kwargs {
+        pairs.push(text(key));
+        pairs.push(*value);
+    }
+    hydro_module_call_kw(
+        module.as_ptr(),
+        module.len(),
+        function.as_ptr(),
+        function.len(),
+        args.len(),
+        args.as_ptr(),
+        kwargs.len(),
+        pairs.as_ptr(),
+    )
+}
+
 fn same(a: i64, b: i64) -> bool {
     call("operator", "eq", &[a, b]) == hydro_true()
 }
@@ -473,7 +491,13 @@ fn binary_mode_rejects_text_options() {
     hydro_runtime_init();
     let temp = TempFile::new("binary-options");
 
-    call("io", "open", &[temp.value(), text("rb"), text("utf-8")]);
+    // Slots follow CPython's `open(file, mode, buffering, encoding, errors,
+    // newline, closefd, opener)` layout.
+    call(
+        "io",
+        "open",
+        &[temp.value(), text("rb"), hydro_none(), text("utf-8")],
+    );
     assert_eq!(error_tag(), 0);
     assert_error_text(
         error_message(),
@@ -484,7 +508,14 @@ fn binary_mode_rejects_text_options() {
     call(
         "io",
         "open",
-        &[temp.value(), text("rb"), hydro_none(), text("\n")],
+        &[
+            temp.value(),
+            text("rb"),
+            hydro_none(),
+            hydro_none(),
+            hydro_none(),
+            text("\n"),
+        ],
     );
     assert_eq!(error_tag(), 0);
     assert_error_text(
@@ -671,15 +702,19 @@ fn keyword_slots_apply_defaults_and_validate_encoding() {
     method(file, "write", &[text("slots")]);
     close(file);
 
-    // `open(path, mode, encoding=None, newline=None, errors=None)`, the shape
-    // the frontend produces for keyword calls.
+    // CPython's keyword layout: `open(file, mode, buffering, encoding,
+    // errors, newline, closefd, opener)`. The frontend pads omitted leading
+    // keywords with `None`, so encoding belongs in slot 3, after buffering.
     let file = call(
         "io",
         "open",
         &[
             temp.value(),
             hydro_none(),
+            hydro_none(),
             text("utf-8"),
+            hydro_none(),
+            hydro_none(),
             hydro_none(),
             hydro_none(),
         ],
@@ -698,14 +733,57 @@ fn keyword_slots_apply_defaults_and_validate_encoding() {
             hydro_none(),
             hydro_none(),
             hydro_none(),
+            hydro_none(),
+            hydro_none(),
+            hydro_none(),
         ],
     );
     assert_eq!(hydro_exc_pending(), 0);
     close(file);
 
-    call("io", "open", &[temp.value(), text("r"), text("latin-1")]);
+    call(
+        "io",
+        "open",
+        &[temp.value(), text("r"), hydro_none(), text("latin-1")],
+    );
     assert_eq!(error_tag(), 0);
     assert_error_text(error_message(), "unsupported encoding: 'latin-1'");
+    clear_error();
+}
+
+#[test]
+fn keyword_binding_places_encoding_after_buffering() {
+    hydro_runtime_init();
+    let temp = TempFile::new("bound-slots");
+
+    let file = open(temp.value(), "w");
+    method(file, "write", &[text("bound")]);
+    close(file);
+
+    // The binder always emits CPython's slot order, so `encoding` lands after
+    // `buffering` even when `buffering` is only supplied by its default.
+    let file = call_kw(
+        "io",
+        "open",
+        &[temp.value()],
+        &[("encoding", text("utf-8"))],
+    );
+    assert_eq!(hydro_exc_pending(), 0);
+    assert_str(method(file, "read", &[]), "bound");
+    close(file);
+
+    // A binary file rejects a text-only keyword after binding.
+    call_kw(
+        "io",
+        "open",
+        &[temp.value(), text("rb")],
+        &[("newline", text("\n"))],
+    );
+    assert_eq!(error_tag(), 0);
+    assert_error_text(
+        error_message(),
+        "binary mode doesn't take a newline argument",
+    );
     clear_error();
 }
 

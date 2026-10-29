@@ -2986,12 +2986,15 @@ fn open_keywords_are_reordered_into_module_args() {
         panic!("expected io.open");
     };
     assert_eq!((module.as_str(), function.as_str()), ("io", "open"));
-    assert_eq!(args.len(), 5);
+    assert_eq!(args.len(), 8);
     assert!(matches!(&args[0].kind, HExprKind::Const(Const::Str(s)) if s == "x"));
     assert!(matches!(&args[1].kind, HExprKind::Const(Const::Str(s)) if s == "r"));
-    assert!(matches!(&args[2].kind, HExprKind::Const(Const::Str(s)) if s == "utf-8"));
-    assert!(matches!(&args[3].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(&args[2].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(&args[3].kind, HExprKind::Const(Const::Str(s)) if s == "utf-8"));
     assert!(matches!(&args[4].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(&args[5].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(&args[6].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(&args[7].kind, HExprKind::Const(Const::None)));
 }
 
 #[test]
@@ -6585,13 +6588,22 @@ fn class_attributes_are_frozen_in_the_class_statement() {
     };
     assert!(methods.is_empty(), "{methods:?}");
     let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, vec!["mark", "ratio", "__annotations__"]);
+    assert_eq!(
+        names,
+        vec![
+            "__module__",
+            "__qualname__",
+            "mark",
+            "ratio",
+            "__annotations__"
+        ]
+    );
     assert!(matches!(
-        &attributes[0].1.kind,
+        &attributes[2].1.kind,
         HExprKind::Const(Const::Int(7))
     ));
     assert!(matches!(
-        &attributes[1].1.kind,
+        &attributes[3].1.kind,
         HExprKind::Const(Const::Int(1))
     ));
 
@@ -6604,9 +6616,130 @@ fn class_attributes_are_frozen_in_the_class_statement() {
     else {
         panic!("expected a class statement");
     };
-    assert_eq!(emitted.len(), 3);
-    assert_eq!(emitted[0].name, "mark");
-    assert_eq!(emitted[2].name, "__annotations__");
+    assert_eq!(emitted.len(), 5);
+    assert_eq!(emitted[0].name, "__module__");
+    assert_eq!(emitted[1].name, "__qualname__");
+    assert_eq!(emitted[2].name, "mark");
+    assert_eq!(emitted[4].name, "__annotations__");
+}
+
+#[test]
+fn static_class_publishes_module_and_qualname() {
+    let source = "\
+class Base:
+    pass
+
+class Child(Base):
+    copied = __qualname__
+
+class Outer:
+    class Inner:
+        pass
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    for (class, expected) in [("Base", "Base"), ("Child", "Child")] {
+        let HStmtKind::ClassDef { attributes, .. } =
+            class_def_in(&hir.functions[0].body, class).expect("class definition")
+        else {
+            unreachable!()
+        };
+        assert_eq!(attributes[0].0, "__module__", "{attributes:?}");
+        assert_eq!(attributes[1].0, "__qualname__", "{attributes:?}");
+        assert!(
+            matches!(&attributes[0].1.kind, HExprKind::Const(Const::Str(module)) if module == "__main__"),
+            "static class module: {attributes:?}"
+        );
+        assert!(
+            matches!(&attributes[1].1.kind, HExprKind::Const(Const::Str(name)) if name == expected),
+            "static class qualname: {attributes:?}"
+        );
+    }
+    // A class-body expression sees the dunder before the members publish.
+    let HStmtKind::ClassDef { attributes, .. } =
+        class_def_in(&hir.functions[0].body, "Child").expect("class Child")
+    else {
+        unreachable!()
+    };
+    let copied = attributes
+        .iter()
+        .find(|(name, _)| name == "copied")
+        .map(|(_, value)| value)
+        .expect("copied attribute");
+    assert!(
+        matches!(&copied.kind, HExprKind::Const(Const::Str(name)) if name == "Child"),
+        "class body must read __qualname__: {copied:?}"
+    );
+
+    // Nested classes are dynamic and qualify against the enclosing class.
+    fn collect_qualnames(stmts: &[HStmt], out: &mut Vec<String>) {
+        for stmt in stmts {
+            match &stmt.kind {
+                HStmtKind::ClassDef { attributes, .. } => {
+                    for (name, value) in attributes {
+                        if name == "__qualname__" {
+                            if let HExprKind::Const(Const::Str(text)) = &value.kind {
+                                out.push(text.clone());
+                            }
+                        }
+                    }
+                }
+                HStmtKind::SetSubscript { index, value, .. } => {
+                    if matches!(&index.kind, HExprKind::Const(Const::Str(key)) if key == "__qualname__")
+                    {
+                        if let HExprKind::Const(Const::Str(text)) = &value.kind {
+                            out.push(text.clone());
+                        }
+                    }
+                }
+                HStmtKind::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    collect_qualnames(then_body, out);
+                    collect_qualnames(else_body, out);
+                }
+                HStmtKind::While {
+                    body, else_body, ..
+                }
+                | HStmtKind::ForRange {
+                    body, else_body, ..
+                }
+                | HStmtKind::ForEach {
+                    body, else_body, ..
+                } => {
+                    collect_qualnames(body, out);
+                    collect_qualnames(else_body, out);
+                }
+                HStmtKind::Try {
+                    body,
+                    handlers,
+                    else_body,
+                    finally_body,
+                } => {
+                    collect_qualnames(body, out);
+                    for handler in handlers {
+                        collect_qualnames(&handler.body, out);
+                    }
+                    collect_qualnames(else_body, out);
+                    collect_qualnames(finally_body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut qualnames = Vec::new();
+    collect_qualnames(&hir.functions[0].body, &mut qualnames);
+    assert!(
+        qualnames.iter().any(|name| name == "Outer"),
+        "{qualnames:?}"
+    );
+    assert!(
+        qualnames.iter().any(|name| name == "Outer.Inner"),
+        "nested classes qualify against the enclosing class: {qualnames:?}"
+    );
 }
 
 #[test]
@@ -6672,11 +6805,14 @@ class C:
         panic!("expected a class statement, got {:?}", block[2].kind);
     };
     let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, vec!["a", "b", "c", "d"]);
-    for (_, value) in &attributes[..3] {
+    assert_eq!(
+        names,
+        vec!["__module__", "__qualname__", "a", "b", "c", "d"]
+    );
+    for (_, value) in &attributes[2..5] {
         assert_eq!(local_of(value), *shared, "{value:?}");
     }
-    assert_eq!(local_of(&attributes[3].1), *derived);
+    assert_eq!(local_of(&attributes[5].1), *derived);
     // The derived attribute is parked like the shared one, so the sum itself
     // lives in the second prelude statement and `d` only publishes it. Both
     // operands resolve `a` and `b` to the one parked value.
@@ -14098,7 +14234,7 @@ class C(base(), _root=flag()):
             .iter()
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>(),
-        ["value"]
+        ["__module__", "__qualname__", "value"]
     );
     assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
@@ -14309,7 +14445,13 @@ class S:
     else {
         panic!("expected class S");
     };
-    assert!(attributes.is_empty(), "{attributes:?}");
+    assert_eq!(
+        attributes
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["__module__", "__qualname__"]
+    );
     let difference = methods
         .iter()
         .find(|(name, _, _)| name == "difference")
@@ -14385,8 +14527,18 @@ class DataOps:
     };
     assert!(methods.is_empty(), "{methods:?}");
     let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, ["__add__", "__radd__", "__iadd__", "primary"]);
-    for ((name, value), bound_local) in attributes[..3].iter().zip(&bound) {
+    assert_eq!(
+        names,
+        [
+            "__module__",
+            "__qualname__",
+            "__add__",
+            "__radd__",
+            "__iadd__",
+            "primary"
+        ]
+    );
+    for ((name, value), bound_local) in attributes[2..5].iter().zip(&bound) {
         match &value.kind {
             HExprKind::Local(id) => assert_eq!(id, bound_local, "{name}"),
             other => panic!("expected the unpacked local for {name}, got {other:?}"),
@@ -14432,7 +14584,17 @@ class C:
         unreachable!()
     };
     let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, ["head", "second", "rest", "tail"]);
+    assert_eq!(
+        names,
+        [
+            "__module__",
+            "__qualname__",
+            "head",
+            "second",
+            "rest",
+            "tail"
+        ]
+    );
     // `tail = rest` reads the starred binding: the parked value of the later
     // attribute is the local the star binds.
     assert!(
@@ -14463,7 +14625,17 @@ fn class_body_chained_and_unpacking_assignment_binds_every_name() {
         unreachable!()
     };
     let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, ["whole", "first", "second", "later"]);
+    assert_eq!(
+        names,
+        [
+            "__module__",
+            "__qualname__",
+            "whole",
+            "first",
+            "second",
+            "later"
+        ]
+    );
     let local = |index: usize| match &attributes[index].1.kind {
         HExprKind::Local(id) => *id,
         other => panic!(
@@ -14471,8 +14643,8 @@ fn class_body_chained_and_unpacking_assignment_binds_every_name() {
             attributes[index].0
         ),
     };
-    assert_ne!(local(0), local(1), "the sequence and its elements differ");
-    assert_ne!(local(1), local(2));
+    assert_ne!(local(2), local(3), "the sequence and its elements differ");
+    assert_ne!(local(3), local(4));
     // `later = whole` reads the chained target's parked value.
     assert!(
         hir.functions[0].body.iter().any(|stmt| {
@@ -14482,7 +14654,7 @@ fn class_body_chained_and_unpacking_assignment_binds_every_name() {
                     if then_body.iter().any(|inner| matches!(
                         &inner.kind,
                         HStmtKind::Assign { value, .. }
-                            if matches!(&value.kind, HExprKind::Local(id) if *id == local(0))
+                            if matches!(&value.kind, HExprKind::Local(id) if *id == local(2))
                     ))
             )
         }),
@@ -14504,7 +14676,10 @@ class C:
         unreachable!()
     };
     let names: Vec<&str> = attributes.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, ["__slots__", "left", "right"]);
+    assert_eq!(
+        names,
+        ["__module__", "__qualname__", "__slots__", "left", "right"]
+    );
 }
 
 #[test]
@@ -15300,12 +15475,220 @@ fn undefined_name_in_an_ordinary_module_still_errors() {
 }
 
 #[test]
+fn global_enum_decorator_makes_member_reads_dynamic() {
+    // `enum.global_enum` copies every class member into the defining module's
+    // namespace from inside the decorator. The members have no static module
+    // binding, so a function read must become a runtime global lookup
+    // (`calendar.FEBRUARY`, `_strptime` importing calendar).
+    let source = "\
+def global_enum(cls):
+    return cls
+
+@global_enum
+class Month:
+    JANUARY = 1
+    FEBRUARY = 2
+
+def month_range(february_only):
+    return FEBRUARY
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let read = function(&hir, "month_range");
+    let HStmtKind::Return(Some(value)) = &read.body[0].kind else {
+        panic!("expected a return, got {:?}", read.body[0]);
+    };
+    assert!(
+        matches!(
+            &value.kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "FEBRUARY"
+        ),
+        "the injected member must be read from the module table, got {:?}",
+        value.kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("dynamic member read");
+}
+
+#[test]
+fn namespace_dunder_update_marks_dynamic_globals() {
+    // `sys.modules[__name__].__dict__.update(...)` is the direct spelling used
+    // by `enum.global_enum`; a later unresolved read is a runtime lookup.
+    let source = "\
+import sys
+sys.modules[__name__].__dict__.update({'INJECTED': 1})
+
+def read():
+    return INJECTED
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let read = function(&hir, "read");
+    let HStmtKind::Return(Some(value)) = &read.body[0].kind else {
+        panic!("expected a return, got {:?}", read.body[0]);
+    };
+    assert!(
+        matches!(
+            &value.kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "INJECTED"
+        ),
+        "the injected name must be read from the module table, got {:?}",
+        value.kind
+    );
+}
+
+#[test]
+fn ordinary_class_decorator_keeps_undefined_name_diagnostics() {
+    // Only the member-injecting `global_enum` shape turns reads dynamic; a
+    // generic decorator must not hide typos.
+    let source = "\
+def mark(cls):
+    return cls
+
+@mark
+class C:
+    pass
+
+def read():
+    return missing
+";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::NAME);
+    assert_eq!(diags[0].message, "name 'missing' is not defined");
+}
+
+#[test]
+fn try_name_error_fallback_compiles_an_absent_name_probe() {
+    // `try: WindowsError / except NameError:` probes for a platform-only
+    // builtin (`_compat_pickle`). The read must execute and raise NameError
+    // at runtime instead of failing the compile.
+    let source = "try:\n    WindowsError\nexcept NameError:\n    pass\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Try { body, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected a try, got {:?}", hir.functions[0].body[0]);
+    };
+    let HStmtKind::Expr(value) = &body[0].kind else {
+        panic!("expected the name probe, got {:?}", body[0]);
+    };
+    assert!(
+        matches!(
+            &value.kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "WindowsError"
+        ),
+        "the absent name must be a runtime global read, got {:?}",
+        value.kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("catchable NameError probe");
+}
+
+#[test]
+fn try_handler_without_name_error_keeps_undefined_name_diagnostics() {
+    let source = "try:\n    WindowsError\nexcept ValueError:\n    pass\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::NAME);
+    assert_eq!(diags[0].message, "name 'WindowsError' is not defined");
+}
+
+#[test]
+fn class_attribute_reassignment_uses_the_last_value() {
+    // CPython's class body is a mapping: `optparse.Option` assigns
+    // `CHECK_METHODS = None` and replaces it later in the same body.
+    let source = "\
+class Option:
+    CHECK_METHODS = None
+
+    def __init__(self):
+        for checker in self.CHECK_METHODS:
+            checker(self)
+
+    def _check_action(self):
+        pass
+
+    CHECK_METHODS = [_check_action]
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::ClassDef { attributes, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected a class, got {:?}", hir.functions[0].body[0]);
+    };
+    let checker = attributes
+        .iter()
+        .rev()
+        .find(|(name, _)| name.as_str() == "CHECK_METHODS")
+        .expect("CHECK_METHODS must be planned");
+    assert!(
+        matches!(&checker.1.kind, HExprKind::List(_)),
+        "the last assignment must win, got {:?}",
+        checker.1.kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("last class attribute wins");
+}
+
+#[test]
+fn slice_assignment_in_an_unpacking_target_compiles() {
+    // socketserver._Threads.pop_all: `self[:], result = [], self[:]`.
+    let source = "\
+def pop_all(items):
+    items[:], result = [], items[:]
+    return result
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = &function(&hir, "pop_all").body;
+    let HStmtKind::If { then_body, .. } = &body[0].kind else {
+        panic!("expected the desugared block, got {:?}", body[0]);
+    };
+    assert!(
+        then_body
+            .iter()
+            .any(|stmt| matches!(&stmt.kind, HStmtKind::Unpack { .. })),
+        "the sequence must still be unpacked exactly once: {then_body:?}"
+    );
+    assert!(
+        then_body
+            .iter()
+            .any(|stmt| matches!(&stmt.kind, HStmtKind::SetSlice { .. })),
+        "the slice element must store through SetSlice: {then_body:?}"
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("slice unpack assignment");
+}
+
+#[test]
 fn dynamic_globals_do_not_hide_local_scope_errors() {
-    // `item` is a module local no function can see; reaching it from `read`
-    // stays a compile-time scope error even though the module writes through
-    // `globals()`.
+    // A module-level loop target is a module global, exactly as in CPython:
+    // a function may read `item` after `for item in ...`. A module that also
+    // writes through `globals()` does not change that.
     let source =
         "namespace = globals()\nfor item in [1]:\n    pass\ndef read():\n    return item\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = function_body(&hir, "read");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::GlobalGet { name, .. } if name == "item"),
+        "the module loop target reads as a global: {:?}",
+        value.kind
+    );
+
+    // A module local that is not a published global is still a compile-time
+    // scope error when a function reads it, even though the module writes
+    // through `globals()`: the dynamic-namespace fallback must not hide it.
+    let source = "\
+namespace = globals()
+try:
+    raise ValueError
+except ValueError as item:
+    pass
+def read():
+    return item
+";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, codes::NAME);
@@ -16749,6 +17132,534 @@ fn global_unpack_target_binds_before_a_later_receiver_runs() {
         matches!(&index.kind, HExprKind::GlobalGet { name, .. } if name == "g"),
         "the receiver reads the declared global, got {:?}",
         index.kind
+    );
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn module_loop_target_is_published_to_the_runtime_global_table() {
+    // CPython executes a module body in the module namespace, so a loop
+    // target is a module global. CPython's `tokenize`/`_pydatetime`/
+    // `_compat_pickle` end a loop with `del name`; an imported unit must have
+    // stored the value into the runtime global table or the `del` raises
+    // `NameError` after a successful loop.
+    let source = "d = {}\nfor p in ('a', 'b'):\n    d[p] = 1\ndel p\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    lowerer.set_mirror_all_globals(true);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let loop_body = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::ForEach { body, .. } => Some(body.as_slice()),
+            _ => None,
+        })
+        .expect("the module must contain the for loop");
+    assert!(
+        loop_body
+            .iter()
+            .any(|stmt| matches!(&stmt.kind, HStmtKind::GlobalSet { name, .. } if name == "p")),
+        "the loop must publish its target every iteration: {loop_body:?}"
+    );
+    // The store runs before the body observes the value.
+    assert!(
+        matches!(&loop_body[0].kind, HStmtKind::GlobalSet { name, .. } if name == "p"),
+        "the target store must precede the loop body: {loop_body:?}"
+    );
+}
+
+#[test]
+fn function_read_of_a_module_loop_target_resolves_through_the_global_table() {
+    let source = "d = {}\nfor p in ('a', 'b'):\n    d[p] = 1\ndef last():\n    return p\n";
+    let hir = lower_ok(source);
+    let body = function_body(&hir, "last");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::GlobalGet { name, .. } if name == "p"),
+        "a function reads the module loop target as a global: {:?}",
+        value.kind
+    );
+    // The loop publishes the same binding before the body runs.
+    let loop_body = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::ForEach { body, .. } => Some(body.as_slice()),
+            _ => None,
+        })
+        .expect("the module must contain the for loop");
+    assert!(loop_body
+        .iter()
+        .any(|stmt| matches!(&stmt.kind, HStmtKind::GlobalSet { name, .. } if name == "p")));
+}
+
+#[test]
+fn host_platform_guards_are_static() {
+    let module = parse("if sys.platform == 'win32':\n    pass\n");
+    let ast::Stmt::If(win32) = &module.body[0] else {
+        panic!("expected an if statement");
+    };
+    assert_eq!(
+        static_if_branch(&win32.test, "mod"),
+        Some(cfg!(target_os = "windows"))
+    );
+
+    let module = parse("if os.name != 'nt':\n    pass\n");
+    let ast::Stmt::If(not_nt) = &module.body[0] else {
+        panic!("expected an if statement");
+    };
+    assert_eq!(
+        static_if_branch(&not_nt.test, "mod"),
+        Some(!cfg!(target_os = "windows"))
+    );
+
+    // An unrecognised platform spelling stays dynamic: only host-fixed
+    // comparisons are decided, so a version/fork check keeps its branch.
+    let module = parse("if sys.platform == 'java':\n    pass\n");
+    let ast::Stmt::If(java) = &module.body[0] else {
+        panic!("expected an if statement");
+    };
+    assert_eq!(static_if_branch(&java.test, "mod"), Some(false));
+    let module = parse("if platform == 'linux':\n    pass\n");
+    let ast::Stmt::If(bare) = &module.body[0] else {
+        panic!("expected an if statement");
+    };
+    assert_eq!(static_if_branch(&bare.test, "mod"), None);
+}
+
+#[test]
+fn windows_only_branch_is_not_lowered_on_non_windows_hosts() {
+    if cfg!(target_os = "windows") {
+        return;
+    }
+    // `encodings/__init__.py` keeps the Windows code page codec behind this
+    // guard; the imports and member reads inside must not reach the compiler
+    // on a POSIX host (the runtime has no `codecs.code_page_encode`).
+    let source = "\
+import sys
+if sys.platform == 'win32':
+    from codecs import code_page_encode, code_page_decode
+    value = code_page_encode(1, 'x')
+    other = codecs.CodecInfo
+";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn dead_name_guard_does_not_register_its_classes() {
+    // CPython's `pstats` defines a `cmd.Cmd` browser inside its `__main__`
+    // block. An imported unit never runs that block, so the class body must
+    // not be planned or lowered (the `cmd` import is dead too).
+    let source = "\
+if __name__ == '__main__':
+    import cmd
+    class ProfileBrowser(cmd.Cmd):
+        def __init__(self):
+            cmd.Cmd.__init__(self)
+";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "pstats.py", &mut infer);
+    lowerer.set_dunder_name("pstats");
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        hir.functions.len() == 1,
+        "a class in a dead `__main__` block must not contribute functions: {:?}",
+        hir.functions
+            .iter()
+            .map(|f| f.name.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // A literal `if False:` block is dead for the same reason.
+    let source = "if False:\n    class C:\n        def m(self):\n            return typo_name\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn builtin_named_parameters_fold_into_positional_slots() {
+    // `enumerate(iterable, start=1)` and `compile(..., flags=...)` advertise
+    // their parameters in the shared `builtins` spec; the compiler must bind
+    // the keyword into the positional slot the runtime entry point expects.
+    let source = "\
+xs = [1]
+a = enumerate(xs, start=2)
+b = compile('x', '<x>', 'exec', flags=0)
+";
+    let hir = lower_ok(source);
+    let HExprKind::Call {
+        callee: Callee::Builtin(Builtin::Enumerate),
+        args,
+    } = &assigned(&hir, "a").kind
+    else {
+        panic!(
+            "expected an enumerate call, got {:?}",
+            assigned(&hir, "a").kind
+        );
+    };
+    assert_eq!(args.len(), 2);
+    assert!(matches!(&args[1].kind, HExprKind::Const(Const::Int(2))));
+
+    let HExprKind::Call {
+        callee: Callee::Builtin(Builtin::Compile),
+        args,
+    } = &assigned(&hir, "b").kind
+    else {
+        panic!(
+            "expected a compile call, got {:?}",
+            assigned(&hir, "b").kind
+        );
+    };
+    assert!(
+        args.len() >= 4,
+        "flags must reach the positional slot: {:?}",
+        args.len()
+    );
+}
+
+#[test]
+fn unnamed_native_specs_fold_keyword_tails() {
+    // `re.compile` and `os.open` expose keyword parameters the shared specs
+    // do not name; the values are appended in source order after the
+    // positional arguments instead of becoming compile errors.
+    let source = "\
+import re
+import os
+p = re.compile('a', flags=1)
+fd = os.open('path', 0, dir_fd=1)
+";
+    let hir = lower_ok(source);
+    let HExprKind::ModuleCall {
+        module,
+        function,
+        args,
+        keywords,
+    } = &assigned(&hir, "p").kind
+    else {
+        panic!("expected a module call, got {:?}", assigned(&hir, "p").kind);
+    };
+    assert_eq!((module.as_str(), function.as_str()), ("re", "compile"));
+    assert_eq!(args.len(), 2);
+    assert!(keywords.is_empty());
+
+    let HExprKind::ModuleCall {
+        module,
+        function,
+        args,
+        keywords,
+    } = &assigned(&hir, "fd").kind
+    else {
+        panic!(
+            "expected a module call, got {:?}",
+            assigned(&hir, "fd").kind
+        );
+    };
+    assert_eq!((module.as_str(), function.as_str()), ("os", "open"));
+    assert_eq!(args.len(), 3);
+    assert!(keywords.is_empty());
+}
+
+#[test]
+fn name_error_fallback_stays_inside_the_guarded_try_body() {
+    // A probe such as `try: WindowsError` lowers to a runtime global read so
+    // the `except NameError` handler can catch it. An undefined name outside
+    // the guarded body stays a compile-time diagnostic: the fallback must not
+    // hide typos.
+    let source = "\
+try:
+    probe = missing_probe
+except NameError:
+    probe = 0
+typo = other_missing
+";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(
+        diags[0].message.contains("other_missing"),
+        "only the name outside the guarded body is a compile error: {diags:?}"
+    );
+}
+
+#[test]
+fn dataclass_non_literal_defaults_are_optional() {
+    // CPython's `_colorize` uses an enum/class member as a field default
+    // (`usage: str = ANSIColors.BOLD_BLUE`). Such a value is not a literal
+    // yet it is still a default: the constructor must not require it.
+    let source = "\
+from dataclasses import dataclass
+class Palette:
+    BOLD_BLUE = 'blue'
+@dataclass(frozen=True, kw_only=True)
+class Theme:
+    usage: str = Palette.BOLD_BLUE
+    count: int = 1
+    must: str
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let init = function(&hir, "Theme.__init__");
+    assert_eq!(
+        init.params
+            .iter()
+            .map(|param| (param.name.as_str(), param.default.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("self", None),
+            ("usage", Some(Const::None)),
+            ("count", Some(Const::Int(1))),
+            // A field without any default is still required.
+            ("must", None),
+        ]
+    );
+    // `usage` falls back to the class-scope member when omitted.
+    let HStmtKind::SetAttr { value, .. } = &init.body[0].kind else {
+        panic!("expected the usage assignment, got {:?}", init.body[0].kind);
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::IfExp { .. }),
+        "a non-literal default lowers through the None check: {:?}",
+        value.kind
+    );
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+
+    // Supplying the defaulted fields is enough; omitting the required field
+    // still reports it.
+    let source = "\
+from dataclasses import dataclass
+class Palette:
+    BOLD_BLUE = 'blue'
+@dataclass
+class Theme:
+    usage: str = Palette.BOLD_BLUE
+    must: str
+ok = Theme('u', 'm')
+bad = Theme('u')
+";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(
+        diags[0]
+            .message
+            .contains("missing required argument 'must'"),
+        "only the genuinely required field is missing: {diags:?}"
+    );
+}
+
+#[test]
+fn dataclass_publishes_field_metadata() {
+    // The runtime's `dataclasses.is_dataclass`/`fields` read the mapping a
+    // dataclass decorator installs. A synthesized dataclass must publish real
+    // `dataclasses.field(...)` values under the field names.
+    let source = "\
+from dataclasses import dataclass
+@dataclass
+class Point:
+    x: int
+    y: int = 1
+";
+    let hir = lower_ok(source);
+    let HStmtKind::ClassDef { attributes, .. } = &hir.functions[0]
+        .body
+        .iter()
+        .find(|stmt| matches!(&stmt.kind, HStmtKind::ClassDef { .. }))
+        .expect("the module must contain the class")
+        .kind
+    else {
+        unreachable!()
+    };
+    let metadata = attributes
+        .iter()
+        .rev()
+        .find_map(|(name, value)| (name == "__dataclass_fields__").then_some(value))
+        .expect("a dataclass publishes __dataclass_fields__");
+    let HExprKind::Dict(pairs) = &metadata.kind else {
+        panic!("expected a field mapping, got {:?}", metadata.kind);
+    };
+    let names: Vec<&str> = pairs
+        .iter()
+        .map(|(key, _)| match &key.kind {
+            HExprKind::Const(Const::Str(name)) => name.as_str(),
+            other => panic!("expected a string key, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["x", "y"]);
+    for (index, (_, field)) in pairs.iter().enumerate() {
+        let HExprKind::ModuleCall {
+            module,
+            function,
+            keywords,
+            ..
+        } = &field.kind
+        else {
+            panic!("expected a dataclasses.field() value, got {:?}", field.kind);
+        };
+        assert_eq!(
+            (module.as_str(), function.as_str()),
+            ("dataclasses", "field")
+        );
+        match index {
+            0 => assert!(keywords.is_empty(), "a required field has no default"),
+            _ => assert!(
+                keywords.iter().any(|(name, _)| name == "default"),
+                "a literal default is part of the field metadata"
+            ),
+        }
+    }
+}
+
+#[test]
+fn undecorated_subclass_inherits_dataclass_metadata() {
+    // A plain subclass of a dataclass does not define its own mapping, so the
+    // runtime's class lookup reads the base's: `is_dataclass(Sub)` stays true
+    // and `fields(Sub)` still reports the inherited fields.
+    let source = "\
+from dataclasses import dataclass
+@dataclass
+class Base:
+    x: int
+class Sub(Base):
+    pass
+";
+    let hir = lower_ok(source);
+    let classes: Vec<(&str, bool)> = hir.functions[0]
+        .body
+        .iter()
+        .filter_map(|stmt| match &stmt.kind {
+            HStmtKind::ClassDef {
+                name, attributes, ..
+            } => Some((
+                name.as_str(),
+                attributes
+                    .iter()
+                    .any(|(attribute, _)| attribute == "__dataclass_fields__"),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(classes, [("Base", true), ("Sub", false)]);
+}
+
+#[test]
+fn entry_module_imports_bind_the_runtime_module() {
+    // CPython's `rlcompleter` imports `__main__` and binds its dict lazily.
+    // The entry module is a runtime value, not a source dependency, so the
+    // import must not be rejected and its module value is a first-class name.
+    let source = "\
+import __main__
+module = __main__
+namespace = __main__.__dict__
+name = __main__.__name__
+@__main__.dataclass
+class C:
+    pass
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    // The alias itself is the runtime module value.
+    let HExprKind::ModuleRef { module } = &assigned(&hir, "module").kind else {
+        panic!(
+            "expected the entry module value, got {:?}",
+            assigned(&hir, "module").kind
+        );
+    };
+    assert_eq!(module, "__main__");
+    // Attribute reads stay dynamic: the entry namespace is only known at
+    // runtime, so a missing name reports AttributeError there.
+    for value in ["namespace", "name"] {
+        assert!(
+            matches!(&assigned(&hir, value).kind, HExprKind::GetAttr { .. }),
+            "{value} must be a runtime attribute read: {:?}",
+            assigned(&hir, value).kind
+        );
+    }
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn from_entry_module_imports_read_the_entry_globals() {
+    // `from __main__ import name` is a runtime read of the entry module's
+    // global namespace; the frontend must not reject the module name.
+    let source = "\
+from __main__ import thing, other as renamed
+a = thing
+b = renamed
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    for value in ["a", "b"] {
+        assert!(
+            matches!(
+                &assigned(&hir, value).kind,
+                HExprKind::DeferredImport { module, member, .. }
+                    if module == "__main__" && member.is_some()
+            ),
+            "{value} must read the entry namespace at runtime: {:?}",
+            assigned(&hir, value).kind
+        );
+    }
+}
+
+#[test]
+fn named_keyword_may_follow_a_double_star_mapping() {
+    // CPython 3.5+ allows `f(**mapping, name=value)`; `tarfile` calls
+    // `member.replace(**new_attrs, deep=False)`. The named keyword is kept as
+    // an ordinary keyword operand, so duplicate detection still happens at
+    // runtime against the mapping keys.
+    let source = "\
+def f(**kw):
+    return kw
+d = {'a': 1}
+x = f(**d, b=2)
+class C:
+    def replace(self, **kw):
+        return kw
+c = C()
+y = c.replace(**d, deep=False)
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::CallFull {
+        keywords,
+        double_star,
+        ..
+    } = &assigned(&hir, "x").kind
+    else {
+        panic!(
+            "x must lower to the general call: {:?}",
+            assigned(&hir, "x").kind
+        );
+    };
+    assert!(double_star.is_some(), "x keeps the **mapping");
+    assert!(
+        keywords.iter().any(|(name, _)| name == "b"),
+        "x keeps the named keyword: {keywords:?}"
+    );
+    let HExprKind::MethodCall {
+        keywords,
+        double_star,
+        ..
+    } = &assigned(&hir, "y").kind
+    else {
+        panic!(
+            "y must lower to a method call: {:?}",
+            assigned(&hir, "y").kind
+        );
+    };
+    assert!(double_star.is_some(), "y keeps the **mapping");
+    assert!(
+        keywords.iter().any(|(name, _)| name == "deep"),
+        "y keeps the named keyword: {keywords:?}"
     );
     assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }

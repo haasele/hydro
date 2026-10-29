@@ -881,6 +881,10 @@ struct ClassPlan {
     /// entry with the same index, and they share the single evaluation of the
     /// right-hand side.
     attributes: Vec<(String, usize)>,
+    /// The class carries `@dataclass`: its emission also publishes the
+    /// `__dataclass_fields__` metadata mapping the runtime's
+    /// `dataclasses.is_dataclass`/`fields` read.
+    dataclass: bool,
     /// True when the class body executes statements the static plan cannot
     /// express (`del`, `if`, `for`, `with`, `try`, `raise`, calls, …). Such a
     /// body runs at runtime against a namespace `dict`, preserving CPython's
@@ -901,8 +905,11 @@ struct ClassEmission<'a> {
     class: &'a ast::StmtClassDef,
     /// Registered header/body plan.
     plan: &'a ClassPlan,
-    /// Class name used for `__qualname__` and the runtime class object.
+    /// Class name used for the runtime class object.
     name: &'a str,
+    /// Value published as `__qualname__`: the class name, prefixed with the
+    /// enclosing class for a nested class (`Outer.Inner`).
+    qualname: String,
     /// Local that receives the class object.
     target: LocalId,
     /// Whether the module global table receives the finished class value.
@@ -951,6 +958,9 @@ struct ClassNs {
     /// Method bodies by definition span start: the binding the class
     /// namespace must receive.
     methods: HashMap<u32, ClassMethodBinding>,
+    /// Qualname of the class whose body is executing. A nested class prepends
+    /// it to its own name (`Outer.Inner`), matching CPython.
+    qualname: String,
 }
 
 struct FuncState {
@@ -1540,7 +1550,7 @@ fn exception_type_catches_import_error(type_expr: &ast::Expr) -> bool {
 /// Truth value of an `if` guard that the import contract fixes statically.
 ///
 /// Returns `Some(true)` when the body always runs, `Some(false)` when it
-/// never runs and `None` for a dynamic condition. Three guards are static:
+/// never runs and `None` for a dynamic condition. Four guards are static:
 ///
 /// - `TYPE_CHECKING` (bare or `typing.TYPE_CHECKING`) is `False` at runtime
 ///   and this frontend never evaluates annotations, so the guarded body is
@@ -1555,6 +1565,11 @@ fn exception_type_catches_import_error(type_expr: &ast::Expr) -> bool {
 ///   `if hasattr(builtins, "sentinel"):` never types the unavailable member.
 ///   Only stdlib/native modules are decided this way; a user module may gain
 ///   attributes at runtime, so its guard stays dynamic.
+/// - `sys.platform == "<value>"` and `os.name == "<value>"` (and `!=`) are
+///   fixed by the host the program targets. A CPython module often keeps
+///   Windows-only imports and attribute reads in such a branch; compiling
+///   them on Linux would resolve members the host runtime never provides
+///   (`encodings._win_cp_codecs` reads `codecs.code_page_encode`).
 ///
 /// A local variable that shadows one of these names (including a local named
 /// like a native module, or a local `hasattr`) is not detected; the guard is
@@ -1606,25 +1621,91 @@ pub(crate) fn static_if_branch(test: &ast::Expr, dunder_name: &str) -> Option<bo
         return None;
     }
     let (op, left, right) = (compare.ops[0], &*compare.left, &compare.comparators[0]);
-    let (literal, name) = match (left, right) {
-        (ast::Expr::Name(name), ast::Expr::Constant(constant))
-        | (ast::Expr::Constant(constant), ast::Expr::Name(name)) => (constant, name),
+    // The string operand must be a literal; the other operand may be a bare
+    // name or a host-fixed attribute chain (`sys.platform`, `os.name`).
+    let (literal, operand) = match (left, right) {
+        (operand, ast::Expr::Constant(constant)) | (ast::Expr::Constant(constant), operand) => {
+            (constant, operand)
+        }
         _ => return None,
     };
-    if name.id.as_str() != "__name__" {
-        return None;
-    }
     let ast::Constant::Str(value) = &literal.value else {
         return None;
     };
-    if value.as_str() != "__main__" {
-        return None;
+    if let ast::Expr::Name(name) = operand {
+        if name.id.as_str() != "__name__" {
+            return None;
+        }
+        if value.as_str() != "__main__" {
+            return None;
+        }
+        let is_entry = dunder_name == "__main__";
+        return match op {
+            ast::CmpOp::Eq => Some(is_entry),
+            ast::CmpOp::NotEq => Some(!is_entry),
+            _ => None,
+        };
     }
-    let is_entry = dunder_name == "__main__";
+    let host = static_host_platform(operand)?;
     match op {
-        ast::CmpOp::Eq => Some(is_entry),
-        ast::CmpOp::NotEq => Some(!is_entry),
+        ast::CmpOp::Eq => Some(host == value.as_str()),
+        ast::CmpOp::NotEq => Some(host != value.as_str()),
         _ => None,
+    }
+}
+
+/// The host value of a guard fixed by the target platform.
+///
+/// Only `sys.platform` and `os.name` are decided here; every other attribute
+/// chain stays dynamic. The values are the ones CPython reports on this host,
+/// so `if sys.platform == "win32":` never runs on Linux.
+fn static_host_platform(expr: &ast::Expr) -> Option<&'static str> {
+    let ast::Expr::Attribute(attribute) = expr else {
+        return None;
+    };
+    let ast::Expr::Name(module) = &*attribute.value else {
+        return None;
+    };
+    match (module.id.as_str(), attribute.attr.as_str()) {
+        ("sys", "platform") => Some(host_sys_platform()),
+        ("os", "name") => Some(host_os_name()),
+        _ => None,
+    }
+}
+
+/// CPython's `sys.platform` spelling for the host this compiler targets.
+fn host_sys_platform() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else if cfg!(target_os = "openbsd") {
+        "openbsd"
+    } else if cfg!(target_os = "netbsd") {
+        "netbsd"
+    } else if cfg!(target_os = "dragonfly") {
+        "dragonfly"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "ios") {
+        "ios"
+    } else if cfg!(target_os = "illumos") || cfg!(target_os = "solaris") {
+        "sunos5"
+    } else {
+        std::env::consts::OS
+    }
+}
+
+/// CPython's `os.name` spelling for the host (`nt` on Windows, else `posix`).
+fn host_os_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "nt"
+    } else {
+        "posix"
     }
 }
 
@@ -2109,6 +2190,13 @@ pub struct Lowerer<'a> {
     /// Resolve otherwise-unknown module-level names to `GlobalGet` while
     /// lowering a parameter default expression.
     in_default_expr: bool,
+    /// Nonzero while lowering the body of a `try` whose handlers catch
+    /// `NameError`. An otherwise-unresolved name there must become a runtime
+    /// global read: CPython raises `NameError` when the read executes, and the
+    /// handler catches it (the `try: WindowsError` probe in CPython's
+    /// `_compat_pickle`). Nested `try` statements add to the depth so only
+    /// the covered block gets the fallback.
+    name_fallback_depth: usize,
     /// `start:stop:step` is legal only inside a subscript index. While such an
     /// index lowers, the syntax becomes a real `slice` value
     /// ([`Lowerer::slice_value_expr`]); everywhere else it keeps the
@@ -2202,6 +2290,7 @@ impl<'a> Lowerer<'a> {
             method_capture_scope: None,
             method_captures: HashMap::new(),
             in_default_expr: false,
+            name_fallback_depth: 0,
             slice_value_allowed: false,
             diags: Vec::new(),
         }
@@ -2748,6 +2837,34 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// The blocks of a module-level compound statement whose definitions can
+    /// execute on this target.
+    ///
+    /// Like [`class_body_blocks`], but a branch whose guard is fixed by the
+    /// import contract (or a literal `if True:`/`if False:`) contributes only
+    /// the branch that runs. CPython compiles both sides of an ordinary
+    /// `if`, but a dead `if __name__ == "__main__":` block of an imported
+    /// module never executes, and CPython's `pstats` keeps a `cmd.Cmd`-based
+    /// class there whose `cmd` import is just as dead. Registering that class
+    /// would lower its method body against a name the module never binds.
+    fn module_control_blocks<'b>(&self, stmt: &'b ast::Stmt) -> Vec<&'b [ast::Stmt]> {
+        if let ast::Stmt::If(s) = stmt {
+            let branch = match &*s.test {
+                ast::Expr::Constant(constant) => match &constant.value {
+                    ast::Constant::Bool(value) => Some(*value),
+                    _ => static_if_branch(&s.test, &self.dunder_name),
+                },
+                _ => static_if_branch(&s.test, &self.dunder_name),
+            };
+            match branch {
+                Some(true) => return vec![&s.body],
+                Some(false) => return vec![&s.orelse],
+                None => {}
+            }
+        }
+        class_body_blocks(stmt)
+    }
+
     /// Registers module-level definitions, including those nested in
     /// module-level control-flow blocks.
     ///
@@ -2808,7 +2925,7 @@ impl<'a> Lowerer<'a> {
                     }
                 }
                 other => {
-                    for block in class_body_blocks(other) {
+                    for block in self.module_control_blocks(other) {
                         self.register_module_definitions(block, false, def_ids);
                     }
                 }
@@ -2895,7 +3012,7 @@ impl<'a> Lowerer<'a> {
                     self.lower_definition_bodies(&c.body, def_ids);
                 }
                 other => {
-                    for block in class_body_blocks(other) {
+                    for block in self.module_control_blocks(other) {
                         self.lower_definition_bodies(block, def_ids);
                     }
                 }
@@ -4501,6 +4618,16 @@ impl<'a> Lowerer<'a> {
             Some(_) => imported,
             None => binding,
         };
+        if imported == "__main__" {
+            // The entry unit is not a source dependency: its module value is
+            // published by the runtime under its canonical name, and
+            // attribute reads consult its global namespace. CPython's
+            // `rlcompleter` does `import __main__` and reads
+            // `__main__.__dict__`.
+            self.user_module_aliases
+                .insert(binding.to_string(), "__main__".to_string());
+            return;
+        }
         // A native module binds the *top-level* spec for the unaliased form:
         // `import os.path` binds `os`, and `os.path` then resolves through the
         // module chain. Binding the leaf under the package name would make
@@ -4620,6 +4747,28 @@ impl<'a> Lowerer<'a> {
         // feature) changes no semantics in this frontend: annotations are
         // hints and are never evaluated.
         if imported == "__future__" {
+            return;
+        }
+        if imported == "__main__" {
+            // The entry unit is a runtime module value. A named member is read
+            // from its global namespace when the binding is used, so an entry
+            // binding that does not exist yet reports the same ImportError a
+            // partially initialized module does. A star import cannot be
+            // enumerated statically; it binds nothing.
+            for alias in &s.names {
+                let member = alias.name.as_str();
+                if member == "*" {
+                    continue;
+                }
+                let binding = match &alias.asname {
+                    Some(name) => name.as_str(),
+                    None => member,
+                };
+                if !self.claim_import_binding(binding, nested) {
+                    continue;
+                }
+                self.record_deferred(binding, "__main__", Some(member));
+            }
             return;
         }
 
@@ -6773,19 +6922,18 @@ impl<'a> Lowerer<'a> {
                 // `a, a = value`) binds the same slot twice in CPython; the
                 // plan registers it once.
                 let mut chained = HashSet::new();
-                for (target_name, target_range, direct) in names {
+                for (target_name, _target_range, direct) in names {
                     let name = target_name.to_string();
                     if !chained.insert(name.clone()) {
                         continue;
                     }
-                    if !seen.insert(name.clone()) {
-                        self.error_at_code(
-                            target_range,
-                            codes::DECL,
-                            format!("duplicate class member '{class}.{name}'"),
-                        );
-                        continue;
-                    }
+                    // CPython's class body is a namespace mapping executed in
+                    // source order: assigning the same name again overwrites
+                    // the earlier value. `optparse.Option` documents
+                    // `CHECK_METHODS = None` and later replaces it with the
+                    // real checker list in the same body. Keep planning the
+                    // later binding; the class namespace keeps the last value.
+                    seen.insert(name.clone());
                     // Only a direct `name = ...` can alias a method or wrap it
                     // in a binding decorator; a name bound by an unpacking
                     // target receives one element of the sequence.
@@ -6984,6 +7132,7 @@ impl<'a> Lowerer<'a> {
             decorators,
             methods,
             attributes,
+            dataclass: is_dataclass,
             dynamic,
             bindings,
         }
@@ -7259,16 +7408,17 @@ impl<'a> Lowerer<'a> {
     ///
     /// The `field(...)` call is read from the AST, never executed: its
     /// `default`/`default_factory` arguments become the synthesized
-    /// `__init__`'s behavior. Every other literal value is a parameter
-    /// default; a non-literal value stays a required parameter (its class
-    /// attribute is still frozen into the class namespace as before).
+    /// `__init__`'s behavior. A literal value is a parameter default; any
+    /// other expression (`usage: str = ANSIColors.BOLD_BLUE`) is evaluated
+    /// lazily when the argument is omitted, so the field is not required.
+    /// Only a field with no default at all stays required.
     fn annotated_field_default<'e>(&mut self, value: &'e ast::Expr) -> FieldDefault<'e> {
         if let Some(call) = self.dataclasses_field_call(value) {
             return self.dataclass_field_default(call);
         }
         match self.const_default(value) {
             Some(constant) => FieldDefault::Literal(constant),
-            None => FieldDefault::Required,
+            None => FieldDefault::Expr(value),
         }
     }
 
@@ -7301,6 +7451,120 @@ impl<'a> Lowerer<'a> {
             (Some(default), None) => FieldDefault::Expr(default),
             (None, Some(factory)) => FieldDefault::Factory(factory),
             (None, None) => FieldDefault::Required,
+        }
+    }
+
+    /// Build the `__dataclass_fields__` mapping published by a synthesized
+    /// dataclass.
+    ///
+    /// CPython's `dataclasses` decorator installs this dict on the class; the
+    /// Hydro runtime reads it in `dataclasses.is_dataclass` and
+    /// `dataclasses.fields`, and CPython library code iterates it
+    /// (`_colorize.ThemeSection.__iter__`). The mapping keys are the field
+    /// names in declaration order and the values are real
+    /// `dataclasses.field(...)` objects, so `fields()` returns the same kind
+    /// of `Field` instance a user-created one would be. A field with no
+    /// default has no `default`/`default_factory` keyword.
+    ///
+    /// A plain non-literal default (`x: str = ANSIColors.BOLD_BLUE`) is
+    /// evaluated in class scope. The static plan already evaluated the class
+    /// attribute before this mapping is built, so its parked value is reused
+    /// instead of evaluating the expression twice.
+    fn dataclass_fields_metadata(
+        &mut self,
+        s: &ast::StmtClassDef,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> HExpr {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut pairs: Vec<(HExpr, HExpr)> = Vec::new();
+        for stmt in &s.body {
+            let ast::Stmt::AnnAssign(ann) = stmt else {
+                continue;
+            };
+            let ast::Expr::Name(target) = &*ann.target else {
+                continue;
+            };
+            let field = target.id.to_string();
+            if !seen.insert(field.clone()) || self.is_classvar_annotation(&ann.annotation) {
+                continue;
+            }
+            let (field_line, field_col) = self.span(ann.range);
+            let mut keywords: Vec<(String, HExpr)> = Vec::new();
+            if let Some(value) = ann.value.as_deref() {
+                // The default value of a `field(...)` marker is its
+                // `default`/`default_factory` argument; every other value is
+                // the default itself. This reads the AST directly and never
+                // repeats the `field()` binding diagnostic the class plan
+                // already reported.
+                if let Some(call) = self.dataclasses_field_call(value) {
+                    let mut default: Option<&ast::Expr> = call.args.first();
+                    let mut factory: Option<&ast::Expr> = None;
+                    for keyword in &call.keywords {
+                        match keyword.arg.as_deref() {
+                            Some("default") if default.is_none() => default = Some(&keyword.value),
+                            Some("default_factory") if factory.is_none() => {
+                                factory = Some(&keyword.value)
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let (Some(default), None) = (default, factory) {
+                        let value = self.expr(default, fs);
+                        keywords.push(("default".to_string(), value));
+                    } else if let (None, Some(factory)) = (default, factory) {
+                        let value = self.expr(factory, fs);
+                        keywords.push(("default_factory".to_string(), value));
+                    }
+                } else if let Some(constant) = self.const_default(value) {
+                    keywords.push((
+                        "default".to_string(),
+                        HExpr {
+                            kind: HExprKind::Const(constant),
+                            ty: Ty::Concrete(Type::Any),
+                            line: field_line,
+                            col: field_col,
+                        },
+                    ));
+                } else {
+                    // Reuse the class-scope value when the static plan already
+                    // evaluated it, so the default expression runs once.
+                    let evaluated = self
+                        .class_attr_scopes
+                        .last()
+                        .and_then(|scope| scope.get(&field))
+                        .cloned()
+                        .unwrap_or_else(|| self.expr(value, fs));
+                    keywords.push(("default".to_string(), evaluated));
+                }
+            }
+            let field_value = HExpr {
+                kind: HExprKind::ModuleCall {
+                    module: "dataclasses".to_string(),
+                    function: "field".to_string(),
+                    args: Vec::new(),
+                    keywords,
+                },
+                ty: Ty::Concrete(Type::Any),
+                line: field_line,
+                col: field_col,
+            };
+            pairs.push((
+                HExpr {
+                    kind: HExprKind::Const(Const::Str(field)),
+                    ty: Ty::Concrete(Type::Str),
+                    line: field_line,
+                    col: field_col,
+                },
+                field_value,
+            ));
+        }
+        HExpr {
+            kind: HExprKind::Dict(pairs),
+            ty: Ty::Concrete(Type::Dict),
+            line,
+            col,
         }
     }
 
@@ -10326,6 +10590,7 @@ impl<'a> Lowerer<'a> {
             class: s,
             plan,
             name,
+            qualname,
             target,
             mirror_globals: mirror,
             type_params,
@@ -10434,7 +10699,7 @@ impl<'a> Lowerer<'a> {
         // CPython publishes `__module__`/`__qualname__` in the namespace.
         for (dunder, constant) in [
             ("__module__", Const::Str(self.dunder_name.clone())),
-            ("__qualname__", Const::Str(name.to_string())),
+            ("__qualname__", Const::Str(qualname.clone())),
         ] {
             statements.push(HStmt {
                 kind: HStmtKind::SetSubscript {
@@ -10499,10 +10764,33 @@ impl<'a> Lowerer<'a> {
             ns,
             bindings: plan.bindings.clone(),
             methods,
+            qualname,
         });
         let body = self.lower_block(&s.body, fs);
+        // `@dataclass` installs its field metadata after the class body ran.
+        // Build it while the class namespace is still the active scope so a
+        // default expression that names a class-body binding resolves there.
+        let dataclass_metadata = plan
+            .dataclass
+            .then(|| self.dataclass_fields_metadata(s, fs, line, col));
         fs.class_ns = previous;
         statements.extend(body);
+        if let Some(metadata) = dataclass_metadata {
+            statements.push(HStmt {
+                kind: HStmtKind::SetSubscript {
+                    object: ns_ref.clone(),
+                    index: HExpr {
+                        kind: HExprKind::Const(Const::Str("__dataclass_fields__".to_string())),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    },
+                    value: metadata,
+                },
+                line,
+                col,
+            });
+        }
         // CPython publishes `__type_params__` after the body has run, so a
         // class-body binding of the same name never wins. The namespace is a
         // plain dict, so the value has to be stored explicitly.
@@ -10605,6 +10893,7 @@ impl<'a> Lowerer<'a> {
                 class: s,
                 plan,
                 name: &name,
+                qualname: name.clone(),
                 target,
                 mirror_globals: true,
                 type_params,
@@ -11068,6 +11357,7 @@ impl<'a> Lowerer<'a> {
                     class: s,
                     plan,
                     name: &name,
+                    qualname: name.clone(),
                     target,
                     mirror_globals: false,
                     type_params,
@@ -11135,6 +11425,7 @@ impl<'a> Lowerer<'a> {
                 class: s,
                 plan,
                 name: &name,
+                qualname: name.clone(),
                 target: bind_target,
                 mirror_globals: false,
                 type_params,
@@ -11189,6 +11480,7 @@ impl<'a> Lowerer<'a> {
             class: s,
             plan,
             name,
+            qualname,
             target,
             type_params,
             line,
@@ -11217,6 +11509,22 @@ impl<'a> Lowerer<'a> {
             })
             .collect();
         let (attributes, prelude) = {
+            // CPython's class body starts with `__module__` and `__qualname__`
+            // already in the namespace, before any annotation or member
+            // assignment. The values are compile-time constants: the current
+            // unit's name and the class's qualified name.
+            let module_value = HExpr {
+                kind: HExprKind::Const(Const::Str(self.dunder_name.clone())),
+                ty: Ty::Concrete(Type::Str),
+                line,
+                col,
+            };
+            let qualname_value = HExpr {
+                kind: HExprKind::Const(Const::Str(qualname)),
+                ty: Ty::Concrete(Type::Str),
+                line,
+                col,
+            };
             self.class_attr_scopes.push(HashMap::new());
             // Class-body expressions can read methods and method aliases that
             // were created earlier in the body; the value is the function
@@ -11233,6 +11541,10 @@ impl<'a> Lowerer<'a> {
                         },
                     );
                 }
+                // A class-body expression may read these before the class
+                // statement publishes them (`x = __qualname__`).
+                scope.insert("__module__".to_string(), module_value.clone());
+                scope.insert("__qualname__".to_string(), qualname_value.clone());
             }
             // A chained assignment (`a = b = value`) shares one right-hand
             // side among several names and an unpacking target (`a, b =
@@ -11257,7 +11569,11 @@ impl<'a> Lowerer<'a> {
                     )
                 });
             let mut prelude: Vec<HStmt> = Vec::new();
-            let mut attributes = Vec::with_capacity(plan.attributes.len());
+            let mut attributes = Vec::with_capacity(plan.attributes.len() + 2);
+            // Published first, in CPython's class-namespace order, so a later
+            // body assignment to either name still wins.
+            attributes.push(("__module__".to_string(), module_value));
+            attributes.push(("__qualname__".to_string(), qualname_value));
             let mut start = 0;
             while start < plan.attributes.len() {
                 // Every attribute an assignment publishes carries the same
@@ -11322,6 +11638,16 @@ impl<'a> Lowerer<'a> {
                     }
                     attributes.push(("__annotations__".to_string(), annotations));
                 }
+            }
+            // `@dataclass` installs its field metadata after the class body has
+            // run, so the synthetic mapping wins over a body assignment of the
+            // same name (CPython's decorator overwrites it too).
+            if plan.dataclass {
+                let metadata = self.dataclass_fields_metadata(s, fs, line, col);
+                if let Some(scope) = self.class_attr_scopes.last_mut() {
+                    scope.insert("__dataclass_fields__".to_string(), metadata.clone());
+                }
+                attributes.push(("__dataclass_fields__".to_string(), metadata));
             }
             self.class_attr_scopes.pop();
             // CPython publishes the PEP 695 parameter list on the class after
@@ -11620,6 +11946,13 @@ impl<'a> Lowerer<'a> {
     ) -> Option<HStmt> {
         let ns = fs.class_ns.as_ref()?.ns;
         let name = s.name.to_string();
+        // CPython qualifies a nested class with its enclosing class
+        // (`Outer.Inner`); `fs.class_ns` carries the enclosing class's
+        // qualname because its body is the scope this class statement runs in.
+        let qualname = {
+            let outer = fs.class_ns.as_ref()?.qualname.clone();
+            format!("{outer}.{name}")
+        };
         let (target, target_ref) = self.hidden_temp(fs, "$nestedclass", Type::Any);
         let mut statements = Vec::new();
         if plan.dynamic {
@@ -11629,6 +11962,7 @@ impl<'a> Lowerer<'a> {
                     class: s,
                     plan,
                     name: &name,
+                    qualname: qualname.clone(),
                     target,
                     mirror_globals: false,
                     type_params,
@@ -11643,6 +11977,7 @@ impl<'a> Lowerer<'a> {
                     class: s,
                     plan,
                     name: &name,
+                    qualname,
                     target,
                     mirror_globals: false,
                     type_params,
@@ -11779,8 +12114,19 @@ impl<'a> Lowerer<'a> {
                 })
             }
             ast::Expr::Tuple(_) | ast::Expr::List(_) => {
-                let targets = self.unpack_targets(target, fs)?;
-                Some(HStmtKind::Unpack { targets, value })
+                if unpack_contains_slice(target) {
+                    // A slice element (`self[:], result = [], self[:]`) cannot
+                    // be represented by `HStmtKind::Unpack`, whose subscript
+                    // targets store through `SetSubscript`. Extract every
+                    // top-level element into a hidden local first, then bind
+                    // the original targets in source order so slice elements
+                    // lower through `HStmtKind::SetSlice`.
+                    let block = self.lower_slice_unpack_store(target, value, fs)?;
+                    Some(block.kind)
+                } else {
+                    let targets = self.unpack_targets(target, fs)?;
+                    Some(HStmtKind::Unpack { targets, value })
+                }
             }
             other => {
                 self.error_at(
@@ -12122,6 +12468,142 @@ impl<'a> Lowerer<'a> {
                 },
                 then_body,
                 else_body: Vec::new(),
+            },
+            line,
+            col,
+        })
+    }
+
+    /// Lower `a[:], result = value` (an unpacking target with a slice
+    /// element), which `HStmtKind::Unpack` cannot express: its subscript
+    /// targets always call `SetSubscript`, while a slice must splice through
+    /// `SetSlice`.
+    ///
+    /// The source value is still unpacked once, with the runtime checking the
+    /// exact element count. Each top-level element lands in a hidden local;
+    /// the original targets then bind left to right in source order, so
+    /// receiver/index evaluation and slice replacement happen exactly once
+    /// and after the whole sequence was validated, matching CPython.
+    fn lower_slice_unpack_store(
+        &mut self,
+        target: &ast::Expr,
+        value: HExpr,
+        fs: &mut FuncState,
+    ) -> Option<HStmt> {
+        let (line, col) = self.span(target.range());
+        let elements = match target {
+            ast::Expr::Tuple(tuple) => tuple.elts.as_slice(),
+            ast::Expr::List(list) => list.elts.as_slice(),
+            other => {
+                self.error_at(other.range(), "unpacking target must be a tuple or list");
+                return None;
+            }
+        };
+        let mut staged = Vec::with_capacity(elements.len());
+        let mut placeholders = Vec::with_capacity(elements.len());
+        let mut starred = false;
+        for element in elements {
+            // A starred element captures the middle list; the star wrapper
+            // itself is not a bindable target.
+            let bindable = match element {
+                ast::Expr::Starred(star) => {
+                    if starred {
+                        self.error_at(
+                            star.range,
+                            "multiple starred unpacking targets are not allowed",
+                        );
+                        return None;
+                    }
+                    starred = true;
+                    &*star.value
+                }
+                other => other,
+            };
+            let (temp, temp_ref) = self.unpack_temp(fs, element);
+            placeholders.push(if matches!(element, ast::Expr::Starred(_)) {
+                HUnpackTarget::Star(Box::new(HUnpackTarget::Name(temp)))
+            } else {
+                HUnpackTarget::Name(temp)
+            });
+            staged.push((bindable, temp_ref));
+        }
+        let mut body = Vec::with_capacity(staged.len() + 1);
+        body.push(HStmt {
+            kind: HStmtKind::Unpack {
+                targets: placeholders,
+                value,
+            },
+            line,
+            col,
+        });
+        for (bindable, temp_ref) in staged {
+            if matches!(bindable, ast::Expr::Tuple(_) | ast::Expr::List(_)) {
+                // A nested container is unpacked the same way, after its
+                // element was extracted.
+                body.push(self.lower_slice_unpack_store(bindable, temp_ref, fs)?);
+                continue;
+            }
+            let kind = self.lower_store(bindable, temp_ref, fs)?;
+            let mirror = self.slice_unpack_mirror(bindable, &kind, fs, line, col);
+            body.push(HStmt { kind, line, col });
+            if let Some(mirror) = mirror {
+                body.push(mirror);
+            }
+        }
+        Some(if_true_block(body, line, col))
+    }
+
+    /// The module-global store for a name bound by
+    /// [`Self::lower_slice_unpack_store`], on the same conditions as
+    /// [`Self::push_lowered_stmt`]. The desugared statement is an `if True:`
+    /// block, so the ordinary mirroring pass cannot see the inner binding.
+    fn slice_unpack_mirror(
+        &mut self,
+        target: &ast::Expr,
+        kind: &HStmtKind,
+        fs: &FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        if !fs.is_module {
+            return None;
+        }
+        let ast::Expr::Name(name) = target else {
+            return None;
+        };
+        if !self.mirror_all_globals && !self.used_globals.contains(name.id.as_str()) {
+            return None;
+        }
+        let (local, cell) = match kind {
+            HStmtKind::Assign { target, .. } => (*target, false),
+            HStmtKind::CellAssign { target, .. } => (*target, true),
+            _ => return None,
+        };
+        let ty = match self
+            .functions
+            .get(fs.fid as usize)
+            .and_then(|function| function.locals.get(local as usize))
+        {
+            Some(local) => local.ty,
+            None => Ty::Concrete(Type::Any),
+        };
+        // A closure-cell binding stores the cell object in its slot, so the
+        // published value is the cell's contents.
+        let value = if cell {
+            self.local_read(fs, local, ty, line, col)
+        } else {
+            HExpr {
+                kind: HExprKind::Local(local),
+                ty,
+                line,
+                col,
+            }
+        };
+        Some(HStmt {
+            kind: HStmtKind::GlobalSet {
+                module: self.dunder_name.clone(),
+                name: name.id.to_string(),
+                value,
             },
             line,
             col,
@@ -14245,6 +14727,79 @@ impl<'a> Lowerer<'a> {
         })
     }
 
+    /// Bindings a module-level loop target publishes into the runtime global
+    /// table, as `(name, local slot)` pairs.
+    ///
+    /// CPython executes a module body in the module namespace, so `for x in
+    /// ...` binds the same global an assignment does. Hydro keeps the loop
+    /// target in a module-frame local, so an imported unit must store it into
+    /// the global table on every iteration; otherwise importers and a later
+    /// `del x` (CPython's `tokenize` does `for _prefix ...` then `del
+    /// _prefix`) see a missing global. An explicit `global x` target has its
+    /// own store and is not repeated here.
+    fn module_loop_bindings(
+        fs: &FuncState,
+        target: &ast::Expr,
+        var: Option<LocalId>,
+        global: Option<&str>,
+        unpack: Option<&[HUnpackTarget]>,
+    ) -> Vec<(String, LocalId)> {
+        if !fs.is_module || global.is_some() {
+            return Vec::new();
+        }
+        if let Some(local) = var {
+            return match target {
+                ast::Expr::Name(name) => vec![(name.id.to_string(), local)],
+                _ => Vec::new(),
+            };
+        }
+        let Some(targets) = unpack else {
+            return Vec::new();
+        };
+        let mut bound = Vec::new();
+        collect_unpack_binding_names(target, targets, &mut bound);
+        bound
+    }
+
+    /// `GlobalSet` statements publishing each module-level loop binding.
+    ///
+    /// They run at the start of every iteration, after the loop target was
+    /// assigned, matching CPython's namespace update before the body.
+    fn module_loop_global_stores(
+        &self,
+        fs: &FuncState,
+        bindings: &[(String, LocalId)],
+        line: u32,
+        col: u32,
+    ) -> Vec<HStmt> {
+        if !fs.is_module {
+            return Vec::new();
+        }
+        bindings
+            .iter()
+            .filter(|(name, _)| {
+                self.mirror_all_globals || self.used_globals.contains(name.as_str())
+            })
+            .map(|(name, local)| {
+                let ty = self
+                    .functions
+                    .get(fs.fid as usize)
+                    .and_then(|function| function.locals.get(*local as usize))
+                    .map(|local| local.ty)
+                    .unwrap_or(Ty::Concrete(Type::Any));
+                HStmt {
+                    kind: HStmtKind::GlobalSet {
+                        module: self.dunder_name.clone(),
+                        name: name.clone(),
+                        value: self.local_read(fs, *local, ty, line, col),
+                    },
+                    line,
+                    col,
+                }
+            })
+            .collect()
+    }
+
     /// Lower `for target in iterable:` (and its optional `else:`) to
     /// [`HStmtKind::ForRange`] or [`HStmtKind::ForEach`].
     #[allow(clippy::too_many_arguments)]
@@ -14264,6 +14819,14 @@ impl<'a> Lowerer<'a> {
             global: global_var,
             unpack: unpack_targets,
         } = self.resolve_loop_target(target, fs)?;
+        // Computed before the target locals move into the IR node below.
+        let module_bindings = Self::module_loop_bindings(
+            fs,
+            target,
+            var,
+            global_var.as_deref(),
+            unpack_targets.as_deref(),
+        );
 
         // `range(...)` keeps its dedicated `ForRange` form; every other
         // iterable is lowered to the runtime iterator form.
@@ -14341,6 +14904,9 @@ impl<'a> Lowerer<'a> {
                     col,
                 });
             }
+            // A module-level target is a module global: publish the value the
+            // loop assigned before the body observes it.
+            body.extend(self.module_loop_global_stores(fs, &module_bindings, line, col));
             body.append(&mut lowered_body);
             // `else` runs after normal exhaustion only; it is outside the
             // loop, so `break`/`continue` in it bind to an enclosing loop.
@@ -14456,6 +15022,9 @@ impl<'a> Lowerer<'a> {
                 col,
             });
         }
+        // A module-level target is a module global: publish the value the
+        // range assigned before the body observes it.
+        body.extend(self.module_loop_global_stores(fs, &module_bindings, line, col));
         body.append(&mut lowered_body);
         // As for `ForEach`, `else` is outside the loop scope.
         let else_body = self.lower_block(orelse, fs);
@@ -14858,6 +15427,22 @@ impl<'a> Lowerer<'a> {
         ExcKind::from_name(name).unwrap_or(ExcKind::RuntimeError)
     }
 
+    /// Whether one `except` clause names `NameError` (alone or as one element
+    /// of a tuple). The handler may catch the `NameError` an unresolved name
+    /// read raises, so the covered `try` body keeps such reads at runtime.
+    fn handler_catches_name_error(handler: &ast::ExceptHandler) -> bool {
+        fn names_name_error(expr: &ast::Expr) -> bool {
+            match expr {
+                ast::Expr::Name(name) => name.id.as_str() == "NameError",
+                ast::Expr::Tuple(tuple) => tuple.elts.iter().any(names_name_error),
+                ast::Expr::List(list) => list.elts.iter().any(names_name_error),
+                _ => false,
+            }
+        }
+        let ast::ExceptHandler::ExceptHandler(handler) = handler;
+        handler.type_.as_deref().is_some_and(names_name_error)
+    }
+
     /// Lowers `try` with tag-based handlers; see
     /// [`Self::handler_exception_kinds`] for the user-class approximation.
     fn lower_try(
@@ -14886,7 +15471,20 @@ impl<'a> Lowerer<'a> {
             }
         }
 
+        // A `try` body whose handlers catch `NameError` may probe for a name
+        // that is absent from the compile-time bindings (`try: WindowsError`
+        // in CPython's `_compat_pickle`): the read must execute (and raise
+        // `NameError`) instead of failing the compile. Only the body is
+        // covered; the `else`/`finally` blocks run when the name was found or
+        // after the handler, so they keep static resolution.
+        let catches_name_error = s.handlers.iter().any(Self::handler_catches_name_error);
+        if catches_name_error {
+            self.name_fallback_depth += 1;
+        }
         let body = self.lower_block(&s.body, fs);
+        if catches_name_error {
+            self.name_fallback_depth -= 1;
+        }
         let mut handlers = Vec::new();
         for (idx, handler) in s.handlers.iter().enumerate() {
             let ast::ExceptHandler::ExceptHandler(h) = handler;
@@ -15948,8 +16546,9 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
-                } else if self.dynamic_module_globals
-                    && (fs.is_module || !self.module_local_names.contains(name))
+                } else if (self.dynamic_module_globals
+                    && (fs.is_module || !self.module_local_names.contains(name)))
+                    || self.name_fallback_depth > 0
                 {
                     // This module writes its namespace at runtime through
                     // `globals()`/`vars()`, so the name may exist even though
@@ -15958,7 +16557,10 @@ impl<'a> Lowerer<'a> {
                     // like CPython. A module local a function cannot see stays
                     // a compile-time scope error (the check above), and a
                     // module that never manipulates its namespace keeps
-                    // diagnosing typos.
+                    // diagnosing typos. Inside a `try` whose handlers catch
+                    // `NameError`, an unresolved name always falls back to the
+                    // global read so the runtime `NameError` is catchable
+                    // (`try: WindowsError`).
                     self.used_globals.insert(name.to_string());
                     HExpr {
                         kind: HExprKind::GlobalGet {
@@ -17639,12 +18241,7 @@ impl<'a> Lowerer<'a> {
             return self.dynamic_module_arguments(call, fs, spec);
         }
         if spec.params.is_empty() {
-            self.error_at_code(
-                call.range,
-                codes::CALL,
-                format!("{}() does not accept keyword arguments", spec.name),
-            );
-            return None;
+            return self.keyword_tail_arguments(call, fs, spec);
         }
 
         let mut slots: Vec<Option<HExpr>> = vec![None; spec.params.len()];
@@ -17716,6 +18313,61 @@ impl<'a> Lowerer<'a> {
                 .collect(),
             Vec::new(),
         ))
+    }
+
+    /// Keyword folding for a native function whose spec does not name its
+    /// parameters.
+    ///
+    /// CPython's C-level functions are mostly positional-only, but some expose
+    /// a keyword parameter the shared spec has not enumerated yet: `re.compile`
+    /// takes `flags=`, `os.open` takes the keyword-only `dir_fd=`. When the
+    /// spec has no trailing optional argument at all the call keeps the strict
+    /// compile-time rejection; otherwise the keyword values are appended in
+    /// source order after the positional arguments. The runtime dispatcher
+    /// knows the real signature and validates names, duplicates and arity.
+    fn keyword_tail_arguments(
+        &mut self,
+        call: &ast::ExprCall,
+        fs: &mut FuncState,
+        spec: &'static FunctionSpec,
+    ) -> Option<LoweredArguments> {
+        if spec.min_args == spec.max_args {
+            self.error_at_code(
+                call.range,
+                codes::CALL,
+                format!("{}() does not accept keyword arguments", spec.name),
+            );
+            return None;
+        }
+        let mut args = Vec::with_capacity(call.args.len() + call.keywords.len());
+        for arg in &call.args {
+            args.push(self.expr(arg, fs));
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        for keyword in &call.keywords {
+            let Some(name) = keyword.arg.as_ref() else {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    "**kwargs arguments are not supported",
+                );
+                return None;
+            };
+            if !seen.insert(name.as_str()) {
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    format!(
+                        "{}() got multiple values for keyword argument '{}'",
+                        spec.name,
+                        name.as_str()
+                    ),
+                );
+                return None;
+            }
+            args.push(self.expr(&keyword.value, fs));
+        }
+        Some((args, Vec::new()))
     }
 
     /// Lowers the arguments of a native function with a dynamic keyword set
@@ -19022,12 +19674,17 @@ impl<'a> Lowerer<'a> {
             };
         }
 
-        if self.dynamic_module_globals && (fs.is_module || !self.module_local_names.contains(name))
+        if (self.dynamic_module_globals
+            && (fs.is_module || !self.module_local_names.contains(name)))
+            || self.name_fallback_depth > 0
         {
             // The callee may have been installed through `globals()`/`vars()`;
             // resolve it from the module table so a missing value raises at
             // runtime instead of failing the compile. A module local a
             // function cannot see stays a compile-time scope error below.
+            // Inside a `try` whose handlers catch `NameError`, an unresolved
+            // callee always falls back to the global read so the runtime
+            // `NameError` is catchable.
             self.used_globals.insert(name.to_string());
             let (callee_line, callee_col) = self.span(name_expr.range);
             let callee = HExpr {
@@ -19328,19 +19985,17 @@ impl<'a> Lowerer<'a> {
                     );
                     return None;
                 }
-                // A `**mapping` must be the last operand: the IR evaluates the
-                // named keywords before it.
+                // The IR keeps one flattened `**mapping` slot, evaluated after
+                // the named keywords. A second `**` cannot be represented.
                 double_star = Some(self.expr(&keyword.value, fs));
                 continue;
             };
-            if double_star.is_some() {
-                self.error_at_code(
-                    keyword.range,
-                    codes::CALL,
-                    "a named keyword argument cannot follow a **mapping argument",
-                );
-                return None;
-            }
+            // CPython has allowed `f(**mapping, name=value)` since 3.5: the
+            // named keyword is an ordinary keyword operand. The IR evaluates
+            // the named values before the mapping, so the later value's side
+            // effects run slightly earlier; name binding is unchanged because
+            // the runtime checks the flattened keyword list against the
+            // mapping keys and reports a duplicate name.
             if keywords
                 .iter()
                 .any(|(existing, _)| existing.as_str() == name.as_str())
@@ -20715,6 +21370,20 @@ impl<'a> Lowerer<'a> {
                     .map(|slot| slot.unwrap_or_else(none))
                     .collect(),
             );
+        }
+        // Builtins whose `builtins` spec names their parameters bind keywords
+        // through the same positional-slot binder as native module functions:
+        // `enumerate(xs, start=1)`, `compile(src, file, "exec", flags=...)`
+        // and `format(value, format_spec=...)` all lower to the positional
+        // layout the runtime entry points use.
+        if !call.keywords.is_empty() {
+            if let Some(spec) = stdlib::function("builtins", builtin.name()) {
+                if !spec.params.is_empty() && !spec.dynamic_keywords {
+                    let (args, keywords) = self.module_arguments(call, fs, spec, line, col)?;
+                    debug_assert!(keywords.is_empty());
+                    return Some(args);
+                }
+            }
         }
         let accepts_key = matches!(builtin, Builtin::Max | Builtin::Min | Builtin::Sorted);
         let accepts_reverse = builtin == Builtin::Sorted;
@@ -22124,6 +22793,16 @@ fn collect_global_names(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
                 collect_global_names(&s.orelse, out);
             }
             ast::Stmt::For(s) => {
+                // A module-level loop target is a module global: `for x in
+                // ...` binds `x` for the rest of the body and for importers.
+                // The loop below mirrors it into the runtime global table on
+                // every iteration (see `lower_for_parts`).
+                collect_target_bound_names(&s.target, out);
+                collect_global_names(&s.body, out);
+                collect_global_names(&s.orelse, out);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                collect_target_bound_names(&s.target, out);
                 collect_global_names(&s.body, out);
                 collect_global_names(&s.orelse, out);
             }
@@ -23297,6 +23976,20 @@ fn collect_unpack_binding_name(
     }
 }
 
+/// Whether an assignment target contains a slice element anywhere in its
+/// unpacking shape (`a[:], b = value`, `(a, b[1:2]), c = value`). Such a
+/// target cannot lower through `HStmtKind::Unpack`, whose subscript stores are
+/// plain `SetSubscript` operations.
+fn unpack_contains_slice(target: &ast::Expr) -> bool {
+    match target {
+        ast::Expr::Tuple(tuple) => tuple.elts.iter().any(unpack_contains_slice),
+        ast::Expr::List(list) => list.elts.iter().any(unpack_contains_slice),
+        ast::Expr::Starred(star) => unpack_contains_slice(&star.value),
+        ast::Expr::Subscript(subscript) => matches!(&*subscript.slice, ast::Expr::Slice(_)),
+        _ => false,
+    }
+}
+
 /// Names bound by `import` statements in one scope.
 ///
 /// Nested `def`/`class` bodies are separate scopes and are not visited. Used to
@@ -24257,6 +24950,14 @@ fn stmt_uses_dynamic_globals(stmt: &ast::Stmt, shadowed: &HashSet<String>) -> bo
                 || s.decorator_list
                     .iter()
                     .any(|decorator| expr_mentions_dynamic_globals(decorator, shadowed))
+                // `enum.global_enum` installs the class members into this
+                // module's namespace from inside the decorator, so its body
+                // is invisible here. Treat the module as dynamic: member
+                // reads without a static binding resolve through the global
+                // table (calendar.Month/Day, mailbox, _strptime).
+                || s.decorator_list
+                    .iter()
+                    .any(class_decorator_exports_members)
                 || module_uses_dynamic_globals(&s.body, shadowed)
         }
         ast::Stmt::TypeAlias(s) => expr_mentions_dynamic_globals(&s.value, shadowed),
@@ -24275,7 +24976,7 @@ fn expr_mentions_dynamic_globals(expr: &ast::Expr, shadowed: &HashSet<String>) -
     let mut names = Vec::new();
     let mut seen = HashSet::new();
     walk_free_expr(expr, shadowed, &mut names, &mut seen);
-    names.iter().any(|name| is_dynamic_globals_name(name))
+    names.iter().any(|name| is_dynamic_globals_name(name)) || expr_calls_namespace_update(expr)
 }
 
 /// Whether a function definition's default values run `globals()`/`vars()`.
@@ -24300,6 +25001,52 @@ fn function_defaults_use_dynamic_globals(
 
 fn is_dynamic_globals_name(name: &str) -> bool {
     name == "globals" || name == "vars"
+}
+
+/// Whether a class decorator is CPython's `enum.global_enum` (spelled bare or
+/// qualified), which copies every enum member into the defining module's
+/// namespace with `sys.modules[cls.__module__].__dict__.update(...)`.
+///
+/// The decorator is imported from a compiled module, so its body is not
+/// visible while lowering the module that uses it. The documented spelling is
+/// the compile-time signal that at least one class member becomes a module
+/// global; treating the module as dynamic only turns unresolved reads into
+/// runtime global lookups, which matches CPython exactly.
+fn class_decorator_exports_members(decorator: &ast::Expr) -> bool {
+    match decorator {
+        ast::Expr::Name(name) => name.id.as_str() == "global_enum",
+        ast::Expr::Attribute(attribute) => attribute.attr.as_str() == "global_enum",
+        ast::Expr::Call(call) => class_decorator_exports_members(&call.func),
+        _ => false,
+    }
+}
+
+/// Whether an expression is a direct namespace update call: `globals()`/
+/// `vars()` `.update(...)`, or `...__dict__.update(...)` (the form
+/// `enum.global_enum` uses through `sys.modules[...]`).
+///
+/// Only the call itself is inspected. Module statements pass their complete
+/// expression to [`expr_mentions_dynamic_globals`], so the executable update
+/// statement is seen; the `globals`/`vars` names are already covered by the
+/// ordinary free-name scan.
+fn expr_calls_namespace_update(expr: &ast::Expr) -> bool {
+    let ast::Expr::Call(call) = expr else {
+        return false;
+    };
+    let ast::Expr::Attribute(update) = &*call.func else {
+        return false;
+    };
+    if update.attr.as_str() != "update" {
+        return false;
+    }
+    match &*update.value {
+        ast::Expr::Call(inner) => matches!(
+            &*inner.func,
+            ast::Expr::Name(name) if is_dynamic_globals_name(name.id.as_str())
+        ),
+        ast::Expr::Attribute(dictionary) => dictionary.attr.as_str() == "__dict__",
+        _ => false,
+    }
 }
 
 /// Wrap a lowered statement sequence in an always-true `if`.

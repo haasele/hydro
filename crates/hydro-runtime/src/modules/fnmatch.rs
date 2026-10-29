@@ -6,6 +6,7 @@
 //! single backtracking point (the most recent `*`), so ordinary inputs run in
 //! `O(len(name) * len(pattern))` time and never recurse.
 
+use crate::container;
 use crate::exc::{self, ATTRIBUTE_ERROR, TYPE_ERROR};
 use crate::iter;
 use crate::value::{self, NONE};
@@ -347,6 +348,79 @@ fn translate(pattern: &[char]) -> String {
     out
 }
 
+/// `fnmatch._translate(pat, star, question_mark)`: the two-wildcard
+/// translator `glob` uses.
+///
+/// Returns `(fragments, star_indices)`: every literal character and wildcard
+/// becomes one regex fragment, `star_indices` records the fragment index of
+/// each (compressed) `*`. The class handling reuses [`parse_class`] /
+/// [`translate_class`], so bracket expressions match CPython's rendering.
+fn translate_parts(pattern: &[char], star: &str, question_mark: &str) -> (Vec<String>, Vec<i64>) {
+    let mut fragments: Vec<String> = Vec::new();
+    let mut star_indices: Vec<i64> = Vec::new();
+    let mut index = 0;
+    while index < pattern.len() {
+        match pattern[index] {
+            '*' => {
+                star_indices.push(fragments.len() as i64);
+                fragments.push(star.to_string());
+                while index < pattern.len() && pattern[index] == '*' {
+                    index += 1;
+                }
+            }
+            '?' => {
+                fragments.push(question_mark.to_string());
+                index += 1;
+            }
+            '[' => match parse_class(pattern, index) {
+                Some(body) => {
+                    fragments.push(translate_class(&body));
+                    index = body.end;
+                }
+                None => {
+                    fragments.push(re_escape_char('['));
+                    index += 1;
+                }
+            },
+            literal => {
+                fragments.push(re_escape_char(literal));
+                index += 1;
+            }
+        }
+    }
+    (fragments, star_indices)
+}
+
+/// `re.escape` for one character (Python 3.7+ set).
+fn re_escape_char(ch: char) -> String {
+    if ch.is_whitespace()
+        || matches!(
+            ch,
+            '\\' | '.'
+                | '^'
+                | '$'
+                | '*'
+                | '+'
+                | '?'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '|'
+                | '-'
+                | '&'
+                | '~'
+                | '#'
+        )
+    {
+        format!("\\{ch}")
+    } else {
+        ch.to_string()
+    }
+}
+
 /// Module-level dispatch for `fnmatch`.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -379,6 +453,53 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                 Err(error) => return error,
             };
             value::str_alloc(translate(&pattern))
+        }
+        "_translate" => {
+            if args.len() != 3 {
+                return arity(function, 3, args.len());
+            }
+            let pattern = match text_chars(args[0], "pat") {
+                Ok(chars) => chars,
+                Err(error) => return error,
+            };
+            let star = match value::as_str(args[1]) {
+                Some(text) => text.to_string(),
+                None => {
+                    return exc::raise_with_message(
+                        exc::TYPE_ERROR,
+                        &format!("star must be str, not {}", value::type_name(args[1])),
+                    )
+                }
+            };
+            let question = match value::as_str(args[2]) {
+                Some(text) => text.to_string(),
+                None => {
+                    return exc::raise_with_message(
+                        exc::TYPE_ERROR,
+                        &format!(
+                            "question_mark must be str, not {}",
+                            value::type_name(args[2])
+                        ),
+                    )
+                }
+            };
+            let (fragments, star_indices) = translate_parts(&pattern, &star, &question);
+            // Build both lists incrementally: each allocated string/number is
+            // owned by the list before the next allocation can collect it.
+            let fragment_list = value::list_new(Vec::new());
+            let index_list = value::list_new(Vec::new());
+            let roots = crate::heap::root_values(&[fragment_list, index_list]);
+            for fragment in fragments {
+                let item = value::str_alloc(fragment);
+                container::list_append(fragment_list, item);
+            }
+            for index in star_indices {
+                let item = value::encode_int(index).unwrap_or(NONE);
+                container::list_append(index_list, item);
+            }
+            let result = value::tuple_new(vec![fragment_list, index_list]);
+            crate::heap::release_roots(roots);
+            result
         }
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,

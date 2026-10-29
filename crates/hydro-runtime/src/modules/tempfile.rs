@@ -302,13 +302,14 @@ fn create_temp_file(prefix: &str, suffix: &str, dir: Option<&str>) -> io::Result
     ))
 }
 
-/// Validates `buffering`; the native file object is not separately buffered,
-/// so only the range/type checks are observable.
-fn buffering_arg(args: &[i64]) -> Result<(), i64> {
+/// Validates `buffering` and returns the value to forward to `io.open`.
+/// The native file object is not separately buffered, so only the range/type
+/// checks are observable.
+fn buffering_arg(args: &[i64]) -> Result<i64, i64> {
     match args.get(1).copied() {
-        None | Some(NONE) => Ok(()),
+        None | Some(NONE) => Ok(NONE),
         Some(argument) => match value::as_integer(argument) {
-            Some(size) if size >= -1 => Ok(()),
+            Some(size) if size >= -1 => Ok(argument),
             Some(_) => Err(exc::raise_with_message(
                 VALUE_ERROR,
                 "invalid buffering size",
@@ -504,9 +505,10 @@ fn new_named_temporary_file(args: &[i64]) -> i64 {
             }
         },
     };
-    if let Err(error) = buffering_arg(args) {
-        return error;
-    }
+    let buffering = match buffering_arg(args) {
+        Ok(buffering) => buffering,
+        Err(error) => return error,
+    };
     let encoding = match optional_text(args, 2, "NamedTemporaryFile", "encoding") {
         Ok(value) => value,
         Err(error) => return error,
@@ -542,12 +544,18 @@ fn new_named_temporary_file(args: &[i64]) -> i64 {
         }
     };
     let path_text = path.to_string_lossy().into_owned();
+    // CPython's `io.open` layout: file, mode, buffering, encoding, errors,
+    // newline, closefd, opener. `io.open` ignores closefd/opener, so they stay
+    // `None`; the wrapper opens an existing path.
     let open_args = [
         value::str_alloc(path_text.clone()),
         value::str_alloc(mode.clone()),
+        buffering,
         encoding,
-        newline,
         errors,
+        newline,
+        NONE,
+        NONE,
     ];
     let file_value = crate::modules::io_open(&open_args);
     if exc::pending() {
@@ -908,12 +916,37 @@ mod tests {
     #[test]
     fn named_temporary_file_rejects_text_options_in_binary_mode() {
         exc::init();
-        let args = [text("w+b"), NONE, text("utf-8")];
-        assert_eq!(call("NamedTemporaryFile", &args), NONE);
-        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
-        let message = value::to_string(exc::pending_value());
-        exc::clear();
-        assert_eq!(message, "binary mode doesn't take an encoding argument");
+        // Slots: mode, buffering, encoding, newline, suffix, prefix, dir,
+        // delete, errors. `io.open` rejects every text-only option.
+        let rejects = |args: &[i64], expected: &str| {
+            assert_eq!(call("NamedTemporaryFile", args), NONE);
+            assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+            let message = value::to_string(exc::pending_value());
+            exc::clear();
+            assert_eq!(message, expected);
+        };
+        rejects(
+            &[text("w+b"), NONE, text("utf-8")],
+            "binary mode doesn't take an encoding argument",
+        );
+        rejects(
+            &[text("w+b"), NONE, NONE, text("\n")],
+            "binary mode doesn't take a newline argument",
+        );
+        rejects(
+            &[
+                text("w+b"),
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                TRUE,
+                text("strict"),
+            ],
+            "binary mode doesn't take an errors argument",
+        );
     }
 
     #[test]

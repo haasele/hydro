@@ -5,15 +5,21 @@
 //! spaces/tabs shared by every non-blank line. `indent` splits with
 //! `str.splitlines(keepends=True)` semantics and honours an optional predicate.
 //!
-//! `wrap`/`fill`/`shorten` use the same defaults as CPython's `TextWrapper`
-//! (`width=70`, tab expansion to 8 columns, whitespace replacement and
-//! dropping, long-word breaking, hyphen-aware chunk splitting). The wrapper is
-//! an internal helper; the Python-visible `TextWrapper` class is not provided
-//! in this batch, and the module functions are the supported surface. All
-//! length calculations count Unicode scalar values, matching `len()` on `str`.
+//! `wrap`/`fill`/`shorten` and `TextWrapper` follow CPython's defaults and
+//! keyword surface (`width=70`, `initial_indent`/`subsequent_indent`, tab
+//! expansion, whitespace replacement and dropping, long-word and hyphen
+//! breaking, `max_lines`/`placeholder`, `fix_sentence_endings`). All length
+//! calculations count Unicode scalar values, matching `len()` on `str`.
+//!
+//! `TextWrapper` is exposed as the module's constructor function: the value
+//! bound to `textwrap.TextWrapper` builds an instance of the cached native
+//! class (so `type(w)`/`isinstance` see one class per runtime) whose `wrap`
+//! and `fill` methods read the instance attributes CPython exposes.
 
 use crate::builtins;
+use crate::core::globals;
 use crate::exc::{self, TYPE_ERROR, VALUE_ERROR};
+use crate::heap;
 use crate::value::{self, NONE};
 
 /// Default wrap width, matching `textwrap.TextWrapper.width`.
@@ -24,6 +30,9 @@ const TABSIZE: usize = 8;
 
 /// Placeholder used by `shorten`, matching CPython's default.
 const DEFAULT_PLACEHOLDER: &str = " [...]";
+
+/// Registry key of the cached `TextWrapper` class.
+const CLASS_KEY: &str = "textwrap.TextWrapper.class";
 
 /// Dispatches a native `textwrap` function.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
@@ -45,11 +54,102 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             Ok(text) => value::str_alloc(text),
             Err(error) => error,
         },
+        "TextWrapper" => textwrapper_new(args),
+        // Instance methods of the native `TextWrapper` class; ordinary
+        // positional calls reach them through `_textwrapper_wrap` and
+        // `_textwrapper_fill`.
+        "_textwrapper_wrap" => textwrapper_method(args, "wrap"),
+        "_textwrapper_fill" => textwrapper_method(args, "fill"),
         _ => exc::raise_with_message(
             exc::ATTRIBUTE_ERROR,
             &format!("module 'textwrap' has no attribute '{function}'"),
         ),
     }
+}
+
+/// Keyword-aware `textwrap` dispatch: `wrap`, `fill`, `shorten` and
+/// `TextWrapper` forward the `TextWrapper` keyword set.
+pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    match function {
+        "wrap" | "fill" | "shorten" | "TextWrapper" => {
+            let bound = match bind_keywords(function, args, keywords) {
+                Ok(bound) => bound,
+                Err(error) => return error,
+            };
+            call(function, &bound)
+        }
+        _ if keywords.is_empty() => call(function, args),
+        _ => type_error(format!(
+            "{function}() got an unexpected keyword argument '{}'",
+            keywords[0].0
+        )),
+    }
+}
+
+/// Binds the keyword names of the `TextWrapper` surface into their positional
+/// slots. `width` is the first option for `wrap`/`fill`/`shorten` (after the
+/// text) and the first parameter of `TextWrapper`.
+fn bind_keywords(
+    function: &str,
+    args: &[i64],
+    keywords: &[(String, i64)],
+) -> Result<Vec<i64>, i64> {
+    let first_option = if matches!(function, "wrap" | "fill" | "shorten") {
+        1
+    } else {
+        0
+    };
+    // `shorten` fills `max_lines=1` itself; a caller may still override it.
+    let mut slots = args.to_vec();
+    while slots.len() < first_option {
+        slots.push(NONE);
+    }
+    for (name, argument) in keywords {
+        let Some(offset) = wrapper_option_index(name) else {
+            return Err(type_error(format!(
+                "{function}() got an unexpected keyword argument '{name}'"
+            )));
+        };
+        let index = first_option + offset;
+        while slots.len() < index {
+            slots.push(NONE);
+        }
+        if slots.len() > index {
+            if slots[index] != NONE {
+                return Err(type_error(format!(
+                    "{function}() got multiple values for argument '{name}'"
+                )));
+            }
+            slots[index] = *argument;
+        } else {
+            slots.push(*argument);
+        }
+    }
+    // Keep the full slot layout so callers can distinguish a three-argument
+    // positional `shorten(text, width, placeholder)` call from a keyword call.
+    while slots.len() < first_option + 12 {
+        slots.push(NONE);
+    }
+    Ok(slots)
+}
+
+/// Position of a `TextWrapper` option in the constructor/`**kwargs` order.
+fn wrapper_option_index(name: &str) -> Option<usize> {
+    Some(match name {
+        "width" => 0,
+        "initial_indent" => 1,
+        "subsequent_indent" => 2,
+        "expand_tabs" => 3,
+        "replace_whitespace" => 4,
+        "fix_sentence_endings" => 5,
+        "break_long_words" => 6,
+        "break_on_hyphens" => 7,
+        "drop_whitespace" => 8,
+        "tabsize" => 9,
+        "max_lines" => 10,
+        "placeholder" => 11,
+        _ => return None,
+    })
 }
 
 fn type_error(message: String) -> i64 {
@@ -67,20 +167,6 @@ fn text_argument(args: &[i64], index: usize, function: &str) -> Result<String, i
             "{function}() argument {} must be str",
             index + 1
         ))),
-    }
-}
-
-/// An optional `width` argument; `None` becomes `default`.
-fn optional_width(args: &[i64], index: usize, function: &str, default: i64) -> Result<i64, i64> {
-    match args.get(index).copied() {
-        None | Some(NONE) => Ok(default),
-        Some(argument) => match value::as_integer(argument) {
-            Some(width) => Ok(width),
-            None => Err(type_error(format!(
-                "{function}() argument {} must be int",
-                index + 1
-            ))),
-        },
     }
 }
 
@@ -232,19 +318,22 @@ fn indent(args: &[i64]) -> i64 {
     value::str_alloc(out)
 }
 
-/// Expands tabs (to 8-column stops) and replaces wrapping whitespace with
-/// spaces, like `TextWrapper._munge_whitespace`.
-fn munge_whitespace(text: &str) -> String {
+/// `str.expandtabs(tabsize)`: tabs advance to the next tab stop, and `\n`/`\r`
+/// reset the column. A non-positive size removes tabs.
+fn expand_tabs(text: &str, tabsize: i64) -> String {
     let mut expanded = String::with_capacity(text.len());
     let mut column = 0usize;
     for character in text.chars() {
         match character {
             '\t' => {
-                let spaces = TABSIZE - column % TABSIZE;
-                for _ in 0..spaces {
-                    expanded.push(' ');
+                if tabsize > 0 {
+                    let tabsize = usize::try_from(tabsize).unwrap_or(usize::MAX);
+                    let spaces = tabsize - column % tabsize;
+                    for _ in 0..spaces {
+                        expanded.push(' ');
+                    }
+                    column += spaces;
                 }
-                column += spaces;
             }
             '\n' | '\r' => {
                 expanded.push(character);
@@ -257,15 +346,131 @@ fn munge_whitespace(text: &str) -> String {
         }
     }
     expanded
-        .chars()
-        .map(|character| {
-            if is_wrap_space(character) {
-                ' '
+}
+
+/// The configuration of a `TextWrapper` instance, matching CPython's
+/// constructor and instance attributes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Wrapper {
+    width: i64,
+    initial_indent: String,
+    subsequent_indent: String,
+    expand_tabs: bool,
+    replace_whitespace: bool,
+    fix_sentence_endings: bool,
+    break_long_words: bool,
+    break_on_hyphens: bool,
+    drop_whitespace: bool,
+    tabsize: i64,
+    max_lines: Option<usize>,
+    placeholder: String,
+}
+
+impl Default for Wrapper {
+    fn default() -> Wrapper {
+        Wrapper {
+            width: DEFAULT_WIDTH,
+            initial_indent: String::new(),
+            subsequent_indent: String::new(),
+            expand_tabs: true,
+            replace_whitespace: true,
+            fix_sentence_endings: false,
+            break_long_words: true,
+            break_on_hyphens: true,
+            drop_whitespace: true,
+            tabsize: TABSIZE as i64,
+            max_lines: None,
+            placeholder: DEFAULT_PLACEHOLDER.to_string(),
+        }
+    }
+}
+
+impl Wrapper {
+    /// `TextWrapper._munge_whitespace`.
+    fn munge_whitespace(&self, text: &str) -> String {
+        let expanded = if self.expand_tabs {
+            expand_tabs(text, self.tabsize)
+        } else {
+            text.to_string()
+        };
+        if self.replace_whitespace {
+            expanded
+                .chars()
+                .map(|character| {
+                    if is_wrap_space(character) {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .collect()
+        } else {
+            expanded
+        }
+    }
+
+    /// `TextWrapper._split`: whitespace runs plus word chunks, with hyphen
+    /// splitting only when `break_on_hyphens` allows it.
+    fn split(&self, text: &str) -> Vec<String> {
+        if self.break_on_hyphens {
+            return split_chunks(text);
+        }
+        split_whitespace_runs(text)
+    }
+
+    /// `TextWrapper._fix_sentence_endings`: a chunk ending a sentence followed
+    /// by a single space gets two spaces.
+    fn fix_sentence_endings(&self, chunks: &mut [String]) {
+        let mut index = 0;
+        while index + 1 < chunks.len() {
+            if chunks[index + 1] == " " && ends_sentence(&chunks[index]) {
+                chunks[index + 1] = "  ".to_string();
+                index += 2;
             } else {
-                character
+                index += 1;
             }
-        })
-        .collect()
+        }
+    }
+
+    /// `TextWrapper.wrap`.
+    fn wrap(&self, text: &str) -> Result<Vec<String>, i64> {
+        let munged = self.munge_whitespace(text);
+        let mut chunks = self.split(&munged);
+        if self.fix_sentence_endings {
+            self.fix_sentence_endings(&mut chunks);
+        }
+        self.wrap_chunks(chunks)
+    }
+}
+
+/// `TextWrapper.wordsep_simple_re`: whitespace runs and whole words, without
+/// hyphen or em-dash splitting.
+fn split_whitespace_runs(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut chunks = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let whitespace = is_wrap_space(chars[index]);
+        let start = index;
+        while index < chars.len() && is_wrap_space(chars[index]) == whitespace {
+            index += 1;
+        }
+        chunks.push(chars[start..index].iter().collect());
+    }
+    chunks
+}
+
+/// `TextWrapper.sentence_end_re = [a-z][.?!]["']?\z`.
+fn ends_sentence(chunk: &str) -> bool {
+    let chars: Vec<char> = chunk.chars().collect();
+    let mut end = chars.len();
+    if end > 0 && matches!(chars[end - 1], '"' | '\'') {
+        end -= 1;
+    }
+    if end < 2 {
+        return false;
+    }
+    matches!(chars[end - 1], '.' | '!' | '?') && chars[end - 2].is_ascii_lowercase()
 }
 
 fn is_word_char(c: char) -> bool {
@@ -373,28 +578,35 @@ fn split_at_chars(text: &str, at: usize) -> (String, String) {
     (head, chars.collect())
 }
 
-/// `TextWrapper._handle_long_word` with `break_long_words=True` and
-/// `break_on_hyphens=True`.
+/// `TextWrapper._handle_long_word`.
 fn handle_long_word(
-    chunks: &mut [String],
+    break_long_words: bool,
+    break_on_hyphens: bool,
+    chunks: &mut Vec<String>,
     cur_line: &mut Vec<String>,
     cur_len: usize,
     width: usize,
 ) {
+    if !break_long_words {
+        // The word is left intact; it may overflow the line.
+        if cur_line.is_empty() {
+            if let Some(chunk) = chunks.pop() {
+                cur_line.push(chunk);
+            }
+        }
+        return;
+    }
     let space_left = if width < 1 {
         1
     } else {
         width.saturating_sub(cur_len)
     };
-    if space_left == 0 {
-        return;
-    }
     let Some(chunk) = chunks.last().cloned() else {
         return;
     };
-    let mut end = space_left;
     let chars: Vec<char> = chunk.chars().collect();
-    if chars.len() > space_left {
+    let mut end = space_left.min(chars.len());
+    if break_on_hyphens && chars.len() > space_left {
         // Break after the last hyphen inside the available space, as long as
         // there are non-hyphen characters before it.
         if let Some(hyphen) = chars[..space_left.min(chars.len())]
@@ -407,146 +619,405 @@ fn handle_long_word(
         }
     }
     let (head, tail) = split_at_chars(&chunk, end);
-    cur_line.push(head);
+    if !head.is_empty() {
+        cur_line.push(head);
+    }
     if let Some(last) = chunks.last_mut() {
         *last = tail;
-    }
-}
-
-/// `TextWrapper._wrap_chunks` with the default options.
-fn wrap_chunks(
-    mut chunks: Vec<String>,
-    width: usize,
-    max_lines: Option<usize>,
-    placeholder: &str,
-) -> Result<Vec<String>, i64> {
-    let placeholder_head = placeholder.trim_start_matches(is_space);
-    if max_lines.is_some() && char_len(placeholder_head) > width {
-        return Err(exc::raise_with_message(
-            VALUE_ERROR,
-            "placeholder too large for max width",
-        ));
-    }
-    chunks.reverse();
-    let mut lines: Vec<String> = Vec::new();
-    'outer: while !chunks.is_empty() {
-        let mut cur_line: Vec<String> = Vec::new();
-        let mut cur_len = 0usize;
-        if !lines.is_empty() && chunks.last().is_some_and(|chunk| is_blank(chunk)) {
+        if last.is_empty() {
             chunks.pop();
-            if chunks.is_empty() {
-                break;
-            }
-        }
-        while let Some(chunk) = chunks.last() {
-            let length = char_len(chunk);
-            if cur_len + length <= width {
-                cur_len += length;
-                cur_line.push(chunks.pop().unwrap_or_default());
-            } else {
-                break;
-            }
-        }
-        if chunks.last().is_some_and(|chunk| char_len(chunk) > width) {
-            handle_long_word(&mut chunks, &mut cur_line, cur_len, width);
-            cur_len = cur_line.iter().map(|chunk| char_len(chunk)).sum();
-        }
-        if cur_line.last().is_some_and(|chunk| is_blank(chunk)) {
-            if let Some(removed) = cur_line.pop() {
-                cur_len = cur_len.saturating_sub(char_len(&removed));
-            }
-        }
-        if cur_line.is_empty() {
-            continue;
-        }
-        let fits = max_lines.is_none()
-            || lines.len() + 1 < max_lines.unwrap_or(0)
-            || ((chunks.is_empty()
-                || (chunks.len() == 1 && chunks.last().is_some_and(|chunk| is_blank(chunk))))
-                && cur_len <= width);
-        if fits {
-            lines.push(cur_line.concat());
-            continue;
-        }
-        // Truncation: replace the tail of this line (or a previous line) with
-        // the placeholder, like CPython's `_wrap_chunks` max_lines path.
-        loop {
-            let last_fits = cur_line
-                .last()
-                .is_some_and(|last| !is_blank(last) && cur_len + char_len(placeholder) <= width);
-            if last_fits {
-                cur_line.push(placeholder.to_string());
-                lines.push(cur_line.concat());
-                break 'outer;
-            }
-            let Some(last) = cur_line.pop() else {
-                if let Some(previous) = lines.last_mut() {
-                    let trimmed = trim_space(previous).to_string();
-                    if char_len(&trimmed) + char_len(placeholder) <= width {
-                        *previous = format!("{trimmed}{placeholder}");
-                        break 'outer;
-                    }
-                }
-                lines.push(placeholder_head.to_string());
-                break 'outer;
-            };
-            cur_len = cur_len.saturating_sub(char_len(&last));
         }
     }
-    Ok(lines)
 }
 
-fn wrap_text(
-    text: &str,
-    width: i64,
-    max_lines: Option<usize>,
-    placeholder: &str,
-) -> Result<Vec<String>, i64> {
-    if width <= 0 {
-        return Err(exc::raise_with_message(
-            VALUE_ERROR,
-            &format!("invalid width {width} (must be > 0)"),
-        ));
+impl Wrapper {
+    /// `TextWrapper._wrap_chunks`.
+    fn wrap_chunks(&self, mut chunks: Vec<String>) -> Result<Vec<String>, i64> {
+        if self.width <= 0 {
+            return Err(exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("invalid width {} (must be > 0)", self.width),
+            ));
+        }
+        let width = usize::try_from(self.width).unwrap_or(usize::MAX);
+        let placeholder_head = self.placeholder.trim_start_matches(is_space);
+        if let Some(max_lines) = self.max_lines {
+            let indent = if max_lines > 1 {
+                &self.subsequent_indent
+            } else {
+                &self.initial_indent
+            };
+            if char_len(indent) + char_len(placeholder_head) > width {
+                return Err(exc::raise_with_message(
+                    VALUE_ERROR,
+                    "placeholder too large for max width",
+                ));
+            }
+        }
+        chunks.reverse();
+        let mut lines: Vec<String> = Vec::new();
+        'outer: while !chunks.is_empty() {
+            let mut cur_line: Vec<String> = Vec::new();
+            let mut cur_len = 0usize;
+            let indent = if lines.is_empty() {
+                &self.initial_indent
+            } else {
+                &self.subsequent_indent
+            };
+            let width = width.saturating_sub(char_len(indent));
+            if self.drop_whitespace
+                && !lines.is_empty()
+                && chunks.last().is_some_and(|c| is_blank(c))
+            {
+                chunks.pop();
+                if chunks.is_empty() {
+                    break;
+                }
+            }
+            while let Some(chunk) = chunks.last() {
+                let length = char_len(chunk);
+                if cur_len + length <= width {
+                    cur_len += length;
+                    cur_line.push(chunks.pop().unwrap_or_default());
+                } else {
+                    break;
+                }
+            }
+            if chunks.last().is_some_and(|chunk| char_len(chunk) > width) {
+                handle_long_word(
+                    self.break_long_words,
+                    self.break_on_hyphens,
+                    &mut chunks,
+                    &mut cur_line,
+                    cur_len,
+                    width,
+                );
+                cur_len = cur_line.iter().map(|chunk| char_len(chunk)).sum();
+            }
+            if self.drop_whitespace && cur_line.last().is_some_and(|chunk| is_blank(chunk)) {
+                if let Some(removed) = cur_line.pop() {
+                    cur_len = cur_len.saturating_sub(char_len(&removed));
+                }
+            }
+            if cur_line.is_empty() {
+                continue;
+            }
+            let fits = self.max_lines.is_none()
+                || lines.len() + 1 < self.max_lines.unwrap_or(0)
+                || ((chunks.is_empty()
+                    || (self.drop_whitespace
+                        && chunks.len() == 1
+                        && chunks.last().is_some_and(|chunk| is_blank(chunk))))
+                    && cur_len <= width);
+            if fits {
+                lines.push(format!("{indent}{}", cur_line.concat()));
+                continue;
+            }
+            // Truncation: replace the tail of this line (or a previous line)
+            // with the placeholder, like CPython's `_wrap_chunks` max_lines
+            // path.
+            loop {
+                let last_fits = cur_line.last().is_some_and(|last| {
+                    !is_blank(last) && cur_len + char_len(&self.placeholder) <= width
+                });
+                if last_fits {
+                    cur_line.push(self.placeholder.clone());
+                    lines.push(format!("{indent}{}", cur_line.concat()));
+                    break 'outer;
+                }
+                let Some(last) = cur_line.pop() else {
+                    if let Some(previous) = lines.last_mut() {
+                        let trimmed = trim_space(previous).to_string();
+                        if char_len(&trimmed) + char_len(&self.placeholder)
+                            <= usize::try_from(self.width).unwrap_or(usize::MAX)
+                        {
+                            *previous = format!("{trimmed}{}", self.placeholder);
+                            break 'outer;
+                        }
+                    }
+                    lines.push(format!("{indent}{placeholder_head}"));
+                    break 'outer;
+                };
+                cur_len = cur_len.saturating_sub(char_len(&last));
+            }
+        }
+        Ok(lines)
     }
-    let munged = munge_whitespace(text);
-    let chunks = split_chunks(&munged);
-    wrap_chunks(chunks, width as usize, max_lines, placeholder)
+}
+
+/// Reads a string option from the positional slot layout.
+fn option_text(args: &[i64], index: usize, function: &str, default: &str) -> Result<String, i64> {
+    match args.get(index).copied() {
+        None | Some(NONE) => Ok(default.to_string()),
+        Some(argument) => match value::as_str(argument) {
+            Some(text) => Ok(text.to_string()),
+            None => Err(type_error(format!(
+                "{function}() argument {} must be str",
+                index + 1
+            ))),
+        },
+    }
+}
+
+/// Reads an integer option from the positional slot layout.
+fn option_int(args: &[i64], index: usize, function: &str, default: i64) -> Result<i64, i64> {
+    match args.get(index).copied() {
+        None | Some(NONE) => Ok(default),
+        Some(argument) => match value::as_integer(argument) {
+            Some(number) => Ok(number),
+            None => Err(type_error(format!(
+                "{function}() argument {} must be int",
+                index + 1
+            ))),
+        },
+    }
+}
+
+/// Reads a boolean option from the positional slot layout (`None` keeps the
+/// default, matching the spec binder's padding).
+fn option_bool(args: &[i64], index: usize, default: bool) -> bool {
+    match args.get(index).copied() {
+        None | Some(NONE) => default,
+        Some(argument) => value::truthy(argument),
+    }
+}
+
+/// Builds a [`Wrapper`] from the positional slot layout shared by `wrap`,
+/// `fill`, `shorten` and `TextWrapper`. `first` is the slot holding `width`.
+fn wrapper_from_args(args: &[i64], first: usize, function: &str) -> Result<Wrapper, i64> {
+    let defaults = Wrapper::default();
+    let slot = |offset: usize| first + offset;
+    let max_lines = match args.get(slot(10)).copied() {
+        None | Some(NONE) => None,
+        Some(argument) => match value::as_integer(argument) {
+            Some(lines) if lines >= 0 => Some(usize::try_from(lines).unwrap_or(usize::MAX)),
+            Some(lines) => {
+                return Err(type_error(format!(
+                    "{function}() max_lines must be non-negative (got {lines})"
+                )))
+            }
+            None => {
+                return Err(type_error(format!(
+                    "{function}() argument {} must be int",
+                    slot(10) + 1
+                )))
+            }
+        },
+    };
+    Ok(Wrapper {
+        width: option_int(args, slot(0), function, defaults.width)?,
+        initial_indent: option_text(args, slot(1), function, &defaults.initial_indent)?,
+        subsequent_indent: option_text(args, slot(2), function, &defaults.subsequent_indent)?,
+        expand_tabs: option_bool(args, slot(3), defaults.expand_tabs),
+        replace_whitespace: option_bool(args, slot(4), defaults.replace_whitespace),
+        fix_sentence_endings: option_bool(args, slot(5), defaults.fix_sentence_endings),
+        break_long_words: option_bool(args, slot(6), defaults.break_long_words),
+        break_on_hyphens: option_bool(args, slot(7), defaults.break_on_hyphens),
+        drop_whitespace: option_bool(args, slot(8), defaults.drop_whitespace),
+        tabsize: option_int(args, slot(9), function, defaults.tabsize)?,
+        max_lines,
+        placeholder: option_text(args, slot(11), function, &defaults.placeholder)?,
+    })
 }
 
 fn wrap_lines(args: &[i64], function: &str) -> Result<Vec<String>, i64> {
     let text = text_argument(args, 0, function)?;
-    let width = optional_width(args, 1, function, DEFAULT_WIDTH)?;
-    wrap_text(&text, width, None, DEFAULT_PLACEHOLDER)
+    let options = wrapper_from_args(args, 1, function)?;
+    options.wrap(&text)
 }
 
-/// `shorten`: collapse whitespace, then wrap to a single line.
+/// `shorten`: collapse whitespace, then wrap to a single line. The third
+/// positional argument is the legacy placeholder slot; `placeholder=` binds
+/// through [`call_kw`].
 fn shorten(args: &[i64]) -> Result<String, i64> {
     let text = text_argument(args, 0, "shorten")?;
-    let width = match args.get(1).copied() {
-        None | Some(NONE) => {
-            return Err(type_error(
-                "shorten() missing required argument: 'width'".to_string(),
-            ))
-        }
-        Some(argument) => match value::as_integer(argument) {
-            Some(width) => width,
-            None => return Err(type_error("shorten() argument 2 must be int".to_string())),
-        },
-    };
-    let placeholder = match args.get(2).copied() {
-        None | Some(NONE) => DEFAULT_PLACEHOLDER.to_string(),
-        Some(argument) => match value::as_str(argument) {
-            Some(text) => text.to_string(),
+    if args.get(1).copied().is_none_or(|width| width == NONE) {
+        return Err(type_error(
+            "shorten() missing required argument: 'width'".to_string(),
+        ));
+    }
+    let mut options = wrapper_from_args(args, 1, "shorten")?;
+    // A three-argument positional call keeps the historical
+    // `shorten(text, width, placeholder)` spelling (the spec passes keyword
+    // calls with the full 13-slot layout, so this cannot shadow
+    // `initial_indent=`).
+    if args.len() == 3 && args[2] != NONE {
+        match value::as_str(args[2]) {
+            Some(placeholder) => {
+                options.placeholder = placeholder.to_string();
+                options.initial_indent = String::new();
+            }
             None => return Err(type_error("shorten() argument 3 must be str".to_string())),
-        },
-    };
+        }
+    }
+    options.max_lines = Some(1);
     let collapsed = trim_space(&text)
         .split(is_space)
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    let lines = wrap_text(&collapsed, width, Some(1), &placeholder)?;
+    let lines = options.wrap(&collapsed)?;
     Ok(lines.join("\n"))
+}
+
+// -------------------------------------------------------------------------
+// TextWrapper
+// -------------------------------------------------------------------------
+
+/// Stores the wrapper options as the instance attributes CPython exposes.
+fn store_options(instance: i64, options: &Wrapper) {
+    let set = |name: &str, item: i64| value::instance_setattr(instance, name.to_string(), item);
+    set("width", value::encode_int(options.width).unwrap_or(NONE));
+    set(
+        "initial_indent",
+        value::str_alloc(options.initial_indent.clone()),
+    );
+    set(
+        "subsequent_indent",
+        value::str_alloc(options.subsequent_indent.clone()),
+    );
+    set("expand_tabs", value::bool_value(options.expand_tabs));
+    set(
+        "replace_whitespace",
+        value::bool_value(options.replace_whitespace),
+    );
+    set(
+        "fix_sentence_endings",
+        value::bool_value(options.fix_sentence_endings),
+    );
+    set(
+        "break_long_words",
+        value::bool_value(options.break_long_words),
+    );
+    set(
+        "break_on_hyphens",
+        value::bool_value(options.break_on_hyphens),
+    );
+    set(
+        "drop_whitespace",
+        value::bool_value(options.drop_whitespace),
+    );
+    set(
+        "tabsize",
+        value::encode_int(options.tabsize).unwrap_or(NONE),
+    );
+    set(
+        "max_lines",
+        match options.max_lines {
+            Some(lines) => {
+                value::encode_int(i64::try_from(lines).unwrap_or(i64::MAX)).unwrap_or(NONE)
+            }
+            None => NONE,
+        },
+    );
+    set("placeholder", value::str_alloc(options.placeholder.clone()));
+}
+
+/// Reads the wrapper options back from an instance, falling back to the
+/// defaults for attributes removed or never set.
+fn options_of(instance: i64) -> Wrapper {
+    let mut options = Wrapper::default();
+    if let Some(value) = value::instance_attr(instance, "width") {
+        if let Some(width) = value::as_integer(value) {
+            options.width = width;
+        }
+    }
+    for (name, target) in [
+        ("initial_indent", &mut options.initial_indent),
+        ("subsequent_indent", &mut options.subsequent_indent),
+        ("placeholder", &mut options.placeholder),
+    ] {
+        if let Some(value) = value::instance_attr(instance, name) {
+            if let Some(text) = value::as_str(value) {
+                *target = text.to_string();
+            }
+        }
+    }
+    for (name, target) in [
+        ("expand_tabs", &mut options.expand_tabs),
+        ("replace_whitespace", &mut options.replace_whitespace),
+        ("fix_sentence_endings", &mut options.fix_sentence_endings),
+        ("break_long_words", &mut options.break_long_words),
+        ("break_on_hyphens", &mut options.break_on_hyphens),
+        ("drop_whitespace", &mut options.drop_whitespace),
+    ] {
+        if let Some(value) = value::instance_attr(instance, name) {
+            *target = value::truthy(value);
+        }
+    }
+    if let Some(value) = value::instance_attr(instance, "tabsize") {
+        if let Some(tabsize) = value::as_integer(value) {
+            options.tabsize = tabsize;
+        }
+    }
+    if let Some(value) = value::instance_attr(instance, "max_lines") {
+        options.max_lines = value::as_integer(value).and_then(|lines| usize::try_from(lines).ok());
+    }
+    options
+}
+
+/// The cached native `TextWrapper` class: one class per runtime so
+/// `isinstance` and `type(w)` stay consistent.
+fn textwrapper_class() -> i64 {
+    if let Some(cached) = globals::registry_get(CLASS_KEY) {
+        return cached;
+    }
+    let specs: [(&str, &'static str, usize); 2] = [
+        ("wrap", "_textwrapper_wrap", 2),
+        ("fill", "_textwrapper_fill", 2),
+    ];
+    let mut values = Vec::with_capacity(specs.len());
+    let mut methods = Vec::with_capacity(specs.len());
+    for (name, native, arity) in specs {
+        let function = value::native_function_new("textwrap", native, arity);
+        values.push(function);
+        methods.push((name.to_string(), function));
+    }
+    let method_roots = heap::root_values(&values);
+    let class = value::class_new("TextWrapper".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(CLASS_KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// `TextWrapper(**kwargs)`: builds an instance of the cached class with the
+/// option attributes installed.
+fn textwrapper_new(args: &[i64]) -> i64 {
+    let options = match wrapper_from_args(args, 0, "TextWrapper") {
+        Ok(options) => options,
+        Err(error) => return error,
+    };
+    let class = textwrapper_class();
+    if exc::pending() {
+        return NONE;
+    }
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance]);
+    store_options(instance, &options);
+    heap::release_roots(roots);
+    if exc::pending() {
+        return NONE;
+    }
+    instance
+}
+
+/// `TextWrapper.wrap`/`TextWrapper.fill`.
+fn textwrapper_method(args: &[i64], method: &str) -> i64 {
+    let Some(&instance) = args.first() else {
+        return type_error(format!("TextWrapper.{method}() missing self"));
+    };
+    let text = match text_argument(args, 1, method) {
+        Ok(text) => text,
+        Err(error) => return error,
+    };
+    let options = options_of(instance);
+    match options.wrap(&text) {
+        Ok(lines) if method == "fill" => value::str_alloc(lines.join("\n")),
+        Ok(lines) => value::list_new(lines.into_iter().map(value::str_alloc).collect()),
+        Err(error) => error,
+    }
 }
 
 #[cfg(test)]
@@ -697,6 +1168,173 @@ mod tests {
         exc::clear();
 
         assert_eq!(call("nope", &[]), NONE);
+        assert!(exc::pending());
+        exc::clear();
+    }
+
+    fn int(number: i64) -> i64 {
+        value::encode_int(number).unwrap()
+    }
+
+    fn keyword(name: &str, argument: i64) -> (String, i64) {
+        (name.to_string(), argument)
+    }
+
+    #[test]
+    fn wrap_and_fill_accept_textwrapper_keywords() {
+        exc::init();
+        let result = call_kw(
+            "fill",
+            &[text("hello world")],
+            &[
+                keyword("width", int(20)),
+                keyword("initial_indent", text("* ")),
+            ],
+        );
+        assert_eq!(value::as_str(result), Some("* hello world"));
+        assert!(!exc::pending());
+
+        let lines = call_kw(
+            "wrap",
+            &[text("aa bb cc")],
+            &[
+                keyword("width", int(4)),
+                keyword("subsequent_indent", text("..")),
+            ],
+        );
+        assert_eq!(strings(lines), ["aa", "..bb", "..cc"]);
+
+        // Tab expansion is off, but whitespace replacement still turns the
+        // tab into a single space.
+        let result = call_kw(
+            "fill",
+            &[text("a\tb")],
+            &[
+                keyword("width", int(5)),
+                keyword("expand_tabs", value::FALSE),
+            ],
+        );
+        assert_eq!(value::as_str(result), Some("a b"));
+
+        let result = call_kw(
+            "fill",
+            &[text("a\tb")],
+            &[
+                keyword("width", int(5)),
+                keyword("expand_tabs", value::FALSE),
+                keyword("replace_whitespace", value::FALSE),
+            ],
+        );
+        assert_eq!(value::as_str(result), Some("a\tb"));
+
+        let lines = call_kw(
+            "wrap",
+            &[text("aa  bb   cc")],
+            &[
+                keyword("width", int(4)),
+                keyword("drop_whitespace", value::FALSE),
+            ],
+        );
+        assert_eq!(strings(lines), ["aa  ", "bb", "   ", "cc"]);
+
+        let lines = call_kw(
+            "wrap",
+            &[text("abcdefghij")],
+            &[
+                keyword("width", int(5)),
+                keyword("break_long_words", value::FALSE),
+            ],
+        );
+        assert_eq!(strings(lines), ["abcdefghij"]);
+
+        assert_eq!(wrap("aaa-bbb-ccc", 5), ["aaa-", "bbb-", "ccc"]);
+        let lines = call_kw(
+            "wrap",
+            &[text("aaa-bbb-ccc")],
+            &[
+                keyword("width", int(5)),
+                keyword("break_on_hyphens", value::FALSE),
+            ],
+        );
+        assert_eq!(strings(lines), ["aaa-b", "bb-cc", "c"]);
+
+        let result = call_kw(
+            "fill",
+            &[text("aa bb cc dd")],
+            &[
+                keyword("width", int(6)),
+                keyword("max_lines", int(1)),
+                keyword("placeholder", text("...")),
+            ],
+        );
+        assert_eq!(value::as_str(result), Some("aa..."));
+
+        let lines = call_kw(
+            "wrap",
+            &[text("One. Two. Three. Four.")],
+            &[
+                keyword("width", int(12)),
+                keyword("fix_sentence_endings", value::TRUE),
+            ],
+        );
+        assert_eq!(strings(lines), ["One.  Two.", "Three.", "Four."]);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn textwrapper_instances_wrap_and_fill() {
+        exc::init();
+        let wrapper = call(
+            "TextWrapper",
+            &[int(10), text("> "), text(".."), value::FALSE],
+        );
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_integer(value::instance_attr(wrapper, "width").expect("width")),
+            Some(10)
+        );
+        assert_eq!(
+            value::as_str(value::instance_attr(wrapper, "initial_indent").expect("indent")),
+            Some("> ")
+        );
+        assert_eq!(
+            value::instance_attr(wrapper, "expand_tabs").map(value::truthy),
+            Some(false)
+        );
+
+        let lines = call("_textwrapper_wrap", &[wrapper, text("hello world")]);
+        assert_eq!(strings(lines), ["> hello", "..world"]);
+        let filled = call("_textwrapper_fill", &[wrapper, text("hello world")]);
+        assert_eq!(value::as_str(filled), Some("> hello\n..world"));
+
+        // The class is cached, so repeated construction shares its type.
+        assert_eq!(textwrapper_class(), textwrapper_class());
+        assert_eq!(
+            value::instance_class_value(wrapper),
+            Some(textwrapper_class())
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn textwrapper_keywords_bind_through_call_kw() {
+        exc::init();
+        let wrapper = call_kw(
+            "TextWrapper",
+            &[],
+            &[
+                keyword("width", int(6)),
+                keyword("subsequent_indent", text("- ")),
+            ],
+        );
+        assert!(!exc::pending());
+        let filled = call("_textwrapper_fill", &[wrapper, text("a bb cc dd")]);
+        assert_eq!(value::as_str(filled), Some("a bb\n- cc\n- dd"));
+
+        assert_eq!(
+            call_kw("wrap", &[text("x")], &[keyword("bogus", int(1))]),
+            NONE
+        );
         assert!(exc::pending());
         exc::clear();
     }

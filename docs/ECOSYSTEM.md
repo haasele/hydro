@@ -78,10 +78,12 @@ Smoke/AOT/upstream runs are not claimed until the runner observes them.
 HNA v1/bindgen/sidecar/packaging work or for the CPython-compatible
 handle/tuple/list layout. The generated table therefore remains the honest
 last observed evidence, not the current state of every case. Current known
-blockers beyond that table: pydantic 2.14.1 imports but model smoke fails at
-typed-dict class naming/annotations; NumPy fails on delayed dtype/module
-initialization; pandas remains blocked behind those gaps. No "all ecosystem"
-claim is made; there is no passing upstream-suite record yet.
+blockers beyond that table: pydantic 2.14.1 imports through the vendored
+`enum`/typing surface, but model smoke still stops on lazy `pydantic.main`
+dynamic imports (unlinked package submodules); NumPy 2.5 now reaches
+`_multiarray_umath`'s `Py_BuildValue` after `sys.flags`/`PyType_Ready`/
+`PyContextVar_New` fixes; pandas remains blocked behind earlier gaps. No "all
+ecosystem" claim is made; there is no passing upstream-suite record yet.
 
 <!-- BEGIN GENERATED ECOSYSTEM RESULTS -->
 

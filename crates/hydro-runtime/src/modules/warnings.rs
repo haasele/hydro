@@ -1634,11 +1634,35 @@ fn deprecated_call(instance: i64, arg: i64) -> i64 {
     arg
 }
 
+/// `warnings._DEPRECATED_MSG`: the format string `_deprecated` renders when
+/// no explicit message is supplied. Kept byte-for-byte equal to
+/// `_py_warnings._DEPRECATED_MSG`, because decorators pass it through
+/// `str.format` themselves (`name` and `remove` keywords).
+const DEPRECATED_MSG: &str = "{name!r} is deprecated and slated for removal in Python {remove}";
+
+/// `warnings.EncodingWarning` (CPython exports the builtin `EncodingWarning`
+/// from `builtins` and re-exports it here): a real `Warning` subclass, cached
+/// so repeated reads share identity.
+fn encoding_warning_class() -> i64 {
+    const KEY: &str = "warnings.EncodingWarning";
+    if let Some(cached) = crate::core::globals::registry_get(KEY) {
+        return cached;
+    }
+    let base = exc::exception_class(WARNING);
+    let class = value::class_new("EncodingWarning".to_string(), base, Vec::new());
+    let roots = heap::root_values(&[class]);
+    crate::core::globals::registry_set(KEY, class);
+    heap::release_roots(roots);
+    class
+}
+
 /// Materialises a `warnings` constant.
 pub(crate) fn constant(name: &str) -> i64 {
     match name {
         "filters" => filters(),
         "deprecated" => deprecated_class(),
+        "_DEPRECATED_MSG" => value::str_alloc(DEPRECATED_MSG.to_string()),
+        "EncodingWarning" => encoding_warning_class(),
         _ => attribute_error(name),
     }
 }
@@ -1689,6 +1713,34 @@ pub(crate) fn filters() -> i64 {
 mod tests {
     use super::*;
     use crate::value::{as_class, as_integer, as_str};
+
+    #[test]
+    fn deprecated_message_and_encoding_warning_are_defined() {
+        exc::init();
+        let message = constant("_DEPRECATED_MSG");
+        assert_eq!(
+            as_str(message),
+            Some("{name!r} is deprecated and slated for removal in Python {remove}")
+        );
+        assert!(!exc::pending());
+
+        let encoding = constant("EncodingWarning");
+        assert!(!exc::pending());
+        let name = as_class(encoding).map(|state| state.name.clone());
+        assert_eq!(name.as_deref(), Some("EncodingWarning"));
+        // A distinct class deriving from `Warning`, so `issubclass` /
+        // `except Warning` and repeated module reads agree.
+        assert_eq!(encoding, constant("EncodingWarning"));
+        assert!(value::is_subclass_of(
+            encoding,
+            exc::exception_class(WARNING)
+        ));
+        assert_eq!(
+            exc::exception_tag_of_class(encoding),
+            None,
+            "a derived warning class has no native tag"
+        );
+    }
 
     #[test]
     fn deprecated_is_the_cached_warnings_class() {

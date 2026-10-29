@@ -17,6 +17,19 @@
 //! slice without splitting a character. The [`BYTES_PATTERN`] bit of a
 //! pattern's stored flags marks the byte domain; it is masked out of the
 //! public `Pattern.flags` attribute.
+//!
+//! # `sre_*` compatibility
+//!
+//! The deprecated `sre_compile`, `sre_constants` and `sre_parse` modules are
+//! thin wrappers that do `from re import _compiler as _` (and likewise for
+//! `_constants`/`_parser`) and then re-export `vars(_)`. [`constant`] serves
+//! those three names as real module values; their members come from
+//! [`submodule_constant`] and [`submodule_call`]: the SRE limits, flag bits
+//! and error class that CPython's `re/_constants.py` defines, plus
+//! `_compiler.compile` (this same engine) and `_compiler.isstring`. There is
+//! no SRE parse tree or bytecode program behind this engine, so
+//! `_parser.parse`/`parse_template` and the `OPCODES`/`ATCODES`/`CHCODES`
+//! tables are absent rather than fabricated.
 
 use regex::{bytes as regex_bytes, Regex, RegexBuilder};
 
@@ -79,6 +92,13 @@ pub(crate) fn constant(name: &str) -> i64 {
         // through the native type-name table.
         "Pattern" => return value::pattern_class(),
         "Match" => return value::match_class(),
+        // The private namespaces behind the deprecated `sre_compile`,
+        // `sre_constants` and `sre_parse` modules, which obtain them with
+        // `from re import _compiler as _` (and friends) and then re-export
+        // `vars(_)`. They are module values so `vars()` and identity work.
+        "_compiler" => return super::module_value_by_name("re._compiler"),
+        "_constants" => return super::module_value_by_name("re._constants"),
+        "_parser" => return super::module_value_by_name("re._parser"),
         // The spec table only announces the names above; anything else is
         // still reported like a missing module attribute.
         _ => {
@@ -1285,6 +1305,95 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `sre_*` compatibility facades (`re._compiler`, `re._constants`,
+// `re._parser`)
+// ---------------------------------------------------------------------------
+
+/// `MAGIC` of the SRE program format. CPython's `_sre` and `re._constants`
+/// share it (3.14's `SRE_MAGIC` in `sre_constants.h`).
+const SRE_MAGIC: i64 = 20_230_612;
+/// `MAXREPEAT`: `SRE_CODE` is `Py_UCS4`, so the bound is `u32::MAX`.
+const SRE_MAXREPEAT: i64 = u32::MAX as i64;
+/// `MAXGROUPS`: `INT32_MAX / 2` on this 64-bit build.
+const SRE_MAXGROUPS: i64 = i32::MAX as i64 / 2;
+
+/// `re._compiler.isstring(obj)`: `isinstance(obj, (str, bytes))`, the
+/// predicate the SRE compiler uses before parsing a pattern.
+fn isstring_call(args: &[i64]) -> i64 {
+    if args.len() != 1 {
+        return type_error(&format!(
+            "isstring() takes exactly one argument ({} given)",
+            args.len()
+        ));
+    }
+    value::bool_value(matches!(value::type_name(args[0]), "str" | "bytes"))
+}
+
+/// `PatternError`/`error` of the three private namespaces.
+///
+/// CPython's `re.PatternError` is its own `Exception` subclass; this runtime
+/// reports every invalid pattern as `ValueError`, so the error class here is
+/// the cached `ValueError` class. `except re.error` and `except ValueError`
+/// then catch the same failures, exactly like the `ssl.SSLError`/`OSError`
+/// mapping the socket module uses.
+fn pattern_error_class() -> i64 {
+    exc::exception_class(VALUE_ERROR)
+}
+
+/// Constants of `re._compiler`, `re._constants` and `re._parser`.
+///
+/// Each CPython namespace starts with `from ._constants import *`, so the SRE
+/// limits, the flag bits and the error class are present in all three. The
+/// `OPCODES`/`ATCODES`/`CHCODES` tables are deliberately not reported: they
+/// describe the SRE bytecode program, which this `regex`-crate engine does
+/// not produce, so any table here would be invented data.
+pub(crate) fn submodule_constant(module: &str, name: &str) -> i64 {
+    let bits = match name {
+        "MAGIC" => SRE_MAGIC,
+        "MAXREPEAT" => SRE_MAXREPEAT,
+        "MAXGROUPS" => SRE_MAXGROUPS,
+        "SRE_FLAG_IGNORECASE" => IGNORECASE,
+        "SRE_FLAG_LOCALE" => LOCALE,
+        "SRE_FLAG_MULTILINE" => MULTILINE,
+        "SRE_FLAG_DOTALL" => DOTALL,
+        "SRE_FLAG_UNICODE" => UNICODE,
+        "SRE_FLAG_VERBOSE" => VERBOSE,
+        "SRE_FLAG_DEBUG" => DEBUG,
+        "SRE_FLAG_ASCII" => ASCII,
+        // `INFO` primitive flags, from `re/_constants.py`.
+        "SRE_INFO_PREFIX" => 1,
+        "SRE_INFO_LITERAL" => 2,
+        "SRE_INFO_CHARSET" => 4,
+        "PatternError" | "error" => return pattern_error_class(),
+        _ => {
+            return exc::raise_with_message(
+                ATTRIBUTE_ERROR,
+                &format!("module '{module}' has no attribute '{name}'"),
+            )
+        }
+    };
+    value::encode_int(bits).unwrap_or(NONE)
+}
+
+/// Functions of `re._compiler`.
+///
+/// `compile` is the engine `re.compile` already exposes; `isstring` is the
+/// pattern-type predicate. `re._parser.parse`/`parse_template` are absent on
+/// purpose: this runtime hands patterns straight to the `regex` crate and
+/// never builds an SRE parse tree, so surfacing a fabricated tree would be a
+/// lie. Reading those names raises `AttributeError`.
+pub(crate) fn submodule_call(module: &str, function: &str, args: &[i64]) -> i64 {
+    match (module, function) {
+        ("re._compiler", "compile") => call("compile", args),
+        ("re._compiler", "isstring") => isstring_call(args),
+        _ => exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("module '{module}' has no attribute '{function}'"),
+        ),
+    }
+}
+
 /// Methods of a compiled `Pattern`.
 pub(crate) fn pattern_method(obj: i64, name: &str, args: &[i64]) -> i64 {
     let Some(state) = value::as_pattern(obj) else {
@@ -1923,6 +2032,103 @@ mod tests {
         // Invalid bytes patterns raise ValueError, never panic.
         call("compile", &[bytes_value(b"(")]);
         assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        exc::init();
+    }
+
+    #[test]
+    fn sre_facade_namespaces_expose_the_engine_surface() {
+        exc::init();
+        // `from re import _compiler as _` (the body of the deprecated
+        // `sre_compile`, `sre_constants` and `sre_parse` wrappers) binds a
+        // module value; repeated reads keep their identity, so `vars(_)` and
+        // `is` agree.
+        for name in ["_compiler", "_constants", "_parser"] {
+            let module = constant(name);
+            assert!(!exc::pending(), "re.{name}");
+            assert_eq!(value::type_name(module), "module", "re.{name}");
+            assert_eq!(module, constant(name), "re.{name} identity");
+            let dotted = format!("re.{name}");
+            assert_eq!(
+                value::as_str(crate::modules::module_get_by_name(&dotted, "__name__")),
+                Some(dotted.as_str())
+            );
+        }
+
+        // The SRE limits are 3.14's: `SRE_CODE` is `Py_UCS4`, and groups are
+        // limited to `INT32_MAX / 2`.
+        let magic = submodule_constant("re._constants", "MAGIC");
+        assert!(!exc::pending());
+        assert_eq!(value::as_integer(magic), Some(20_230_612));
+        assert_eq!(
+            value::as_integer(submodule_constant("re._constants", "MAXREPEAT")),
+            Some(u32::MAX as i64)
+        );
+        assert_eq!(
+            value::as_integer(submodule_constant("re._constants", "MAXGROUPS")),
+            Some(i32::MAX as i64 / 2)
+        );
+        // `from ._constants import *` puts the flag bits in all three.
+        assert_eq!(
+            value::as_integer(submodule_constant("re._compiler", "SRE_FLAG_IGNORECASE")),
+            Some(IGNORECASE)
+        );
+        assert_eq!(
+            value::as_integer(submodule_constant("re._parser", "SRE_FLAG_ASCII")),
+            Some(ASCII)
+        );
+        assert_eq!(
+            value::as_integer(submodule_constant("re._constants", "SRE_INFO_CHARSET")),
+            Some(4)
+        );
+        // One error class everywhere, and it is the class the engine raises.
+        let error = submodule_constant("re._constants", "PatternError");
+        assert_eq!(error, submodule_constant("re._constants", "error"));
+        assert_eq!(error, submodule_constant("re._compiler", "PatternError"));
+        assert_eq!(error, submodule_constant("re._parser", "error"));
+        assert_eq!(error, exc::exception_class(VALUE_ERROR));
+        call("compile", &[text("(")]);
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        exc::init();
+
+        // `_compiler.compile` is the same engine `re.compile` uses.
+        let compiled = submodule_call("re._compiler", "compile", &[text("a+")]);
+        assert!(!exc::pending());
+        assert!(value::as_pattern(compiled).is_some());
+        let found = call("search", &[compiled, text("caa")]);
+        assert!(!exc::pending());
+        assert_eq!(value::as_str(match_method(found, "group", &[])), Some("aa"));
+
+        // `isstring` is exactly `isinstance(obj, (str, bytes))`.
+        assert_eq!(
+            submodule_call("re._compiler", "isstring", &[text("x")]),
+            value::TRUE
+        );
+        assert_eq!(
+            submodule_call("re._compiler", "isstring", &[bytes_value(b"x")]),
+            value::TRUE
+        );
+        assert_eq!(
+            submodule_call("re._compiler", "isstring", &[bytearray_value(b"x")]),
+            value::FALSE
+        );
+        assert_eq!(
+            submodule_call("re._compiler", "isstring", &[int(1)]),
+            value::FALSE
+        );
+        submodule_call("re._compiler", "isstring", &[]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::init();
+
+        // No SRE parse trees exist in this engine, so `_parser.parse` is
+        // absent instead of fabricated, and `OPCODES` is not invented.
+        submodule_constant("re._parser", "parse");
+        assert_eq!(exc::pending_tag(), i64::from(ATTRIBUTE_ERROR));
+        exc::init();
+        submodule_constant("re._constants", "OPCODES");
+        assert_eq!(exc::pending_tag(), i64::from(ATTRIBUTE_ERROR));
+        exc::init();
+        submodule_call("re._parser", "parse_template", &[]);
+        assert_eq!(exc::pending_tag(), i64::from(ATTRIBUTE_ERROR));
         exc::init();
     }
 }

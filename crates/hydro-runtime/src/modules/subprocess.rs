@@ -4,7 +4,17 @@
 //! and a native `Popen` object with `wait`/`poll`/`terminate`/`kill`. There is
 //! no `shell=True`, no `communicate()` and no file-object redirection; the
 //! stream selectors accept `None`, `PIPE`, `DEVNULL` and (for `stderr`)
-//! `STDOUT`.
+//! `STDOUT`. `Popen(..., start_new_session=True)` really calls `setsid(2)` in
+//! the child.
+//!
+//! `Popen` accepts CPython's `stdin`/`stdout`/`stderr`, `text`, `encoding`,
+//! `errors`, `close_fds`, `start_new_session`, `cwd`, `env` and `preexec_fn`
+//! parameters. The stream slots map to `Stdio::inherit`, `Stdio::null` and
+//! `Stdio::piped`; a piped stdin is closed right after the spawn (the object
+//! exposes no write handle), so the child sees EOF. `encoding`/`errors` and
+//! `text` are recorded as `encoding`, `errors` and `text_mode`. `preexec_fn`
+//! cannot run a Python callable between `fork` and `exec`, so a supplied hook
+//! raises `NotImplementedError` instead of being silently ignored.
 //!
 //! `stdin`/`stdout`/`stderr` are `std::process::Stdio` choices. For
 //! `stderr=STDOUT` the child's stderr descriptor is pointed at the same pipe
@@ -24,13 +34,16 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR,
+    TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::value::{self, NONE};
@@ -833,11 +846,71 @@ fn popen_new(args: &[i64]) -> i64 {
         Ok(env) => env,
         Err(error) => return error,
     };
+    // Slot 8 is `stdin`; `output_mode` rejects `STDOUT`, which CPython also
+    // refuses for the input side.
+    let stdin = match output_mode(argument(args, 8), "stdin") {
+        Ok(mode) => mode,
+        Err(error) => return error,
+    };
+    // Slots 9 and 10 are `encoding` and `errors`. CPython stores them
+    // verbatim and derives `text_mode` from their truthiness; the values are
+    // only consumed when a text wrapper is created, and this object exposes
+    // no pipe handles, so they are recorded rather than decoded here.
+    let encoding_argument = argument(args, 9);
+    let errors_argument = argument(args, 10);
+    // `text` is slot 4; CPython's `text_mode` is the truthiness of `encoding`,
+    // `errors` or `text` (`encoding=""` does not enable it).
+    let text_mode = value::truthy(encoding_argument)
+        || value::truthy(errors_argument)
+        || value::truthy(argument(args, 4));
+    // Slot 11 is `preexec_fn`. CPython calls it between `fork` and `exec`,
+    // where no Python-level code (and therefore no Hydro object) may run:
+    // rejecting the hook is the only honest option.
+    if argument(args, 11) != NONE {
+        return exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            "subprocess: preexec_fn is not supported",
+        );
+    }
+    // `close_fds=True` is CPython's default. Hydro's child inherits the
+    // descriptor table as `std::process::Command` leaves it (standard streams
+    // replaced, unrelated descriptors neither closed nor forced inheritable),
+    // so no descriptor-set effect can be claimed here; the value is validated
+    // and recorded on the instance instead of being dropped. It stays
+    // observable as `popen.close_fds`.
+    let close_fds_argument = argument(args, 6);
+    let close_fds = if close_fds_argument == NONE {
+        true
+    } else {
+        value::truthy(close_fds_argument)
+    };
+    // Slot 7 is `start_new_session`. CPython converts it with
+    // `PyObject_IsTrue`, so any truthy value starts the new session; it is
+    // never dropped, and an omitted slot (the common case) stays false.
+    let start_new_session = match argument(args, 7) {
+        v if v == NONE => false,
+        v => value::truthy(v),
+    };
 
     let mut command = match build_command(&argv, &cwd, &env) {
         Ok(command) => command,
         Err(error) => return error,
     };
+    // Bottom of the CPython `Popen(..., stdin=...)` matrix: inherit the
+    // parent's descriptor, open `/dev/null`, or create a pipe whose parent
+    // side is closed right after the spawn.
+    match stdin {
+        StreamMode::Inherit => {}
+        StreamMode::DevNull => {
+            command.stdin(Stdio::null());
+        }
+        StreamMode::Pipe => {
+            command.stdin(Stdio::piped());
+        }
+        StreamMode::Stdout => {
+            return value_error("subprocess: stdin must not be subprocess.STDOUT");
+        }
+    }
     if stdout == StreamMode::DevNull {
         command.stdout(Stdio::null());
     } else if stdout == StreamMode::Pipe {
@@ -871,6 +944,26 @@ fn popen_new(args: &[i64]) -> i64 {
         StreamMode::Inherit => {}
     }
 
+    // `start_new_session=True` puts the child in a fresh session and process
+    // group (no controlling terminal), which is what `setsid(2)` does between
+    // fork and exec. On targets without `setsid` the flag has no effect, as in
+    // CPython's Windows implementation.
+    #[cfg(unix)]
+    if start_new_session {
+        // SAFETY: `setsid` is async-signal-safe and allocates nothing, which
+        // is what `pre_exec` requires of the child-side closure.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = start_new_session;
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return io_error(error),
@@ -884,6 +977,10 @@ fn popen_new(args: &[i64]) -> i64 {
     if let Some(reader) = child.stderr.take() {
         discard(reader);
     }
+    // The object exposes no writable stdin handle, so closing the parent's
+    // pipe end immediately gives the child EOF instead of leaving it blocked
+    // forever on a pipe nobody writes to.
+    drop(child.stdin.take());
     let pid = i64::from(child.id());
     let key = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     children().insert(key, child);
@@ -896,6 +993,33 @@ fn popen_new(args: &[i64]) -> i64 {
     );
     value::instance_setattr(instance, "returncode".to_string(), NONE);
     value::instance_setattr(instance, "pid".to_string(), int_value(pid));
+    value::instance_setattr(
+        instance,
+        "close_fds".to_string(),
+        value::bool_value(close_fds),
+    );
+    // CPython's `text_mode` is the truthiness of `encoding`/`errors`/`text`;
+    // when text mode is on without an explicit codec it records
+    // `_text_encoding()`, which Hydro's UTF-8 text path mirrors.
+    value::instance_setattr(
+        instance,
+        "text_mode".to_string(),
+        value::bool_value(text_mode),
+    );
+    let encoding_value = if encoding_argument != NONE {
+        encoding_argument
+    } else if text_mode {
+        value::str_alloc("utf-8".to_string())
+    } else {
+        NONE
+    };
+    value::instance_setattr(instance, "encoding".to_string(), encoding_value);
+    value::instance_setattr(instance, "errors".to_string(), errors_argument);
+    // CPython initializes `stdin`/`stdout`/`stderr` to `None` and only fills a
+    // stream attribute when it created a file object. Hydro has no file
+    // objects for child pipes, and the piped stdin is closed at spawn, so the
+    // attribute stays `None` just like inherited or `/dev/null` streams.
+    value::instance_setattr(instance, "stdin".to_string(), NONE);
     value::instance_setattr(instance, ID_ATTR.to_string(), int_value(key as i64));
     instance
 }
@@ -1352,10 +1476,345 @@ mod tests {
     }
 
     #[test]
+    fn popen_records_close_fds_keyword_slot() {
+        exc::init();
+        // Slot 6 of the Popen argument layout is `close_fds`; an omitted
+        // slot defaults to True, and an explicit falsy value is recorded.
+        let process = call("Popen", &[seq(&["/bin/true"])]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::instance_attr(process, "close_fds"),
+            Some(value::TRUE)
+        );
+        let _ = call("_popen_wait", &[process]);
+
+        exc::init();
+        let process = call(
+            "Popen",
+            &[
+                seq(&["/bin/true"]),
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                value::FALSE,
+            ],
+        );
+        assert!(!exc::pending());
+        assert_eq!(
+            value::instance_attr(process, "close_fds"),
+            Some(value::FALSE)
+        );
+        let _ = call("_popen_wait", &[process]);
+        assert!(!exc::pending());
+    }
+
+    #[test]
     fn popen_rejects_bad_instance() {
         exc::init();
         call("_popen_wait", &[NONE]);
         assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
         clear_error();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn popen_start_new_session_starts_a_new_session() {
+        // `sh` reads its own `/proc/self/stat` (field 6 is the session id)
+        // and writes the value to `$1`.
+        const SESSION_SCRIPT: &str =
+            "read _pid _comm _state _ppid _pgrp session _rest < /proc/self/stat; \
+             echo \"$session\" > \"$1\"";
+
+        fn session_path(tag: &str) -> String {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0);
+            std::env::temp_dir()
+                .join(format!("hydro-popen-{tag}-{}-{nanos}", std::process::id()))
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        fn child_session(tag: &str, start_new_session: bool) -> (i64, i64) {
+            let path = session_path(tag);
+            let argv = vec!["/bin/sh", "-c", SESSION_SCRIPT, "sh", path.as_str()];
+            let mut args = vec![seq(&argv), NONE, NONE, NONE, NONE, NONE, NONE];
+            if start_new_session {
+                args.push(value::TRUE);
+            }
+            exc::init();
+            let process = call("Popen", &args);
+            assert!(
+                !exc::pending(),
+                "Popen failed: {}",
+                value::to_string(exc::pending_value())
+            );
+            let pid =
+                value::as_integer(value::instance_attr(process, "pid").expect("pid")).expect("pid");
+            let code = value::as_integer(call("_popen_wait", &[process])).expect("exit code");
+            assert_eq!(code, 0, "child failed");
+            let session = std::fs::read_to_string(&path)
+                .expect("child records its session id")
+                .trim()
+                .parse::<i64>()
+                .expect("session id");
+            let _ = std::fs::remove_file(&path);
+            (pid, session)
+        }
+
+        // Without the flag the child stays in the caller's session.
+        let (_, inherited) = child_session("inherit", false);
+        // SAFETY: `getsid(0)` only reads the calling thread's session id.
+        let parent = i64::from(unsafe { libc::getsid(0) });
+        assert_eq!(inherited, parent);
+
+        // `setsid` makes the child a session leader, so its session id is its
+        // own pid — and therefore differs from the parent's session.
+        let (pid, session) = child_session("new", true);
+        assert_eq!(session, pid, "the child must lead its own session");
+        assert_ne!(session, parent, "the child session must be new");
+    }
+
+    /// Waits for `process` with a deadline so a redirection bug shows up as a
+    /// failed assertion instead of a hung test run.
+    fn wait_bounded(process: i64) -> Option<i64> {
+        let code = call("_popen_wait", &[process, value::float_new(5.0)]);
+        assert!(
+            !exc::pending(),
+            "Popen.wait failed: {}",
+            value::to_string(exc::pending_value())
+        );
+        value::as_integer(code)
+    }
+
+    #[test]
+    fn popen_applies_stdin_redirection() {
+        // `read` fails on EOF or on an unreadable descriptor, so the child
+        // reports 7 whenever its stdin is `/dev/null` or a closed pipe.
+        const READ_SCRIPT: &str = "if read x; then exit 1; else exit 7; fi";
+
+        exc::init();
+        // Slot 8 is `stdin`; DEVNULL opens the null device.
+        let process = call(
+            "Popen",
+            &[
+                seq(&["/bin/sh", "-c", READ_SCRIPT]),
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                int(DEVNULL),
+            ],
+        );
+        assert!(!exc::pending(), "Popen(DEVNULL) failed");
+        assert_eq!(wait_bounded(process), Some(7));
+
+        exc::init();
+        // PIPE creates a pipe whose parent end is closed at spawn, so the
+        // child reads EOF rather than blocking forever.
+        let process = call(
+            "Popen",
+            &[
+                seq(&["/bin/sh", "-c", READ_SCRIPT]),
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                int(PIPE),
+            ],
+        );
+        assert!(!exc::pending(), "Popen(PIPE) failed");
+        assert_eq!(wait_bounded(process), Some(7));
+
+        exc::init();
+        // `stdin=STDOUT` has no meaning (CPython rejects it too).
+        call(
+            "Popen",
+            &[
+                seq(&["/bin/true"]),
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                int(STDOUT),
+            ],
+        );
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        clear_error();
+
+        exc::init();
+        // `stdin=PIPE` composes with `stdout`/`stderr` redirection.
+        let process = call(
+            "Popen",
+            &[
+                seq(&["/bin/sh", "-c", "echo out; echo err >&2"]),
+                NONE,
+                int(PIPE),
+                int(PIPE),
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                int(PIPE),
+            ],
+        );
+        assert!(!exc::pending(), "Popen with piped stdio failed");
+        assert_eq!(wait_bounded(process), Some(0));
+    }
+
+    #[test]
+    fn popen_records_text_encoding_and_errors() {
+        fn popen_with(slots: &mut Vec<i64>) -> i64 {
+            slots.resize(12, NONE);
+            exc::init();
+            let process = call("Popen", slots.as_slice());
+            assert!(
+                !exc::pending(),
+                "Popen failed: {}",
+                value::to_string(exc::pending_value())
+            );
+            process
+        }
+
+        // Defaults: no text mode, no encoding, no errors, no stdin handle.
+        let process = popen_with(&mut vec![seq(&["/bin/true"])]);
+        assert_eq!(
+            value::instance_attr(process, "text_mode"),
+            Some(value::FALSE)
+        );
+        assert_eq!(value::instance_attr(process, "encoding"), Some(NONE));
+        assert_eq!(value::instance_attr(process, "errors"), Some(NONE));
+        assert_eq!(value::instance_attr(process, "stdin"), Some(NONE));
+        let _ = wait_bounded(process);
+
+        // Slot 9/10: `encoding='utf-8', errors='strict'` turn text mode on.
+        let process = popen_with(&mut vec![
+            seq(&["/bin/true"]),
+            NONE,
+            NONE,
+            NONE,
+            NONE,
+            NONE,
+            NONE,
+            NONE,
+            NONE,
+            text("utf-8"),
+            text("strict"),
+        ]);
+        assert_eq!(
+            value::instance_attr(process, "text_mode"),
+            Some(value::TRUE)
+        );
+        assert_eq!(
+            value::as_str(value::instance_attr(process, "encoding").expect("encoding")),
+            Some("utf-8")
+        );
+        assert_eq!(
+            value::as_str(value::instance_attr(process, "errors").expect("errors")),
+            Some("strict")
+        );
+        let _ = wait_bounded(process);
+
+        // Slot 4: `text=True` alone implies the runtime's UTF-8 text path.
+        let process = popen_with(&mut vec![
+            seq(&["/bin/true"]),
+            NONE,
+            NONE,
+            NONE,
+            value::TRUE,
+        ]);
+        assert_eq!(
+            value::instance_attr(process, "text_mode"),
+            Some(value::TRUE)
+        );
+        assert_eq!(
+            value::as_str(value::instance_attr(process, "encoding").expect("encoding")),
+            Some("utf-8")
+        );
+        assert_eq!(value::instance_attr(process, "errors"), Some(NONE));
+        let _ = wait_bounded(process);
+
+        // An empty codec name is falsy in CPython, so it keeps binary mode.
+        let process = popen_with(&mut vec![
+            seq(&["/bin/true"]),
+            NONE,
+            NONE,
+            NONE,
+            NONE,
+            NONE,
+            NONE,
+            NONE,
+            NONE,
+            text(""),
+        ]);
+        assert_eq!(
+            value::instance_attr(process, "text_mode"),
+            Some(value::FALSE)
+        );
+        assert_eq!(
+            value::as_str(value::instance_attr(process, "encoding").expect("encoding")),
+            Some("")
+        );
+        let _ = wait_bounded(process);
+    }
+
+    #[test]
+    fn popen_rejects_preexec_fn() {
+        exc::init();
+        // Slot 11 is `preexec_fn`; a Python hook cannot run between `fork`
+        // and `exec`, so a supplied one is reported instead of ignored.
+        call(
+            "Popen",
+            &[
+                seq(&["/bin/true"]),
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                value::native_function_new("test", "preexec_hook", 0),
+            ],
+        );
+        assert_eq!(exc::pending_tag(), i64::from(NOT_IMPLEMENTED_ERROR));
+        clear_error();
+
+        // An explicit `None` is the default and spawns normally.
+        exc::init();
+        let process = call(
+            "Popen",
+            &[
+                seq(&["/bin/true"]),
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+            ],
+        );
+        assert!(!exc::pending(), "Popen(preexec_fn=None) failed");
+        let _ = wait_bounded(process);
     }
 }

@@ -70,15 +70,15 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-10-29: **2553 tests listed
-(2552 passed, 1 skipped)**; the per-crate breakdown below sums to 2553:
+`cargo nextest run --workspace` on 2026-10-30: **2764 tests run
+(2764 passed, 1 skipped)**; the per-crate breakdown below sums to 2764:
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 1553 |
-| frontend | 788 |
+| runtime (unit + integration) | 1728 |
+| frontend | 815 |
 | codegen | 76 |
-| IR | 51 |
+| IR | 60 |
 | bindgen | 42 |
 | interpreter | 24 |
 | parser | 19 |
@@ -90,11 +90,12 @@ Tea (separate repository) `cargo test` is green: **154 E2E tests** plus all
 other suites, including HNA 7/7, bindgen 2/2, sidecar 6/6 and wheels 15/15.
 Other docs must link here instead of repeating the total.
 
-### Compatibility checkpoint (2026-10-29)
+### Compatibility checkpoint (2026-10-30)
 
-- **Import matrix:** **145/297 modules importable** (31 builtin/frozen, 102 pure,
-  12 extension; 152 failed; 9 modules fail under CPython 3.14.9 itself).
-  Report: `docs/COMPATIBILITY.md`, JSON `benchmarks/compat/latest.json`.
+- **Import matrix:** **210/297 modules importable** (50 builtin/frozen, 124 pure,
+  35 extension, 1 CPython-failing; 87 fail; 9 modules fail under CPython 3.14.9
+  itself). Report: `docs/COMPATIBILITY.md`, JSON
+  `benchmarks/compat/latest.json`.
 - **Official suite:** **3/398 passing** (`test_errno.py`,
   `test_int_literal.py`, `test_longexp.py`), 333 `hydro_fail`, 62
   `expected_fail` (CPython also fails), 0 timeouts; full differential run took
@@ -102,9 +103,11 @@ Other docs must link here instead of repeating the total.
   `hydro_pass` runs.
 - **Ecosystem:** the ABI inventory reports **0 missing required symbols** across
   68 pinned extension modules. `pydantic 2.14.1` imports through the real
-  `_pydantic_core` extension; pydantic model smoke still fails at typed-dict
-  class naming/annotations, NumPy fails at delayed dtype/module init, and
-  pandas remains blocked. Pinned ecosystem report: `docs/ECOSYSTEM.md`.
+  `_pydantic_core` extension with the vendored `enum`/typing surface; model
+  smoke still stops on lazy `pydantic.main` dynamic imports. NumPy 2.5 now
+  reaches `_multiarray_umath`'s `Py_BuildValue` after `sys.flags`,
+  `PyType_Ready` and `PyContextVar_New` fixes; pandas remains blocked by
+  earlier semantic gaps. Pinned ecosystem report: `docs/ECOSYSTEM.md`.
 - **Native bindings:** HNA v1, `hydro-bindgen` and `_hydro_sidecar` protocol v1
   are implemented and tested (see the checkpoint above and
   `docs/NATIVE_BINDINGS.md` §3.7); Tier 2 is implemented for the v1 slice and
@@ -112,8 +115,10 @@ Other docs must link here instead of repeating the total.
 - **C-API:** limited-API fixture runs under JIT/AOT without `libpython`;
   multi-phase init, wheel tags, heap types, vectorcall, buffers, the
   CPython-compatible handle prefix and `PyTuple`/`PyList` item access, and the
-  pinned-wheel link-time symbol set work. Full `tp_traverse`/`tp_clear`,
-  GIL/thread integration and the NumPy/pandas ecosystem model remain open.
+  pinned-wheel link-time symbol set work. `PyGC_Collect` now drives real
+  `tp_traverse`/`tp_clear` (visitproc order fixed), and threaded
+  callback/GC stress plus pydantic-core/NumPy link probes pass. NumPy/pandas
+  ecosystem model and lazy module imports remain open.
 - **Benchmarks:** default-GC micro suite (2026-10-29) passes all 22 workloads
   plus startup: hello JIT/AOT 1.54/1.35 ms, while_sum 4.28/1.83 ms,
   math_loop 3.28/1.58 ms, async_gather 24.08/22.37 ms; generator_sum is now
@@ -132,7 +137,7 @@ Other docs must link here instead of repeating the total.
   resumes remain the narrowest compute result but are now faster than CPython
   (P5 focuses on PGO/inlining).
 - Full CPython stdlib/P7 parity, C extensions/full ABI behavior, and the
-  ecosystem suites remain open; 145/297 stdlib modules import.
+  ecosystem suites remain open; 210/297 stdlib modules import.
 - Imports: packages, dotted/relative imports, site-packages and vendored
   `stdlib/` work; dynamic imports of unlinked package submodules, namespace/
   zip/frozen imports and `from x import *` remain incomplete.

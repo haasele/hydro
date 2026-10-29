@@ -114,7 +114,11 @@ fn parse_module(
 /// while an absent one stays deferred; a module-level `try` body links only
 /// modules whose initializer cannot fail inside the handler. Imported module
 /// bodies are compiled into the returned [`Program`] and run before the entry
-/// module (see [`Program::initializers`]).
+/// module (see [`Program::initializers`]). A module that reads a partially
+/// initialized ancestor package (NumPy's `_typing` helpers read `numpy.dtype`)
+/// is initialized after that package body when the import chain has a
+/// function-only edge that can be relaxed; direct submodule imports keep the
+/// existing dependency order.
 ///
 /// Packages that expose members through PEP 562 `__getattr__` and
 /// `importlib.import_module` (pydantic's `_dynamic_imports`) are handled by a
@@ -286,8 +290,11 @@ struct LoadedModule {
     /// that is importing this unit back). The lowerer binds their members late,
     /// through the runtime global table, and binds the module itself — not a
     /// package attribute — for `from . import sub`. A late module has no
-    /// dependency edge, so its initializer runs after this unit: its members
-    /// are readable only once the importing module's functions run.
+    /// dependency edge, so its initializer normally runs after this unit: its
+    /// members are readable only once the importing module's functions run.
+    /// The exception is a late ancestor package that this unit does not depend
+    /// on directly: `unit_initializer_order` runs the package body first so a
+    /// helper can read the names it published before importing the helper.
     late: Vec<String>,
     /// Imports nested in functions, classes or compound bodies, recorded by
     /// the scan as `(module, member)` pairs. They are not linked: the lowerer
@@ -2056,6 +2063,13 @@ impl ModuleLoader {
         if hydro_ir::stdlib::module(name).is_some() {
             return;
         }
+        if name == "__main__" {
+            // The entry module is never loaded as a dependency: the runtime
+            // publishes its module value under the canonical name, and the
+            // lowerer binds `import __main__` / `from __main__ import x`
+            // against the entry global namespace.
+            return;
+        }
 
         // A compiled extension is resolved by the lowerer: it binds
         // aliases/members to `Callee::Extension` and needs no linked module
@@ -2733,10 +2747,531 @@ fn effective_module_all(
     Some(names)
 }
 
+/// One module-level import of a unit, in the form the initializer-order pass
+/// needs: a whole module (a module alias) or named members.
+enum ModuleImportKind {
+    /// `import a.b` / `from x import sub`: binding the module value does not
+    /// need the target's body to have run.
+    ModuleAlias,
+    /// `from a import name, other`: named members, some of which are direct
+    /// function handles.
+    Members(Vec<String>),
+}
+
+/// Collects the imports that execute while a unit's module body initializes.
+///
+/// Nested function and class bodies run later and carry no ordering
+/// requirement; module-level control flow does execute, so its imports count.
+/// Branches whose guard is statically fixed are resolved like the import scan
+/// (`if TYPE_CHECKING:` never runs).
+fn collect_initializer_imports(
+    stmts: &[ast::Stmt],
+    current: &str,
+    package: &str,
+    out: &mut Vec<(String, ModuleImportKind)>,
+) {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Import(s) => {
+                for alias in &s.names {
+                    out.push((alias.name.to_string(), ModuleImportKind::ModuleAlias));
+                }
+            }
+            ast::Stmt::ImportFrom(s) => {
+                let level = s.level.as_ref().map(|level| level.to_u32()).unwrap_or(0);
+                let Ok(module) = lower::resolve_import_name(
+                    level,
+                    s.module.as_ref().map(|module| module.as_str()),
+                    package,
+                ) else {
+                    continue;
+                };
+                out.push((
+                    module,
+                    ModuleImportKind::Members(
+                        s.names.iter().map(|alias| alias.name.to_string()).collect(),
+                    ),
+                ));
+            }
+            // Definitions only execute their own nested imports when called.
+            ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) | ast::Stmt::ClassDef(_) => {
+            }
+            ast::Stmt::If(s) => {
+                let branch = lower::static_if_branch(&s.test, current);
+                if branch != Some(false) {
+                    collect_initializer_imports(&s.body, current, package, out);
+                }
+                if branch != Some(true) {
+                    collect_initializer_imports(&s.orelse, current, package, out);
+                }
+            }
+            ast::Stmt::For(s) => {
+                collect_initializer_imports(&s.body, current, package, out);
+                collect_initializer_imports(&s.orelse, current, package, out);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                collect_initializer_imports(&s.body, current, package, out);
+                collect_initializer_imports(&s.orelse, current, package, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_initializer_imports(&s.body, current, package, out);
+                collect_initializer_imports(&s.orelse, current, package, out);
+            }
+            ast::Stmt::With(s) => collect_initializer_imports(&s.body, current, package, out),
+            ast::Stmt::AsyncWith(s) => collect_initializer_imports(&s.body, current, package, out),
+            ast::Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_initializer_imports(&case.body, current, package, out);
+                }
+            }
+            ast::Stmt::Try(s) => {
+                collect_initializer_imports(&s.body, current, package, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_initializer_imports(&handler.body, current, package, out);
+                }
+                collect_initializer_imports(&s.orelse, current, package, out);
+                collect_initializer_imports(&s.finalbody, current, package, out);
+            }
+            ast::Stmt::TryStar(s) => {
+                collect_initializer_imports(&s.body, current, package, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_initializer_imports(&handler.body, current, package, out);
+                }
+                collect_initializer_imports(&s.orelse, current, package, out);
+                collect_initializer_imports(&s.finalbody, current, package, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Names a module body binds with a `def` statement.
+///
+/// Such exports are compiled into callable handles that exist before the
+/// defining module's body runs; importing one does not require the defining
+/// module to have initialized. Every other export (a class, an assignment, a
+/// type alias, a re-export) is a value stored by the body and does.
+fn module_callable_names(module: &ast::ModModule, current: &str) -> HashSet<String> {
+    // Only definitions that always execute are callable handles before the
+    // body runs. A definition inside a loop, a `try` or an open branch may
+    // never execute, so it keeps the edge hard.
+    fn walk(stmts: &[ast::Stmt], current: &str, out: &mut HashSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                ast::Stmt::FunctionDef(s) => {
+                    out.insert(s.name.to_string());
+                }
+                ast::Stmt::AsyncFunctionDef(s) => {
+                    out.insert(s.name.to_string());
+                }
+                ast::Stmt::If(s) => {
+                    let branch = lower::static_if_branch(&s.test, current);
+                    match branch {
+                        Some(true) => walk(&s.body, current, out),
+                        Some(false) => walk(&s.orelse, current, out),
+                        None => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut names = HashSet::new();
+    walk(&module.body, current, &mut names);
+    names
+}
+
+/// Callable exports of every unit, following explicit and star re-exports.
+///
+/// A package initializer often only re-exports its implementation module
+/// (`numpy/linalg/__init__.py` does `from ._linalg import *`). Importing
+/// `matrix_power` from that package binds the same compiled function handle as
+/// importing it from `_linalg`, so the re-export must be recognized before an
+/// edge can be called soft. Only `def` names are propagated: classes and plain
+/// assignments stay values that need the defining body to have run.
+fn initializer_callable_names(
+    units: &[LoadedModule],
+    by_name: &HashMap<String, usize>,
+) -> HashMap<usize, HashSet<String>> {
+    fn collect(
+        index: usize,
+        units: &[LoadedModule],
+        by_name: &HashMap<String, usize>,
+        cache: &mut HashMap<usize, HashSet<String>>,
+        visiting: &mut HashSet<usize>,
+    ) -> HashSet<String> {
+        if let Some(cached) = cache.get(&index) {
+            return cached.clone();
+        }
+        if !visiting.insert(index) {
+            return HashSet::new();
+        }
+        let unit = &units[index];
+        let mut names = module_callable_names(&unit.module, &unit.name);
+        let mut imports = Vec::new();
+        collect_initializer_imports(&unit.module.body, &unit.name, &unit.package, &mut imports);
+        for (module, kind) in imports {
+            let Some(&dep) = by_name.get(&module) else {
+                continue;
+            };
+            if dep == index {
+                continue;
+            }
+            let dep_names = collect(dep, units, by_name, cache, visiting);
+            if let ModuleImportKind::Members(members) = kind {
+                for name in members {
+                    if name == "*" {
+                        names.extend(dep_names.iter().cloned());
+                    } else if !by_name.contains_key(&format!("{module}.{name}"))
+                        && dep_names.contains(&name)
+                    {
+                        names.insert(name);
+                    }
+                }
+            }
+        }
+        visiting.remove(&index);
+        cache.insert(index, names.clone());
+        names
+    }
+
+    let mut cache = HashMap::new();
+    for index in 0..units.len() {
+        let mut visiting = HashSet::new();
+        collect(index, units, by_name, &mut cache, &mut visiting);
+    }
+    cache
+}
+
+/// Whether the importer's module body can initialize before `dep`'s.
+///
+/// Only a `from dep import name` where every imported `name` is a `def` in
+/// `dep` qualifies: the lowerer binds those to direct handles, so
+/// running the importer's body first cannot observe a missing value. A module
+/// alias, a star import, a submodule binding, an assignment/value export and
+/// every edge added by preload (extension support, deferred discovery) are
+/// conservative: the importer may read the target's namespace and must stay
+/// after it.
+fn initializer_edge_is_soft(
+    units: &[LoadedModule],
+    by_name: &HashMap<String, usize>,
+    callables: &HashMap<usize, HashSet<String>>,
+    importer: usize,
+    dep: usize,
+) -> bool {
+    let dep_unit = &units[dep];
+    let callable = callables.get(&dep).cloned().unwrap_or_default();
+    let mut imports = Vec::new();
+    collect_initializer_imports(
+        &units[importer].module.body,
+        &units[importer].name,
+        &units[importer].package,
+        &mut imports,
+    );
+    let mut saw_edge = false;
+    for (module, kind) in imports {
+        if module == dep_unit.name {
+            match &kind {
+                ModuleImportKind::ModuleAlias => return false,
+                ModuleImportKind::Members(names) => {
+                    if names.is_empty() {
+                        // `from dep import ()` cannot occur; be conservative.
+                        return false;
+                    }
+                    for name in names {
+                        if name.as_str() == "*"
+                            || by_name.contains_key(&format!("{module}.{name}"))
+                            || !callable.contains(name)
+                        {
+                            return false;
+                        }
+                    }
+                    saw_edge = true;
+                }
+            }
+            continue;
+        }
+        // `from base import name` where `base.name` is `dep`: the scan linked
+        // the submodule, not a package attribute, so the importer needs the
+        // submodule's body (module alias).
+        if let Some((base, member)) = dep_unit.name.rsplit_once('.') {
+            if module == base {
+                if let ModuleImportKind::Members(names) = &kind {
+                    if names.iter().any(|name| name.as_str() == member) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    saw_edge
+}
+
+/// One ordering edge between module bodies.
+///
+/// `dep -> importer` means the dependency usually initializes first. A soft
+/// edge only binds compiled function/class handles and may be dropped to break
+/// a cycle; constraint edges encode "the package body must initialize before
+/// this late helper".
+struct InitializerEdge {
+    dep: usize,
+    importer: usize,
+    soft: bool,
+    dropped: bool,
+}
+
+/// Forward reachability over the currently active ordering edges.
+///
+/// The direction is `dependency -> importer`, so a path from a late unit to
+/// its ancestor package closes that constraint's cycle.
+fn initializer_reachable(
+    start: usize,
+    outgoing: &[Vec<usize>],
+    edges: &[InitializerEdge],
+    placed: &[bool],
+) -> HashSet<usize> {
+    let mut seen = HashSet::new();
+    let mut pending = vec![start];
+    while let Some(index) = pending.pop() {
+        if !seen.insert(index) {
+            continue;
+        }
+        for &edge in &outgoing[index] {
+            if edges[edge].dropped {
+                continue;
+            }
+            let importer = edges[edge].importer;
+            if !placed[importer] {
+                pending.push(importer);
+            }
+        }
+    }
+    seen
+}
+
+/// Orders the module bodies so a unit that reads a partially initialized
+/// ancestor package initializes after that package.
+///
+/// CPython runs a package body incrementally: when `pkg/__init__.py` imports
+/// `pkg.lib`, the package's already-executed prefix is visible to every module
+/// reached from there. Hydro runs a whole module body as one initializer, and
+/// the scan normally places every imported unit before its importer, so a
+/// helper reached through `pkg.lib` (`numpy._typing._dtype_like`, which reads
+/// `numpy.dtype`) would run before `pkg/__init__.py` had published anything.
+///
+/// A unit whose `late` set names an ancestor package it does not depend on
+/// directly is therefore constrained to run after that package. The dependency
+/// graph can then contain a cycle (`pkg` -> `lib` -> ... -> helper -> `pkg`);
+/// an edge that only binds compiled `def`/`class` handles is soft and may be
+/// dropped to break it. A module that imports functions from the delayed
+/// subtree still binds them directly, so it can initialize before the subtree
+/// body; a value/alias/module-alias import keeps the edge and the cycle falls
+/// back to the previous order. The entry unit always stays last.
+fn unit_initializer_order(units: &[LoadedModule], entry: usize) -> Vec<usize> {
+    let count = units.len();
+    let identity: Vec<usize> = (0..count).collect();
+    let by_name: HashMap<String, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(index, unit)| (unit.name.clone(), index))
+        .collect();
+
+    // Constraint edges `package -> unit`: the package body must run first.
+    let mut constraints: Vec<(usize, usize)> = Vec::new();
+    for (index, unit) in units.iter().enumerate() {
+        for late in &unit.late {
+            let Some(&package) = by_name.get(late) else {
+                continue;
+            };
+            if package == index || package == entry {
+                continue;
+            }
+            let ancestor = unit.name.len() > late.len()
+                && unit.name.starts_with(late.as_str())
+                && unit.name.as_bytes().get(late.len()) == Some(&b'.');
+            if !ancestor {
+                continue;
+            }
+            // A submodule the package body imports directly is part of the
+            // existing "run it before the body" contract; moving it after the
+            // body would leave the package's own import reads uninitialized.
+            if units[package].deps.contains(&index) {
+                continue;
+            }
+            if !constraints.contains(&(package, index)) {
+                constraints.push((package, index));
+            }
+        }
+    }
+    if constraints.is_empty() {
+        return identity;
+    }
+
+    let callable = initializer_callable_names(units, &by_name);
+    let mut edges: Vec<InitializerEdge> = Vec::new();
+    for (importer, unit) in units.iter().enumerate() {
+        for &dep in &unit.deps {
+            if dep >= count || dep == importer {
+                continue;
+            }
+            edges.push(InitializerEdge {
+                dep,
+                importer,
+                soft: initializer_edge_is_soft(units, &by_name, &callable, importer, dep),
+                dropped: false,
+            });
+        }
+    }
+    // A "package first" constraint is only useful when some soft edge on the
+    // cycle can be relaxed. If the late helper can reach its package through
+    // hard edges alone (a package and its `_core` subpackage import each other
+    // through module aliases), no reordering can satisfy both; keep the
+    // dependency-scan order for that helper and drop the constraint before it
+    // can move unrelated modules.
+    let unplaced = vec![false; count];
+    let mut hard_outgoing: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for (index, edge) in edges.iter().enumerate() {
+        if !edge.soft {
+            hard_outgoing[edge.dep].push(index);
+        }
+    }
+    constraints.retain(|&(package, unit)| {
+        !initializer_reachable(unit, &hard_outgoing, &edges, &unplaced).contains(&package)
+    });
+    if constraints.is_empty() {
+        return identity;
+    }
+
+    let mut constraint_edges: Vec<usize> = Vec::with_capacity(constraints.len());
+    for &(dep, importer) in &constraints {
+        if dep >= count || importer >= count || dep == importer {
+            continue;
+        }
+        constraint_edges.push(edges.len());
+        edges.push(InitializerEdge {
+            dep,
+            importer,
+            soft: false,
+            dropped: false,
+        });
+    }
+
+    let mut degrees = vec![0usize; count];
+    let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for (index, edge) in edges.iter().enumerate() {
+        if edge.dropped {
+            continue;
+        }
+        degrees[edge.importer] += 1;
+        outgoing[edge.dep].push(index);
+    }
+
+    let mut placed = vec![false; count];
+    let mut order: Vec<usize> = Vec::with_capacity(count);
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> = (0..count)
+        .filter(|&index| index != entry && degrees[index] == 0)
+        .map(std::cmp::Reverse)
+        .collect();
+    loop {
+        while let Some(std::cmp::Reverse(index)) = ready.pop() {
+            if placed[index] || index == entry {
+                continue;
+            }
+            placed[index] = true;
+            order.push(index);
+            for &edge in &outgoing[index] {
+                if edges[edge].dropped {
+                    continue;
+                }
+                let importer = edges[edge].importer;
+                if placed[importer] || importer == entry {
+                    continue;
+                }
+                degrees[importer] -= 1;
+                if degrees[importer] == 0 {
+                    ready.push(std::cmp::Reverse(importer));
+                }
+            }
+        }
+        if order.len() + 1 >= count {
+            break;
+        }
+        // A soft edge is droppable only when it lies on a path from a
+        // constrained (late) unit back to its ancestor package: dropping an
+        // unrelated edge would reorder modules that are not part of this
+        // approximation.
+        let mut candidate = None;
+        'edges: for (index, edge) in edges.iter().enumerate() {
+            if edge.dropped || !edge.soft || placed[edge.dep] || placed[edge.importer] {
+                continue;
+            }
+            for &constraint in &constraint_edges {
+                let constrained = &edges[constraint];
+                if constrained.dropped {
+                    continue;
+                }
+                let (package, unit) = (constrained.dep, constrained.importer);
+                if package == entry || unit == entry || placed[package] || placed[unit] {
+                    continue;
+                }
+                let from_unit = initializer_reachable(unit, &outgoing, &edges, &placed);
+                if !from_unit.contains(&edge.dep) {
+                    continue;
+                }
+                let from_importer =
+                    initializer_reachable(edge.importer, &outgoing, &edges, &placed);
+                if from_importer.contains(&package) || edge.importer == package {
+                    candidate = Some(index);
+                    break 'edges;
+                }
+            }
+        }
+        let index = if let Some(index) = candidate {
+            index
+        } else {
+            // No soft boundary exists for a cycle (for example a package and
+            // its `_core` subpackage that import each other through module
+            // aliases). Give up that particular "package first" constraint
+            // instead of blocking the package itself: the directly imported
+            // subtree keeps the previous, dependency-scan order.
+            let fallback = constraint_edges.iter().copied().find(|&constraint| {
+                let constrained = &edges[constraint];
+                !constrained.dropped
+                    && !placed[constrained.dep]
+                    && !placed[constrained.importer]
+                    && initializer_reachable(constrained.importer, &outgoing, &edges, &placed)
+                        .contains(&constrained.dep)
+            });
+            let Some(index) = fallback else {
+                break;
+            };
+            index
+        };
+        edges[index].dropped = true;
+        let importer = edges[index].importer;
+        degrees[importer] -= 1;
+        if degrees[importer] == 0 && importer != entry {
+            ready.push(std::cmp::Reverse(importer));
+        }
+    }
+    for (index, is_placed) in placed.iter().enumerate() {
+        if index != entry && !*is_placed {
+            order.push(index);
+        }
+    }
+    order.push(entry);
+    order
+}
+
 /// Lowers every loaded module in dependency order and links the results.
 ///
-/// The module bodies of imported units become [`Program::initializers`] (in
-/// dependency order) and run before the entry module. Namespace packages in
+/// The module bodies of imported units become [`Program::initializers`] and run
+/// before the entry module. They follow the dependency order, except that a
+/// unit that reads a partially initialized ancestor package is placed after
+/// that package ([`unit_initializer_order`]). Namespace packages in
 /// `namespaces` have no unit: they are exposed as empty user modules and never
 /// produce an initializer.
 fn lower_modules(
@@ -2757,7 +3292,10 @@ fn lower_modules(
     // star-imported module); importers inherit them so unknown members bind to
     // lazy extension reads.
     let mut extension_star_units: Vec<Vec<String>> = vec![Vec::new(); units.len()];
-    let mut initializers: Vec<FunctionId> = Vec::new();
+    // Module body of each unit, in unit (lowering) order. The initializer list
+    // is derived separately because a package body can need a module that must
+    // itself run after the package (see `unit_initializer_order`).
+    let mut initializer_by_unit: Vec<Option<FunctionId>> = vec![None; units.len()];
     let mut entry_main = 0;
     let mut class_registry: HashMap<(String, String), (FunctionId, lower::CallSignature)> =
         HashMap::new();
@@ -2780,7 +3318,7 @@ fn lower_modules(
         if index != entry_index {
             lowerer.set_dunder_name(&unit.name);
             lowerer.set_package(&unit.package);
-            initializers.push(base);
+            initializer_by_unit[index] = Some(base);
         }
         let mut user_modules = HashMap::new();
         // Package `__init__.py` files import their submodules, which become
@@ -2895,6 +3433,11 @@ fn lower_modules(
             entry_main = base;
         }
     }
+
+    let initializers: Vec<FunctionId> = unit_initializer_order(units, entry_index)
+        .into_iter()
+        .filter_map(|index| initializer_by_unit.get(index).copied().flatten())
+        .collect();
 
     Ok(Program {
         source_name: units[entry_index].display.clone(),
@@ -4148,6 +4691,26 @@ mod tests {
             diags[0].help.as_deref(),
             Some("expected a module file on the import search path")
         );
+    }
+
+    #[test]
+    fn entry_module_can_be_imported_by_a_dependency() {
+        // `rlcompleter` imports `__main__`; the entry module is a runtime
+        // value, so the loader must not look for a `__main__.py` on the
+        // import search path.
+        let dir = TestDir::new("entry-module-import");
+        dir.write(
+            "helper.py",
+            "import __main__\nnamespace = __main__.__dict__\nfrom __main__ import value\n",
+        );
+        let main = dir.write("main.py", "import helper\nvalue = 1\n");
+        let program = check_file(&main).expect("__main__ is a known runtime module");
+        let names: Vec<&str> = program
+            .functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert!(names.contains(&"helper.<module>"), "{names:?}");
     }
 
     #[test]
@@ -5791,6 +6354,109 @@ def __getattr__(name):
                 "pkg.<module>",
                 "pkg.main.<module>",
             ]
+        );
+    }
+
+    #[test]
+    fn lazy_typing_helpers_initialize_after_the_package() {
+        // NumPy's `numpy.lib` eagerly imports a helper (`api`) that imports
+        // functions from a subpackage (`_linalg`), which reaches the private
+        // typing helpers. Those helpers read `numpy.dtype`/`numpy.value` from
+        // the package prefix at module scope, so running them before
+        // `numpy/__init__.py` publishes its names raises AttributeError.
+        // `_linalg` re-exports the implementation with `import *`, exactly
+        // like `numpy/linalg/__init__.py`. The function-only import
+        // `from ._linalg import compute` is the soft boundary: the helper can
+        // still initialize before `_linalg`, while the typing chain is placed
+        // after the package. Recognizing the star re-export as a callable is
+        // what makes that edge soft.
+        let dir = TestDir::new("late-typing-order");
+        let pkg = dir.path.join("pkg");
+        let lib = pkg.join("lib");
+        let linalg = lib.join("_linalg");
+        let typing = lib.join("_typing");
+        fs::create_dir_all(&linalg).expect("create linalg package");
+        fs::create_dir_all(&typing).expect("create typing package");
+        fs::write(
+            pkg.join("__init__.py"),
+            "value = 1\nfrom .lib import HOLDER\n",
+        )
+        .expect("write package init");
+        fs::write(lib.join("__init__.py"), "from .api import HOLDER\n").expect("write lib init");
+        fs::write(
+            lib.join("api.py"),
+            "from ._linalg import compute\n\nHOLDER = 1\n\ndef run(value):\n    return compute(value)\n",
+        )
+        .expect("write api");
+        fs::write(linalg.join("__init__.py"), "from ._impl import *\n").expect("write linalg init");
+        fs::write(
+            linalg.join("_impl.py"),
+            "from pkg.lib._typing import ALIAS\n\ndef compute(value):\n    return ALIAS if value is None else value\n",
+        )
+        .expect("write linalg impl");
+        fs::write(
+            typing.join("__init__.py"),
+            "from ._dtype_like import ALIAS\n",
+        )
+        .expect("write typing init");
+        fs::write(
+            typing.join("_dtype_like.py"),
+            "import pkg\n\nALIAS = pkg.value\n",
+        )
+        .expect("write typing helper");
+        let main = dir.write("main.py", "import pkg\nprint(pkg.HOLDER)\n");
+        let program = program(&main);
+
+        let names = initializer_names(&program);
+        let position = |name: &str| {
+            names
+                .iter()
+                .position(|current| *current == name)
+                .unwrap_or_else(|| panic!("missing initializer '{name}': {names:?}"))
+        };
+        let pkg_body = position("pkg.<module>");
+        let lib_body = position("pkg.lib.<module>");
+        let helper = position("pkg.lib._typing._dtype_like.<module>");
+        let typing_body = position("pkg.lib._typing.<module>");
+        let impl_body = position("pkg.lib._linalg._impl.<module>");
+        let linalg_body = position("pkg.lib._linalg.<module>");
+        assert!(
+            lib_body < pkg_body,
+            "the package body reads a value from lib: {names:?}"
+        );
+        assert!(
+            pkg_body < helper,
+            "the typing helper reads the package prefix: {names:?}"
+        );
+        assert!(
+            helper < typing_body && typing_body < impl_body && impl_body < linalg_body,
+            "the typing chain keeps its own dependency order: {names:?}"
+        );
+    }
+
+    #[test]
+    fn direct_submodule_cycle_keeps_the_scan_order() {
+        // A submodule imported directly by its package body keeps the existing
+        // contract: it initializes before the body, because the body may read
+        // the module's exports. Only a *transitive* helper of a partially
+        // initialized ancestor is moved after the package.
+        let dir = TestDir::new("direct-submodule-cycle");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(pkg.join("__init__.py"), "from . import sub\nvalue = 1\n")
+            .expect("write package init");
+        fs::write(
+            pkg.join("sub.py"),
+            "import pkg\n\ndef value():\n    return pkg.value\n",
+        )
+        .expect("write submodule");
+        let main = dir.write("main.py", "import pkg\nprint(pkg.value)\n");
+        let program = program(&main);
+
+        assert_eq!(
+            initializer_names(&program),
+            vec!["pkg.sub.<module>", "pkg.<module>"],
+            "a directly imported submodule stays before its package body"
         );
     }
 }

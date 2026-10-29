@@ -26,6 +26,8 @@ const MODULE: &str = "importlib.metadata";
 const DISTRIBUTION_READ_TEXT: &str = "_distribution_read_text";
 const ENTRY_POINT_LOAD: &str = "_entry_point_load";
 const PACKAGE_NOT_FOUND_STR: &str = "_package_not_found_str";
+const METADATA_FINDER_INVALIDATE: &str = "_metadata_path_finder_invalidate";
+const METADATA_FINDER_FIND: &str = "_metadata_path_finder_find";
 
 /// One parsed entry point.
 #[derive(Clone, Debug)]
@@ -106,6 +108,14 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         DISTRIBUTION_READ_TEXT => distribution_read_text(args),
         ENTRY_POINT_LOAD => entry_point_load(args),
         PACKAGE_NOT_FOUND_STR => package_not_found_str(args),
+        METADATA_FINDER_INVALIDATE => {
+            invalidate_caches();
+            NONE
+        }
+        METADATA_FINDER_FIND => {
+            let context = args.get(1).copied().filter(|&item| item != NONE);
+            metadata_finder_find(context)
+        }
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module '{MODULE}' has no attribute '{function}'"),
@@ -133,6 +143,7 @@ pub(crate) fn constant(name: &str) -> i64 {
         "PackageNotFoundError" => package_not_found_class(),
         "Distribution" => distribution_class(),
         "EntryPoint" => entry_point_class(),
+        "MetadataPathFinder" => metadata_path_finder_class(),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module '{MODULE}' has no attribute '{name}'"),
@@ -363,13 +374,24 @@ fn not_found(name: &str) -> i64 {
 // -------------------------------------------------------------------------
 
 fn cached_class(key: &str, name: &str, base: i64, methods: Vec<(String, i64)>) -> i64 {
-    if let Some(class) = globals::registry_get(key) {
-        return class;
-    }
-    let methods: Vec<(String, i64, MethodKind)> = methods
+    let methods = methods
         .into_iter()
         .map(|(name, function)| (name, function, MethodKind::Normal))
         .collect();
+    cached_class_kinds(key, name, base, methods)
+}
+
+/// [`cached_class`] with explicit method kinds (`MetadataPathFinder`'s
+/// discovery hooks are classmethods).
+fn cached_class_kinds(
+    key: &str,
+    name: &str,
+    base: i64,
+    methods: Vec<(String, i64, MethodKind)>,
+) -> i64 {
+    if let Some(class) = globals::registry_get(key) {
+        return class;
+    }
     let method_values: Vec<i64> = methods.iter().map(|(_, value, _)| *value).collect();
     let method_roots = crate::heap::root_values(&method_values);
     let class = value::class_new_full(name.to_string(), base, methods, Vec::new());
@@ -382,6 +404,95 @@ fn cached_class(key: &str, name: &str, base: i64, methods: Vec<(String, i64)>) -
 
 fn native(function: &'static str, arity: usize) -> i64 {
     value::native_function_new(MODULE, function, arity)
+}
+
+/// `importlib.metadata.MetadataPathFinder`: the `sys.meta_path` finder the
+/// import system consults. `importlib._bootstrap_external.PathFinder` calls
+/// `MetadataPathFinder.invalidate_caches()` and forwards
+/// `find_distributions(*args, **kwargs)` to it, so both hooks must exist.
+///
+/// `find_distributions` returns a list of real `Distribution` instances.
+/// Hydro discovers distributions from the interpreter search path; the
+/// CPython `context.path` override and the `FastPath` zip cache have no
+/// equivalent here, so only `context.name` narrows the result.
+fn metadata_path_finder_class() -> i64 {
+    let find = value::native_function_new(MODULE, METADATA_FINDER_FIND, usize::MAX);
+    value::function_set_signature(
+        find,
+        vec![
+            value::ParamMeta {
+                name: "cls".to_string(),
+                kind: hydro_ir::ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "context".to_string(),
+                kind: hydro_ir::ParamKind::KwOnly,
+                default: Some(NONE),
+            },
+        ],
+    );
+    value::function_set_full_entry(find, metadata_finder_find_entry as *const () as usize);
+    cached_class_kinds(
+        "importlib.metadata.MetadataPathFinder",
+        "MetadataPathFinder",
+        NONE,
+        vec![
+            (
+                "invalidate_caches".to_string(),
+                native(METADATA_FINDER_INVALIDATE, 1),
+                MethodKind::Classmethod,
+            ),
+            (
+                "find_distributions".to_string(),
+                find,
+                MethodKind::Classmethod,
+            ),
+        ],
+    )
+}
+
+extern "C" fn metadata_finder_find_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(cls, context)`.
+    let context = unsafe { *argv.add(1) };
+    metadata_finder_find(Some(context).filter(|&item| item != NONE))
+}
+
+/// `MetadataPathFinder.find_distributions(context=None)`: every discovered
+/// `Distribution`, narrowed to `context.name` when the context carries one.
+fn metadata_finder_find(context: Option<i64>) -> i64 {
+    let wanted = context.and_then(|context| {
+        let name = value::instance_attr(context, "name").or_else(|| {
+            value::as_dict(context).and_then(|pairs| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| value::as_str(*key) == Some("name"))
+                    .map(|(_, item)| *item)
+            })
+        })?;
+        if name == NONE {
+            return None;
+        }
+        value::as_str(name).map(normalize)
+    });
+    let dists: Vec<Dist> = distributions_cache()
+        .into_iter()
+        .filter(|dist| {
+            wanted
+                .as_deref()
+                .is_none_or(|name| dist.normalized.as_str() == name)
+        })
+        .collect();
+    let list = value::list_new(Vec::new());
+    let roots = crate::heap::root_values(&[list]);
+    for dist in &dists {
+        let item = distribution_value(dist);
+        let item_roots = crate::heap::root_values(&[item]);
+        crate::container::list_append(list, item);
+        crate::heap::release_roots(item_roots);
+    }
+    crate::heap::release_roots(roots);
+    list
 }
 
 fn distribution_class() -> i64 {
@@ -795,4 +906,45 @@ fn entry_points_kw(keywords: &[(String, i64)]) -> i64 {
         }
     }
     value::list_new(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_path_finder_exposes_the_discovery_hooks() {
+        exc::init();
+        let class = constant("MetadataPathFinder");
+        assert!(!exc::pending());
+        // Cached class identity, so `is` comparisons are stable.
+        assert_eq!(class, constant("MetadataPathFinder"));
+        assert_eq!(
+            value::as_class(class)
+                .map(|state| state.name.clone())
+                .as_deref(),
+            Some("MetadataPathFinder")
+        );
+        // Both hooks `importlib._bootstrap_external` uses are real members.
+        assert!(value::class_lookup(class, "find_distributions").is_some());
+        assert!(value::class_lookup(class, "invalidate_caches").is_some());
+
+        // `invalidate_caches()` takes only the bound class and returns None.
+        assert_eq!(call(METADATA_FINDER_INVALIDATE, &[class]), NONE);
+        assert!(!exc::pending());
+
+        // `find_distributions(context=None)` answers an iterable (a list here)
+        // of `Distribution` instances; an empty environment gives an empty
+        // list, which is a truthful answer rather than an error.
+        let found = call(METADATA_FINDER_FIND, &[class, NONE]);
+        assert!(!exc::pending());
+        let items = value::as_list(found).expect("find_distributions list");
+        for item in items {
+            assert_eq!(
+                value::type_name_of(*item),
+                "Distribution",
+                "finder yields Distribution instances"
+            );
+        }
+    }
 }

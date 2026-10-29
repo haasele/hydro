@@ -250,6 +250,7 @@ mod tests {
             ("ENOSPC", 28),
             ("EPIPE", 32),
             ("ECONNREFUSED", 111),
+            ("ENOTCONN", 107),
             ("ETIMEDOUT", 110),
             ("EAGAIN", 11),
             ("EWOULDBLOCK", 11),

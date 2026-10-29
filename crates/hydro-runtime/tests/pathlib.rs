@@ -386,6 +386,11 @@ fn open_reads_and_writes_through_files() {
     assert_str(method(file, "read", &[]), "hi");
     method(file, "close", &[]);
 
+    // Positional arguments after `mode` are `buffering`, `encoding`, ...
+    let file = method(target, "open", &[text("r"), hydro_int(-1), text("utf-8")]);
+    assert_str(method(file, "read", &[]), "hi");
+    method(file, "close", &[]);
+
     // Binary mode round-trips raw bytes.
     let file = method(target, "open", &[text("wb")]);
     assert_no_error();
@@ -397,9 +402,19 @@ fn open_reads_and_writes_through_files() {
     assert_bytes(method(file, "read", &[]), &[0, 255]);
     method(file, "close", &[]);
 
-    // A binary file rejects a text encoding.
-    method(target, "open", &[text("rb"), text("utf-8")]);
+    // Positional slots after `mode` are CPython's `buffering`, `encoding`,
+    // `errors`, `newline`; a binary file rejects a bound text encoding.
+    method_kw(
+        target,
+        "open",
+        &[text("rb")],
+        &[("encoding", text("utf-8"))],
+    );
     assert_eq!(error_tag(), 0);
+    assert_error_text(
+        error_message(),
+        "binary mode doesn't take an encoding argument",
+    );
     clear_error();
 }
 

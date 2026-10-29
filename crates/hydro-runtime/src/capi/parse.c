@@ -929,6 +929,10 @@ typedef struct {
     hydro_capi_bv_frame frames[HYDRO_CAPI_BV_DEPTH];
     int depth;
     PyObject *result;
+    /* Implicit top-level tuple, created once a second top-level value
+     * appears; CPython returns a tuple when the format names more than one
+     * top-level unit. */
+    PyObject *items;
 } hydro_capi_bv_state;
 
 static void hydro_capi_bv_release(hydro_capi_bv_state *state)
@@ -944,26 +948,50 @@ static void hydro_capi_bv_release(hydro_capi_bv_state *state)
             Py_DecRef(frame->container);
         }
     }
+    if (state->items != NULL) {
+        Py_DecRef(state->items);
+    }
     if (state->result != NULL) {
         Py_DecRef(state->result);
     }
     state->depth = 0;
+    state->items = NULL;
     state->result = NULL;
 }
 
-/* Adds a value whose reference the state takes over. */
+/* Adds a value whose reference the state takes over. At the top level a
+ * second value turns the result into a tuple, as CPython's Py_BuildValue
+ * does for formats such as "OO", "NN" or "Oi". */
 static int hydro_capi_bv_add(hydro_capi_bv_state *state, PyObject *value)
 {
     hydro_capi_bv_frame *frame;
 
     if (state->depth == 0) {
-        if (state->result != NULL) {
+        if (state->items != NULL) {
+            if (PyList_Append(state->items, value) != 0) {
+                Py_DecRef(value);
+                return -1;
+            }
             Py_DecRef(value);
-            hydro_capi_set_error(
-                "TypeError: Py_BuildValue: more than one value in format");
+            return 0;
+        }
+        if (state->result == NULL) {
+            state->result = value;
+            return 0;
+        }
+        state->items = PyList_New(0);
+        if (state->items == NULL ||
+            PyList_Append(state->items, state->result) != 0) {
+            Py_DecRef(value);
             return -1;
         }
-        state->result = value;
+        Py_DecRef(state->result);
+        state->result = NULL;
+        if (PyList_Append(state->items, value) != 0) {
+            Py_DecRef(value);
+            return -1;
+        }
+        Py_DecRef(value);
         return 0;
     }
     frame = &state->frames[state->depth - 1];
@@ -1099,6 +1127,7 @@ static PyObject *hydro_capi_build_value_va(const char *format, va_list *argument
 
     state.depth = 0;
     state.result = NULL;
+    state.items = NULL;
     if (format == NULL) {
         return NULL;
     }
@@ -1384,6 +1413,15 @@ static PyObject *hydro_capi_build_value_va(const char *format, va_list *argument
     if (state.depth != 0) {
         hydro_capi_set_error("SystemError: Py_BuildValue: unbalanced format");
         goto fail;
+    }
+    if (state.items != NULL) {
+        PyObject *tuple = PyList_AsTuple(state.items);
+        Py_DecRef(state.items);
+        state.items = NULL;
+        if (tuple == NULL) {
+            goto fail;
+        }
+        return tuple;
     }
     if (state.result == NULL) {
         state.result = hydro_capi_none();

@@ -36,6 +36,12 @@
 //! (`tp_call`), attribute lookup (`tp_getattro`/`tp_getattr`/descriptors),
 //! `tp_repr`/`tp_str`, `tp_hash`, buffer export, iteration and GC tracking.
 //!
+//! GC tracking is not bookkeeping only: [`collect_cycles`] is the body of the
+//! exported `PyGC_Collect` and runs CPython's cycle algorithm over the tracked
+//! instances, driving each type's `tp_traverse` to find internal references
+//! and each unreachable instance's `tp_clear` to break the cycle exactly once.
+//! The default deallocator clears an instance only when the collector did not.
+//!
 //! All CPython 3.14 builtin types are exported as real data symbols
 //! (`PyLong_Type`, `PyType_Type`, ...), and `ob_type` of every handle points at
 //! the corresponding symbol.
@@ -51,7 +57,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, Once, PoisonError};
 
 use super::buffer::PyBufferProcs;
@@ -928,9 +934,14 @@ fn builtin_type_pointers() -> [*mut TypeObject; 48] {
 
 static TYPES_READY: Once = Once::new();
 
-/// Addresses of type objects this module allocated outside the exported
-/// builtin table (`PyExc_*` classes). `PyType_Ready` must not re-adopt them as
-/// statically declared C types: their role is already correct.
+/// Addresses of type objects this module owns outside the exported builtin
+/// table: heap types it allocated (`PyExc_*` classes, `PyType_FromSpec`) and
+/// C static types it adopted through `PyType_Ready`.
+///
+/// `PyType_Ready` must not re-adopt them as statically declared C types (their
+/// role is already correct), and an adopted static type is a valid metatype
+/// for another static type, as in `Py_SET_TYPE(&PyArrayDescr_Type,
+/// &PyArrayDTypeMeta_Type)`.
 static INTERNAL_TYPE_ADDRESSES: LazyLock<Mutex<HashSet<usize>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -2474,9 +2485,16 @@ pub(crate) fn free_instance(object: *mut ShimObject) {
     // SAFETY: every field read here belongs to a live type object.
     unsafe {
         let flags = (*type_object).tp_flags;
-        if flags & PY_TPFLAGS_HAVE_GC != 0 {
+        // A GC instance the cycle collector already cleared must not have
+        // `tp_clear` run a second time here: CPython runs it exactly once, in
+        // the collector. The marker is consumed on every deallocation so an
+        // address reused later starts without one.
+        let cleared_by_collector = if flags & PY_TPFLAGS_HAVE_GC != 0 {
             gc_untrack(object);
-        }
+            take_collector_clear_marker(object)
+        } else {
+            false
+        };
         if (*type_object).tp_finalize != 0 {
             let finalize: unsafe extern "C" fn(*mut ShimObject) =
                 std::mem::transmute((*type_object).tp_finalize as *const c_void);
@@ -2499,7 +2517,8 @@ pub(crate) fn free_instance(object: *mut ShimObject) {
         // type declared to the collector is dropped exactly once before the
         // storage is released. A type that installs its own `tp_dealloc` owns
         // this duty (CPython contract), so it never reaches this branch.
-        if flags & PY_TPFLAGS_HAVE_GC != 0 && (*type_object).tp_clear != 0 {
+        if flags & PY_TPFLAGS_HAVE_GC != 0 && (*type_object).tp_clear != 0 && !cleared_by_collector
+        {
             let clear: unsafe extern "C" fn(*mut ShimObject) =
                 std::mem::transmute((*type_object).tp_clear as *const c_void);
             clear(object);
@@ -2659,12 +2678,14 @@ pub extern "C" fn PyType_FromSpecWithBases(
 /// Adopts a statically declared `PyTypeObject` (the `PyVarObject_HEAD_INIT`
 /// pattern every hand-written C extension uses).
 ///
-/// Such an object starts with a NULL `ob_type`; CPython's `PyType_Ready`
-/// makes it immortal, points it at the metatype and treats it as a normal
-/// static type. Only an aligned object with a NULL metatype link, a readable
-/// name and non-negative sizes is adopted. Every other layout is rejected
-/// with a diagnostic instead of being written to, so an instance handle or a
-/// corrupt pointer cannot be turned into a type by accident.
+/// Such an object starts with a NULL (or extension-chosen) `ob_type`;
+/// CPython's `PyType_Ready` makes it immortal, links the metatype and treats
+/// it as a normal static type. An aligned object whose metatype is NULL, this
+/// host's `type`, an allocated heap type, or a static type already adopted
+/// here, with a readable name and non-negative sizes, is adopted. Every other
+/// layout is rejected with a diagnostic instead of being written to, so a
+/// builtin instance handle or a corrupt pointer cannot be turned into a type
+/// by accident.
 fn adopt_static_type(pointer: *mut TypeObject) -> Result<*mut TypeObject, String> {
     if pointer.is_null() {
         return Err("TypeError: PyType_Ready: type is NULL".to_string());
@@ -2679,15 +2700,20 @@ fn adopt_static_type(pointer: *mut TypeObject) -> Result<*mut TypeObject, String
     // SAFETY: the caller owns a PyTypeObject-shaped object at this address;
     // every read below is inside the CPython prefix.
     let metatype = unsafe { (*pointer).ob_type };
-    if !metatype.is_null() && metatype != ptr::addr_of_mut!(TYPE_TYPE) {
-        // Not a static type: an instance handle (or a type with an
-        // unsupported custom metatype). Writing through it would corrupt the
-        // object, so report instead.
-        return Err(
-            "TypeError: PyType_Ready: object is not a static type object (ob_type is not NULL or \
-             &PyType_Type)"
-                .to_string(),
-        );
+    // CPython accepts any metatype; this host additionally requires the link
+    // to be one it can identify: NULL, its own metatype, an allocated heap
+    // type, or a static type an earlier `PyType_Ready` adopted (NumPy points
+    // `PyArrayDescr_Type` at its own `PyArrayDTypeMeta_Type` this way). An
+    // instance handle's class is a builtin value type, which is not in the
+    // registry, so `PyType_Ready(instance)` is still rejected.
+    let known_metatype = metatype.is_null()
+        || metatype == ptr::addr_of_mut!(TYPE_TYPE)
+        || is_internal_type(metatype);
+    if !known_metatype {
+        return Err(format!(
+            "TypeError: PyType_Ready: object at {address:#x} is not a static type object \
+             (ob_type {metatype:p} is not a known type object)"
+        ));
     }
     let name = unsafe { (*pointer).tp_name };
     if name.is_null() {
@@ -2718,6 +2744,8 @@ fn adopt_static_type(pointer: *mut TypeObject) -> Result<*mut TypeObject, String
             .ob_refcnt
             .store(IMMORTAL_REFCNT, Ordering::Relaxed);
     }
+    // Remember the object so another static type may name it as its metatype.
+    remember_internal_type(pointer);
     Ok(pointer)
 }
 
@@ -3115,21 +3143,235 @@ pub(crate) fn gc_is_tracked(object: *mut ShimObject) -> bool {
     tracked_lock().contains(&(object as usize))
 }
 
+/// Instances whose `tp_clear` already ran in [`collect_cycles`].
+///
+/// CPython calls `tp_clear` once, from the collector, and the deallocator does
+/// not repeat it. This host's default deallocator also clears GC instances, so
+/// the collector records what it cleared and [`free_instance`] skips that one
+/// call. The marker is removed when the instance is freed, so a later
+/// allocation that reuses the address is never mistaken for a cleared one.
+static CLEARED_BY_COLLECTOR: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn cleared_lock() -> MutexGuard<'static, HashSet<usize>> {
+    CLEARED_BY_COLLECTOR
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Removes and reports the "cleared by the cycle collector" marker.
+pub(crate) fn take_collector_clear_marker(object: *mut ShimObject) -> bool {
+    if object.is_null() {
+        return false;
+    }
+    cleared_lock().remove(&(object as usize))
+}
+
+/// Guards against reentrant collection: `tp_traverse`/`tp_clear` may call
+/// `PyGC_Collect` again.
+static COLLECTING: AtomicBool = AtomicBool::new(false);
+
+struct CollectingGuard;
+
+impl Drop for CollectingGuard {
+    fn drop(&mut self) {
+        COLLECTING.store(false, Ordering::Release);
+    }
+}
+
+/// Runs one cycle-collection pass over the GC-tracked extension instances.
+///
+/// This is the production body of `PyGC_Collect` (`capi::mod`). It implements
+/// CPython's cycle algorithm for the instances this host tracks:
+///
+/// 1. every tracked instance that is still alive is protected with a
+///    temporary reference (taken with a compare-and-swap, so a handle another
+///    thread is already freeing is never resurrected);
+/// 2. `tp_traverse` of every tracked instance subtracts the references that
+///    come from other candidates (see [`gc_walk_tracked`]);
+/// 3. an instance whose remaining count is non-zero has a reference from
+///    outside the candidate set, so it and everything reachable from it
+///    through tracked edges are live;
+/// 4. the remaining candidates are unreachable: `tp_clear` runs once for each,
+///    the instance is untracked, and releasing the temporary reference frees
+///    it through the normal deallocation path.
+///
+/// A `tp_traverse` that reports more edges than the object's reference count
+/// supports makes the pass abandon its result instead of risking a live
+/// object, and a nested `PyGC_Collect` (from a traverse or clear callback)
+/// returns zero. Returns the number of instances whose cycle was broken.
+pub(crate) fn collect_cycles() -> usize {
+    if COLLECTING.swap(true, Ordering::AcqRel) {
+        return 0;
+    }
+    let _guard = CollectingGuard;
+    collect_cycles_pass()
+}
+
+fn collect_cycles_pass() -> usize {
+    // The GIL serialises every free this host performs (`free_object` takes
+    // it), so holding it keeps the snapshot's addresses valid for the pass and
+    // lets a concurrent `Py_DecRef` from another thread finish first.
+    let _gripper = GilGuard::new();
+    let addresses: Vec<usize> = tracked_lock().iter().copied().collect();
+    if addresses.is_empty() {
+        return 0;
+    }
+    // `external` starts as each candidate's reference count without the
+    // temporary reference this pass takes; every edge from another candidate
+    // is then subtracted. A candidate whose count already reached zero is
+    // being freed by another thread (direct reference-count operations are
+    // atomic and do not take the GIL) and is skipped instead of resurrected.
+    let mut external: HashMap<usize, isize> = HashMap::with_capacity(addresses.len());
+    let mut protected: Vec<usize> = Vec::with_capacity(addresses.len());
+    for &address in &addresses {
+        match protect_for_collection(address as *mut ShimObject) {
+            Protection::Temporary(count) => {
+                external.insert(address, count);
+                protected.push(address);
+            }
+            Protection::Immortal => {
+                external.insert(address, isize::MAX);
+            }
+            Protection::Dying => {}
+        }
+    }
+    if external.is_empty() {
+        return 0;
+    }
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    gc_walk_tracked(&mut |parent, child| {
+        let parent = parent as usize;
+        let child = child as usize;
+        if external.contains_key(&parent) {
+            if let Some(count) = external.get_mut(&child) {
+                *count -= 1;
+                edges.push((parent, child));
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    if external.values().any(|count| *count < 0) {
+        // A `tp_traverse` reported more references than the object holds;
+        // trusting it could free a live object. Abandon this pass.
+        for &address in &protected {
+            dec_ref(address as *mut ShimObject);
+        }
+        return 0;
+    }
+    let mut reachable: HashSet<usize> = external
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(&address, _)| address)
+        .collect();
+    let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (parent, child) in edges {
+        adjacency.entry(parent).or_default().push(child);
+    }
+    let mut pending: Vec<usize> = reachable.iter().copied().collect();
+    while let Some(address) = pending.pop() {
+        if let Some(children) = adjacency.get(&address) {
+            for &child in children {
+                if reachable.insert(child) {
+                    pending.push(child);
+                }
+            }
+        }
+    }
+    let garbage: Vec<usize> = protected
+        .iter()
+        .copied()
+        .filter(|address| !reachable.contains(address))
+        .filter(|address| gc_is_tracked(*address as *mut ShimObject))
+        .collect();
+    if !garbage.is_empty() {
+        {
+            let mut markers = cleared_lock();
+            for &address in &garbage {
+                markers.insert(address);
+            }
+        }
+        for &address in &garbage {
+            let object = address as *mut ShimObject;
+            clear_instance(object);
+            gc_untrack(object);
+        }
+    }
+    let cleared = garbage.len();
+    for &address in &protected {
+        dec_ref(address as *mut ShimObject);
+    }
+    cleared
+}
+
+/// Outcome of taking a temporary reference on a collection candidate.
+enum Protection {
+    /// The reference was taken; the value is the count before it.
+    Temporary(isize),
+    /// The instance is immortal; it is a root and needs no temporary
+    /// reference.
+    Immortal,
+    /// Another thread already brought the count to zero; the object is being
+    /// freed and must not be resurrected.
+    Dying,
+}
+
+/// Takes a temporary reference on a candidate without ever resurrecting an
+/// object whose count already reached zero.
+fn protect_for_collection(object: *mut ShimObject) -> Protection {
+    // SAFETY: the address came from the tracked set. Every free is serialised
+    // by the GIL this pass holds, so the handle is still allocated.
+    let counter = unsafe { &(*object).head.ob_refcnt };
+    let mut count = counter.load(Ordering::Relaxed);
+    loop {
+        if count == IMMORTAL_REFCNT {
+            return Protection::Immortal;
+        }
+        if count <= 0 {
+            return Protection::Dying;
+        }
+        match counter.compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return Protection::Temporary(count),
+            Err(observed) => count = observed,
+        }
+    }
+}
+
+/// Runs one instance's `tp_clear`, the collector's clear phase.
+fn clear_instance(object: *mut ShimObject) {
+    let type_object = type_of(object);
+    if type_object.is_null() {
+        return;
+    }
+    // SAFETY: live type object; both fields belong to it.
+    let (flags, clear) = unsafe { ((*type_object).tp_flags, (*type_object).tp_clear) };
+    if flags & PY_TPFLAGS_HAVE_GC == 0 || clear == 0 {
+        return;
+    }
+    // SAFETY: `tp_clear` has CPython's `int (*)(PyObject *)` signature.
+    let clear: unsafe extern "C" fn(*mut ShimObject) -> c_int =
+        unsafe { std::mem::transmute(clear as *const c_void) };
+    let _gripper = GilGuard::new();
+    // SAFETY: `object` is live (the pass holds a reference) and of this type.
+    // CPython ignores the returned status here as well; a `tp_clear` that
+    // raises leaves the exception for the caller.
+    let _ = unsafe { clear(object) };
+}
+
 /// Adapter between `visitproc` and a Rust closure.
 ///
-/// `allow(dead_code)`: this is part of the deliberately exposed traversal
-/// bridge below. It has no production caller yet, but it is the only
-/// implementation of CPython's `visitproc` calling convention in this host;
-/// deleting it would silently drop `tp_traverse` support. It is exercised by
-/// the in-crate GC tests.
-#[allow(dead_code)]
+/// This is the only implementation of CPython's `visitproc` calling
+/// convention in this host; [`gc_traverse`] uses it to drive an extension's
+/// `tp_traverse`, including from the `PyGC_Collect` production path.
 struct TraverseVisitor<'a> {
     visit: &'a mut dyn FnMut(*mut ShimObject) -> std::ops::ControlFlow<()>,
 }
 
-/// `visitproc` adapter used by [`gc_traverse`] (see its `allow` note).
-#[allow(dead_code)]
-extern "C" fn traverse_visitor(context: *mut c_void, object: *mut c_void) -> c_int {
+/// `visitproc` adapter used by [`gc_traverse`].
+///
+/// CPython's convention is `int (*visitproc)(PyObject *object, void *arg)`:
+/// the visited object comes first and the opaque context second.
+extern "C" fn traverse_visitor(object: *mut c_void, context: *mut c_void) -> c_int {
     if context.is_null() {
         return 1;
     }
@@ -3150,11 +3392,6 @@ extern "C" fn traverse_visitor(context: *mut c_void, object: *mut c_void) -> c_i
 /// `tp_traverse` have no traversable edges. A type that installs
 /// `tp_traverse` without `Py_TPFLAGS_HAVE_GC` is not walked: CPython only
 /// calls the slot for GC types.
-// `allow(dead_code)`: the host collector bridge is intentionally present but
-// not wired from Hydro code yet. Extensions' `tp_traverse` must remain
-// executable (PyType_GetSlot also returns it); the in-crate GC tests use this
-// function, and the collector integration will consume it. Do not delete.
-#[allow(dead_code)]
 pub(crate) fn gc_traverse(
     object: *mut ShimObject,
     visit: &mut dyn FnMut(*mut ShimObject) -> std::ops::ControlFlow<()>,
@@ -3194,20 +3431,14 @@ pub(crate) fn gc_traverse(
 /// Walks every currently tracked GC instance and enumerates its `tp_traverse`
 /// edges.
 ///
-/// This is the bridge a host-side collector uses to see references held by C
+/// This is the bridge the collector uses to see references held by C
 /// instances: the tracked set is the registry of GC-enabled instances, and
 /// this function turns each type's `tp_traverse` into a Rust callback. Hydro
 /// values cross through rooted handles (see `HydroValue`) rather than raw
 /// heap pointers, so a handle held by an extension already has its own
-/// persistent root; the bridge exists so a collector can follow the handle
-/// graph when it needs to, instead of assuming a C instance is an opaque
-/// non-GC container.
-///
-/// `allow(dead_code)`: deliberately exposed in-crate bridge. Its production
-/// consumer (the Hydro collector following C-instance edges) is not wired yet;
-/// the GC tests exercise the machinery and removing it would drop the only
-/// implementation of the `tp_traverse` walk. Do not delete.
-#[allow(dead_code)]
+/// persistent root; the bridge exists so the collector can follow the handle
+/// graph instead of assuming a C instance is an opaque non-GC container.
+/// [`collect_cycles`] is its production caller.
 pub(crate) fn gc_walk_tracked(
     visit: &mut dyn FnMut(*mut ShimObject, *mut ShimObject) -> std::ops::ControlFlow<()>,
 ) {

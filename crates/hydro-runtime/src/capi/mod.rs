@@ -124,16 +124,28 @@
 //! automatically; deallocation untracks. The tracked set records the handles
 //! this host owns. `tp_traverse` is preserved in the type layout, returned by
 //! `PyType_GetSlot`, and executable: `capi::types::gc_traverse` walks one
-//! instance's edges, and `capi::types::gc_walk_tracked` is the bridge a
-//! host-side collector uses to enumerate every tracked instance's references.
-//! A GC type must install `tp_traverse`; `PyType_Ready` rejects the
-//! `Py_TPFLAGS_HAVE_GC`/no-traverse combination with CPython's `SystemError`.
+//! instance's edges and `capi::types::gc_walk_tracked` enumerates every tracked
+//! instance's references. A GC type must install `tp_traverse`; `PyType_Ready`
+//! rejects the `Py_TPFLAGS_HAVE_GC`/no-traverse combination with CPython's
+//! `SystemError`.
+//!
+//! Both slots run in production: `PyGC_Collect` is the exported entry point
+//! that drives a real cycle-collection pass over the tracked instances. It
+//! counts the references each instance receives from other tracked instances
+//! through `tp_traverse`, treats an instance with no reference from outside
+//! that set as unreachable, and breaks the cycle with one `tp_clear` call
+//! before the instance is freed. The default deallocation path (a GC type with
+//! no `tp_dealloc`) runs `tp_clear` exactly once before releasing the instance,
+//! and skips it when the collector already ran it, so declared edges are
+//! dropped once and never twice. A type with its own `tp_dealloc` owns that
+//! duty, as in CPython.
+//!
 //! Because Hydro values cross as rooted handles rather than raw heap
 //! pointers, a handle held by an extension already carries its own persistent
-//! root; there are no additional cross-heap edges the tracked set has to add.
-//! The default deallocation path (a GC type with no `tp_dealloc`) runs
-//! `tp_clear` exactly once before releasing the instance, so declared edges
-//! are dropped; a type with its own `tp_dealloc` owns that duty, as in CPython.
+//! root; the collector's pass therefore never frees Hydro memory, only the
+//! C-side handles whose cycles it breaks. Handle-internal cycles that do not
+//! involve a GC-tracked instance (a list containing itself) still leak rather
+//! than dangle.
 //!
 //! Static C `PyTypeObject` declarations (`PyVarObject_HEAD_INIT(NULL, 0)` or
 //! `&PyType_Type`) are adopted by `PyType_Ready`: the object is linked to the
@@ -778,10 +790,13 @@ pub(crate) enum ShimKind {
     },
     /// `contextvars.ContextVar` created through the C API.
     ///
-    /// CPython's `ContextVar` stores only its name; `PyContextVar_New`'s
-    /// optional argument is not exposed as an attribute.
+    /// `default` is CPython's second `PyContextVar_New` argument: any object
+    /// (a *new* reference owned by the variable, or 0 for none), used by
+    /// `PyContextVar_Get` when the variable has no value in the current
+    /// context. It is not a doc string.
     ContextVar {
         name: String,
+        default: usize,
         values: Arc<ContextVarValues>,
     },
     /// Token returned by `PyContextVar_Set`; `previous` is 0 when the variable
@@ -1555,7 +1570,12 @@ fn release_kind(kind: ShimKind, address: *mut ShimObject) {
                 dec_ref(sequence as *mut ShimObject);
             }
         }
-        ShimKind::ContextVar { values, .. } => {
+        ShimKind::ContextVar {
+            default, values, ..
+        } => {
+            if default != 0 {
+                dec_ref(default as *mut ShimObject);
+            }
             drop(values);
         }
         ShimKind::ContextVarToken { var, previous } => {
@@ -4653,15 +4673,15 @@ pub extern "C" fn PyModule_GetDef(module: *mut ShimObject) -> *mut PyModuleDefMi
 }
 
 /// `PyModule_GetState`.
+///
+/// Returns the module's per-module state block, or NULL for a module whose
+/// `PyModuleDef.m_size` is zero, without setting an exception: that is
+/// CPython's `_PyModule_GetState` contract, and extensions distinguish "no
+/// state" from a failed call by looking at `PyErr_Occurred`. A non-module
+/// argument raises `TypeError`.
 #[no_mangle]
 pub extern "C" fn PyModule_GetState(module: *mut ShimObject) -> *mut c_void {
     match module_entry_pointer(module, |entry| entry.state) {
-        Ok(0) => {
-            // `m_size == 0`: the module declared no per-module state. CPython
-            // reports this instead of handing back a bogus pointer.
-            set_error("SystemError: module state is not available");
-            ptr::null_mut()
-        }
         Ok(state) => state as *mut c_void,
         Err(error) => {
             set_error(error);
@@ -5159,29 +5179,116 @@ pub extern "C" fn PyEval_GetLocals() -> *mut ShimObject {
     frame_dict(&EVAL_LOCALS) as *mut ShimObject
 }
 
+/// Copies one runtime `sys.<name>` value into the C-visible dictionary.
+///
+/// The value is resolved through the native module table and converted with
+/// the same tagged-value bridge extension calls use; the wrapper owns the
+/// Hydro root for as long as the dictionary holds it.
+fn sys_copy_runtime_value(dict: *mut ShimObject, name: &str) {
+    let value = crate::modules::module_get_by_name("sys", name);
+    if crate::exc::pending() {
+        // The runtime has no such value; leave the entry absent rather than
+        // exposing a placeholder. `PySys_GetObject` then returns NULL.
+        crate::exc::clear();
+        return;
+    }
+    if let Ok(shim) = crate::modules::extension::value_to_shim(value) {
+        let object = value_object(shim);
+        if !object.is_null() {
+            dict_set_string(dict, name, object);
+            dec_ref(object);
+        }
+    }
+    // A value with no C representation stays absent; `PySys_GetObject`
+    // then reports it as missing instead of returning an object with an
+    // unrelated exception pending. Every name resolved above has a C
+    // representation, which the sys-surface test asserts.
+}
+
+/// The C-visible `sys` dictionary behind `PySys_GetObject`.
+///
+/// Every name an extension commonly reads is populated from the runtime's own
+/// `sys` module, so `sys.flags.optimize`, `sys.version`, `sys.platform`,
+/// `sys.implementation` and friends report the values Hydro code sees instead
+/// of a C-only stub. `sys.modules` stays the live C registry dictionary that
+/// `PyImport_GetModuleDict` returns, and the two option containers are real
+/// empty objects because this runtime parses no `-W`/`-X` options.
+///
+/// The entries that wrap Hydro values are only valid for the heap generation
+/// that produced them, so a runtime reset (`hydro_runtime_init`) rebuilds the
+/// dictionary instead of handing out handles into the freed heap.
 fn sys_dict() -> usize {
-    static SYS: LazyLock<usize> = LazyLock::new(|| {
-        let dict = PyDict_New();
-        if dict.is_null() {
+    static SYS: LazyLock<Mutex<(u64, usize)>> = LazyLock::new(|| Mutex::new((u64::MAX, 0)));
+    loop {
+        let generation = crate::heap::generation();
+        {
+            let cached = SYS.lock().unwrap_or_else(PoisonError::into_inner);
+            if cached.0 == generation && cached.1 != 0 {
+                return cached.1;
+            }
+        }
+        // Build without holding the cache lock: the values come from the
+        // runtime's module table, which takes its own locks.
+        let dict = build_sys_dict();
+        if dict == 0 {
             return 0;
         }
-        let modules = PyImport_GetModuleDict();
-        if !modules.is_null() {
-            dict_set_string(dict, "modules", modules);
+        let mut cached = SYS.lock().unwrap_or_else(PoisonError::into_inner);
+        if crate::heap::generation() != generation {
+            // A reset raced the build; its heap is gone, so try again.
+            drop(cached);
+            dec_ref(dict as *mut ShimObject);
+            continue;
         }
-        let path = PyList_New(0);
-        if !path.is_null() {
-            dict_set_string(dict, "path", path);
-            dec_ref(path);
+        if cached.0 == generation && cached.1 != 0 {
+            // Another thread published this generation's dictionary first.
+            let winner = cached.1;
+            drop(cached);
+            dec_ref(dict as *mut ShimObject);
+            return winner;
         }
-        let argv = PyList_New(0);
-        if !argv.is_null() {
-            dict_set_string(dict, "argv", argv);
-            dec_ref(argv);
+        let previous = cached.1;
+        cached.0 = generation;
+        cached.1 = dict;
+        drop(cached);
+        if previous != 0 {
+            dec_ref(previous as *mut ShimObject);
         }
-        dict as usize
-    });
-    *SYS
+        return dict;
+    }
+}
+
+/// Builds one generation's C-visible `sys` dictionary.
+fn build_sys_dict() -> usize {
+    ensure_builtin_types();
+    let dict = PyDict_New();
+    if dict.is_null() {
+        return 0;
+    }
+    let modules = PyImport_GetModuleDict();
+    if !modules.is_null() {
+        dict_set_string(dict, "modules", modules);
+    }
+    for name in [
+        "flags",
+        "implementation",
+        "version",
+        "version_info",
+        "platform",
+        "byteorder",
+        "maxsize",
+        "path",
+        "argv",
+    ] {
+        sys_copy_runtime_value(dict, name);
+    }
+    for (name, container) in [("warnoptions", PyList_New(0)), ("_xoptions", PyDict_New())] {
+        if !container.is_null() {
+            dict_set_string(dict, name, container);
+            dec_ref(container);
+        }
+    }
+    dict as usize
 }
 
 /// `PySys_GetObject`: borrowed object from the `sys` dictionary, or NULL.
@@ -5889,9 +5996,10 @@ pub extern "C" fn PyType_GetModule(type_object: *mut ShimObject) -> *mut ShimObj
 
 /// `PyType_GetModuleState`: the module state block of a heap type's module.
 ///
-/// Mirrors CPython: a type without a module, or a module whose
-/// `PyModuleDef.m_size` is zero, yields NULL with a `TypeError` naming the
-/// missing association instead of an arbitrary address.
+/// Mirrors CPython: a type without an associated module yields NULL with the
+/// `TypeError` from [`PyType_GetModule`], and a module whose
+/// `PyModuleDef.m_size` is zero yields NULL without an exception. No
+/// arbitrary address is ever returned.
 #[no_mangle]
 pub extern "C" fn PyType_GetModuleState(type_object: *mut ShimObject) -> *mut c_void {
     let module = PyType_GetModule(type_object);
@@ -5899,11 +6007,7 @@ pub extern "C" fn PyType_GetModuleState(type_object: *mut ShimObject) -> *mut c_
         // `PyType_GetModule` already set the diagnostic.
         return ptr::null_mut();
     }
-    let state = PyModule_GetState(module);
-    if state.is_null() && !error_pending() {
-        set_error("TypeError: PyType_GetModuleState(): module state is not available");
-    }
-    state
+    PyModule_GetState(module)
 }
 
 /// `PyType_FromMetaclass`.
@@ -12884,6 +12988,27 @@ pub extern "C" fn PyInterpreterState_Main() -> *mut PyInterpreterState {
     ptr::addr_of!(MAIN_INTERPRETER) as *mut PyInterpreterState
 }
 
+/// `PyGC_Collect`: runs one collection cycle and returns the number of
+/// unreachable objects it reclaimed.
+///
+/// The objects this entry point collects are the GC-tracked extension
+/// instances registered by `PyObject_GC_Track`/`PyType_GenericAlloc`. The pass
+/// calls every tracked type's `tp_traverse`, treats an instance whose
+/// references all come from other tracked instances as unreachable, runs its
+/// `tp_clear` exactly once and frees it, which is CPython's contract for
+/// `tp_traverse`/`tp_clear`. Hydro values are not part of this graph: a Hydro
+/// value held by an extension is kept alive by its own persistent root, so
+/// breaking a C-side cycle can never free Hydro memory.
+///
+/// The Hydro heap collector is deliberately not run here: this entry point can
+/// be called while a foreign thread holds the emulated GIL, and a Hydro
+/// collection would have to wait for other threads' safepoints. `gc.collect()`
+/// drives the Hydro heap through `hydro_gc_collect`.
+#[no_mangle]
+pub extern "C" fn PyGC_Collect() -> isize {
+    types::collect_cycles() as isize
+}
+
 // -- Unicode ----------------------------------------------------------------
 
 /// `PyUnicode_AsASCIIString`.
@@ -14111,26 +14236,36 @@ fn current_thread_key() -> u64 {
 }
 
 /// `PyContextVar_New`.
+///
+/// CPython's second argument is the variable's *default object* — any
+/// `PyObject *`, not a doc string — and the newly created variable owns a new
+/// reference to it. `PyContextVar_Get` returns it when no value has been set
+/// for the current context.
 #[no_mangle]
-pub extern "C" fn PyContextVar_New(name: *const c_char, doc: *mut ShimObject) -> *mut ShimObject {
+pub extern "C" fn PyContextVar_New(
+    name: *const c_char,
+    default: *mut ShimObject,
+) -> *mut ShimObject {
     if name.is_null() {
         bad_internal_call();
         return ptr::null_mut();
     }
     let name = read_c_string(name);
-    // Like CPython's `ContextVar`, the optional argument is only validated and
-    // never surfaced as an attribute of the variable.
-    if !doc.is_null() && doc != ptr::addr_of_mut!(_Py_NoneStruct) && as_string(doc).is_none() {
-        set_error("TypeError: PyContextVar_New: doc must be a string or None");
-        return ptr::null_mut();
+    if !default.is_null() {
+        inc_ref(default);
     }
     new_object(ShimKind::ContextVar {
         name,
+        default: default as usize,
         values: Arc::new(ContextVarValues::new()),
     })
 }
 
 /// `PyContextVar_Get`: writes a new reference to the value or default.
+///
+/// `default_value` overrides the variable only when it is non-NULL; otherwise
+/// the variable's creation default (if any) is written. When neither exists,
+/// `*value` is set to NULL and the call still succeeds, as in CPython.
 #[no_mangle]
 pub extern "C" fn PyContextVar_Get(
     variable: *mut ShimObject,
@@ -14143,10 +14278,14 @@ pub extern "C" fn PyContextVar_Get(
     }
     // SAFETY: caller-supplied writable slot.
     unsafe { *value = ptr::null_mut() };
-    let Some(ShimKind::ContextVar { values, .. }) = kind_ref(variable) else {
+    let Some(ShimKind::ContextVar {
+        default, values, ..
+    }) = kind_ref(variable)
+    else {
         set_error("TypeError: a context variable is required");
         return -1;
     };
+    let stored_default = *default;
     let key = current_thread_key();
     let found = {
         let map = values.lock();
@@ -14155,7 +14294,7 @@ pub extern "C" fn PyContextVar_Get(
     let result = match found {
         Some(found) => found,
         None if !default_value.is_null() => default_value as usize,
-        None => 0,
+        None => stored_default,
     };
     if result != 0 {
         inc_ref(result as *mut ShimObject);
@@ -14539,6 +14678,7 @@ pub(crate) fn anchor() {
         PyObject_GC_UnTrack as *const (),
         PyObject_GC_IsTracked as *const (),
         PyObject_GC_Del as *const (),
+        PyGC_Collect as *const (),
         PyObject_IS_GC as *const (),
         _PyObject_GC_New as *const (),
         _PyObject_GC_NewVar as *const (),
@@ -14773,6 +14913,7 @@ pub(crate) fn anchor() {
         PyErr_NormalizeException as *const (),
         PyErr_Print as *const (),
         PyErr_Restore as *const (),
+        PyErr_WriteUnraisable as *const (),
         PyException_SetContext as *const (),
         PyFloat_FromString as *const (),
         PyInterpreterState_Main as *const (),
@@ -16110,6 +16251,10 @@ mod tests {
         types::TypeObject::builtin(c"probe.StaticLinkedHead".as_ptr(), types::TypeRole::Shim, 0);
     static mut STATIC_BAD: types::TypeObject =
         types::TypeObject::builtin(c"probe.StaticBad".as_ptr(), types::TypeRole::Shim, 0);
+    static mut STATIC_CUSTOM_METATYPE: types::TypeObject =
+        types::TypeObject::builtin(c"probe.StaticCustomMeta".as_ptr(), types::TypeRole::Shim, 0);
+    static mut STATIC_METACLASS: types::TypeObject =
+        types::TypeObject::builtin(c"probe.StaticMetaclass".as_ptr(), types::TypeRole::Shim, 0);
 
     #[test]
     fn py_type_ready_adopts_static_c_type_objects() {
@@ -16182,6 +16327,51 @@ mod tests {
             assert_eq!((*linked).ob_refcnt.load(SEQ), IMMORTAL_REFCNT);
         }
 
+        // A static metaclass declares `tp_base = &PyType_Type`, exactly the
+        // `PyArrayDTypeMeta_Type` pattern.
+        let metaclass = std::ptr::addr_of_mut!(STATIC_METACLASS);
+        unsafe {
+            (*metaclass).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+            (*metaclass).tp_flags = 0;
+            (*metaclass).tp_base = std::ptr::addr_of_mut!(types::TYPE_TYPE);
+        }
+        assert_eq!(
+            PyType_Ready(metaclass as *mut ShimObject),
+            0,
+            "{:?}",
+            take_error()
+        );
+        unsafe {
+            assert_eq!(
+                (*metaclass).tp_base,
+                std::ptr::addr_of_mut!(types::TYPE_TYPE)
+            );
+            assert_ne!((*metaclass).tp_flags & types::PY_TPFLAGS_READY, 0);
+        }
+
+        // A static type may name another static type as its metatype before
+        // `PyType_Ready`, as NumPy does with `Py_SET_TYPE(&PyArrayDescr_Type,
+        // &PyArrayDTypeMeta_Type)`. The adopted metaclass is a known type
+        // object, so the type is adopted (and its link normalised to this
+        // host's metatype) instead of being rejected as an instance.
+        let custom = std::ptr::addr_of_mut!(STATIC_CUSTOM_METATYPE);
+        unsafe {
+            (*custom).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+            (*custom).ob_type = metaclass;
+            (*custom).tp_flags = 0;
+        }
+        assert_eq!(
+            PyType_Ready(custom as *mut ShimObject),
+            0,
+            "{:?}",
+            take_error()
+        );
+        unsafe {
+            assert_eq!((*custom).role, types::TypeRole::Instance);
+            assert_eq!((*custom).ob_type, std::ptr::addr_of_mut!(types::TYPE_TYPE));
+            assert_ne!((*custom).tp_flags & types::PY_TPFLAGS_READY, 0);
+        }
+
         // A static type with a negative layout is rejected with a diagnostic
         // and left untouched.
         let bad = std::ptr::addr_of_mut!(STATIC_BAD);
@@ -16218,7 +16408,8 @@ mod tests {
         let visit: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
             unsafe { std::mem::transmute(visit) };
         // SAFETY: the visitor and its argument come from the host walker.
-        unsafe { visit(argument, GC_CHILD.load(SEQ) as *mut c_void) }
+        // `visitproc` receives the visited object first, then the context.
+        unsafe { visit(GC_CHILD.load(SEQ) as *mut c_void, argument) }
     }
 
     extern "C" fn probe_clear(_self: *mut ShimObject) {
@@ -16285,6 +16476,1105 @@ mod tests {
         assert!(PyType_FromSpec(&mut bad_spec).is_null());
         let message = take_error().expect("GC without traverse");
         assert!(message.contains("has no tp_traverse function"), "{message}");
+    }
+
+    // -- production GC pass (PyGC_Collect) --------------------------------
+
+    /// One clear per instance whose cycle the collector broke.
+    static CYCLE_CLEARS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Serialises tests that run a collection pass: the tracked set is
+    /// process-wide, so two passes at once could break each other's cycle.
+    static GC_PASS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn gc_pass_lock() -> std::sync::MutexGuard<'static, ()> {
+        GC_PASS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `tp_traverse` of the cycle probe: visits the child stored directly after
+    /// `PyObject_HEAD`, the CPython instance layout this host allocates.
+    extern "C" fn cycle_traverse(
+        self_object: *mut ShimObject,
+        visit: *mut c_void,
+        argument: *mut c_void,
+    ) -> c_int {
+        if visit.is_null() {
+            return 0;
+        }
+        let visit: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
+            unsafe { std::mem::transmute(visit) };
+        // SAFETY: instances of this type store their child at that offset and
+        // the pass holds a reference to the object.
+        let child =
+            unsafe { *((self_object as *mut u8).add(PY_OBJECT_HEAD_SIZE) as *mut *mut ShimObject) };
+        if child.is_null() {
+            0
+        } else {
+            // SAFETY: the visitor comes from `gc_traverse`; `visitproc` takes
+            // the visited object first and the context second.
+            unsafe { visit(child as *mut c_void, argument) }
+        }
+    }
+
+    /// `tp_clear` of the cycle probe: releases the stored handle and counts.
+    extern "C" fn cycle_clear(self_object: *mut ShimObject) -> c_int {
+        CYCLE_CLEARS.fetch_add(1, SEQ);
+        // SAFETY: same layout as `cycle_traverse`; the object is live.
+        let slot =
+            unsafe { (self_object as *mut u8).add(PY_OBJECT_HEAD_SIZE) as *mut *mut ShimObject };
+        let child = unsafe { *slot };
+        if !child.is_null() {
+            unsafe { *slot = std::ptr::null_mut() };
+            Py_DecRef(child);
+        }
+        0
+    }
+
+    /// Creates the cycle probe type (GC flag, traverse and clear slots).
+    fn cycle_probe_type() -> *mut ShimObject {
+        let mut slots = [
+            PyTypeSlotMirror {
+                slot: 71, // Py_tp_traverse
+                pfunc: cycle_traverse as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 51, // Py_tp_clear
+                pfunc: cycle_clear as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 0,
+                pfunc: std::ptr::null_mut(),
+            },
+        ];
+        make_type(
+            c"probe.Cycle",
+            (PY_OBJECT_HEAD_SIZE + std::mem::size_of::<*mut c_void>()) as c_int,
+            0,
+            PY_TPFLAGS_HAVE_GC as c_uint,
+            &mut slots,
+        )
+    }
+
+    /// Stores `child` in the probe instance's trailing pointer, taking a
+    /// reference.
+    fn set_cycle_child(object: *mut ShimObject, child: *mut ShimObject) {
+        // SAFETY: the object is a live cycle-probe instance.
+        let slot = unsafe { (object as *mut u8).add(PY_OBJECT_HEAD_SIZE) as *mut *mut ShimObject };
+        let previous = unsafe { *slot };
+        Py_IncRef(child);
+        unsafe { *slot = child };
+        if !previous.is_null() {
+            Py_DecRef(previous);
+        }
+    }
+
+    #[test]
+    fn py_gc_collect_breaks_a_tracked_cycle_exactly_once() {
+        anchor();
+        let _guard = gc_pass_lock();
+        let type_object = cycle_probe_type();
+        let first = PyType_GenericAlloc(type_object, 0);
+        let second = PyType_GenericAlloc(type_object, 0);
+        assert!(!first.is_null() && !second.is_null(), "{:?}", take_error());
+        set_cycle_child(first, second);
+        set_cycle_child(second, first);
+        CYCLE_CLEARS.store(0, SEQ);
+        // The caller's references go away; only the cycle keeps each alive.
+        Py_DecRef(first);
+        Py_DecRef(second);
+
+        let collected = PyGC_Collect();
+        assert!(
+            collected >= 2,
+            "the collector did not reclaim the cycle: {collected}"
+        );
+        assert_eq!(
+            CYCLE_CLEARS.load(SEQ),
+            2,
+            "tp_clear must run exactly once per collected instance"
+        );
+        // A second pass finds no candidate and must not clear again.
+        PyGC_Collect();
+        assert_eq!(
+            CYCLE_CLEARS.load(SEQ),
+            2,
+            "a collected cycle must not be cleared twice"
+        );
+        Py_DecRef(type_object);
+    }
+
+    #[test]
+    fn py_gc_collect_keeps_a_cycle_reachable_from_outside() {
+        anchor();
+        let _guard = gc_pass_lock();
+        let type_object = cycle_probe_type();
+        let first = PyType_GenericAlloc(type_object, 0);
+        let second = PyType_GenericAlloc(type_object, 0);
+        assert!(!first.is_null() && !second.is_null(), "{:?}", take_error());
+        set_cycle_child(first, second);
+        set_cycle_child(second, first);
+        CYCLE_CLEARS.store(0, SEQ);
+        // Drop `second`'s allocation reference: afterwards only `first` has a
+        // reference from this frame, which is outside the tracked set.
+        // `second` is only referenced from `first`, so it must be reached
+        // through `tp_traverse` rather than collected.
+        Py_DecRef(second);
+        PyGC_Collect();
+        assert_eq!(
+            CYCLE_CLEARS.load(SEQ),
+            0,
+            "a cycle reachable from outside must not be cleared"
+        );
+
+        // Dropping the outside reference leaves the bare cycle behind.
+        Py_DecRef(first);
+        let collected = PyGC_Collect();
+        assert!(
+            collected >= 2,
+            "the unreachable cycle was not collected: {collected}"
+        );
+        assert_eq!(CYCLE_CLEARS.load(SEQ), 2);
+        Py_DecRef(type_object);
+    }
+
+    // -- C fixture: real extension instances, traverse/clear --------------
+
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// A real stable-ABI extension compiled at test time. It exposes a
+    /// `Py_TPFLAGS_HAVE_GC` type whose `tp_traverse` and `tp_clear` count their
+    /// calls and release a stored handle, plus the threaded-callback probe.
+    ///
+    /// The fixture imports nothing beyond `<Python.h>`; every one of those
+    /// symbols is bound to this process's runtime definition through
+    /// [`install_host_exports`], so it exercises the real C API exactly like
+    /// the checked-in integration fixtures.
+    const GC_PROBE_SOURCE: &str = r#"#define Py_LIMITED_API 0x030C0000
+#include <Python.h>
+#include <pthread.h>
+#include <stddef.h>
+#include <stdlib.h>
+
+typedef struct {
+    PyObject_HEAD
+    PyObject *child;
+} NodeObject;
+
+static PyObject *NodeType;
+static PyObject *kept_node;
+
+static long traverse_calls;
+static long clear_calls;
+static long finalize_calls;
+static long children_set;
+static long children_cleared;
+static long callback_calls;
+
+static int Node_traverse(PyObject *self, visitproc visit, void *arg) {
+    NodeObject *node = (NodeObject *)self;
+    traverse_calls++;
+    Py_VISIT(node->child);
+    return 0;
+}
+
+static int Node_clear(PyObject *self) {
+    NodeObject *node = (NodeObject *)self;
+    clear_calls++;
+    if (node->child != NULL) {
+        children_cleared++;
+        Py_CLEAR(node->child);
+    }
+    return 0;
+}
+
+static void Node_finalize(PyObject *self) {
+    (void)self;
+    finalize_calls++;
+}
+
+static PyObject *Node_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
+    NodeObject *self;
+    (void)args;
+    (void)kwds;
+    self = (NodeObject *)PyType_GenericAlloc(type, 0);
+    if (self != NULL) {
+        self->child = NULL;
+    }
+    return (PyObject *)self;
+}
+
+static int Node_set_child(PyObject *self, PyObject *value, void *closure) {
+    (void)closure;
+    if (value == NULL) {
+        PyErr_SetString(PyExc_AttributeError, "cannot delete child");
+        return -1;
+    }
+    {
+        NodeObject *node = (NodeObject *)self;
+        PyObject *previous = node->child;
+        Py_INCREF(value);
+        node->child = value;
+        Py_XDECREF(previous);
+    }
+    children_set++;
+    return 0;
+}
+
+static PyObject *Node_get_child(PyObject *self, void *closure) {
+    PyObject *child = ((NodeObject *)self)->child;
+    (void)closure;
+    if (child == NULL) {
+        Py_RETURN_NONE;
+    }
+    Py_INCREF(child);
+    return child;
+}
+
+static PyGetSetDef Node_getset[] = {
+    {"child", Node_get_child, Node_set_child, NULL, NULL},
+    {NULL, NULL, NULL, NULL, NULL}
+};
+
+static PyType_Slot Node_slots[] = {
+    {Py_tp_new, (void *)Node_new},
+    {Py_tp_getset, (void *)Node_getset},
+    {Py_tp_traverse, (void *)Node_traverse},
+    {Py_tp_clear, (void *)Node_clear},
+    {Py_tp_finalize, (void *)Node_finalize},
+    {0, NULL}
+};
+
+static PyType_Spec Node_spec = {
+    "gc_probe.Node",
+    (int)sizeof(NodeObject),
+    0,
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+    Node_slots
+};
+
+static PyObject *new_node(void) {
+    return PyObject_CallNoArgs(NodeType);
+}
+
+static int link_node(PyObject *from, PyObject *to) {
+    return Node_set_child(from, to, NULL);
+}
+
+static PyObject *probe_make_cycle(PyObject *module, PyObject *unused) {
+    PyObject *a;
+    PyObject *b;
+    (void)module;
+    (void)unused;
+    a = new_node();
+    b = new_node();
+    if (a == NULL || b == NULL) {
+        Py_XDECREF(a);
+        Py_XDECREF(b);
+        return NULL;
+    }
+    if (link_node(a, b) < 0 || link_node(b, a) < 0) {
+        Py_DECREF(a);
+        Py_DECREF(b);
+        return NULL;
+    }
+    Py_DECREF(a);
+    Py_DECREF(b);
+    Py_RETURN_NONE;
+}
+
+static PyObject *probe_keep_cycle(PyObject *module, PyObject *unused) {
+    PyObject *a;
+    PyObject *b;
+    (void)module;
+    (void)unused;
+    a = new_node();
+    b = new_node();
+    if (a == NULL || b == NULL) {
+        Py_XDECREF(a);
+        Py_XDECREF(b);
+        return NULL;
+    }
+    if (link_node(a, b) < 0 || link_node(b, a) < 0) {
+        Py_DECREF(a);
+        Py_DECREF(b);
+        return NULL;
+    }
+    Py_CLEAR(kept_node);
+    kept_node = a;
+    Py_DECREF(b);
+    Py_RETURN_NONE;
+}
+
+static PyObject *probe_drop_kept(PyObject *module, PyObject *unused) {
+    (void)module;
+    (void)unused;
+    Py_CLEAR(kept_node);
+    Py_RETURN_NONE;
+}
+
+static PyObject *probe_teardown(PyObject *module, PyObject *unused) {
+    PyObject *node;
+    PyObject *child;
+    (void)module;
+    (void)unused;
+    node = new_node();
+    if (node == NULL) {
+        return NULL;
+    }
+    child = PyLong_FromLong(11);
+    if (child == NULL) {
+        Py_DECREF(node);
+        return NULL;
+    }
+    if (link_node(node, child) < 0) {
+        Py_DECREF(child);
+        Py_DECREF(node);
+        return NULL;
+    }
+    Py_DECREF(child);
+    Py_DECREF(node);
+    Py_RETURN_NONE;
+}
+
+static PyObject *probe_collect(PyObject *module, PyObject *unused) {
+    (void)module;
+    (void)unused;
+    return PyLong_FromLong((long)PyGC_Collect());
+}
+
+static PyObject *probe_reset_stats(PyObject *module, PyObject *unused) {
+    (void)module;
+    (void)unused;
+    traverse_calls = 0;
+    clear_calls = 0;
+    finalize_calls = 0;
+    children_set = 0;
+    children_cleared = 0;
+    callback_calls = 0;
+    Py_RETURN_NONE;
+}
+
+static int add_long(PyObject *tuple, Py_ssize_t index, long value) {
+    PyObject *number = PyLong_FromLong(value);
+    if (number == NULL) {
+        return -1;
+    }
+    if (PyTuple_SetItem(tuple, index, number) < 0) {
+        Py_DECREF(number);
+        return -1;
+    }
+    return 0;
+}
+
+static PyObject *probe_stats(PyObject *module, PyObject *unused) {
+    PyObject *tuple;
+    (void)module;
+    (void)unused;
+    tuple = PyTuple_New(6);
+    if (tuple == NULL) {
+        return NULL;
+    }
+    if (add_long(tuple, 0, traverse_calls) < 0 ||
+        add_long(tuple, 1, clear_calls) < 0 ||
+        add_long(tuple, 2, finalize_calls) < 0 ||
+        add_long(tuple, 3, children_set) < 0 ||
+        add_long(tuple, 4, children_cleared) < 0 ||
+        add_long(tuple, 5, callback_calls) < 0) {
+        Py_DECREF(tuple);
+        return NULL;
+    }
+    return tuple;
+}
+
+static PyObject *probe_callback(PyObject *module, PyObject *unused) {
+    (void)module;
+    (void)unused;
+    callback_calls++;
+    return PyLong_FromLong(7);
+}
+
+typedef struct {
+    PyObject *callable;
+    PyObject *handle;
+    long iterations;
+    long failures;
+} Worker;
+
+static void *worker_main(void *raw) {
+    Worker *work = (Worker *)raw;
+    long i;
+    for (i = 0; i < work->iterations; i++) {
+        int state = PyGILState_Ensure();
+        PyObject *result = PyObject_CallNoArgs(work->callable);
+        if (result == NULL) {
+            work->failures++;
+            PyErr_Clear();
+        } else {
+            Py_DECREF(result);
+        }
+        Py_INCREF(work->handle);
+        Py_DECREF(work->handle);
+        PyGILState_Release(state);
+    }
+    return NULL;
+}
+
+static PyObject *probe_threaded_call(PyObject *module, PyObject *args) {
+    PyObject *handle;
+    PyObject *callable;
+    PyThreadState *saved;
+    pthread_t ids[32];
+    Worker *work;
+    long threads = 4;
+    long iterations = 64;
+    long started = 0;
+    long failures = 0;
+    long i;
+    if (!PyArg_ParseTuple(args, "O|ll:threaded_call", &handle, &threads, &iterations)) {
+        return NULL;
+    }
+    if (threads < 1 || threads > 32 || iterations < 1 || iterations > 1000000) {
+        PyErr_SetString(PyExc_ValueError, "threaded_call: argument out of range");
+        return NULL;
+    }
+    callable = PyObject_GetAttrString(module, "callback");
+    if (callable == NULL) {
+        return NULL;
+    }
+    work = (Worker *)calloc((size_t)threads, sizeof(Worker));
+    if (work == NULL) {
+        Py_DECREF(callable);
+        return PyErr_NoMemory();
+    }
+    Py_INCREF(handle);
+    for (i = 0; i < threads; i++) {
+        work[i].callable = callable;
+        work[i].handle = handle;
+        work[i].iterations = iterations;
+        work[i].failures = 0;
+        if (pthread_create(&ids[i], NULL, worker_main, &work[i]) != 0) {
+            break;
+        }
+        started++;
+    }
+    saved = PyEval_SaveThread();
+    for (i = 0; i < started; i++) {
+        pthread_join(ids[i], NULL);
+    }
+    PyEval_RestoreThread(saved);
+    for (i = 0; i < started; i++) {
+        failures += work[i].failures;
+    }
+    free(work);
+    Py_DECREF(callable);
+    if (started != threads || failures != 0) {
+        Py_DECREF(handle);
+        PyErr_SetString(PyExc_RuntimeError, "threaded_call: callback failed");
+        return NULL;
+    }
+    return handle;
+}
+
+static PyMethodDef probe_methods[] = {
+    {"make_cycle", probe_make_cycle, METH_NOARGS, NULL},
+    {"keep_cycle", probe_keep_cycle, METH_NOARGS, NULL},
+    {"drop_kept", probe_drop_kept, METH_NOARGS, NULL},
+    {"teardown", probe_teardown, METH_NOARGS, NULL},
+    {"collect", probe_collect, METH_NOARGS, NULL},
+    {"stats", probe_stats, METH_NOARGS, NULL},
+    {"reset_stats", probe_reset_stats, METH_NOARGS, NULL},
+    {"callback", probe_callback, METH_NOARGS, NULL},
+    {"threaded_call", probe_threaded_call, METH_VARARGS, NULL},
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef gc_probe_module = {
+    PyModuleDef_HEAD_INIT,
+    "gc_probe",
+    NULL,
+    -1,
+    probe_methods,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+};
+
+PyMODINIT_FUNC PyInit_gc_probe(void) {
+    PyObject *module = PyModule_Create(&gc_probe_module);
+    if (module == NULL) {
+        return NULL;
+    }
+    NodeType = PyType_FromSpec(&Node_spec);
+    if (NodeType == NULL) {
+        Py_DECREF(module);
+        return NULL;
+    }
+    if (PyModule_AddObject(module, "Node", NodeType) < 0) {
+        Py_DECREF(NodeType);
+        Py_DECREF(module);
+        return NULL;
+    }
+    return module;
+}
+"#;
+
+    /// Reads a little-endian `u16` from an ELF image at `offset`.
+    #[cfg(target_os = "linux")]
+    fn elf_u16(image: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(image[offset..offset + 2].try_into().expect("ELF u16"))
+    }
+
+    /// Reads a little-endian `u32` from an ELF image at `offset`.
+    #[cfg(target_os = "linux")]
+    fn elf_u32(image: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(image[offset..offset + 4].try_into().expect("ELF u32"))
+    }
+
+    /// Reads a little-endian `u64` from an ELF image at `offset`.
+    #[cfg(target_os = "linux")]
+    fn elf_u64(image: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(image[offset..offset + 8].try_into().expect("ELF u64"))
+    }
+
+    /// One `Elf64_Shdr`, reduced to the fields the symbol reader needs.
+    #[cfg(target_os = "linux")]
+    struct ElfSection {
+        kind: u32,
+        offset: usize,
+        size: usize,
+        link: usize,
+        entry_size: usize,
+    }
+
+    /// Load base of the main executable (`dlpi_addr` of an empty `dlpi_name`).
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" fn find_main_executable(
+        info: *mut libc::dl_phdr_info,
+        _size: usize,
+        context: *mut c_void,
+    ) -> c_int {
+        // SAFETY: the dynamic loader passes a live descriptor for the call.
+        let info = unsafe { &*info };
+        let name = info.dlpi_name;
+        if name.is_null() || unsafe { *name } == 0 {
+            // SAFETY: `context` is the `usize` out-parameter below.
+            unsafe { *(context as *mut usize) = info.dlpi_addr as usize };
+            return 1;
+        }
+        0
+    }
+
+    /// Returns the address the main executable was mapped at.
+    #[cfg(target_os = "linux")]
+    fn main_executable_base() -> usize {
+        let mut base = 0usize;
+        // SAFETY: the callback only reads the descriptor it is handed.
+        unsafe {
+            libc::dl_iterate_phdr(
+                Some(find_main_executable),
+                &mut base as *mut usize as *mut c_void,
+            );
+        }
+        base
+    }
+
+    /// Collects every `Py*`/`_Py*` definition in the test executable's own
+    /// symbol table, as `(name, runtime address)`.
+    ///
+    /// The library's unit-test harness is linked without `--export-dynamic`:
+    /// Cargo's `rustc-link-arg-tests` reaches integration test targets only,
+    /// so the harness's dynamic symbol table contains imports but no
+    /// definitions. The static symbol table is still complete, and these are
+    /// the same real definitions the integration fixtures resolve through the
+    /// dynamic table.
+    #[cfg(target_os = "linux")]
+    fn executable_py_symbols() -> Vec<(String, usize)> {
+        use std::collections::BTreeMap;
+
+        let path = std::env::current_exe().expect("the test executable path");
+        let image = std::fs::read(&path).expect("read the test executable");
+        assert!(
+            image.len() > 64 && image.starts_with(b"\x7fELF") && image[4] == 2 && image[5] == 1,
+            "the unit-test harness is not an ELF64 little-endian image: {}",
+            path.display()
+        );
+        let section_offset = elf_u64(&image, 0x28) as usize;
+        let section_size = elf_u16(&image, 0x3a) as usize;
+        let section_count = elf_u16(&image, 0x3c) as usize;
+        let mut sections = Vec::with_capacity(section_count);
+        for index in 0..section_count {
+            let header = section_offset + index * section_size;
+            sections.push(ElfSection {
+                kind: elf_u32(&image, header + 4),
+                offset: elf_u64(&image, header + 0x18) as usize,
+                size: elf_u64(&image, header + 0x20) as usize,
+                link: elf_u32(&image, header + 0x28) as usize,
+                entry_size: elf_u64(&image, header + 0x38) as usize,
+            });
+        }
+        let symbol_table = sections
+            .iter()
+            .find(|section| section.kind == 2)
+            .expect("the test executable has no .symtab; it must not be stripped");
+        let strings = &sections[symbol_table.link];
+        let base = main_executable_base();
+        let mut symbols: BTreeMap<String, usize> = BTreeMap::new();
+        for index in 0..symbol_table.size / symbol_table.entry_size {
+            let entry = symbol_table.offset + index * symbol_table.entry_size;
+            let name_offset = elf_u32(&image, entry) as usize;
+            let info = image[entry + 4];
+            let section = elf_u16(&image, entry + 6);
+            let value = elf_u64(&image, entry + 8) as usize;
+            // Only defined global/weak functions and objects can back a
+            // dynamic relocation; undefined, absolute, local and TLS entries
+            // cannot.
+            let binding = info >> 4;
+            let kind = info & 0xf;
+            if section == 0 || section >= 0xff00 || !(binding == 1 || binding == 2) || kind > 2 {
+                continue;
+            }
+            let start = strings.offset + name_offset;
+            let length = image[start..]
+                .iter()
+                .position(|&byte| byte == 0)
+                .expect("unterminated symbol name");
+            let name = std::str::from_utf8(&image[start..start + length]).expect("symbol name");
+            if !(name.starts_with("Py") || name.starts_with("_Py")) {
+                continue;
+            }
+            symbols.entry(name.to_string()).or_insert(base + value);
+        }
+        assert!(
+            !symbols.is_empty(),
+            "no CPython symbols in {}; the test harness must not be stripped",
+            path.display()
+        );
+        symbols.into_iter().collect()
+    }
+
+    /// Builds and loads a shared object that binds every CPython symbol this
+    /// executable defines to its absolute address.
+    ///
+    /// A fixture compiled against `<Python.h>` imports `Py*` definitions at
+    /// load time. Once this object is loaded `RTLD_GLOBAL`, those imports
+    /// resolve to the runtime definitions in this process, which is precisely
+    /// what `--export-dynamic` provides for the integration fixtures. The
+    /// object contains only `.set` absolute symbols; no code or state is
+    /// duplicated.
+    #[cfg(target_os = "linux")]
+    fn load_host_exports() {
+        let directory =
+            std::env::temp_dir().join(format!("hydro-capi-host-exports-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("host-export directory");
+        let source = directory.join("host_exports.S");
+        let library = directory.join("host_exports.so");
+        let mut assembly =
+            String::from("# Generated by the C API tests: absolute host bindings.\n");
+        for (name, address) in executable_py_symbols() {
+            assembly.push_str(&format!(".globl {name}\n.set {name}, 0x{address:x}\n"));
+        }
+        assembly.push_str(".section .note.GNU-stack,\"\",@progbits\n");
+        std::fs::write(&source, assembly).expect("write the host-export source");
+        let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let output = Command::new(compiler)
+            .args(["-shared", "-nostdlib", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .output()
+            .expect("run the C compiler for the host-export shim");
+        assert!(
+            output.status.success(),
+            "the host-export shim failed to compile: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let path = std::ffi::CString::new(library.to_str().expect("host-export path is UTF-8"))
+            .expect("host-export path has no NUL");
+        // SAFETY: `path` is NUL-terminated and outlives the call. The handle is
+        // deliberately kept open: a later `dlclose` would unmap the symbol
+        // bindings the fixtures resolved against.
+        let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+        assert!(
+            !handle.is_null(),
+            "the host-export shim failed to load: {}",
+            dl_error()
+        );
+    }
+
+    /// Makes the executable's CPython definitions available to `dlopen`ed
+    /// fixtures, once per test process.
+    #[cfg(target_os = "linux")]
+    fn install_host_exports() {
+        static LOADED: std::sync::LazyLock<()> = std::sync::LazyLock::new(load_host_exports);
+        let _ = &*LOADED;
+    }
+
+    /// Non-ELF hosts rely on `--export-dynamic` for the fixture's imports.
+    #[cfg(not(target_os = "linux"))]
+    fn install_host_exports() {}
+
+    /// Compiles the probe fixture once. `None` means the environment has no
+    /// `python3-config`/compiler; a fixture that fails to compile panics
+    /// instead of being reported as a skip.
+    fn build_gc_probe() -> Option<PathBuf> {
+        let include_output = Command::new("python3-config")
+            .arg("--includes")
+            .output()
+            .ok()?;
+        if !include_output.status.success() {
+            return None;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("hydro-capi-gc-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).ok()?;
+        let source = directory.join("gc_probe.c");
+        std::fs::write(&source, GC_PROBE_SOURCE).ok()?;
+        let output = directory.join("gc_probe.abi3.so");
+        let includes = String::from_utf8_lossy(&include_output.stdout);
+        let mut command = Command::new("cc");
+        command.args(["-shared", "-fPIC", "-O1", "-Wall", "-Wextra", "-pthread"]);
+        for include in includes.split_whitespace() {
+            command.arg(include);
+        }
+        command.arg(&source).arg("-o").arg(&output);
+        let status = command.status().ok()?;
+        assert!(
+            status.success(),
+            "the GC probe fixture failed to compile: {}",
+            source.display()
+        );
+        Some(output)
+    }
+
+    static GC_PROBE: std::sync::LazyLock<Option<PathBuf>> =
+        std::sync::LazyLock::new(build_gc_probe);
+
+    /// Loads the probe fixture and returns its module id.
+    fn gc_probe_module() -> Option<u64> {
+        let path = GC_PROBE.as_deref()?;
+        install_host_exports();
+        let path = path.to_str().expect("fixture path is UTF-8");
+        Some(load_extension(path, "gc_probe").expect("the GC probe fixture must load"))
+    }
+
+    fn fixture_call(module: u64, member: &str, args: &[ShimValue]) -> ShimValue {
+        match get_attr(module, member) {
+            Ok(ShimAttr::Callable(callable)) => call_method(callable.module, callable.method, args)
+                .unwrap_or_else(|error| panic!("{member}: {error}")),
+            other => panic!("{member} is not callable: {other:?}"),
+        }
+    }
+
+    fn fixture_int(value: ShimValue) -> i64 {
+        match value {
+            ShimValue::Int(number) => number,
+            other => panic!("expected an int result, got {other:?}"),
+        }
+    }
+
+    #[derive(Debug)]
+    struct GcProbeStats {
+        traverse: i64,
+        clear: i64,
+        finalize: i64,
+        children_set: i64,
+        children_cleared: i64,
+        callbacks: i64,
+    }
+
+    fn fixture_stats(module: u64) -> GcProbeStats {
+        let value = fixture_call(module, "stats", &[]);
+        let items = match value {
+            ShimValue::Tuple(items) => items,
+            other => panic!("stats must return a tuple, got {other:?}"),
+        };
+        let field = |index: usize| match items.get(index) {
+            Some(ShimValue::Int(number)) => *number,
+            other => panic!("stats[{index}] is {other:?}"),
+        };
+        GcProbeStats {
+            traverse: field(0),
+            clear: field(1),
+            finalize: field(2),
+            children_set: field(3),
+            children_cleared: field(4),
+            callbacks: field(5),
+        }
+    }
+
+    #[test]
+    fn extension_gc_traverse_and_clear_run_exactly_once() {
+        anchor();
+        let _guard = gc_pass_lock();
+        let Some(module) = gc_probe_module() else {
+            eprintln!("skipping: no C compiler or Python headers for the fixture");
+            return;
+        };
+        fixture_call(module, "reset_stats", &[]);
+
+        // 1. Default teardown of a GC instance runs the finalizer and one
+        //    `tp_clear`, which releases the declared handle.
+        fixture_call(module, "teardown", &[]);
+        let stats = fixture_stats(module);
+        assert_eq!(stats.finalize, 1, "tp_finalize runs once at dealloc");
+        assert_eq!(stats.clear, 1, "tp_clear runs once at default dealloc");
+        assert_eq!(
+            stats.children_cleared, 1,
+            "tp_clear must release the stored handle"
+        );
+
+        // 2. A two-instance cycle is collected through the exported
+        //    `PyGC_Collect`: `tp_traverse` finds the edges and `tp_clear` runs
+        //    exactly once per instance.
+        fixture_call(module, "reset_stats", &[]);
+        fixture_call(module, "make_cycle", &[]);
+        let collected = fixture_int(fixture_call(module, "collect", &[]));
+        assert!(collected >= 2, "the cycle was not collected: {collected}");
+        let stats = fixture_stats(module);
+        assert!(
+            stats.traverse >= 2,
+            "tp_traverse must be invoked by the collector: {stats:?}"
+        );
+        assert_eq!(stats.children_set, 2, "both edges were declared");
+        assert_eq!(
+            stats.children_cleared, 2,
+            "both handles were released by tp_clear"
+        );
+        assert_eq!(stats.clear, 2, "tp_clear runs exactly once per instance");
+        assert_eq!(stats.finalize, 2, "each instance is deallocated once");
+
+        // 3. A second pass must not clear or free anything again.
+        fixture_int(fixture_call(module, "collect", &[]));
+        let again = fixture_stats(module);
+        assert_eq!(again.clear, 2, "no second tp_clear (double free)");
+        assert_eq!(again.finalize, 2, "no second deallocation");
+
+        // 4. A cycle with an external reference is kept, together with the
+        //    instance only reachable through it; dropping the reference makes
+        //    both collectable.
+        fixture_call(module, "reset_stats", &[]);
+        fixture_call(module, "keep_cycle", &[]);
+        fixture_int(fixture_call(module, "collect", &[]));
+        let reachable = fixture_stats(module);
+        assert_eq!(
+            reachable.clear, 0,
+            "a cycle reachable from outside must not be cleared"
+        );
+        fixture_call(module, "drop_kept", &[]);
+        let collected = fixture_int(fixture_call(module, "collect", &[]));
+        assert!(
+            collected >= 2,
+            "the released cycle was not collected: {collected}"
+        );
+        let released = fixture_stats(module);
+        assert_eq!(released.clear, 2);
+        assert_eq!(released.finalize, 2);
+    }
+
+    /// Hydro callback invoked from the fixture's OS threads under the GIL.
+    /// It returns an immediate so no Hydro heap object is allocated on a
+    /// thread that is not registered with the collector.
+    extern "C" fn stress_callback(_argv: *const i64) -> i64 {
+        crate::abi::hydro_int(7)
+    }
+
+    #[test]
+    fn threaded_extension_callbacks_run_under_the_gil_during_collection() {
+        anchor();
+        crate::exc::init();
+        let _guard = gc_pass_lock();
+        let Some(module) = gc_probe_module() else {
+            eprintln!("skipping: no C compiler or Python headers for the fixture");
+            return;
+        };
+        fixture_call(module, "reset_stats", &[]);
+        let path = GC_PROBE
+            .as_deref()
+            .and_then(Path::to_str)
+            .expect("fixture path is UTF-8")
+            .to_string();
+        // A Hydro function crosses as a rooted handle: the extension stores it
+        // while its threads call back, and the handle must survive the
+        // concurrent Hydro collections.
+        let handle = crate::abi::hydro_function_new(
+            stress_callback as *const u8,
+            0,
+            b"stress_callback".as_ptr(),
+            15,
+            0,
+        );
+        assert_eq!(
+            crate::abi::hydro_exc_pending(),
+            0,
+            "hydro_function_new failed"
+        );
+        let argv = [handle];
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = crate::abi::hydro_extension_call(
+                path.as_ptr(),
+                path.len(),
+                b"threaded_call".as_ptr(),
+                13,
+                argv.len(),
+                argv.as_ptr(),
+            );
+            let _ = sender.send(result);
+        });
+
+        // Collect on this thread while the fixture's threads run their
+        // callbacks. `handle` stays on this stack, which the collector scans.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut collected_total = 0;
+        let result = loop {
+            for _ in 0..64 {
+                let _ = crate::abi::hydro_str_new(b"gc-stress".as_ptr(), 9);
+            }
+            collected_total += crate::heap::collect();
+            match receiver.recv_timeout(std::time::Duration::from_millis(2)) {
+                Ok(result) => break result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "threaded extension callbacks deadlocked"
+                    );
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the extension call thread panicked")
+                }
+            }
+        };
+        worker.join().expect("extension call thread");
+        assert_eq!(
+            crate::abi::hydro_exc_pending(),
+            0,
+            "the threaded callback reported an error"
+        );
+        assert_eq!(
+            crate::abi::hydro_binop(15, result, handle),
+            crate::abi::hydro_true(),
+            "the extension must return the same handle it was given"
+        );
+        assert!(
+            collected_total > 0,
+            "no Hydro collection ran while the callbacks were in flight"
+        );
+        let stats = fixture_stats(module);
+        assert_eq!(
+            stats.callbacks,
+            4 * 64,
+            "every worker iteration must invoke the callback"
+        );
+    }
+
+    // -- pinned ecosystem ABI probes --------------------------------------
+
+    /// Locates a pinned wheel extension under `.hydro/ecosystem/site`.
+    fn pinned_extension(directory: &str, stem: &str) -> Option<PathBuf> {
+        let site = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()?
+            .parent()?
+            .join(".hydro/ecosystem/site")
+            .join(directory);
+        for entry in std::fs::read_dir(&site).ok()?.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.starts_with(stem) && name.ends_with(".so") {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// `pydantic_core.SchemaValidator({'type': 'int'}).validate_python(7)`.
+    ///
+    /// The extension is loaded straight through the C API bridge (not through
+    /// the Python importer), so this exercises the same `PyType_FromSpec`
+    /// class creation, `tp_new`, vectorcall and argument parsing pydantic-core
+    /// uses in production. pydantic-core's classes are GC types whose
+    /// `tp_traverse` walks the Python schema object, so the probe also gives
+    /// `PyGC_Collect` a real PyO3 type to traverse.
+    #[test]
+    fn pydantic_core_schema_validator_constructs_and_validates() {
+        anchor();
+        // The probe creates GC-tracked PyO3 instances; keep the process-wide
+        // collection passes away while it constructs them.
+        let _guard = gc_pass_lock();
+        let Some(path) = pinned_extension("pydantic_core", "_pydantic_core") else {
+            eprintln!("skipping: the pinned pydantic-core wheel is not installed");
+            return;
+        };
+        let path = path.to_str().expect("pinned extension path is UTF-8");
+        install_host_exports();
+        let module = load_extension(path, "_pydantic_core")
+            .unwrap_or_else(|error| panic!("pydantic-core initialization failed: {error}"));
+        let validator_type = match get_attr(module, "SchemaValidator") {
+            Ok(ShimAttr::Type(address)) => address,
+            other => panic!("SchemaValidator is not a type: {other:?}"),
+        };
+        // `core_schema.int_schema()` is exactly this dictionary.
+        let schema = ShimValue::Dict(vec![(
+            ShimValue::Str("type".to_string()),
+            ShimValue::Str("int".to_string()),
+        )]);
+        let validator = call_type_object(validator_type, &[schema])
+            .unwrap_or_else(|error| panic!("SchemaValidator({{'type': 'int'}}) failed: {error}"));
+        let validator = value_object(validator);
+        assert!(!validator.is_null());
+        let validate = PyObject_GetAttrString(validator, c"validate_python".as_ptr());
+        assert!(!validate.is_null(), "validate_python: {:?}", take_error());
+        let argument = PyLong_FromLong(7);
+        let result = PyObject_Vectorcall(validate, &argument, 1, std::ptr::null_mut());
+        assert!(!result.is_null(), "validate_python(7): {:?}", take_error());
+        assert_eq!(PyLong_AsLong(result), 7);
+        Py_DecRef(result);
+        Py_DecRef(argument);
+        Py_DecRef(validate);
+        Py_DecRef(validator);
+    }
+
+    /// NumPy array/dtype probe through the pinned `_multiarray_umath`.
+    ///
+    /// The semantic half of this probe is blocked before any array exists:
+    /// `_multiarray_umath_exec` calls `npy_import("numpy._globals",
+    /// "_signature_descriptor")` (see
+    /// `numpy/_core/src/multiarray/multiarraymodule.c`), and `numpy._globals`
+    /// is pure Python. A runtime-only process has no compiled body for it, so
+    /// `Py_mod_exec` fails before `PyArrayDTypeMeta_Type`/`PyArray_Type` are
+    /// made ready. What can be verified without the Python package is the
+    /// runtime ABI surface: the pinned wheel resolves every undefined CPython
+    /// symbol against this host and exports its initializer.
+    #[test]
+    fn numpy_multiarray_links_against_the_host_abi() {
+        anchor();
+        let Some(path) = pinned_extension("numpy/_core", "_multiarray_umath") else {
+            eprintln!("skipping: the pinned NumPy wheel is not installed");
+            return;
+        };
+        let path = std::ffi::CString::new(path.to_str().expect("pinned extension path is UTF-8"))
+            .expect("path has no NUL");
+        install_host_exports();
+        // `RTLD_NOW` is the runtime form of the link-time ABI inventory: an
+        // unresolved `Py*` symbol fails the load instead of deferring to the
+        // first call. The initializer is not run, so closing is safe.
+        let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        assert!(
+            !handle.is_null(),
+            "the pinned NumPy extension does not resolve against this host: {}",
+            dl_error()
+        );
+        let initializer = unsafe { libc::dlsym(handle, c"PyInit__multiarray_umath".as_ptr()) };
+        assert!(
+            !initializer.is_null(),
+            "PyInit__multiarray_umath is missing from the pinned wheel"
+        );
+        unsafe { libc::dlclose(handle) };
     }
 
     // -- bytearray buffer -------------------------------------------------
@@ -16633,8 +17923,9 @@ mod tests {
         assert!(PyType_GetModuleState(plain).is_null());
         assert!(take_error().unwrap().contains("type has no module"));
 
-        // A module with `m_size == 0` has no state block; both spellings
-        // report it and never return a bogus pointer.
+        // A module with `m_size == 0` has no state block; CPython returns
+        // NULL without an exception, and so does this host, for both
+        // spellings. No bogus pointer is ever returned.
         let mut stateless = empty_definition();
         stateless.m_name = c"probe_stateless".as_ptr();
         let stateless_module = PyModule_Create2(&mut stateless, 3);
@@ -16645,14 +17936,26 @@ mod tests {
         assert_eq!(PyType_GetModule(associated), stateless_module);
         clear_error();
         assert!(PyType_GetModuleState(associated).is_null());
-        assert!(take_error()
-            .unwrap()
-            .contains("module state is not available"));
+        assert!(take_error().is_none(), "a stateless module is not an error");
         clear_error();
         assert!(PyModule_GetState(stateless_module).is_null());
-        assert!(take_error()
-            .unwrap()
-            .contains("module state is not available"));
+        assert!(take_error().is_none(), "a stateless module is not an error");
+
+        // The module association lives in a side table and is removed when the
+        // heap type is freed, so a later allocation that reuses the address
+        // cannot observe a stale module (and the module reference is dropped).
+        for _ in 0..8 {
+            let temporary = PyType_FromModuleAndSpec(module, &mut spec, std::ptr::null_mut());
+            assert!(!temporary.is_null(), "{:?}", take_error());
+            assert_eq!(PyType_GetModule(temporary), module);
+            let address = temporary as *mut types::TypeObject;
+            assert!(types::type_module(address).is_some());
+            Py_DecRef(temporary);
+            assert!(
+                types::type_module(address).is_none(),
+                "the association must be dropped with the type"
+            );
+        }
 
         Py_DecRef(plain);
         Py_DecRef(type_object);
@@ -16841,12 +18144,13 @@ mod tests {
         // Every exported entry point this runtime claims is a real function
         // address (the linker keeps them through `anchor`).
         anchor();
-        let exported: [*const (); 8] = [
+        let exported: [*const (); 9] = [
             PyType_FromSpec as *const (),
             PyType_GetSlot as *const (),
             PyObject_Vectorcall as *const (),
             PyObject_GetBuffer as *const (),
             PyObject_GC_Track as *const (),
+            PyGC_Collect as *const (),
             PyGILState_Ensure as *const (),
             super::PyObject_CallFunctionObjArgs as *const (),
             super::PyArg_ParseTuple as *const (),
@@ -17633,6 +18937,86 @@ mod tests {
         clear_error();
         assert!(PyImport_ImportModule(c"not_a_loaded_module".as_ptr()).is_null());
         assert!(take_error().unwrap().contains("ImportError"));
+    }
+
+    /// `PySys_GetObject` exposes the runtime's own `sys` values, not a C-only
+    /// stub. Extension module initialisation depends on this: NumPy 2.5 fails
+    /// with `cannot get sys.flags` unless `sys.flags.optimize` resolves.
+    #[test]
+    fn sys_dictionary_exposes_runtime_values() {
+        anchor();
+        let flags = PySys_GetObject(c"flags".as_ptr());
+        assert!(!flags.is_null(), "sys.flags is missing");
+        // `npy_static_data.c` reads exactly this field.
+        let optimize = PyObject_GetAttrString(flags, c"optimize".as_ptr());
+        assert!(
+            !optimize.is_null(),
+            "sys.flags.optimize: {:?}",
+            take_error()
+        );
+        assert_eq!(PyLong_AsLong(optimize), 0);
+        Py_DecRef(optimize);
+        for name in [c"debug", c"utf8_mode", c"verbose", c"dev_mode"] {
+            let field = PyObject_GetAttrString(flags, name.as_ptr());
+            assert!(
+                !field.is_null(),
+                "sys.flags.{}: {:?}",
+                name.to_str().unwrap(),
+                take_error()
+            );
+            Py_DecRef(field);
+        }
+
+        let version = PySys_GetObject(c"version".as_ptr());
+        assert!(!version.is_null(), "sys.version is missing");
+        let text = as_string(version).expect("sys.version is a string");
+        assert!(text.contains("3.14") && text.contains("Hydro"), "{text}");
+
+        let platform = PySys_GetObject(c"platform".as_ptr());
+        assert!(!platform.is_null(), "sys.platform is missing");
+        assert!(!as_string(platform)
+            .expect("sys.platform is a string")
+            .is_empty());
+
+        let byteorder = PySys_GetObject(c"byteorder".as_ptr());
+        assert_eq!(
+            as_string(byteorder).as_deref(),
+            Some(if cfg!(target_endian = "little") {
+                "little"
+            } else {
+                "big"
+            })
+        );
+
+        let version_info = PySys_GetObject(c"version_info".as_ptr());
+        assert!(!version_info.is_null(), "sys.version_info is missing");
+        assert_eq!(PyTuple_Size(version_info), 5);
+
+        let maxsize = PySys_GetObject(c"maxsize".as_ptr());
+        assert!(!maxsize.is_null(), "sys.maxsize is missing");
+        assert_eq!(PyLong_AsLong(maxsize), crate::value::MAX_INT);
+
+        let implementation = PySys_GetObject(c"implementation".as_ptr());
+        assert!(!implementation.is_null(), "sys.implementation is missing");
+        let name = PyObject_GetAttrString(implementation, c"name".as_ptr());
+        assert_eq!(
+            as_string(name).as_deref(),
+            Some("hydro"),
+            "{:?}",
+            take_error()
+        );
+        Py_DecRef(name);
+
+        // No `-W`/`-X` options are parsed, so the real containers are empty.
+        let warnoptions = PySys_GetObject(c"warnoptions".as_ptr());
+        assert!(!warnoptions.is_null(), "sys.warnoptions is missing");
+        assert_eq!(PyList_Size(warnoptions), 0);
+        let xoptions = PySys_GetObject(c"_xoptions".as_ptr());
+        assert!(!xoptions.is_null(), "sys._xoptions is missing");
+        assert_eq!(PyDict_Size(xoptions), 0);
+
+        assert!(!PySys_GetObject(c"path".as_ptr()).is_null());
+        assert!(!PySys_GetObject(c"argv".as_ptr()).is_null());
     }
 
     #[test]
@@ -19002,6 +20386,77 @@ long hydro_fixture_last_op(void) { return last_op; }
         dec_ref(argument);
     }
 
+    /// `PyContextVar_New`'s second argument is the default object, not a doc
+    /// string. NumPy 2.5 creates the `current_allocator` variable with
+    /// `PyDataMem_DefaultHandler` (a capsule/function), which must be accepted
+    /// and returned by `PyContextVar_Get` while the variable is unset.
+    #[test]
+    fn context_var_accepts_any_default_object() {
+        anchor();
+        clear_error();
+        extern "C" fn noop(_self: *mut ShimObject, _args: *mut ShimObject) -> *mut ShimObject {
+            ptr::addr_of_mut!(_Py_NoneStruct)
+        }
+        let mut definition = PyMethodDefMirror {
+            ml_name: c"handler".as_ptr(),
+            ml_meth: noop as *const () as *mut c_void,
+            ml_flags: METH_NOARGS,
+            ml_doc: ptr::null(),
+        };
+        let function = PyCFunction_New(&mut definition, ptr::null_mut());
+        assert!(!function.is_null(), "{:?}", take_error());
+        let baseline = Py_REFCNT(function);
+
+        let variable = PyContextVar_New(c"current_allocator".as_ptr(), function);
+        assert!(!variable.is_null(), "{:?}", take_error());
+        assert_eq!(
+            Py_REFCNT(function),
+            baseline + 1,
+            "the variable owns a reference to its default"
+        );
+
+        let mut fetched: *mut ShimObject = ptr::null_mut();
+        assert_eq!(PyContextVar_Get(variable, ptr::null_mut(), &mut fetched), 0);
+        assert_eq!(
+            fetched, function,
+            "the creation default is returned while unset"
+        );
+        dec_ref(fetched);
+
+        let override_default = new_str("override".to_string());
+        assert_eq!(
+            PyContextVar_Get(variable, override_default, &mut fetched),
+            0
+        );
+        assert_eq!(
+            fetched, override_default,
+            "an explicit fallback takes precedence"
+        );
+        dec_ref(fetched);
+        dec_ref(override_default);
+
+        let stored = new_str("stored".to_string());
+        let token = PyContextVar_Set(variable, stored);
+        assert!(!token.is_null(), "{:?}", take_error());
+        assert_eq!(PyContextVar_Get(variable, ptr::null_mut(), &mut fetched), 0);
+        assert_eq!(
+            as_string(fetched).as_deref(),
+            Some("stored"),
+            "a context value takes precedence over the default"
+        );
+        dec_ref(fetched);
+        dec_ref(token);
+        dec_ref(stored);
+
+        dec_ref(variable);
+        assert_eq!(
+            Py_REFCNT(function),
+            baseline,
+            "freeing the variable releases its default"
+        );
+        dec_ref(function);
+    }
+
     #[test]
     fn error_state_recursion_and_memoryview() {
         anchor();
@@ -19177,6 +20632,122 @@ long hydro_fixture_last_op(void) { return last_op; }
         // SAFETY: `end` receives a pointer into the input literal.
         let parsed = unsafe { super::PyOS_strtol(c"ff".as_ptr(), &mut text, 16) };
         assert_eq!(parsed, 255);
+    }
+
+    /// CPython's `Py_BuildValue` returns a tuple when the format names more
+    /// than one top-level value (`"OO"`, `"NN"`, `"ONc"`, `"iis#"`), which
+    /// NumPy's `_multiarray_umath` initialisation relies on.
+    #[test]
+    fn build_value_returns_a_tuple_for_multiple_top_level_values() {
+        anchor();
+        clear_error();
+
+        let left = new_int(1000);
+        let right = new_int(1001);
+        // SAFETY: "OO" supplies two borrowed objects.
+        let pair = unsafe { super::Py_BuildValue(c"OO".as_ptr(), left, right) as *mut ShimObject };
+        assert!(!pair.is_null(), "{:?}", take_error());
+        let items = match kind_ref(pair) {
+            Some(ShimKind::Tuple(items)) => *items,
+            other => panic!("expected a tuple, got {}", kind_variant(other)),
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0] as *mut ShimObject, left);
+        assert_eq!(items[1] as *mut ShimObject, right);
+        assert_eq!(Py_REFCNT(left), 2, "'O' borrows; the tuple owns one ref");
+        dec_ref(pair);
+        assert_eq!(Py_REFCNT(left), 1);
+        dec_ref(left);
+        dec_ref(right);
+
+        // A stolen 'N' reference is transferred to the tuple.
+        let borrowed = new_int(1002);
+        let stolen = new_int(1003);
+        // SAFETY: "ON" supplies one borrowed and one stolen object.
+        let mixed =
+            unsafe { super::Py_BuildValue(c"ON".as_ptr(), borrowed, stolen) as *mut ShimObject };
+        assert!(!mixed.is_null(), "{:?}", take_error());
+        assert_eq!(PyTuple_Size(mixed), 2);
+        assert_eq!(Py_REFCNT(borrowed), 2);
+        assert_eq!(Py_REFCNT(stolen), 1, "'N' steals the caller's reference");
+        dec_ref(mixed);
+        assert_eq!(Py_REFCNT(borrowed), 1);
+        dec_ref(borrowed);
+
+        // Basic scalar units take part in the implicit tuple too.
+        // SAFETY: "iis#" takes two ints, a C string and its length.
+        let scalars = unsafe {
+            super::Py_BuildValue(
+                c"iis#".as_ptr(),
+                5 as c_int,
+                6 as c_int,
+                c"abc".as_ptr(),
+                2isize,
+            ) as *mut ShimObject
+        };
+        assert!(!scalars.is_null(), "{:?}", take_error());
+        assert_eq!(PyTuple_Size(scalars), 3);
+        assert_eq!(
+            as_int(PyTuple_GetItem(scalars, 0)).unwrap(),
+            5,
+            "the first scalar is an int"
+        );
+        assert_eq!(
+            as_string(PyTuple_GetItem(scalars, 2)).as_deref(),
+            Some("ab")
+        );
+        dec_ref(scalars);
+
+        // A three-value tuple and the `l` (long) unit are the remaining
+        // shapes used by NumPy's type tables.
+        let first = new_int(1005);
+        let second = new_int(1006);
+        let third = new_int(1007);
+        // SAFETY: "(OOO)" supplies three borrowed objects.
+        let triple = unsafe {
+            super::Py_BuildValue(c"(OOO)".as_ptr(), first, second, third) as *mut ShimObject
+        };
+        assert_eq!(PyTuple_Size(triple), 3);
+        dec_ref(triple);
+        dec_ref(first);
+        dec_ref(second);
+        dec_ref(third);
+        // SAFETY: "l" takes one C long.
+        let long_value =
+            unsafe { super::Py_BuildValue(c"l".as_ptr(), 123456789 as c_long) as *mut ShimObject };
+        assert_eq!(as_int(long_value).unwrap(), 123_456_789);
+        dec_ref(long_value);
+
+        // `z` maps a NULL C string to None, as CPython does.
+        // SAFETY: "z" takes a C string pointer.
+        let none = unsafe {
+            super::Py_BuildValue(c"z".as_ptr(), ptr::null::<c_char>()) as *mut ShimObject
+        };
+        assert!(!none.is_null(), "{:?}", take_error());
+        assert_eq!(none, ptr::addr_of_mut!(_Py_NoneStruct));
+        dec_ref(none);
+
+        // "{ON}" is NumPy's type-dictionary form: a borrowed key and a
+        // stolen value inside a dict.
+        let key = new_str("signature".to_string());
+        let value = new_int(1004);
+        // SAFETY: "{ON}" takes a key and a stolen value.
+        let dictionary =
+            unsafe { super::Py_BuildValue(c"{ON}".as_ptr(), key, value) as *mut ShimObject };
+        assert!(!dictionary.is_null(), "{:?}", take_error());
+        assert_eq!(
+            PyDict_GetItemString(dictionary, c"signature".as_ptr()),
+            value
+        );
+        assert_eq!(Py_REFCNT(value), 1, "the dict owns the stolen reference");
+        dec_ref(dictionary);
+        dec_ref(key);
+
+        // An empty format still yields None.
+        // SAFETY: no arguments are read.
+        let empty = unsafe { super::Py_BuildValue(c"".as_ptr()) as *mut ShimObject };
+        assert_eq!(empty, ptr::addr_of_mut!(_Py_NoneStruct));
+        dec_ref(empty);
     }
     #[test]
     fn hydro_handles_wrap_hydro_values() {

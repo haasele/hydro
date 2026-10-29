@@ -424,6 +424,39 @@ pub(crate) fn oct_value(v: i64) -> i64 {
     radix_literal(v, 8, "0o")
 }
 
+/// Tries `v.__int__()` / `v.__index__()` for the `int()` conversion protocol.
+///
+/// The special method is looked up the way CPython looks it up: through the
+/// receiver's class for instances, through the metaclass for class objects,
+/// and through the extension's attribute surface for opaque extension values.
+/// A missing method clears the `AttributeError` and returns `None`; any other
+/// exception propagates. A result that is not an exact integer reports the
+/// protocol's `TypeError` (CPython still *accepts* `bool` there, deprecating
+/// it, so that case converts silently).
+fn int_special_method(v: i64, name: &str) -> Option<i64> {
+    let result = methods::call(v, name.as_ptr(), name.len(), 0, std::ptr::null());
+    if exc::pending() {
+        if exc::pending_tag() == ATTRIBUTE_ERROR as i64 {
+            exc::clear();
+            return None;
+        }
+        return Some(NONE);
+    }
+    if let Some(n) = value::as_integer(result) {
+        return Some(ops::int_result(n));
+    }
+    if let Some(n) = value::as_bigint(result) {
+        return Some(value::bigint_new(n.clone()));
+    }
+    Some(exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "{name} returned non-int (type {})",
+            value::type_name_of(result)
+        ),
+    ))
+}
+
 /// `int(v)`.
 pub(crate) fn to_int(v: i64) -> i64 {
     if let Some(n) = value::as_integer(v) {
@@ -462,11 +495,26 @@ pub(crate) fn to_int(v: i64) -> i64 {
             ),
         };
     }
+    // CPython's conversion protocol: `__int__` first, then `__index__`, on
+    // instances, class objects (via the metaclass) and extension values.
+    if let Some(result) = int_special_method(v, "__int__") {
+        return result;
+    }
+    if let Some(result) = int_special_method(v, "__index__") {
+        return result;
+    }
+    // CPython names the class of an instance but reports `type` for a class
+    // object that defines no conversion protocol.
+    let type_name = if value::as_class(v).is_some() {
+        "type".to_string()
+    } else {
+        value::type_name_of(v)
+    };
     exc::raise_with_message(
         TYPE_ERROR,
         &format!(
             "int() argument must be a string, a bytes-like object or a real number, not '{}'",
-            value::type_name(v)
+            type_name
         ),
     )
 }
@@ -486,7 +534,16 @@ fn to_int_base(value_arg: i64, base_arg: i64) -> i64 {
         );
     };
     if base == 10 {
-        return to_int(value_arg);
+        // An explicit base only accepts strings (CPython:
+        // "int() can't convert non-string with explicit base"); in particular
+        // it never runs the `__int__`/`__index__` protocol.
+        if value::as_str(value_arg).is_some() {
+            return to_int(value_arg);
+        }
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "int() can't convert non-string with explicit base",
+        );
     }
     if !(base == 0 || (2..=36).contains(&base)) {
         return exc::raise_with_message(VALUE_ERROR, "int() base must be >= 2 and <= 36, or 0");
@@ -836,6 +893,12 @@ pub(crate) fn bytes_build(argc: usize, argv: *const i64) -> i64 {
         }
         return value::bytes_new(vec![0; count]);
     }
+    // `bytes(range(...))` is the common iterable form; materialise it
+    // directly so the builtin never depends on the generic iterator for this
+    // shape (and so huge ranges are rejected before any allocation).
+    if let Some(range) = value::as_range(args[0]) {
+        return bytes_from_range(range);
+    }
     let sequence = value::as_list(args[0])
         .or_else(|| value::as_tuple(args[0]))
         .or_else(|| value::as_set(args[0]));
@@ -854,7 +917,7 @@ pub(crate) fn bytes_build(argc: usize, argv: *const i64) -> i64 {
                     TYPE_ERROR,
                     &format!(
                         "'{}' object cannot be interpreted as an integer",
-                        value::type_name(item)
+                        value::type_name_of(item)
                     ),
                 );
             };
@@ -868,13 +931,177 @@ pub(crate) fn bytes_build(argc: usize, argv: *const i64) -> i64 {
     if value::as_str(args[0]).is_some() {
         return exc::raise_with_message(TYPE_ERROR, "string argument without an encoding");
     }
-    exc::raise_with_message(
-        TYPE_ERROR,
-        &format!(
-            "cannot convert '{}' object to bytes",
-            value::type_name(args[0])
-        ),
-    )
+    bytes_from_iterable(args[0])
+}
+
+/// `bytes(range(start, stop, step))`: one byte per element.
+///
+/// The element count is computed in `i128` so an extreme range is rejected by
+/// the allocation limit instead of overflowing; every value must be in
+/// `0..=255`, like CPython.
+fn bytes_from_range((start, stop, step): (i64, i64, i64)) -> i64 {
+    let (start, stop, step) = (i128::from(start), i128::from(stop), i128::from(step));
+    let count = if step > 0 {
+        if start >= stop {
+            0
+        } else {
+            (stop - start + step - 1) / step
+        }
+    } else if step < 0 {
+        if start <= stop {
+            0
+        } else {
+            (start - stop + (-step) - 1) / (-step)
+        }
+    } else {
+        return exc::raise_with_message(VALUE_ERROR, "range() arg 3 must not be zero");
+    };
+    let count = usize::try_from(count).unwrap_or(usize::MAX);
+    if count > MAX_BYTES_ALLOC {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "bytes length exceeds the runtime allocation limit",
+        );
+    }
+    let mut out = Vec::with_capacity(count);
+    let mut current = start;
+    for _ in 0..count {
+        if !(0..=255).contains(&current) {
+            return exc::raise_with_message(VALUE_ERROR, "bytes must be in range(0, 256)");
+        }
+        out.push(current as u8);
+        current += step;
+    }
+    value::bytes_new(out)
+}
+
+/// `bytes(iterable)`: consumes any other iterable (generators, ranges, dict
+/// key views, ...) one integer at a time.
+///
+/// Each element must support the integer conversion; a `0..=255` range check
+/// reports CPython's `ValueError`. A value that is not iterable reports the
+/// constructor's `TypeError` rather than the iterator protocol's diagnostic,
+/// so `bytes(object())` matches CPython's wording.
+fn bytes_from_iterable(iterable: i64) -> i64 {
+    let iterator = iter::iter_new(iterable);
+    if exc::pending() {
+        // Not iterable: replace `'X' object is not iterable` with the
+        // constructor's message.
+        exc::clear();
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "cannot convert '{}' object to bytes",
+                value::type_name_of(iterable)
+            ),
+        );
+    }
+    let mut out = Vec::new();
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        let Some(byte) = value::as_integer(item) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    value::type_name_of(item)
+                ),
+            );
+        };
+        if !(0..=255).contains(&byte) {
+            return exc::raise_with_message(VALUE_ERROR, "bytes must be in range(0, 256)");
+        }
+        if out.len() >= MAX_BYTES_ALLOC {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                "bytes length exceeds the runtime allocation limit",
+            );
+        }
+        out.push(byte as u8);
+    }
+    value::bytes_new(out)
+}
+
+/// `bytes.fromhex(string)`: decodes pairs of hexadecimal digits.
+///
+/// CPython accepts `str` and any bytes-like operand (ASCII only in either
+/// case), skips ASCII whitespace anywhere, and only allows whitespace between
+/// pairs: a whitespace character standing between the two digits of a pair is
+/// reported as a non-hexadecimal character at its own position. The error
+/// wording and positions match CPython's `bytes.fromhex`/`bytearray.fromhex`.
+pub(crate) fn bytes_fromhex(argument: i64) -> i64 {
+    // The operand is a sequence of code units: Unicode scalar values for a
+    // `str`, bytes for a bytes-like value. Positions in error messages count
+    // those units, not bytes of the UTF-8 encoding.
+    let units: Vec<u32> = if let Some(text) = value::as_str(argument) {
+        text.chars().map(|ch| ch as u32).collect()
+    } else if let Some(bytes) = value::as_bytes(argument) {
+        bytes.iter().map(|byte| u32::from(*byte)).collect()
+    } else if let Some(bytes) = value::as_bytearray(argument) {
+        bytes.iter().map(|byte| u32::from(*byte)).collect()
+    } else if let Some(view) = value::as_memoryview(argument) {
+        match value::memoryview_bytes(view) {
+            Ok(bytes) => bytes.into_iter().map(u32::from).collect(),
+            Err(message) => return exc::raise_with_message(VALUE_ERROR, message),
+        }
+    } else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "fromhex() argument must be str or bytes-like, not {}",
+                value::type_name(argument)
+            ),
+        );
+    };
+    let mut out = Vec::with_capacity(units.len() / 2);
+    let mut high: Option<u8> = None;
+    for (position, unit) in units.into_iter().enumerate() {
+        if matches!(unit, 0x20 | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d) {
+            if high.is_some() {
+                return exc::raise_with_message(
+                    VALUE_ERROR,
+                    &format!(
+                        "non-hexadecimal number found in fromhex() arg at position {position}"
+                    ),
+                );
+            }
+            continue;
+        }
+        let Some(digit) = hex_digit(unit) else {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("non-hexadecimal number found in fromhex() arg at position {position}"),
+            );
+        };
+        match high.take() {
+            Some(first) => out.push((first << 4) | digit),
+            None => high = Some(digit),
+        }
+    }
+    if high.is_some() {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "fromhex() arg must contain an even number of hexadecimal digits",
+        );
+    }
+    value::bytes_new(out)
+}
+
+/// Value of one hexadecimal digit code unit, lower- or upper-case.
+fn hex_digit(unit: u32) -> Option<u8> {
+    match unit {
+        0x30..=0x39 => Some((unit - 0x30) as u8),
+        0x41..=0x46 => Some((unit - 0x41 + 10) as u8),
+        0x61..=0x66 => Some((unit - 0x61 + 10) as u8),
+        _ => None,
+    }
 }
 
 /// `bytearray(...)`: the mutable byte-sequence constructor.
@@ -2096,6 +2323,20 @@ pub(crate) fn call_kw(
         {
             return crate::modules::builtins::frozendict_instantiate(&args, &keywords);
         }
+        // `collections.defaultdict`'s module value is a class (it carries the
+        // `__repr__` that `pprint` keys its dispatch table by), so calling the
+        // value must still run the real constructor.
+        if value::class_display_name(class) == Some("defaultdict")
+            && globals::registry_get("collections.defaultdict.class") == Some(class)
+        {
+            return crate::modules::collections::call_kw("defaultdict", &args, &keywords);
+        }
+        // `codecs.CodecInfo(...)` builds the native codec-registry entry.
+        if value::class_display_name(class) == Some("CodecInfo")
+            && globals::registry_get("codecs.CodecInfo.class") == Some(class)
+        {
+            return crate::modules::codecs_codecinfo_new(&args, &keywords);
+        }
         // The `pathlib` pure-path classes construct the same native `Path`
         // value as `pathlib.Path`; the helper validates the identity and the
         // platform-specific `PosixPath`/`WindowsPath` rules.
@@ -2504,6 +2745,59 @@ pub(crate) fn call_kw(
                 .take(provided)
                 .map(|slot| slot.unwrap_or(NONE))
                 .collect();
+            return call_builtin(*builtin, bound.len(), bound.as_ptr());
+        }
+        // `int(x, base=10)`: `base` is the only keyword CPython accepts.
+        if matches!(builtin, Builtin::Int) {
+            let pairs = if kwargc == 0 {
+                &[][..]
+            } else {
+                if kw_argv.is_null() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "keyword arguments were passed without an argument buffer",
+                    );
+                }
+                // SAFETY: the caller validated the buffer and its length.
+                unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) }
+            };
+            let mut base: Option<i64> = None;
+            for pair in pairs.as_chunks::<2>().0 {
+                let Some(keyword) = value::as_str(pair[0]) else {
+                    return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+                };
+                if keyword != "base" {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("int() got an unexpected keyword argument '{keyword}'"),
+                    );
+                }
+                if base.is_some() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "int() got multiple values for argument 'base'",
+                    );
+                }
+                base = Some(pair[1]);
+            }
+            if argc == 0 {
+                return exc::raise_with_message(TYPE_ERROR, "int() missing string argument");
+            }
+            if argc > 2 {
+                return builtin_arity_error("int", "at most 2", argc);
+            }
+            if argc == 2 && base.is_some() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "int() got multiple values for argument 'base'",
+                );
+            }
+            let mut bound = Vec::with_capacity(2);
+            // SAFETY: nil with argc > 0 was rejected by the caller.
+            bound.push(unsafe { *argv });
+            if let Some(base) = base {
+                bound.push(base);
+            }
             return call_builtin(*builtin, bound.len(), bound.as_ptr());
         }
         // `max`/`min` bind `key=` and the keyword-only `default=` here; the
@@ -3270,6 +3564,31 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
             unsafe { std::slice::from_raw_parts(argv, argc) }
         };
         return modules::builtins::frozendict_instantiate(args, &[]);
+    }
+    // The `collections.defaultdict` module value is a class for `pprint`'s
+    // dispatch keys; calling it runs the real constructor.
+    if native_name == Some("defaultdict")
+        && globals::registry_get("collections.defaultdict.class") == Some(class)
+    {
+        let args: &[i64] = if argc == 0 {
+            &[]
+        } else {
+            // SAFETY: argc > 0 implies a non-null, readable buffer.
+            unsafe { std::slice::from_raw_parts(argv, argc) }
+        };
+        return modules::collections::call("defaultdict", args);
+    }
+    // `codecs.CodecInfo(...)` builds the native codec-registry entry.
+    if native_name == Some("CodecInfo")
+        && globals::registry_get("codecs.CodecInfo.class") == Some(class)
+    {
+        let args: &[i64] = if argc == 0 {
+            &[]
+        } else {
+            // SAFETY: argc > 0 implies a non-null, readable buffer.
+            unsafe { std::slice::from_raw_parts(argv, argc) }
+        };
+        return modules::codecs_codecinfo_new(args, &[]);
     }
     // The `pathlib` pure-path classes construct the same native `Path` value
     // as `pathlib.Path`; the helper validates the identity and the
@@ -5305,6 +5624,9 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             _ => builtin_arity_error("round", "1 or 2", argc),
         },
         Builtin::Format => match args {
+            // `format(value)` uses the empty format specification; CPython's
+            // signature is `format(value, format_spec='')`.
+            [value] => format_builtin(*value, crate::value::str_from_bytes(b""), 0),
             [value, spec] => format_builtin(*value, *spec, 0),
             [value, spec, conversion] => match value::as_integer(*conversion) {
                 Some(flag @ 0..=3) => format_builtin(*value, *spec, flag as u8),
@@ -7009,6 +7331,10 @@ mod tests {
         encode_int(n).expect("representable")
     }
 
+    fn as_int(v: i64) -> i64 {
+        value::as_integer(v).expect("int result")
+    }
+
     fn string(s: &str) -> i64 {
         value::str_from_bytes(s.as_bytes())
     }
@@ -8200,6 +8526,16 @@ mod tests {
     #[allow(clippy::approx_constant)]
     fn format_builtin_uses_the_shared_formatter() {
         exc::init();
+        // `format(value)` defaults `format_spec` to the empty string.
+        assert_eq!(
+            value::as_str(builtin_call(Builtin::Format, &[int(7)])),
+            Some("7")
+        );
+        assert_eq!(
+            value::as_str(builtin_call(Builtin::Format, &[string("x")])),
+            Some("x")
+        );
+        assert!(!exc::pending());
         assert_eq!(
             value::as_str(format_builtin(int(255), string("#x"), 0)),
             Some("0xff")
@@ -10009,5 +10345,236 @@ mod tests {
 
         globals::reset();
         exc::init();
+    }
+
+    extern "C" fn int_probe_seven(_argv: *const i64) -> i64 {
+        value::encode_int(7).expect("representable")
+    }
+
+    extern "C" fn int_probe_nine(_argv: *const i64) -> i64 {
+        value::encode_int(9).expect("representable")
+    }
+
+    extern "C" fn int_probe_float(_argv: *const i64) -> i64 {
+        value::float_new(2.5)
+    }
+
+    extern "C" fn int_probe_true(_argv: *const i64) -> i64 {
+        TRUE
+    }
+
+    fn int_method_class(name: &str, methods: &[(&str, extern "C" fn(*const i64) -> i64)]) -> i64 {
+        let entries = methods
+            .iter()
+            .map(|(method, probe)| {
+                (
+                    method.to_string(),
+                    value::function_new(*probe as *const () as usize, 1, method.to_string()),
+                )
+            })
+            .collect();
+        value::class_new(name.to_string(), NONE, entries)
+    }
+
+    #[test]
+    fn int_uses_the_int_and_index_protocols() {
+        exc::init();
+        // `__int__` is preferred and its result is the integer.
+        let ipv4_like = int_method_class("IPv4Like", &[("__int__", int_probe_seven)]);
+        let instance = value::instance_new(ipv4_like);
+        assert_eq!(as_int(builtin_call(Builtin::Int, &[instance])), 7);
+
+        // `__index__` is the fallback when `__int__` is absent.
+        let indexed = int_method_class("Indexed", &[("__index__", int_probe_nine)]);
+        let instance = value::instance_new(indexed);
+        assert_eq!(as_int(builtin_call(Builtin::Int, &[instance])), 9);
+
+        // `__int__` wins over `__index__`.
+        let both = int_method_class(
+            "Both",
+            &[("__int__", int_probe_seven), ("__index__", int_probe_nine)],
+        );
+        assert_eq!(
+            as_int(builtin_call(Builtin::Int, &[value::instance_new(both)])),
+            7
+        );
+
+        // A non-int result is the protocol's TypeError.
+        let bad = int_method_class("BadInt", &[("__int__", int_probe_float)]);
+        assert_eq!(
+            builtin_call(Builtin::Int, &[value::instance_new(bad)]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(pending_message(), "__int__ returned non-int (type float)");
+        exc::clear();
+
+        // CPython still accepts `bool` (deprecated); convert silently.
+        let boolean = int_method_class("BoolInt", &[("__int__", int_probe_true)]);
+        assert_eq!(
+            as_int(builtin_call(Builtin::Int, &[value::instance_new(boolean)])),
+            1
+        );
+
+        // No protocol: the generic message names the class.
+        let plain = value::instance_new(value::class_new("Plain".to_string(), NONE, Vec::new()));
+        assert_eq!(builtin_call(Builtin::Int, &[plain]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(pending_message().ends_with("not 'Plain'"));
+        exc::clear();
+
+        // A class object converts through its metaclass's `__int__`.
+        let meta = int_method_class("Meta", &[("__int__", int_probe_seven)]);
+        let class = value::class_new_multi(
+            "MetaInstance".to_string(),
+            Vec::new(),
+            meta,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(as_int(builtin_call(Builtin::Int, &[class])), 7);
+
+        // `int("10", base=2)`: the only keyword CPython accepts.
+        let int_fn = value::builtin_function_new(Builtin::Int);
+        let mut words = [string("base"), int(2)];
+        assert_eq!(
+            as_int(call_kw(
+                int_fn,
+                1,
+                [string("10")].as_ptr(),
+                1,
+                words.as_mut_ptr()
+            )),
+            2
+        );
+        // `int(base=2)` has no string operand.
+        assert_eq!(
+            call_kw(int_fn, 0, std::ptr::null(), 1, words.as_mut_ptr()),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(pending_message(), "int() missing string argument");
+        exc::clear();
+        // An unexpected keyword is rejected by name.
+        let mut words = [string("encoding"), string("utf-8")];
+        assert_eq!(
+            call_kw(int_fn, 1, [string("10")].as_ptr(), 1, words.as_mut_ptr()),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "int() got an unexpected keyword argument 'encoding'"
+        );
+        exc::clear();
+
+        // An explicit base never uses the protocol.
+        let instance = value::instance_new(ipv4_like);
+        assert_eq!(builtin_call(Builtin::Int, &[instance, int(10)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "int() can't convert non-string with explicit base"
+        );
+    }
+
+    #[test]
+    fn bytes_accepts_general_iterables() {
+        exc::init();
+        // A range is not a list/tuple/set, so it exercises the iterator path.
+        let from_range = builtin_call(Builtin::Bytes, &[value::range_new(65, 68, 1)]);
+        assert_eq!(value::as_bytes(from_range), Some(&b"ABC"[..]));
+        // A stepped range follows the range values, not the index:
+        // 65, 67, 69 -> b"ACE".
+        let stepped = builtin_call(Builtin::Bytes, &[value::range_new(65, 70, 2)]);
+        assert_eq!(value::as_bytes(stepped), Some(&b"ACE"[..]));
+        // An element above 255 is CPython's ValueError.
+        assert_eq!(
+            builtin_call(Builtin::Bytes, &[value::range_new(250, 258, 1)]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(pending_message(), "bytes must be in range(0, 256)");
+        exc::clear();
+
+        // Mapping iteration yields keys, exactly like CPython; the key must
+        // be integer-convertible (`bytes({'A': 1})` is a TypeError there).
+        let mapping = value::dict_new(vec![(int(65), int(1))]);
+        let from_dict = builtin_call(Builtin::Bytes, &[mapping]);
+        assert_eq!(value::as_bytes(from_dict), Some(&b"A"[..]));
+
+        // An element that is not index-convertible reports its own type.
+        let bad = value::list_new(vec![string("x")]);
+        assert_eq!(builtin_call(Builtin::Bytes, &[bad]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "'str' object cannot be interpreted as an integer"
+        );
+        exc::clear();
+
+        // A non-iterable reports the constructor's message, not the iterator's.
+        let obj = value::instance_new(value::class_new(
+            "NotIterable".to_string(),
+            NONE,
+            Vec::new(),
+        ));
+        assert_eq!(builtin_call(Builtin::Bytes, &[obj]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "cannot convert 'NotIterable' object to bytes"
+        );
+    }
+
+    #[test]
+    fn bytes_fromhex_matches_cpython() {
+        exc::init();
+        assert_eq!(value::as_bytes(bytes_fromhex(string(""))), Some(&b""[..]));
+        assert_eq!(
+            value::as_bytes(bytes_fromhex(string(" 00\t0a\n0B\r0c\x0b"))),
+            Some(&[0x00, 0x0a, 0x0b, 0x0c][..])
+        );
+        // Bytes-like operands use byte positions in error messages.
+        let bytes_operand = value::bytes_new(b"00 01".to_vec());
+        assert_eq!(
+            value::as_bytes(bytes_fromhex(bytes_operand)),
+            Some(&[0x00, 0x01][..])
+        );
+        let buffer = value::bytearray_new(b"fF".to_vec());
+        assert_eq!(value::as_bytes(bytes_fromhex(buffer)), Some(&[0xff][..]));
+
+        // Whitespace inside a pair is the whitespace character's error.
+        assert_eq!(bytes_fromhex(string("0 0")), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "non-hexadecimal number found in fromhex() arg at position 1"
+        );
+        exc::clear();
+
+        assert_eq!(bytes_fromhex(string("000")), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "fromhex() arg must contain an even number of hexadecimal digits"
+        );
+        exc::clear();
+
+        // A non-ASCII character is reported at its own index.
+        assert_eq!(bytes_fromhex(string("00\u{a0}01")), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "non-hexadecimal number found in fromhex() arg at position 2"
+        );
+        exc::clear();
+
+        assert_eq!(bytes_fromhex(int(3)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "fromhex() argument must be str or bytes-like, not int"
+        );
     }
 }

@@ -31,6 +31,8 @@
 //! `byteorder`, sign-extension and overflow rules; `from_bytes` keeps arbitrary
 //! precision through the heap `BigInt` path.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{BufRead as _, IsTerminal, Read as _, Write as _};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -60,6 +62,20 @@ pub(crate) fn call(
     let Some(method) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    // `dict.__repr__(value)` lowers to a method call on the builtin type
+    // value instead of an attribute read, so dispatch the type-level `repr`
+    // slot here as well as through `getattr`.
+    if method == "__repr__" {
+        if let Some(function) = value::as_function(obj) {
+            if matches!(
+                &function.body,
+                value::FunctionBody::Builtin(builtin)
+                    if builtin_repr_type_name(*builtin).is_some()
+            ) {
+                return builtins::call_builtin(hydro_ir::Builtin::Repr, argc, argv);
+            }
+        }
+    }
     // A `property` object exposes its slots as attributes (`p.fget`), and
     // calling `p.fget(...)` must invoke the stored getter rather than looking
     // for a method named `fget` on the property class.
@@ -194,6 +210,9 @@ pub(crate) fn call(
         // Same rule as for strings: copy the payload out first.
         return bytes_method(obj, bytes.to_vec(), &method, &args);
     }
+    if value::as_range(obj).is_some() {
+        return range_method(obj, &method, &args);
+    }
     if value::as_list(obj).is_some() {
         return list_method(obj, &method, &args);
     }
@@ -257,10 +276,14 @@ pub(crate) fn call(
     if value::as_socket(obj).is_some() {
         return crate::modules::socket::method(obj, &method, &args);
     }
-    // The `int` builtin type value is a function object at runtime, so
-    // `int.from_bytes(...)` arrives here with the type value as the receiver.
+    // The `int`/`bytes` builtin type values are function objects at runtime,
+    // so `int.from_bytes(...)`/`bytes.fromhex(...)` arrive here with the type
+    // value as the receiver.
     if is_builtin_int_type(obj) {
         return int_class_method(obj, &method, &args, &[]);
+    }
+    if is_builtin_bytes_type(obj) {
+        return bytes_class_method(obj, &method, &args, &[]);
     }
     // `type` is the metaclass builtin: metaclasses and typing stubs reach
     // `type.__new__`/`type.__subclasscheck__` through the same value.
@@ -930,6 +953,11 @@ fn metaclass_attribute(class: i64, attr: &str) -> Option<i64> {
 /// `AttributeError` here. A name missing from the class namespace is resolved
 /// on the metaclass, where the class itself is the receiver.
 fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
+    // `type(obj).__repr__(value)` resolves the type-level `repr` slot the
+    // cached native classes expose, not the metaclass's own `__repr__`.
+    if method == "__repr__" && cached_repr_type_name(class).is_some() {
+        return builtins::call_builtin(hydro_ir::Builtin::Repr, argc, argv);
+    }
     if method == "__new__"
         && value::class_lookup(class, "__new__").is_none()
         && !metaclass_defines_new(class)
@@ -1485,6 +1513,9 @@ pub(crate) fn call_kw(
     if is_builtin_int_type(obj) {
         return int_class_method(obj, &method, &args, &keywords.items);
     }
+    if is_builtin_bytes_type(obj) {
+        return bytes_class_method(obj, &method, &args, &keywords.items);
+    }
     if is_builtin_type_type(obj) {
         return type_class_method(obj, &method, &args, &keywords.items);
     }
@@ -1635,7 +1666,7 @@ fn str_method_kw(
 fn path_method_kw(obj: i64, method: &str, args: &mut Vec<i64>, keywords: &KeywordArgs) -> i64 {
     let (params, min_args): (&[&str], usize) = match method {
         "mkdir" => (&["parents", "exist_ok"], 0),
-        "open" => (&["mode", "encoding", "newline", "errors"], 0),
+        "open" => (&["mode", "buffering", "encoding", "errors", "newline"], 0),
         "write_text" => (&["text", "encoding"], 1),
         "read_text" => (&["encoding"], 0),
         "write_bytes" => (&["data"], 1),
@@ -1648,6 +1679,79 @@ fn path_method_kw(obj: i64, method: &str, args: &mut Vec<i64>, keywords: &Keywor
     path_method(obj, method, args.as_slice())
 }
 
+// builtin type-level attributes
+
+thread_local! {
+    /// Cached `__repr__` callables for builtin types, keyed by type name and
+    /// tagged with the heap generation that owns the value.
+    static BUILTIN_TYPE_REPRS: RefCell<HashMap<&'static str, (u64, i64)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Builtin types whose type-level `__repr__` the runtime exposes.
+///
+/// `pprint` keys its dispatch table on `dict.__repr__` and compares
+/// `type(object).__repr__` with `is dict.__repr__`, so every lookup must
+/// return the same callable object.
+fn builtin_repr_type_name(builtin: hydro_ir::Builtin) -> Option<&'static str> {
+    Some(match builtin {
+        hydro_ir::Builtin::Dict => "dict",
+        hydro_ir::Builtin::List => "list",
+        hydro_ir::Builtin::Set => "set",
+        hydro_ir::Builtin::Frozenset => "frozenset",
+        hydro_ir::Builtin::Tuple => "tuple",
+        hydro_ir::Builtin::Str => "str",
+        hydro_ir::Builtin::Bytes => "bytes",
+        hydro_ir::Builtin::ByteArray => "bytearray",
+        hydro_ir::Builtin::Int => "int",
+        _ => return None,
+    })
+}
+
+/// Type name of a cached native class in the exposed `__repr__` set.
+///
+/// Only classes cached by [`value::type_class`] qualify, so a user class that
+/// happens to be named `dict` keeps its own `__repr__`.
+fn cached_repr_type_name(class: i64) -> Option<&'static str> {
+    if !value::is_cached_type_class(class) {
+        return None;
+    }
+    let name = value::class_display_name(class)?;
+    matches!(
+        name,
+        "dict" | "list" | "set" | "frozenset" | "tuple" | "str" | "bytes" | "bytearray" | "int"
+    )
+    .then_some(name)
+}
+
+/// Stable `__repr__` callable for the builtin type called `name`.
+///
+/// The value is the native `repr` builtin, which already runs
+/// [`value::repr`] on its single argument, so the unbound form
+/// `dict.__repr__(value)` has CPython's descriptor shape. It is cached per
+/// heap generation and registered as a GC root while the cache holds it;
+/// [`crate::heap::reset`] bumps the generation and drops the roots, so a later
+/// access allocates a fresh callable instead of returning a freed object.
+fn builtin_type_repr(name: &'static str) -> i64 {
+    let generation = crate::heap::generation();
+    let cached = BUILTIN_TYPE_REPRS.with(|cache| {
+        cache
+            .borrow()
+            .get(name)
+            .filter(|(cached, _)| *cached == generation)
+            .map(|(_, value)| *value)
+    });
+    if let Some(value) = cached {
+        return value;
+    }
+    let wrapper = value::builtin_function_new(hydro_ir::Builtin::Repr);
+    crate::heap::add_thread_root(wrapper);
+    BUILTIN_TYPE_REPRS.with(|cache| {
+        cache.borrow_mut().insert(name, (generation, wrapper));
+    });
+    wrapper
+}
+
 /// Dispatches `obj.<name>` for data attributes of native objects, class
 /// instances, class objects and built-in exception objects.
 ///
@@ -1655,7 +1759,8 @@ fn path_method_kw(obj: i64, method: &str, args: &mut Vec<i64>, keywords: &Keywor
 /// `AttributeError` when read without a call; a `@property` is a data
 /// attribute and calls its getter. Class instances resolve their own attribute
 /// table first, then `__class__`, properties and the frozen class attributes.
-/// Class objects expose their frozen attributes and `__name__`. Exception
+/// Class objects expose their frozen attributes, `__name__` and the cached
+/// type-level `__repr__` used by `pprint`. Exception
 /// objects expose `args`, `__class__`, `__cause__`, `__context__`,
 /// `__suppress_context__` and `__traceback__` through
 /// [`crate::exc::exception_attr`]. Unknown names and receivers without
@@ -1708,6 +1813,16 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     // because Hydro keeps no module provenance or annotation payload; every
     // other name falls back to the function's live `__dict__`.
     if let Some(function) = value::as_function(obj) {
+        // Builtin type values expose the same stable `__repr__` callable as
+        // their native classes; `pprint` keys its dispatch table on
+        // `dict.__repr__` and compares classes by identity.
+        if attr == "__repr__" {
+            if let value::FunctionBody::Builtin(builtin) = &function.body {
+                if let Some(name) = builtin_repr_type_name(*builtin) {
+                    return builtin_type_repr(name);
+                }
+            }
+        }
         // The `int` builtin type value exposes its class-level methods as
         // callable attributes, like CPython's type objects.
         if matches!(
@@ -1717,6 +1832,15 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             attr.as_str(),
             "from_bytes" | "to_bytes" | "bit_length" | "__new__"
         ) {
+            return value::bound_method_new(obj, attr);
+        }
+        // The `bytes` builtin type value exposes its classmethods the same
+        // way (`bytes.fromhex('00')`).
+        if matches!(
+            &function.body,
+            value::FunctionBody::Builtin(hydro_ir::Builtin::Bytes)
+        ) && attr == "fromhex"
+        {
             return value::bound_method_new(obj, attr);
         }
         // The `type` metaclass exposes its C-level class operations as
@@ -1966,11 +2090,41 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         };
     }
     if let Some(class) = value::as_class(obj) {
+        // `pprint` compares `type(object).__repr__` with `is dict.__repr__`,
+        // so the cached native classes for the exposed builtin types return
+        // the same wrapper as the builtin type value.
+        if attr == "__repr__" {
+            if let Some(name) = cached_repr_type_name(obj) {
+                return builtin_type_repr(name);
+            }
+        }
         // Every class object knows its Python-visible name; its attributes
         // were frozen when the class statement ran and later assignments live
         // in the overlay.
         match attr.as_str() {
-            "__name__" | "__qualname__" => return value::str_alloc(class.name.clone()),
+            // `Cls.__name__`/`__qualname__` honor a runtime rename: classes
+            // created by `type.__new__` are frequently renamed in place (the
+            // `typing_extensions` TypedDict metaclass allocates under the
+            // placeholder `Protocol` and renames immediately).
+            "__name__" => {
+                return value::str_alloc(
+                    value::class_display_name(obj)
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            }
+            "__qualname__" => {
+                return value::str_alloc(value::class_qualname(obj).unwrap_or_default().to_string())
+            }
+            // `type.__annotations__`/`type.__annotate__` are getset descriptors
+            // on the metatype: they report the class's *own* mapping/callable
+            // (evaluating PEP 649 lazy annotations) and never inherit.
+            "__annotations__" => {
+                if let Some(annotations) = value::class_annotations(obj) {
+                    return annotations;
+                }
+            }
+            "__annotate__" => return value::class_annotate(obj),
             "__bases__" => return value::tuple_new(class.bases.clone()),
             "__base__" => return class.bases.first().copied().unwrap_or(NONE),
             "__mro__" => return value::tuple_new(value::class_mro(obj)),
@@ -2110,6 +2264,12 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             }
             _ => attribute_error(obj, &attr),
         };
+    }
+    if value::as_range(obj).is_some() {
+        if attr == "index" {
+            return value::bound_method_new(obj, attr);
+        }
+        return attribute_error(obj, &attr);
     }
     // Every Python object answers `__class__`, including immediate
     // singletons such as `NotImplemented`, `None` and booleans.
@@ -2292,6 +2452,13 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
         return NONE;
     }
     if let Some(class) = value::as_class(obj) {
+        // `Cls.__name__`/`Cls.__qualname__` accept only strings, like
+        // `type.__name__`'s setter.
+        if matches!(attr.as_str(), "__name__" | "__qualname__")
+            && value::as_str(new_value).is_none()
+        {
+            return type_error(format!("{attr} must be set to a string object"));
+        }
         if value::class_set_attr(obj, attr, new_value) {
             return NONE;
         }
@@ -2557,6 +2724,20 @@ fn is_builtin_int_type(obj: i64) -> bool {
     matches!(
         &function.body,
         value::FunctionBody::Builtin(hydro_ir::Builtin::Int)
+    )
+}
+
+/// Whether `obj` is the `bytes` builtin *type* value.
+///
+/// Like `int`, `bytes` is a builtin function value at runtime, so
+/// `bytes.fromhex(...)` reaches [`call`] with the function as the receiver.
+fn is_builtin_bytes_type(obj: i64) -> bool {
+    let Some(function) = value::as_function(obj) else {
+        return false;
+    };
+    matches!(
+        &function.body,
+        value::FunctionBody::Builtin(hydro_ir::Builtin::Bytes)
     )
 }
 
@@ -2855,8 +3036,12 @@ fn int_bytes_arguments(
     Ok((slots, signed.is_some_and(value::truthy)))
 }
 
-/// Copies the payload of a buffer-protocol argument (`bytes`, `bytearray` or
-/// `memoryview`) for `int.from_bytes`.
+/// Copies the payload of an `int.from_bytes` operand.
+///
+/// CPython accepts any buffer-protocol value (`bytes`, `bytearray`,
+/// `memoryview`) *or* an iterable of integers; a `str` is explicitly not a
+/// byte source even though it is iterable. Elements are converted like
+/// `bytes(...)` and must fit one byte.
 fn buffer_bytes(object: i64) -> Result<Vec<u8>, i64> {
     if let Some(bytes) = value::as_bytes(object) {
         return Ok(bytes.to_vec());
@@ -2865,14 +3050,66 @@ fn buffer_bytes(object: i64) -> Result<Vec<u8>, i64> {
         return value::memoryview_bytes(view)
             .map_err(|message| exc::raise_with_message(VALUE_ERROR, message));
     }
-    Err(type_error(format!(
-        "cannot convert '{}' object to bytes",
-        value::type_name(object)
-    )))
+    if value::as_str(object).is_some() {
+        return Err(type_error(
+            "cannot convert 'str' object to bytes".to_string(),
+        ));
+    }
+    let iterator = crate::iter::iter_new(object);
+    if exc::pending() {
+        // Replace the iterator protocol's diagnostic with the constructor's
+        // wording, exactly like `bytes(non_iterable)`.
+        exc::clear();
+        return Err(type_error(format!(
+            "cannot convert '{}' object to bytes",
+            value::type_name(object)
+        )));
+    }
+    let mut data = Vec::new();
+    loop {
+        let mut item = NONE;
+        let produced = crate::iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return Err(NONE);
+        }
+        if produced == 0 {
+            break;
+        }
+        let Some(byte) = value::as_integer(item) else {
+            if value::is_bigint(item) {
+                // A magnitude outside the tagged width is definitely not a
+                // byte value.
+                return Err(exc::raise_with_message(
+                    VALUE_ERROR,
+                    "bytes must be in range(0, 256)",
+                ));
+            }
+            return Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(item)
+            )));
+        };
+        if !(0..=255).contains(&byte) {
+            return Err(exc::raise_with_message(
+                VALUE_ERROR,
+                "bytes must be in range(0, 256)",
+            ));
+        }
+        if data.len() >= builtins::MAX_BYTES_ALLOC {
+            return Err(exc::raise_with_message(
+                VALUE_ERROR,
+                "bytes length exceeds the runtime allocation limit",
+            ));
+        }
+        data.push(byte as u8);
+    }
+    Ok(data)
 }
 
-/// `int.from_bytes(bytes, byteorder='big', *, signed=False)`.
+/// `int.from_bytes(bytes_like | iterable, byteorder='big', *, signed=False)`.
 ///
+/// The operand is either a buffer-protocol value or any iterable of
+/// byte-valued integers (a mapping contributes its keys), matching CPython.
 /// The result keeps Python's arbitrary precision: the bytes are decoded as a
 /// `BigInt` and allocated through [`value::bigint_new`], which tags the value
 /// when it fits. `signed` selects two's-complement sign extension.
@@ -3786,6 +4023,25 @@ fn strip_bytes(data: &[u8], chars: Option<&[u8]>, left: bool, right: bool) -> Ve
     data[start..end].to_vec()
 }
 
+/// Class-level methods reached through the `bytes` builtin type value.
+///
+/// `fromhex` reuses [`builtins::bytes_fromhex`], the CPython-faithful decoder
+/// that also backs `bytearray.fromhex`.
+fn bytes_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    match method {
+        "fromhex" => {
+            if !keywords.is_empty() {
+                return type_error("fromhex() takes no keyword arguments".to_string());
+            }
+            if let Some(err) = check_arity("bytes", method, args.len(), 1, 1) {
+                return err;
+            }
+            builtins::bytes_fromhex(args[0])
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
 fn bytes_method(obj: i64, data: Vec<u8>, method: &str, args: &[i64]) -> i64 {
     match method {
         "decode" => {
@@ -4423,6 +4679,90 @@ fn dict_view_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 }
             }
             value::TRUE
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
+// range
+
+/// Raises CPython's `ValueError` for a `range.index` miss
+/// (`3 is not in range`).
+fn range_value_error(needle: i64) -> i64 {
+    exc::raise_with_message(
+        VALUE_ERROR,
+        &format!("{} is not in range", value::repr(needle)),
+    )
+}
+
+/// Methods of a lazy `range` object.
+///
+/// `index` is CPython's one-argument `METH_O` method. Integer values use the
+/// membership arithmetic instead of iterating: the value must lie on the
+/// range's progression, and the result is its 0-based step count. Non-integer
+/// values fall back to a sequence search comparing members with `==`, so
+/// `range(10).index(3.0)` reports position 3 and custom equality objects
+/// participate exactly as in CPython.
+fn range_method(obj: i64, method: &str, args: &[i64]) -> i64 {
+    let Some((first, last, step)) = value::as_range(obj) else {
+        return attribute_error(obj, method);
+    };
+    match method {
+        "index" => {
+            if let Some(err) = check_arity("range", method, args.len(), 1, 1) {
+                return err;
+            }
+            let needle = args[0];
+            let length = value::range_len(first, last, step);
+            let Some(number) = value::as_integer(needle) else {
+                if value::is_bigint(needle) {
+                    // Cannot equal any tagged member, so no search needed.
+                    return range_value_error(needle);
+                }
+                // CPython falls back to a sequence search for values that are
+                // not exact integers; equality only decides membership, and
+                // the reported result is the member's position.
+                for position in 0..length {
+                    let Ok(index) = usize::try_from(position) else {
+                        break;
+                    };
+                    let Some(item) = value::range_item(first, last, step, index) else {
+                        break;
+                    };
+                    // `range_item` returns the raw integer; tag it before the
+                    // comparison or a raw 1/3/… collides with a special value.
+                    let matched = container::equals(ops::int_result(item), needle);
+                    if exc::pending() {
+                        return NONE;
+                    }
+                    if matched {
+                        return ops::int_result(position);
+                    }
+                }
+                return range_value_error(needle);
+            };
+            // Compare in `i128` so `value - first` cannot overflow the tagged
+            // integer width before the divisibility check.
+            let value_i = number as i128;
+            let first_i = first as i128;
+            let last_i = last as i128;
+            let step_i = step as i128;
+            if step_i == 0 {
+                return range_value_error(needle);
+            }
+            let inside = if step_i > 0 {
+                value_i >= first_i && value_i < last_i
+            } else {
+                value_i <= first_i && value_i > last_i
+            };
+            if !inside || (value_i - first_i) % step_i != 0 {
+                return range_value_error(needle);
+            }
+            let position = (value_i - first_i) / step_i;
+            if position < 0 || position >= length as i128 {
+                return range_value_error(needle);
+            }
+            ops::int_result(position as i64)
         }
         _ => attribute_error(obj, method),
     }
@@ -6302,11 +6642,12 @@ fn path_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             }
         }
         "open" => {
-            if let Some(err) = check_arity("Path", method, args.len(), 0, 4) {
+            if let Some(err) = check_arity("Path", method, args.len(), 0, 5) {
                 return err;
             }
-            // The slots follow `io.open`: file, mode, encoding, newline,
-            // errors. Omitted trailing slots keep their defaults.
+            // `Path.open` forwards its positional slots to `io.open`, whose
+            // parameters are file, mode, buffering, encoding, errors and
+            // newline. Omitted trailing slots keep their io defaults.
             let mut io_args = Vec::with_capacity(args.len() + 1);
             io_args.push(value::str_alloc(path));
             io_args.extend_from_slice(args);
@@ -8213,6 +8554,108 @@ mod tests {
     }
 
     #[test]
+    fn class_name_assignment_renames_the_class() {
+        reset();
+        // `_TypedDictMeta` allocates under the placeholder name and renames
+        // the result immediately, so the writable slot must win over the
+        // frozen definition name.
+        let base = value::class_new("TypedDict".to_string(), NONE, Vec::new());
+        let class = value::class_new("Protocol".to_string(), base, Vec::new());
+        assert_eq!(value::class_display_name(class), Some("Protocol"));
+        assert_eq!(value::repr(class), "<class 'Protocol'>");
+
+        assert_eq!(
+            super::setattr(class, b"__name__".as_ptr(), 8, string("ConfigDict")),
+            NONE
+        );
+        assert!(!crate::exc::pending());
+        assert_eq!(value::class_display_name(class), Some("ConfigDict"));
+        assert_eq!(text(getattr(class, b"__name__".as_ptr(), 8)), "ConfigDict");
+        // An unassigned `__qualname__` follows the renamed class.
+        assert_eq!(
+            text(getattr(class, b"__qualname__".as_ptr(), 12)),
+            "ConfigDict"
+        );
+        assert_eq!(value::repr(class), "<class 'ConfigDict'>");
+        assert_eq!(value::to_string(class), "<class 'ConfigDict'>");
+
+        assert_eq!(
+            super::setattr(
+                class,
+                b"__qualname__".as_ptr(),
+                12,
+                string("Outer.ConfigDict")
+            ),
+            NONE
+        );
+        assert_eq!(
+            text(getattr(class, b"__qualname__".as_ptr(), 12)),
+            "Outer.ConfigDict"
+        );
+        assert_eq!(
+            value::class_display_name(class),
+            Some("ConfigDict"),
+            "`__name__` is independent of `__qualname__`"
+        );
+
+        // Non-string names are rejected like `type.__name__`'s setter.
+        super::setattr(class, b"__name__".as_ptr(), 8, int(1));
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "__name__ must be set to a string object");
+        crate::exc::clear();
+        assert_eq!(value::class_display_name(class), Some("ConfigDict"));
+    }
+
+    extern "C" fn annotated_value(_args: *const i64) -> i64 {
+        dict(&[(string("x"), int(1))])
+    }
+
+    #[test]
+    fn class_annotations_are_evaluated_from_annotate() {
+        reset();
+        let annotate = value::function_new_with_flags(
+            annotated_value as *const () as usize,
+            1,
+            "annotate".to_string(),
+            0,
+        );
+        let roots = crate::heap::root_values(&[annotate]);
+        let class = value::class_new("Protocol".to_string(), NONE, Vec::new());
+        let class_roots = crate::heap::root_values(&[class]);
+        value::class_set_attr(class, "__annotate__".to_string(), annotate);
+
+        // `Cls.__annotations__` evaluates the PEP 649 callable and caches the
+        // mapping on the class; the class's own `__annotate__` slot reports
+        // the callable, while a class without one reports `None`.
+        let annotations = getattr(class, b"__annotations__".as_ptr(), 15);
+        assert!(!crate::exc::pending());
+        assert_eq!(value::repr(annotations), "{'x': 1}");
+        assert!(matches!(
+            value::class_own_lookup(class, "__annotations__"),
+            Some(value::ClassEntry::Attr(cached)) if cached == annotations
+        ));
+        assert_eq!(getattr(class, b"__annotations__".as_ptr(), 15), annotations);
+        assert_eq!(getattr(class, b"__annotate__".as_ptr(), 12), annotate);
+
+        let plain = value::class_new("Plain".to_string(), NONE, Vec::new());
+        assert_eq!(
+            getattr(plain, b"__annotate__".as_ptr(), 12),
+            NONE,
+            "a class without annotations reports `__annotate__ = None`"
+        );
+        // Annotations are per-class; a subclass never sees its base's mapping.
+        let child = value::class_new("Child".to_string(), class, Vec::new());
+        let child_roots = crate::heap::root_values(&[child]);
+        let child_annotations = getattr(child, b"__annotations__".as_ptr(), 15);
+        assert!(value::as_dict(child_annotations).is_some_and(<[(i64, i64)]>::is_empty));
+        assert!(!crate::exc::pending());
+
+        crate::heap::release_roots(child_roots);
+        crate::heap::release_roots(class_roots);
+        crate::heap::release_roots(roots);
+    }
+
+    #[test]
     fn exception_attributes_resolve_through_getattr_and_hasattr() {
         reset();
         let raised =
@@ -8639,5 +9082,344 @@ mod tests {
         );
         assert_eq!(read(type_builtin, "__annotations__"), replacement);
         assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn range_index_is_a_one_argument_membership_search() {
+        reset();
+        let r = value::range_new(0, 10, 1);
+        assert_eq!(invoke(r, "index", &[int(3)]), int(3));
+        // A non-integer searches the sequence; equality decides membership
+        // and the result is the member's position, never the comparison bool.
+        assert_eq!(
+            invoke(r, "index", &[value::float_new(3.0)]),
+            int(3),
+            "the float fallback must return the position"
+        );
+        invoke(r, "index", &[value::float_new(3.5)]);
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(message(), "3.5 is not in range");
+        crate::exc::clear();
+        invoke(r, "index", &[string("3")]);
+        assert_eq!(message(), "'3' is not in range");
+        crate::exc::clear();
+
+        // CPython's `range.index` takes exactly one argument (`METH_O`).
+        invoke(r, "index", &[]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "range.index() takes exactly one argument (0 given)"
+        );
+        crate::exc::clear();
+        invoke(r, "index", &[int(1), int(2)]);
+        assert_eq!(
+            message(),
+            "range.index() takes exactly one argument (2 given)"
+        );
+        crate::exc::clear();
+
+        // A big integer outside the tagged width can never be a member.
+        let huge =
+            value::bigint_new(num_bigint::BigInt::from(i64::MAX) + num_bigint::BigInt::from(1));
+        invoke(r, "index", &[huge]);
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert!(message().ends_with(" is not in range"));
+        crate::exc::clear();
+
+        // The attribute is a bound method and can be read and called.
+        let bound = getattr(r, b"index".as_ptr(), 5);
+        assert_eq!(crate::builtins::call(bound, 1, [int(7)].as_ptr()), int(7));
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn range_index_follows_membership_arithmetic() {
+        reset();
+        let ascending = value::range_new(0, 5, 1);
+        assert_eq!(invoke(ascending, "index", &[int(0)]), int(0));
+        assert_eq!(invoke(ascending, "index", &[int(4)]), int(4));
+        invoke(ascending, "index", &[int(5)]);
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(message(), "5 is not in range");
+
+        crate::exc::clear();
+        let stepped = value::range_new(1, 10, 3);
+        assert_eq!(invoke(stepped, "index", &[int(4)]), int(1));
+        // Inside the bounds but off the progression: absent.
+        invoke(stepped, "index", &[int(5)]);
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(message(), "5 is not in range");
+
+        crate::exc::clear();
+        let descending = value::range_new(1, -10, -3);
+        assert_eq!(invoke(descending, "index", &[int(-5)]), int(2));
+        invoke(descending, "index", &[int(-4)]);
+        assert_eq!(message(), "-4 is not in range");
+        crate::exc::clear();
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn bytes_fromhex_decodes_ascii_hex_pairs() {
+        reset();
+        let bytes_type = value::builtin_function_new(hydro_ir::Builtin::Bytes);
+        let decoded = invoke(bytes_type, "fromhex", &[string("00 0a 0B")]);
+        assert_eq!(
+            value::as_bytes(decoded).map(|bytes| bytes.to_vec()),
+            Some(vec![0x00, 0x0a, 0x0b])
+        );
+        // Whitespace anywhere between pairs is ignored; the empty input and a
+        // whitespace-only input decode to empty bytes.
+        for source in [" 00\t0A\nff ", "000aff", "00  0a\nff"] {
+            assert_eq!(
+                value::as_bytes(invoke(bytes_type, "fromhex", &[string(source)]))
+                    .map(|bytes| bytes.to_vec()),
+                Some(vec![0x00, 0x0a, 0xff]),
+                "source {source:?}"
+            );
+        }
+        assert_eq!(
+            value::as_bytes(invoke(bytes_type, "fromhex", &[string("  ")]))
+                .map(|bytes| bytes.to_vec()),
+            Some(Vec::new())
+        );
+        // Bytes-like input is decoded from its raw payload.
+        let raw = value::bytes_new(b"000a".to_vec());
+        assert_eq!(
+            value::as_bytes(invoke(bytes_type, "fromhex", &[raw])).map(|bytes| bytes.to_vec()),
+            Some(vec![0x00, 0x0a])
+        );
+        assert!(!crate::exc::pending());
+
+        // A space inside a digit pair is an invalid character at its offset.
+        invoke(bytes_type, "fromhex", &[string("0 0")]);
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "non-hexadecimal number found in fromhex() arg at position 1"
+        );
+        crate::exc::clear();
+        invoke(bytes_type, "fromhex", &[string("0g")]);
+        assert_eq!(
+            message(),
+            "non-hexadecimal number found in fromhex() arg at position 1"
+        );
+        crate::exc::clear();
+        invoke(bytes_type, "fromhex", &[string("000")]);
+        assert_eq!(
+            message(),
+            "fromhex() arg must contain an even number of hexadecimal digits"
+        );
+        crate::exc::clear();
+        invoke(bytes_type, "fromhex", &[int(5)]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "fromhex() argument must be str or bytes-like, not int"
+        );
+        crate::exc::clear();
+        invoke(bytes_type, "fromhex", &[string("00"), string("00")]);
+        assert_eq!(
+            message(),
+            "bytes.fromhex() takes exactly one argument (2 given)"
+        );
+        crate::exc::clear();
+
+        // The classmethod is an attribute of the builtin type value.
+        let bound = getattr(bytes_type, b"fromhex".as_ptr(), 7);
+        assert_eq!(
+            value::as_bytes(crate::builtins::call(bound, 1, [string("ff")].as_ptr()))
+                .map(|bytes| bytes.to_vec()),
+            Some(vec![0xff])
+        );
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn path_open_accepts_buffering_and_all_io_slots() {
+        reset();
+        // A missing file reaches `io.open`, proving the keyword was bound to
+        // the `buffering` slot instead of being rejected.
+        let path = value::path_new(format!("/hydro-path-open-probe-{}", std::process::id()));
+        let mut args = Vec::new();
+        let keywords = super::KeywordArgs {
+            items: vec![("buffering".to_string(), int(-1))],
+        };
+        let _ = super::path_method_kw(path, "open", &mut args, &keywords);
+        assert_eq!(error_tag(), crate::exc::OS_ERROR as i64);
+        crate::exc::clear();
+
+        // Five positional slots map onto mode, buffering, encoding, errors
+        // and newline, matching `io.open`'s signature.
+        invoke(path, "open", &[string("r"), int(-1), NONE, NONE, NONE]);
+        assert_eq!(error_tag(), crate::exc::OS_ERROR as i64);
+        crate::exc::clear();
+        invoke(
+            path,
+            "open",
+            &[string("r"), int(-1), NONE, NONE, NONE, NONE],
+        );
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "open() takes at most 5 arguments (6 given)");
+        crate::exc::clear();
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn int_from_bytes_accepts_integer_iterables() {
+        reset();
+        let int_type = value::builtin_function_new(hydro_ir::Builtin::Int);
+        let big = string("big");
+        let little = string("little");
+
+        // list/tuple/range/set/mapping keys are all byte sources.
+        let list_data = list(&[int(1), int(2), int(3)]);
+        assert_eq!(
+            invoke(int_type, "from_bytes", &[list_data, big]),
+            int(0x01_02_03)
+        );
+        assert_eq!(
+            invoke(int_type, "from_bytes", &[list_data, little]),
+            int(0x03_02_01)
+        );
+        let tuple_data = tuple(&[int(1), int(2), int(3)]);
+        assert_eq!(
+            invoke(int_type, "from_bytes", &[tuple_data, big]),
+            int(0x01_02_03)
+        );
+        let range_data = value::range_new(1, 4, 1);
+        assert_eq!(
+            invoke(int_type, "from_bytes", &[range_data, big]),
+            int(0x01_02_03)
+        );
+        // Mapping iteration supplies keys, like CPython.
+        let mapping = dict(&[(int(65), int(1))]);
+        assert_eq!(invoke(int_type, "from_bytes", &[mapping, big]), int(65));
+
+        // `map(lambda ...)` in pydantic materialises to a list here; the same
+        // list also exercises the iterable conversion directly.
+        let int_function = value::builtin_function_new(hydro_ir::Builtin::Int);
+        let source = list(&[string("1"), string("2"), string("3")]);
+        let mapped = crate::builtins::call_builtin(
+            hydro_ir::Builtin::Map,
+            2,
+            [int_function, source].as_ptr(),
+        );
+        assert!(!crate::exc::pending());
+        assert_eq!(
+            invoke(int_type, "from_bytes", &[mapped, big]),
+            int(0x01_02_03)
+        );
+
+        // Buffer operands keep working, and the empty iterable is zero.
+        let raw = value::bytes_new(vec![1, 2, 3]);
+        assert_eq!(invoke(int_type, "from_bytes", &[raw, big]), int(0x01_02_03));
+        assert_eq!(invoke(int_type, "from_bytes", &[list(&[]), big]), int(0));
+        // `signed=True` applies two's-complement sign extension.
+        assert_eq!(
+            super::int_from_bytes(&[list(&[int(0xff)]), big], &[("signed".to_string(), TRUE)],),
+            int(-1)
+        );
+        assert!(!crate::exc::pending());
+
+        // Element and operand diagnostics match CPython.
+        invoke(int_type, "from_bytes", &[list(&[int(256)]), big]);
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(message(), "bytes must be in range(0, 256)");
+        crate::exc::clear();
+        invoke(int_type, "from_bytes", &[list(&[int(-1)]), big]);
+        assert_eq!(message(), "bytes must be in range(0, 256)");
+        crate::exc::clear();
+        invoke(
+            int_type,
+            "from_bytes",
+            &[list(&[value::float_new(1.0)]), big],
+        );
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "'float' object cannot be interpreted as an integer"
+        );
+        crate::exc::clear();
+        invoke(int_type, "from_bytes", &[value::float_new(1.0), big]);
+        assert_eq!(message(), "cannot convert 'float' object to bytes");
+        crate::exc::clear();
+        invoke(int_type, "from_bytes", &[string("abc"), big]);
+        assert_eq!(message(), "cannot convert 'str' object to bytes");
+        crate::exc::clear();
+
+        // `to_bytes` round-trips the same payload.
+        assert_eq!(
+            value::as_bytes(invoke(int(0x01_02_03), "to_bytes", &[int(3), big],))
+                .map(|bytes| bytes.to_vec()),
+            Some(vec![1, 2, 3])
+        );
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn builtin_type_repr_is_stable_and_callable() {
+        reset();
+        let dict_builtin = value::builtin_function_new(hydro_ir::Builtin::Dict);
+        let d = dict(&[(string("a"), int(1))]);
+        let read = |obj: i64| getattr(obj, b"__repr__".as_ptr(), 8);
+        let repr = read(dict_builtin);
+        assert_eq!(read(dict_builtin), repr);
+        // `pprint` dispatches on `type(object).__repr__` and compares it with
+        // `is dict.__repr__`, so the class surface must return the same value.
+        let dict_class = value::type_class(d);
+        assert_eq!(read(dict_class), repr);
+        assert_eq!(
+            text(crate::builtins::call(repr, 1, [d].as_ptr())),
+            "{'a': 1}",
+            "the cached __repr__ callable must render the instance"
+        );
+        // The method-call lowering (`dict.__repr__(d)`) bypasses `getattr`
+        // and dispatches the type-level slot directly.
+        assert_eq!(
+            text(invoke(dict_builtin, "__repr__", &[d])),
+            "{'a': 1}",
+            "dict.__repr__(d) must call the type-level repr slot"
+        );
+        assert_eq!(
+            text(invoke(dict_class, "__repr__", &[d])),
+            "{'a': 1}",
+            "type(d).__repr__(d) must call the type-level repr slot"
+        );
+        // The wrapper is hashable, so it can key the dispatch table.
+        let keyed = dict(&[(repr, int(7))]);
+        assert_eq!(container::subscript(keyed, read(dict_builtin)), int(7));
+
+        for (builtin, instance, rendered) in [
+            (hydro_ir::Builtin::List, list(&[int(1), int(2)]), "[1, 2]"),
+            (hydro_ir::Builtin::Str, string("a"), "'a'"),
+            (hydro_ir::Builtin::Int, int(5), "5"),
+        ] {
+            let type_value = value::builtin_function_new(builtin);
+            let method = read(type_value);
+            assert_eq!(read(type_value), method);
+            assert_eq!(read(value::type_class(instance)), method);
+            assert_eq!(
+                text(crate::builtins::call(method, 1, [instance].as_ptr())),
+                rendered,
+                "cached __repr__ for {builtin:?} must render {rendered}"
+            );
+        }
+
+        // The function metadata surface is untouched.
+        assert_eq!(text(getattr(dict_builtin, b"__name__".as_ptr(), 8)), "dict");
+        assert_eq!(
+            text(getattr(dict_builtin, b"__qualname__".as_ptr(), 12)),
+            "dict"
+        );
+        assert!(!crate::exc::pending());
+
+        // An unbound call without the instance reports the callable's arity
+        // diagnostic.
+        crate::builtins::call(repr, 0, std::ptr::null());
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "repr() takes exactly 1 argument(s) (0 given)");
+        crate::exc::clear();
     }
 }

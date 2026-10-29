@@ -41,6 +41,21 @@ const FROZEN_FIND_SPEC: &str = "_frozen_find_spec";
 const FROZEN_CREATE_MODULE: &str = "_frozen_create_module";
 const FROZEN_EXEC_MODULE: &str = "_frozen_exec_module";
 const FROZEN_INVALIDATE: &str = "_frozen_invalidate_caches";
+const INSTALL: &str = "_install";
+const PATH_FINDER_FIND_SPEC: &str = "_path_finder_find_spec";
+const PATH_FINDER_INVALIDATE: &str = "_path_finder_invalidate_caches";
+const FILE_FINDER_INIT: &str = "_file_finder_init";
+const FILE_FINDER_PATH_HOOK: &str = "_file_finder_path_hook";
+const FILE_FINDER_HOOK: &str = "_file_finder_hook";
+const FILE_FINDER_FIND_SPEC: &str = "_file_finder_find_spec";
+const FILE_FINDER_INVALIDATE: &str = "_file_finder_invalidate_caches";
+
+/// Registry key of the bootstrap module `_install()` was called with.
+const BOOTSTRAP_KEY: &str = "importlib.machinery._bootstrap";
+
+/// Registry key of `zipimport._zip_directory_cache` (shared with the
+/// `zipimport` alias).
+const ZIP_DIRECTORY_CACHE: &str = "zipimport._zip_directory_cache";
 
 /// Dispatches a native `importlib.machinery` function. Arity is enforced by
 /// the central spec before this point.
@@ -62,6 +77,13 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         FROZEN_CREATE_MODULE => frozen_create_module(args),
         FROZEN_EXEC_MODULE => frozen_exec_module(args),
         BUILTIN_INVALIDATE | FROZEN_INVALIDATE => NONE,
+        INSTALL => install(args),
+        PATH_FINDER_FIND_SPEC => path_finder_find_spec(args),
+        PATH_FINDER_INVALIDATE | FILE_FINDER_INVALIDATE => NONE,
+        FILE_FINDER_INIT => file_finder_init(args),
+        FILE_FINDER_PATH_HOOK => file_finder_path_hook(args),
+        FILE_FINDER_HOOK => file_finder_hook(args),
+        FILE_FINDER_FIND_SPEC => file_finder_find_spec(args),
         "all_suffixes" => all_suffixes(),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
@@ -79,6 +101,18 @@ pub(crate) fn constant(name: &str) -> i64 {
         "ExtensionFileLoader" => extension_loader_class(),
         "BuiltinImporter" => builtin_importer_class(),
         "FrozenImporter" => frozen_importer_class(),
+        // The external path finders and loaders. `PathFinder`/`FileFinder`
+        // are real finders over Hydro's compiled-module table and the
+        // filesystem; `SourcelessFileLoader` and `AppleFrameworkLoader`
+        // complete the loader classes CPython's frozen module exports.
+        "PathFinder" => path_finder_class(),
+        "FileFinder" => file_finder_class(),
+        "SourcelessFileLoader" => sourceless_loader_class(),
+        "AppleFrameworkLoader" => apple_framework_loader_class(),
+        // `zipimport._zip_directory_cache`: Hydro imports no zip archives, so
+        // the mapping is a real, permanently empty dict (`pkgutil` reads it
+        // only for an existing `zipimporter`, which Hydro never creates).
+        "_zip_directory_cache" => zip_directory_cache(),
         // The module-suffix lists. They are cached, mutable lists like
         // CPython's module-level lists (`SOURCE_SUFFIXES.append(...)` sticks).
         "SOURCE_SUFFIXES" => {
@@ -323,6 +357,287 @@ pub(crate) fn frozen_importer_class() -> i64 {
             ),
         ],
     )
+}
+
+/// `importlib.machinery.PathFinder`: the `sys.meta_path` finder for path
+/// entries. Hydro resolves installed files and compiled modules through
+/// [`importlib_util`](super::importlib_util), so the finder reports those
+/// specs instead of maintaining a separate path-importer cache.
+pub(crate) fn path_finder_class() -> i64 {
+    cached_class(
+        "importlib.machinery.PathFinder",
+        "PathFinder",
+        NONE,
+        vec![
+            (
+                "find_spec".to_string(),
+                native(PATH_FINDER_FIND_SPEC, 4),
+                MethodKind::Classmethod,
+            ),
+            (
+                "invalidate_caches".to_string(),
+                native(PATH_FINDER_INVALIDATE, 1),
+                MethodKind::Classmethod,
+            ),
+        ],
+    )
+}
+
+/// `importlib.machinery.FileFinder`: a directory finder.
+///
+/// The instance stores its directory in `path`; `find_spec` searches that
+/// directory with [`importlib_util`](super::importlib_util)'s filesystem
+/// discovery. `path_hook` returns the hook function CPython installs into
+/// `sys.path_hooks`; Hydro has no runtime `sys.path_hooks` list (imports are
+/// resolved ahead of time), so the hook is returned for compatibility and
+/// works when called directly.
+pub(crate) fn file_finder_class() -> i64 {
+    cached_class(
+        "importlib.machinery.FileFinder",
+        "FileFinder",
+        NONE,
+        vec![
+            (
+                "__init__".to_string(),
+                native(FILE_FINDER_INIT, usize::MAX),
+                MethodKind::Normal,
+            ),
+            (
+                "path_hook".to_string(),
+                native(FILE_FINDER_PATH_HOOK, usize::MAX),
+                MethodKind::Classmethod,
+            ),
+            (
+                "find_spec".to_string(),
+                native(FILE_FINDER_FIND_SPEC, 3),
+                MethodKind::Normal,
+            ),
+            (
+                "invalidate_caches".to_string(),
+                native(FILE_FINDER_INVALIDATE, 1),
+                MethodKind::Classmethod,
+            ),
+        ],
+    )
+}
+
+/// `importlib.machinery.SourcelessFileLoader(name, path)`: the loader for a
+/// `.pyc` file that has no source.
+///
+/// Hydro cannot execute bytecode at runtime; a module compiled into the
+/// program is already initialized, so `exec_module` accepts that module and
+/// reports a precise `ImportError` for any other file.
+pub(crate) fn sourceless_loader_class() -> i64 {
+    cached_class(
+        "importlib.machinery.SourcelessFileLoader",
+        "SourcelessFileLoader",
+        loader_class(),
+        vec![
+            (
+                "__init__".to_string(),
+                native(SOURCE_INIT, 3),
+                MethodKind::Normal,
+            ),
+            (
+                "get_filename".to_string(),
+                native(SOURCE_GET_FILENAME, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "create_module".to_string(),
+                native(SOURCE_CREATE_MODULE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "exec_module".to_string(),
+                native(SOURCE_EXEC_MODULE, 2),
+                MethodKind::Normal,
+            ),
+        ],
+    )
+}
+
+/// `importlib.machinery.AppleFrameworkLoader`: on every non-Apple target this
+/// is the extension loader under its Apple-framework spelling, matching
+/// CPython's Linux surface.
+pub(crate) fn apple_framework_loader_class() -> i64 {
+    cached_class(
+        "importlib.machinery.AppleFrameworkLoader",
+        "AppleFrameworkLoader",
+        extension_loader_class(),
+        vec![
+            (
+                "__init__".to_string(),
+                native(EXTENSION_INIT, 3),
+                MethodKind::Normal,
+            ),
+            (
+                "get_filename".to_string(),
+                native(EXTENSION_GET_FILENAME, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "create_module".to_string(),
+                native(EXTENSION_CREATE_MODULE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "exec_module".to_string(),
+                native(EXTENSION_EXEC_MODULE, 2),
+                MethodKind::Normal,
+            ),
+        ],
+    )
+}
+
+// -------------------------------------------------------------------------
+// Path finders
+// -------------------------------------------------------------------------
+
+/// `_install(_bootstrap_module)`: CPython's hook that registers the
+/// path-based import components.
+///
+/// Hydro's importer is compiled in: native modules, modules compiled into the
+/// program and files under `sys.path` are discovered by
+/// [`importlib_util`](super::importlib_util) without a mutable
+/// `sys.path_hooks` list. The truthful equivalent of the CPython call is
+/// therefore to record the bootstrap module and ensure the real
+/// [`PathFinder`] is on `sys.meta_path`; no file finder is installed because
+/// there is no runtime path-importer cache to populate. Repeated calls are
+/// idempotent.
+fn install(args: &[i64]) -> i64 {
+    let Some(bootstrap) = args.first().copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "_install() missing 1 required positional argument: '_bootstrap_module'",
+        );
+    };
+    globals::registry_set(BOOTSTRAP_KEY, bootstrap);
+    let meta_path = super::module_get_by_name("sys", "meta_path");
+    if exc::pending() {
+        return NONE;
+    }
+    let finder = path_finder_class();
+    let Some(items) = value::as_list(meta_path) else {
+        return NONE;
+    };
+    if items.contains(&finder) {
+        return NONE;
+    }
+    let roots = crate::heap::root_values(&[meta_path, finder]);
+    crate::container::list_append(meta_path, finder);
+    crate::heap::release_roots(roots);
+    NONE
+}
+
+/// The `path` argument of `PathFinder.find_spec` as directories, or `None`
+/// for `sys.path`.
+fn finder_path(argument: i64) -> Option<Vec<String>> {
+    if argument == NONE {
+        return None;
+    }
+    let items = value::as_list(argument)?;
+    Some(
+        items
+            .iter()
+            .filter_map(|item| value::as_str(*item).map(str::to_string))
+            .collect(),
+    )
+}
+
+/// `PathFinder.find_spec(fullname, path=None, target=None)`, with the class
+/// receiver in `args[0]`.
+fn path_finder_find_spec(args: &[i64]) -> i64 {
+    let Some(name) = args.get(1).and_then(|arg| value::as_str(*arg)) else {
+        return exc::raise_with_message(TYPE_ERROR, "find_spec() argument 'name' must be str");
+    };
+    if name.is_empty() || name.split('.').any(str::is_empty) {
+        return NONE;
+    }
+    if hydro_ir::stdlib::module(name).is_some() {
+        return super::importlib_util::native_spec(name);
+    }
+    let path = finder_path(args.get(2).copied().unwrap_or(NONE));
+    match super::importlib_util::resolve_module_with_path(name, path.as_deref()) {
+        Some(found) => super::importlib_util::spec_instance(&found),
+        None => NONE,
+    }
+}
+
+/// `FileFinder(path, *loader_details)`.
+fn file_finder_init(args: &[i64]) -> i64 {
+    let receiver = args[0];
+    let Some(path) = args.get(1).and_then(|arg| value::as_str(*arg)) else {
+        return exc::raise_with_message(TYPE_ERROR, "file_finder path must be a str, not 'int'");
+    };
+    value::instance_setattr(
+        receiver,
+        "path".to_string(),
+        value::str_alloc(path.to_string()),
+    );
+    NONE
+}
+
+/// `FileFinder.path_hook(*loader_details)`: the hook CPython appends to
+/// `sys.path_hooks`. The loader details only choose which loaders a finder
+/// knows; Hydro's discovery picks the loader from the file suffix, so the
+/// returned hook accepts the directory alone.
+fn file_finder_path_hook(_args: &[i64]) -> i64 {
+    native(FILE_FINDER_HOOK, 1)
+}
+
+/// The function returned by `FileFinder.path_hook`: `hook(path)`.
+fn file_finder_hook(args: &[i64]) -> i64 {
+    let Some(path) = args.first().and_then(|arg| value::as_str(*arg)) else {
+        return exc::raise_with_message(TYPE_ERROR, "path hook argument must be str, not 'int'");
+    };
+    if !Path::new(path).is_dir() {
+        return exc::raise_with_message(IMPORT_ERROR, "only directories are supported");
+    }
+    let finder = value::instance_new(file_finder_class());
+    let roots = crate::heap::root_values(&[finder]);
+    value::instance_setattr(
+        finder,
+        "path".to_string(),
+        value::str_alloc(path.to_string()),
+    );
+    crate::heap::release_roots(roots);
+    finder
+}
+
+/// `FileFinder.find_spec(fullname, target=None)`, with the instance receiver
+/// in `args[0]`.
+fn file_finder_find_spec(args: &[i64]) -> i64 {
+    let Some(name) = args.get(1).and_then(|arg| value::as_str(*arg)) else {
+        return exc::raise_with_message(TYPE_ERROR, "find_spec() argument 'name' must be str");
+    };
+    let Some(path) = loader_field(args[0], "path") else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "find_spec() receiver has no str 'path' attribute",
+        );
+    };
+    match super::importlib_util::filesystem_spec(name, &[path]) {
+        Some(found) => super::importlib_util::spec_instance(&found),
+        None => NONE,
+    }
+}
+
+/// `zipimport._zip_directory_cache`: archive path -> directory mapping.
+///
+/// Hydro never creates a `zipimporter`, so no archive is ever imported and the
+/// mapping stays empty; it is a real cached dict so identity and mutation
+/// behave like CPython's module global. `pkgutil` only indexes it with an
+/// existing importer's `archive`, which cannot occur here.
+fn zip_directory_cache() -> i64 {
+    if let Some(cached) = globals::registry_get(ZIP_DIRECTORY_CACHE) {
+        return cached;
+    }
+    let cache = value::dict_new(Vec::new());
+    let roots = crate::heap::root_values(&[cache]);
+    globals::registry_set(ZIP_DIRECTORY_CACHE, cache);
+    crate::heap::release_roots(roots);
+    cache
 }
 
 // -------------------------------------------------------------------------
@@ -897,5 +1212,168 @@ mod tests {
         assert_ne!(combined, second);
         assert_eq!(items(second), suffixes);
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn install_registers_the_path_finder_and_bootstrap_module_once() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
+        crate::core::globals::reset();
+        exc::init();
+        let bootstrap = value::module_value("importlib._bootstrap".to_string());
+        let roots = crate::heap::root_values(&[bootstrap]);
+
+        assert_eq!(call("_install", &[bootstrap]), NONE);
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(
+            crate::core::globals::registry_get(BOOTSTRAP_KEY),
+            Some(bootstrap)
+        );
+
+        let meta_path = crate::modules::module_get_by_name("sys", "meta_path");
+        let finders = value::as_list(meta_path).expect("sys.meta_path is a list");
+        let finder = path_finder_class();
+        assert_eq!(
+            finders.iter().filter(|item| **item == finder).count(),
+            1,
+            "PathFinder is installed exactly once"
+        );
+        let after_first = finders.len();
+
+        // Repeated installs are idempotent.
+        assert_eq!(call("_install", &[bootstrap]), NONE);
+        assert_eq!(
+            value::as_list(meta_path).map(|finders| finders.len()),
+            Some(after_first)
+        );
+        assert!(!exc::pending());
+
+        crate::heap::release_roots(roots);
+        crate::core::globals::reset();
+        exc::init();
+    }
+
+    #[test]
+    fn install_requires_the_bootstrap_module() {
+        exc::init();
+        call("_install", &[]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::clear();
+    }
+
+    #[test]
+    fn zip_directory_cache_is_a_real_empty_mapping() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
+        crate::core::globals::reset();
+        exc::init();
+        let cache = constant("_zip_directory_cache");
+        assert_eq!(cache, constant("_zip_directory_cache"));
+        let entries = value::as_dict(cache).expect("_zip_directory_cache is a dict");
+        assert!(entries.is_empty());
+        assert!(!exc::pending());
+
+        // It is the live mapping, not a fresh copy per read.
+        let key = value::str_alloc("/tmp/hydro.zip".to_string());
+        let value = value::dict_new(Vec::new());
+        let roots = crate::heap::root_values(&[key, value]);
+        crate::container::dict_set(cache, key, value);
+        crate::heap::release_roots(roots);
+        assert_eq!(
+            value::as_dict(constant("_zip_directory_cache")).map(|entries| entries.len()),
+            Some(1)
+        );
+
+        crate::core::globals::reset();
+        exc::init();
+    }
+
+    #[test]
+    fn path_finder_finds_native_and_unknown_modules() {
+        exc::init();
+        let finder = path_finder_class();
+        let spec = call(
+            PATH_FINDER_FIND_SPEC,
+            &[finder, value::str_alloc("math".to_string()), NONE, NONE],
+        );
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(spec_name(spec).as_deref(), Some("math"));
+        assert_eq!(
+            value::instance_attr(spec, "loader"),
+            Some(builtin_importer_class())
+        );
+
+        exc::clear();
+        let missing = call(
+            PATH_FINDER_FIND_SPEC,
+            &[
+                finder,
+                value::str_alloc("hydro_no_such_module_xyz".to_string()),
+                NONE,
+                NONE,
+            ],
+        );
+        assert_eq!(missing, NONE);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn file_finder_hook_accepts_directories_only() {
+        exc::init();
+        let hook = call(FILE_FINDER_PATH_HOOK, &[file_finder_class()]);
+        assert!(!exc::pending());
+        assert_eq!(value::function_name(hook), "_file_finder_hook".to_string());
+
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let finder = call(FILE_FINDER_HOOK, &[value::str_alloc(dir.clone())]);
+        assert!(
+            !exc::pending(),
+            "{}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(
+            value::instance_attr(finder, "path").and_then(value::as_str),
+            Some(dir.as_str())
+        );
+        // A FileFinder instance resolves a real file in its directory.
+        let spec = call(
+            FILE_FINDER_FIND_SPEC,
+            &[finder, value::str_alloc("math".to_string()), NONE],
+        );
+        assert_eq!(spec, NONE, "native modules are not directory entries");
+
+        exc::clear();
+        call(
+            FILE_FINDER_HOOK,
+            &[value::str_alloc("/hydro_no_such_dir_xyz".to_string())],
+        );
+        assert_eq!(exc::pending_tag(), i64::from(IMPORT_ERROR));
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "only directories are supported"
+        );
+        exc::clear();
+    }
+
+    #[test]
+    fn external_loader_classes_are_cached() {
+        exc::init();
+        for name in [
+            "PathFinder",
+            "FileFinder",
+            "SourcelessFileLoader",
+            "AppleFrameworkLoader",
+        ] {
+            let first = constant(name);
+            assert_eq!(first, constant(name), "{name} is cached");
+            assert!(value::as_class(first).is_some(), "{name} is a class");
+            assert!(!exc::pending(), "{name}");
+        }
     }
 }

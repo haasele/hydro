@@ -878,10 +878,24 @@ fn tuple_methods_return_int() {
 }
 
 #[test]
-fn dict_items_returns_list() {
-    let source = "d = {'a': 1}\nxs = d.items()\n";
+fn dict_view_methods_have_dynamic_runtime_types() {
+    // `keys()`/`values()`/`items()` are live views, not lists: their members
+    // may be used as sets (`need <= d.keys()`, `d.keys() - need`), which the
+    // static list type would reject.
+    let source = "d = {'a': 1}\nks = d.keys()\nvs = d.values()\nits = d.items()\n";
     let program = crate::check_source(source, "test.py").expect("valid program");
-    assert_eq!(assigned_type(&program, 1), Type::List);
+    assert_eq!(assigned_type(&program, 1), Type::Any);
+    assert_eq!(assigned_type(&program, 2), Type::Any);
+    assert_eq!(assigned_type(&program, 3), Type::Any);
+}
+
+#[test]
+fn dict_keys_view_supports_set_operations() {
+    let source =
+        "d = {'a': 1}\nneed = {'a'}\nsubset = need <= d.keys()\nexcess = d.keys() - need\n";
+    let program = crate::check_source(source, "test.py").expect("valid program");
+    assert_eq!(assigned_type(&program, 2), Type::Bool);
+    assert_eq!(assigned_type(&program, 3), Type::Any);
 }
 
 #[test]
@@ -3693,4 +3707,36 @@ fn narrowed_parameter_provenance_reaches_its_reads() {
     assert!(ck.inf.unify(gradual, Ty::Concrete(Type::Bool)).is_ok());
     assert!(ck.inf.unify(typed, gradual).is_ok());
     assert!(!ck.inf.is_gradual(typed));
+}
+
+#[test]
+fn gradual_boolop_operands_stay_dynamic() {
+    // `configparser` builds `'get' + (key or None)` where `key` is an
+    // unannotated parameter. The `or` result is `str | None` at runtime, not a
+    // constant `None`; unifying the gradual operand with `None` used to pin it
+    // and report a bogus `str + None`.
+    let source = "def f(key):\n    return 'get' + (key or None)\n";
+    crate::check_source(source, "test.py").expect("dynamic `or` result must stay open");
+
+    // A genuine constant `str + None` is still a static error.
+    let source = "x = 'get' + None\n";
+    let diags = crate::check_source(source, "test.py").expect_err("str + None is invalid");
+    assert!(diags[0].message.contains("'str' and 'None'"), "{diags:?}");
+}
+
+#[test]
+fn range_index_returns_int() {
+    // `calendar`/`_strptime`/`imaplib`/`mailbox` call `range.index(value)`;
+    // the runtime implements it, so the static range method table must too.
+    let source = "r = range(3)\ni = r.index(2)\n";
+    let program = crate::check_source(source, "test.py").expect("range.index typechecks");
+    assert_eq!(assigned_type(&program, 1), Type::Int);
+
+    // The argument is still required.
+    let source = "r = range(3)\ni = r.index()\n";
+    let diags = crate::check_source(source, "test.py").expect_err("index() needs a value");
+    assert!(
+        diags[0].message.contains("index"),
+        "missing argument is diagnosed: {diags:?}"
+    );
 }

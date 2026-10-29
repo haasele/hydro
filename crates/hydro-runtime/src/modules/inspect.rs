@@ -58,6 +58,7 @@ use crate::exc::{
 };
 use crate::heap;
 use crate::iter;
+use crate::modules::importlib_machinery;
 use crate::value::{self, ClassEntry, DescriptorKind, FunctionBody, ParamMeta, FALSE, NONE, TRUE};
 
 // -------------------------------------------------------------------------
@@ -2888,6 +2889,41 @@ fn getsourcefile_impl(obj: i64) -> i64 {
     }
 }
 
+/// `inspect.getmodulename(path)`: the final path component with a recognized
+/// import suffix removed, or `None` when no source/bytecode/extension suffix
+/// matches. This is CPython's `basename` + `importlib.machinery.all_suffixes`
+/// scan.
+fn getmodulename_impl(path: i64) -> i64 {
+    let Some(text) = value::as_str(path) else {
+        if value::as_bytes(path).is_some() {
+            // `bytes.endswith(str)` is a `TypeError` in CPython's helper.
+            return type_error("endswith first arg must be bytes or a tuple of bytes, not str");
+        }
+        return type_error(&format!(
+            "expected str, bytes or os.PathLike object, not {}",
+            value::type_name(path)
+        ));
+    };
+    // `os.path.basename` on POSIX: everything after the last separator.
+    let name = text.rsplit('/').next().unwrap_or("");
+    let suffixes = importlib_machinery::all_suffixes();
+    if exc::pending() {
+        return NONE;
+    }
+    let Some(items) = value::as_list(suffixes) else {
+        return NONE;
+    };
+    for suffix in items {
+        let Some(suffix) = value::as_str(*suffix) else {
+            continue;
+        };
+        if !suffix.is_empty() && name.ends_with(suffix) {
+            return value::str_alloc(name[..name.len() - suffix.len()].to_string());
+        }
+    }
+    NONE
+}
+
 fn getmodule_impl(obj: i64) -> i64 {
     if let Some(module) = value::as_module(obj) {
         return value::module_value(module.name().to_string());
@@ -3280,6 +3316,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "cleandoc" => cleandoc_impl(args[0]),
         "getdoc" => getdoc_impl(args[0]),
         "getmodule" => getmodule_impl(args[0]),
+        "getmodulename" => getmodulename_impl(args.first().copied().unwrap_or(NONE)),
         "getfile" => getfile_impl(args[0]),
         "getsourcefile" => getsourcefile_impl(args[0]),
         "findsource" | "getsourcelines" => value::tuple_new(vec![
@@ -3487,6 +3524,41 @@ mod tests {
         let function = value::function_new_with_flags(1, arity, name.to_string(), flags);
         value::function_set_signature(function, params);
         function
+    }
+
+    #[test]
+    fn getmodulename_strips_import_suffixes() {
+        exc::init();
+        let cases = [
+            ("/a/b/mod.py", Some("mod")),
+            ("mod.py", Some("mod")),
+            ("/a/b/mod.pyc", Some("mod")),
+            ("dir/mod.abi3.so", Some("mod")),
+            ("mod.txt", None),
+            ("", None),
+            ("dir/", None),
+        ];
+        for (path, expected) in cases {
+            let argument = value::str_alloc(path.to_string());
+            let result = call("getmodulename", &[argument]);
+            assert!(!exc::pending(), "{path} raised");
+            assert_eq!(value::as_str(result), expected, "{path}");
+        }
+        // The result is a plain `str`, and a real extension suffix (`.so`) is
+        // recognized too.
+        assert_eq!(
+            value::as_str(call(
+                "getmodulename",
+                &[value::str_alloc("x.so".to_string())]
+            )),
+            Some("x")
+        );
+        exc::init();
+        let _ = call("getmodulename", &[value::encode_int(3).unwrap_or(NONE)]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        assert!(value::to_string(exc::pending_value())
+            .contains("expected str, bytes or os.PathLike object, not int"));
+        exc::clear();
     }
 
     fn signature_of(obj: i64) -> i64 {

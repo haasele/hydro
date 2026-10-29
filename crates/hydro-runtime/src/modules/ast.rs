@@ -12,6 +12,13 @@
 //!   `ast.Set`, `ast.Dict`, `ast.Slice`, `ast.Starred`, `ast.BinOp`,
 //!   `ast.UnaryOp`, `ast.BoolOp`, `ast.Compare`, `ast.keyword`,
 //!   `ast.Expression`, `ast.Module`, `ast.Expr`);
+//! * the statement and helper node constructors (`ast.Assign`, `ast.Return`,
+//!   `ast.If`, `ast.FunctionDef`, `ast.ClassDef`, `ast.Try`, `ast.TryStar`,
+//!   `ast.Match`, the `ast.Match*` pattern nodes, `ast.ListComp`,
+//!   `ast.arguments`, `ast.alias`, `ast.withitem`, `ast.TypeAlias`,
+//!   `ast.TypeVar`, ...). Construction accepts positional or keyword fields,
+//!   gives sequence fields a fresh empty list and unknown keywords a
+//!   `TypeError`, like CPython; `_fields` lists the CPython field order;
 //! * the operator/context node classes (`ast.Add`, `ast.Eq`, `ast.Load`, ...)
 //!   and the `ast.AST`/`ast.NodeVisitor`/`ast.NodeTransformer` classes.
 //! * the PEP 750 template nodes `ast.TemplateStr(values=...)` and
@@ -211,28 +218,525 @@ const NODE_SPECS: &[NodeSpec] = &[
         fields: &["values"],
         init: init_TemplateStr,
     },
+    // Statement and helper nodes. `doctest`, `logging`, `hashlib`, `pdb` and
+    // `venv` inspect or build these from the runtime AST surface, so they are
+    // real classes with the CPython field order, not opaque placeholders.
+    NodeSpec {
+        name: "Return",
+        base: "stmt",
+        fields: &["value"],
+        init: init_Return,
+    },
+    NodeSpec {
+        name: "If",
+        base: "stmt",
+        fields: &["test", "body", "orelse"],
+        init: init_If,
+    },
+    NodeSpec {
+        name: "Else",
+        base: "stmt",
+        fields: &["body"],
+        init: init_Else,
+    },
+    NodeSpec {
+        name: "For",
+        base: "stmt",
+        fields: &["target", "iter", "body", "orelse", "type_comment"],
+        init: init_For,
+    },
+    NodeSpec {
+        name: "While",
+        base: "stmt",
+        fields: &["test", "body", "orelse"],
+        init: init_While,
+    },
+    NodeSpec {
+        name: "Try",
+        base: "stmt",
+        fields: &["body", "handlers", "orelse", "finalbody"],
+        init: init_Try,
+    },
+    NodeSpec {
+        name: "ExceptHandler",
+        base: "excepthandler",
+        fields: &["type", "name", "body"],
+        init: init_ExceptHandler,
+    },
+    NodeSpec {
+        name: "Raise",
+        base: "stmt",
+        fields: &["exc", "cause"],
+        init: init_Raise,
+    },
+    NodeSpec {
+        name: "Assert",
+        base: "stmt",
+        fields: &["test", "msg"],
+        init: init_Assert,
+    },
+    NodeSpec {
+        name: "Import",
+        base: "stmt",
+        fields: &["names"],
+        init: init_Import,
+    },
+    NodeSpec {
+        name: "ImportFrom",
+        base: "stmt",
+        fields: &["module", "names", "level"],
+        init: init_ImportFrom,
+    },
+    NodeSpec {
+        name: "FunctionDef",
+        base: "stmt",
+        fields: &[
+            "name",
+            "args",
+            "body",
+            "decorator_list",
+            "returns",
+            "type_comment",
+            "type_params",
+        ],
+        init: init_FunctionDef,
+    },
+    NodeSpec {
+        name: "AsyncFunctionDef",
+        base: "stmt",
+        fields: &[
+            "name",
+            "args",
+            "body",
+            "decorator_list",
+            "returns",
+            "type_comment",
+            "type_params",
+        ],
+        init: init_AsyncFunctionDef,
+    },
+    NodeSpec {
+        name: "ClassDef",
+        base: "stmt",
+        fields: &[
+            "name",
+            "bases",
+            "keywords",
+            "body",
+            "decorator_list",
+            "type_params",
+        ],
+        init: init_ClassDef,
+    },
+    NodeSpec {
+        name: "With",
+        base: "stmt",
+        fields: &["items", "body", "type_comment"],
+        init: init_With,
+    },
+    NodeSpec {
+        name: "AsyncWith",
+        base: "stmt",
+        fields: &["items", "body", "type_comment"],
+        init: init_AsyncWith,
+    },
+    NodeSpec {
+        name: "Match",
+        base: "stmt",
+        fields: &["subject", "cases"],
+        init: init_Match,
+    },
+    // CPython spells this one lowercase (`ast.match_case`); `MatchCase` is
+    // accepted as an alias below.
+    NodeSpec {
+        name: "match_case",
+        base: "AST",
+        fields: &["pattern", "guard", "body"],
+        init: init_match_case,
+    },
+    NodeSpec {
+        name: "AugAssign",
+        base: "stmt",
+        fields: &["target", "op", "value"],
+        init: init_AugAssign,
+    },
+    NodeSpec {
+        name: "AnnAssign",
+        base: "stmt",
+        fields: &["target", "annotation", "value", "simple"],
+        init: init_AnnAssign,
+    },
+    NodeSpec {
+        name: "Delete",
+        base: "stmt",
+        fields: &["targets"],
+        init: init_Delete,
+    },
+    NodeSpec {
+        name: "Global",
+        base: "stmt",
+        fields: &["names"],
+        init: init_Global,
+    },
+    NodeSpec {
+        name: "Nonlocal",
+        base: "stmt",
+        fields: &["names"],
+        init: init_Nonlocal,
+    },
+    NodeSpec {
+        name: "Pass",
+        base: "stmt",
+        fields: &[],
+        init: init_Pass,
+    },
+    NodeSpec {
+        name: "Break",
+        base: "stmt",
+        fields: &[],
+        init: init_Break,
+    },
+    NodeSpec {
+        name: "Continue",
+        base: "stmt",
+        fields: &[],
+        init: init_Continue,
+    },
+    NodeSpec {
+        name: "Yield",
+        base: "expr",
+        fields: &["value"],
+        init: init_Yield,
+    },
+    NodeSpec {
+        name: "YieldFrom",
+        base: "expr",
+        fields: &["value"],
+        init: init_YieldFrom,
+    },
+    NodeSpec {
+        name: "Await",
+        base: "expr",
+        fields: &["value"],
+        init: init_Await,
+    },
+    NodeSpec {
+        name: "Lambda",
+        base: "expr",
+        fields: &["args", "body"],
+        init: init_Lambda,
+    },
+    NodeSpec {
+        name: "JoinedStr",
+        base: "expr",
+        fields: &["values"],
+        init: init_JoinedStr,
+    },
+    NodeSpec {
+        name: "FormattedValue",
+        base: "expr",
+        fields: &["value", "conversion", "format_spec"],
+        init: init_FormattedValue,
+    },
+    NodeSpec {
+        name: "comprehension",
+        base: "AST",
+        fields: &["target", "iter", "ifs", "is_async"],
+        init: init_comprehension,
+    },
+    NodeSpec {
+        name: "arguments",
+        base: "AST",
+        fields: &[
+            "posonlyargs",
+            "args",
+            "vararg",
+            "kwonlyargs",
+            "kw_defaults",
+            "kwarg",
+            "defaults",
+        ],
+        init: init_arguments,
+    },
+    NodeSpec {
+        name: "alias",
+        base: "AST",
+        fields: &["name", "asname"],
+        init: init_alias,
+    },
+    NodeSpec {
+        name: "withitem",
+        base: "AST",
+        fields: &["context_expr", "optional_vars"],
+        init: init_withitem,
+    },
+    NodeSpec {
+        name: "TypeAlias",
+        base: "stmt",
+        fields: &["name", "type_params", "value"],
+        init: init_TypeAlias,
+    },
+    NodeSpec {
+        name: "TypeVar",
+        base: "type_param",
+        fields: &["name", "bound", "default_value"],
+        init: init_TypeVar,
+    },
+    NodeSpec {
+        name: "ParamSpec",
+        base: "type_param",
+        fields: &["name", "default_value"],
+        init: init_ParamSpec,
+    },
+    NodeSpec {
+        name: "TypeVarTuple",
+        base: "type_param",
+        fields: &["name", "default_value"],
+        init: init_TypeVarTuple,
+    },
+    NodeSpec {
+        name: "Assign",
+        base: "stmt",
+        fields: &["targets", "value", "type_comment"],
+        init: init_Assign,
+    },
+    NodeSpec {
+        name: "NamedExpr",
+        base: "expr",
+        fields: &["target", "value"],
+        init: init_NamedExpr,
+    },
+    NodeSpec {
+        name: "TypeIgnore",
+        base: "type_ignore",
+        fields: &["lineno", "tag"],
+        init: init_TypeIgnore,
+    },
+    NodeSpec {
+        name: "TryStar",
+        base: "stmt",
+        fields: &["body", "handlers", "orelse", "finalbody"],
+        init: init_TryStar,
+    },
+    NodeSpec {
+        name: "AsyncFor",
+        base: "stmt",
+        fields: &["target", "iter", "body", "orelse", "type_comment"],
+        init: init_AsyncFor,
+    },
+    // Structural pattern-matching pattern nodes (`match` statements).
+    NodeSpec {
+        name: "MatchValue",
+        base: "pattern",
+        fields: &["value"],
+        init: init_MatchValue,
+    },
+    NodeSpec {
+        name: "MatchSingleton",
+        base: "pattern",
+        fields: &["value"],
+        init: init_MatchSingleton,
+    },
+    NodeSpec {
+        name: "MatchSequence",
+        base: "pattern",
+        fields: &["patterns"],
+        init: init_MatchSequence,
+    },
+    NodeSpec {
+        name: "MatchMapping",
+        base: "pattern",
+        fields: &["keys", "patterns", "rest"],
+        init: init_MatchMapping,
+    },
+    NodeSpec {
+        name: "MatchClass",
+        base: "pattern",
+        fields: &["cls", "patterns", "kwd_attrs", "kwd_patterns"],
+        init: init_MatchClass,
+    },
+    NodeSpec {
+        name: "MatchStar",
+        base: "pattern",
+        fields: &["name"],
+        init: init_MatchStar,
+    },
+    NodeSpec {
+        name: "MatchAs",
+        base: "pattern",
+        fields: &["pattern", "name"],
+        init: init_MatchAs,
+    },
+    NodeSpec {
+        name: "MatchOr",
+        base: "pattern",
+        fields: &["patterns"],
+        init: init_MatchOr,
+    },
+    // Comprehension expressions (`comp` nodes).
+    NodeSpec {
+        name: "ListComp",
+        base: "expr",
+        fields: &["elt", "generators"],
+        init: init_ListComp,
+    },
+    NodeSpec {
+        name: "SetComp",
+        base: "expr",
+        fields: &["elt", "generators"],
+        init: init_SetComp,
+    },
+    NodeSpec {
+        name: "DictComp",
+        base: "expr",
+        fields: &["key", "value", "generators"],
+        init: init_DictComp,
+    },
+    NodeSpec {
+        name: "GeneratorExp",
+        base: "expr",
+        fields: &["elt", "generators"],
+        init: init_GeneratorExp,
+    },
 ];
 
-/// Defines one `__init__` trampoline that stores the declared fields (and any
-/// extra keyword attributes) on the instance the class-call path allocated.
+/// Sequence fields whose omitted default is a fresh empty list, matching the
+/// CPython constructors. Earlier expression node specs keep their historical
+/// all-`None` defaults, so their construction is unchanged.
+const NODE_LIST_FIELDS: &[(&str, &[&str])] = &[
+    ("If", &["body", "orelse"]),
+    ("Else", &["body"]),
+    ("For", &["body", "orelse"]),
+    ("While", &["body", "orelse"]),
+    ("Try", &["body", "handlers", "orelse", "finalbody"]),
+    ("ExceptHandler", &["body"]),
+    ("Import", &["names"]),
+    ("ImportFrom", &["names"]),
+    ("FunctionDef", &["body", "decorator_list", "type_params"]),
+    (
+        "AsyncFunctionDef",
+        &["body", "decorator_list", "type_params"],
+    ),
+    (
+        "ClassDef",
+        &["bases", "keywords", "body", "decorator_list", "type_params"],
+    ),
+    ("With", &["items", "body"]),
+    ("AsyncWith", &["items", "body"]),
+    ("Match", &["cases"]),
+    ("match_case", &["body"]),
+    ("Delete", &["targets"]),
+    ("Global", &["names"]),
+    ("Nonlocal", &["names"]),
+    ("JoinedStr", &["values"]),
+    ("comprehension", &["ifs"]),
+    (
+        "arguments",
+        &[
+            "posonlyargs",
+            "args",
+            "kwonlyargs",
+            "kw_defaults",
+            "defaults",
+        ],
+    ),
+    ("TypeAlias", &["type_params"]),
+    ("Assign", &["targets"]),
+    ("TryStar", &["body", "handlers", "orelse", "finalbody"]),
+    ("AsyncFor", &["body", "orelse"]),
+    ("MatchSequence", &["patterns"]),
+    ("MatchMapping", &["keys", "patterns"]),
+    ("MatchClass", &["patterns", "kwd_attrs", "kwd_patterns"]),
+    ("MatchOr", &["patterns"]),
+    ("ListComp", &["generators"]),
+    ("SetComp", &["generators"]),
+    ("DictComp", &["generators"]),
+    ("GeneratorExp", &["generators"]),
+];
+
+/// Names that resolve to an existing node spec. CPython spells the helper
+/// nodes lowercase; the capitalized spellings are accepted because the
+/// runtime AST surface historically documented them that way.
+const NODE_ALIASES: &[(&str, &str)] = &[
+    ("MatchCase", "match_case"),
+    ("Comprehension", "comprehension"),
+];
+
+fn list_fields_for(name: &str) -> &'static [&'static str] {
+    NODE_LIST_FIELDS
+        .iter()
+        .find(|(node, _)| *node == name)
+        .map(|(_, fields)| *fields)
+        .unwrap_or(&[])
+}
+
+fn node_spec(name: &str) -> Option<&'static NodeSpec> {
+    if let Some(spec) = NODE_SPECS.iter().find(|spec| spec.name == name) {
+        return Some(spec);
+    }
+    let canonical = NODE_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == name)
+        .map(|(_, canonical)| *canonical)?;
+    NODE_SPECS.iter().find(|spec| spec.name == canonical)
+}
+
+/// The unique value the class-call signature uses for an omitted sequence
+/// field, so the trampoline can allocate a fresh list without confusing an
+/// explicit `None` with an omitted argument.
+fn sequence_default_marker() -> i64 {
+    ensure_registry();
+    let guard = registry_lock();
+    match guard.as_ref() {
+        // The value is permanently rooted by `build_registry`.
+        Some(registry) => registry.sequence_default,
+        None => NONE,
+    }
+}
+
+/// Replaces the omission marker of a declared sequence field with a fresh
+/// empty list; every other value is stored unchanged.
+fn node_field_value(item: i64, field: &str, list_fields: &[&str]) -> i64 {
+    if list_fields.contains(&field) && item == sequence_default_marker() {
+        return value::list_new(Vec::new());
+    }
+    item
+}
+
+/// Defines one `__init__` trampoline that stores the declared fields on the
+/// instance the class-call path allocated.
+///
+/// Unknown keywords raise `TypeError` like CPython instead of inventing an
+/// attribute, and omitted sequence fields receive a new empty list.
 macro_rules! node_init {
-    ($function:ident, [$($field:literal),*]) => {
+    ($function:ident, [$($field:literal),* $(,)?]) => {
+        // Fieldless nodes (`Pass`, `Break`, `Continue`) expand to no field
+        // reads, so `list_fields` and the `mut` on `index` are unused there.
+        #[allow(unused_variables, unused_mut)]
         extern "C" fn $function(argv: *const i64) -> i64 {
             // SAFETY: the class-call binder passes one slot per declared
             // parameter (self, the fields in order, then `**kwargs`).
             let instance = unsafe { *argv };
+            let class_name = value::instance_class_value(instance)
+                .and_then(value::class_display_name)
+                .unwrap_or("AST");
+            let list_fields = list_fields_for(class_name);
             let mut index = 1usize;
             $(
-                let item = unsafe { *argv.add(index) };
+                let item = node_field_value(unsafe { *argv.add(index) }, $field, list_fields);
                 value::instance_setattr(instance, $field.to_string(), item);
                 index += 1;
             )*
             let keywords = unsafe { *argv.add(index) };
             if let Some(entries) = value::as_dict(keywords) {
                 for (key, item) in entries {
-                    if let Some(name) = value::as_str(*key) {
-                        value::instance_setattr(instance, name.to_string(), *item);
+                    let Some(name) = value::as_str(*key) else { continue };
+                    if ![$($field),*].contains(&name) {
+                        return type_error(&format!(
+                            "{class_name}.__init__() got an unexpected keyword argument '{name}'"
+                        ));
                     }
+                    value::instance_setattr(instance, name.to_string(), *item);
                 }
             }
             NONE
@@ -266,8 +770,120 @@ node_init!(
     ["value", "str", "conversion", "format_spec"]
 );
 node_init!(init_TemplateStr, ["values"]);
+node_init!(init_Return, ["value"]);
+node_init!(init_If, ["test", "body", "orelse"]);
+node_init!(init_Else, ["body"]);
+node_init!(
+    init_For,
+    ["target", "iter", "body", "orelse", "type_comment"]
+);
+node_init!(init_While, ["test", "body", "orelse"]);
+node_init!(init_Try, ["body", "handlers", "orelse", "finalbody"]);
+node_init!(init_ExceptHandler, ["type", "name", "body"]);
+node_init!(init_Raise, ["exc", "cause"]);
+node_init!(init_Assert, ["test", "msg"]);
+node_init!(init_Import, ["names"]);
+node_init!(init_ImportFrom, ["module", "names", "level"]);
+node_init!(
+    init_FunctionDef,
+    [
+        "name",
+        "args",
+        "body",
+        "decorator_list",
+        "returns",
+        "type_comment",
+        "type_params",
+    ]
+);
+node_init!(
+    init_AsyncFunctionDef,
+    [
+        "name",
+        "args",
+        "body",
+        "decorator_list",
+        "returns",
+        "type_comment",
+        "type_params",
+    ]
+);
+node_init!(
+    init_ClassDef,
+    [
+        "name",
+        "bases",
+        "keywords",
+        "body",
+        "decorator_list",
+        "type_params",
+    ]
+);
+node_init!(init_With, ["items", "body", "type_comment"]);
+node_init!(init_AsyncWith, ["items", "body", "type_comment"]);
+node_init!(init_Match, ["subject", "cases"]);
+node_init!(init_match_case, ["pattern", "guard", "body"]);
+node_init!(init_AugAssign, ["target", "op", "value"]);
+node_init!(init_AnnAssign, ["target", "annotation", "value", "simple"]);
+node_init!(init_Delete, ["targets"]);
+node_init!(init_Global, ["names"]);
+node_init!(init_Nonlocal, ["names"]);
+node_init!(init_Pass, []);
+node_init!(init_Break, []);
+node_init!(init_Continue, []);
+node_init!(init_Yield, ["value"]);
+node_init!(init_YieldFrom, ["value"]);
+node_init!(init_Await, ["value"]);
+node_init!(init_Lambda, ["args", "body"]);
+node_init!(init_JoinedStr, ["values"]);
+node_init!(init_FormattedValue, ["value", "conversion", "format_spec"]);
+node_init!(init_comprehension, ["target", "iter", "ifs", "is_async"]);
+node_init!(
+    init_arguments,
+    [
+        "posonlyargs",
+        "args",
+        "vararg",
+        "kwonlyargs",
+        "kw_defaults",
+        "kwarg",
+        "defaults",
+    ]
+);
+node_init!(init_alias, ["name", "asname"]);
+node_init!(init_withitem, ["context_expr", "optional_vars"]);
+node_init!(init_TypeAlias, ["name", "type_params", "value"]);
+node_init!(init_TypeVar, ["name", "bound", "default_value"]);
+node_init!(init_ParamSpec, ["name", "default_value"]);
+node_init!(init_TypeVarTuple, ["name", "default_value"]);
+node_init!(init_Assign, ["targets", "value", "type_comment"]);
+node_init!(init_NamedExpr, ["target", "value"]);
+node_init!(init_TypeIgnore, ["lineno", "tag"]);
+node_init!(init_TryStar, ["body", "handlers", "orelse", "finalbody"]);
+node_init!(
+    init_AsyncFor,
+    ["target", "iter", "body", "orelse", "type_comment"]
+);
+node_init!(init_MatchValue, ["value"]);
+node_init!(init_MatchSingleton, ["value"]);
+node_init!(init_MatchSequence, ["patterns"]);
+node_init!(init_MatchMapping, ["keys", "patterns", "rest"]);
+node_init!(
+    init_MatchClass,
+    ["cls", "patterns", "kwd_attrs", "kwd_patterns"]
+);
+node_init!(init_MatchStar, ["name"]);
+node_init!(init_MatchAs, ["pattern", "name"]);
+node_init!(init_MatchOr, ["patterns"]);
+node_init!(init_ListComp, ["elt", "generators"]);
+node_init!(init_SetComp, ["elt", "generators"]);
+node_init!(init_DictComp, ["key", "value", "generators"]);
+node_init!(init_GeneratorExp, ["elt", "generators"]);
 
 /// Holder base classes exposed on the module (`ast.expr`, `ast.operator`, ...).
+///
+/// `comprehension`, `arguments` and `alias` are concrete node classes (as in
+/// CPython), so they are not holder bases here.
 const BASE_CLASSES: &[&str] = &[
     "AST",
     "mod",
@@ -278,10 +894,10 @@ const BASE_CLASSES: &[&str] = &[
     "operator",
     "unaryop",
     "cmpop",
-    "comprehension",
     "excepthandler",
-    "arguments",
-    "alias",
+    "type_param",
+    "type_ignore",
+    "pattern",
 ];
 
 /// Operator and context node classes, with their holder base.
@@ -323,6 +939,9 @@ const OPERATOR_CLASSES: &[(&str, &str)] = &[
 struct Registry {
     generation: u64,
     ast_class: i64,
+    /// Unique value used as the class-call default for omitted sequence
+    /// fields; the `__init__` trampoline replaces it with a fresh list.
+    sequence_default: i64,
     bases: HashMap<&'static str, i64>,
     nodes: HashMap<&'static str, i64>,
     operators: HashMap<&'static str, i64>,
@@ -355,6 +974,8 @@ fn ensure_registry() {
 }
 
 fn build_registry(generation: u64) -> Registry {
+    let sequence_default = value::tuple_new(Vec::new());
+    heap::add_thread_root(sequence_default);
     let ast_class = value::class_new("AST".to_string(), NONE, Vec::new());
     heap::add_thread_root(ast_class);
     let mut bases = HashMap::new();
@@ -368,6 +989,7 @@ fn build_registry(generation: u64) -> Registry {
     for spec in NODE_SPECS {
         let base = *bases.get(spec.base).unwrap_or(&ast_class);
         let init = value::native_function_new("ast", "_ast_node_init", usize::MAX);
+        let list_fields = list_fields_for(spec.name);
         let mut signature = Vec::with_capacity(spec.fields.len() + 2);
         signature.push(value::ParamMeta {
             name: "self".to_string(),
@@ -375,10 +997,15 @@ fn build_registry(generation: u64) -> Registry {
             default: None,
         });
         for field in spec.fields {
+            let default = if list_fields.contains(field) {
+                sequence_default
+            } else {
+                NONE
+            };
             signature.push(value::ParamMeta {
                 name: (*field).to_string(),
                 kind: ParamKind::Positional,
-                default: Some(NONE),
+                default: Some(default),
             });
         }
         signature.push(value::ParamMeta {
@@ -388,13 +1015,33 @@ fn build_registry(generation: u64) -> Registry {
         });
         value::function_set_signature(init, signature);
         value::function_set_full_entry(init, spec.init as usize);
-        let class = value::class_new(
+        // `_fields` is the CPython class attribute listing the node fields in
+        // order; `doctest`/`inspect` walk it generically.
+        let name_roots = heap::root_values(&[]);
+        let mut names = Vec::with_capacity(spec.fields.len());
+        for field in spec.fields {
+            let name = value::str_alloc((*field).to_string());
+            heap::root_values(&[name]);
+            names.push(name);
+        }
+        let fields_tuple = value::tuple_new(names);
+        heap::release_roots(name_roots);
+        heap::add_thread_root(fields_tuple);
+        let class = value::class_new_full(
             spec.name.to_string(),
             base,
-            vec![("__init__".to_string(), init)],
+            vec![("__init__".to_string(), init, hydro_ir::MethodKind::Normal)],
+            vec![("_fields".to_string(), fields_tuple)],
         );
         heap::add_thread_root(class);
         nodes.insert(spec.name, class);
+    }
+    // The capitalized spellings share the canonical class, so `isinstance`
+    // and `ast.MatchCase is ast.match_case` behave consistently.
+    for (alias, canonical) in NODE_ALIASES {
+        if let Some(&class) = nodes.get(*canonical) {
+            nodes.insert(*alias, class);
+        }
     }
     let mut operators = HashMap::new();
     for (name, base) in OPERATOR_CLASSES {
@@ -428,6 +1075,7 @@ fn build_registry(generation: u64) -> Registry {
     Registry {
         generation,
         ast_class,
+        sequence_default,
         bases,
         nodes,
         operators,
@@ -506,7 +1154,7 @@ pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
 
 /// Dispatches a native `ast` function. Arity is enforced by the central spec.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
-    if NODE_SPECS.iter().any(|spec| spec.name == function) {
+    if node_spec(function).is_some() {
         return build_node(function, args, &[]);
     }
     if OPERATOR_CLASSES.iter().any(|(name, _)| *name == function) {
@@ -537,7 +1185,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
 
 /// Keyword-aware dispatch: node constructors and `parse`.
 pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
-    if NODE_SPECS.iter().any(|spec| spec.name == function) {
+    if node_spec(function).is_some() {
         return build_node(function, args, keywords);
     }
     if OPERATOR_CLASSES.iter().any(|(name, _)| *name == function) {
@@ -563,15 +1211,16 @@ fn operator_instance(name: &str) -> Option<i64> {
 
 /// Constructs one node from positional fields and CPython-style keywords.
 fn build_node(name: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
-    let Some(spec) = NODE_SPECS.iter().find(|spec| spec.name == name) else {
+    let Some(spec) = node_spec(name) else {
         return exc::raise_with_message(
             exc::ATTRIBUTE_ERROR,
             &format!("module 'ast' has no attribute '{name}'"),
         );
     };
+    let node_name = spec.name;
     if args.len() > spec.fields.len() {
         return type_error(&format!(
-            "{name}() takes at most {} arguments ({} given)",
+            "{node_name}() takes at most {} arguments ({} given)",
             spec.fields.len(),
             args.len()
         ));
@@ -584,11 +1233,25 @@ fn build_node(name: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
                 .any(|(keyword, _)| keyword.as_str() == *field)
         {
             return type_error(&format!(
-                "{name}() got multiple values for argument '{field}'"
+                "{node_name}() got multiple values for argument '{field}'"
+            ));
+        }
+    }
+    // An unknown keyword is a construction error, not a fabricated attribute.
+    for (keyword, _) in keywords {
+        if !spec.fields.contains(&keyword.as_str()) {
+            return type_error(&format!(
+                "{node_name}.__init__() got an unexpected keyword argument '{keyword}'"
             ));
         }
     }
     let mut extra = keywords.to_vec();
+    let list_fields = list_fields_for(node_name);
+    // Arguments and keyword values live in Rust memory while the instance
+    // attribute table allocates; root them before any further allocation.
+    let mut inputs: Vec<i64> = args.to_vec();
+    inputs.extend(keywords.iter().map(|(_, value)| *value));
+    let roots = heap::root_values(&inputs);
     let mut fields: Vec<(&'static str, i64)> = Vec::with_capacity(spec.fields.len());
     for (index, field) in spec.fields.iter().enumerate() {
         let value = if let Some(&value) = args.get(index) {
@@ -598,26 +1261,24 @@ fn build_node(name: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
             .position(|(keyword, _)| keyword.as_str() == *field)
         {
             extra.remove(position).1
+        } else if list_fields.contains(field) {
+            // CPython sequence fields default to a fresh empty list. Root the
+            // new list until the instance owns it (released with `roots`).
+            let list = value::list_new(Vec::new());
+            heap::root_values(&[list]);
+            list
         } else {
             NONE
         };
         fields.push((*field, value));
     }
-    // Every value lives in Rust memory while the class lookup and the instance
-    // attribute table allocate; root them explicitly.
-    let mut inputs: Vec<i64> = args.to_vec();
-    inputs.extend(keywords.iter().map(|(_, value)| *value));
-    let roots = heap::root_values(&inputs);
-    let Some(class) = node_class(name) else {
+    let Some(class) = node_class(node_name) else {
         heap::release_roots(roots);
-        return type_error(&format!("unknown AST node '{name}'"));
+        return type_error(&format!("unknown AST node '{node_name}'"));
     };
     let instance = value::instance_new(class);
     for (field, item) in fields {
         value::instance_setattr(instance, field.to_string(), item);
-    }
-    for (keyword, item) in extra {
-        value::instance_setattr(instance, keyword, item);
     }
     heap::release_roots(roots);
     instance
@@ -2529,5 +3190,282 @@ mod tests {
             Some("int")
         );
         assert!(!exc::pending());
+    }
+
+    fn fields_of(class: i64) -> Vec<Option<&'static str>> {
+        match value::class_lookup(class, "_fields") {
+            Some(value::ClassEntry::Attr(fields)) => value::as_tuple(fields)
+                .expect("_fields tuple")
+                .iter()
+                .map(|field| value::as_str(*field))
+                .collect(),
+            _ => panic!("class has no _fields"),
+        }
+    }
+
+    #[test]
+    fn statement_and_helper_nodes_are_real_classes() {
+        exc::init();
+        let expected: &[(&str, &[&str])] = &[
+            ("Return", &["value"]),
+            ("If", &["test", "body", "orelse"]),
+            ("Else", &["body"]),
+            ("For", &["target", "iter", "body", "orelse", "type_comment"]),
+            ("While", &["test", "body", "orelse"]),
+            ("Try", &["body", "handlers", "orelse", "finalbody"]),
+            ("ExceptHandler", &["type", "name", "body"]),
+            ("Raise", &["exc", "cause"]),
+            ("Assert", &["test", "msg"]),
+            ("Import", &["names"]),
+            ("ImportFrom", &["module", "names", "level"]),
+            (
+                "FunctionDef",
+                &[
+                    "name",
+                    "args",
+                    "body",
+                    "decorator_list",
+                    "returns",
+                    "type_comment",
+                    "type_params",
+                ],
+            ),
+            (
+                "AsyncFunctionDef",
+                &[
+                    "name",
+                    "args",
+                    "body",
+                    "decorator_list",
+                    "returns",
+                    "type_comment",
+                    "type_params",
+                ],
+            ),
+            (
+                "ClassDef",
+                &[
+                    "name",
+                    "bases",
+                    "keywords",
+                    "body",
+                    "decorator_list",
+                    "type_params",
+                ],
+            ),
+            ("With", &["items", "body", "type_comment"]),
+            ("AsyncWith", &["items", "body", "type_comment"]),
+            ("Match", &["subject", "cases"]),
+            ("match_case", &["pattern", "guard", "body"]),
+            ("AugAssign", &["target", "op", "value"]),
+            ("AnnAssign", &["target", "annotation", "value", "simple"]),
+            ("Delete", &["targets"]),
+            ("Global", &["names"]),
+            ("Nonlocal", &["names"]),
+            ("Pass", &[]),
+            ("Break", &[]),
+            ("Continue", &[]),
+            ("Yield", &["value"]),
+            ("YieldFrom", &["value"]),
+            ("Await", &["value"]),
+            ("Lambda", &["args", "body"]),
+            ("JoinedStr", &["values"]),
+            ("FormattedValue", &["value", "conversion", "format_spec"]),
+            ("comprehension", &["target", "iter", "ifs", "is_async"]),
+            (
+                "arguments",
+                &[
+                    "posonlyargs",
+                    "args",
+                    "vararg",
+                    "kwonlyargs",
+                    "kw_defaults",
+                    "kwarg",
+                    "defaults",
+                ],
+            ),
+            ("alias", &["name", "asname"]),
+            ("withitem", &["context_expr", "optional_vars"]),
+            ("TypeAlias", &["name", "type_params", "value"]),
+            ("TypeVar", &["name", "bound", "default_value"]),
+            ("ParamSpec", &["name", "default_value"]),
+            ("TypeVarTuple", &["name", "default_value"]),
+            ("Assign", &["targets", "value", "type_comment"]),
+            ("NamedExpr", &["target", "value"]),
+            ("TypeIgnore", &["lineno", "tag"]),
+            ("TryStar", &["body", "handlers", "orelse", "finalbody"]),
+            (
+                "AsyncFor",
+                &["target", "iter", "body", "orelse", "type_comment"],
+            ),
+            ("MatchValue", &["value"]),
+            ("MatchSingleton", &["value"]),
+            ("MatchSequence", &["patterns"]),
+            ("MatchMapping", &["keys", "patterns", "rest"]),
+            (
+                "MatchClass",
+                &["cls", "patterns", "kwd_attrs", "kwd_patterns"],
+            ),
+            ("MatchStar", &["name"]),
+            ("MatchAs", &["pattern", "name"]),
+            ("MatchOr", &["patterns"]),
+            ("ListComp", &["elt", "generators"]),
+            ("SetComp", &["elt", "generators"]),
+            ("DictComp", &["key", "value", "generators"]),
+            ("GeneratorExp", &["elt", "generators"]),
+        ];
+        for (name, fields) in expected {
+            let class = class_value("ast", name).unwrap_or_else(|| panic!("ast.{name}"));
+            assert_eq!(value::class_display_name(class), Some(*name));
+            assert_eq!(
+                fields_of(class),
+                fields.iter().map(|field| Some(*field)).collect::<Vec<_>>()
+            );
+            // A bare construction yields an instance of that class.
+            let node = call_kw(name, &[], &[]);
+            assert!(!exc::pending(), "constructing ast.{name}");
+            assert_eq!(value::instance_class_value(node), Some(class));
+            assert_eq!(node_class(name), Some(class));
+        }
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn statement_construction_uses_cpython_defaults() {
+        exc::init();
+        let ret = call_kw("Return", &[], &[("value".to_string(), NONE)]);
+        assert!(!exc::pending());
+        assert_eq!(value::instance_attr(ret, "value"), Some(NONE));
+
+        let first = call_kw("If", &[], &[]);
+        let second = call_kw("If", &[], &[]);
+        assert!(!exc::pending());
+        assert_eq!(value::instance_attr(first, "test"), Some(NONE));
+        let first_body = value::instance_attr(first, "body").expect("If.body");
+        let second_body = value::instance_attr(second, "body").expect("If.body");
+        assert_eq!(as_list(first_body).map(|items| items.len()), Some(0));
+        assert_eq!(
+            as_list(value::instance_attr(first, "orelse").unwrap()).map(|items| items.len()),
+            Some(0)
+        );
+        assert_ne!(first_body, second_body, "each node gets a fresh list");
+
+        let handler = call("ExceptHandler", &[]);
+        assert_eq!(
+            as_list(value::instance_attr(handler, "body").unwrap()).map(|items| items.len()),
+            Some(0)
+        );
+
+        let func = call_kw("FunctionDef", &[], &[("name".to_string(), text("f"))]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::instance_attr(func, "name").and_then(value::as_str),
+            Some("f")
+        );
+        assert_eq!(
+            as_list(value::instance_attr(func, "decorator_list").unwrap()).map(|items| items.len()),
+            Some(0)
+        );
+        assert_eq!(value::instance_attr(func, "returns"), Some(NONE));
+
+        // `Assign` is the primary statement node importers need.
+        let assign_class = class_value("ast", "Assign").expect("ast.Assign");
+        assert_eq!(
+            crate::modules::module_get_by_name("ast", "Assign"),
+            assign_class
+        );
+        assert_eq!(
+            crate::modules::module_get_by_name("_ast", "Assign"),
+            assign_class
+        );
+        let assign = call_kw(
+            "Assign",
+            &[],
+            &[
+                ("value".to_string(), NONE),
+                ("type_comment".to_string(), NONE),
+            ],
+        );
+        assert!(!exc::pending());
+        assert_eq!(value::instance_class_value(assign), Some(assign_class));
+        assert_eq!(
+            as_list(value::instance_attr(assign, "targets").unwrap()).map(|items| items.len()),
+            Some(0)
+        );
+        assert_eq!(value::instance_attr(assign, "value"), Some(NONE));
+
+        let named = call("NamedExpr", &[]);
+        assert!(!exc::pending());
+        assert_eq!(value::instance_attr(named, "target"), Some(NONE));
+        assert_eq!(value::instance_attr(named, "value"), Some(NONE));
+
+        // A positional field and the same field by keyword conflict.
+        let _ = call_kw("Return", &[NONE], &[("value".to_string(), NONE)]);
+        assert!(exc::pending());
+        exc::clear();
+
+        // Too many positional fields are rejected, never stored as extras.
+        let _ = call("Return", &[NONE, NONE]);
+        assert!(exc::pending());
+        exc::clear();
+    }
+
+    #[test]
+    fn unknown_node_fields_raise_type_error() {
+        exc::init();
+        let node = call_kw("Return", &[], &[("bogus".to_string(), NONE)]);
+        assert_eq!(node, NONE);
+        assert!(exc::pending());
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::clear();
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn node_aliases_share_the_canonical_class() {
+        exc::init();
+        assert_eq!(
+            class_value("ast", "MatchCase"),
+            class_value("ast", "match_case")
+        );
+        assert_eq!(
+            class_value("ast", "Comprehension"),
+            class_value("ast", "comprehension")
+        );
+        // `_ast` is an alias module: its names resolve to the same classes.
+        assert_eq!(
+            crate::modules::module_get_by_name("_ast", "Return"),
+            class_value("ast", "Return").expect("ast.Return")
+        );
+        assert_eq!(
+            crate::modules::module_get_by_name("_ast", "MatchCase"),
+            class_value("ast", "match_case").expect("ast.match_case")
+        );
+        let node = call_kw("Comprehension", &[], &[]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::instance_class_value(node),
+            class_value("ast", "comprehension")
+        );
+        assert_eq!(
+            as_list(value::instance_attr(node, "ifs").unwrap()).map(|items| items.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn existing_expression_node_defaults_are_unchanged() {
+        exc::init();
+        let name = call_kw("Name", &[], &[]);
+        assert!(!exc::pending());
+        assert_eq!(value::instance_attr(name, "id"), Some(NONE));
+        assert_eq!(value::instance_attr(name, "ctx"), Some(NONE));
+        assert_eq!(
+            fields_of(class_value("ast", "Name").unwrap()),
+            vec![Some("id"), Some("ctx")]
+        );
+        let call_node = call_kw("Call", &[], &[]);
+        assert_eq!(value::instance_attr(call_node, "args"), Some(NONE));
+        assert_eq!(value::instance_attr(call_node, "keywords"), Some(NONE));
     }
 }

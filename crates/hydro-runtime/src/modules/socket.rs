@@ -29,6 +29,11 @@
 //! IPv6 sockets bind and format with the usual `(host, port, flowinfo,
 //! scopeid)` 4-tuple; host strings in brackets (`[::1]`) are accepted
 //! everywhere a host is accepted.
+//!
+//! Host lookup covers `gethostname`, `gethostbyname`, `getaddrinfo` and
+//! `getfqdn`; the last one reverse-resolves the name it is given (the local
+//! host name when the argument is empty), so it reports the resolver's
+//! canonical name instead of echoing its argument.
 
 use std::io::{self, Read, Write};
 use std::net::{
@@ -858,6 +863,181 @@ fn create_connection(args: &[i64]) -> i64 {
     }
 }
 
+/// Keyword-only options of `socket.create_server`. The module call path
+/// (`create_server(address)`) leaves the CPython defaults in place; the
+/// keyword path in [`call_kw`] fills them.
+#[derive(Clone, Copy)]
+struct ServerOptions {
+    family: i64,
+    /// `None` means `SOMAXCONN`, like CPython's `backlog=None`.
+    backlog: Option<i64>,
+    reuse_port: bool,
+    dualstack_ipv6: bool,
+}
+
+impl ServerOptions {
+    const DEFAULT: ServerOptions = ServerOptions {
+        family: AF_INET,
+        backlog: None,
+        reuse_port: false,
+        dualstack_ipv6: false,
+    };
+}
+
+/// `socket.create_server(address, *, family=AF_INET, backlog=None,
+/// reuse_port=False, dualstack_ipv6=False)`.
+///
+/// Creates, configures, binds and listens on a TCP server socket, returning
+/// it in the listening state — exactly the sequence of the CPython helper:
+/// `SO_REUSEADDR` is always set before `bind`, `SO_REUSEPORT` is set before
+/// `bind` when `reuse_port` is true, and `IPV6_V6ONLY` is written for IPv6
+/// sockets (0 for a dual-stack server, 1 otherwise). Any failure closes the
+/// descriptor and raises the underlying `OSError`/`ValueError`.
+fn create_server(args: &[i64]) -> i64 {
+    if args.len() > 1 {
+        return type_error(&format!(
+            "create_server() takes 1 positional argument but {} were given",
+            args.len()
+        ));
+    }
+    let Some(&address) = args.first() else {
+        return type_error("create_server() missing 1 required positional argument: 'address'");
+    };
+    create_server_impl(address, ServerOptions::DEFAULT)
+}
+
+fn create_server_impl(address_value: i64, options: ServerOptions) -> i64 {
+    if options.dualstack_ipv6 && options.family != AF_INET6 {
+        return exc::raise_with_message(VALUE_ERROR, "dualstack_ipv6 requires AF_INET6 family");
+    }
+    let address = match address_argument(address_value) {
+        Ok(address) => address,
+        Err(err) => return err,
+    };
+    let addrs = match resolve(&address.host, address.port, options.family) {
+        Ok(addrs) => addrs,
+        Err(error) => return io_error(error),
+    };
+    let addr = scope_address(addrs[0], address.scope_id);
+    let backlog = match options.backlog {
+        None => libc::SOMAXCONN as i64,
+        Some(backlog) => match libc::c_int::try_from(backlog) {
+            Ok(backlog) => i64::from(backlog),
+            Err(_) => {
+                return exc::raise_with_message(
+                    crate::exc::OVERFLOW_ERROR,
+                    "Python int too large to convert to C int",
+                )
+            }
+        },
+    };
+    create_listener(addr, options, backlog as libc::c_int)
+}
+
+#[cfg(unix)]
+fn create_listener(addr: SocketAddr, options: ServerOptions, backlog: libc::c_int) -> i64 {
+    use std::os::unix::io::FromRawFd;
+
+    const IPPROTO_IPV6_LEVEL: i32 = 41;
+    const IPV6_V6ONLY: i32 = 26;
+
+    let domain = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    // SAFETY: `socket` returns an owned descriptor or -1.
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return io_error(io::Error::last_os_error());
+    }
+    let mut stored: Vec<((i32, i32), i64)> = Vec::new();
+    let mut configure = |level: i32, option: i32, value: i64| -> io::Result<()> {
+        apply_option(fd, level, option, value)?;
+        stored.push(((level, option), value));
+        Ok(())
+    };
+    // CPython always requests address reuse before binding; `reuse_port` must
+    // also reach the kernel before `bind` to participate in the port group.
+    if let Err(error) = configure(libc::SOL_SOCKET, libc::SO_REUSEADDR, 1) {
+        // SAFETY: `fd` is still owned here and has not been handed to a Rust
+        // wrapper; closing it releases the failed socket.
+        unsafe { libc::close(fd) };
+        return io_error(error);
+    }
+    if options.reuse_port {
+        if let Err(error) = configure(libc::SOL_SOCKET, libc::SO_REUSEPORT, 1) {
+            // SAFETY: as above.
+            unsafe { libc::close(fd) };
+            return io_error(error);
+        }
+    }
+    if !addr.is_ipv4() {
+        let dual_stack = i64::from(options.dualstack_ipv6);
+        if let Err(error) = configure(IPPROTO_IPV6_LEVEL, IPV6_V6ONLY, dual_stack) {
+            // SAFETY: as above.
+            unsafe { libc::close(fd) };
+            return io_error(error);
+        }
+    }
+    let (storage, length) = raw_sockaddr(addr);
+    // SAFETY: `storage` holds an initialized sockaddr of `length` bytes and
+    // `fd` is a live stream descriptor.
+    let bound = unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, length) };
+    if bound != 0 {
+        let error = io::Error::last_os_error();
+        // SAFETY: as above.
+        unsafe { libc::close(fd) };
+        return io_error(error);
+    }
+    // SAFETY: `fd` is a bound stream descriptor owned by this function.
+    let listening = unsafe { libc::listen(fd, backlog) };
+    if listening != 0 {
+        let error = io::Error::last_os_error();
+        // SAFETY: as above.
+        unsafe { libc::close(fd) };
+        return io_error(error);
+    }
+    // SAFETY: ownership of the configured, bound, listening descriptor moves
+    // into the `TcpListener`; the runtime state closes it on drop.
+    let listener = unsafe { TcpListener::from_raw_fd(fd) };
+    let family = family_of(&addr);
+    value::socket_new(SocketState::from_inner(SocketInner {
+        kind: SocketKind::Listener(listener),
+        family,
+        sock_type: SOCK_STREAM,
+        timeout: None,
+        closed: false,
+        options: stored,
+    }))
+}
+
+#[cfg(not(unix))]
+fn create_listener(addr: SocketAddr, options: ServerOptions, backlog: libc::c_int) -> i64 {
+    // No descriptor-level API on this target: bind through `std` and report
+    // the reuse options as stored socket options. `std` already binds with
+    // safe reuse defaults, so the listening socket is truthful; the
+    // `SO_REUSEPORT` group semantics are the documented limitation.
+    let listener = match TcpListener::bind(addr) {
+        Ok(listener) => listener,
+        Err(error) => return io_error(error),
+    };
+    let _ = backlog;
+    let mut stored = vec![((1, 2), 1)];
+    if options.reuse_port {
+        stored.push(((1, 15), 1));
+    }
+    let family = family_of(&addr);
+    value::socket_new(SocketState::from_inner(SocketInner {
+        kind: SocketKind::Listener(listener),
+        family,
+        sock_type: SOCK_STREAM,
+        timeout: None,
+        closed: false,
+        options: stored,
+    }))
+}
+
 /// `socket.gethostname()`: the kernel host name, or `"localhost"`.
 fn gethostname() -> String {
     #[cfg(unix)]
@@ -1011,6 +1191,86 @@ fn gethostbyname(host: &str) -> i64 {
     }
 }
 
+// The reverse resolver `libc` does not declare for linux-gnu:
+// `getnameinfo(3)` is the call CPython's `gethostbyaddr` ends in. The symbol
+// exists in every Unix libc and its ABI is fixed, so the declaration lives
+// here instead of being faked with a forward lookup.
+#[cfg(unix)]
+extern "C" {
+    fn getnameinfo(
+        addr: *const libc::sockaddr,
+        addrlen: libc::socklen_t,
+        host: *mut libc::c_char,
+        hostlen: libc::socklen_t,
+        serv: *mut libc::c_char,
+        servlen: libc::socklen_t,
+        flags: libc::c_int,
+    ) -> libc::c_int;
+}
+
+/// Reverse-resolves `host` the way `gethostbyaddr` does: turn the text into an
+/// address (a literal needs no lookup), then ask the resolver for the name
+/// recorded for that address.
+///
+/// The alias list `gethostbyaddr` also returns is not reachable through
+/// `getnameinfo`, so the official name is the only candidate and
+/// `getfqdn`'s "prefer the first alias containing a dot" step reduces to it.
+/// `None` means the lookup failed, which `getfqdn` treats like CPython's
+/// `gaierror` fallback.
+#[cfg(unix)]
+fn reverse_lookup(host: &str) -> Option<String> {
+    let addr = *resolve(host, 0, AF_UNSPEC).ok()?.first()?;
+    let (storage, length) = raw_sockaddr(addr);
+    // `NI_MAXHOST` is 1025 in glibc and 255 in musl; one buffer covers both.
+    let mut buffer = [0u8; 1025];
+    heap::blocking_enter();
+    // SAFETY: `storage` holds an initialized sockaddr of `length` bytes and
+    // `buffer` is a writable array of `buffer.len()` bytes.
+    let status = unsafe {
+        getnameinfo(
+            &storage as *const libc::sockaddr_storage as *const libc::sockaddr,
+            length,
+            buffer.as_mut_ptr() as *mut libc::c_char,
+            buffer.len() as libc::socklen_t,
+            std::ptr::null_mut(),
+            0,
+            0,
+        )
+    };
+    heap::blocking_leave();
+    if status != 0 {
+        return None;
+    }
+    let end = buffer
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(buffer.len());
+    let name = String::from_utf8_lossy(&buffer[..end]).into_owned();
+    // Without `NI_NAMEREQD` a missing PTR record yields the numeric host;
+    // CPython's `gethostbyaddr` raises `gaierror` there instead.
+    if name.is_empty() || name == addr.ip().to_string() {
+        return None;
+    }
+    Some(name)
+}
+
+#[cfg(not(unix))]
+fn reverse_lookup(_host: &str) -> Option<String> {
+    None
+}
+
+/// `socket.getfqdn(name='')`: the fully qualified name the resolver records
+/// for `name`, or the local host name when the argument is empty (CPython
+/// also treats the `0.0.0.0` wildcard that way). A failed lookup returns the
+/// name unchanged, exactly like CPython's `gaierror` fallback.
+fn getfqdn(name: &str) -> String {
+    let mut host = name.trim().to_string();
+    if host.is_empty() || host == "0.0.0.0" {
+        host = gethostname();
+    }
+    reverse_lookup(&host).unwrap_or(host)
+}
+
 fn inet_pton(args: &[i64]) -> i64 {
     let family = match int_argument(args[0], "family") {
         Ok(family) => family,
@@ -1065,12 +1325,26 @@ pub(crate) fn call(module: &str, function: &str, args: &[i64]) -> i64 {
     match function {
         "socket" => construct(args),
         "create_connection" => create_connection(args),
+        "create_server" => create_server(args),
         "gethostname" => value::str_alloc(gethostname()),
         "socketpair" => socketpair(args),
         "getaddrinfo" => getaddrinfo(args),
         "gethostbyname" => match value::as_str(args[0]) {
             Some(host) => gethostbyname(host),
             None => type_error("gethostbyname() argument must be str"),
+        },
+        // `getfqdn` is pure Python upstream and its first statement is
+        // `name.strip()`, so a non-str argument fails with `AttributeError`
+        // rather than a `TypeError`.
+        "getfqdn" => match args.first() {
+            None => value::str_alloc(getfqdn("")),
+            Some(&v) => match value::as_str(v) {
+                Some(name) => value::str_alloc(getfqdn(name)),
+                None => exc::raise_with_message(
+                    ATTRIBUTE_ERROR,
+                    &format!("'{}' object has no attribute 'strip'", value::type_name(v)),
+                ),
+            },
         },
         "inet_pton" => inet_pton(args),
         "inet_ntop" => inet_ntop(args),
@@ -1089,6 +1363,52 @@ pub(crate) fn call_kw(
     args: &[i64],
     keywords: Vec<(String, i64)>,
 ) -> i64 {
+    // `create_server`'s options are keyword-only. They are bound here instead
+    // of into positional slots, so a second positional argument (which CPython
+    // rejects) cannot be mistaken for `family`.
+    if function == "create_server" {
+        if args.len() > 1 {
+            return type_error(&format!(
+                "create_server() takes 1 positional argument but {} were given",
+                args.len()
+            ));
+        }
+        let Some(&address) = args.first() else {
+            return type_error("create_server() missing 1 required positional argument: 'address'");
+        };
+        let mut options = ServerOptions::DEFAULT;
+        for (name, item) in keywords {
+            match name.as_str() {
+                "family" => match int_argument(item, "family") {
+                    Ok(family) => options.family = family,
+                    Err(err) => return err,
+                },
+                "backlog" => {
+                    options.backlog = if item == NONE {
+                        None
+                    } else {
+                        match value::as_integer(item) {
+                            Some(backlog) => Some(backlog),
+                            None => {
+                                return type_error(&format!(
+                                    "'{}' object cannot be interpreted as an integer",
+                                    value::type_name(item)
+                                ))
+                            }
+                        }
+                    }
+                }
+                "reuse_port" => options.reuse_port = value::truthy(item),
+                "dualstack_ipv6" => options.dualstack_ipv6 = value::truthy(item),
+                _ => {
+                    return type_error(&format!(
+                        "{module}.{function}() got an unexpected keyword argument '{name}'"
+                    ))
+                }
+            }
+        }
+        return create_server_impl(address, options);
+    }
     let mut bound = args.to_vec();
     for (name, item) in keywords {
         let index = match (function, name.as_str()) {
@@ -1097,6 +1417,7 @@ pub(crate) fn call_kw(
             ("socket", "proto") => 2,
             ("create_connection", "address") => 0,
             ("create_connection", "timeout") => 1,
+            ("getfqdn", "name") => 0,
             _ => {
                 return type_error(&format!(
                     "{module}.{function}() got an unexpected keyword argument '{name}'"
@@ -1153,6 +1474,52 @@ pub(crate) fn constant(module: &str, name: &str) -> i64 {
         "IPPROTO_IP" => encode_int(IPPROTO_IP),
         "IPPROTO_TCP" => encode_int(IPPROTO_TCP),
         "IPPROTO_UDP" => encode_int(IPPROTO_UDP),
+        // TCP-level options. `TCP_NODELAY` is what `socketserver` and
+        // `http.client` set so a small write is not held back by Nagle; the
+        // remaining entries are the Linux/Android knobs long-lived clients
+        // tune. Every value comes from libc, so it follows the target ABI
+        // instead of being restated here.
+        #[cfg(unix)]
+        "TCP_NODELAY" => encode_int(libc::TCP_NODELAY as i64),
+        // Winsock's `TCP_NODELAY` is the same bit.
+        #[cfg(not(unix))]
+        "TCP_NODELAY" => encode_int(1),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_MAXSEG" => encode_int(libc::TCP_MAXSEG as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_CORK" => encode_int(libc::TCP_CORK as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_KEEPIDLE" => encode_int(libc::TCP_KEEPIDLE as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_KEEPINTVL" => encode_int(libc::TCP_KEEPINTVL as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_KEEPCNT" => encode_int(libc::TCP_KEEPCNT as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_SYNCNT" => encode_int(libc::TCP_SYNCNT as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_LINGER2" => encode_int(libc::TCP_LINGER2 as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_DEFER_ACCEPT" => encode_int(libc::TCP_DEFER_ACCEPT as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_WINDOW_CLAMP" => encode_int(libc::TCP_WINDOW_CLAMP as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_INFO" => encode_int(libc::TCP_INFO as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_QUICKACK" => encode_int(libc::TCP_QUICKACK as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_CONGESTION" => encode_int(libc::TCP_CONGESTION as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_USER_TIMEOUT" => encode_int(libc::TCP_USER_TIMEOUT as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_FASTOPEN" => encode_int(libc::TCP_FASTOPEN as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_FASTOPEN_CONNECT" => encode_int(libc::TCP_FASTOPEN_CONNECT as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_ULP" => encode_int(libc::TCP_ULP as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_NOTSENT_LOWAT" => encode_int(libc::TCP_NOTSENT_LOWAT as i64),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "TCP_INQ" => encode_int(libc::TCP_INQ as i64),
         "SHUT_RD" => encode_int(SHUT_RD),
         "SHUT_WR" => encode_int(SHUT_WR),
         "SHUT_RDWR" => encode_int(SHUT_RDWR),
@@ -3322,5 +3689,203 @@ mod tests {
         // `create_connection` accepts the sentinel where `timeout` belongs.
         assert_eq!(timeout_argument(NONE), Ok(None));
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn create_server_binds_listens_and_records_reuse_options() {
+        exc::init();
+        let address = value::tuple_new(vec![
+            value::str_alloc("127.0.0.1".to_string()),
+            encode_int(0),
+        ]);
+        let keywords = vec![
+            ("backlog".to_string(), encode_int(8)),
+            ("reuse_port".to_string(), value::TRUE),
+        ];
+        let server = call_kw("socket", "create_server", &[address], keywords);
+        assert!(!exc::pending());
+        assert!(value::as_socket(server).is_some());
+
+        let name = method(server, "getsockname", &[]);
+        assert!(!exc::pending());
+        let parts = value::as_tuple(name).expect("getsockname tuple");
+        let port = value::as_integer(parts[1]).expect("bound port");
+        assert!(port > 0, "ephemeral port must be assigned");
+        assert_eq!(value::as_str(parts[0]), Some("127.0.0.1"));
+
+        // `SO_REUSEADDR` is always set before bind; `SO_REUSEPORT` because the
+        // keyword requested it. getsockopt reports the recorded values.
+        let reuseaddr = method(server, "getsockopt", &[encode_int(1), encode_int(2)]);
+        assert_eq!(value::as_integer(reuseaddr), Some(1));
+        let reuseport = method(server, "getsockopt", &[encode_int(1), encode_int(15)]);
+        assert_eq!(value::as_integer(reuseport), Some(1));
+
+        // The socket is really listening: a client connects and `accept`
+        // returns the connected stream.
+        let client = TcpStream::connect(("127.0.0.1", port as u16)).expect("client connect");
+        let accepted = method(server, "accept", &[]);
+        assert!(!exc::pending());
+        let pair = value::as_tuple(accepted).expect("accept tuple");
+        assert!(value::as_socket(pair[0]).is_some());
+        drop(client);
+    }
+
+    #[test]
+    fn create_server_rejects_positional_options_and_bad_keywords() {
+        exc::init();
+        let address = value::tuple_new(vec![
+            value::str_alloc("127.0.0.1".to_string()),
+            encode_int(0),
+        ]);
+        let _ = call("socket", "create_server", &[address, encode_int(AF_INET)]);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(value::to_string(exc::pending_value())
+            .contains("create_server() takes 1 positional argument but 2 were given"));
+        exc::clear();
+
+        exc::init();
+        let dual_stack = vec![("dualstack_ipv6".to_string(), value::TRUE)];
+        let _ = call_kw("socket", "create_server", &[address], dual_stack);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert!(value::to_string(exc::pending_value())
+            .contains("dualstack_ipv6 requires AF_INET6 family"));
+        exc::clear();
+
+        exc::init();
+        let unknown = vec![("bogus".to_string(), encode_int(1))];
+        let _ = call_kw("socket", "create_server", &[address], unknown);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(
+            value::to_string(exc::pending_value()).contains("unexpected keyword argument 'bogus'")
+        );
+        exc::clear();
+
+        exc::init();
+        let _ = call("socket", "create_server", &[]);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(value::to_string(exc::pending_value())
+            .contains("missing 1 required positional argument: 'address'"));
+        exc::clear();
+    }
+
+    fn fqdn_text(args: &[i64]) -> String {
+        let result = call("socket", "getfqdn", args);
+        assert!(!exc::pending(), "getfqdn failed unexpectedly");
+        value::as_str(result)
+            .expect("getfqdn returns str")
+            .to_string()
+    }
+
+    #[test]
+    fn getfqdn_strips_the_name_and_defaults_to_the_local_host() {
+        exc::init();
+        let empty = fqdn_text(&[]);
+        assert!(!empty.is_empty(), "getfqdn() must name the local host");
+        assert!(!empty.chars().any(char::is_whitespace), "{empty}");
+
+        // Surrounding whitespace is stripped, and `0.0.0.0` means "this
+        // host" just like an empty argument.
+        let blank = fqdn_text(&[value::str_alloc("   ".to_string())]);
+        assert_eq!(blank, empty);
+        let wildcard = fqdn_text(&[value::str_alloc(" 0.0.0.0 ".to_string())]);
+        assert_eq!(wildcard, empty);
+        // Passing the host name itself goes through the same reverse lookup.
+        let hostname = fqdn_text(&[value::str_alloc(gethostname())]);
+        assert_eq!(hostname, empty);
+    }
+
+    #[test]
+    fn getfqdn_reverses_loopback_and_localhost() {
+        exc::init();
+        let localhost = fqdn_text(&[value::str_alloc("localhost".to_string())]);
+        assert!(localhost.contains("localhost"), "{localhost}");
+
+        // The v4 and v6 loopback entries resolve to the machine's own
+        // localhost name; a host without a PTR record keeps the literal.
+        let v4 = fqdn_text(&[value::str_alloc("127.0.0.1".to_string())]);
+        assert!(!v4.is_empty());
+        assert!(v4.contains("localhost") || v4 == "127.0.0.1", "{v4}");
+        let v6 = fqdn_text(&[value::str_alloc("::1".to_string())]);
+        assert!(v6.contains("localhost") || v6 == "::1", "{v6}");
+
+        // `name` is a positional-or-keyword parameter upstream, and the
+        // keyword form binds to the same slot.
+        let keywords = vec![(
+            "name".to_string(),
+            value::str_alloc("localhost".to_string()),
+        )];
+        let keyword_call = call_kw("socket", "getfqdn", &[], keywords);
+        assert_eq!(value::as_str(keyword_call), Some(localhost.as_str()));
+
+        // CPython's `getfqdn` starts with `name.strip()`, so a non-str
+        // argument raises `AttributeError`, not `TypeError`.
+        exc::init();
+        let _ = call("socket", "getfqdn", &[encode_int(1)]);
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+        assert!(value::to_string(exc::pending_value())
+            .contains("'int' object has no attribute 'strip'"));
+        exc::clear();
+    }
+
+    #[test]
+    fn tcp_nodelay_constant_reaches_the_kernel() {
+        exc::init();
+        let nodelay = constant("socket", "TCP_NODELAY");
+        assert!(!exc::pending());
+        #[cfg(unix)]
+        assert_eq!(
+            value::as_integer(nodelay),
+            Some(i64::from(libc::TCP_NODELAY))
+        );
+        // `_socket` is the same native module under its accelerator name.
+        assert_eq!(
+            value::as_integer(constant("_socket", "TCP_NODELAY")),
+            value::as_integer(nodelay)
+        );
+        // Every `TCP_*` option is a tagged Python int, never a raw C number.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        for name in [
+            "TCP_MAXSEG",
+            "TCP_KEEPIDLE",
+            "TCP_USER_TIMEOUT",
+            "TCP_FASTOPEN",
+            "TCP_INQ",
+        ] {
+            let option = constant("socket", name);
+            assert!(
+                value::as_integer(option).is_some(),
+                "socket.{name} is not a tagged int"
+            );
+        }
+
+        // A bound stream socket owns a descriptor, so the option reaches the
+        // kernel: a wrong constant number fails with ENOPROTOOPT instead of
+        // being recorded silently.
+        let sock = call(
+            "socket",
+            "socket",
+            &[encode_int(AF_INET), encode_int(SOCK_STREAM)],
+        );
+        assert!(!exc::pending());
+        let address = value::tuple_new(vec![
+            value::str_alloc("127.0.0.1".to_string()),
+            encode_int(0),
+        ]);
+        let _ = method(sock, "bind", &[address]);
+        assert!(
+            !exc::pending(),
+            "bind failed: {}",
+            value::to_string(exc::pending_value())
+        );
+        let level = encode_int(IPPROTO_TCP);
+        assert_eq!(
+            method(sock, "setsockopt", &[level, nodelay, encode_int(1)]),
+            NONE
+        );
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_integer(method(sock, "getsockopt", &[level, nodelay])),
+            Some(1)
+        );
     }
 }

@@ -298,6 +298,9 @@ fn file_type(args: &[i64]) -> i64 {
 pub(crate) fn constant(name: &str) -> i64 {
     match name {
         "SUPPRESS" => text_value(SUPPRESS),
+        // `argparse.REMAINDER` is the literal string `"..."`, not a sentinel
+        // object.
+        "REMAINDER" => text_value("..."),
         "RawTextHelpFormatter"
         | "RawDescriptionHelpFormatter"
         | "ArgumentDefaultsHelpFormatter"
@@ -337,6 +340,10 @@ fn opt_bool(argument: i64, default: bool) -> bool {
 /// `ArgumentParser(prog, usage, description, epilog, parents,
 /// formatter_class, prefix_chars, fromfile_prefix_chars, argument_default,
 /// conflict_handler, add_help, allow_abbrev, exit_on_error, color)`.
+///
+/// Every parameter is optional. In particular `usage` defaults to `None`, so
+/// both `ArgumentParser()` and `ArgumentParser(usage="...")` are valid and an
+/// omitted `usage` keeps the auto-generated usage line.
 fn new_parser(args: &[i64]) -> i64 {
     let arg = |index: usize| args.get(index).copied().unwrap_or(NONE);
     let prog = match opt_str(arg(0), "prog must be str or None") {
@@ -3075,5 +3082,71 @@ mod tests {
         assert!(negative_number_allowed(&view));
         assert!(!note_option_like("-5", &view));
         assert!(note_option_like("--n", &view));
+    }
+
+    #[test]
+    fn argument_parser_accepts_omitted_usage() {
+        exc::init();
+        // `usage` is optional and defaults to None; the usage line is derived
+        // from `prog` and the `-h` action.
+        let parser = new_parser(&[text_value("demo")]);
+        assert!(!exc::pending());
+        let state = value::as_arg_parser(parser).expect("parser");
+        assert!(state.usage.is_none());
+        assert_eq!(state.prog.as_deref(), Some("demo"));
+        assert!(state.add_help);
+        assert!(state.allow_abbrev);
+        assert!(state.exit_on_error);
+        assert!(state.color);
+        assert_eq!(state.prefix_chars, "-");
+        assert_eq!(state.conflict_handler, "error");
+        assert_eq!(format_usage(parser), "usage: demo [-h]\n");
+
+        // No arguments at all is equally valid.
+        let parser = new_parser(&[]);
+        assert!(!exc::pending());
+        let state = value::as_arg_parser(parser).expect("parser");
+        assert!(state.usage.is_none());
+        assert!(state.prog.is_some());
+    }
+
+    #[test]
+    fn argument_parser_accepts_every_documented_keyword() {
+        exc::init();
+        let mut slots = vec![NONE; 14];
+        slots[0] = text_value("demo");
+        slots[1] = text_value("%(prog)s [opts]");
+        slots[2] = text_value("description");
+        slots[3] = text_value("epilog");
+        slots[5] = NONE; // formatter_class
+        slots[6] = text_value("-+");
+        slots[7] = text_value("@");
+        slots[8] = NONE; // argument_default
+        slots[9] = text_value("resolve");
+        slots[10] = value::FALSE; // add_help
+        slots[11] = value::FALSE; // allow_abbrev
+        slots[12] = value::FALSE; // exit_on_error
+        slots[13] = value::FALSE; // color
+        let parser = new_parser(&slots);
+        assert!(!exc::pending());
+        let state = value::as_arg_parser(parser).expect("parser");
+        assert_eq!(state.usage.as_deref(), Some("%(prog)s [opts]"));
+        assert_eq!(state.description.as_deref(), Some("description"));
+        assert_eq!(state.epilog.as_deref(), Some("epilog"));
+        assert_eq!(state.prefix_chars, "-+");
+        assert_eq!(state.fromfile_prefix_chars.as_deref(), Some("@"));
+        assert_eq!(state.conflict_handler, "resolve");
+        assert!(!state.add_help);
+        assert!(!state.allow_abbrev);
+        assert!(!state.exit_on_error);
+        assert!(!state.color);
+        assert_eq!(format_usage(parser), "usage: demo [opts]\n");
+        // With add_help disabled the help section is absent.
+        assert!(!format_help(parser).contains("-h, --help"));
+        // The parsed attributes mirror the constructor values.
+        assert_eq!(
+            value::as_str(parser_attr(parser, "usage").expect("usage")),
+            Some("%(prog)s [opts]")
+        );
     }
 }

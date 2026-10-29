@@ -139,6 +139,15 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     if let Some(method) = function.strip_prefix("OrderedDict.") {
         return ordereddict_method(method, args);
     }
+    if let Some(method) = function.strip_prefix("UserDict.") {
+        return userdict_method(method, args);
+    }
+    if let Some(method) = function.strip_prefix("UserList.") {
+        return userlist_method(method, args);
+    }
+    if let Some(method) = function.strip_prefix("UserString.") {
+        return userstring_method(method, args);
+    }
     if let Some(method) = function.strip_prefix("Counter.") {
         return counter_method(method, args);
     }
@@ -306,6 +315,1295 @@ fn view_list(method: &str, pairs: Vec<(i64, i64)>) -> i64 {
         }
         "keys" => value::list_new(pairs.into_iter().map(|(key, _)| key).collect()),
         _ => value::list_new(pairs.into_iter().map(|(_, item)| item).collect()),
+    }
+}
+
+// -------------------------------------------------------------------------
+// collections.UserDict
+// -------------------------------------------------------------------------
+
+/// Attribute holding a `UserDict`'s backing `dict`. CPython's class exposes the
+/// backing store as the public `data` attribute, and `pprint` formats through
+/// exactly that name.
+const USERDICT_DATA_ATTR: &str = "data";
+
+/// Whether `obj` is a `UserDict` (or subclass) instance.
+fn userdict_instance(obj: i64) -> bool {
+    value::instance_class_value(obj)
+        .is_some_and(|class| value::is_subclass_of(class, userdict_class()))
+}
+
+/// Snapshot of the backing pairs; a missing store reads as empty.
+fn userdict_pairs(obj: i64) -> Vec<(i64, i64)> {
+    value::instance_attr(obj, USERDICT_DATA_ATTR)
+        .and_then(value::as_dict)
+        .map(|pairs| pairs.to_vec())
+        .unwrap_or_default()
+}
+
+/// Replaces the backing store with `pairs`.
+fn userdict_store(obj: i64, pairs: Vec<(i64, i64)>) {
+    let data = value::dict_new(pairs);
+    value::instance_setattr(obj, USERDICT_DATA_ATTR.to_string(), data);
+}
+
+/// Collects a constructor/update source into pairs. A `UserDict` source keeps
+/// its mapping semantics (its backing dict), not its key iteration.
+fn userdict_collect(source: i64) -> Result<Vec<(i64, i64)>, i64> {
+    if userdict_instance(source) {
+        return Ok(userdict_pairs(source));
+    }
+    ordereddict_collect(source)
+}
+
+/// `self` of a `UserDict` method, validated like CPython's descriptors.
+fn userdict_receiver(method: &str, args: &[i64]) -> Result<i64, i64> {
+    let Some(&obj) = args.first() else {
+        return Err(type_error(&format!(
+            "UserDict.{method}() missing required argument 'self'"
+        )));
+    };
+    if !userdict_instance(obj) {
+        return Err(type_error(&format!(
+            "descriptor '{method}' for 'UserDict' objects doesn't apply to a '{}' object",
+            value::type_name(obj)
+        )));
+    }
+    Ok(obj)
+}
+
+/// `UserDict.__init__(self, dict=None, /, **kwargs)`.
+extern "C" fn userdict_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, dict, kwargs)`.
+    userdict_init(unsafe { *argv }, unsafe { *argv.add(1) }, unsafe {
+        *argv.add(2)
+    })
+}
+
+fn userdict_init(instance: i64, source: i64, keywords: i64) -> i64 {
+    if !userdict_instance(instance) {
+        return type_error("UserDict.__init__() called on a non-UserDict instance");
+    }
+    let mark = heap::root_values(&[]);
+    let mut pairs = if source == NONE {
+        Vec::new()
+    } else {
+        match userdict_collect(source) {
+            Ok(pairs) => pairs,
+            Err(error) => {
+                heap::release_roots(mark);
+                return error;
+            }
+        }
+    };
+    for (key, item) in keywords_of(keywords) {
+        heap::root_values(&[key, item]);
+        match container::dict_find(&pairs, key) {
+            Some(position) => pairs[position].1 = item,
+            None => pairs.push((key, item)),
+        }
+    }
+    userdict_store(instance, pairs);
+    heap::release_roots(mark);
+    NONE
+}
+
+/// `(key, value)` pairs of the `**kwargs` dict the binder materialised.
+fn keywords_of(item: i64) -> Vec<(i64, i64)> {
+    value::as_dict(item)
+        .map(|pairs| pairs.to_vec())
+        .unwrap_or_default()
+}
+
+/// `UserDict[key] = value` into the backing dict.
+fn userdict_set(obj: i64, key: i64, item: i64) {
+    if let Some(data) = value::instance_attr(obj, USERDICT_DATA_ATTR) {
+        if let Some(mut pairs) = value::dict_pairs_mut(data) {
+            container::dict_insert_barrier(data, &mut *pairs, key, item);
+            return;
+        }
+    }
+    userdict_store(obj, vec![(key, item)]);
+}
+
+/// Implements the native `UserDict` method bodies. CPython's `UserDict`
+/// implements `MutableMapping` on top of `self.data`; the methods here operate
+/// on the same real `dict` so `data`, `repr`, insertion order and equality all
+/// agree with the stdlib class.
+fn userdict_method(name: &str, args: &[i64]) -> i64 {
+    let obj = match userdict_receiver(name, args) {
+        Ok(obj) => obj,
+        Err(error) => return error,
+    };
+    match name {
+        "__len__" => value::encode_int(userdict_pairs(obj).len() as i64).unwrap_or(NONE),
+        "__getitem__" => {
+            let Some(&key) = args.get(1) else {
+                return type_error("UserDict.__getitem__() missing required argument 'key'");
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            let pairs = userdict_pairs(obj);
+            match container::dict_find(&pairs, key) {
+                Some(position) => pairs[position].1,
+                None => exc::raise_with_message(KEY_ERROR, &value::repr(key)),
+            }
+        }
+        "__setitem__" => {
+            let (Some(&key), Some(&item)) = (args.get(1), args.get(2)) else {
+                return type_error("UserDict.__setitem__() requires a key and a value");
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            userdict_set(obj, key, item);
+            NONE
+        }
+        "__delitem__" => {
+            let Some(&key) = args.get(1) else {
+                return type_error("UserDict.__delitem__() missing required argument 'key'");
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            let mut pairs = userdict_pairs(obj);
+            match container::dict_find(&pairs, key) {
+                Some(position) => {
+                    pairs.remove(position);
+                    userdict_store(obj, pairs);
+                    NONE
+                }
+                None => exc::raise_with_message(KEY_ERROR, &value::repr(key)),
+            }
+        }
+        "__iter__" => {
+            let keys: Vec<i64> = userdict_pairs(obj)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            iter::iter_new(value::list_new(keys))
+        }
+        "__contains__" => {
+            let Some(&key) = args.get(1) else {
+                return value::bool_value(false);
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            let pairs = userdict_pairs(obj);
+            value::bool_value(container::dict_find(&pairs, key).is_some())
+        }
+        "__eq__" => {
+            let Some(&other) = args.get(1) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            if other == obj {
+                return value::TRUE;
+            }
+            let right = if userdict_instance(other) {
+                userdict_pairs(other)
+            } else if let Some(pairs) = value::as_dict(other) {
+                pairs.to_vec()
+            } else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let left_pairs = userdict_pairs(obj);
+            let equal = left_pairs.len() == right.len()
+                && left_pairs.iter().all(|(key, item)| {
+                    container::dict_find(&right, *key)
+                        .is_some_and(|position| container::equals(*item, right[position].1))
+                });
+            value::bool_value(equal)
+        }
+        "__repr__" => match value::instance_attr(obj, USERDICT_DATA_ATTR) {
+            Some(data) => value::str_alloc(value::repr(data)),
+            None => value::str_alloc("{}".to_string()),
+        },
+        "get" => {
+            let Some(&key) = args.get(1) else {
+                return type_error("UserDict.get() missing required argument 'key'");
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            let default = args.get(2).copied().unwrap_or(NONE);
+            let pairs = userdict_pairs(obj);
+            match container::dict_find(&pairs, key) {
+                Some(position) => pairs[position].1,
+                None => default,
+            }
+        }
+        "keys" | "values" | "items" => view_list(name, userdict_pairs(obj)),
+        "update" => {
+            let mark = heap::root_values(&[]);
+            let mut pairs = userdict_pairs(obj);
+            if let Some(&source) = args.get(1) {
+                if source != NONE {
+                    match userdict_collect(source) {
+                        Ok(incoming) => {
+                            for (key, item) in incoming {
+                                heap::root_values(&[key, item]);
+                                match container::dict_find(&pairs, key) {
+                                    Some(position) => pairs[position].1 = item,
+                                    None => pairs.push((key, item)),
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            heap::release_roots(mark);
+                            return error;
+                        }
+                    }
+                }
+            }
+            userdict_store(obj, pairs);
+            heap::release_roots(mark);
+            NONE
+        }
+        "pop" => {
+            let Some(&key) = args.get(1) else {
+                return type_error("UserDict.pop() missing required argument 'key'");
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            let mut pairs = userdict_pairs(obj);
+            match container::dict_find(&pairs, key) {
+                Some(position) => {
+                    let (_, item) = pairs.remove(position);
+                    userdict_store(obj, pairs);
+                    item
+                }
+                None => match args.get(2) {
+                    Some(&default) => default,
+                    None => exc::raise_with_message(KEY_ERROR, &value::repr(key)),
+                },
+            }
+        }
+        "popitem" => {
+            // `MutableMapping.popitem()` pops the first key, unlike `dict`.
+            let mut pairs = userdict_pairs(obj);
+            if pairs.is_empty() {
+                return exc::raise_with_message(KEY_ERROR, "");
+            }
+            let (key, item) = pairs.remove(0);
+            userdict_store(obj, pairs);
+            value::tuple_new(vec![key, item])
+        }
+        "setdefault" => {
+            let Some(&key) = args.get(1) else {
+                return type_error("UserDict.setdefault() missing required argument 'key'");
+            };
+            if let Some(unhashable) = container::unhashable_name(key) {
+                return type_error(&container::unhashable_message(unhashable));
+            }
+            let default = args.get(2).copied().unwrap_or(NONE);
+            let pairs = userdict_pairs(obj);
+            match container::dict_find(&pairs, key) {
+                Some(position) => pairs[position].1,
+                None => {
+                    userdict_set(obj, key, default);
+                    default
+                }
+            }
+        }
+        "clear" => {
+            userdict_store(obj, Vec::new());
+            NONE
+        }
+        "copy" => {
+            let class = value::instance_class_value(obj).unwrap_or_else(userdict_class);
+            let instance = value::instance_new(class);
+            userdict_store(instance, userdict_pairs(obj));
+            instance
+        }
+        _ => attribute_error(name),
+    }
+}
+
+/// Identity-stable `collections.UserDict` class.
+///
+/// A real instance class whose backing store is the public `data` dict, so
+/// `pprint`'s `_dispatch[_collections.UserDict.__repr__]` lookup, `vars()`,
+/// `isinstance` and subclassing all observe the stdlib shape.
+pub(crate) fn userdict_class() -> i64 {
+    const KEY: &str = "collections.UserDict.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let mut methods: Vec<(String, i64, MethodKind)> = Vec::with_capacity(18);
+    // `__init__(self, dict=None, /, **kwargs)` needs a real signature so the
+    // class call path binds its keyword entries and the positional-only dict.
+    let init = value::native_function_new("collections", "UserDict.__init__", usize::MAX);
+    value::function_set_signature(
+        init,
+        vec![
+            ParamMeta {
+                name: "self".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            ParamMeta {
+                name: "dict".to_string(),
+                kind: ParamKind::PosOnly,
+                default: Some(NONE),
+            },
+            ParamMeta {
+                name: "kwargs".to_string(),
+                kind: ParamKind::KwArg,
+                default: Some(NONE),
+            },
+        ],
+    );
+    value::function_set_full_entry(init, userdict_init_entry as *const () as usize);
+    methods.push(("__init__".to_string(), init, MethodKind::Normal));
+    for (name, arity) in [
+        ("__getitem__", 2),
+        ("__setitem__", 3),
+        ("__delitem__", 2),
+        ("__iter__", 1),
+        ("__len__", 1),
+        ("__contains__", 2),
+        ("__eq__", 2),
+        ("__repr__", 1),
+        ("get", 3),
+        ("keys", 1),
+        ("values", 1),
+        ("items", 1),
+        ("update", 2),
+        ("pop", 3),
+        ("popitem", 2),
+        ("setdefault", 3),
+        ("copy", 1),
+        ("clear", 1),
+    ] {
+        let qualified = match name {
+            "__getitem__" => "UserDict.__getitem__",
+            "__setitem__" => "UserDict.__setitem__",
+            "__delitem__" => "UserDict.__delitem__",
+            "__iter__" => "UserDict.__iter__",
+            "__len__" => "UserDict.__len__",
+            "__contains__" => "UserDict.__contains__",
+            "__eq__" => "UserDict.__eq__",
+            "__repr__" => "UserDict.__repr__",
+            "get" => "UserDict.get",
+            "keys" => "UserDict.keys",
+            "values" => "UserDict.values",
+            "items" => "UserDict.items",
+            "update" => "UserDict.update",
+            "pop" => "UserDict.pop",
+            "popitem" => "UserDict.popitem",
+            "setdefault" => "UserDict.setdefault",
+            "copy" => "UserDict.copy",
+            "clear" => "UserDict.clear",
+            _ => unreachable!(),
+        };
+        methods.push((
+            name.to_string(),
+            value::native_function_new("collections", qualified, arity),
+            MethodKind::Normal,
+        ));
+    }
+    let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new_full("UserDict".to_string(), NONE, methods, Vec::new());
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+// -------------------------------------------------------------------------
+// collections.UserList
+// -------------------------------------------------------------------------
+
+/// Attribute holding a `UserList`'s backing list (`pprint` reads `object.data`).
+const USERLIST_DATA_ATTR: &str = "data";
+
+fn userlist_instance(obj: i64) -> bool {
+    value::instance_class_value(obj)
+        .is_some_and(|class| value::is_subclass_of(class, userlist_class()))
+}
+
+fn userlist_data(obj: i64) -> Option<i64> {
+    userlist_instance(obj).then(|| value::instance_attr(obj, USERLIST_DATA_ATTR))?
+}
+
+fn userlist_items(obj: i64) -> Vec<i64> {
+    userlist_data(obj)
+        .and_then(value::as_list)
+        .map(|items| items.to_vec())
+        .unwrap_or_default()
+}
+
+fn userlist_from_items(items: Vec<i64>) -> i64 {
+    let instance = value::instance_new(userlist_class());
+    let list = value::list_new(items);
+    value::instance_setattr(instance, USERLIST_DATA_ATTR.to_string(), list);
+    instance
+}
+
+/// Normalises a list index, returning `None` when it is out of range.
+fn user_sequence_index(length: usize, raw: i64) -> Option<usize> {
+    let len = i64::try_from(length).ok()?;
+    let adjusted = if raw < 0 { raw.checked_add(len)? } else { raw };
+    usize::try_from(adjusted)
+        .ok()
+        .filter(|&index| index < length)
+}
+
+/// Elements of a `UserList`/list/iterable source.
+fn userlist_collect(source: i64) -> Result<Vec<i64>, i64> {
+    if userlist_instance(source) {
+        return Ok(userlist_items(source));
+    }
+    if let Some(items) = value::as_list(source) {
+        return Ok(items.to_vec());
+    }
+    let iterator = iter::iter_of(source);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    let mut items = Vec::new();
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return Err(NONE);
+        }
+        if status == 0 {
+            return Ok(items);
+        }
+        heap::root_values(&[item]);
+        items.push(item);
+    }
+}
+
+fn userlist_receiver(method: &str, args: &[i64]) -> Result<i64, i64> {
+    let Some(&obj) = args.first() else {
+        return Err(type_error(&format!(
+            "UserList.{method}() missing required argument 'self'"
+        )));
+    };
+    if !userlist_instance(obj) {
+        return Err(type_error(&format!(
+            "descriptor '{method}' for 'UserList' objects doesn't apply to a '{}' object",
+            value::type_name(obj)
+        )));
+    }
+    Ok(obj)
+}
+
+/// `UserList.__init__(self, initlist=None)`.
+extern "C" fn userlist_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes the signature's two slots.
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    userlist_init(args)
+}
+
+fn userlist_init(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return type_error("UserList.__init__() missing required argument 'self'");
+    };
+    if !userlist_instance(instance) {
+        return type_error("UserList.__init__() called on a non-UserList instance");
+    }
+    let items = match args.get(1).copied() {
+        None | Some(NONE) => Vec::new(),
+        Some(source) => match userlist_collect(source) {
+            Ok(items) => items,
+            Err(error) => return error,
+        },
+    };
+    let list = value::list_new(items);
+    value::instance_setattr(instance, USERLIST_DATA_ATTR.to_string(), list);
+    NONE
+}
+
+/// In-place mutation of the backing list (so aliases of `.data` observe it).
+fn userlist_mutate(obj: i64, mutate: impl FnOnce(&mut Vec<i64>)) -> bool {
+    let Some(data) = userlist_data(obj) else {
+        return false;
+    };
+    let Some(mut items) = value::list_items_mut(data) else {
+        return false;
+    };
+    mutate(&mut items);
+    true
+}
+
+fn userlist_method(name: &str, args: &[i64]) -> i64 {
+    if name == "__init__" {
+        return userlist_init(args);
+    }
+    let obj = match userlist_receiver(name, args) {
+        Ok(obj) => obj,
+        Err(error) => return error,
+    };
+    let Some(data) = userlist_data(obj) else {
+        return type_error("UserList instance has no 'data' list");
+    };
+    match name {
+        "__len__" => value::encode_int(userlist_items(obj).len() as i64).unwrap_or(NONE),
+        "__repr__" => value::str_alloc(value::repr(data)),
+        "__iter__" => iter::iter_new(data),
+        "__contains__" => {
+            let Some(&item) = args.get(1) else {
+                return value::FALSE;
+            };
+            value::bool_value(
+                userlist_items(obj)
+                    .iter()
+                    .any(|existing| container::equals(*existing, item)),
+            )
+        }
+        "__getitem__" => {
+            let Some(&index) = args.get(1) else {
+                return type_error("UserList.__getitem__() missing required argument 'index'");
+            };
+            let item = container::subscript(data, index);
+            if exc::pending() {
+                return NONE;
+            }
+            // A slice yields a plain list; CPython wraps it in the same class.
+            match value::as_list(item) {
+                Some(items) => userlist_from_items(items.to_vec()),
+                None => item,
+            }
+        }
+        "__setitem__" => {
+            let (Some(&index), Some(&item)) = (args.get(1), args.get(2)) else {
+                return type_error("UserList.__setitem__() requires an index and a value");
+            };
+            container::subscript_set(data, index, item)
+        }
+        "__delitem__" => {
+            let Some(&index) = args.get(1) else {
+                return type_error("UserList.__delitem__() missing required argument 'index'");
+            };
+            container::delete_subscript(data, index)
+        }
+        "__eq__" => {
+            let Some(&other) = args.get(1) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let other_data = if userlist_instance(other) {
+                match userlist_data(other) {
+                    Some(other_data) => other_data,
+                    None => return value::NOT_IMPLEMENTED,
+                }
+            } else if value::as_list(other).is_some() {
+                other
+            } else {
+                return value::NOT_IMPLEMENTED;
+            };
+            value::bool_value(container::equals(data, other_data))
+        }
+        "__add__" | "__radd__" => {
+            let Some(&other) = args.get(1) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let incoming = match userlist_collect(other) {
+                Ok(items) => items,
+                Err(error) => return error,
+            };
+            let mut items = userlist_items(obj);
+            if name == "__add__" {
+                items.extend(incoming);
+            } else {
+                let mut combined = incoming;
+                combined.extend(items);
+                items = combined;
+            }
+            userlist_from_items(items)
+        }
+        "__iadd__" | "extend" => {
+            let Some(&other) = args.get(1) else {
+                return type_error(&format!(
+                    "UserList.{name}() missing required argument 'other'"
+                ));
+            };
+            let incoming = match userlist_collect(other) {
+                Ok(items) => items,
+                Err(error) => return error,
+            };
+            let ok = userlist_mutate(obj, |items| {
+                for item in incoming {
+                    items.push(item);
+                }
+            });
+            if !ok {
+                return type_error("UserList instance has no 'data' list");
+            }
+            if name == "__iadd__" {
+                obj
+            } else {
+                NONE
+            }
+        }
+        "__mul__" | "__rmul__" | "__imul__" => {
+            let Some(&factor) = args.get(1) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let Some(count) = value::as_integer(factor) else {
+                return type_error(&format!(
+                    "can't multiply sequence by non-int of type '{}'",
+                    value::type_name(factor)
+                ));
+            };
+            let count = usize::try_from(count).unwrap_or(0);
+            let items = userlist_items(obj);
+            let mut repeated = Vec::with_capacity(items.len().saturating_mul(count));
+            for _ in 0..count {
+                repeated.extend_from_slice(&items);
+            }
+            if name == "__imul__" {
+                if !userlist_mutate(obj, |items| *items = repeated) {
+                    return type_error("UserList instance has no 'data' list");
+                }
+                return obj;
+            }
+            userlist_from_items(repeated)
+        }
+        "__copy__" | "copy" => userlist_from_items(userlist_items(obj)),
+        "append" => {
+            let Some(&item) = args.get(1) else {
+                return type_error("UserList.append() missing required argument 'item'");
+            };
+            if !userlist_mutate(obj, |items| items.push(item)) {
+                return type_error("UserList instance has no 'data' list");
+            }
+            heap::write_barrier_edge(data, item);
+            NONE
+        }
+        "insert" => {
+            let (Some(&index_arg), Some(&item)) = (args.get(1), args.get(2)) else {
+                return type_error("UserList.insert() requires an index and an item");
+            };
+            let Some(index) = value::as_integer(index_arg) else {
+                return type_error(&format!(
+                    "list.insert() index must be an integer, not {}",
+                    value::type_name(index_arg)
+                ));
+            };
+            let length = userlist_items(obj).len();
+            let position = if index < 0 {
+                i64::try_from(length)
+                    .ok()
+                    .map(|len| (len + index).max(0))
+                    .unwrap_or(0)
+            } else {
+                index.min(i64::try_from(length).unwrap_or(i64::MAX))
+            };
+            let position = usize::try_from(position).unwrap_or(length);
+            if !userlist_mutate(obj, |items| items.insert(position, item)) {
+                return type_error("UserList instance has no 'data' list");
+            }
+            heap::write_barrier_edge(data, item);
+            NONE
+        }
+        "pop" => {
+            let items = userlist_items(obj);
+            let raw = match args.get(1).copied() {
+                None | Some(NONE) => -1,
+                Some(argument) => match value::as_integer(argument) {
+                    Some(index) => index,
+                    None => {
+                        return type_error(&format!(
+                            "list.pop() index must be an integer, not {}",
+                            value::type_name(argument)
+                        ))
+                    }
+                },
+            };
+            let Some(position) = user_sequence_index(items.len(), raw) else {
+                return exc::raise_with_message(INDEX_ERROR, "pop index out of range");
+            };
+            let mut popped = NONE;
+            userlist_mutate(obj, |items| popped = items.remove(position));
+            popped
+        }
+        "remove" => {
+            let Some(&item) = args.get(1) else {
+                return type_error("UserList.remove() missing required argument 'item'");
+            };
+            let items = userlist_items(obj);
+            let Some(position) = items
+                .iter()
+                .position(|existing| container::equals(*existing, item))
+            else {
+                return exc::raise_with_message(VALUE_ERROR, "list.remove(x): x not in list");
+            };
+            userlist_mutate(obj, |items| {
+                items.remove(position);
+            });
+            NONE
+        }
+        "clear" => {
+            if !userlist_mutate(obj, |items| items.clear()) {
+                return type_error("UserList instance has no 'data' list");
+            }
+            NONE
+        }
+        "count" => {
+            let Some(&item) = args.get(1) else {
+                return value::encode_int(0).unwrap_or(NONE);
+            };
+            let count = userlist_items(obj)
+                .iter()
+                .filter(|existing| container::equals(**existing, item))
+                .count();
+            value::encode_int(count as i64).unwrap_or(NONE)
+        }
+        "index" => {
+            let Some(&item) = args.get(1) else {
+                return type_error("UserList.index() missing required argument 'item'");
+            };
+            let items = userlist_items(obj);
+            let length = items.len();
+            let start = match args.get(2).copied() {
+                None | Some(NONE) => 0,
+                Some(argument) => match value::as_integer(argument) {
+                    Some(raw) => i64::try_from(length)
+                        .ok()
+                        .map(|len| {
+                            usize::try_from(if raw < 0 { (raw + len).max(0) } else { raw })
+                                .unwrap_or(length)
+                                .min(length)
+                        })
+                        .unwrap_or(0),
+                    None => return type_error("index start must be an integer"),
+                },
+            };
+            let end = match args.get(3).copied() {
+                None | Some(NONE) => length,
+                Some(argument) => match value::as_integer(argument) {
+                    Some(raw) => i64::try_from(length)
+                        .ok()
+                        .map(|len| {
+                            usize::try_from(if raw < 0 { (raw + len).max(0) } else { raw })
+                                .unwrap_or(length)
+                                .min(length)
+                        })
+                        .unwrap_or(length),
+                    None => return type_error("index end must be an integer"),
+                },
+            };
+            let found =
+                (start..end.min(length)).find(|&position| container::equals(items[position], item));
+            match found {
+                Some(position) => value::encode_int(position as i64).unwrap_or(NONE),
+                None => exc::raise_with_message(
+                    VALUE_ERROR,
+                    &format!("{} is not in list", value::repr(item)),
+                ),
+            }
+        }
+        "reverse" => {
+            userlist_mutate(obj, |items| items.reverse());
+            NONE
+        }
+        "sort" => {
+            // Delegate to the runtime's real list sort on the backing list
+            // (receiver-aware dispatch, not a detached method value).
+            let extra = &args[1..];
+            methods::call(data, b"sort".as_ptr(), 4, extra.len(), extra.as_ptr())
+        }
+        _ => attribute_error(name),
+    }
+}
+
+/// Identity-stable `collections.UserList` class.
+pub(crate) fn userlist_class() -> i64 {
+    const KEY: &str = "collections.UserList.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let mut methods: Vec<(String, i64, MethodKind)> = Vec::with_capacity(30);
+    // `__init__` carries a real signature: the class-call path uses the
+    // method binder (native functions without a signature would be routed
+    // through the central spec table, which does not declare internal
+    // `UserList.__init__` names).
+    let init = value::native_function_new("collections", "UserList.__init__", usize::MAX);
+    value::function_set_signature(
+        init,
+        vec![
+            ParamMeta {
+                name: "self".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            ParamMeta {
+                name: "initlist".to_string(),
+                kind: ParamKind::PosOnly,
+                default: Some(NONE),
+            },
+        ],
+    );
+    value::function_set_full_entry(init, userlist_init_entry as *const () as usize);
+    methods.push(("__init__".to_string(), init, MethodKind::Normal));
+    for (name, arity) in [
+        ("__repr__", 1),
+        ("__len__", 1),
+        ("__iter__", 1),
+        ("__contains__", 2),
+        ("__getitem__", 2),
+        ("__setitem__", 3),
+        ("__delitem__", 2),
+        ("__eq__", 2),
+        ("__add__", 2),
+        ("__radd__", 2),
+        ("__iadd__", 2),
+        ("__mul__", 2),
+        ("__rmul__", 2),
+        ("__imul__", 2),
+        ("__copy__", 1),
+        ("append", 2),
+        ("insert", 3),
+        ("pop", 2),
+        ("remove", 2),
+        ("clear", 1),
+        ("copy", 1),
+        ("count", 2),
+        ("index", 4),
+        ("reverse", 1),
+        ("sort", 3),
+        ("extend", 2),
+    ] {
+        methods.push((
+            name.to_string(),
+            value::native_function_new("collections", userlist_native_name(name), arity),
+            MethodKind::Normal,
+        ));
+    }
+    let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new_full("UserList".to_string(), NONE, methods, Vec::new());
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+fn userlist_native_name(name: &str) -> &'static str {
+    match name {
+        "__init__" => "UserList.__init__",
+        "__repr__" => "UserList.__repr__",
+        "__len__" => "UserList.__len__",
+        "__iter__" => "UserList.__iter__",
+        "__contains__" => "UserList.__contains__",
+        "__getitem__" => "UserList.__getitem__",
+        "__setitem__" => "UserList.__setitem__",
+        "__delitem__" => "UserList.__delitem__",
+        "__eq__" => "UserList.__eq__",
+        "__add__" => "UserList.__add__",
+        "__radd__" => "UserList.__radd__",
+        "__iadd__" => "UserList.__iadd__",
+        "__mul__" => "UserList.__mul__",
+        "__rmul__" => "UserList.__rmul__",
+        "__imul__" => "UserList.__imul__",
+        "__copy__" => "UserList.__copy__",
+        "append" => "UserList.append",
+        "insert" => "UserList.insert",
+        "pop" => "UserList.pop",
+        "remove" => "UserList.remove",
+        "clear" => "UserList.clear",
+        "copy" => "UserList.copy",
+        "count" => "UserList.count",
+        "index" => "UserList.index",
+        "reverse" => "UserList.reverse",
+        "sort" => "UserList.sort",
+        "extend" => "UserList.extend",
+        _ => unreachable!(),
+    }
+}
+
+// -------------------------------------------------------------------------
+// collections.UserString
+// -------------------------------------------------------------------------
+
+/// Attribute holding a `UserString`'s backing `str`.
+const USERSTRING_DATA_ATTR: &str = "data";
+
+fn userstring_instance(obj: i64) -> bool {
+    value::instance_class_value(obj)
+        .is_some_and(|class| value::is_subclass_of(class, userstring_class()))
+}
+
+fn userstring_text(obj: i64) -> Option<String> {
+    if !userstring_instance(obj) {
+        return None;
+    }
+    value::instance_attr(obj, USERSTRING_DATA_ATTR)
+        .and_then(value::as_str)
+        .map(str::to_string)
+}
+
+fn userstring_from_text(text: String) -> i64 {
+    let instance = value::instance_new(userstring_class());
+    userstring_store(instance, text);
+    instance
+}
+
+fn userstring_store(instance: i64, text: String) {
+    let data = value::str_alloc(text);
+    value::instance_setattr(instance, USERSTRING_DATA_ATTR.to_string(), data);
+}
+
+/// `UserString.__init__(self, seq)`.
+extern "C" fn userstring_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes the signature's two slots.
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    userstring_init(args)
+}
+
+fn userstring_init(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return type_error("UserString.__init__() missing required argument 'self'");
+    };
+    if !userstring_instance(instance) {
+        return type_error("UserString.__init__() called on a non-UserString instance");
+    }
+    let Some(&seq) = args.get(1) else {
+        return type_error("UserString.__init__() missing required argument 'seq'");
+    };
+    let text = if let Some(text) = value::as_str(seq) {
+        text.to_string()
+    } else if userstring_instance(seq) {
+        userstring_text(seq).unwrap_or_default()
+    } else {
+        value::to_string(seq)
+    };
+    userstring_store(instance, text);
+    NONE
+}
+
+/// String methods `UserString` re-exports on its backing `str`. Methods that
+/// answer a `str` are wrapped in the same class, exactly like CPython.
+const USERSTRING_DELEGATED: &[&str] = &[
+    "capitalize",
+    "casefold",
+    "center",
+    "count",
+    "encode",
+    "endswith",
+    "expandtabs",
+    "find",
+    "index",
+    "isalnum",
+    "isalpha",
+    "isascii",
+    "isdecimal",
+    "isdigit",
+    "isidentifier",
+    "islower",
+    "isnumeric",
+    "isprintable",
+    "isspace",
+    "istitle",
+    "isupper",
+    "join",
+    "ljust",
+    "lower",
+    "lstrip",
+    "partition",
+    "removeprefix",
+    "removesuffix",
+    "replace",
+    "rfind",
+    "rindex",
+    "rjust",
+    "rpartition",
+    "rsplit",
+    "rstrip",
+    "split",
+    "splitlines",
+    "startswith",
+    "strip",
+    "swapcase",
+    "title",
+    "translate",
+    "upper",
+    "zfill",
+];
+
+fn userstring_method(name: &str, args: &[i64]) -> i64 {
+    if name == "__init__" {
+        return userstring_init(args);
+    }
+    if let Some(text) = args.first().and_then(|&obj| userstring_text(obj)) {
+        // `text` is a snapshot: the receiver is a real `UserString`.
+        let _ = text;
+    } else {
+        let Some(&obj) = args.first() else {
+            return type_error("UserString method missing required argument 'self'");
+        };
+        return type_error(&format!(
+            "descriptor '{name}' for 'UserString' objects doesn't apply to a '{}' object",
+            value::type_name(obj)
+        ));
+    }
+    let obj = args[0];
+    let text = userstring_text(obj).unwrap_or_default();
+    match name {
+        "__str__" => value::str_alloc(text),
+        "__repr__" => {
+            let data = value::instance_attr(obj, USERSTRING_DATA_ATTR).unwrap_or(NONE);
+            value::str_alloc(value::repr(data))
+        }
+        "__len__" => value::encode_int(text.chars().count() as i64).unwrap_or(NONE),
+        "__iter__" => {
+            let chars: Vec<i64> = text
+                .chars()
+                .map(|ch| value::str_alloc(ch.to_string()))
+                .collect();
+            iter::iter_new(value::list_new(chars))
+        }
+        "__contains__" => {
+            let Some(&other) = args.get(1) else {
+                return value::FALSE;
+            };
+            let needle = if let Some(other_text) = value::as_str(other) {
+                other_text.to_string()
+            } else if let Some(other_text) = args.get(1).and_then(|&value| userstring_text(value)) {
+                other_text
+            } else {
+                return type_error("'in <string>' requires string as left operand");
+            };
+            value::bool_value(text.contains(&needle))
+        }
+        "__getitem__" => {
+            let Some(&index) = args.get(1) else {
+                return type_error("UserString.__getitem__() missing required argument 'index'");
+            };
+            let data = value::instance_attr(obj, USERSTRING_DATA_ATTR).unwrap_or(NONE);
+            let part = container::subscript(data, index);
+            if exc::pending() {
+                return NONE;
+            }
+            match value::as_str(part) {
+                Some(part) => userstring_from_text(part.to_string()),
+                None => part,
+            }
+        }
+        "__eq__" => {
+            let Some(&other) = args.get(1) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let other_text = if let Some(other_text) = value::as_str(other) {
+                other_text.to_string()
+            } else if let Some(other_text) = userstring_text(other) {
+                other_text
+            } else {
+                return value::NOT_IMPLEMENTED;
+            };
+            value::bool_value(text == other_text)
+        }
+        "__add__" | "__radd__" => {
+            let Some(&other) = args.get(1) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let other_text = if let Some(other_text) = value::as_str(other) {
+                other_text.to_string()
+            } else if let Some(other_text) = userstring_text(other) {
+                other_text
+            } else {
+                value::to_string(other)
+            };
+            let combined = if name == "__add__" {
+                format!("{text}{other_text}")
+            } else {
+                format!("{other_text}{text}")
+            };
+            userstring_from_text(combined)
+        }
+        "__mul__" | "__rmul__" => {
+            let Some(&factor) = args.get(1) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let Some(count) = value::as_integer(factor) else {
+                return type_error(&format!(
+                    "can't multiply sequence by non-int of type '{}'",
+                    value::type_name(factor)
+                ));
+            };
+            let count = usize::try_from(count).unwrap_or(0);
+            userstring_from_text(text.repeat(count))
+        }
+        _ if USERSTRING_DELEGATED.contains(&name) => {
+            let data = value::instance_attr(obj, USERSTRING_DATA_ATTR).unwrap_or(NONE);
+            // `methods::call` is the interpreter's receiver-aware dispatch
+            // (`obj.method(...)`), so the backing `str` is the receiver here;
+            // `getattr` + `builtins::call` would resolve a different value.
+            let extra = &args[1..];
+            let result =
+                methods::call(data, name.as_ptr(), name.len(), extra.len(), extra.as_ptr());
+            if exc::pending() {
+                return NONE;
+            }
+            // CPython's `UserString.join` and `encode` answer plain `str`/
+            // `bytes`; every other str-returning method is re-wrapped.
+            if matches!(name, "join" | "encode") {
+                return result;
+            }
+            match value::as_str(result) {
+                Some(result) => userstring_from_text(result.to_string()),
+                None => result,
+            }
+        }
+        _ => attribute_error(name),
+    }
+}
+
+/// Identity-stable `collections.UserString` class.
+pub(crate) fn userstring_class() -> i64 {
+    const KEY: &str = "collections.UserString.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let mut methods: Vec<(String, i64, MethodKind)> = Vec::with_capacity(32);
+    // Same reason as `UserList.__init__`: a declared signature keeps class
+    // construction on the method-binder path.
+    let init = value::native_function_new("collections", "UserString.__init__", usize::MAX);
+    value::function_set_signature(
+        init,
+        vec![
+            ParamMeta {
+                name: "self".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            ParamMeta {
+                name: "seq".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+        ],
+    );
+    value::function_set_full_entry(init, userstring_init_entry as *const () as usize);
+    methods.push(("__init__".to_string(), init, MethodKind::Normal));
+    for (name, arity) in [
+        ("__str__", 1),
+        ("__repr__", 1),
+        ("__len__", 1),
+        ("__iter__", 1),
+        ("__contains__", 2),
+        ("__getitem__", 2),
+        ("__eq__", 2),
+        ("__add__", 2),
+        ("__radd__", 2),
+        ("__mul__", 2),
+        ("__rmul__", 2),
+    ] {
+        methods.push((
+            name.to_string(),
+            value::native_function_new("collections", userstring_native_name(name), arity),
+            MethodKind::Normal,
+        ));
+    }
+    for name in USERSTRING_DELEGATED {
+        methods.push((
+            (*name).to_string(),
+            value::native_function_new("collections", userstring_delegated_name(name), 4),
+            MethodKind::Normal,
+        ));
+    }
+    let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new_full("UserString".to_string(), NONE, methods, Vec::new());
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+fn userstring_native_name(name: &str) -> &'static str {
+    match name {
+        "__init__" => "UserString.__init__",
+        "__str__" => "UserString.__str__",
+        "__repr__" => "UserString.__repr__",
+        "__len__" => "UserString.__len__",
+        "__iter__" => "UserString.__iter__",
+        "__contains__" => "UserString.__contains__",
+        "__getitem__" => "UserString.__getitem__",
+        "__eq__" => "UserString.__eq__",
+        "__add__" => "UserString.__add__",
+        "__radd__" => "UserString.__radd__",
+        "__mul__" => "UserString.__mul__",
+        "__rmul__" => "UserString.__rmul__",
+        _ => unreachable!(),
+    }
+}
+
+/// Native dispatch names of the delegated string methods.
+fn userstring_delegated_name(name: &str) -> &'static str {
+    match name {
+        "capitalize" => "UserString.capitalize",
+        "casefold" => "UserString.casefold",
+        "center" => "UserString.center",
+        "count" => "UserString.count",
+        "encode" => "UserString.encode",
+        "endswith" => "UserString.endswith",
+        "expandtabs" => "UserString.expandtabs",
+        "find" => "UserString.find",
+        "index" => "UserString.index",
+        "isalnum" => "UserString.isalnum",
+        "isalpha" => "UserString.isalpha",
+        "isascii" => "UserString.isascii",
+        "isdecimal" => "UserString.isdecimal",
+        "isdigit" => "UserString.isdigit",
+        "isidentifier" => "UserString.isidentifier",
+        "islower" => "UserString.islower",
+        "isnumeric" => "UserString.isnumeric",
+        "isprintable" => "UserString.isprintable",
+        "isspace" => "UserString.isspace",
+        "istitle" => "UserString.istitle",
+        "isupper" => "UserString.isupper",
+        "join" => "UserString.join",
+        "ljust" => "UserString.ljust",
+        "lower" => "UserString.lower",
+        "lstrip" => "UserString.lstrip",
+        "partition" => "UserString.partition",
+        "removeprefix" => "UserString.removeprefix",
+        "removesuffix" => "UserString.removesuffix",
+        "replace" => "UserString.replace",
+        "rfind" => "UserString.rfind",
+        "rindex" => "UserString.rindex",
+        "rjust" => "UserString.rjust",
+        "rpartition" => "UserString.rpartition",
+        "rsplit" => "UserString.rsplit",
+        "rstrip" => "UserString.rstrip",
+        "split" => "UserString.split",
+        "splitlines" => "UserString.splitlines",
+        "startswith" => "UserString.startswith",
+        "strip" => "UserString.strip",
+        "swapcase" => "UserString.swapcase",
+        "title" => "UserString.title",
+        "translate" => "UserString.translate",
+        "upper" => "UserString.upper",
+        "zfill" => "UserString.zfill",
+        _ => unreachable!(),
+    }
+}
+
+/// Materialises a `collections` class constant by name. This is the generic
+/// hook `mod.rs`'s constant dispatch can call for every `collections` name.
+pub(crate) fn constant(name: &str) -> i64 {
+    match name {
+        "UserDict" => userdict_class(),
+        "UserList" => userlist_class(),
+        "UserString" => userstring_class(),
+        "OrderedDict" => ordereddict_class(),
+        "Counter" => counter_class(),
+        "defaultdict" => defaultdict_function(),
+        _ => exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("module 'collections' has no attribute '{name}'"),
+        ),
     }
 }
 
@@ -2789,5 +4087,506 @@ mod counter_tests {
             value::type_class(value::dict_new(Vec::new()))
         ));
         assert_eq!(value::type_name_of(c), "Counter");
+    }
+}
+
+#[cfg(test)]
+mod userdict_tests {
+    use super::*;
+
+    fn int(n: i64) -> i64 {
+        value::encode_int(n).expect("representable")
+    }
+
+    fn text(s: &str) -> i64 {
+        value::str_alloc(s.to_string())
+    }
+
+    fn number(v: i64) -> i64 {
+        value::as_integer(v).expect("integer")
+    }
+
+    fn string(v: i64) -> String {
+        value::as_str(v).expect("string").to_string()
+    }
+
+    fn construct(source: Option<i64>) -> i64 {
+        match source {
+            Some(source) => crate::core::builtins::call(userdict_class(), 1, [source].as_ptr()),
+            None => crate::core::builtins::call(userdict_class(), 0, std::ptr::null()),
+        }
+    }
+
+    fn method(instance: i64, name: &str, args: &[i64]) -> i64 {
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(instance);
+        argv.extend_from_slice(args);
+        call(&format!("UserDict.{name}"), &argv)
+    }
+
+    #[test]
+    fn userdict_is_a_cached_class_with_mapping_methods() {
+        exc::init();
+        let class = userdict_class();
+        assert_eq!(class, userdict_class(), "class identity is cached");
+        assert_eq!(
+            value::as_class(class)
+                .map(|state| state.name.clone())
+                .as_deref(),
+            Some("UserDict")
+        );
+        for name in [
+            "__init__",
+            "__getitem__",
+            "__setitem__",
+            "__delitem__",
+            "__iter__",
+            "__len__",
+            "__contains__",
+            "__repr__",
+            "get",
+            "keys",
+            "values",
+            "items",
+            "update",
+            "pop",
+            "popitem",
+            "setdefault",
+            "copy",
+            "clear",
+        ] {
+            assert!(
+                value::class_lookup(class, name).is_some(),
+                "UserDict.{name} missing"
+            );
+        }
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn userdict_initialises_from_a_mapping_and_keywords() {
+        exc::init();
+        let source = value::dict_new(vec![(text("a"), int(1))]);
+        let instance = construct(Some(source));
+        assert!(!exc::pending());
+        assert_eq!(value::type_name_of(instance), "UserDict");
+        assert_eq!(number(method(instance, "__len__", &[])), 1);
+        assert_eq!(number(method(instance, "__getitem__", &[text("a")])), 1);
+        assert_eq!(string(method(instance, "__repr__", &[])), "{'a': 1}");
+
+        // `data` is the public backing dict (`pprint` formats through it).
+        let data = value::instance_attr(instance, "data").expect("data attribute");
+        assert_eq!(
+            value::as_dict(data).expect("data is a dict").len(),
+            1,
+            "data holds the mapping entries"
+        );
+
+        // Keyword entries are data keys: `UserDict(**{'k': 3})`.
+        let keyword = [text("k"), int(3)];
+        let with_keyword = crate::core::builtins::call_kw(
+            userdict_class(),
+            0,
+            std::ptr::null(),
+            1,
+            keyword.as_ptr(),
+        );
+        assert!(!exc::pending());
+        assert_eq!(number(method(with_keyword, "__getitem__", &[text("k")])), 3);
+    }
+
+    #[test]
+    fn userdict_mutation_and_views_match_a_mapping() {
+        exc::init();
+        let instance = construct(None);
+        assert_eq!(string(method(instance, "__repr__", &[])), "{}");
+
+        method(instance, "__setitem__", &[text("b"), int(2)]);
+        method(instance, "__setitem__", &[text("a"), int(1)]);
+        assert_eq!(number(method(instance, "__len__", &[])), 2);
+        assert_eq!(method(instance, "__contains__", &[text("a")]), value::TRUE);
+        assert_eq!(method(instance, "__contains__", &[text("z")]), value::FALSE);
+        assert_eq!(number(method(instance, "get", &[text("z"), int(9)])), 9);
+
+        // Insertion order is the backing dict's order.
+        let keys = method(instance, "keys", &[]);
+        let keys: Vec<String> = value::as_list(keys)
+            .expect("keys list")
+            .iter()
+            .map(|key| string(*key))
+            .collect();
+        assert_eq!(keys, vec!["b".to_string(), "a".to_string()]);
+
+        let items = method(instance, "items", &[]);
+        let first = value::as_list(items).expect("items list")[0];
+        let pair = value::as_tuple(first).expect("pair");
+        assert_eq!(string(pair[0]), "b");
+        assert_eq!(number(pair[1]), 2);
+
+        // `setdefault` inserts once, then answers the stored value.
+        assert_eq!(
+            number(method(instance, "setdefault", &[text("c"), int(3)])),
+            3
+        );
+        assert_eq!(
+            number(method(instance, "setdefault", &[text("c"), int(4)])),
+            3
+        );
+        // `update` merges a mapping and keeps existing keys.
+        let incoming = value::dict_new(vec![(text("a"), int(10)), (text("d"), int(4))]);
+        method(instance, "update", &[incoming]);
+        assert_eq!(number(method(instance, "__getitem__", &[text("a")])), 10);
+        assert_eq!(number(method(instance, "__getitem__", &[text("d")])), 4);
+
+        // `pop` honours a default, `popitem` pops the first key.
+        assert_eq!(number(method(instance, "pop", &[text("nope"), int(7)])), 7);
+        let popped = method(instance, "popitem", &[]);
+        let pair = value::as_tuple(popped).expect("popitem pair");
+        assert_eq!(string(pair[0]), "b");
+        assert_eq!(number(pair[1]), 2);
+
+        // A copy is an independent UserDict with equal contents.
+        let copy = method(instance, "copy", &[]);
+        assert_eq!(value::type_name_of(copy), "UserDict");
+        assert_eq!(method(copy, "__eq__", &[instance]), value::TRUE);
+        method(copy, "clear", &[]);
+        assert_eq!(number(method(copy, "__len__", &[])), 0);
+        assert_eq!(number(method(instance, "__len__", &[])), 3);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn userdict_missing_keys_raise_key_error() {
+        exc::init();
+        let instance = construct(None);
+        method(instance, "__getitem__", &[text("missing")]);
+        assert_eq!(exc::pending_tag(), KEY_ERROR as i64);
+        exc::clear();
+
+        exc::init();
+        let instance = construct(None);
+        method(instance, "pop", &[text("missing")]);
+        assert_eq!(exc::pending_tag(), KEY_ERROR as i64);
+        exc::clear();
+
+        exc::init();
+        let instance = construct(None);
+        method(instance, "popitem", &[]);
+        assert_eq!(exc::pending_tag(), KEY_ERROR as i64);
+        exc::clear();
+    }
+}
+
+#[cfg(test)]
+mod user_sequence_tests {
+    use super::*;
+
+    fn int(n: i64) -> i64 {
+        value::encode_int(n).expect("representable")
+    }
+
+    fn text(s: &str) -> i64 {
+        value::str_alloc(s.to_string())
+    }
+
+    fn number(v: i64) -> i64 {
+        value::as_integer(v).expect("integer")
+    }
+
+    fn string(v: i64) -> String {
+        value::as_str(v).expect("string").to_string()
+    }
+
+    fn make_list(items: &[i64]) -> i64 {
+        let source = value::list_new(items.to_vec());
+        crate::core::builtins::call(userlist_class(), 1, [source].as_ptr())
+    }
+
+    fn lmethod(instance: i64, name: &str, args: &[i64]) -> i64 {
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(instance);
+        argv.extend_from_slice(args);
+        call(&format!("UserList.{name}"), &argv)
+    }
+
+    fn make_string(content: i64) -> i64 {
+        crate::core::builtins::call(userstring_class(), 1, [content].as_ptr())
+    }
+
+    fn smethod(instance: i64, name: &str, args: &[i64]) -> i64 {
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(instance);
+        argv.extend_from_slice(args);
+        call(&format!("UserString.{name}"), &argv)
+    }
+
+    #[test]
+    fn userlist_wraps_a_real_list_with_identity_repr() {
+        exc::init();
+        let class = userlist_class();
+        assert_eq!(class, userlist_class());
+        assert_eq!(
+            value::as_class(class)
+                .map(|state| state.name.clone())
+                .as_deref(),
+            Some("UserList")
+        );
+        // The `pprint` dispatch key exists and is a class member value.
+        assert!(value::class_lookup(class, "__repr__").is_some());
+
+        let instance = make_list(&[int(1), int(2), int(3)]);
+        assert!(!exc::pending());
+        assert_eq!(value::type_name_of(instance), "UserList");
+        assert_eq!(string(lmethod(instance, "__repr__", &[])), "[1, 2, 3]");
+        assert_eq!(number(lmethod(instance, "__len__", &[])), 3);
+        assert_eq!(number(lmethod(instance, "__getitem__", &[int(1)])), 2);
+        assert_eq!(lmethod(instance, "__contains__", &[int(2)]), value::TRUE);
+        assert_eq!(lmethod(instance, "__contains__", &[int(9)]), value::FALSE);
+        // `data` is the public backing list, mutated in place.
+        let data = value::instance_attr(instance, "data").expect("data");
+        assert_eq!(value::as_list(data).expect("list data").len(), 3);
+        lmethod(instance, "append", &[int(4)]);
+        assert_eq!(value::as_list(data).expect("list data").len(), 4);
+    }
+
+    #[test]
+    fn userlist_mutation_methods_work_and_keep_data_in_sync() {
+        exc::init();
+        let instance = make_list(&[int(1), int(2), int(3)]);
+        lmethod(instance, "__setitem__", &[int(0), int(9)]);
+        assert_eq!(number(lmethod(instance, "__getitem__", &[int(0)])), 9);
+        lmethod(instance, "__delitem__", &[int(2)]);
+        assert_eq!(string(lmethod(instance, "__repr__", &[])), "[9, 2]");
+
+        lmethod(instance, "insert", &[int(1), int(5)]);
+        assert_eq!(string(lmethod(instance, "__repr__", &[])), "[9, 5, 2]");
+        assert_eq!(number(lmethod(instance, "pop", &[])), 2);
+        lmethod(instance, "remove", &[int(5)]);
+        assert_eq!(string(lmethod(instance, "__repr__", &[])), "[9]");
+
+        let other = make_list(&[int(7), int(8)]);
+        lmethod(instance, "extend", &[other]);
+        assert_eq!(number(lmethod(instance, "__len__", &[])), 3);
+        assert_eq!(number(lmethod(instance, "count", &[int(8)])), 1);
+        assert_eq!(number(lmethod(instance, "index", &[int(8)])), 2);
+        lmethod(instance, "reverse", &[]);
+        assert_eq!(string(lmethod(instance, "__repr__", &[])), "[8, 7, 9]");
+        lmethod(instance, "clear", &[]);
+        assert_eq!(string(lmethod(instance, "__repr__", &[])), "[]");
+
+        // `sort` delegates to the runtime's real list sort.
+        let sortable = make_list(&[int(3), int(1), int(2)]);
+        lmethod(sortable, "sort", &[]);
+        assert!(!exc::pending(), "sort delegation raised");
+        assert_eq!(string(lmethod(sortable, "__repr__", &[])), "[1, 2, 3]");
+
+        // Equality, copy independence and the operator forms.
+        let left = make_list(&[int(1), int(2)]);
+        let right = make_list(&[int(1), int(2)]);
+        assert_eq!(lmethod(left, "__eq__", &[right]), value::TRUE);
+        let copy = lmethod(left, "copy", &[]);
+        lmethod(copy, "append", &[int(3)]);
+        assert_eq!(number(lmethod(left, "__len__", &[])), 2);
+        assert_eq!(number(lmethod(copy, "__len__", &[])), 3);
+        let sum = lmethod(left, "__add__", &[right]);
+        assert_eq!(number(lmethod(sum, "__len__", &[])), 4);
+        let repeated = lmethod(left, "__mul__", &[int(2)]);
+        assert_eq!(string(lmethod(repeated, "__repr__", &[])), "[1, 2, 1, 2]");
+        lmethod(left, "__iadd__", &[right]);
+        assert_eq!(number(lmethod(left, "__len__", &[])), 4);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn userstring_wraps_text_and_delegates_string_methods() {
+        exc::init();
+        let class = userstring_class();
+        assert_eq!(class, userstring_class());
+        assert_eq!(
+            value::as_class(class)
+                .map(|state| state.name.clone())
+                .as_deref(),
+            Some("UserString")
+        );
+        assert!(value::class_lookup(class, "__repr__").is_some());
+
+        let instance = make_string(text("abc"));
+        assert!(!exc::pending());
+        assert_eq!(value::type_name_of(instance), "UserString");
+        assert_eq!(string(smethod(instance, "__repr__", &[])), "'abc'");
+        assert_eq!(number(smethod(instance, "__len__", &[])), 3);
+
+        let part = smethod(instance, "__getitem__", &[int(1)]);
+        assert_eq!(value::type_name_of(part), "UserString");
+        assert_eq!(string(smethod(part, "__repr__", &[])), "'b'");
+        assert_eq!(smethod(instance, "__contains__", &[text("b")]), value::TRUE);
+        assert_eq!(smethod(instance, "__eq__", &[text("abc")]), value::TRUE);
+        assert_eq!(smethod(instance, "__eq__", &[text("abd")]), value::FALSE);
+
+        let joined = smethod(instance, "__add__", &[text("d")]);
+        assert_eq!(string(smethod(joined, "__repr__", &[])), "'abcd'");
+        let repeated = smethod(instance, "__mul__", &[int(2)]);
+        assert_eq!(string(smethod(repeated, "__repr__", &[])), "'abcabc'");
+
+        // Delegated pure-`str` methods re-wrap their `str` result...
+        let upper = smethod(instance, "upper", &[]);
+        assert_eq!(value::type_name_of(upper), "UserString");
+        assert_eq!(string(smethod(upper, "__repr__", &[])), "'ABC'");
+        assert_eq!(number(smethod(instance, "find", &[text("c")])), 2);
+        assert_eq!(smethod(instance, "startswith", &[text("ab")]), value::TRUE);
+        // ...while `join`/`encode`/`split` keep CPython's plain result types.
+        let joined_text = smethod(
+            instance,
+            "join",
+            &[value::list_new(vec![text("x"), text("y")])],
+        );
+        assert_eq!(value::as_str(joined_text), Some("xabcy"));
+        let encoded = smethod(instance, "encode", &[]);
+        assert_eq!(value::as_bytes(encoded), Some(b"abc".as_slice()));
+        let parts = smethod(instance, "split", &[text("b")]);
+        let parts = value::as_list(parts).expect("split list");
+        assert_eq!(string(parts[0]), "a");
+        assert_eq!(string(parts[1]), "c");
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn collections_constant_hook_materialises_every_container_class() {
+        exc::init();
+        for name in [
+            "UserDict",
+            "UserList",
+            "UserString",
+            "OrderedDict",
+            "Counter",
+        ] {
+            let class = constant(name);
+            assert!(!exc::pending(), "collections.{name} raised");
+            assert!(
+                value::as_class(class).is_some(),
+                "collections.{name} not a class"
+            );
+        }
+        assert_eq!(constant("UserDict"), userdict_class());
+        assert_eq!(constant("UserList"), userlist_class());
+        assert_eq!(constant("UserString"), userstring_class());
+        exc::init();
+        let _ = constant("NoSuchName");
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+        exc::clear();
+    }
+}
+
+#[cfg(test)]
+mod pprint_dispatch_tests {
+    use super::*;
+
+    /// `Lib/pprint.py` resolves `collections.UserDict`, `UserList` and
+    /// `UserString` through its `import collections as _collections` alias and
+    /// registers `_dispatch[cls.__repr__] = handler` for each. A native
+    /// constructor function in that slot raises
+    /// `AttributeError: 'function' object has no attribute '__repr__'`, so both
+    /// spellings must hand out the one cached class and the class must carry a
+    /// real `__repr__` member.
+    fn attr(obj: i64, name: &str) -> i64 {
+        methods::getattr(obj, name.as_ptr(), name.len())
+    }
+
+    fn int(n: i64) -> i64 {
+        value::encode_int(n).expect("representable")
+    }
+
+    fn text(s: &str) -> i64 {
+        value::str_alloc(s.to_string())
+    }
+
+    #[test]
+    fn wrapper_classes_are_the_cached_class_on_both_module_spellings() {
+        exc::init();
+        for (name, cached) in [
+            ("UserDict", userdict_class as fn() -> i64),
+            ("UserList", userlist_class as fn() -> i64),
+            ("UserString", userstring_class as fn() -> i64),
+        ] {
+            let class = crate::modules::module_get_by_name("collections", name);
+            assert!(!exc::pending(), "collections.{name} raised");
+            assert!(
+                value::as_class(class).is_some(),
+                "collections.{name} is a {} rather than a class",
+                value::type_name(class)
+            );
+            assert_eq!(class, cached(), "collections.{name} identity");
+            assert_eq!(
+                crate::modules::module_get_by_name("collections", name),
+                class,
+                "repeated reads must share the cached class"
+            );
+            // `pprint` reads the names off its `_collections` alias; the
+            // accelerator spelling must be the same object.
+            let accelerator = crate::modules::module_get_by_name("_collections", name);
+            assert!(!exc::pending(), "_collections.{name} raised");
+            assert_eq!(accelerator, class, "_collections.{name} identity");
+            assert_eq!(constant(name), class, "constant hook identity");
+        }
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn wrapper_classes_expose_the_pprint_repr_dispatch_key() {
+        exc::init();
+        // `pprint.PrettyPrinter._dispatch` is a plain dict keyed by the class
+        // descriptor: `_dispatch[cls.__repr__] = handler`.
+        let dispatch = value::dict_new(Vec::new());
+        let handler = value::native_function_new("pprint", "_pprint_wrapper", 0);
+        for name in ["UserDict", "UserList", "UserString"] {
+            let class = crate::modules::module_get_by_name("_collections", name);
+            // `repr()` of an instance and `type(obj).__repr__` both need a
+            // normal method entry; an attribute entry would not bind.
+            assert!(
+                matches!(
+                    value::class_lookup(class, "__repr__"),
+                    Some(value::ClassEntry::Method(MethodKind::Normal, _))
+                ),
+                "_collections.{name}.__repr__ must be a normal class method"
+            );
+            let key = attr(class, "__repr__");
+            assert!(!exc::pending(), "_collections.{name}.__repr__ raised");
+            assert!(
+                value::as_function(key).is_some(),
+                "_collections.{name}.__repr__ is not callable"
+            );
+            container::dict_set(dispatch, key, handler);
+            assert!(!exc::pending(), "_dispatch[{name}.__repr__] raised");
+            let pairs = value::as_dict(dispatch).expect("dispatch dict");
+            assert!(
+                container::dict_find(pairs, key).is_some(),
+                "_dispatch[{name}.__repr__] lost its key"
+            );
+        }
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn wrapper_instances_survive_the_pprint_type_repr_lookup() {
+        exc::init();
+        let cases = [
+            ("UserDict", value::dict_new(vec![(text("a"), int(1))])),
+            ("UserList", value::list_new(vec![int(1), int(2)])),
+            ("UserString", text("abc")),
+        ];
+        for (name, argument) in cases {
+            let class = crate::modules::module_get_by_name("collections", name);
+            let instance = crate::core::builtins::call(class, 1, [argument].as_ptr());
+            assert!(!exc::pending(), "{name}() raised");
+            assert_eq!(value::type_class(instance), class, "type({name}())");
+            // `pprint` probes `type(object).__repr__` for every value; the
+            // probe must not raise and must stay reachable on the class.
+            let probe = attr(value::type_class(instance), "__repr__");
+            assert!(!exc::pending(), "type({name}()).__repr__ raised");
+            assert!(value::as_function(probe).is_some());
+            // The generic fallback renders through the same member.
+            assert!(!value::repr(instance).is_empty());
+        }
+        assert!(!exc::pending());
     }
 }
