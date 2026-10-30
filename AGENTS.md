@@ -101,8 +101,8 @@ Other docs must link here instead of repeating the total.
 
 ### Compatibility checkpoint (2026-10-30)
 
-- **Import matrix:** **246/297 modules importable** (50 builtin/frozen, 144 pure,
-  52 extension; 51 fail; 9 modules fail under CPython 3.14.9 itself). The
+- **Import matrix:** **252/297 modules importable** (50 builtin/frozen, 150 pure,
+  52 extension; 45 fail; 9 modules fail under CPython 3.14.9 itself). The
   harness now sets `HYDRO_STDLIB` to the pinned CPython `Lib` tree; the earlier
   159 count used the toolchain's default subset. Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
@@ -149,7 +149,7 @@ Other docs must link here instead of repeating the total.
   resumes remain the narrowest compute result but are now faster than CPython
   (P5 focuses on PGO/inlining).
 - Full CPython stdlib/P7 parity, C extensions/full ABI behavior, and the
-  ecosystem suites remain open; 246/297 stdlib modules import.
+  ecosystem suites remain open; 252/297 stdlib modules import.
 - Imports: packages, dotted/relative imports, site-packages and vendored
   `stdlib/` work; dynamic imports of unlinked package submodules, namespace/
   zip/frozen imports and `from x import *` remain incomplete.

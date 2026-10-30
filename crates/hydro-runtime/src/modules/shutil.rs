@@ -531,6 +531,26 @@ fn copyfileobj_chunks(source: i64, destination: i64, limit: i64) -> i64 {
     }
 }
 
+/// `shutil.copymode(src, dst)`: copy the permission bits without content.
+fn copymode(args: &[i64]) -> i64 {
+    let source = match required_path(args, 0, "copymode", "src") {
+        Ok(path) => path,
+        Err(raised) => return raised,
+    };
+    let destination = match required_path(args, 1, "copymode", "dst") {
+        Ok(path) => path,
+        Err(raised) => return raised,
+    };
+    let permissions = match std::fs::metadata(&source) {
+        Ok(metadata) => metadata.permissions(),
+        Err(error) => return io_error(error, Path::new(&source)),
+    };
+    match std::fs::set_permissions(&destination, permissions) {
+        Ok(()) => NONE,
+        Err(error) => io_error(error, Path::new(&destination)),
+    }
+}
+
 /// `shutil.copyfile(src, dst)`.
 fn copyfile(args: &[i64]) -> i64 {
     let source = match required_path(args, 0, "copyfile", "src") {
@@ -722,6 +742,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "which" => which(args),
         "get_terminal_size" => get_terminal_size(args),
         "copyfile" => copyfile(args),
+        "copymode" => copymode(args),
         "copyfileobj" => copyfileobj(args),
         "copy" => copy_entry(args, "copy", false),
         "copy2" => copy_entry(args, "copy2", true),

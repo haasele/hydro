@@ -249,6 +249,8 @@ pub static TIME: ModuleSpec = ModuleSpec {
         c("tzname", Type::Any),
         // Non-zero when daylight saving time is in effect.
         c("daylight", Type::Int),
+        c("timezone", Type::Int),
+        c("altzone", Type::Int),
         // The nine `struct_time` field names (`['tm_year', ...]`), not a count.
         c("_STRUCT_TM_ITEMS", Type::List),
     ],
@@ -419,6 +421,8 @@ pub static OS_PATH: ModuleSpec = ModuleSpec {
         f("getctime", 1, 1, Type::Float),
         // `islink(path)`: whether the final path component is a symlink.
         f("islink", 1, 1, Type::Bool),
+        // `samefile(path1, path2)`: same device and inode.
+        f("samefile", 2, 2, Type::Bool),
         // `expanduser(path)`: `~`/`~user` expanded against the home directory.
         f("expanduser", 1, 1, Type::Str),
         f("abspath", 1, 1, Type::Str),
@@ -643,6 +647,15 @@ pub static OS: ModuleSpec = ModuleSpec {
         // Descriptor inheritance flags.
         // `lseek(fd, offset, whence)`: the descriptor's new absolute offset.
         f("lseek", 3, 3, Type::Int),
+        // `openpty()`: the `(master, slave)` pseudo-terminal pair.
+        f("openpty", 0, 0, Type::Tuple),
+        // `setsid()`: create a session and return its id.
+        f("setsid", 0, 0, Type::Int),
+        f("login_tty", 1, 1, Type::None),
+        f("forkpty", 0, 0, Type::Tuple),
+        // `walk(top)`: directory entries as a materialised list of
+        // `(path, dirnames, filenames)` triples.
+        f("walk", 1, 2, Type::List),
         f("set_inheritable", 2, 2, Type::None),
         f("get_inheritable", 1, 1, Type::Bool),
     ],
@@ -781,6 +794,9 @@ pub static FCNTL: ModuleSpec = ModuleSpec {
         c("F_SETLK", Type::Int),
         c("F_SETLKW", Type::Int),
         c("F_GETOWN", Type::Int),
+        // Linux exposes the STREAMS push operation even though it fails at
+        // runtime; `pty` imports it unconditionally.
+        c("I_PUSH", Type::Int),
         c("F_SETOWN", Type::Int),
         // Linux/Android extras beyond the portable set.
         c("F_GETSIG", Type::Int),
@@ -1428,6 +1444,11 @@ pub static SYS: ModuleSpec = ModuleSpec {
         // stay absent, but the dict identity is stable.
         c("path_importer_cache", Type::Dict),
         c("executable", Type::Str),
+        c("_base_executable", Type::Str),
+        c("__excepthook__", Type::Any),
+        // Interactive prompt strings read by `code`/`pdb`.
+        c("ps1", Type::Str),
+        c("ps2", Type::Str),
         // "little" or "big": the byte order of the target the program runs on.
         c("byteorder", Type::Str),
         c("platform", Type::Str),
@@ -2787,7 +2808,7 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
         kw(
             "Popen",
             1,
-            12,
+            14,
             Type::Any,
             &[
                 "args",
@@ -2802,6 +2823,8 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
                 "encoding",
                 "errors",
                 "preexec_fn",
+                "bufsize",
+                "shell",
             ],
         ),
         f("_popen_wait", 1, 2, Type::Int),
@@ -2874,6 +2897,7 @@ pub static SHUTIL: ModuleSpec = ModuleSpec {
         kw("copy2", 2, 2, Type::Str, &["src", "dst"]),
         kw("rmtree", 1, 2, Type::None, &["path", "ignore_errors"]),
         kw("move", 2, 2, Type::Str, &["src", "dst"]),
+        f("copymode", 2, 2, Type::None),
     ],
     constants: &[],
 };
@@ -5831,8 +5855,11 @@ pub static READLINE: ModuleSpec = ModuleSpec {
         f("get_completer_delims", 0, 0, Type::Str),
         f("set_auto_history", 1, 1, Type::None),
         f("get_current_history_length", 0, 0, Type::Int),
+        // `redisplay()`: the readline front end is always non-interactive
+        // here; the call succeeds and redraws nothing.
+        f("redisplay", 0, 1, Type::None),
     ],
-    constants: &[],
+    constants: &[c("backend", Type::Str)],
 };
 
 /// `_curses`: the ncurses screen surface. `window` and `error` are class
@@ -8602,7 +8629,7 @@ mod tests {
         // `subprocess.Popen` declares the keyword-only options after the
         // leading six slots.
         let popen = function("subprocess", "Popen").expect("subprocess.Popen");
-        assert_eq!((popen.min_args, popen.max_args), (1, 12));
+        assert_eq!((popen.min_args, popen.max_args), (1, 14));
         assert_eq!(
             popen.params,
             &[
@@ -8618,6 +8645,8 @@ mod tests {
                 "encoding",
                 "errors",
                 "preexec_fn",
+                "bufsize",
+                "shell",
             ][..]
         );
         assert_eq!(
@@ -9253,11 +9282,13 @@ mod tests {
             ("get_begidx", 0, 0, Type::Int),
             ("get_completer_delims", 0, 0, Type::Str),
             ("get_current_history_length", 0, 0, Type::Int),
+            ("redisplay", 0, 1, Type::None),
         ] {
             let spec = function("readline", name).unwrap_or_else(|| panic!("readline.{name}"));
             assert_eq!((spec.min_args, spec.max_args, spec.ret), (min, max, ret));
         }
-        assert!(module("readline").expect("readline").constants.is_empty());
+        let backend = constant("readline", "backend").expect("readline.backend");
+        assert_eq!(backend.ty, Type::Str);
 
         let initscr = function("_curses", "initscr").expect("_curses.initscr");
         assert_eq!(

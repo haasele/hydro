@@ -37,20 +37,19 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 50 | 2 |
-| pure | 174 | 144 | 30 |
+| pure | 174 | 150 | 24 |
 | extension | 63 | 52 | 11 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 246 | 51 |
+| **Total** | 297 | 252 | 45 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:HYD0002 | 19 |
-| compile_error:HYD0201 | 12 |
+| compile_error:HYD0002 | 21 |
 | runtime_error | 10 |
 | cpython_failed | 9 |
-| compile_error:HYD0103 | 1 |
+| compile_error:HYD0201 | 5 |
 
 ## Modules by layer
 
@@ -147,8 +146,8 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `bz2` | ok | ok | ok | - |
 | `cProfile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
 | `calendar` | ok | ok | ok | - |
-| `cmd` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'readline' has no attribute 'backend' |
-| `code` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute '__excepthook__' |
+| `cmd` | ok | ok | ok | - |
+| `code` | ok | exit 2 | runtime_error | tea: internal codegen error: call to function traceback.format_exception expects 6 argume… |
 | `codeop` | ok | ok | ok | - |
 | `collections` | ok | ok | ok | - |
 | `colorsys` | ok | ok | ok | - |
@@ -162,14 +161,14 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `copyreg` | ok | ok | ok | - |
 | `csv` | ok | ok | ok | - |
 | `ctypes` | ok | ok | ok | - |
-| `curses` | ok | exit 1 | runtime_error | AttributeError: module '_curses' has no attribute 'ACS_ULCORNER' |
+| `curses` | ok | ok | ok | - |
 | `dataclasses` | ok | ok | ok | - |
 | `datetime` | ok | ok | ok | - |
 | `dbm` | ok | ok | ok | - |
 | `decimal` | ok | ok | ok | - |
 | `difflib` | ok | ok | ok | - |
 | `dis` | ok | ok | ok | - |
-| `doctest` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'readline' has no attribute 'backend' |
+| `doctest` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: type parameters are not supported in Phase 1 |
 | `email` | ok | ok | ok | - |
 | `encodings` | ok | ok | ok | - |
 | `ensurepip` | ok | ok | ok | - |
@@ -192,7 +191,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `html` | ok | ok | ok | - |
 | `http` | ok | ok | ok | - |
 | `idlelib` | ok | ok | ok | - |
-| `imaplib` | ok | exit 1 | compile_error:HYD0103 | error[HYD0103]: Popen() got an unexpected keyword argument 'bufsize' |
+| `imaplib` | ok | exit 1 | runtime_error | error: repetition quantifier expects a valid decimal |
 | `importlib` | ok | ok | ok | - |
 | `inspect` | ok | ok | ok | - |
 | `ipaddress` | ok | ok | ok | - |
@@ -200,7 +199,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `keyword` | ok | ok | ok | - |
 | `linecache` | ok | ok | ok | - |
 | `locale` | ok | ok | ok | - |
-| `logging` | ok | exit 1 | runtime_error | AttributeError: 'function' object has no attribute '__code__' |
+| `logging` | ok | exit 1 | runtime_error | error: repetition operator missing expression |
 | `lzma` | ok | ok | ok | - |
 | `mailbox` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: class-body import binding 'walk' is not supported: only native modules an… |
 | `mimetypes` | ok | ok | ok | - |
@@ -213,17 +212,17 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `operator` | ok | ok | ok | - |
 | `optparse` | ok | exit 1 | runtime_error | TypeError: FileNotFoundError() takes at most 1 argument (3 given) |
 | `pathlib` | ok | ok | ok | - |
-| `pdb` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'readline' has no attribute 'backend' |
+| `pdb` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: type parameters are not supported in Phase 1 |
 | `pickle` | ok | ok | ok | - |
 | `pickletools` | ok | ok | ok | - |
 | `pkgutil` | ok | ok | ok | - |
 | `platform` | ok | ok | ok | - |
 | `plistlib` | ok | exit 1 | runtime_error | TypeError: Enum.__new__() takes at most 1 positional argument(s) (2 given) |
 | `poplib` | ok | ok | ok | - |
-| `pprint` | ok | exit 1 | runtime_error | AttributeError: 'function' object has no attribute '__repr__' |
+| `pprint` | ok | ok | ok | - |
 | `profile` | ok | ok | ok | - |
-| `pstats` | ok | exit 1 | runtime_error | AttributeError: 'function' object has no attribute '__func__' |
-| `pty` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'fcntl' has no attribute 'I_PUSH' |
+| `pstats` | ok | ok | ok | - |
+| `pty` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'get_blocking' |
 | `py_compile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'importlib._bootstrap_external' has no attribute '_code_to_timesta… |
 | `pyclbr` | ok | ok | ok | - |
 | `pydoc` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_frozen_importlib' has no attribute '_find_spec' |
@@ -233,7 +232,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `random` | ok | ok | ok | - |
 | `re` | ok | ok | ok | - |
 | `reprlib` | ok | ok | ok | - |
-| `rlcompleter` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'readline' has no attribute 'redisplay' |
+| `rlcompleter` | ok | ok | ok | - |
 | `sched` | ok | ok | ok | - |
 | `secrets` | ok | ok | ok | - |
 | `selectors` | ok | ok | ok | - |
@@ -257,7 +256,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `symtable` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_symtable' not found: not supported on the import search path |
 | `sysconfig` | ok | ok | ok | - |
 | `tabnanny` | ok | ok | ok | - |
-| `tarfile` | ok | exit 1 | runtime_error | TypeError: __slots__ must be a string or an iterable of strings |
+| `tarfile` | ok | ok | ok | - |
 | `tempfile` | ok | ok | ok | - |
 | `textwrap` | ok | ok | ok | - |
 | `this` | ok | ok | ok | - |
@@ -278,7 +277,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `unittest` | ok | ok | ok | - |
 | `urllib` | ok | ok | ok | - |
 | `uuid` | ok | ok | ok | - |
-| `venv` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'sys' has no attribute '_base_executable' |
+| `venv` | ok | exit 1 | runtime_error | error: repetition operator missing expression |
 | `warnings` | ok | ok | ok | - |
 | `wave` | ok | ok | ok | - |
 | `weakref` | ok | ok | ok | - |
@@ -286,7 +285,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `wsgiref` | ok | ok | ok | - |
 | `xml` | ok | ok | ok | - |
 | `xmlrpc` | ok | ok | ok | - |
-| `zipapp` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os.path' has no attribute 'samefile' |
+| `zipapp` | ok | exit 1 | runtime_error | AttributeError: module 'zipfile' has no attribute 'ZipFile' |
 | `zipfile` | ok | exit 1 | runtime_error | AttributeError: module 'zipfile' has no attribute 'ZipFile' |
 | `zoneinfo` | ok | ok | ok | - |
 

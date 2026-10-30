@@ -2653,6 +2653,28 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
                 return builtin_type_method(obj, type_name, attr);
             }
         }
+        // Functions expose a code object and bound-metadata attributes.
+        // Generated bodies have no first-class code value, so materialise the
+        // documented metadata from the function record.
+        if attr == "__code__" {
+            let name = value::function_name(obj);
+            return value::code_new(value::CodeState {
+                name: name.clone(),
+                qualname: name,
+                filename: "<hydro>".to_string(),
+                first_line: 0,
+                argcount: 0,
+                flags: 0,
+                nlocals: 0,
+                varnames: Vec::new(),
+            });
+        }
+        if attr == "__repr__" {
+            return value::native_function_new("builtins", "repr", 1);
+        }
+        if attr == "__func__" {
+            return obj;
+        }
         return match attr {
             "__name__" => value::str_alloc(value::function_name(obj)),
             "__qualname__" => value::str_alloc(value::function_qualname(obj)),

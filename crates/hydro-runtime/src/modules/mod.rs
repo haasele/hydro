@@ -5725,11 +5725,14 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("sys", "prefix") => value::str_alloc(installation_prefix()),
         ("sys", "base_prefix") => value::str_alloc(base_prefix()),
         ("sys", "exec_prefix") => value::str_alloc(base_prefix()),
-        ("sys", "executable") => value::str_alloc(
+        ("sys", "executable") | ("sys", "_base_executable") => value::str_alloc(
             std::env::current_exe()
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         ),
+        ("sys", "__excepthook__") => value::native_function_new("sys", "excepthook", 3),
+        ("sys", "ps1") => value::str_from_bytes(b">>> "),
+        ("sys", "ps2") => value::str_from_bytes(b"... "),
         ("sys", "platform") => value::str_from_bytes(platform().as_bytes()),
         // Target endianness, as CPython reports it (the compiler and runtime
         // always share one target).
@@ -5994,6 +5997,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("time", "tzname") => time_tzname(),
         ("time", "daylight") => encode_int(time_daylight()),
         ("time", "_STRUCT_TM_ITEMS") => time_struct_tm_items(),
+        ("time", "timezone" | "altzone") => encode_int(0),
         // `pickle`'s exception classes.
         ("pickle", name @ ("PickleError" | "PicklingError" | "UnpicklingError")) => {
             pickle_exception_class(name)
@@ -15155,6 +15159,11 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
             value::set_new(items)
         }
         "lseek" => os_lseek(args),
+        "openpty" => os_openpty(),
+        "forkpty" => os_forkpty(),
+        "setsid" => os_setsid(),
+        "login_tty" => os_login_tty(args),
+        "walk" => os_walk(args),
         "access" => os_access(args),
         "urandom" => os_urandom(args),
         "fspath" => os_fspath(args[0]),
@@ -16174,6 +16183,129 @@ fn os_error_from_io(function: &str, error: std::io::Error, path: Option<&str>) -
 
 /// `os.access(path, mode)`: Linux permission bits, no exception on failure.
 /// `os.lseek(fd, offset, whence)`.
+/// `os.openpty()`: the `(master, slave)` pseudo-terminal descriptors.
+fn os_openpty() -> i64 {
+    #[cfg(unix)]
+    {
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: the kernel writes both descriptors and accepts NULL
+        // terminal attributes/window size.
+        let result = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if result != 0 {
+            return os_error_from_io("openpty", std::io::Error::last_os_error(), None);
+        }
+        value::tuple_new(vec![encode_int(master as i64), encode_int(slave as i64)])
+    }
+    #[cfg(not(unix))]
+    {
+        exc::raise_with_message(exc::NOT_IMPLEMENTED_ERROR, "openpty is unavailable")
+    }
+}
+
+/// `os.login_tty(fd)`: make the descriptor the controlling terminal.
+fn os_login_tty(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(raised) => return raised,
+    };
+    // SAFETY: the descriptor is validated by the kernel.
+    if unsafe { libc::login_tty(fd) } != 0 {
+        return os_error_from_io("login_tty", std::io::Error::last_os_error(), None);
+    }
+    NONE
+}
+
+/// `os.setsid()`: create a new session.
+fn os_setsid() -> i64 {
+    // SAFETY: `setsid` has no arguments and fails with EPERM for a process
+    // group leader.
+    let result = unsafe { libc::setsid() };
+    if result < 0 {
+        return os_error_from_io("setsid", std::io::Error::last_os_error(), None);
+    }
+    encode_int(result as i64)
+}
+
+/// `os.forkpty()`: fork a child attached to a new pseudo-terminal.
+fn os_forkpty() -> i64 {
+    #[cfg(unix)]
+    {
+        let mut master = -1;
+        // SAFETY: the kernel writes the master descriptor and validates the
+        // NULL terminal attributes.
+        let pid = unsafe {
+            libc::forkpty(
+                &mut master,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if pid < 0 {
+            return os_error_from_io("forkpty", std::io::Error::last_os_error(), None);
+        }
+        value::tuple_new(vec![encode_int(pid as i64), encode_int(master as i64)])
+    }
+    #[cfg(not(unix))]
+    {
+        exc::raise_with_message(exc::NOT_IMPLEMENTED_ERROR, "forkpty is unavailable")
+    }
+}
+
+/// `os.walk(top)`: recursive directory entries materialised as a list of
+/// `(path, dirnames, filenames)` triples.
+fn os_walk(args: &[i64]) -> i64 {
+    let Some(root) = args.first().copied().and_then(value::as_path_like) else {
+        return exc::raise_with_message(TYPE_ERROR, "walk() argument must be a path string");
+    };
+    let result = value::list_new(Vec::new());
+    fn visit(root: &std::path::Path, result: i64) {
+        let mut dirnames = Vec::new();
+        let mut filenames = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+                if is_dir {
+                    dirnames.push(name);
+                } else {
+                    filenames.push(name);
+                }
+            }
+        }
+        let path = value::str_alloc(root.to_string_lossy().into_owned());
+        let dirs = value::list_new(
+            dirnames
+                .iter()
+                .map(|name| value::str_alloc(name.clone()))
+                .collect(),
+        );
+        let files = value::list_new(
+            filenames
+                .iter()
+                .map(|name| value::str_alloc(name.clone()))
+                .collect(),
+        );
+        let triple = value::tuple_new(vec![path, dirs, files]);
+        crate::core::container::list_append(result, triple);
+        let children: Vec<_> = dirnames.into_iter().collect();
+        for child in children {
+            visit(&root.join(child), result);
+        }
+    }
+    visit(std::path::Path::new(root), result);
+    result
+}
+
 fn os_lseek(args: &[i64]) -> i64 {
     let fd = match os_fd_argument(args[0]) {
         Ok(fd) => fd,

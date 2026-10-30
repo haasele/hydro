@@ -850,6 +850,9 @@ mod unix {
 
     /// Dispatches a native `readline` function.
     pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
+        if function == "redisplay" {
+            return NONE;
+        }
         if !available() {
             return unavailable();
         }
@@ -879,6 +882,9 @@ mod unix {
     /// `readline` exposes no integer constants; CPython's module only has
     /// functions. Unknown names report `AttributeError`.
     pub(crate) fn constant(name: &str) -> i64 {
+        if name == "backend" {
+            return value::str_from_bytes(b"readline");
+        }
         attribute_error(name)
     }
 
@@ -1082,6 +1088,9 @@ mod portable {
     }
 
     pub(crate) fn constant(name: &str) -> i64 {
+        if name == "backend" {
+            return value::str_from_bytes(b"readline");
+        }
         exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'readline' has no attribute '{name}'"),

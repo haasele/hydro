@@ -5688,6 +5688,9 @@ fn parse_slots(attrs: &[(String, i64)]) -> Result<Option<(Vec<String>, bool)>, S
             items.to_vec()
         } else if let Some(items) = as_set(declared) {
             items.to_vec()
+        } else if let Some(pairs) = as_dict(declared) {
+            // `__slots__ = dict(name=doc, ...)` stores the slot names as keys.
+            pairs.iter().map(|(key, _)| *key).collect()
         } else {
             return Err("__slots__ must be a string or an iterable of strings".to_string());
         };

@@ -26,18 +26,22 @@ initial state of the first runnable core.
   `codecs` gained decoder/encoder factories and stream marker classes;
   `locale.localeconv`, `sys.hash_info/getsizeof`, `io.UnsupportedOperation`
   and `csv` quote constants are implemented.
+- Further stdlib surface: `sys.ps1`/`ps2`, `os.openpty`/`forkpty`/`setsid`/
+  `login_tty`/`walk`, `shutil.copymode`, `readline.backend`/`redisplay`,
+  `curses` ACS/size fallbacks, dict-form `__slots__`, and function
+  `__code__`/`__repr__`/`__func__` metadata.
 - Added the README compatibility progress chart and
   `scripts/progress.py`, generated from the official CPython-test and stdlib
   import reports.
 - The stdlib matrix now runs with `HYDRO_STDLIB` pointed at the pinned CPython
   `Lib` tree (the earlier 159 count used the toolchain's default subset); the
-  same code imports **246/297** modules, so the previous report undercounted
+  same code imports **252/297** modules, so the previous report undercounted
   the implementation by 87 modules.
 
 ### Compatibility — 2026-10-30 native stdlib and ecosystem continuation
 
-- Stdlib import matrix advanced to **246/297** (144 pure, 50 builtin/frozen,
-  52 extension; 51 failed, 9 of them CPython-failing). Added real `_sqlite3`/`sqlite3`
+- Stdlib import matrix advanced to **252/297** (150 pure, 50 builtin/frozen,
+  52 extension; 45 failed, 9 of them CPython-failing). Added real `_sqlite3`/`sqlite3`
   DB-API, `_ssl`/SSLContext factory surface, `_bz2`/`_lzma`, `pyexpat`,
   readline, `_curses`, CJK/ISO-2022 codec accelerators, `_dbm`/`_gdbm`,
   `_zstd`, SHA-3/SHAKE, and AST/importlib/OS surfaces.

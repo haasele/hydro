@@ -2424,6 +2424,25 @@ mod unix {
         if let Some((_, value)) = ATTR_CONSTANTS.iter().find(|(key, _)| *key == name) {
             return encode_int(*value);
         }
+        // The screen dimensions exist before `initscr` in a non-interactive
+        // process; use the conventional 80x24 fallback.
+        if name == "LINES" {
+            return encode_int(24);
+        }
+        if name == "COLS" {
+            return encode_int(80);
+        }
+        if name == "COLORS" {
+            return encode_int(256);
+        }
+        if name == "COLOR_PAIRS" {
+            return encode_int(256);
+        }
+        // `ACS_*` values are stable one-character strings. They are exposed
+        // before `initscr()` (the `curses` wrapper imports them eagerly).
+        if let Some((_, byte)) = ACS_CONSTANTS.iter().find(|(key, _)| *key == name) {
+            return value::str_from_bytes(&[*byte]);
+        }
         let Some(library) = library() else {
             return unavailable();
         };
@@ -2562,17 +2581,13 @@ mod unix {
             assert_eq!(number(constant("A_ITALIC")), 2_147_483_648);
             assert!(!exc::pending());
 
-            // State-dependent attributes are absent until their call, exactly
-            // like CPython's module dictionary.
-            constant("LINES");
-            assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
-            exc::clear();
-            constant("ACS_HLINE");
-            assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
-            exc::clear();
-            constant("COLORS");
-            assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
-            exc::clear();
+            // `curses` imports the ACS/size constants eagerly, so the
+            // non-interactive fallback is available before `initscr`.
+            assert_eq!(number(constant("LINES")), 24);
+            assert_eq!(number(constant("COLS")), 80);
+            assert_eq!(number(constant("COLORS")), 256);
+            assert_eq!(number(constant("COLOR_PAIRS")), 256);
+            assert!(value::as_str(constant("ACS_HLINE")).is_some());
             constant("not_a_constant");
             assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
             exc::clear();
