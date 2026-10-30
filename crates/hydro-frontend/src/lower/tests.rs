@@ -5313,9 +5313,8 @@ fn lambda_defaults_lower_like_function_defaults() {
 }
 
 #[test]
-fn lambda_rejects_variadic_parameters() {
+fn lambda_rejects_unsupported_parameter_forms() {
     for (source, expected) in [
-        ("f = lambda *args: args\n", "varargs"),
         ("f = lambda *, x: x\n", "keyword-only"),
         ("f = lambda **kwargs: kwargs\n", "kwargs"),
     ] {
@@ -12548,11 +12547,10 @@ def f(t, cells, style):
         let (_, _, diags) = lower_source(source, &parse(source));
         assert!(diags.is_empty(), "{source}: {diags:?}");
     }
-    // Two starred operands still cannot be represented.
+    // Several starred operands fold into one tuple concatenation.
     let source = "def f(t, a, b):\n    return t.add_row(*a, *b)\n";
     let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{source}: {diags:?}");
-    assert!(diags[0].message.contains("only one starred argument"));
+    assert!(diags.is_empty(), "{source}: {diags:?}");
 }
 
 #[test]
@@ -12716,13 +12714,18 @@ fn starred_calls_diagnose_multiple_arguments() {
     let source = "def f(*args):\n    return args\n\
                   xs = (1, 2)\n\
                   a = f(*xs, *xs)\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert!(
-        diags
-            .iter()
-            .any(|diag| diag.message.contains("only one starred argument")),
-        "{diags:?}"
-    );
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::IndirectCall { star, .. } = &assigned(&hir, "a").kind else {
+        panic!(
+            "expected an indirect call, got {:?}",
+            assigned(&hir, "a").kind
+        );
+    };
+    assert!(matches!(
+        star.as_deref().map(|value| &value.kind),
+        Some(HExprKind::Bin { op: BinOp::Add, .. })
+    ));
 
     // CPython allows a positional operand after `*iterable`; the frontend
     // folds the trailing operands into the star operand.
@@ -15280,17 +15283,10 @@ fn super_init_accepts_positional_after_star() {
 }
 
 #[test]
-fn super_init_rejects_multiple_starred_operands() {
-    // The runtime method ABI has a single star slot; a second `*` is
-    // diagnosed instead of being dropped.
+fn super_init_accepts_multiple_starred_operands() {
     let source = "class Base:\n    def __init__(self, *args):\n        pass\nclass Derived(Base):\n    def __init__(self, a, b):\n        super().__init__(*a, *b)\n";
     let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{source}: {diags:?}");
-    assert!(
-        diags[0].message.contains("only one starred argument"),
-        "{source}: {}",
-        diags[0].message
-    );
+    assert!(diags.is_empty(), "{source}: {diags:?}");
 }
 
 #[test]
@@ -17897,4 +17893,62 @@ y = c.replace(**d, deep=False)
         "y keeps the named keyword: {keywords:?}"
     );
     assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn open_as_a_value_resolves_to_io_open_and_unit_binding_shadows_it() {
+    let source = "value = open\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::ModuleAttr { module, name } = &assigned(&hir, "value").kind else {
+        panic!(
+            "open must lower to io.open: {:?}",
+            assigned(&hir, "value").kind
+        );
+    };
+    assert_eq!((module.as_str(), name.as_str()), ("io", "open"));
+
+    // A module-level assignment shadows the builtin even when the reading
+    // function is lowered before the assignment.
+    let source = "def value():\n    return open\nopen = None\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = function_body(&hir, "value");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::GlobalGet { name, .. } if name == "open"),
+        "the shadowed open reads as a global: {:?}",
+        value.kind
+    );
+}
+
+#[test]
+fn multiple_mapping_arguments_fold_into_one_call_operand() {
+    let source = "def call(f, a, b):\n    return f(**a, **b)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = function_body(&hir, "call");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement");
+    };
+    let HExprKind::CallFull {
+        double_star: Some(merged),
+        ..
+    } = &value.kind
+    else {
+        panic!("expected a flattened call expression: {:?}", value.kind);
+    };
+    assert!(
+        matches!(
+            &merged.kind,
+            HExprKind::Call {
+                callee: Callee::Builtin(hydro_ir::Builtin::DictMerge),
+                ..
+            }
+        ),
+        "mappings must merge left to right: {:?}",
+        merged.kind
+    );
 }

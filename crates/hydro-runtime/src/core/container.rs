@@ -910,6 +910,10 @@ pub(crate) fn dict_set(dict: i64, key: i64, new_value: i64) -> i64 {
 
 /// `object[index]` for lists, strings, tuples, dicts, bytes-likes and views.
 pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
+    // `re.Match` supports `m[name_or_index]` as `m.group(...)`.
+    if value::as_match(obj).is_some() {
+        return crate::modules::re::match_method(obj, "group", &[index]);
+    }
     // Checked before `as_bytes`, which also accepts a `bytearray`.
     if let Some(bytes) = value::as_bytearray(obj) {
         let Some(raw) = value::as_integer(index) else {

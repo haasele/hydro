@@ -21,16 +21,27 @@ profiling flavors) and `tea brew`/`tea build` (AOT).
 | Phase 1 — Compiler, runtime ABI, JIT/AOT | done, verified by `scripts/verify.sh` |
 | Phase 2 — Runtime, GC, modules, classes, concurrency | **done & verified**; precise shadow-stack GC, size-classed allocator, async generators/TaskGroup, TLS/UDP networking, pytest, interpreter/REPL |
 | Phase 3 — Toolchain (`new`/`init`/`test`/`fmt`/`lint`/`clean`, build cache, uv passthrough) | moved to the separate **Tea** repository |
-| Phase 4 — Python compatibility, C API/ABI | **decision B; native C-API layer imports real wheels** (0 missing link-time symbols for pinned NumPy/pandas/pydantic extensions, no `libpython`; pydantic import green); full ABI semantics/stdlib/ecosystem remain open (P4-04c…P4-11), see [`docs/C_API.md`](docs/C_API.md) |
+| Phase 4 — Python compatibility, C API/ABI | **decision B; native C-API layer imports real wheels** (0 missing link-time symbols for pinned NumPy/pandas/pydantic extensions, no `libpython`; pydantic import/model smoke and six green); full ABI semantics/stdlib/ecosystem remain open (P4-04c…P4-11), see [`docs/C_API.md`](docs/C_API.md) |
 | Phase 5 — Performance | baseline + local regression gate + CPython/Hydro/PyPy/Go engine comparison |
 | Phase 6 — Diagnostics/Developer Experience | largely done; CLI/diagnostic references, `--verbose`/`--quiet`, ICE and span tests; troubleshooting/migration open |
+
+## Progress
+
+![Hydro compatibility progress: CPython 3.14.9 test suite and stdlib modules](docs/progress.svg)
+
+The chart is generated from the differential reports by
+`python3 scripts/progress.py`. The CPython row counts suites that pass under
+both CPython 3.14.9 and Hydro; the stdlib rows count modules that import, split
+by implementation layer. Exact case lists live in
+[`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md) and
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 
 Current state of work (Cargo version 0.1.0, no public release yet): the runtime
 monorepo carries the unit/integration suites; CLI/E2E/AOT tests live in Tea.
 Compatibility target: **CPython 3.14.9**; the official `Lib/test` baseline is
 **3/398** (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`), tracked in
 [`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md). The generated stdlib import
-matrix is **233/297** ([`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).
+matrix is **246/297** ([`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).
 Hydro JIT (`tea infuse`) and AOT (`tea build`) share this runtime and IR.
 Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), work list in
 [`docs/TODO.md`](docs/TODO.md), source tree in
@@ -283,7 +294,7 @@ User decorators and pattern matching remain incomplete; `except*` grouping and
 `await`/cancellation edge cases are still open. The general descriptor and
 metaclass protocols, `bytearray`/`memoryview`, async generators and async
 comprehensions are implemented. Arbitrary C extensions/full CPython ABI
-semantics and the complete stdlib remain open (233/297 modules import; see
+semantics and the complete stdlib remain open (246/297 modules import; see
 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). A general `sys.path`/
 `sys.modules` model, dynamic imports from unlinked packages, namespace/zip/
 frozen imports and `from x import *` are incomplete; packages, dotted/relative

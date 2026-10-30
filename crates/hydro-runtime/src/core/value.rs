@@ -259,6 +259,8 @@ pub(crate) enum ExecCheck {
     IdentityEither { first: String, second: String },
     /// `isinstance(PARAM, NAME)`
     IsInstance { name: String },
+    /// `raise VALUE from CAUSE` (the bounded `six.raise_from` factory).
+    RaiseFrom,
     /// `False`
     AlwaysFalse,
 }
@@ -284,6 +286,9 @@ pub(crate) enum FunctionBody {
     /// returns the value, or a tuple when several keys were given. The keys
     /// are Hydro values and are traced as GC edges.
     ItemGetter { keys: Vec<i64> },
+    /// `operator.methodcaller`: invokes the named method on its first
+    /// argument, forwarding any further arguments.
+    MethodCaller { name: String },
     /// `functools.partial`: calls `function` with `args` prepended to the
     /// arguments of each call and binds `keywords` by parameter name. The
     /// values of `args` and `keywords` are traced as GC edges.
@@ -6849,10 +6854,24 @@ pub(crate) fn host_function_new(
 pub(crate) fn exec_function_new(
     name: String,
     param: String,
+    second_param: Option<String>,
     check: ExecCheck,
     globals: i64,
     locals: i64,
 ) -> i64 {
+    let mut params = vec![param];
+    if let Some(second) = second_param {
+        params.push(second);
+    }
+    let signature = params
+        .iter()
+        .map(|param| ParamMeta {
+            name: param.clone(),
+            kind: ParamKind::PosOnly,
+            default: None,
+        })
+        .collect();
+    let arity = params.len();
     alloc(
         KIND_FUNCTION,
         ObjData::Function(FunctionObj {
@@ -6861,19 +6880,15 @@ pub(crate) fn exec_function_new(
                 globals,
                 locals,
             },
-            arity: 1,
+            arity,
             name,
             flags: 0,
             // No machine-code trampoline: keyword calls are rejected by the
             // runtime binder before it consults the signature.
             full_entry: 0,
-            signature: vec![ParamMeta {
-                name: param.clone(),
-                kind: ParamKind::PosOnly,
-                default: None,
-            }],
+            signature,
             metadata: FunctionMetadata::default(),
-            params: vec![param],
+            params,
         }),
     )
 }
@@ -6905,6 +6920,23 @@ pub(crate) fn item_getter_new(keys: Vec<i64>) -> i64 {
             body: FunctionBody::ItemGetter { keys },
             arity: 1,
             name: "itemgetter".to_string(),
+            flags: 0,
+            full_entry: 0,
+            signature: Vec::new(),
+            metadata: FunctionMetadata::default(),
+            params: Vec::new(),
+        }),
+    )
+}
+
+/// Allocates an `operator.methodcaller` callable for `name`.
+pub(crate) fn method_caller_new(name: String) -> i64 {
+    alloc(
+        KIND_FUNCTION,
+        ObjData::Function(FunctionObj {
+            body: FunctionBody::MethodCaller { name },
+            arity: 1,
+            name: "methodcaller".to_string(),
             flags: 0,
             full_entry: 0,
             signature: Vec::new(),
@@ -6957,7 +6989,8 @@ pub(crate) fn partial_new_with_keywords(
             | FunctionBody::Identity
             | FunctionBody::Exec { .. }
             | FunctionBody::AttributeGetter { .. }
-            | FunctionBody::ItemGetter { .. } => func.arity.saturating_sub(bound),
+            | FunctionBody::ItemGetter { .. }
+            | FunctionBody::MethodCaller { .. } => func.arity.saturating_sub(bound),
         },
         None => usize::MAX,
     };

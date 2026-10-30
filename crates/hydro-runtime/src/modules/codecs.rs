@@ -112,6 +112,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "escape_encode" => escape_encode(args),
         "escape_decode" => escape_decode(args),
         "lookup" => lookup(args),
+        "getdecoder" => codec_member(args, "decode"),
+        "getencoder" => codec_member(args, "encode"),
         "register" => register(args),
         "unregister" => unregister(args),
         "register_error" => register_error(args),
@@ -888,6 +890,32 @@ fn escape_decode(args: &[i64]) -> i64 {
 }
 
 // registries
+
+/// The marker stream/ incremental codec base classes. `codecs` exposes these
+/// for `isinstance` checks; Hydro's streams are native objects, so an empty
+/// cached class is the faithful identity.
+pub(crate) fn stream_class(name: &str) -> i64 {
+    let key = format!("codecs.class.{name}");
+    if let Some(class) = crate::core::globals::registry_get(&key) {
+        return class;
+    }
+    let class = value::class_new(name.to_string(), NONE, Vec::new());
+    crate::core::globals::registry_set(&key, class);
+    class
+}
+
+/// `getdecoder(encoding)` / `getencoder(encoding)`: the `decode`/`encode`
+/// member of the `CodecInfo` returned by `lookup`.
+fn codec_member(args: &[i64], member: &str) -> i64 {
+    let info = lookup(&args[..1]);
+    if exc::pending() {
+        return info;
+    }
+    let roots = crate::heap::root_values(&[info]);
+    let result = crate::core::methods::getattr(info, member.as_ptr(), member.len());
+    crate::heap::release_roots(roots);
+    result
+}
 
 /// `lookup(name)`: the built-in codecs (and their aliases) are answered
 /// first; other names consult the registered search functions.

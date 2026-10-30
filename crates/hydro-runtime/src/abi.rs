@@ -976,6 +976,7 @@ pub extern "C" fn hydro_map(function: i64, iterable: i64) -> i64 {
 
 /// `map(function, *iterables)`: variadic form used when the call has more
 /// than one source iterable. `argc` counts `function` plus the iterables.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn hydro_map_many(argc: u64, argv: *const i64) -> i64 {
     if argc < 2 || argv.is_null() {
@@ -3621,6 +3622,25 @@ mod tests {
             "function takes 2 arguments (1 given)"
         );
         hydro_exc_clear();
+    }
+
+    #[test]
+    fn variadic_map_consumes_all_iterables() {
+        test_init();
+        let add = function(add_wrapper, 2, "add");
+        let left = make_list(&[1, 2]);
+        let right = make_list(&[10, 20]);
+        let arguments = [add, left, right];
+        let mapped = hydro_map_many(arguments.len() as u64, arguments.as_ptr());
+        assert_eq!(value::to_string(mapped), "[11, 22]");
+        assert_eq!(hydro_exc_pending(), 0);
+
+        // A short source stops the result at its own length, like `map`.
+        let short = make_list(&[5]);
+        let arguments = [add, left, short];
+        let mapped = hydro_map_many(arguments.len() as u64, arguments.as_ptr());
+        assert_eq!(value::to_string(mapped), "[6]");
+        assert_eq!(hydro_exc_pending(), 0);
     }
 
     #[test]

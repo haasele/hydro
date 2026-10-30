@@ -225,6 +225,7 @@ fn start_spawn(process: &ProcessState) -> Result<(), String> {
         // code entry.
         FunctionBody::AttributeGetter { .. }
         | FunctionBody::ItemGetter { .. }
+        | FunctionBody::MethodCaller { .. }
         | FunctionBody::Partial { .. }
         | FunctionBody::BoundMethod { .. }
         | FunctionBody::Host { .. }

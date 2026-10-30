@@ -3828,6 +3828,7 @@ unsafe fn trace(addr: usize) {
                             }
                         }
                         FunctionBody::AttributeGetter { .. }
+                        | FunctionBody::MethodCaller { .. }
                         | FunctionBody::Identity
                         | FunctionBody::Native { .. }
                         | FunctionBody::Builtin(_)

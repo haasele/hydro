@@ -340,6 +340,28 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
             dynamic_keywords: false,
         },
     ),
+    (
+        "itertools.chain.from_iterable",
+        stdlib::FunctionSpec {
+            name: "chain.from_iterable",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::List,
+            params: &["iterable"],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "types.ModuleType.__init__",
+        stdlib::FunctionSpec {
+            name: "ModuleType.__init__",
+            min_args: 2,
+            max_args: 3,
+            ret: hydro_ir::Type::None,
+            params: &["self", "name", "doc"],
+            dynamic_keywords: false,
+        },
+    ),
     // Native methods of `_struct.Struct`. The native values carry these
     // dotted names (`FunctionBody::Native`), so the central table must know
     // them even though they are not Python-visible module functions.
@@ -5819,13 +5841,45 @@ fn constant_value(module: &str, name: &str) -> i64 {
         }
         ("os", "WNOHANG") => encode_int(os_wnohang()),
         // `io`/`_io` seek whence values (`os.SEEK_*` share the values).
-        ("io" | "_io", "SEEK_SET") => encode_int(0),
-        ("io" | "_io", "SEEK_CUR") => encode_int(1),
-        ("io" | "_io", "SEEK_END") => encode_int(2),
+        ("io" | "_io" | "os", "SEEK_SET") => encode_int(0),
+        ("io" | "_io" | "os", "SEEK_CUR") => encode_int(1),
+        ("io" | "_io" | "os", "SEEK_END") => encode_int(2),
         // CPython's default buffered-I/O size and the module's exported name
         // list. `_io` does not declare either constant.
         ("io", "DEFAULT_BUFFER_SIZE") => encode_int(8192),
+        ("io", "UnsupportedOperation") => io_unsupported_operation_class(),
         ("io", "__all__") => io_all_list(),
+        // `csv` quote flags (the numeric values are CPython's).
+        (
+            "codecs",
+            class @ ("StreamReader" | "StreamWriter" | "StreamReaderWriter" | "StreamRecoder"
+            | "IncrementalEncoder" | "IncrementalDecoder"),
+        ) => codecs::stream_class(class),
+        ("csv" | "_csv", "QUOTE_MINIMAL") => encode_int(0),
+        ("csv" | "_csv", "QUOTE_ALL") => encode_int(1),
+        ("csv" | "_csv", "QUOTE_NONNUMERIC") => encode_int(2),
+        ("csv" | "_csv", "QUOTE_NONE") => encode_int(3),
+        ("csv" | "_csv", "QUOTE_STRINGS") => encode_int(4),
+        ("csv" | "_csv", "QUOTE_NOTNULL") => encode_int(5),
+        // `sys.hash_info`: CPython's stable hash parameters.
+        ("sys", "hash_info") => value::namespace_new(vec![
+            ("width".to_string(), encode_int(64)),
+            (
+                "modulus".to_string(),
+                value::bigint_new(BigInt::from(2_305_843_009_213_693_951u64)),
+            ),
+            ("inf".to_string(), encode_int(314_159)),
+            ("nan".to_string(), encode_int(0)),
+            ("imag".to_string(), encode_int(1_000_003)),
+            (
+                "algorithm".to_string(),
+                value::str_alloc("siphash13".to_string()),
+            ),
+            ("hash_bits".to_string(), encode_int(64)),
+            ("seed_bits".to_string(), encode_int(128)),
+            ("cutoff".to_string(), encode_int(0)),
+            ("digest_size".to_string(), encode_int(8)),
+        ]),
         // `threading.local` is an empty base class: it exists so thread-local
         // subclasses (`class X(threading.local)`) and `local()` calls work.
         // Hydro stores attributes per instance, not per thread; the documented
@@ -9244,6 +9298,18 @@ fn operator_call(function: &str, args: &[i64]) -> i64 {
             return value::attribute_getter_new(names);
         }
         "itemgetter" => return value::item_getter_new(args.to_vec()),
+        "methodcaller" => {
+            let Some(name) = value::as_str(args[0]) else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "method name must be a string, not {}",
+                        value::type_name(args[0])
+                    ),
+                );
+            };
+            return value::method_caller_new(name.to_string());
+        }
         "index" => return operator_index(args[0]),
         "_compare_digest" => return operator_compare_digest(args[0], args[1]),
         // The subscript protocols, exactly as the `[]` syntax performs them.
@@ -9276,7 +9342,10 @@ fn operator_call(function: &str, args: &[i64]) -> i64 {
     }
     match function {
         "neg" => ops::unop(ops::OP_NEG, args[0]),
+        "pos" => ops::unop(ops::OP_POS, args[0]),
+        "invert" | "inv" => ops::unop(ops::OP_INVERT, args[0]),
         "not_" => ops::unop(ops::OP_NOT, args[0]),
+        "abs" => crate::builtins::abs(args[0]),
         "truth" => value::bool_value(value::truthy(args[0])),
         _ => missing_attribute("operator", function),
     }
@@ -10392,6 +10461,7 @@ fn spawn_arity_error(function: i64, argc: usize) -> Option<String> {
         // validates the combined argument list when it calls its target.
         value::FunctionBody::AttributeGetter { .. }
         | value::FunctionBody::ItemGetter { .. }
+        | value::FunctionBody::MethodCaller { .. }
         | value::FunctionBody::Identity
         | value::FunctionBody::Exec { .. } => (func.arity != argc)
             .then(|| format!("function takes {} arguments ({argc} given)", func.arity)),
@@ -10803,7 +10873,7 @@ fn threading_call(function: &str, args: &[i64]) -> i64 {
         }
         "Lock" => value::lock_new(),
         "RLock" => value::lock_new_reentrant(),
-        "Event" => value::event_new(),
+        "Event" | "Condition" => value::event_new(),
         "get_ident" => encode_int(heap::current_thread_id()),
         "current_thread" => threading_current_thread(),
         "main_thread" => threading_thread_for_ident(1),
@@ -13494,6 +13564,19 @@ fn os_fd_argument(argument: i64) -> Result<libc::c_int, i64> {
     })
 }
 
+/// `os.fsync(fd)` / `os.fdatasync(fd)`.
+fn os_sync(args: &[i64], sync: unsafe extern "C" fn(libc::c_int) -> libc::c_int) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(raised) => return raised,
+    };
+    // SAFETY: the kernel validates the descriptor and reports EBADF.
+    if unsafe { sync(fd) } != 0 {
+        return os_error_from_io("fsync", std::io::Error::last_os_error(), None);
+    }
+    NONE
+}
+
 /// `os.close(fd)`: closes the descriptor; an invalid descriptor raises
 /// `OSError(EBADF)`.
 fn os_close(args: &[i64]) -> i64 {
@@ -14509,6 +14592,174 @@ fn os_mkdir(args: &[i64]) -> i64 {
     }
 }
 
+/// `os.chown(path, uid, gid, *, dir_fd=None, follow_symlinks=True)`.
+fn os_chown(args: &[i64]) -> i64 {
+    let path_value = args.first().copied().unwrap_or(NONE);
+    let Some(uid) = args.get(1).copied().and_then(value::as_integer) else {
+        return exc::raise_with_message(TYPE_ERROR, "chown() uid must be an integer");
+    };
+    let Some(gid) = args.get(2).copied().and_then(value::as_integer) else {
+        return exc::raise_with_message(TYPE_ERROR, "chown() gid must be an integer");
+    };
+    if args.get(3).copied().is_some_and(|dir_fd| dir_fd != NONE) {
+        return exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "os.chown: dir_fd is not supported");
+    }
+    let follow_symlinks = match args.get(4).copied() {
+        None | Some(NONE) => true,
+        Some(flag) => value::truthy(flag),
+    };
+    let Some(path) = value::as_path_like(path_value) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "chown() argument must be a path string, not {}",
+                value::type_name(path_value)
+            ),
+        );
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = CString::new(std::ffi::OsStr::new(path).as_bytes()) else {
+            return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+        };
+        // SAFETY: `c_path` is NUL-terminated and the ids are plain integers.
+        let result = unsafe {
+            if follow_symlinks {
+                libc::chown(c_path.as_ptr(), uid as libc::uid_t, gid as libc::gid_t)
+            } else {
+                libc::fchownat(
+                    libc::AT_FDCWD,
+                    c_path.as_ptr(),
+                    uid as libc::uid_t,
+                    gid as libc::gid_t,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            }
+        };
+        if result != 0 {
+            return os_stat_error(std::io::Error::last_os_error(), path);
+        }
+        NONE
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (uid, gid, follow_symlinks);
+        exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            "chown: ownership is unavailable on this platform",
+        )
+    }
+}
+
+/// `os.utime(path, times=None, *, ns=None, dir_fd=None,
+/// follow_symlinks=True)`.
+///
+/// `times` is a `(atime, mtime)` pair in seconds (floats are accepted), `ns`
+/// is the same pair in nanoseconds, and neither means "now".
+fn os_utime(args: &[i64]) -> i64 {
+    let path_value = args.first().copied().unwrap_or(NONE);
+    if args.get(3).copied().is_some_and(|dir_fd| dir_fd != NONE) {
+        return exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "os.utime: dir_fd is not supported");
+    }
+    let follow_symlinks = match args.get(4).copied() {
+        None | Some(NONE) => true,
+        Some(flag) => value::truthy(flag),
+    };
+    let Some(path) = value::as_path_like(path_value) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "utime() argument must be a path string, not {}",
+                value::type_name(path_value)
+            ),
+        );
+    };
+    let times_arg = args.get(1).copied().unwrap_or(NONE);
+    let ns_arg = args.get(2).copied().unwrap_or(NONE);
+    if times_arg != NONE && ns_arg != NONE {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "utime: you may specify either 'times' or 'ns' but not both",
+        );
+    }
+    let pair = |value: i64| -> Option<(i64, i64)> {
+        let items = value::as_tuple(value)
+            .map(|items| items.to_vec())
+            .or_else(|| value::as_list(value).map(|items| items.to_vec()))?;
+        if items.len() != 2 {
+            return None;
+        }
+        Some((items[0], items[1]))
+    };
+    let timespec = |seconds: f64| libc::timespec {
+        tv_sec: seconds.floor() as libc::time_t,
+        tv_nsec: ((seconds.fract()) * 1_000_000_000.0).round() as libc::c_long,
+    };
+    let mut stamp = [libc::timespec {
+        tv_sec: 0,
+        tv_nsec: libc::UTIME_NOW,
+    }; 2];
+    if ns_arg != NONE {
+        let Some((atime, mtime)) = pair(ns_arg) else {
+            return exc::raise_with_message(TYPE_ERROR, "utime: ns must be a pair of integers");
+        };
+        let Some(atime) = value::as_integer(atime) else {
+            return exc::raise_with_message(TYPE_ERROR, "utime: ns values must be integers");
+        };
+        let Some(mtime) = value::as_integer(mtime) else {
+            return exc::raise_with_message(TYPE_ERROR, "utime: ns values must be integers");
+        };
+        stamp[0] = libc::timespec {
+            tv_sec: (atime / 1_000_000_000) as libc::time_t,
+            tv_nsec: (atime % 1_000_000_000) as libc::c_long,
+        };
+        stamp[1] = libc::timespec {
+            tv_sec: (mtime / 1_000_000_000) as libc::time_t,
+            tv_nsec: (mtime % 1_000_000_000) as libc::c_long,
+        };
+    } else if times_arg != NONE {
+        let Some((atime, mtime)) = pair(times_arg) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "utime: times must be a (atime, mtime) pair",
+            );
+        };
+        let (Some(atime), Some(mtime)) = (value::as_float(atime), value::as_float(mtime)) else {
+            return exc::raise_with_message(TYPE_ERROR, "utime: times values must be numbers");
+        };
+        stamp = [timespec(atime), timespec(mtime)];
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = CString::new(std::ffi::OsStr::new(path).as_bytes()) else {
+            return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+        };
+        let flags = if follow_symlinks {
+            0
+        } else {
+            libc::AT_SYMLINK_NOFOLLOW
+        };
+        // SAFETY: `c_path` is NUL-terminated and `stamp` holds two valid
+        // `timespec` values.
+        let result =
+            unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), stamp.as_ptr(), flags) };
+        if result != 0 {
+            return os_stat_error(std::io::Error::last_os_error(), path);
+        }
+        NONE
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (stamp, follow_symlinks);
+        exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            "utime: timestamps are unavailable on this platform",
+        )
+    }
+}
+
 /// `os.chmod(path, mode, *, dir_fd=None, follow_symlinks=True)`.
 ///
 /// The permission bits go straight to `chmod(2)` (or `fchmodat(2)` with
@@ -14851,6 +15102,59 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
                 }
             }
         }
+        "symlink" => {
+            let (Some(src), Some(dst)) =
+                (value::as_path_like(args[0]), value::as_path_like(args[1]))
+            else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "symlink() arguments must be path strings",
+                );
+            };
+            #[cfg(unix)]
+            let created = std::os::unix::fs::symlink(src, dst);
+            #[cfg(not(unix))]
+            let created = Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "symlink is not supported on this platform",
+            ));
+            match created {
+                Ok(()) => NONE,
+                Err(error) => {
+                    exc::raise_with_message(crate::exc::OS_ERROR, &format!("symlink: {error}"))
+                }
+            }
+        }
+        "link" => {
+            let (Some(src), Some(dst)) =
+                (value::as_path_like(args[0]), value::as_path_like(args[1]))
+            else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "link() arguments must be path strings",
+                );
+            };
+            match std::fs::hard_link(src, dst) {
+                Ok(()) => NONE,
+                Err(error) => {
+                    exc::raise_with_message(crate::exc::OS_ERROR, &format!("link: {error}"))
+                }
+            }
+        }
+        "chown" => os_chown(args),
+        "utime" => os_utime(args),
+        "fsync" => os_sync(args, libc::fsync),
+        "fdatasync" => os_sync(args, libc::fdatasync),
+        "sched_getaffinity" => {
+            let cpus = std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(1);
+            let items = (0..cpus)
+                .filter_map(|cpu| value::encode_int(cpu as i64))
+                .collect();
+            value::set_new(items)
+        }
+        "lseek" => os_lseek(args),
         "access" => os_access(args),
         "urandom" => os_urandom(args),
         "fspath" => os_fspath(args[0]),
@@ -15869,6 +16173,27 @@ fn os_error_from_io(function: &str, error: std::io::Error, path: Option<&str>) -
 }
 
 /// `os.access(path, mode)`: Linux permission bits, no exception on failure.
+/// `os.lseek(fd, offset, whence)`.
+fn os_lseek(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(raised) => return raised,
+    };
+    let Some(offset) = args.get(1).copied().and_then(value::as_integer) else {
+        return exc::raise_with_message(TYPE_ERROR, "lseek() offset must be an integer");
+    };
+    let Some(whence) = args.get(2).copied().and_then(value::as_integer) else {
+        return exc::raise_with_message(TYPE_ERROR, "lseek() whence must be an integer");
+    };
+    // SAFETY: the kernel validates the descriptor and whence value.
+    let result = unsafe { libc::lseek(fd, offset, whence as libc::c_int) };
+    if result < 0 {
+        return os_error_from_io("lseek", std::io::Error::last_os_error(), None);
+    }
+    value::encode_int(result as i64)
+        .unwrap_or_else(|| exc::raise_with_message(exc::OVERFLOW_ERROR, "lseek offset overflow"))
+}
+
 fn os_access(args: &[i64]) -> i64 {
     let Some(path) = value::as_path_like(args[0]) else {
         return exc::raise_with_message(
@@ -16085,6 +16410,45 @@ fn runpy_get_module_details(args: &[i64]) -> i64 {
 
 // sys
 
+/// `sys.getsizeof(obj[, default])`: a shallow size estimate in bytes for the
+/// runtime representation. The exact numbers are Hydro's, not CPython's.
+fn sys_getsizeof(args: &[i64]) -> i64 {
+    let Some(object) = args.first().copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "getsizeof() missing required argument: 'object'",
+        );
+    };
+    let size = match value::type_name(object) {
+        "str" => value::as_str(object).map_or(49, |text| 49 + text.len() as i64),
+        "bytes" => value::as_bytes(object).map_or(33, |bytes| 33 + bytes.len() as i64),
+        "bytearray" => value::as_bytearray(object).map_or(56, |bytes| 56 + bytes.len() as i64),
+        "list" => value::as_list(object).map_or(56, |items| 56 + 8 * items.len() as i64),
+        "tuple" => value::as_tuple(object).map_or(40, |items| 40 + 8 * items.len() as i64),
+        "dict" => value::as_dict(object).map_or(64, |items| 64 + 16 * items.len() as i64),
+        "set" => value::as_set(object).map_or(216, |items| 216 + 8 * items.len() as i64),
+        "NoneType" => 16,
+        "bool" => 28,
+        "int" | "BigInt" => 32,
+        "float" => 24,
+        "complex" => 32,
+        "function" | "builtin_function_or_method" => 128,
+        "module" => 48,
+        _ => args.get(1).copied().unwrap_or_else(|| {
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "cannot determine size of object of type '{}'",
+                    value::type_name(object)
+                ),
+            )
+        }),
+    };
+    value::encode_int(size).unwrap_or_else(|| {
+        exc::raise_with_message(TYPE_ERROR, "object size does not fit in an integer")
+    })
+}
+
 fn sys_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "exit" => sys_exit(args),
@@ -16105,6 +16469,7 @@ fn sys_call(function: &str, args: &[i64]) -> i64 {
         // report `None` like CPython's installers.
         "settrace" | "setprofile" => NONE,
         "getrecursionlimit" => sys_getrecursionlimit(),
+        "getsizeof" => sys_getsizeof(args),
         "setrecursionlimit" => sys_setrecursionlimit(args),
         "_getframemodulename" => sys::getframemodulename(args),
         "_getframe" => sys::getframe(args),
@@ -16636,6 +17001,19 @@ fn sys_exit(args: &[i64]) -> i64 {
 /// translation is not implemented: `newline` is accepted and ignored for text
 /// mode, as are `errors`. Binary mode rejects `encoding`, `newline` and
 /// `errors` with `ValueError`, like CPython.
+/// `io.UnsupportedOperation`: an `OSError`/`ValueError` subclass used by the
+/// `_pyio` file objects.
+fn io_unsupported_operation_class() -> i64 {
+    let key = "io.UnsupportedOperation";
+    if let Some(class) = globals::registry_get(key) {
+        return class;
+    }
+    let base = exc::exception_class(exc::OS_ERROR);
+    let class = value::class_new("UnsupportedOperation".to_string(), base, Vec::new());
+    globals::registry_set(key, class);
+    class
+}
+
 fn io_call(function: &str, args: &[i64]) -> i64 {
     if let Some(method) = function.strip_prefix("StringIO.") {
         return string_io_method(method, args);

@@ -8,10 +8,36 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-10-30 ecosystem follow-up and README progress
+
+- The ecosystem gate now passes **9/13** cases under JIT and AOT: pydantic
+  2.14.1 import and model smoke, pydantic-core, python-dateutil, six,
+  typing-extensions, typing-inspection, annotated-types and tzdata. NumPy
+  remains on the `_multiarray_umath` DType/ArrayMethod check; pandas AOT
+  compilation stops on a static `len(self)` false positive.
+- Unblocked the remaining cases with variadic `map` (`hydro_map_many`),
+  `importlib.util.spec_from_loader`, `types.ClassType`, the bounded
+  `six.raise_from` exec shape, `itertools.chain.from_iterable` and legacy
+  aliases, multiple `**` call mappings, `open` as a value, package `__path__`,
+  `str(bytes, encoding=...)`, `csv` quote constants, `threading.Condition`
+  and the missing `os` link/chown/utime/sync/affinity/lseek surface.
+- Language/stdlib follow-up: multiple `*` call operands fold like multiple
+  `**` mappings; lambdas accept `*args`; `re.Match` supports subscripting;
+  `codecs` gained decoder/encoder factories and stream marker classes;
+  `locale.localeconv`, `sys.hash_info/getsizeof`, `io.UnsupportedOperation`
+  and `csv` quote constants are implemented.
+- Added the README compatibility progress chart and
+  `scripts/progress.py`, generated from the official CPython-test and stdlib
+  import reports.
+- The stdlib matrix now runs with `HYDRO_STDLIB` pointed at the pinned CPython
+  `Lib` tree (the earlier 159 count used the toolchain's default subset); the
+  same code imports **246/297** modules, so the previous report undercounted
+  the implementation by 87 modules.
+
 ### Compatibility — 2026-10-30 native stdlib and ecosystem continuation
 
-- Stdlib import matrix advanced to **233/297** (133 pure, 50 builtin/frozen,
-  50 extension, 1 CPython-failing; 64 failed). Added real `_sqlite3`/`sqlite3`
+- Stdlib import matrix advanced to **246/297** (144 pure, 50 builtin/frozen,
+  52 extension; 51 failed, 9 of them CPython-failing). Added real `_sqlite3`/`sqlite3`
   DB-API, `_ssl`/SSLContext factory surface, `_bz2`/`_lzma`, `pyexpat`,
   readline, `_curses`, CJK/ISO-2022 codec accelerators, `_dbm`/`_gdbm`,
   `_zstd`, SHA-3/SHAKE, and AST/importlib/OS surfaces.

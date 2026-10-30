@@ -249,6 +249,7 @@ mod tests {
             ("EISDIR", 21),
             ("ENOSPC", 28),
             ("EPIPE", 32),
+            ("ESPIPE", 29),
             ("ECONNREFUSED", 111),
             ("ENOTCONN", 107),
             ("ETIMEDOUT", 110),

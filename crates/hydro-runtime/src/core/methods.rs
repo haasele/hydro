@@ -510,7 +510,8 @@ fn super_getattr(proxy: i64, attr: &str) -> Option<i64> {
         );
     }
     let entry = entry?;
-    match entry {        value::ClassEntry::Method(MethodKind::Property, function) => {
+    match entry {
+        value::ClassEntry::Method(MethodKind::Property, function) => {
             let args = [state.object];
             Some(builtins::call(function, 1, args.as_ptr()))
         }
@@ -2569,6 +2570,19 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
                 }
                 return method;
             }
+        }
+        // `itertools.chain.from_iterable` is a classmethod on the `chain`
+        // type. Hydro exposes `chain` as a function value, so serve the one
+        // documented attribute explicitly.
+        if matches!(
+            &function.body,
+            value::FunctionBody::Native {
+                module: "itertools",
+                name: "chain"
+            }
+        ) && attr == "from_iterable"
+        {
+            return value::native_function_new("itertools", "chain.from_iterable", 1);
         }
         // CPython's bound-method metadata: `f.__self__` is the bound receiver
         // (the class for a classmethod, the instance for a method) and
@@ -4845,16 +4859,50 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
             })
         }
         "find" => {
-            if let Some(err) = check_arity("str", method, args.len(), 1, 1) {
+            if let Some(err) = check_arity("str", method, args.len(), 1, 3) {
                 return err;
             }
             let pat = match str_arg(method, 1, args[0]) {
                 Ok(s) => s,
                 Err(err) => return err,
             };
-            let position = match s.find(pat.as_str()) {
-                // `find` returns a character index, not a byte offset.
-                Some(byte) => s[..byte].chars().count() as i64,
+            let chars: Vec<char> = s.chars().collect();
+            let length = chars.len() as i64;
+            let mut start = match args.get(1).copied() {
+                Some(argument) => match value::as_integer(argument) {
+                    Some(index) => index,
+                    None => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            "find() index must be an integer",
+                        )
+                    }
+                },
+                None => 0,
+            };
+            if start < 0 {
+                start += length;
+            }
+            start = start.clamp(0, length);
+            let mut end = match args.get(2).copied() {
+                Some(argument) => match value::as_integer(argument) {
+                    Some(index) => index,
+                    None => {
+                        return exc::raise_with_message(TYPE_ERROR, "find() end must be an integer")
+                    }
+                },
+                None => length,
+            };
+            if end < 0 {
+                end += length;
+            }
+            end = end.clamp(0, length);
+            if start > end {
+                return ops::int_result(-1);
+            }
+            let window: String = chars[start as usize..end as usize].iter().collect();
+            let position = match window.find(pat.as_str()) {
+                Some(byte) => start + window[..byte].chars().count() as i64,
                 None => -1,
             };
             ops::int_result(position)
@@ -7364,6 +7412,16 @@ fn event_method(obj: i64, method: &str, args: &[i64]) -> i64 {
         return attribute_error(obj, method);
     };
     match method {
+        // `threading.Condition` is backed by the Event object; its lock
+        // protocol is a no-op (the runtime wait/set pair provides the wakeup).
+        "acquire" => value::TRUE,
+        "release" => NONE,
+        "__enter__" => obj,
+        "__exit__" => NONE,
+        "notify" | "notify_all" => {
+            event.set();
+            NONE
+        }
         "set" | "clear" | "is_set" => {
             if let Some(err) = check_arity("Event", method, args.len(), 0, 0) {
                 return err;

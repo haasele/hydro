@@ -368,6 +368,7 @@ fn validate_callable(function: i64) -> Result<(), String> {
         // code entry.
         value::FunctionBody::AttributeGetter { .. }
         | value::FunctionBody::ItemGetter { .. }
+        | value::FunctionBody::MethodCaller { .. }
         | value::FunctionBody::Partial { .. }
         | value::FunctionBody::BoundMethod { .. }
         | value::FunctionBody::Host { .. }

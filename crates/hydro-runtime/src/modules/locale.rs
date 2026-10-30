@@ -433,6 +433,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "setlocale" => setlocale(args),
         "getlocale" => getlocale(args),
         "getpreferredencoding" => getpreferredencoding(args),
+        "localeconv" => localeconv(),
         "getencoding" => getencoding(args),
         "normalize" => normalize(args),
         "strcoll" => strcoll(args),
@@ -449,6 +450,108 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
+/// `localeconv()`: the C `struct lconv` fields as a dict.
+fn localeconv() -> i64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `localeconv` returns a process-global struct owned by libc;
+        // every pointer is read before another locale call can mutate it.
+        let pointer = unsafe { libc::localeconv() };
+        if pointer.is_null() {
+            return value::dict_new(Vec::new());
+        }
+        // SAFETY: libc owns the struct for the process lifetime; no locale
+        // call runs while its strings are copied below.
+        let conv = unsafe { &*pointer };
+        let c_string = |pointer: *const libc::c_char| -> String {
+            if pointer.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(pointer) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        let grouping = |pointer: *const libc::c_char| -> Vec<i64> {
+            let mut out = Vec::new();
+            if pointer.is_null() {
+                return out;
+            }
+            let mut index = 0isize;
+            loop {
+                let byte = unsafe { *pointer.offset(index) };
+                if byte == 0 {
+                    break;
+                }
+                out.push(encode(byte as i64));
+                index += 1;
+            }
+            out
+        };
+        let keys: [(&str, i64); 23] = [
+            (
+                "decimal_point",
+                value::str_from_bytes(c_string(conv.decimal_point).as_bytes()),
+            ),
+            (
+                "thousands_sep",
+                value::str_from_bytes(c_string(conv.thousands_sep).as_bytes()),
+            ),
+            ("grouping", value::list_new(grouping(conv.grouping))),
+            (
+                "int_curr_symbol",
+                value::str_from_bytes(c_string(conv.int_curr_symbol).as_bytes()),
+            ),
+            (
+                "currency_symbol",
+                value::str_from_bytes(c_string(conv.currency_symbol).as_bytes()),
+            ),
+            (
+                "mon_decimal_point",
+                value::str_from_bytes(c_string(conv.mon_decimal_point).as_bytes()),
+            ),
+            (
+                "mon_thousands_sep",
+                value::str_from_bytes(c_string(conv.mon_thousands_sep).as_bytes()),
+            ),
+            ("mon_grouping", value::list_new(grouping(conv.mon_grouping))),
+            (
+                "positive_sign",
+                value::str_from_bytes(c_string(conv.positive_sign).as_bytes()),
+            ),
+            (
+                "negative_sign",
+                value::str_from_bytes(c_string(conv.negative_sign).as_bytes()),
+            ),
+            ("int_frac_digits", encode(conv.int_frac_digits as i64)),
+            ("frac_digits", encode(conv.frac_digits as i64)),
+            ("p_cs_precedes", encode(conv.p_cs_precedes as i64)),
+            ("p_sep_by_space", encode(conv.p_sep_by_space as i64)),
+            ("n_cs_precedes", encode(conv.n_cs_precedes as i64)),
+            ("n_sep_by_space", encode(conv.n_sep_by_space as i64)),
+            ("p_sign_posn", encode(conv.p_sign_posn as i64)),
+            ("n_sign_posn", encode(conv.n_sign_posn as i64)),
+            ("int_p_cs_precedes", encode(conv.int_p_cs_precedes as i64)),
+            ("int_p_sep_by_space", encode(conv.int_p_sep_by_space as i64)),
+            ("int_n_cs_precedes", encode(conv.int_n_cs_precedes as i64)),
+            ("int_n_sep_by_space", encode(conv.int_n_sep_by_space as i64)),
+            ("int_p_sign_posn", encode(conv.int_p_sign_posn as i64)),
+        ];
+        let roots = crate::heap::root_values(&keys.map(|(_, value)| value));
+        let pairs = keys
+            .iter()
+            .map(|(key, value)| (value::str_alloc((*key).to_string()), *value))
+            .collect();
+        let result = value::dict_new(pairs);
+        crate::heap::release_roots(roots);
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        value::dict_new(Vec::new())
+    }
+}
+
 /// Materialises a `locale` module constant.
 pub(crate) fn constant(name: &str) -> i64 {
     match name {
@@ -460,6 +563,7 @@ pub(crate) fn constant(name: &str) -> i64 {
         "LC_MESSAGES" => encode(LC_MESSAGES),
         "LC_ALL" => encode(LC_ALL),
         "Error" => error_class(),
+        "CHAR_MAX" => encode(127),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'locale' has no attribute '{name}'"),

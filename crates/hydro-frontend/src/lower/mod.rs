@@ -2443,6 +2443,13 @@ impl<'a> Lowerer<'a> {
             && (self.session_globals.contains(name) || self.unit_bound_names.contains(name))
     }
 
+    /// Whether a unit-level binding shadows a builtin name. This covers an
+    /// assignment lower in the file (Python resolves module globals at call
+    /// time), so call sites use it instead of the session-only predicate.
+    fn unit_shadows_builtin(&self, name: &str) -> bool {
+        self.unit_bound_names.contains(name) || self.session_shadows_builtin(name)
+    }
+
     /// Makes resolved user modules (and their exported functions) visible.
     pub fn set_user_modules(&mut self, modules: HashMap<String, UserModule>) {
         self.user_modules = modules;
@@ -3946,6 +3953,25 @@ impl<'a> Lowerer<'a> {
             let value = Self::dunder_const(Const::Str(self.package.clone()));
             inits.push(Self::dunder_assign(local, value));
             inits.push(self.dunder_global_set("__package__", local, Ty::Concrete(Type::Str)));
+        }
+
+        // A package `__init__.py` owns a search path (CPython installs
+        // `__path__` from the spec). The module body may read it directly
+        // (`logging` uses `__path__[0]` while walking a traceback frame).
+        if is_package && (exports_metadata || self.dunder_loads(body, "__path__")) {
+            let local = self.dunder_local(module_locals, "__path__", Ty::Concrete(Type::Any));
+            let spec = self.module_spec_expr(true);
+            let value = HExpr {
+                kind: HExprKind::GetAttr {
+                    object: Box::new(spec),
+                    name: "submodule_search_locations".to_string(),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line: 1,
+                col: 1,
+            };
+            inits.push(Self::dunder_assign(local, value));
+            inits.push(self.dunder_global_set("__path__", local, Ty::Concrete(Type::Any)));
         }
 
         if exports_metadata || self.dunder_loads(body, "__file__") {
@@ -16730,6 +16756,34 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
+                } else if name == "open" && !self.unit_shadows_builtin(name) {
+                    // `open` is `io.open`; builtin references go through the
+                    // native function value instead of a `Builtin` variant.
+                    HExpr {
+                        kind: HExprKind::ModuleAttr {
+                            module: "io".to_string(),
+                            name: "open".to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Function),
+                        line,
+                        col,
+                    }
+                } else if name == "__path__"
+                    && !self.package.is_empty()
+                    && self.package == self.dunder_name
+                {
+                    // Package `__init__.py` modules get their search path from
+                    // the loader; the module body may read it directly.
+                    self.used_globals.insert(name.to_string());
+                    HExpr {
+                        kind: HExprKind::GlobalGet {
+                            module: self.dunder_name.clone(),
+                            name: name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
                 } else if let Some(builtin) = builtin_by_name(name) {
                     HExpr {
                         kind: HExprKind::BuiltinRef(builtin),
@@ -17647,13 +17701,6 @@ impl<'a> Lowerer<'a> {
         }
 
         let mut rejected = false;
-        if let Some(vararg) = &l.args.vararg {
-            self.error_at(
-                vararg.range,
-                "lambda varargs (*args) parameters are not supported",
-            );
-            rejected = true;
-        }
         if let Some(first) = l.args.kwonlyargs.first() {
             self.error_at(
                 first.def.range,
@@ -17808,6 +17855,17 @@ impl<'a> Lowerer<'a> {
                 default,
                 default_expr,
                 ParamKind::Positional,
+                &mut params,
+                &mut locals,
+                &mut seen,
+            );
+        }
+        if let Some(vararg) = &l.args.vararg {
+            self.add_param(
+                vararg,
+                None,
+                None,
+                ParamKind::VarArg,
                 &mut params,
                 &mut locals,
                 &mut seen,
@@ -19736,8 +19794,9 @@ impl<'a> Lowerer<'a> {
         }
 
         // Bare `open(...)` is the io.open alias unless the name is shadowed.
-        // Locals, imports and user functions were handled above.
-        if name == "open" && !self.fn_ids.contains_key(name) {
+        // Locals, imports and user functions were handled above; a module-level
+        // assignment to `open` (even later in the file) also shadows it.
+        if name == "open" && !self.fn_ids.contains_key(name) && !self.unit_shadows_builtin(name) {
             let spec =
                 stdlib::function("io", "open").expect("io.open is declared in the stdlib table");
             let Some((args, keywords)) = self.module_arguments(call, fs, spec, line, col) else {
@@ -19813,7 +19872,7 @@ impl<'a> Lowerer<'a> {
         // `setattr`/`delattr`/`pow` are served by the `builtins` module
         // dispatch, so the call goes through the module ABI (which also
         // validates arity).
-        if is_attribute_only_builtin(name) && !self.session_shadows_builtin(name) {
+        if is_attribute_only_builtin(name) && !self.unit_shadows_builtin(name) {
             if call_has_dynamic_arguments(call) {
                 return self.lower_dynamic_call(call, fs, line, col);
             }
@@ -19837,8 +19896,7 @@ impl<'a> Lowerer<'a> {
 
         // A builtin call binds the few keywords it supports (`max(key=...)`,
         // `min(key=...)`) and rejects the rest.
-        if let Some(builtin) = builtin_by_name(name).filter(|_| !self.session_shadows_builtin(name))
-        {
+        if let Some(builtin) = builtin_by_name(name).filter(|_| !self.unit_shadows_builtin(name)) {
             // `print(*args, sep=, end=, file=, flush=)` is the one builtin
             // whose keywords the runtime binder implements. Lower it through
             // the keyword call ABI (the builtin function value), keeping the
@@ -19894,6 +19952,38 @@ impl<'a> Lowerer<'a> {
             // above.
             if builtin == Builtin::Dict && !call.keywords.is_empty() {
                 return self.lower_dict_keywords(call, fs, line, col);
+            }
+            // `str(bytes, encoding=..., errors=...)` is bytes decoding, not
+            // object stringification. Lower it to the equivalent
+            // `bytes.decode` call so the encoding keywords bind.
+            if builtin == Builtin::Str && !call.keywords.is_empty() {
+                if call_has_dynamic_arguments(call) || call.args.len() != 1 {
+                    return self.error_expr(call.range);
+                }
+                let object = self.expr(&call.args[0], fs);
+                let mut args = Vec::new();
+                for keyword in &call.keywords {
+                    let Some(name) = keyword.arg.as_ref() else {
+                        return self.error_expr(call.range);
+                    };
+                    if !matches!(name.as_str(), "encoding" | "errors") {
+                        return self.error_expr(call.range);
+                    }
+                    args.push(self.expr(&keyword.value, fs));
+                }
+                return HExpr {
+                    kind: HExprKind::MethodCall {
+                        object: Box::new(object),
+                        method: "decode".to_string(),
+                        args,
+                        star: None,
+                        keywords: Vec::new(),
+                        double_star: None,
+                    },
+                    ty: self.infer.fresh(),
+                    line,
+                    col,
+                };
             }
             let Some(mut args) = self.builtin_call_arguments(builtin, call, fs, line, col) else {
                 return self.error_expr(call.range);
@@ -20335,11 +20425,10 @@ impl<'a> Lowerer<'a> {
     /// arguments, at most one starred operand, the named keyword values and at
     /// most one `**mapping` (which must come last).
     ///
-    /// The IR has a single star slot, so positional operands written after
-    /// `*iterable` are folded into it as `tuple(iterable) + (rest)` (evaluated
-    /// in source order). A second `*` and a `**` that is not last are
-    /// diagnosed at the call site instead of silently reordering side
-    /// effects.
+    /// The IR has a single star slot, so several starred operands and
+    /// positional operands written after them are folded into one tuple
+    /// concatenation in source order. A `**` that is not last is diagnosed
+    /// instead of silently reordering side effects.
     #[allow(clippy::type_complexity)]
     fn call_operands(
         &mut self,
@@ -20351,15 +20440,45 @@ impl<'a> Lowerer<'a> {
         let mut post_star: Vec<HExpr> = Vec::new();
         for arg in &call.args {
             if let ast::Expr::Starred(starred) = arg {
-                if star.is_some() {
-                    self.error_at_code(
-                        starred.range,
-                        codes::CALL,
-                        "only one starred argument is supported",
-                    );
-                    return None;
+                let (line, col) = self.span(arg.range());
+                let next = self.expr(&starred.value, fs);
+                if let Some(previous) = star.take() {
+                    // PEP 448 allows several `*` operands. Concatenate the
+                    // tuple forms in source order; any plain operands since
+                    // the previous star become one tuple segment.
+                    let mut combined = self.expr_to_tuple(previous, line, col);
+                    if !post_star.is_empty() {
+                        let middle = HExpr {
+                            kind: HExprKind::Tuple(std::mem::take(&mut post_star)),
+                            ty: Ty::Concrete(Type::Tuple),
+                            line,
+                            col,
+                        };
+                        combined = HExpr {
+                            kind: HExprKind::Bin {
+                                op: BinOp::Add,
+                                lhs: Box::new(combined),
+                                rhs: Box::new(middle),
+                            },
+                            ty: Ty::Concrete(Type::Tuple),
+                            line,
+                            col,
+                        };
+                    }
+                    let next = self.expr_to_tuple(next, line, col);
+                    star = Some(HExpr {
+                        kind: HExprKind::Bin {
+                            op: BinOp::Add,
+                            lhs: Box::new(combined),
+                            rhs: Box::new(next),
+                        },
+                        ty: Ty::Concrete(Type::Tuple),
+                        line,
+                        col,
+                    });
+                } else {
+                    star = Some(next);
                 }
-                star = Some(self.expr(&starred.value, fs));
                 continue;
             }
             if star.is_some() {
@@ -20398,17 +20517,24 @@ impl<'a> Lowerer<'a> {
         let mut double_star: Option<HExpr> = None;
         for keyword in &call.keywords {
             let Some(name) = keyword.arg.as_ref() else {
-                if double_star.is_some() {
-                    self.error_at_code(
-                        keyword.range,
-                        codes::CALL,
-                        "only one **mapping argument is allowed",
-                    );
-                    return None;
-                }
                 // The IR keeps one flattened `**mapping` slot, evaluated after
-                // the named keywords. A second `**` cannot be represented.
-                double_star = Some(self.expr(&keyword.value, fs));
+                // the named keywords. The language allows several `**`
+                // operands, so fold them with the insertion-order,
+                // last-wins `DictMerge` builtin.
+                let (line, col) = self.span(keyword.value.range());
+                let next = self.expr(&keyword.value, fs);
+                double_star = Some(match double_star.take() {
+                    Some(previous) => HExpr {
+                        kind: HExprKind::Call {
+                            callee: Callee::Builtin(Builtin::DictMerge),
+                            args: vec![previous, next],
+                        },
+                        ty: Ty::Concrete(Type::Dict),
+                        line,
+                        col,
+                    },
+                    None => next,
+                });
                 continue;
             };
             // CPython has allowed `f(**mapping, name=value)` since 3.5: the
@@ -20968,15 +21094,20 @@ impl<'a> Lowerer<'a> {
         let mut dstar: Option<HExpr> = None;
         for keyword in &call.keywords {
             let Some(name) = keyword.arg.as_ref() else {
-                if dstar.is_some() {
-                    self.error_at_code(
-                        keyword.range,
-                        codes::CALL,
-                        "only one **mapping argument is allowed",
-                    );
-                    return None;
-                }
-                dstar = Some(self.expr(&keyword.value, fs));
+                let (line, col) = self.span(keyword.value.range());
+                let next = self.expr(&keyword.value, fs);
+                dstar = Some(match dstar.take() {
+                    Some(previous) => HExpr {
+                        kind: HExprKind::Call {
+                            callee: Callee::Builtin(Builtin::DictMerge),
+                            args: vec![previous, next],
+                        },
+                        ty: Ty::Concrete(Type::Dict),
+                        line,
+                        col,
+                    },
+                    None => next,
+                });
                 continue;
             };
             let matched = params

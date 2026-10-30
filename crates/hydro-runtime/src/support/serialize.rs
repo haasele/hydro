@@ -237,6 +237,7 @@ fn encode_value(
             // no registry entry to reconstruct them from.
             FunctionBody::AttributeGetter { .. }
             | FunctionBody::ItemGetter { .. }
+            | FunctionBody::MethodCaller { .. }
             | FunctionBody::Partial { .. }
             | FunctionBody::BoundMethod { .. }
             | FunctionBody::Host { .. }
@@ -693,6 +694,7 @@ mod tests {
             }
             crate::value::FunctionBody::AttributeGetter { .. }
             | crate::value::FunctionBody::ItemGetter { .. }
+            | crate::value::FunctionBody::MethodCaller { .. }
             | crate::value::FunctionBody::Partial { .. }
             | crate::value::FunctionBody::BoundMethod { .. }
             | crate::value::FunctionBody::Host { .. }

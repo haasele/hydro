@@ -112,7 +112,9 @@ Versions and dist-info RECORD digests are verified before any case runs.
 | Status | Cases |
 | --- | ---: |
 | aot_build_error | 2 |
-| **Total** | 2 |
+| pass | 9 |
+| runtime_error | 2 |
+| **Total** | 13 |
 
 A case passes only when the oracle, Hydro JIT and (unless `--no-aot`) the AOT binary all exit 0 with byte-identical stdout.
 
@@ -120,7 +122,18 @@ A case passes only when the oracle, Hydro JIT and (unless `--no-aot`) the AOT bi
 
 | Case | CPython | Hydro JIT | Hydro AOT | Status | Detail |
 | --- | --- | --- | --- | --- | --- |
-| `numpy:import` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 2): tea: C compiler 'cc' failed while linking '<tmp>/aot_binary' (exit code 1) |
-| `numpy:smoke` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 2): tea: C compiler 'cc' failed while linking '<tmp>/aot_binary' (exit code 1) |
+| `numpy:import` | ok | exit 1 | exit 1 | runtime_error | jit: TypeError: ArrayMethod provided object <class 'numpy.dtypes.Float16DType'> is not a DType.(method: half_sort) |
+| `numpy:smoke` | ok | exit 1 | exit 1 | runtime_error | jit: TypeError: ArrayMethod provided object <class 'numpy.dtypes.Float16DType'> is not a DType.(method: half_sort) |
+| `pandas:import` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0002]: error[HYD0002]: only simple exception names are supported |
+| `pandas:smoke` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0002]: error[HYD0002]: only simple exception names are supported |
+| `pydantic:import` | ok | ok | ok | pass | - |
+| `pydantic:smoke` | ok | ok | ok | pass | - |
+| `pydantic-core:import` | ok | ok | ok | pass | - |
+| `python-dateutil:import` | ok | ok | ok | pass | - |
+| `six:import` | ok | ok | ok | pass | - |
+| `typing-extensions:import` | ok | ok | ok | pass | - |
+| `typing-inspection:import` | ok | ok | ok | pass | - |
+| `annotated-types:import` | ok | ok | ok | pass | - |
+| `tzdata:import` | ok | ok | ok | pass | - |
 
 <!-- END GENERATED ECOSYSTEM RESULTS -->

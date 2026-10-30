@@ -26,7 +26,7 @@ GC tracking, constants/keywords), and `tea install` for wheels with an
 abi3 smoke. **Still open and blocking full parity:** runtime dynamic
 imports/`compile`/`eval`/`globals`/`locals`/`vars`, class-body statements
 such as `del`, `builtins.__dict__`, `ast.parse/unparse`, `except*` grouping,
-and the NumPy/pydantic ABI gate; the official CPython baseline has not been
+and the NumPy/pandas ABI gate; the official CPython baseline has not been
 regenerated after this slice. Full P7/P4-10 remains open.
 Phase 1 is complete; Phase 2 is complete. It includes lazy/async generators,
 coroutines and task groups, precise shadow-stack roots (strict mode
@@ -422,8 +422,8 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`); `required`
       stays empty until a never-regress subset is pinned. It grows only from
       real `hydro_pass` results.
-      Stdlib import baseline 2026-10-30: **233/297 importable** (50
-      builtin/frozen, 133 pure, 50 extension, 1 `cpython_failed`; 64 failed). Batch A of
+      Stdlib import baseline 2026-10-30: **246/297 importable** (50
+      builtin/frozen, 144 pure, 52 extension; 9 CPython-failing; 51 failed). Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
       `_heapq`/`heapq`, `colorsys`, `keyword`, `_stat`/`stat`,
       `_operator`, `_functools`, `_io`), the Batch B native core
@@ -794,7 +794,7 @@ code, span, help and stable exit code; `--json` is documented and tested.
 Goal: the CPython 3.14.9 standard library works on the Hydro runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
-from it). Status 2026-10-30: **233/297 modules importable**, **64 failed**
+from it). Status 2026-10-30: **246/297 modules importable**, **51 failed**
 (including 9 modules where CPython 3.14.9 itself fails on this host).
 
 The package/site-packages loader (P7-01) is in place: packages with
@@ -1053,7 +1053,7 @@ marks a module CPython ships only for a
 platform Hydro does not target on this host (Windows/Apple), tracked as
 platform-unsupported rather than implemented.
 
-Current matrix: 233/297 importable, 64 failed (including 9 modules CPython
+Current matrix: 246/297 importable, 51 failed (including 9 modules CPython
 3.14.9 itself fails). The ledger is the work list for the failed entries;
 checked entries count as delivered slices, not as complete parity.
 
@@ -1398,19 +1398,19 @@ is implemented for the v1 slice, and Tier 4/NB-6 is a tested pilot.
       - [x] Link-time symbol surface for the pinned wheels; CPython-compatible
             handle/tuple/list layout; pydantic 2.14.1 import (with the vendored
             `enum`/typing surface).
-      - [ ] pydantic model smoke: TypedDict naming/PEP 649 annotations,
-            ConfigDict, lazy `pydantic.main` dispatch, uuid/enum/object
-            protocol and model-field construction work; importing `pydantic`
-            is still blocked by native-scalar subclass allocation for
-            `IntEnum` (`AnnotationSource.ANY`).
+      - [x] pydantic 2.14.1 import and model smoke pass under JIT and AOT
+            (TypedDict naming, lazy `pydantic.main` dispatch, enum/uuid/object
+            protocol and model-field construction).
       - [ ] NumPy 2.5 import/smoke: module init passes `sys.flags`,
             `PyType_Ready` base adoption, `PyContextVar_New`, `Py_BuildValue`
             and `PyErr_Format`; it stops on a DType/ArrayMethod type check.
-      - [ ] pandas 3.1 import/smoke: not reached yet.
+      - [ ] pandas 3.1 import/smoke: compilation now reaches
+            `pandas/io/common.py`; the remaining blocker is `except` with a
+            dynamic exception expression (`except tuple(...)`).
       - [x] Full `tp_traverse`/`tp_clear`, GIL/thread integration and the
             threaded callback + GC stress gate (`PyGC_Collect` production
             pass; visitproc order fixed).
-- [ ] NB-7 Stdlib parity: 233/297 importable; 297/297 must be accounted for
+- [ ] NB-7 Stdlib parity: 246/297 importable; 297/297 must be accounted for
       (import + mapped `Lib/test` subset green, or documented unsupported).
       Tracked by P7 above; P7 is **not** complete.
 

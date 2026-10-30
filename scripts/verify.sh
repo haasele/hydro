@@ -40,4 +40,7 @@ echo "== fuzz smoke =="
 echo "== CPython manifest (offline) =="
 python3 scripts/cpython_compat.py --check-manifest
 
+echo "== progress chart =="
+python3 scripts/progress.py --check
+
 echo "ALL GREEN (Hydro)"

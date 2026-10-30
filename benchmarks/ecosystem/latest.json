@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-10-30T18:48:28Z",
+    "date": "2026-10-30T22:55:16Z",
     "python": "CPython 3.14.9",
     "python_version": "3.14.9",
     "python_executable": "/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14",
@@ -16,15 +16,13 @@
     "pins": "/mnt/Vault/GitHub/hydro/benchmarks/ecosystem/pins.json",
     "options": {
       "suite": "all",
-      "only": [
-        "numpy"
-      ],
-      "timeout": 180.0,
+      "only": null,
+      "timeout": 120.0,
       "aot": true,
       "tests": null
     },
     "cwd": "/mnt/Vault/GitHub/hydro",
-    "elapsed_seconds": 35.8,
+    "elapsed_seconds": 92.7,
     "pins_ok": true,
     "upstream_note": null
   },
@@ -171,11 +169,13 @@
     }
   ],
   "counts": {
-    "total": 2,
-    "pass": 0,
-    "failed": 2,
+    "total": 13,
+    "pass": 9,
+    "failed": 4,
     "by_status": {
-      "aot_build_error": 2
+      "aot_build_error": 2,
+      "pass": 9,
+      "runtime_error": 2
     }
   },
   "cases": [
@@ -183,8 +183,8 @@
       "id": "numpy:import",
       "package": "numpy",
       "kind": "import",
-      "status": "aot_build_error",
-      "detail": "AOT build failed (exit 2): tea: C compiler 'cc' failed while linking '<tmp>/aot_binary' (exit code 1)",
+      "status": "runtime_error",
+      "detail": "jit: TypeError: ArrayMethod provided object <class 'numpy.dtypes.Float16DType'> is not a DType.(method: half_sort)",
       "differences": {},
       "runs": {
         "cpython": {
@@ -199,36 +199,44 @@
         "jit": {
           "exit": 1,
           "timed_out": false,
-          "duration_ms": 9016.8,
+          "duration_ms": 7238.2,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
-          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-n6_glvck/import_numpy.py\", line 37, in numpy._typing._dtype_like.<module>\nAttributeError: module 'numpy' has no attribute 'dtype'\n"
+          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-fwy3sl7q/import_numpy.py\", line 83, in numpy._core.overrides.<module>\nTypeError: ArrayMethod provided object <class 'numpy.dtypes.Float16DType'> is not a DType.(method: half_sort)\n"
         },
-        "aot": null
+        "aot": {
+          "exit": 1,
+          "timed_out": false,
+          "duration_ms": 32.4,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-fwy3sl7q/import_numpy.py\", line 83, in numpy._core.overrides.<module>\nTypeError: ArrayMethod provided object <class 'numpy.dtypes.Float16DType'> is not a DType.(method: half_sort)\n"
+        }
       },
       "aot_build": {
-        "exit": 2,
+        "exit": 0,
         "timed_out": false,
-        "duration_ms": 9380.6,
+        "duration_ms": 7626.8,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
-        "stderr_tail": "/usr/bin/ld: /tmp/tea-1098974-1793386090592370132-0.o: in function `__hydro_fn_1768':\nhydro_module:(.text+0x1ce658a): undefined reference to `hydro_map_many'\n/usr/bin/ld: /tmp/tea-1098974-1793386090592370132-0.o: in function `__hydro_fn_2124':\nhydro_module:(.text+0x2174fd3): undefined reference to `hydro_map_many'\n/usr/bin/ld: /tmp/tea-1098974-1793386090592370132-0.o: in function `__hydro_fn_2149':\nhydro_module:(.text+0x220f24c): undefined reference to `hydro_map_many'\ncollect2: error: ld returned 1 exit status\ntea: C compiler 'cc' failed while linking '/tmp/hydro-ecosystem-n6_glvck/aot_binary' (exit code 1)\n"
+        "stderr_tail": ""
       }
     },
     {
       "id": "numpy:smoke",
       "package": "numpy",
       "kind": "smoke",
-      "status": "aot_build_error",
-      "detail": "AOT build failed (exit 2): tea: C compiler 'cc' failed while linking '<tmp>/aot_binary' (exit code 1)",
+      "status": "runtime_error",
+      "detail": "jit: TypeError: ArrayMethod provided object <class 'numpy.dtypes.Float16DType'> is not a DType.(method: half_sort)",
       "differences": {},
       "runs": {
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 156.4,
+          "duration_ms": 138.9,
           "stdout_sha256": "0323dea80ac074f1bd604113f98b1dbb4ead84e0c3423ee62aede3d3ec5712e1",
           "stdout_bytes": 763,
           "stdout": "numpy 2.5.0\narray (3, 4) <i8 [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]\nreduce 66 5.5 11\naxis [6, 22, 38]\nslice [[4, 6], [8, 10]]\ntranspose (4, 3) [0, 4, 8]\nlinspace [0.0, 0.25, 0.5, 0.75, 1.0]\nbroadcast [[10, 21, 32, 43], [14, 25, 36, 47]]\nufunc [1.0, 1.414214, 1.732051, 2.0, 2.236068]\nwhere [[0, -1, 2, -1], [4, -1, 6, -1], [8, -1, 10, -1]]\nclip [[2, 2, 2, 3], [4, 5, 6, 7], [7, 7, 7, 7]]\nunique [0, 1, 2, 3, 4]\ndet 11.0\ninv [[0.272727, -0.090909], [-0.090909, 0.363636]]\nsolve [0.090909, 0.636364]\neigh [2.381966, 4.618034]\nmatmul [[58, 64], [139, 154]]\neinsum [[58, 64], [139, 154]]\nrandom [0.205682, 0.738822, 0.125443, 0.517044]\nrandom_int [93, 1, 57, 31, 97]\nsave_load (3, 4) <i8 True\nargmax [3, 3, 3]\nsort [1, 2, 3]\nastype 66.0\ndatetime64 2020-01-06 8\n",
@@ -237,22 +245,520 @@
         "jit": {
           "exit": 1,
           "timed_out": false,
-          "duration_ms": 7296.5,
+          "duration_ms": 7206.2,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
-          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-b028b2nz/numpy_smoke.py\", line 37, in numpy._typing._dtype_like.<module>\nAttributeError: module 'numpy' has no attribute 'dtype'\n"
+          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-u_l1b5yy/numpy_smoke.py\", line 83, in numpy._core.overrides.<module>\nTypeError: ArrayMethod provided object <class 'numpy.dtypes.Float16DType'> is not a DType.(method: half_sort)\n"
+        },
+        "aot": {
+          "exit": 1,
+          "timed_out": false,
+          "duration_ms": 26.8,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-u_l1b5yy/numpy_smoke.py\", line 83, in numpy._core.overrides.<module>\nTypeError: ArrayMethod provided object <class 'numpy.dtypes.Float16DType'> is not a DType.(method: half_sort)\n"
+        }
+      },
+      "aot_build": {
+        "exit": 0,
+        "timed_out": false,
+        "duration_ms": 7558.0,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": ""
+      }
+    },
+    {
+      "id": "pandas:import",
+      "package": "pandas",
+      "kind": "import",
+      "status": "aot_build_error",
+      "detail": "AOT build failed (exit 1) [HYD0002]: error[HYD0002]: only simple exception names are supported",
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 797.7,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 1,
+          "timed_out": false,
+          "duration_ms": 7587.9,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": "error[HYD0002]: only simple exception names are supported\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/io/common.py:458:16\n     |\n 458 |         except tuple(err_types_to_retry_with_anon):\n     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n     |\n     = help: this construct is not implemented yet; see docs/TODO.md\nerror: could not compile '/tmp/hydro-ecosystem-wilfg59i/import_pandas.py' due to 1 previous error(s)\n"
         },
         "aot": null
       },
       "aot_build": {
-        "exit": 2,
+        "exit": 1,
         "timed_out": false,
-        "duration_ms": 9884.3,
+        "duration_ms": 7544.3,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
-        "stderr_tail": "/usr/bin/ld: /tmp/tea-1099084-1793386107801558380-0.o: in function `__hydro_fn_1768':\nhydro_module:(.text+0x1ce65c2): undefined reference to `hydro_map_many'\n/usr/bin/ld: /tmp/tea-1099084-1793386107801558380-0.o: in function `__hydro_fn_2124':\nhydro_module:(.text+0x217500b): undefined reference to `hydro_map_many'\n/usr/bin/ld: /tmp/tea-1099084-1793386107801558380-0.o: in function `__hydro_fn_2149':\nhydro_module:(.text+0x220f284): undefined reference to `hydro_map_many'\ncollect2: error: ld returned 1 exit status\ntea: C compiler 'cc' failed while linking '/tmp/hydro-ecosystem-b028b2nz/aot_binary' (exit code 1)\n"
+        "stderr_tail": "error[HYD0002]: only simple exception names are supported\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/io/common.py:458:16\n     |\n 458 |         except tuple(err_types_to_retry_with_anon):\n     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n     |\n     = help: this construct is not implemented yet; see docs/TODO.md\nerror: could not compile '/tmp/hydro-ecosystem-wilfg59i/import_pandas.py' due to 1 previous error(s)\n"
+      }
+    },
+    {
+      "id": "pandas:smoke",
+      "package": "pandas",
+      "kind": "smoke",
+      "status": "aot_build_error",
+      "detail": "AOT build failed (exit 1) [HYD0002]: error[HYD0002]: only simple exception names are supported",
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 755.6,
+          "stdout_sha256": "91c875a0b4440cfe6a66b140568641712c927e7efbb615c66112b566fe8fcecd",
+          "stdout_bytes": 561,
+          "stdout": "pandas 3.1.0\nseries [4, 1, 3, 2] ['d', 'a', 'c', 'b'] int64\nstats 10 2.5 4 d\nsorted [1, 2, 3, 4]\nshape (4, 3)\ncolumns ['group', 'value', 'flag']\ndtypes ['str', 'int64', 'bool']\nvalue_sum 14 3.5\ngroupby_sum {'x': 4, 'y': 10}\ngroupby_agg {'count': [2, 2], 'min': [1, 2], 'max': [3, 8]}\nmerge ['a', 'b', 'c'] [-1, 20, 30]\nconcat (8, 3) 28\nmissing [False, True, False] [1.0, 0.0, 3.0]\nffill [1.0, 1.0, 3.0]\ncsv [1, 2] ['x', 'y']\ndatetime ['2021-01-01', '2021-01-04', '2021-02-01']\ndelta_days 3\ndayofweek [4, 0, 0] month [1, 1, 2]\npivot ['x', 'y'] [4, 10]\ncast 14.0\n",
+          "stderr_tail": "/tmp/hydro-ecosystem-576giz9b/pandas_smoke.py:70: Pandas4Warning: Series.dt.dayofweek is deprecated and will be removed in a future version. Use Series.dt.day_of_week instead.\n  print(\"dayofweek\", dates.dt.dayofweek.tolist(), \"month\", dates.dt.month.tolist())\n"
+        },
+        "jit": {
+          "exit": 1,
+          "timed_out": false,
+          "duration_ms": 7570.4,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": "error[HYD0002]: only simple exception names are supported\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/io/common.py:458:16\n     |\n 458 |         except tuple(err_types_to_retry_with_anon):\n     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n     |\n     = help: this construct is not implemented yet; see docs/TODO.md\nerror: could not compile '/tmp/hydro-ecosystem-576giz9b/pandas_smoke.py' due to 1 previous error(s)\n"
+        },
+        "aot": null
+      },
+      "aot_build": {
+        "exit": 1,
+        "timed_out": false,
+        "duration_ms": 7690.7,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": "error[HYD0002]: only simple exception names are supported\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/io/common.py:458:16\n     |\n 458 |         except tuple(err_types_to_retry_with_anon):\n     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n     |\n     = help: this construct is not implemented yet; see docs/TODO.md\nerror: could not compile '/tmp/hydro-ecosystem-576giz9b/pandas_smoke.py' due to 1 previous error(s)\n"
+      }
+    },
+    {
+      "id": "pydantic:import",
+      "package": "pydantic",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 72.6,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 5683.5,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 548.1,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        }
+      },
+      "aot_build": {
+        "exit": 0,
+        "timed_out": false,
+        "duration_ms": 5531.6,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": ""
+      }
+    },
+    {
+      "id": "pydantic:smoke",
+      "package": "pydantic",
+      "kind": "smoke",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 105.5,
+          "stdout_sha256": "fc64c59b9e537b2d8b714b4582007e0a9ff566f316d0cb49db0a4c920fe3ca55",
+          "stdout_bytes": 785,
+          "stdout": "pydantic 2.14.1 core 2.50.1\ndump {'id': 7, 'name': 'Ada', 'email': None, 'tags': ['admin'], 'address': {'city': 'London', 'zip_code': 12345}}\ndump_alias {'id': 7, 'name': 'Ada', 'email': None, 'tags': ['admin'], 'address': {'city': 'London', 'zip': 12345}}\njson {\"id\":7,\"name\":\"Ada\",\"email\":null,\"tags\":[\"admin\"],\"address\":{\"city\":\"London\",\"zip_code\":12345}}\nroundtrip True\nerrors 2\nerror_types ['int_parsing', 'string_type']\nerror_locs [['id'], ['name']]\ncoerce {'x': 1.5, 'y': 2.0}\nadapter [1, 2, 3]\nadapter_json [4, 5]\nschema_keys ['$defs', 'properties', 'required', 'title', 'type']\nschema_properties ['address', 'email', 'id', 'name', 'tags']\nschema_required ['id', 'name']\ndefs ['Address']\ncore_py 42\ncore_json 7\ncore_error 1 ['int_parsing']\ntyped_dict {'name': 'Bob', 'age': 3}\n",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 5610.4,
+          "stdout_sha256": "fc64c59b9e537b2d8b714b4582007e0a9ff566f316d0cb49db0a4c920fe3ca55",
+          "stdout_bytes": 785,
+          "stdout": "pydantic 2.14.1 core 2.50.1\ndump {'id': 7, 'name': 'Ada', 'email': None, 'tags': ['admin'], 'address': {'city': 'London', 'zip_code': 12345}}\ndump_alias {'id': 7, 'name': 'Ada', 'email': None, 'tags': ['admin'], 'address': {'city': 'London', 'zip': 12345}}\njson {\"id\":7,\"name\":\"Ada\",\"email\":null,\"tags\":[\"admin\"],\"address\":{\"city\":\"London\",\"zip_code\":12345}}\nroundtrip True\nerrors 2\nerror_types ['int_parsing', 'string_type']\nerror_locs [['id'], ['name']]\ncoerce {'x': 1.5, 'y': 2.0}\nadapter [1, 2, 3]\nadapter_json [4, 5]\nschema_keys ['$defs', 'properties', 'required', 'title', 'type']\nschema_properties ['address', 'email', 'id', 'name', 'tags']\nschema_required ['id', 'name']\ndefs ['Address']\ncore_py 42\ncore_json 7\ncore_error 1 ['int_parsing']\ntyped_dict {'name': 'Bob', 'age': 3}\n",
+          "stderr_tail": ""
+        },
+        "aot": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 569.7,
+          "stdout_sha256": "fc64c59b9e537b2d8b714b4582007e0a9ff566f316d0cb49db0a4c920fe3ca55",
+          "stdout_bytes": 785,
+          "stdout": "pydantic 2.14.1 core 2.50.1\ndump {'id': 7, 'name': 'Ada', 'email': None, 'tags': ['admin'], 'address': {'city': 'London', 'zip_code': 12345}}\ndump_alias {'id': 7, 'name': 'Ada', 'email': None, 'tags': ['admin'], 'address': {'city': 'London', 'zip': 12345}}\njson {\"id\":7,\"name\":\"Ada\",\"email\":null,\"tags\":[\"admin\"],\"address\":{\"city\":\"London\",\"zip_code\":12345}}\nroundtrip True\nerrors 2\nerror_types ['int_parsing', 'string_type']\nerror_locs [['id'], ['name']]\ncoerce {'x': 1.5, 'y': 2.0}\nadapter [1, 2, 3]\nadapter_json [4, 5]\nschema_keys ['$defs', 'properties', 'required', 'title', 'type']\nschema_properties ['address', 'email', 'id', 'name', 'tags']\nschema_required ['id', 'name']\ndefs ['Address']\ncore_py 42\ncore_json 7\ncore_error 1 ['int_parsing']\ntyped_dict {'name': 'Bob', 'age': 3}\n",
+          "stderr_tail": ""
+        }
+      },
+      "aot_build": {
+        "exit": 0,
+        "timed_out": false,
+        "duration_ms": 5471.7,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": ""
+      }
+    },
+    {
+      "id": "pydantic-core:import",
+      "package": "pydantic-core",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 36.5,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 1541.1,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 327.0,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        }
+      },
+      "aot_build": {
+        "exit": 0,
+        "timed_out": false,
+        "duration_ms": 1596.6,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": ""
+      }
+    },
+    {
+      "id": "python-dateutil:import",
+      "package": "python-dateutil",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 10.0,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 10.7,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 3.2,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        }
+      },
+      "aot_build": {
+        "exit": 0,
+        "timed_out": false,
+        "duration_ms": 292.7,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": ""
+      }
+    },
+    {
+      "id": "six:import",
+      "package": "six",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 17.9,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 134.6,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 5.1,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        }
+      },
+      "aot_build": {
+        "exit": 0,
+        "timed_out": false,
+        "duration_ms": 405.5,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": ""
+      }
+    },
+    {
+      "id": "typing-extensions:import",
+      "package": "typing-extensions",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 31.4,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 696.8,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 6.1,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        }
+      },
+      "aot_build": {
+        "exit": 0,
+        "timed_out": false,
+        "duration_ms": 1000.4,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": ""
+      }
+    },
+    {
+      "id": "typing-inspection:import",
+      "package": "typing-inspection",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 8.1,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 5.4,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 3.8,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        }
+      },
+      "aot_build": {
+        "exit": 0,
+        "timed_out": false,
+        "duration_ms": 280.2,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": ""
+      }
+    },
+    {
+      "id": "annotated-types:import",
+      "package": "annotated-types",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 36.4,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 69.8,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 3.8,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        }
+      },
+      "aot_build": {
+        "exit": 0,
+        "timed_out": false,
+        "duration_ms": 345.1,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": ""
+      }
+    },
+    {
+      "id": "tzdata:import",
+      "package": "tzdata",
+      "kind": "import",
+      "status": "pass",
+      "detail": null,
+      "differences": {},
+      "runs": {
+        "cpython": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 10.1,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "jit": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 6.2,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        },
+        "aot": {
+          "exit": 0,
+          "timed_out": false,
+          "duration_ms": 2.6,
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_bytes": 0,
+          "stdout": "",
+          "stderr_tail": ""
+        }
+      },
+      "aot_build": {
+        "exit": 0,
+        "timed_out": false,
+        "duration_ms": 279.6,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": ""
       }
     }
   ]

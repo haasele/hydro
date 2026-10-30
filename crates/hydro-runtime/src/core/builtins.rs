@@ -1928,6 +1928,21 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
         FunctionBody::Builtin(builtin) => call_builtin(*builtin, argc, argv),
         FunctionBody::AttributeGetter { names } => attribute_getter_call(names, argc, argv),
         FunctionBody::ItemGetter { keys } => item_getter_call(keys, argc, argv),
+        FunctionBody::MethodCaller { name } => {
+            if argc == 0 || argv.is_null() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "methodcaller() takes at least one argument (0 given)",
+                );
+            }
+            methods::call(
+                unsafe { *argv },
+                name.as_ptr(),
+                name.len(),
+                argc - 1,
+                unsafe { argv.add(1) },
+            )
+        }
         FunctionBody::Partial {
             function: inner,
             args: bound,
@@ -1990,15 +2005,27 @@ fn exec_check_call(
     argc: usize,
     argv: *const i64,
 ) -> i64 {
-    if argc != 1 || argv.is_null() {
+    let expected = if matches!(check, value::ExecCheck::RaiseFrom) {
+        2
+    } else {
+        1
+    };
+    if argc != expected || argv.is_null() {
         return exc::raise_with_message(
             TYPE_ERROR,
-            &format!("{function_name}() takes exactly 1 positional argument ({argc} given)"),
+            &format!(
+                "{function_name}() takes exactly {expected} positional argument(s) ({argc} given)"
+            ),
         );
     }
-    // SAFETY: exactly one argument was checked above.
+    // SAFETY: exactly `expected` arguments were checked above.
     let argument = unsafe { *argv };
     match check {
+        value::ExecCheck::RaiseFrom => {
+            // SAFETY: two positional parameters were checked above.
+            let cause = unsafe { *argv.add(1) };
+            exc::raise_value_from(argument, cause)
+        }
         value::ExecCheck::AlwaysFalse => value::FALSE,
         value::ExecCheck::Identity { name } => {
             let Some(target) = exec_lookup(globals_ns, locals_ns, name) else {
@@ -5300,6 +5327,8 @@ fn parse_integer(digits: &str, radix: u32) -> EvalResult {
 struct ExecSource {
     name: String,
     param: String,
+    /// Second positional-only parameter for the `raise_from` shape.
+    second: Option<String>,
     check: value::ExecCheck,
 }
 
@@ -5371,6 +5400,7 @@ fn exec_builtin(args: &[i64]) -> i64 {
     let function = value::exec_function_new(
         parsed.name,
         parsed.param,
+        parsed.second,
         parsed.check,
         globals_ns,
         locals_ns,
@@ -5422,13 +5452,34 @@ fn parse_exec_source(source: &str) -> Result<ExecSource, String> {
     let Some(close) = exec_closing_paren(after_open) else {
         return Err("a function header without a closing ')'".to_string());
     };
-    let param = parse_exec_parameter(&after_open[..close])?;
     let after_params = after_open[close + 1..].trim_start();
     let colon = exec_header_colon(after_params)?;
     let body = after_params[colon + 1..].trim();
     if body.is_empty() {
         return Err("a function definition without a body".to_string());
     }
+    // `six.raise_from` (installed through `exec` on Python 3) is the one
+    // multi-statement shape the standard library generates. Recognise the
+    // exact `raise value from from_value` statement and keep the rest of the
+    // bounded grammar unchanged.
+    let normalized_body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized_body.contains("raise value from from_value") {
+        let parameters = after_open[..close].trim();
+        let mut parts = parameters.split(',').map(str::trim);
+        let (Some(value), Some(cause), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err("a function body with a raise statement".to_string());
+        };
+        if !is_exec_identifier(value) || !is_exec_identifier(cause) {
+            return Err("a function body with a raise statement".to_string());
+        }
+        return Ok(ExecSource {
+            name: name.to_string(),
+            param: value.to_string(),
+            second: Some(cause.to_string()),
+            check: value::ExecCheck::RaiseFrom,
+        });
+    }
+    let param = parse_exec_parameter(&after_open[..close])?;
     if body.chars().any(|ch| matches!(ch, '\n' | '\r')) {
         return Err("a function body with more than one statement".to_string());
     }
@@ -5449,6 +5500,7 @@ fn parse_exec_source(source: &str) -> Result<ExecSource, String> {
     Ok(ExecSource {
         name: name.to_string(),
         param,
+        second: None,
         check,
     })
 }

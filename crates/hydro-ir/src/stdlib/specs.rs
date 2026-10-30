@@ -174,6 +174,10 @@ const OPERATOR_FUNCTIONS: &[FunctionSpec] = &[
     f("and_", 2, 2, Type::Any),
     f("xor", 2, 2, Type::Any),
     f("neg", 1, 1, Type::Any),
+    f("pos", 1, 1, Type::Any),
+    f("invert", 1, 1, Type::Any),
+    f("inv", 1, 1, Type::Any),
+    f("abs", 1, 1, Type::Any),
     f("not_", 1, 1, Type::Bool),
     f("truth", 1, 1, Type::Bool),
     // `operator.index(a)`: `a.__index__()`, or `a` itself for exact integers.
@@ -186,6 +190,10 @@ const OPERATOR_FUNCTIONS: &[FunctionSpec] = &[
     f("delitem", 2, 2, Type::None),
     f("attrgetter", 1, usize::MAX, Type::Function),
     f("itemgetter", 1, usize::MAX, Type::Function),
+    // `methodcaller(name, /, *args, **kwargs)`: a callable that invokes the
+    // named method. The runtime currently binds the name only (the `six`
+    // dictionary-view helpers); extra arguments are rejected at call time.
+    f("methodcaller", 1, 1, Type::Function),
     // `_compare_digest(a, b)`: the timing-safe comparison `hmac`/`secrets`
     // import from `_operator`.
     f("_compare_digest", 2, 2, Type::Bool),
@@ -383,7 +391,14 @@ pub static CSV: ModuleSpec = ModuleSpec {
         kw("DictReader", 1, 1, Type::Any, &["file"]),
         kw("DictWriter", 2, 2, Type::Any, &["file", "fieldnames"]),
     ],
-    constants: &[],
+    constants: &[
+        c("QUOTE_MINIMAL", Type::Int),
+        c("QUOTE_ALL", Type::Int),
+        c("QUOTE_NONNUMERIC", Type::Int),
+        c("QUOTE_NONE", Type::Int),
+        c("QUOTE_STRINGS", Type::Int),
+        c("QUOTE_NOTNULL", Type::Int),
+    ],
 };
 
 pub static OS_PATH: ModuleSpec = ModuleSpec {
@@ -479,6 +494,18 @@ pub static OS: ModuleSpec = ModuleSpec {
         // portable single-argument form is declared here.
         f("unlink", 1, 1, Type::None),
         f("rename", 2, 2, Type::None),
+        // `symlink(src, dst, target_is_directory=False, *, dir_fd=None)` and
+        // `link(src, dst, *, src_dir_fd=None, dst_dir_fd=None,
+        // follow_symlinks=True)`: POSIX link creation. The Windows-only
+        // `target_is_directory` slot is accepted and ignored on POSIX.
+        kw(
+            "symlink",
+            2,
+            3,
+            Type::None,
+            &["src", "dst", "target_is_directory"],
+        ),
+        kw("link", 2, 2, Type::None, &["src", "dst"]),
         f("access", 2, 2, Type::Bool),
         // `os.urandom(n)`: `n` bytes from the OS entropy source.
         f("urandom", 1, 1, Type::Bytes),
@@ -540,6 +567,28 @@ pub static OS: ModuleSpec = ModuleSpec {
             Type::None,
             &["path", "mode", "device", "dir_fd"],
         ),
+        // `chown(path, uid, gid, *, dir_fd=None, follow_symlinks=True)`.
+        kw(
+            "chown",
+            3,
+            5,
+            Type::None,
+            &["path", "uid", "gid", "dir_fd", "follow_symlinks"],
+        ),
+        // `utime(path, times=None, *, ns=None, dir_fd=None,
+        // follow_symlinks=True)`.
+        kw(
+            "utime",
+            1,
+            5,
+            Type::None,
+            &["path", "times", "ns", "dir_fd", "follow_symlinks"],
+        ),
+        // `fsync(fd)`: flush a descriptor to stable storage; `fdatasync(fd)`.
+        f("fsync", 1, 1, Type::None),
+        f("fdatasync", 1, 1, Type::None),
+        // `sched_getaffinity(pid)`: the CPU set as a `set[int]`.
+        f("sched_getaffinity", 1, 1, Type::Set),
         // `os.system(command)`: runs a shell command and returns its wait
         // status.
         f("system", 1, 1, Type::Any),
@@ -592,6 +641,8 @@ pub static OS: ModuleSpec = ModuleSpec {
         // argument may be passed by name (CPython's wrapper is Python code).
         kw("scandir", 0, 1, Type::Any, &["path"]),
         // Descriptor inheritance flags.
+        // `lseek(fd, offset, whence)`: the descriptor's new absolute offset.
+        f("lseek", 3, 3, Type::Int),
         f("set_inheritable", 2, 2, Type::None),
         f("get_inheritable", 1, 1, Type::Bool),
     ],
@@ -608,8 +659,12 @@ pub static OS: ModuleSpec = ModuleSpec {
         // search path.
         c("altsep", Type::Any),
         c("defpath", Type::Str),
-        // `os.extsep`: the extension separator (`.`).
+        // `os.extsep`: the extension separator (`.`), and the seek whence
+        // values shared with `io`.
         c("extsep", Type::Str),
+        c("SEEK_SET", Type::Int),
+        c("SEEK_CUR", Type::Int),
+        c("SEEK_END", Type::Int),
         // `os.WNOHANG`: the non-blocking flag for the `waitpid` family.
         c("WNOHANG", Type::Int),
         c("F_OK", Type::Int),
@@ -1156,6 +1211,9 @@ pub static THREADING: ModuleSpec = ModuleSpec {
         f("Lock", 0, 0, Type::Any),
         f("RLock", 0, 0, Type::Any),
         f("Event", 0, 0, Type::Any),
+        // `Condition(lock=None)`: lock/notify surface used by
+        // `concurrent.futures`; the runtime backs it with the Event object.
+        f("Condition", 0, 1, Type::Any),
         f("get_ident", 0, 0, Type::Int),
         f("active_count", 0, 0, Type::Int),
         // `current_thread()`/`main_thread()`: `Thread` objects representing the
@@ -1327,6 +1385,9 @@ pub static SYS: ModuleSpec = ModuleSpec {
         // limit like CPython (integer, above the current recursion depth) and
         // stores it for the whole process.
         f("getrecursionlimit", 0, 0, Type::Int),
+        // `getsizeof(obj, default=None)`: the object's shallow size. Hydro
+        // reports its own representation sizes, not CPython's.
+        f("getsizeof", 1, 2, Type::Int),
         f("setrecursionlimit", 1, 1, Type::None),
         // `sys._getframemodulename(depth=0)` reports the module name of a
         // caller frame, and `sys._getframe(depth=0)` returns that frame.
@@ -1361,6 +1422,8 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("argv", Type::List),
         // `sys.float_info`: the platform IEEE-754 binary64 limits.
         c("float_info", Type::Any),
+        // `sys.hash_info`: the stable numeric hash parameters.
+        c("hash_info", Type::Any),
         // Process-wide importer cache; native modules and path entries may
         // stay absent, but the dict identity is stable.
         c("path_importer_cache", Type::Dict),
@@ -1760,6 +1823,7 @@ pub static IO: ModuleSpec = ModuleSpec {
         c("RawIOBase", Type::Any),
         c("TextIOBase", Type::Any),
         c("BufferedIOBase", Type::Any),
+        c("UnsupportedOperation", Type::Any),
         // `io.Reader`/`io.Writer` are the ABCs from `Lib/io.py`;
         // `typing_extensions` uses them as its generic I/O protocols.
         c("Reader", Type::Any),
@@ -2244,6 +2308,7 @@ pub static ERRNO: ModuleSpec = ModuleSpec {
         c("EISDIR", Type::Int),
         c("ENOSPC", Type::Int),
         c("EPIPE", Type::Int),
+        c("ESPIPE", Type::Int),
         c("ECONNREFUSED", Type::Int),
         c("ENOTCONN", Type::Int),
         c("ETIMEDOUT", Type::Int),
@@ -3432,9 +3497,15 @@ pub static TYPES: ModuleSpec = ModuleSpec {
             &["name", "bases", "kwds"],
         ),
         f("resolve_bases", 1, 1, Type::Any),
+        // `MappingProxyType(mapping)`: the read-only wrapper constructor.
+        f("MappingProxyType", 1, 1, Type::Any),
     ],
     constants: &[
         c("CodeType", Type::Any),
+        // CPython removed `ClassType` in 3 but the `six` compatibility layer
+        // still references it in a version-guarded branch; keep the alias so
+        // the reference resolves.
+        c("ClassType", Type::Any),
         c("FrameType", Type::Any),
         c("UnionType", Type::Any),
         c("BuiltinFunctionType", Type::Any),
@@ -3466,6 +3537,12 @@ pub static ITERTOOLS: ModuleSpec = ModuleSpec {
     name: "itertools",
     functions: &[
         f("islice", 2, 4, Type::List),
+        // Python-2 compatibility aliases (`six.moves`).
+        f("imap", 2, usize::MAX, Type::List),
+        f("izip", 0, usize::MAX, Type::List),
+        f("izip_longest", 0, usize::MAX, Type::List),
+        f("ifilter", 2, 2, Type::List),
+        f("ifilterfalse", 2, 2, Type::List),
         f("filterfalse", 2, 2, Type::List),
         f("chain", 0, usize::MAX, Type::List),
         kw_dynamic("zip_longest", 0, usize::MAX, Type::List, &[]),
@@ -3753,6 +3830,13 @@ pub static IMPORTLIB_UTIL: ModuleSpec = ModuleSpec {
             4,
             Type::Any,
             &["name", "location", "loader", "submodule_search_locations"],
+        ),
+        kw(
+            "spec_from_loader",
+            2,
+            4,
+            Type::Any,
+            &["name", "loader", "origin", "is_package"],
         ),
         kw("module_from_spec", 1, 1, Type::Any, &["spec"]),
         kw("resolve_name", 2, 2, Type::Str, &["name", "package"]),
@@ -4048,6 +4132,12 @@ pub static CODECS: ModuleSpec = ModuleSpec {
         // `escape_decode(data, errors='strict')`: the `unicode_escape` /
         // `raw_unicode_escape` decoder shared with `_codecs`.
         f("escape_decode", 1, 2, Type::Tuple),
+        f("getreader", 1, 1, Type::Function),
+        f("getwriter", 1, 1, Type::Function),
+        // `getdecoder(encoding)`/`getencoder(encoding)`: the matching
+        // `CodecInfo` member, used by pandas' string accessors.
+        f("getdecoder", 1, 1, Type::Function),
+        f("getencoder", 1, 1, Type::Function),
     ],
     constants: &[
         // `CodecInfo(encode, decode, streamreader=None, streamwriter=None,
@@ -4055,6 +4145,12 @@ pub static CODECS: ModuleSpec = ModuleSpec {
         // _is_text_encoding=None)`: the registry-entry class `encodings`
         // constructs and checks with `isinstance`.
         c("CodecInfo", Type::Any),
+        c("StreamReader", Type::Any),
+        c("StreamWriter", Type::Any),
+        c("StreamReaderWriter", Type::Any),
+        c("StreamRecoder", Type::Any),
+        c("IncrementalEncoder", Type::Any),
+        c("IncrementalDecoder", Type::Any),
         c("BOM_UTF8", Type::Bytes),
         c("BOM_UTF16_LE", Type::Bytes),
         c("BOM_UTF16_BE", Type::Bytes),
@@ -4713,6 +4809,8 @@ pub static LOCALE: ModuleSpec = ModuleSpec {
         f("setlocale", 1, 2, Type::Str),
         f("getlocale", 0, 1, Type::Tuple),
         f("getpreferredencoding", 0, 1, Type::Str),
+        // `localeconv()`: the C locale's numeric/monetary formatting data.
+        f("localeconv", 0, 0, Type::Dict),
         f("getencoding", 0, 0, Type::Str),
         f("normalize", 1, 1, Type::Str),
         f("strcoll", 2, 2, Type::Int),
@@ -4735,6 +4833,7 @@ pub static LOCALE: ModuleSpec = ModuleSpec {
         c("LC_MESSAGES", Type::Int),
         c("LC_ALL", Type::Int),
         c("Error", Type::Any),
+        c("CHAR_MAX", Type::Int),
     ],
 };
 

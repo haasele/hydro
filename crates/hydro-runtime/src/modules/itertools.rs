@@ -110,8 +110,15 @@ fn snapshot(list: i64) -> Vec<i64> {
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         "islice" => islice(args),
+        // Python-2 spellings kept by compatibility layers (`six`). They are
+        // aliases of the Python-3 combinators.
+        "imap" => builtins::map_many(args[0], &args[1..]),
+        "izip" => builtins::zip(args.len(), args.as_ptr()),
+        "izip_longest" => zip_longest(args, NONE),
+        "ifilter" | "ifilterfalse" => builtins::filter(args[0], args[1]),
         "filterfalse" => filterfalse(args),
         "chain" => chain(args),
+        "chain.from_iterable" => chain_from_iterable(args[0]),
         "zip_longest" => zip_longest(args, NONE),
         "pairwise" => pairwise(args),
         "count" => count(args),
@@ -259,6 +266,18 @@ fn chain(args: &[i64]) -> i64 {
             push_item(result, item);
         }
     }
+    result
+}
+
+/// `chain.from_iterable(iterable)`: flattens one level of nested iterables.
+fn chain_from_iterable(iterable: i64) -> i64 {
+    let collected = match collect(iterable) {
+        Ok(collected) => collected,
+        Err(error) => return error,
+    };
+    let roots = crate::heap::root_values(&[collected]);
+    let result = chain(&snapshot(collected));
+    crate::heap::release_roots(roots);
     result
 }
 

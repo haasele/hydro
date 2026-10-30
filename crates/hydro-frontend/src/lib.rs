@@ -3500,7 +3500,10 @@ fn unit_initializer_order(units: &[LoadedModule], entry: usize) -> Vec<usize> {
     if debug {
         eprintln!(
             "init-order: {:?}",
-            order.iter().map(|&index| units[index].name.as_str()).collect::<Vec<_>>()
+            order
+                .iter()
+                .map(|&index| units[index].name.as_str())
+                .collect::<Vec<_>>()
         );
         eprintln!(
             "init-dropped: {:?}",
@@ -3508,7 +3511,11 @@ fn unit_initializer_order(units: &[LoadedModule], entry: usize) -> Vec<usize> {
                 .iter()
                 .enumerate()
                 .filter(|(_, edge)| edge.dropped)
-                .map(|(index, edge)| (index, units[edge.dep].name.as_str(), units[edge.importer].name.as_str()))
+                .map(|(index, edge)| (
+                    index,
+                    units[edge.dep].name.as_str(),
+                    units[edge.importer].name.as_str()
+                ))
                 .collect::<Vec<_>>()
         );
     }

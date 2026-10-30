@@ -77,6 +77,7 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         hydro_yield_checked,
         hydro_yield_from,
         hydro_map,
+        hydro_map_many,
         hydro_filter,
         hydro_sum,
         hydro_enumerate,

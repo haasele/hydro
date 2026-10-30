@@ -7762,7 +7762,11 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     let actual = values.len();
                     return Err(CodegenError::new(format!(
                         "builtin {name} expects {} arguments, got {actual}",
-                        if builtin == Builtin::Map { "at least 2" } else { "2" }
+                        if builtin == Builtin::Map {
+                            "at least 2"
+                        } else {
+                            "2"
+                        }
                     )));
                 }
                 let result = if builtin == Builtin::Map && values.len() > 2 {

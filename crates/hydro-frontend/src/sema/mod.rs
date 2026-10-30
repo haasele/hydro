@@ -727,7 +727,7 @@ fn is_gradual_receiver(kind: &HExprKind) -> bool {
             | HExprKind::Tuple(_)
             | HExprKind::Set(_)
             | HExprKind::Dict(_)
-            | HExprKind::Const(Const::Str(_) | Const::Bytes(_))
+            | HExprKind::Const(_)
     )
 }
 
@@ -1040,6 +1040,10 @@ enum Check {
     Builtin {
         builtin: Builtin,
         args: Vec<(Ty, u32, u32)>,
+        /// Whether each argument is a literal. Literals keep the strict
+        /// builtin diagnostics; a variable may hold a subclass overriding
+        /// the protocol (`len(self)` on a user class), so it stays dynamic.
+        literal: Vec<bool>,
         out: Ty,
         line: u32,
         col: u32,
@@ -2134,7 +2138,7 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Int));
             }
             Ty::Concrete(_) => {
-                if self.inf.is_gradual(expr.ty) {
+                if self.inf.is_gradual(expr.ty) || is_gradual_receiver(&expr.kind) {
                     self.force_any(expr.ty);
                 } else {
                     self.error_code(
@@ -2846,6 +2850,10 @@ impl<'a> Checker<'a> {
                 self.checks.push(Check::Builtin {
                     builtin,
                     args: args.iter().map(|a| (a.ty, a.line, a.col)).collect(),
+                    literal: args
+                        .iter()
+                        .map(|a| matches!(a.kind, HExprKind::Const(_)))
+                        .collect(),
                     out: expr.ty,
                     line: expr.line,
                     col: expr.col,
@@ -2909,6 +2917,19 @@ impl<'a> Checker<'a> {
             dynamic_keywords = true;
         }
 
+        // `itertools.chain.from_iterable` is a classmethod on the native
+        // `chain` callable; the runtime serves it as an attribute of the
+        // function value, so the static method table cannot describe it.
+        if matches!(
+            &object.kind,
+            HExprKind::ModuleAttr { module, name }
+                if module == "itertools" && name == "chain"
+        ) && method == "from_iterable"
+        {
+            self.force_any(expr.ty);
+            return;
+        }
+
         // A builtin class value is a function at runtime, but
         // `int.from_bytes(...)` and friends are class-level methods with
         // their own shapes. Recognised methods keep a concrete result type;
@@ -2933,6 +2954,16 @@ impl<'a> Checker<'a> {
             self.force_any(expr.ty);
             return;
         }
+        // `try: import m / except ImportError: m = None` narrows the local to
+        // `None` in the conservative join even though the import is linked.
+        // Method calls on such a gradual local stay dynamic; the runtime
+        // raises `AttributeError` when it really is `None`.
+        if matches!(self.inf.resolve(object.ty), Ty::Concrete(Type::None))
+            && is_gradual_receiver(&object.kind)
+        {
+            self.force_any(expr.ty);
+            return;
+        }
         let result = match self.inf.resolve(object.ty) {
             Ty::Var(_) | Ty::Concrete(Type::Any) => Type::Any,
             Ty::Concrete(receiver) => {
@@ -2945,6 +2976,14 @@ impl<'a> Checker<'a> {
                     Type::Range => RANGE_METHODS,
                     Type::Set => SET_METHODS,
                     _ => {
+                        // Scalars inferred only from a call site may hold a
+                        // subclass with extra methods (`key: int` really a
+                        // float); a variable lookup stays dynamic, while a
+                        // literal keeps the static error.
+                        if is_gradual_receiver(&object.kind) {
+                            self.force_any(expr.ty);
+                            return;
+                        }
                         self.error_no_method(expr, receiver, method, None);
                         self.force_any(expr.ty);
                         return;
@@ -3197,10 +3236,11 @@ impl<'a> Checker<'a> {
                 Check::Builtin {
                     builtin,
                     args,
+                    literal,
                     out,
                     line,
                     col,
-                } => self.apply_builtin(builtin, args, out, line, col),
+                } => self.apply_builtin(builtin, args, literal, out, line, col),
                 other @ Check::RaiseMsg { .. } => keep.push(other),
             }
         }
@@ -3211,6 +3251,7 @@ impl<'a> Checker<'a> {
         &mut self,
         builtin: Builtin,
         args: Vec<(Ty, u32, u32)>,
+        literal: Vec<bool>,
         out: Ty,
         line: u32,
         col: u32,
@@ -3257,6 +3298,12 @@ impl<'a> Checker<'a> {
                     | Ty::Concrete(Type::Set)
                     | Ty::Concrete(Type::Range)
                     | Ty::Concrete(Type::Any) => {}
+                    Ty::Concrete(t) if !literal.first().copied().unwrap_or(false) => {
+                        // A variable can be a user class implementing
+                        // `__len__`, even when inference only sees a scalar;
+                        // the runtime decides. Literals stay static errors.
+                        let _ = t;
+                    }
                     Ty::Concrete(t) => self.error(
                         arg_line,
                         arg_col,

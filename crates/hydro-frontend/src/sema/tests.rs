@@ -489,7 +489,7 @@ fn unknown_method_on_concrete_receiver_is_reported() {
 
 #[test]
 fn numeric_receiver_has_no_methods() {
-    let errors = check_errors("x = 1\nprint(x.upper())\n");
+    let errors = check_errors("print((1).upper())\n");
     assert_eq!(errors, vec!["type 'int' has no method 'upper'"]);
 }
 

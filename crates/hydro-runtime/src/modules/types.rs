@@ -70,6 +70,8 @@ const CLASSES: &[&str] = &[
     "AsyncGeneratorType",
     "BuiltinFunctionType",
     "BuiltinMethodType",
+    // Python-2 compatibility alias kept for `six`'s guarded import path.
+    "ClassType",
     "ClassMethodDescriptorType",
     "CoroutineType",
     "EllipsisType",
@@ -82,7 +84,6 @@ const CLASSES: &[&str] = &[
     "MethodDescriptorType",
     "MethodType",
     "MethodWrapperType",
-    "ModuleType",
     "NoneType",
     "TracebackType",
     "WrapperDescriptorType",
@@ -105,6 +106,10 @@ pub(crate) fn constant(name: &str) -> i64 {
         // The module value is the cached class (see [`class_value`]); the
         // constructor remains the module call handled by [`call`].
         "SimpleNamespace" => simple_namespace_class(),
+        // `types.ModuleType(name[, doc])`: a real class with a module-shaped
+        // initialiser, so subclasses (`six._LazyModule`) can call
+        // `super().__init__(name)`.
+        "ModuleType" => module_type_class(),
         "NoneType" => value::type_class(NONE),
         "EllipsisType" => value::type_class(crate::modules::builtins::constant("Ellipsis")),
         "NotImplementedType" => value::type_class(value::NOT_IMPLEMENTED),
@@ -129,6 +134,52 @@ pub(crate) fn cell_type_class() -> i64 {
     let class = value::class_new("CellType".to_string(), NONE, Vec::new());
     globals::registry_set("types.CellType", class);
     class
+}
+
+/// The cached `types.ModuleType` class.
+///
+/// Unlike the tag-only classes in [`CLASSES`], this class carries a real
+/// `__init__(self, name, doc=None)` so a Python subclass (`six._LazyModule`)
+/// can initialise its module attributes through `super().__init__`.
+pub(crate) fn module_type_class() -> i64 {
+    if let Some(cached) = globals::registry_get("types.ModuleType") {
+        return cached;
+    }
+    let init = value::native_function_new("types", "ModuleType.__init__", 3);
+    let class = value::class_new_full(
+        "ModuleType".to_string(),
+        NONE,
+        vec![("__init__".to_string(), init, MethodKind::Normal)],
+        Vec::new(),
+    );
+    globals::registry_set("types.ModuleType", class);
+    class
+}
+
+/// `types.ModuleType.__init__(self, name, doc=None)`.
+fn module_type_init(args: &[i64]) -> i64 {
+    let Some(instance) = args.first().copied() else {
+        return exc::raise_with_message(TYPE_ERROR, "ModuleType.__init__ missing self");
+    };
+    let Some(name) = args.get(1).copied().filter(|value| *value != NONE) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "module() missing required argument 'name' (pos 1)",
+        );
+    };
+    let Some(name) = value::as_str(name) else {
+        return exc::raise_with_message(TYPE_ERROR, "module name must be a string");
+    };
+    let doc = args.get(2).copied().unwrap_or(NONE);
+    let name = value::str_alloc(name.to_string());
+    let roots = heap::root_values(&[name, doc]);
+    value::instance_setattr(instance, "__name__".to_string(), name);
+    value::instance_setattr(instance, "__doc__".to_string(), doc);
+    value::instance_setattr(instance, "__package__".to_string(), NONE);
+    value::instance_setattr(instance, "__loader__".to_string(), NONE);
+    value::instance_setattr(instance, "__spec__".to_string(), NONE);
+    heap::release_roots(roots);
+    NONE
 }
 
 /// `types.CellType([value])`: a cell object holding `value` (empty when
@@ -167,6 +218,10 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "SimpleNamespace" => simple_namespace(args.first().copied().unwrap_or(NONE)),
         "prepare_class" => prepare_class(args),
         "CellType" => cell_type_new(args),
+        // The mapping proxy is a read-only view; returning the mapping is
+        // sufficient for the `tomllib` immutable-table construction.
+        "MappingProxyType" => args.first().copied().unwrap_or(NONE),
+        "ModuleType.__init__" => module_type_init(args),
         // `types.FunctionType(code, globals, ...)`.
         "FunctionType" => function_type_new(args),
         // `types.UnionType[a, b, ...]` through the module-call path (the

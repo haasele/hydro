@@ -613,6 +613,14 @@ def main(argv: list[str] | None = None) -> int:
     env = dict(os.environ)
     env["BROWSER"] = "true"  # keep `import antigravity` from opening a browser
     env.setdefault("NO_COLOR", "1")
+    # Compare against the pinned CPython's own Lib tree, not whatever default
+    # the toolchain would otherwise select. This is the differential the
+    # matrix reports: can Hydro import the module CPython ships?
+    if "HYDRO_STDLIB" not in env:
+        minor = ".".join(TARGET_PYTHON.split(".")[:2])
+        stdlib = cpython.parent.parent / "lib" / f"python{minor}"
+        if stdlib.is_dir():
+            env["HYDRO_STDLIB"] = str(stdlib)
 
     json_path = Path(args.json) if args.json else DEFAULT_JSON
     md_path = Path(args.md) if args.md else DEFAULT_MD

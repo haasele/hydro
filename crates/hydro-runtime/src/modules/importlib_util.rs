@@ -43,6 +43,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "find_spec" => find_spec(args),
         "_find_spec_from_path" => find_spec_from_path(args),
         "spec_from_file_location" => spec_from_file_location(args),
+        "spec_from_loader" => spec_from_loader(args),
         "module_from_spec" => module_from_spec(args),
         "resolve_name" => resolve_name(args),
         "decode_source" => decode_source(args),
@@ -674,6 +675,28 @@ fn spec_for_name(name: &str, path: Option<&[String]>) -> Result<i64, i64> {
         Some(found) => found_spec(&found),
         None => NONE,
     })
+}
+
+/// `spec_from_loader(name, loader, *, origin=None, is_package=None)`.
+///
+/// Builds a bare `ModuleSpec` around an already-constructed loader. The
+/// package flag is honoured when supplied; otherwise the spec is treated as a
+/// module, which is the common `six`/`pkgutil` use.
+fn spec_from_loader(args: &[i64]) -> i64 {
+    let name = match str_arg(args, 0, "spec_from_loader", "name") {
+        Ok(name) => name,
+        Err(raised) => return raised,
+    };
+    let loader = args.get(1).copied().unwrap_or(NONE);
+    let origin = args.get(2).copied().unwrap_or(NONE);
+    let is_package = args.get(3).copied().unwrap_or(NONE);
+    let origin = value::as_str(origin).map(str::to_string);
+    let locations = if is_package == value::TRUE {
+        Some(Vec::new())
+    } else {
+        None
+    };
+    machinery::new_spec(&name, loader, origin, locations, false)
 }
 
 /// `spec_from_file_location(name, location=None, loader=None,
