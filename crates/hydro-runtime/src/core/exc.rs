@@ -52,6 +52,12 @@ pub(crate) struct ExcData {
     /// the source-position keywords. The tagged values are GC edges (see
     /// `gc::heap::mark_value`).
     pub(crate) keywords: Vec<(String, i64)>,
+    /// Original exception instance when the raise crossed the C-API boundary
+    /// (pydantic-core raises its `ValidationError` this way). The tagged value
+    /// is a [`crate::value::KIND_EXT_OBJECT`] handle and a GC edge: `str`,
+    /// `repr`, `args`, attribute reads and method calls delegate to it, while
+    /// the tag stays the handler-compatible approximation the frontend emits.
+    pub(crate) object: Option<i64>,
 }
 
 // Exception tags, fixed by ARCHITECTURE §3.2.
@@ -478,6 +484,7 @@ pub(crate) fn exception_value_with_keywords(
         exit_code: None,
         args,
         keywords,
+        object: None,
     })
 }
 
@@ -1242,6 +1249,7 @@ fn raise_with_message_cause(
         exit_code: None,
         args,
         keywords: Vec::new(),
+        object: None,
     };
     publish(value::exception_new(data))
 }
@@ -1278,6 +1286,7 @@ pub(crate) fn raise_exit(code: i64) -> i64 {
         exit_code,
         args,
         keywords: Vec::new(),
+        object: None,
     };
     publish(value::exception_new(data))
 }
@@ -1355,8 +1364,97 @@ pub(crate) fn raise_value(v: i64) -> i64 {
                 _ => publish(v),
             }
         }
+        // An extension exception object re-raised from source. Hydro has no
+        // class object for it, so it becomes the handler-compatible
+        // `RuntimeError` wrapper that keeps the original instance.
+        None if value::is_ext_exception(v) => raise_extension(v, RUNTIME_ERROR, ""),
         None => raise_with_message(RUNTIME_ERROR, "exceptions must derive from BaseException"),
     }
+}
+
+/// Python-visible class name of an exception payload.
+///
+/// A raise that crossed the C-API boundary keeps the original extension
+/// instance, whose type name is authoritative (for example
+/// `pydantic_core._pydantic_core.ValidationError`); a native raise uses the
+/// static tag name.
+pub(crate) fn exception_display_name(data: &ExcData) -> String {
+    match data.object.and_then(value::ext_object_type_name) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => data.name.to_string(),
+    }
+}
+
+/// Message rendered for an exception payload in tracebacks.
+///
+/// An extension instance supplies its own `str()`; otherwise the stored
+/// message is used.
+pub(crate) fn exception_message(data: &ExcData) -> String {
+    match data.object {
+        Some(object) => {
+            let text = value::ext_object_str(object);
+            if text.is_empty() {
+                data.msg.clone()
+            } else {
+                text
+            }
+        }
+        None => data.msg.clone(),
+    }
+}
+
+/// Raises `tag` while preserving an extension exception instance.
+///
+/// The frontend approximates an imported exception class with
+/// [`RUNTIME_ERROR`] for `raise`/`except`, so the Hydro payload carries that
+/// tag while `object` (an opaque [`value::KIND_EXT_OBJECT`] handle) supplies
+/// the original `str`, `repr`, `args`, attributes and methods. `message` is
+/// the C-API error text, used only when the extension cannot render itself.
+pub(crate) fn raise_extension(object: i64, tag: u32, message: &str) -> i64 {
+    raise_extension_with(object, tag, message, None, false)
+}
+
+/// [`raise_extension`] with an explicit `raise ... from` cause.
+pub(crate) fn raise_extension_from(object: i64, tag: u32, message: &str, cause: i64) -> i64 {
+    raise_extension_with(object, tag, message, cause_of(cause), true)
+}
+
+fn raise_extension_with(
+    object: i64,
+    tag: u32,
+    message: &str,
+    cause: Option<i64>,
+    suppress_context: bool,
+) -> i64 {
+    let args = if message.is_empty() {
+        Vec::new()
+    } else {
+        vec![message.to_string()]
+    };
+    let (file, line, frame) = current_location();
+    let context = handled();
+    // The extension handle is not reachable from the pending mirror until the
+    // exception object exists, so root it across the allocation.
+    let roots = crate::heap::root_values(&[object]);
+    let data = ExcData {
+        tag,
+        name: tag_name(tag),
+        msg: message.to_string(),
+        file,
+        line,
+        frame,
+        cause,
+        context,
+        suppress_context,
+        exit_code: None,
+        args,
+        keywords: Vec::new(),
+        object: Some(object),
+    };
+    let exception = value::exception_new(data);
+    publish(exception);
+    crate::heap::release_roots(roots);
+    NONE
 }
 
 /// `hydro_raise_from`: `raise X(msg) from cause`.
@@ -1390,6 +1488,7 @@ pub(crate) fn raise_value_from(v: i64, cause: i64) -> i64 {
             // Keep a user-defined exception's Python class identity.
             publish(value::exception_with_data(v, data))
         }
+        None if value::is_ext_exception(v) => raise_extension_from(v, RUNTIME_ERROR, "", cause),
         None => raise_with_message(RUNTIME_ERROR, "exceptions must derive from BaseException"),
     }
 }
@@ -1440,6 +1539,24 @@ pub(crate) fn matches_handler(handler_tag: u32) -> i32 {
 /// was not supplied to the constructor is `None`, like CPython.
 pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
     let data = value::exception_data(object)?;
+    // An exception raised by a C extension keeps its original instance: every
+    // attribute resolves there first, so `exc.errors`, `exc.args` and the
+    // exception's own data attributes behave like CPython. A name the
+    // extension does not define falls back to the native surface below.
+    if let Some(extension) = data.object {
+        if let Some(pointer) = value::ext_object_pointer(extension) {
+            match crate::capi::object_get_attr_hydro(pointer, name) {
+                Ok(attribute) => return Some(attribute),
+                Err(message) => {
+                    // The probe failed (typically `AttributeError`); release
+                    // any exception instance it stashed before falling back.
+                    if let Some(exception) = crate::capi::take_error_exception(&message) {
+                        crate::capi::dec_ref(exception);
+                    }
+                }
+            }
+        }
+    }
     Some(match name {
         "args" => args_tuple(&data.args),
         "__class__" => value::type_class(object),
@@ -1516,6 +1633,7 @@ pub(crate) fn uncaught() -> i64 {
         exit_code: None,
         args: Vec::new(),
         keywords: Vec::new(),
+        object: None,
     });
 
     // `SystemExit` never renders a traceback. An integer code becomes the
@@ -1606,7 +1724,12 @@ fn render_chain(root: i64, data: &ExcData) -> String {
             "  File \"{}\", line {}, in {}",
             data.file, data.line, data.frame
         );
-        let _ = writeln!(text, "{}: {}", data.name, data.msg);
+        let _ = writeln!(
+            text,
+            "{}: {}",
+            exception_display_name(data),
+            exception_message(data)
+        );
     }
     text
 }
@@ -1834,6 +1957,7 @@ mod tests {
             exit_code: None,
             args: vec![msg.to_string()],
             keywords: Vec::new(),
+            object: None,
         }
     }
 
@@ -2030,6 +2154,7 @@ mod tests {
             exit_code: None,
             args: Vec::new(),
             keywords: Vec::new(),
+            object: None,
         };
         publish(value::exception_new(data));
         assert_eq!(matches_handler(EXCEPTION), 1);

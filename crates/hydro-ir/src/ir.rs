@@ -347,9 +347,9 @@ pub enum ExprKind {
     /// starred operand) cannot express.
     ///
     /// Evaluation order is Python's: `callee`, then every positional operand
-    /// in source order (the starred operand is evaluated at its source
-    /// position, which the frontend limits to the end of the positional list),
-    /// then each named keyword value, then the `**mapping`. Codegen forwards
+    /// in source order (positional operands written after the starred one are
+    /// folded into the star operand by the frontend), then each named keyword
+    /// value, then the `**mapping`. Codegen forwards
     /// the buffers to `hydro_call_star_kw`, which flattens `star`, merges the
     /// keywords and raises `TypeError` for a non-mapping `double_star`, a
     /// non-`str` key or a key bound twice. A class, function, builtin or

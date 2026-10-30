@@ -1104,6 +1104,119 @@ fn hex_digit(unit: u32) -> Option<u8> {
     }
 }
 
+/// `float.fromhex(string)`: parses CPython's hexadecimal floating-point
+/// spelling.
+///
+/// The operand must be a `str`; the grammar is `[sign] [0x] hexdigits
+/// [. hexdigits] [p [sign] decimal-digits]` with at least one hexadecimal
+/// digit, plus the case-insensitive `inf`/`infinity`/`nan` spellings.
+/// Underscores are not accepted (unlike integer hex literals). The sign of a
+/// NaN is ignored, matching CPython.
+pub(crate) fn float_fromhex(argument: i64) -> i64 {
+    let Some(text) = value::as_str(argument) else {
+        return exc::raise_with_message(TYPE_ERROR, "bad argument type for built-in operation");
+    };
+    match parse_hex_float(text) {
+        Some(number) => value::float_new(number),
+        None => exc::raise_with_message(VALUE_ERROR, "invalid hexadecimal floating-point string"),
+    }
+}
+
+/// Parses one hexadecimal floating-point string; `None` when it is malformed.
+fn parse_hex_float(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let (negative, body) = match text.as_bytes().first() {
+        Some(&b'-') => (true, &text[1..]),
+        Some(&b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let lower = body.to_ascii_lowercase();
+    if lower == "inf" || lower == "infinity" {
+        return Some(if negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
+    }
+    if lower == "nan" {
+        return Some(f64::NAN);
+    }
+    let body = body
+        .strip_prefix("0x")
+        .or_else(|| body.strip_prefix("0X"))
+        .unwrap_or(body);
+    let mut pieces = body.splitn(2, ['p', 'P']);
+    let mantissa = pieces.next().unwrap_or("");
+    let exponent = match pieces.next() {
+        Some(digits) => parse_hex_exponent(digits)?,
+        None => 0,
+    };
+    let mut value = 0f64;
+    let mut exact: u128 = 0;
+    let mut exact_overflow = false;
+    let mut fraction_digits = 0i32;
+    let mut digits = 0usize;
+    let mut seen_dot = false;
+    for ch in mantissa.chars() {
+        if ch == '.' {
+            if seen_dot {
+                return None;
+            }
+            seen_dot = true;
+            continue;
+        }
+        let digit = ch.to_digit(16)?;
+        digits += 1;
+        value = value * 16.0 + f64::from(digit);
+        if !exact_overflow {
+            match exact
+                .checked_mul(16)
+                .and_then(|n| n.checked_add(u128::from(digit)))
+            {
+                Some(next) => exact = next,
+                None => exact_overflow = true,
+            }
+        }
+        if seen_dot {
+            fraction_digits += 1;
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    // The accumulated digits already include the fractional ones; shift the
+    // binary point back by four bits per fractional hexadecimal digit.
+    let value = if exact_overflow { value } else { exact as f64 };
+    let scale = i64::from(exponent) - 4 * i64::from(fraction_digits);
+    let result = if scale > i64::from(i32::MAX) {
+        f64::INFINITY
+    } else if scale < i64::from(i32::MIN) {
+        0.0
+    } else {
+        value * 2f64.powi(scale as i32)
+    };
+    Some(if negative { -result } else { result })
+}
+
+/// Parses the decimal exponent of a hexadecimal float (`p3`, `P-2`).
+fn parse_hex_exponent(digits: &str) -> Option<i32> {
+    let (negative, digits) = match digits.as_bytes().first() {
+        Some(&b'-') => (true, &digits[1..]),
+        Some(&b'+') => (false, &digits[1..]),
+        _ => (false, digits),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for ch in digits.chars() {
+        let digit = ch.to_digit(10)?;
+        value = value.saturating_mul(10).saturating_add(i64::from(digit));
+    }
+    let value = if negative { -value } else { value };
+    Some(value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+}
+
 /// `bytearray(...)`: the mutable byte-sequence constructor.
 ///
 /// The 0/1/2/3-argument forms share [`bytes_build`] and wrap its result in a
@@ -1660,6 +1773,17 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
             // arguments.
             let varargs = func.flags & value::FUNCTION_FLAG_VARARGS != 0;
             if varargs {
+                // A default that only exists when the function value was
+                // created (`def f(x=expr)`) cannot be embedded in the wrapper:
+                // the attached signature carries the evaluated value. Route
+                // through the shared binder so that value is applied instead
+                // of the wrapper's compile-time `None` fallback.
+                if func.flags & value::FUNCTION_FLAG_DYNAMIC_DEFAULTS != 0
+                    && func.full_entry != 0
+                    && !func.signature.is_empty()
+                {
+                    return call_kw(function, argc, argv, 0, std::ptr::null());
+                }
                 if argc < arity {
                     return exc::raise_with_message(
                         TYPE_ERROR,
@@ -2362,6 +2486,12 @@ pub(crate) fn call_kw(
             if let Some(result) = modules::pathlib_instantiate(class, &args, &keywords) {
                 return result;
             }
+        }
+        // `type.__call__` runs a compiled `__new__` before the default
+        // allocation and `__init__` (pure-Python `_pydatetime` classes build
+        // themselves there).
+        if let Some(result) = call_user_new(class, &args, &keywords) {
+            return result;
         }
         let instance = value::instance_new(class);
         let Some((kind, init)) = value::class_member(class, "__init__") else {
@@ -3522,6 +3652,119 @@ fn typed_dict_construct(args: &[i64], keywords: &[(String, i64)]) -> i64 {
     result
 }
 
+/// Native constructor that supplies a scalar subclass instance's payload.
+fn scalar_constructor(kind: &str) -> Option<Builtin> {
+    Some(match kind {
+        "bool" => Builtin::Bool,
+        "int" => Builtin::Int,
+        "float" => Builtin::Float,
+        "str" => Builtin::Str,
+        "bytes" => Builtin::Bytes,
+        _ => return None,
+    })
+}
+
+/// Allocates `class(args...)` when `class` derives from a native scalar type.
+///
+/// Returns `None` when `class` is not a scalar subclass. The exact native
+/// class (`type(1)(3)`, `type('')(b'x')`) returns the plain scalar value;
+/// a user subclass gets an instance carrying the scalar payload in a reserved
+/// attribute, which [`crate::value::scalar_payload`] and every scalar view
+/// unwrap.
+pub(crate) fn scalar_instance_new(class: i64, argc: usize, argv: *const i64) -> Option<i64> {
+    let (kind, native) = value::native_scalar_base(class)?;
+    let builtin = scalar_constructor(kind)?;
+    // `float()` accepts no argument (`float.__new__(cls)` is `0.0`), while
+    // `Builtin::Float` itself takes exactly one.
+    let payload = if kind == "float" && argc == 0 {
+        value::float_new(0.0)
+    } else {
+        call_builtin(builtin, argc, argv)
+    };
+    if exc::pending() {
+        return Some(NONE);
+    }
+    if class == native {
+        return Some(payload);
+    }
+    let roots = crate::heap::root_values(std::slice::from_ref(&payload));
+    let instance = value::instance_new(class);
+    value::instance_set_scalar_payload(instance, payload);
+    crate::heap::release_roots(roots);
+    Some(instance)
+}
+
+/// `int.__new__(cls, ...)` and the native `__scalar_new__` slot.
+///
+/// `argv[0]` is the class; the remaining arguments are the constructor's.
+/// The bound form (`int.__new__`) reaches this through [`crate::methods::call`].
+pub(crate) fn scalar_new_from_args(argc: usize, argv: *const i64) -> i64 {
+    if argc == 0 || argv.is_null() {
+        return exc::raise_with_message(TYPE_ERROR, "scalar __new__() missing the class argument");
+    }
+    // SAFETY: checked above for NULL; caller contract.
+    let args = unsafe { std::slice::from_raw_parts(argv, argc) };
+    let class = args[0];
+    if value::as_class(class).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "scalar __new__() argument 1 must be a type, not '{}'",
+                value::type_name(class)
+            ),
+        );
+    }
+    match scalar_instance_new(class, argc - 1, args[1..].as_ptr()) {
+        Some(result) => result,
+        None => value::instance_new(class),
+    }
+}
+
+/// Runs a compiled `__new__` override for a class call.
+///
+/// CPython's `type.__call__` invokes `cls.__new__(cls, *args, **kwargs)`
+/// before `__init__`. A class that overrides `__new__` (the pure-Python
+/// `_pydatetime` classes, for example) allocates and initialises its own
+/// instance, so a missing `__init__` is not an arity error. Native hooks
+/// (`object.__new__`, the scalar `__scalar_new__`) carry no compiled signature
+/// and return `None` so the default allocation path runs. When `__new__`
+/// returns an instance of `class`, its `__init__` runs with the same
+/// arguments; any other result is returned unchanged, as in CPython.
+fn call_user_new(class: i64, args: &[i64], keywords: &[(String, i64)]) -> Option<i64> {
+    let (_kind, new) = value::class_member(class, "__new__")?;
+    if value::function_signature(new).is_empty() || value::function_full_entry(new) == 0 {
+        return None;
+    }
+    // `__new__` is implicitly a static method: the class is the first
+    // argument even when the body does not decorate it.
+    let result = methods::call_user_method(
+        class,
+        class,
+        MethodKind::Normal,
+        new,
+        "__new__",
+        args,
+        keywords,
+    );
+    if exc::pending() {
+        return Some(NONE);
+    }
+    if instance_of(result, class) {
+        if let Some((kind, init)) = value::class_member(class, "__init__") {
+            if !value::function_signature(init).is_empty() && value::function_full_entry(init) != 0
+            {
+                let _ = methods::call_user_method(
+                    result, class, kind, init, "__init__", args, keywords,
+                );
+                if exc::pending() {
+                    return Some(NONE);
+                }
+            }
+        }
+    }
+    Some(result)
+}
+
 fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && argv.is_null() {
         return exc::raise_with_message(
@@ -3744,13 +3987,45 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     let name = value::class_display_name(class)
         .unwrap_or("type")
         .to_string();
-    let instance = value::instance_new(class);
+    // `type.__call__` runs a compiled `__new__` before the default allocation
+    // and `__init__`; `_pydatetime`'s classes build themselves there.
+    let call_args: &[i64] = if argc == 0 {
+        &[]
+    } else {
+        // SAFETY: checked above for NULL; caller contract.
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    };
+    if let Some(result) = call_user_new(class, call_args, &[]) {
+        return result;
+    }
+    // A subclass of a native scalar allocates the wrapped scalar as its
+    // payload; the exact native class returns the plain builtin value.
+    let instance = match scalar_instance_new(class, argc, argv) {
+        Some(result) => {
+            if exc::pending() {
+                return NONE;
+            }
+            if value::as_instance(result).is_none() {
+                return result;
+            }
+            result
+        }
+        None => value::instance_new(class),
+    };
     let Some((kind, init)) = value::class_member(class, "__init__") else {
         if argc > 0 {
             return exc::raise_with_message(TYPE_ERROR, &format!("{name}() takes no arguments"));
         }
         return instance;
     };
+    // `object.__init__` ignores extra arguments when the scalar payload has
+    // already consumed them, matching CPython's behaviour for builtin
+    // subclasses (`class N(int): pass; N(3)`).
+    if value::function_native_name(init) == Some("__object_init__")
+        && value::scalar_payload(instance).is_some()
+    {
+        return instance;
+    }
     if !value::function_signature(init).is_empty() && value::function_full_entry(init) != 0 {
         let call_args = if argc == 0 {
             Vec::new()
@@ -5572,8 +5847,8 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             _ => builtin_arity_error("enumerate", "1 or 2", argc),
         },
         Builtin::Map => match args {
-            [function, iterable] => map(*function, *iterable),
-            _ => builtin_arity_error("map", "exactly 2", argc),
+            [function, iterables @ ..] if !iterables.is_empty() => map_many(*function, iterables),
+            _ => builtin_arity_error("map", "at least 2", argc),
         },
         Builtin::Filter => match args {
             [function, iterable] => filter(*function, *iterable),
@@ -5855,31 +6130,50 @@ fn get_ipython_value() -> i64 {
     value::instance_new(class)
 }
 
-/// `map(function, iterable)`: materialises a list with one call per source
-/// element. The result list and the iterator are live roots while callbacks
-/// run, so a collection inside the callback cannot free them.
+/// `map(function, iterable, *iterables)`: materialises a list with one call
+/// per tuple of source elements. With several iterables the mapping stops at
+/// the shortest one, matching CPython. The result list, iterators and the
+/// per-call argument vector are live roots while callbacks run, so a
+/// collection inside the callback cannot free them.
 pub(crate) fn map(function: i64, iterable: i64) -> i64 {
+    map_many(function, &[iterable])
+}
+
+/// Multi-iterable body of [`map`].
+pub(crate) fn map_many(function: i64, iterables: &[i64]) -> i64 {
     if value::as_function(function).is_none() {
         return exc::raise_with_message(TYPE_ERROR, "map() argument 1 must be callable");
     }
-    let iterator = iter::iter_new(iterable);
-    if exc::pending() {
-        return NONE;
-    }
-    let result = value::list_new(Vec::new());
-    loop {
-        let mut item = NONE;
-        let status = iter::iter_next(iterator, &mut item);
+    let mut iterators = Vec::with_capacity(iterables.len());
+    for &iterable in iterables {
+        let iterator = iter::iter_new(iterable);
         if exc::pending() {
             return NONE;
         }
-        if status == 0 {
-            break;
+        iterators.push(iterator);
+    }
+    let result = value::list_new(Vec::new());
+    let roots = crate::heap::root_values(&[result]);
+    loop {
+        let mut arguments = Vec::with_capacity(iterators.len());
+        for &iterator in &iterators {
+            let mut item = NONE;
+            let status = iter::iter_next(iterator, &mut item);
+            if exc::pending() {
+                crate::heap::release_roots(roots);
+                return NONE;
+            }
+            if status == 0 {
+                crate::heap::release_roots(roots);
+                return result;
+            }
+            arguments.push(item);
         }
-        // `&item` points at this stack slot; the collector scans the native
-        // stack, so the argument stays reachable for the whole callback.
-        let mapped = call(function, 1, &item);
+        let argument_roots = crate::heap::root_values(&arguments);
+        let mapped = call(function, arguments.len(), arguments.as_ptr());
+        crate::heap::release_roots(argument_roots);
         if exc::pending() {
+            crate::heap::release_roots(roots);
             return NONE;
         }
         if let Some(mut items) = value::list_items_mut(result) {
@@ -5887,7 +6181,6 @@ pub(crate) fn map(function: i64, iterable: i64) -> i64 {
             crate::heap::write_barrier_edge(result, mapped);
         }
     }
-    result
 }
 
 /// `filter(function_or_none, iterable)`: materialises the elements for which
@@ -6568,6 +6861,8 @@ fn round_float(x: f64, digits: Option<i64>) -> i64 {
 /// `format(value, spec)`: Python's built-in formatting with no conversion.
 /// `conversion` is the f-string flag (`0` none, `1` `!s`, `2` `!r`, `3` `!a`).
 pub(crate) fn format_builtin(value: i64, spec: i64, conversion: u8) -> i64 {
+    // A native scalar subclass instance formats as the wrapped builtin value.
+    let value = value::scalar_payload(value).unwrap_or(value);
     let Some(spec_text) = value::as_str(spec) else {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -6804,11 +7099,15 @@ fn protocol_instance_of(value: i64, class: i64) -> bool {
 /// Matches `value` against a native type name (`int`, `bool`, `str`, ...).
 fn named_type_check(value: i64, name: &str) -> Option<bool> {
     Some(match name {
-        // `bool` is a subclass of `int` in Python.
-        "int" => {
-            value::is_int(value) || value::is_bigint(value) || value::type_name(value) == "bool"
+        // `bool` is a subclass of `int` in Python. A native scalar subclass
+        // instance is checked through its payload (`class N(int)`), so
+        // `isinstance(N(3), int)` holds for the builtin spelling too.
+        "int" => value::as_integer(value).is_some() || value::is_bigint(value),
+        "bool" => {
+            value::type_name(value) == "bool"
+                || value::scalar_payload(value)
+                    .is_some_and(|payload| payload == value::TRUE || payload == value::FALSE)
         }
-        "bool" => value::type_name(value) == "bool",
         "float" => value::as_float(value).is_some(),
         "str" => value::as_str(value).is_some(),
         // `bytearray` is bytes-like but not a `bytes` instance.
@@ -8946,9 +9245,19 @@ mod tests {
                 "{name} is owned by object"
             );
         }
-        // The fallback is limited to the attribute protocol: construction
-        // still treats a missing `__init__` as "no initializer".
-        assert!(value::class_lookup_after(class, class, "__init__").is_none());
+        // `super()` asks for the next attribute in the real linearization,
+        // which ends at `object`; `class_lookup` keeps the construction
+        // fallback narrow, so a missing `__init__` still means "no
+        // initializer" for ordinary instance construction.
+        assert!(matches!(
+            value::class_lookup_after(class, class, "__init__"),
+            Some(value::ClassEntry::Method(MethodKind::Normal, _))
+        ));
+        assert_eq!(
+            value::class_lookup_owner(class, "__init__"),
+            None,
+            "the construction path must not synthesize object.__init__"
+        );
         assert!(value::class_lookup(class, "__init__").is_none());
 
         // The `sentinel.__init__` body (`self._name = name` through the
@@ -10838,5 +11147,257 @@ mod tests {
             pending_message(),
             "fromhex() argument must be str or bytes-like, not int"
         );
+    }
+
+    #[test]
+    fn float_fromhex_matches_cpython() {
+        exc::init();
+        // Hex digits, an optional `0x`, and the binary exponent.
+        assert_eq!(
+            value::as_float(float_fromhex(string("0x1.a934f0979a371p-2"))),
+            Some(0.4152410118609203)
+        );
+        // Without `0x`, digits are still hexadecimal: `1.5` is 1 + 5/16 and
+        // `1e3` is 0x1e3.
+        assert_eq!(value::as_float(float_fromhex(string("1.5"))), Some(1.3125));
+        assert_eq!(value::as_float(float_fromhex(string("1e3"))), Some(483.0));
+        assert_eq!(
+            value::as_float(float_fromhex(string("  +0x1p3  "))),
+            Some(8.0)
+        );
+        assert_eq!(
+            value::as_float(float_fromhex(string("-inf"))),
+            Some(f64::NEG_INFINITY)
+        );
+        assert!(value::as_float(float_fromhex(string("nan"))).is_some_and(f64::is_nan));
+
+        for source in ["", "  ", "0x", ".", "0x1p", "0x1p+", "1__0", "1 2", "nanx"] {
+            assert_eq!(float_fromhex(string(source)), NONE, "{source:?}");
+            assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+            assert_eq!(
+                pending_message(),
+                "invalid hexadecimal floating-point string"
+            );
+            exc::clear();
+        }
+        // Only `str` is accepted.
+        assert_eq!(float_fromhex(int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "bad argument type for built-in operation"
+        );
+    }
+
+    /// A native scalar subclass allocates an instance that carries the wrapped
+    /// scalar payload: `class N(int): pass; N(3)`.
+    #[test]
+    fn scalar_subclass_constructs_and_behaves_like_its_builtin() {
+        crate::exc::init();
+        let int_class = value::native_class("int");
+        let class = value::class_new_multi(
+            "N".to_string(),
+            vec![int_class],
+            NONE,
+            Vec::new(),
+            Vec::new(),
+        );
+        let args = [int(3)];
+        let instance = call(class, 1, args.as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            value::as_instance(instance).map(|state| state.class),
+            Some(class)
+        );
+        assert_eq!(value::as_integer(instance), Some(3));
+        assert_eq!(value::type_class(instance), class);
+        assert_eq!(value::repr(instance), "3");
+        assert_eq!(value::to_string(instance), "3");
+        assert_eq!(
+            value::as_integer(builtin_call(Builtin::Int, &[instance])),
+            Some(3)
+        );
+        assert!(crate::container::equals(instance, int(3)));
+        assert_eq!(hash(instance), hash(int(3)));
+        // Operator dispatch must not fall back to `object.__eq__` identity.
+        assert_eq!(
+            crate::ops::binop(crate::ops::OP_EQ, instance, int(3)),
+            value::TRUE
+        );
+        assert_eq!(
+            crate::ops::binop(crate::ops::OP_NE, instance, int(3)),
+            value::FALSE
+        );
+        assert_eq!(
+            value::as_integer(crate::ops::binop(crate::ops::OP_ADD, instance, int(1))),
+            Some(4)
+        );
+        assert!(value::truthy(builtin_call(
+            Builtin::Isinstance,
+            &[instance, int_class]
+        )));
+        // The source spelling `isinstance(x, int)` uses the builtin value.
+        assert!(value::truthy(builtin_call(
+            Builtin::Isinstance,
+            &[instance, value::builtin_function_new(Builtin::Int)]
+        )));
+        assert!(value::truthy(instance));
+        assert_eq!(
+            value::as_str(format_builtin(instance, string("04d"), 0)),
+            Some("0003")
+        );
+
+        // A subclass with no own `__init__` inherits `object.__init__`, which
+        // must ignore the arguments the scalar constructor already consumed.
+        assert!(!exc::pending());
+
+        // Invalid construction keeps the scalar constructor's error.
+        let too_many = [int(1), int(2), int(3)];
+        assert_eq!(call(class, 3, too_many.as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(pending_message().contains("int()"));
+        exc::clear();
+
+        // A plain class keeps rejecting constructor arguments.
+        let plain = value::class_new("Plain".to_string(), NONE, Vec::new());
+        assert_eq!(call(plain, 1, args.as_ptr()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    /// `class S(str)` and `class B(bytes)` expose the wrapped value through the
+    /// scalar views, rendering, equality and inherited methods.
+    #[test]
+    fn scalar_subclasses_wrap_str_and_bytes() {
+        crate::exc::init();
+        let str_class = value::native_class("str");
+        let sclass = value::class_new_multi(
+            "S".to_string(),
+            vec![str_class],
+            NONE,
+            Vec::new(),
+            Vec::new(),
+        );
+        let text = [string("a")];
+        let instance = call(sclass, 1, text.as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::as_str(instance), Some("a"));
+        assert_eq!(value::repr(instance), "'a'");
+        assert_eq!(value::to_string(instance), "a");
+        assert!(crate::container::equals(instance, string("a")));
+        assert_eq!(hash(instance), hash(string("a")));
+        assert!(value::truthy(builtin_call(
+            Builtin::Isinstance,
+            &[instance, str_class]
+        )));
+        let upper = crate::methods::call(instance, b"upper".as_ptr(), 5, 0, std::ptr::null());
+        assert_eq!(value::as_str(upper), Some("A"));
+        assert!(!exc::pending());
+
+        let bytes_class = value::native_class("bytes");
+        let bclass = value::class_new_multi(
+            "B".to_string(),
+            vec![bytes_class],
+            NONE,
+            Vec::new(),
+            Vec::new(),
+        );
+        let data = [value::bytes_new(b"xy".to_vec())];
+        let instance = call(bclass, 1, data.as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::as_bytes(instance), Some(&b"xy"[..]));
+        assert_eq!(value::repr(instance), "b'xy'");
+        assert!(value::truthy(builtin_call(
+            Builtin::Isinstance,
+            &[instance, bytes_class]
+        )));
+
+        let float_class = value::native_class("float");
+        let fclass = value::class_new_multi(
+            "F".to_string(),
+            vec![float_class],
+            NONE,
+            Vec::new(),
+            Vec::new(),
+        );
+        let zero = call(fclass, 0, std::ptr::null());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::as_float(zero), Some(0.0));
+        let arg = [string("1.5")];
+        let instance = call(fclass, 1, arg.as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::as_float(instance), Some(1.5));
+        assert_eq!(value::repr(instance), "1.5");
+        assert!(value::truthy(builtin_call(
+            Builtin::Isinstance,
+            &[instance, float_class]
+        )));
+
+        let bool_class = value::native_class("bool");
+        let bclass = value::class_new_multi(
+            "Bool".to_string(),
+            vec![bool_class],
+            NONE,
+            Vec::new(),
+            Vec::new(),
+        );
+        let arg = [int(0)];
+        let instance = call(bclass, 1, arg.as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::as_integer(instance), Some(0));
+        assert_eq!(value::repr(instance), "False");
+        assert!(!value::truthy(instance));
+        assert!(value::truthy(builtin_call(
+            Builtin::Isinstance,
+            &[instance, bool_class]
+        )));
+        assert!(value::truthy(builtin_call(
+            Builtin::Isinstance,
+            &[instance, value::builtin_function_new(Builtin::Bool)]
+        )));
+    }
+
+    /// `int.__new__(cls, value)` (the path `enum.py` uses to build IntEnum
+    /// members) allocates the subclass instance instead of returning the
+    /// class or a plain int.
+    #[test]
+    fn scalar_new_allocates_a_subclass_instance() {
+        crate::exc::init();
+        let int_class = value::native_class("int");
+        let class = value::class_new_multi(
+            "E".to_string(),
+            vec![int_class],
+            NONE,
+            Vec::new(),
+            Vec::new(),
+        );
+        let args = [class, int(1)];
+        let member = crate::modules::call_native("builtins", "__scalar_new__", 2, args.as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            value::as_instance(member).map(|state| state.class),
+            Some(class)
+        );
+        assert_eq!(value::as_integer(member), Some(1));
+        assert_eq!(value::repr(member), "1");
+
+        // The bound spelling `int.__new__(cls, value)` takes the same path.
+        let int_fn = value::builtin_function_new(Builtin::Int);
+        let new_fn = crate::methods::getattr(int_fn, b"__new__".as_ptr(), 7);
+        assert!(!exc::pending(), "{}", pending_message());
+        let args = [class, int(2)];
+        let member = call(new_fn, 2, args.as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            value::as_instance(member).map(|state| state.class),
+            Some(class)
+        );
+        assert_eq!(value::as_integer(member), Some(2));
+
+        // The exact native class still yields the plain builtin value.
+        let args = [int_class, int(3)];
+        let plain = crate::modules::call_native("builtins", "__scalar_new__", 2, args.as_ptr());
+        assert!(value::is_int(plain));
+        assert_eq!(value::as_integer(plain), Some(3));
     }
 }

@@ -1985,12 +1985,44 @@ fn range_slice(range_start: i64, range_step: i64, start: i64, stop: i64, step: i
 }
 
 /// Python `==` for the value subset (numeric cross-type equality, string
-/// contents, deep list equality and order-insensitive dict equality).
+/// contents, deep list equality, order-insensitive dict equality and the
+/// `__eq__` of user-class instances).
 pub(crate) fn equals(a: i64, b: i64) -> bool {
     equals_depth(a, b, 0)
 }
 
 const MAX_EQ_DEPTH: usize = 64;
+
+thread_local! {
+    /// Nested user-`__eq__` dispatches in flight. A class that compares its
+    /// operands recursively re-enters this path with a fresh `depth`, so the
+    /// container limit cannot bound it and the native call stack would
+    /// overflow. Treat an unconverged comparison as unequal, like
+    /// [`MAX_EQ_DEPTH`].
+    static INSTANCE_EQ_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `a == b` for user-class instances: `a.__eq__(b)`, then the reflected
+/// `b.__eq__(a)`, exactly like a direct `==`. `None` means neither side
+/// defines equality, so the caller keeps its identity fallback (which has
+/// already failed at this point). A raised exception stays pending and the
+/// comparison reports `false`.
+fn instance_equality(a: i64, b: i64) -> Option<bool> {
+    if value::as_instance(a).is_none() && value::as_instance(b).is_none() {
+        return None;
+    }
+    if INSTANCE_EQ_DEPTH.with(|depth| depth.get()) >= MAX_EQ_DEPTH {
+        return Some(false);
+    }
+    INSTANCE_EQ_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let result = crate::ops::instance_comparison(crate::ops::OP_EQ, a, b);
+    INSTANCE_EQ_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    match result {
+        Some(result) if !exc::pending() => Some(value::truthy(result)),
+        Some(_) => Some(false),
+        None => None,
+    }
+}
 
 fn equals_depth(a: i64, b: i64, depth: usize) -> bool {
     // Opaque extension handles own their equality: `tp_richcompare` when the
@@ -2143,6 +2175,13 @@ fn equals_depth(a: i64, b: i64, depth: usize) -> bool {
                     .map(|pos| equals_depth(*val, ys[pos].1, depth + 1))
                     .unwrap_or(false)
             });
+    }
+    // A user class owns its instances' equality (`pydantic` generates `==` on
+    // the model class). Two distinct instances cannot be compared by content
+    // here, so dispatch the same `__eq__` a direct `==` would; without one,
+    // Python's identity fallback has already failed above.
+    if let Some(equal) = instance_equality(a, b) {
+        return equal;
     }
     false
 }
@@ -3116,5 +3155,89 @@ mod tests {
             "slice step cannot be zero"
         );
         assert_eq!(value::as_list(zero), Some(&[int(1)][..]));
+    }
+
+    /// A native scalar subclass instance hashes and compares as the wrapped
+    /// builtin value, so it can key a dict next to the plain value.
+    #[test]
+    fn scalar_subclass_keys_hash_and_compare_as_the_builtin() {
+        crate::exc::init();
+        let int_class = value::native_class("int");
+        let class = value::class_new_multi(
+            "N".to_string(),
+            vec![int_class],
+            NONE,
+            Vec::new(),
+            Vec::new(),
+        );
+        let instance = value::instance_new(class);
+        value::instance_set_scalar_payload(instance, int(3));
+        assert!(equals(instance, int(3)));
+        assert!(equals(int(3), instance));
+        assert_eq!(key_hash(instance), key_hash(int(3)));
+
+        let str_class = value::native_class("str");
+        let sclass = value::class_new_multi(
+            "S".to_string(),
+            vec![str_class],
+            NONE,
+            Vec::new(),
+            Vec::new(),
+        );
+        let text = value::instance_new(sclass);
+        value::instance_set_scalar_payload(text, string("a"));
+        assert!(equals(text, string("a")));
+        assert!(equals(string("a"), text));
+        assert_eq!(key_hash(text), key_hash(string("a")));
+    }
+
+    /// A user class's `__eq__` (how `pydantic` compares models) decides
+    /// equality for its instances even when they sit inside containers, where
+    /// no structural rule can tell two distinct instances apart.
+    #[test]
+    fn user_class_eq_dispatches_inside_containers() {
+        extern "C" fn eq_by_marker(argv: *const i64) -> i64 {
+            fn marker(v: i64) -> Option<i64> {
+                value::instance_attr(v, "marker").and_then(value::as_integer)
+            }
+            // SAFETY: the method ABI passes the receiver and the other operand.
+            let (left, right) = unsafe { (*argv, *argv.add(1)) };
+            value::bool_value(marker(left) == marker(right))
+        }
+
+        crate::exc::init();
+        let eq = value::function_new(eq_by_marker as *const () as usize, 2, "__eq__".to_string());
+        let class = value::class_new("Model".to_string(), NONE, vec![("__eq__".to_string(), eq)]);
+        let model = |marker: i64| {
+            let instance = value::instance_new(class);
+            value::instance_setattr(instance, "marker".to_string(), int(marker));
+            instance
+        };
+        let (left, same, other) = (model(1), model(1), model(2));
+
+        // Direct and nested comparisons run the class's `__eq__`.
+        assert!(equals(left, same));
+        assert!(equals(tuple(&[left]), tuple(&[same])));
+        assert!(equals(list(&[left]), list(&[same])));
+        assert!(equals(tuple(&[list(&[left])]), tuple(&[list(&[same])])));
+        assert!(equals(tuple(&[left, int(3)]), tuple(&[same, int(3)])));
+        assert!(!crate::exc::pending());
+
+        // Different field values stay unequal in every position.
+        assert!(!equals(left, other));
+        assert!(!equals(tuple(&[left]), tuple(&[other])));
+        assert!(!equals(list(&[left, same]), list(&[left, other])));
+        assert!(!equals(tuple(&[list(&[other])]), tuple(&[list(&[left])])));
+        assert!(!crate::exc::pending());
+
+        // Identity still short-circuits, and a class without `__eq__` keeps
+        // the identity fallback.
+        assert!(equals(left, left));
+        let bare = value::class_new("Bare".to_string(), NONE, Vec::new());
+        assert!(!equals(
+            value::instance_new(bare),
+            value::instance_new(bare)
+        ));
+        assert!(!crate::exc::pending());
     }
 }

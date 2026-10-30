@@ -7,7 +7,7 @@
 //! first-class function values for callables.
 //!
 //! Only the `ShimValue` types cross the boundary: scalars, bytes, strings,
-//! capsules, `NotImplemented`, lists/tuples/dicts of them and opaque
+//! capsules, `NotImplemented`, lists/tuples/dicts/sets of them and opaque
 //! [`ShimValue::Object`] handles. Containers are copied recursively in both
 //! directions (depth-limited to [`MAX_CONVERSION_DEPTH`]); a cyclic Hydro
 //! container raises a `TypeError` instead of recursing. Capsules cross as an
@@ -188,6 +188,9 @@ fn value_to_shim_at(
         path.pop();
         return Ok(ShimValue::Dict(converted));
     }
+    if let Some(items) = value::as_set(value_arg) {
+        return convert_sequence(value_arg, "set", depth, path, items, ShimValue::Set);
+    }
     // Classes, instances, functions and modules have no copied shim
     // representation. They cross as a rooted handle instead, so the extension
     // can inspect, call and store them and pass them back with their identity.
@@ -205,7 +208,7 @@ fn value_to_shim_at(
 /// Scalars and containers are copied by the arms above; the values listed
 /// here have no copy representation and need a live handle so the extension
 /// can observe their real identity, attributes and call semantics.
-fn hydro_handle_supported(value_arg: i64) -> bool {
+pub(crate) fn hydro_handle_supported(value_arg: i64) -> bool {
     value::as_class(value_arg).is_some()
         || value::as_instance(value_arg).is_some()
         || value::as_exc_instance(value_arg).is_some()
@@ -308,6 +311,25 @@ fn shim_to_value_at(shim: ShimValue, depth: usize) -> Result<i64, String> {
             }
             value::dict_new(converted)
         }
+        ShimValue::Set(items) => {
+            let items = shim_items_to_values(items, "set", depth)?;
+            // Reuse the set helpers so an item Hydro cannot hash raises
+            // `TypeError` (a C set may hold a handle whose Hydro value is
+            // unhashable) instead of corrupting the set invariant.
+            let set = value::set_new(Vec::new());
+            let roots = crate::heap::root_values(&[set]);
+            for item in items {
+                crate::container::set_add(set, item);
+                if exc::pending() {
+                    crate::heap::release_roots(roots);
+                    return Err(capi::take_hydro_error(
+                        "cannot convert an extension set item",
+                    ));
+                }
+            }
+            crate::heap::release_roots(roots);
+            set
+        }
         ShimValue::NotImplemented => value::NOT_IMPLEMENTED,
         ShimValue::Ellipsis => {
             return Err(
@@ -347,6 +369,7 @@ fn shim_type_name(shim: &ShimValue) -> String {
         ShimValue::List(_) => "list".to_string(),
         ShimValue::Tuple(_) => "tuple".to_string(),
         ShimValue::Dict(_) => "dict".to_string(),
+        ShimValue::Set(_) => "set".to_string(),
         ShimValue::Capsule { .. } => "PyCapsule".to_string(),
         ShimValue::Object { type_name, .. } => type_name.clone(),
         ShimValue::Hydro(handle) => handle.type_name().to_string(),
@@ -379,6 +402,14 @@ pub(crate) fn raised_error(message: &str) -> i64 {
         },
         None => fallback_error(message),
     };
+    // An exception instance raised by the extension is preserved as the
+    // payload: the frontend approximates its imported class with
+    // `RuntimeError`, while `str`/`repr`/attributes/methods delegate to the
+    // original object.
+    if let Some(exception) = capi::take_error_exception(message) {
+        let object = capi::exception_object_to_hydro(exception);
+        return exc::raise_extension(object, exc::RUNTIME_ERROR, text);
+    }
     exc::raise_with_message(tag, text)
 }
 
@@ -476,6 +507,8 @@ fn fallback_error(message: &str) -> (u32, &str) {
     } else if message.contains("TypeError")
         || message.contains("not callable")
         || message.contains("takes ")
+        || message.contains("cannot pass")
+        || message.contains("cannot set")
     {
         (TYPE_ERROR, message)
     } else {
@@ -537,12 +570,8 @@ pub(crate) fn call(
     };
     match attribute {
         ShimAttr::Callable(callable) => {
-            let args = match shim_arguments(argv) {
-                Ok(args) => args,
-                Err(value) => return value,
-            };
-            match capi::call_method(callable.module, callable.method, &args) {
-                Ok(result) => result_value(result),
+            match capi::call_method_hydro_args(callable.module, callable.method, argv) {
+                Ok(value) => value,
                 Err(message) => raised_error(&message),
             }
         }
@@ -553,8 +582,8 @@ pub(crate) fn call(
             };
             // Construction goes through the spec's `Py_tp_new`; a type without
             // one reports a `TypeError` from `capi`.
-            match capi::call_type_object(address, &args) {
-                Ok(result) => result_value(result),
+            match capi::call_type_object_hydro(address, &args) {
+                Ok(value) => value,
                 Err(message) => raised_error(&message),
             }
         }
@@ -659,12 +688,8 @@ pub(crate) fn call_value(state: &ExtFunctionState, argc: usize, argv: *const i64
         Ok(args) => args,
         Err(message) => return exc::raise_with_message(TYPE_ERROR, message),
     };
-    let args = match shim_arguments(argv) {
-        Ok(args) => args,
-        Err(value) => return value,
-    };
-    match capi::call_method(state.module, state.method, &args) {
-        Ok(result) => result_value(result),
+    match capi::call_method_hydro_args(state.module, state.method, argv) {
+        Ok(value) => value,
         Err(message) => raised_error(&message),
     }
 }
@@ -673,20 +698,11 @@ pub(crate) fn call_value(state: &ExtFunctionState, argc: usize, argv: *const i64
 // Opaque extension handles
 // ---------------------------------------------------------------------------
 
-/// Converts an ABI argument buffer to contract values.
-fn abi_arguments(argc: usize, argv: *const i64) -> Result<Vec<ShimValue>, i64> {
-    let argv = match argument_slice(argc, argv) {
-        Ok(args) => args,
-        Err(message) => return Err(exc::raise_with_message(TYPE_ERROR, message)),
-    };
-    shim_arguments(argv)
-}
-
-/// Converts an ABI keyword buffer (`name`, `value` pairs) to contract values.
-fn abi_keywords(kwargc: usize, kw_argv: *const i64) -> Result<Vec<(String, ShimValue)>, i64> {
-    if kwargc == 0 {
-        return Ok(Vec::new());
-    }
+/// Validates a Hydro keyword buffer and keeps the values tagged.
+///
+/// The names are checked exactly like [`abi_keywords`], but the values stay
+/// Hydro values so the call can track container identity across the bridge.
+fn hydro_keywords(kwargc: usize, kw_argv: *const i64) -> Result<Vec<(String, i64)>, i64> {
     if kw_argv.is_null() || kwargc > isize::MAX as usize / (2 * std::mem::size_of::<i64>()) {
         return Err(exc::raise_with_message(
             TYPE_ERROR,
@@ -703,10 +719,7 @@ fn abi_keywords(kwargc: usize, kw_argv: *const i64) -> Result<Vec<(String, ShimV
                 "keyword name must be str",
             ));
         };
-        match value_to_shim(pair[1]) {
-            Ok(converted) => keywords.push((name.to_string(), converted)),
-            Err(message) => return Err(exc::raise_with_message(TYPE_ERROR, &message)),
-        }
+        keywords.push((name.to_string(), pair[1]));
     }
     Ok(keywords)
 }
@@ -733,8 +746,8 @@ pub(crate) fn ext_object_getattr(value_arg: i64, name: &str) -> i64 {
     let Some(object) = ext_handle(value_arg) else {
         return NONE;
     };
-    match capi::object_get_attr(object, name) {
-        Ok(result) => result_value(result),
+    match capi::object_get_attr_hydro(object, name) {
+        Ok(value) => value,
         Err(message) => raised_error(&message),
     }
 }
@@ -744,19 +757,13 @@ pub(crate) fn ext_object_call(value_arg: i64, argc: usize, argv: *const i64) -> 
     let Some(object) = ext_handle(value_arg) else {
         return NONE;
     };
-    let args = match abi_arguments(argc, argv) {
+    let argv = match argument_slice(argc, argv) {
         Ok(args) => args,
-        Err(value) => return value,
+        Err(message) => return exc::raise_with_message(TYPE_ERROR, message),
     };
-    // Construction goes through `call_type_object` so heap types use their
-    // `Py_tp_new`/vectorcall path; any other handle is a normal callable.
-    let outcome = if capi::object_is_type(object) {
-        capi::call_type_object(object as usize, &args)
-    } else {
-        capi::object_call(object, &args, &[])
-    };
-    match outcome {
-        Ok(result) => result_value(result),
+    // Vectorcall handles both heap-type construction and plain callables.
+    match capi::object_call_hydro_args(object, argv, &[]) {
+        Ok(value) => value,
         Err(message) => raised_error(&message),
     }
 }
@@ -766,12 +773,12 @@ pub(crate) fn ext_object_method(value_arg: i64, name: &str, argc: usize, argv: *
     let Some(object) = ext_handle(value_arg) else {
         return NONE;
     };
-    let args = match abi_arguments(argc, argv) {
+    let argv = match argument_slice(argc, argv) {
         Ok(args) => args,
-        Err(value) => return value,
+        Err(message) => return exc::raise_with_message(TYPE_ERROR, message),
     };
-    match capi::object_call_method(object, name, &args, &[]) {
-        Ok(result) => result_value(result),
+    match capi::object_call_method_hydro_args(object, name, argv, &[]) {
+        Ok(value) => value,
         Err(message) => raised_error(&message),
     }
 }
@@ -788,16 +795,16 @@ pub(crate) fn ext_object_method_kw(
     let Some(object) = ext_handle(value_arg) else {
         return NONE;
     };
-    let args = match abi_arguments(argc, argv) {
+    let argv = match argument_slice(argc, argv) {
         Ok(args) => args,
-        Err(value) => return value,
+        Err(message) => return exc::raise_with_message(TYPE_ERROR, message),
     };
-    let keywords = match abi_keywords(kwargc, kw_argv) {
+    let keywords = match hydro_keywords(kwargc, kw_argv) {
         Ok(keywords) => keywords,
         Err(value) => return value,
     };
-    match capi::object_call_method(object, name, &args, &keywords) {
-        Ok(result) => result_value(result),
+    match capi::object_call_method_hydro_args(object, name, argv, &keywords) {
+        Ok(value) => value,
         Err(message) => raised_error(&message),
     }
 }
@@ -813,18 +820,16 @@ pub(crate) fn ext_object_call_kw(
     let Some(object) = ext_handle(value_arg) else {
         return NONE;
     };
-    let args = match abi_arguments(argc, argv) {
+    let argv = match argument_slice(argc, argv) {
         Ok(args) => args,
-        Err(value) => return value,
+        Err(message) => return exc::raise_with_message(TYPE_ERROR, message),
     };
-    let keywords = match abi_keywords(kwargc, kw_argv) {
+    let keywords = match hydro_keywords(kwargc, kw_argv) {
         Ok(keywords) => keywords,
         Err(value) => return value,
     };
-    // Types also construct through vectorcall when keywords are present;
-    // `call_type_object` only carries the positional fast path.
-    match capi::object_call(object, &args, &keywords) {
-        Ok(result) => result_value(result),
+    match capi::object_call_hydro_args(object, argv, &keywords) {
+        Ok(value) => value,
         Err(message) => raised_error(&message),
     }
 }
@@ -1413,6 +1418,66 @@ mod tests {
         ));
         let back = shim_to_value(shim).expect("unnamed capsule converts back");
         assert_eq!(value::as_capsule(back), Some((0x1234, None)));
+    }
+
+    #[test]
+    fn nested_sets_roundtrip_through_the_contract() {
+        let shim = ShimValue::Dict(vec![
+            (
+                ShimValue::Str("fields".to_string()),
+                ShimValue::Set(vec![
+                    ShimValue::Str("a".to_string()),
+                    ShimValue::Str("b".to_string()),
+                ]),
+            ),
+            (
+                ShimValue::Str("nested".to_string()),
+                ShimValue::List(vec![ShimValue::Set(vec![ShimValue::Int(1)])]),
+            ),
+        ]);
+        let tagged = shim_to_value(shim.clone()).expect("sets convert to Hydro");
+        let pairs = value::as_dict(tagged).expect("the root stays a dict");
+        let fields = pairs
+            .iter()
+            .find(|(key, _)| value::as_str(*key) == Some("fields"))
+            .map(|&(_, item)| item)
+            .expect("fields entry");
+        assert_eq!(
+            value::as_set(fields)
+                .expect("the nested value is a Hydro set")
+                .len(),
+            2
+        );
+        let nested = pairs
+            .iter()
+            .find(|(key, _)| value::as_str(*key) == Some("nested"))
+            .map(|&(_, item)| item)
+            .expect("nested entry");
+        let nested_items = value::as_list(nested).expect("the nested list stays a list");
+        assert!(value::as_set(nested_items[0]).is_some());
+
+        let back = value_to_shim(tagged).expect("sets convert back to the contract");
+        let ShimValue::Dict(pairs) = back else {
+            panic!("the root stays a dict");
+        };
+        let fields = pairs
+            .iter()
+            .find(|(key, _)| matches!(key, ShimValue::Str(name) if name.as_str() == "fields"))
+            .map(|(_, item)| item)
+            .expect("fields entry");
+        let ShimValue::Set(items) = fields else {
+            panic!("the nested value becomes ShimValue::Set, not an opaque handle");
+        };
+        assert_eq!(items.len(), 2);
+        let nested = pairs
+            .iter()
+            .find(|(key, _)| matches!(key, ShimValue::Str(name) if name.as_str() == "nested"))
+            .map(|(_, item)| item)
+            .expect("nested entry");
+        let ShimValue::List(items) = nested else {
+            panic!("the nested list stays a list");
+        };
+        assert!(matches!(&items[0], ShimValue::Set(inner) if inner.len() == 1));
     }
 
     #[test]

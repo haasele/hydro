@@ -226,6 +226,9 @@ pub static TIME: ModuleSpec = ModuleSpec {
         // `ctime([secs])`: the `asctime(localtime(secs))` spelling with an
         // optional epoch-seconds argument.
         f("ctime", 0, 1, Type::Str),
+        // `asctime([t])`: a nine-field time sequence (or `struct_time`) in
+        // C `asctime` form; omitted means the current local time.
+        f("asctime", 0, 1, Type::Str),
         // `mktime(t)`: the inverse of `localtime`, an epoch-seconds float for
         // a nine-field `struct_time` sequence.
         f("mktime", 1, 1, Type::Float),
@@ -393,6 +396,12 @@ pub static OS_PATH: ModuleSpec = ModuleSpec {
         f("isfile", 1, 1, Type::Bool),
         f("isdir", 1, 1, Type::Bool),
         f("isabs", 1, 1, Type::Bool),
+        // `getsize(filename)`/`getmtime(filename)`/`getatime(filename)`/
+        // `getctime(filename)`: the `os.stat` fields of the path.
+        f("getsize", 1, 1, Type::Int),
+        f("getmtime", 1, 1, Type::Float),
+        f("getatime", 1, 1, Type::Float),
+        f("getctime", 1, 1, Type::Float),
         // `islink(path)`: whether the final path component is a symlink.
         f("islink", 1, 1, Type::Bool),
         // `expanduser(path)`: `~`/`~user` expanded against the home directory.
@@ -451,6 +460,11 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("getcwd", 0, 0, Type::Str),
         // `getcwdb()`: the current directory as bytes.
         f("getcwdb", 0, 0, Type::Bytes),
+        f("chdir", 1, 1, Type::None),
+        // Linux glibc device-number helpers used by pandas' terminal checks.
+        f("makedev", 2, 2, Type::Int),
+        f("major", 1, 1, Type::Int),
+        f("minor", 1, 1, Type::Int),
         f("getenv", 1, 2, Type::Any),
         // `os.fspath(path)`: str/bytes pass through, other objects are asked
         // for `__fspath__`. The result is str or bytes, which the runtime
@@ -1483,6 +1497,11 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("ord", 1, 1, Type::Int),
         f("chr", 1, 1, Type::Str),
         f("divmod", 2, 2, Type::Tuple),
+        // `pow(base, exp, mod=None)`: two-argument exponentiation (the `**`
+        // operator) and integer modular exponentiation. CPython 3.14 binds all
+        // three parameters by name, and an explicit `mod=None` selects the
+        // two-argument form.
+        kw("pow", 2, 3, Type::Any, &["base", "exp", "mod"]),
         // Integer-base spellings: `hex`, `bin` and `oct` take exactly one
         // integer (including arbitrary-precision values) and return the
         // prefixed literal text.
@@ -2947,7 +2966,8 @@ pub static TIMEIT: ModuleSpec = ModuleSpec {
 /// arbitrary keyword names, so it forwards every keyword to the runtime
 /// ([`kw_dynamic`]); the runtime shallow-copies the instance attributes.
 /// `fields(class_or_instance)` returns the declared `Field` objects as a
-/// tuple.
+/// tuple, and `asdict(obj, *, dict_factory=dict)` walks those fields to build
+/// the nested mapping.
 pub static DATACLASSES: ModuleSpec = ModuleSpec {
     name: "dataclasses",
     functions: &[
@@ -2957,6 +2977,10 @@ pub static DATACLASSES: ModuleSpec = ModuleSpec {
         // `default` slot.
         kw_dynamic("field", 0, 0, Type::Any, &[]),
         kw_dynamic("replace", 1, 1, Type::Any, &["obj"]),
+        // `asdict(obj, *, dict_factory=dict)`: recursively converts a dataclass
+        // instance to a mapping; `dict_factory` is keyword-only, so keywords
+        // are forwarded to the runtime.
+        kw_dynamic("asdict", 1, 1, Type::Dict, &["obj"]),
         // `is_dataclass(obj)`: true for a dataclass or one of its instances.
         f("is_dataclass", 1, 1, Type::Bool),
         // `fields(class_or_instance)`: tuple of the declared `Field` objects.
@@ -3062,6 +3086,14 @@ pub static TYPING: ModuleSpec = ModuleSpec {
         f("assert_never", 1, 1, Type::Never),
         f("runtime_checkable", 1, 1, Type::Any),
         f("overload", 1, 1, Type::Any),
+        // `no_type_check(arg)`: the identity decorator that stamps
+        // `__no_type_check__` on a function (recursively on a class's own
+        // members) and returns it unchanged. pydantic applies it to helper
+        // functions. `no_type_check_decorator(decorator)` gives another
+        // decorator the same effect and emits a DeprecationWarning (removed
+        // in CPython 3.15).
+        kw("no_type_check", 1, 1, Type::Any, &["arg"]),
+        kw("no_type_check_decorator", 1, 1, Type::Any, &["decorator"]),
         // `TypeVar(name, *constraints, *, bound=None, covariant=False,
         // contravariant=False, infer_variance=False, default=NoDefault,
         // module=None)`: only the name is a named positional parameter; the
@@ -3154,6 +3186,10 @@ pub static TYPING: ModuleSpec = ModuleSpec {
     ],
     constants: &[
         c("TYPE_CHECKING", Type::Bool),
+        // `typing.__all__`: the module's public export list (built by the
+        // runtime from this spec so `from typing import *` and
+        // `typing_extensions`' name probing agree with it).
+        c("__all__", Type::List),
         // CPython 3.13+ sentinels imported by `typing_extensions` and
         // pydantic. They are identity-stable singleton instances; no
         // `builtins.sentinel` (3.15-only) is added.
@@ -5235,7 +5271,8 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
 // ---------------------------------------------------------------------------
 //
 // `hashlib` and the C accelerator surfaces (`_hashlib`, `_sha1`, `_sha2`,
-// `_md5`, `_blake2`, `_hmac`, `_uuid`) are implemented by one runtime module.
+// `_sha3`, `_md5`, `_blake2`, `_hmac`, `_uuid`) are implemented by one runtime
+// module.
 // The constructors accept their documented keyword names; the digest objects
 // themselves are `HASH`/`HMAC` class instances whose methods are runtime
 // supplemental entries.
@@ -5365,6 +5402,23 @@ pub static _SHA2: ModuleSpec = ModuleSpec {
         kw("sha256", 0, 1, Type::Any, &["data"]),
         kw("sha384", 0, 1, Type::Any, &["data"]),
         kw("sha512", 0, 1, Type::Any, &["data"]),
+    ],
+    constants: &[],
+};
+
+/// `_sha3`: the SHA-3 (FIPS 202) and SHAKE accelerator constructors. CPython's
+/// `hashlib` imports exactly these names from it when the OpenSSL accelerator
+/// is unavailable; the runtime routes the alias to the `hashlib`
+/// implementation.
+pub static _SHA3: ModuleSpec = ModuleSpec {
+    name: "_sha3",
+    functions: &[
+        kw("sha3_224", 0, 1, Type::Any, &["data"]),
+        kw("sha3_256", 0, 1, Type::Any, &["data"]),
+        kw("sha3_384", 0, 1, Type::Any, &["data"]),
+        kw("sha3_512", 0, 1, Type::Any, &["data"]),
+        kw("shake_128", 0, 1, Type::Any, &["data"]),
+        kw("shake_256", 0, 1, Type::Any, &["data"]),
     ],
     constants: &[],
 };
@@ -6143,6 +6197,15 @@ pub static _SRE: ModuleSpec = ModuleSpec {
     constants: RE.constants,
 };
 
+/// `_ssl`: the C module `ssl` wraps. Hydro implements TLS natively and has no
+/// separate C layer, so the alias reuses `ssl`'s tables (the class/constant
+/// values must stay identical and calls must reach one implementation).
+pub static _SSL: ModuleSpec = ModuleSpec {
+    name: "_ssl",
+    functions: SSL.functions,
+    constants: SSL.constants,
+};
+
 /// `posix`: the Unix flavour of `os`. The table is `os`'s, so the platform
 /// spelling resolves the same names.
 pub static POSIX: ModuleSpec = ModuleSpec {
@@ -6384,6 +6447,14 @@ mod tests {
         assert!(
             replace.dynamic_keywords,
             "replace() forwards arbitrary keyword names to the runtime"
+        );
+        let asdict = function("dataclasses", "asdict").expect("dataclasses.asdict");
+        assert_eq!((asdict.min_args, asdict.max_args), (1, 1));
+        assert_eq!(asdict.ret, Type::Dict);
+        assert_eq!(asdict.params, &["obj"][..]);
+        assert!(
+            asdict.dynamic_keywords,
+            "asdict() accepts the keyword-only dict_factory"
         );
         assert_eq!(constant("dataclasses", "MISSING").unwrap().ty, Type::Any);
         let fields = function("dataclasses", "fields").expect("dataclasses.fields");
@@ -6679,6 +6750,12 @@ mod tests {
         );
         assert_eq!(assert_never.ret, Type::Never, "assert_never never returns");
         assert_eq!(function("typing", "runtime_checkable").unwrap().max_args, 1);
+        for name in ["no_type_check", "no_type_check_decorator"] {
+            let decorator = function("typing", name).expect(name);
+            assert_eq!((decorator.min_args, decorator.max_args), (1, 1));
+            assert_eq!(decorator.ret, Type::Any);
+        }
+        assert_eq!(constant("typing", "__all__").unwrap().ty, Type::List);
         assert_eq!(function("typing", "overload").unwrap().min_args, 1);
         let typevar = function("typing", "TypeVar").unwrap();
         assert_eq!(typevar.min_args, 1);
@@ -8503,6 +8580,7 @@ mod tests {
             ("_types", "types"),
             ("_typing", "typing"),
             ("_sre", "re"),
+            ("_ssl", "ssl"),
             ("posix", "os"),
             ("posixpath", "os.path"),
             ("ntpath", "os.path"),
@@ -8534,6 +8612,13 @@ mod tests {
                 "{alias}.constants must be the {target} table"
             );
         }
+        // `_ssl` imports and member access resolve the `ssl` surface the
+        // standard library uses (`http.client`, `urllib.request`, `smtplib`).
+        let context = function("_ssl", "SSLContext").expect("_ssl.SSLContext");
+        assert_eq!((context.min_args, context.max_args), (0, 1));
+        assert!(function("_ssl", "_ssl_context_wrap_socket").is_some());
+        assert!(constant("_ssl", "SSLSocket").is_some());
+        assert!(constant("_ssl", "CERT_REQUIRED").is_some());
         let name = "faulthandler";
         let spec = module(name).unwrap_or_else(|| panic!("{name}"));
         assert!(spec.functions.is_empty(), "{name}");
@@ -8565,6 +8650,7 @@ mod tests {
             "_types",
             "_typing",
             "_sre",
+            "_ssl",
             "posix",
             "posixpath",
             "ntpath",
@@ -8591,6 +8677,7 @@ mod tests {
             "_bisect",
             "_heapq",
             "_struct",
+            "_sha3",
         ] {
             let count = crate::stdlib::MODULES
                 .iter()
@@ -9427,6 +9514,17 @@ mod tests {
         for (module, names) in [
             ("_sha1", &["sha1"][..]),
             ("_sha2", &["sha224", "sha256", "sha384", "sha512"][..]),
+            (
+                "_sha3",
+                &[
+                    "sha3_224",
+                    "sha3_256",
+                    "sha3_384",
+                    "sha3_512",
+                    "shake_128",
+                    "shake_256",
+                ][..],
+            ),
             ("_md5", &["md5"][..]),
             ("_blake2", &["blake2b", "blake2s"][..]),
         ] {

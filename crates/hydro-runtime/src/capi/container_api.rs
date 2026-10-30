@@ -87,6 +87,7 @@ pub unsafe extern "C" fn PyDict_Pop(
         pairs.remove(position)
     };
     dec_ref(removed.0 as *mut ShimObject);
+    super::sync_dict_prefix(dict);
     let value = removed.1 as *mut ShimObject;
     if result.is_null() {
         dec_ref(value);

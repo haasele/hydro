@@ -189,6 +189,7 @@ struct Runtime {
     deferred_call: FuncId,
     arity_error: FuncId,
     map: FuncId,
+    map_many: FuncId,
     filter: FuncId,
     sum: FuncId,
     enumerate: FuncId,
@@ -466,6 +467,7 @@ impl Runtime {
             // positional maximum and the supplied count.
             arity_error: declare_runtime(module, "hydro_arity_error", &[i64t, i64t], Some(i64t))?,
             map: declare_runtime(module, "hydro_map", &[i64t, i64t], Some(i64t))?,
+            map_many: declare_runtime(module, "hydro_map_many", &[ptr, ptr], Some(i64t))?,
             filter: declare_runtime(module, "hydro_filter", &[i64t, i64t], Some(i64t))?,
             sum: declare_runtime(module, "hydro_sum", &[i64t, i64t], Some(i64t))?,
             enumerate: declare_runtime(module, "hydro_enumerate", &[i64t, i64t], Some(i64t))?,
@@ -2188,13 +2190,21 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
     }
 
     /// Encode the function kind as the runtime's `flags` word: bit0 marks an
-    /// `async def`, bit1 marks a generator. Both the coroutine and the
-    /// generator object are created from this flag word by the function
-    /// wrappers.
+    /// `async def`, bit1 a generator, bit2 a dynamic signature (`*args`,
+    /// keyword-only or `**kwargs`) and bit3 a parameter default that only
+    /// exists when the function value is created (a non-literal
+    /// `default_expr`). A dynamic wrapper cannot embed such a default, so the
+    /// runtime binder must bind it from the attached signature.
     fn function_flags(&mut self, function: &Function) -> Value {
         let flags = u32::from(function.is_async)
             | (u32::from(function.is_generator) << 1)
-            | (u32::from(function.has_dynamic_signature()) << 2);
+            | (u32::from(function.has_dynamic_signature()) << 2)
+            | (u32::from(
+                function
+                    .params
+                    .iter()
+                    .any(|param| param.default_expr.is_some()),
+            ) << 3);
         self.builder.ins().iconst(types::I32, i64::from(flags))
     }
 
@@ -7742,24 +7752,37 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 Ok(result)
             }
             Builtin::Map | Builtin::Filter => {
-                if values.len() != 2 {
+                let valid = match builtin {
+                    Builtin::Map => values.len() >= 2,
+                    Builtin::Filter => values.len() == 2,
+                    _ => unreachable!("match guarded by the outer arm"),
+                };
+                if !valid {
                     let name = builtin.name();
                     let actual = values.len();
                     return Err(CodegenError::new(format!(
-                        "builtin {name} expects 2 arguments, got {actual}"
+                        "builtin {name} expects {} arguments, got {actual}",
+                        if builtin == Builtin::Map { "at least 2" } else { "2" }
                     )));
                 }
-                let id = match builtin {
-                    Builtin::Map => self.runtime.map,
-                    Builtin::Filter => self.runtime.filter,
-                    _ => {
-                        let name = builtin.name();
-                        return Err(CodegenError::new(format!(
-                            "internal error: {name} reached first-class builtin lowering"
-                        )));
+                let result = if builtin == Builtin::Map && values.len() > 2 {
+                    let slot = self.stack_array_slot(values.len(), "map()")?;
+                    for (index, value) in values.iter().enumerate() {
+                        self.builder
+                            .ins()
+                            .stack_store(*value, slot, (index * 8) as i32);
                     }
+                    let argv = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
+                    let argc = self.builder.ins().iconst(self.ptr_ty, values.len() as i64);
+                    self.call_rt(self.runtime.map_many, &[argc, argv])?
+                } else {
+                    let id = match builtin {
+                        Builtin::Map => self.runtime.map,
+                        Builtin::Filter => self.runtime.filter,
+                        _ => unreachable!("match guarded by the outer arm"),
+                    };
+                    self.call_rt(id, &values[..2])?
                 };
-                let result = self.call_rt(id, &values[..2])?;
                 self.emit_exc_check()?;
                 Ok(result)
             }

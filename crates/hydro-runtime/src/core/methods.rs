@@ -128,6 +128,13 @@ pub(crate) fn call(
     if value::as_ext_object(obj).is_some() {
         return modules::extension::ext_object_method(obj, &method, argc, argv);
     }
+    // An exception raised by a C extension keeps the original instance, so its
+    // methods (`exc.errors()`, `exc.error_count()`, ...) dispatch there.
+    if let Some(extension) = value::exception_ext_object(obj) {
+        if value::as_ext_object(extension).is_some() {
+            return modules::extension::ext_object_method(extension, &method, argc, argv);
+        }
+    }
     // Template values expose only `Interpolation.convert()`.
     if let Some(result) = crate::core::template::call_method(obj, &method, argc, argv) {
         return result;
@@ -308,6 +315,19 @@ pub(crate) fn call(
         }
         return attribute_error(obj, &method);
     }
+    // `int.__new__(cls, ...)` and the same slot on the other native scalar
+    // type spellings. The class argument is explicit, so the whole argument
+    // list (class first) reaches the scalar constructor.
+    if method == "__new__" {
+        if let Some(name) = value::builtin_type_name(obj) {
+            if matches!(name, "bool" | "int" | "float" | "str" | "bytes") {
+                let roots = crate::heap::root_values(&args);
+                let result = builtins::scalar_new_from_args(args.len(), args.as_ptr());
+                crate::heap::release_roots(roots);
+                return result;
+            }
+        }
+    }
     // The `int`/`bytes` builtin type values are function objects at runtime,
     // so `int.from_bytes(...)`/`bytes.fromhex(...)` arrive here with the type
     // value as the receiver.
@@ -316,6 +336,9 @@ pub(crate) fn call(
     }
     if is_builtin_bytes_type(obj) {
         return bytes_class_method(obj, &method, &args, &[]);
+    }
+    if is_builtin_float_type(obj) {
+        return float_class_method(obj, &method, &args, &[]);
     }
     // `type` is the metaclass builtin: metaclasses and typing stubs reach
     // `type.__new__`/`type.__subclasscheck__` through the same value.
@@ -446,6 +469,18 @@ fn super_method(proxy: i64, method: &str, args: &[i64]) -> i64 {
         return attribute_error(proxy, method);
     };
     let Some(entry) = value::class_lookup_after(owner, state.class, method) else {
+        if std::env::var_os("HYDRO_DEBUG_SUPER").is_some() {
+            let mro: Vec<&str> = value::class_mro(owner)
+                .iter()
+                .map(|&class| value::class_display_name(class).unwrap_or("<non-class>"))
+                .collect();
+            eprintln!(
+                "super call miss: method={method} start={} object={} owner={} mro={mro:?}",
+                value::class_display_name(state.class).unwrap_or("<non-class>"),
+                value::type_name_of(state.object),
+                value::class_display_name(owner).unwrap_or("<non-class>"),
+            );
+        }
         return attribute_error(proxy, method);
     };
     call_bound_entry(state.object, owner, entry, method, args, &[])
@@ -461,9 +496,21 @@ fn super_getattr(proxy: i64, attr: &str) -> Option<i64> {
     } else {
         return None;
     };
-    let entry = value::class_lookup_after(owner, state.class, attr)?;
-    match entry {
-        value::ClassEntry::Method(MethodKind::Property, function) => {
+    let entry = value::class_lookup_after(owner, state.class, attr);
+    if entry.is_none() && std::env::var_os("HYDRO_DEBUG_SUPER").is_some() {
+        let mro: Vec<&str> = value::class_mro(owner)
+            .iter()
+            .map(|&class| value::class_display_name(class).unwrap_or("<non-class>"))
+            .collect();
+        eprintln!(
+            "super getattr miss: attr={attr} start={} object={} owner={} mro={mro:?}",
+            value::class_display_name(state.class).unwrap_or("<non-class>"),
+            value::type_name_of(state.object),
+            value::class_display_name(owner).unwrap_or("<non-class>"),
+        );
+    }
+    let entry = entry?;
+    match entry {        value::ClassEntry::Method(MethodKind::Property, function) => {
             let args = [state.object];
             Some(builtins::call(function, 1, args.as_ptr()))
         }
@@ -599,6 +646,16 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
         return attribute_error(obj, method);
     };
     let entry = value::class_lookup(class, method);
+    // `object.__init__` ignores extra arguments once a native scalar payload
+    // consumed them (`class N(int): pass`; `enum` calls a member's `__init__`
+    // after constructing it through `int.__new__`).
+    if method == "__init__" && value::scalar_payload(obj).is_some() {
+        if let Some(value::ClassEntry::Method(_, function)) = &entry {
+            if value::function_native_name(*function) == Some("__object_init__") {
+                return NONE;
+            }
+        }
+    }
     // Python's precedence: a data descriptor wins over the instance
     // dictionary, which wins over a normal method / non-data descriptor.
     if let Some(entry) = &entry {
@@ -617,6 +674,11 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
         return builtins::call(attribute, argc, argv);
     }
     let Some(entry) = entry else {
+        // A scalar subclass instance inherits the wrapped builtin's method
+        // surface (`class S(str): pass; S('a').upper()`).
+        if let Some(payload) = value::scalar_payload(obj) {
+            return call(payload, method.as_ptr(), method.len(), argc, argv);
+        }
         return attribute_error(obj, method);
     };
     let args = if argc == 0 {
@@ -1523,6 +1585,15 @@ pub(crate) fn call_kw(
     if value::as_ext_object(obj).is_some() {
         return modules::extension::ext_object_method_kw(obj, &method, argc, argv, kwargc, kw_argv);
     }
+    // An exception raised by a C extension keeps the original instance, so its
+    // methods dispatch there, exactly like the positional path.
+    if let Some(extension) = value::exception_ext_object(obj) {
+        if value::as_ext_object(extension).is_some() {
+            return modules::extension::ext_object_method_kw(
+                extension, &method, argc, argv, kwargc, kw_argv,
+            );
+        }
+    }
     if let Some(module) = value::as_module(obj) {
         if module.path().is_some() {
             let function = modules::module_attr(module, &method);
@@ -1749,6 +1820,9 @@ pub(crate) fn call_kw(
     }
     if is_builtin_bytes_type(obj) {
         return bytes_class_method(obj, &method, &args, &keywords.items);
+    }
+    if is_builtin_float_type(obj) {
+        return float_class_method(obj, &method, &args, &keywords.items);
     }
     if is_builtin_type_type(obj) {
         return type_class_method(obj, &method, &args, &keywords.items);
@@ -2426,6 +2500,16 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
                 }
             }
         }
+        // Every native scalar type spelling exposes `__new__`, so
+        // `str.__new__(cls, value)` (enum.py's `StrEnum.__new__`) and
+        // `int.__new__(cls, value)` reach the scalar constructor.
+        if attr == "__new__" {
+            if let Some(name) = value::builtin_type_name(obj) {
+                if matches!(name, "bool" | "int" | "float" | "str" | "bytes") {
+                    return value::bound_method_new(obj, attr.to_string());
+                }
+            }
+        }
         // The `int` builtin type value exposes its class-level methods as
         // callable attributes, like CPython's type objects.
         if matches!(
@@ -2440,6 +2524,14 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         if matches!(
             &function.body,
             value::FunctionBody::Builtin(hydro_ir::Builtin::Bytes)
+        ) && attr == "fromhex"
+        {
+            return value::bound_method_new(obj, attr.to_string());
+        }
+        // `float.fromhex('0x1p3')` is the `float` type's classmethod.
+        if matches!(
+            &function.body,
+            value::FunctionBody::Builtin(hydro_ir::Builtin::Float)
         ) && attr == "fromhex"
         {
             return value::bound_method_new(obj, attr.to_string());
@@ -2739,6 +2831,11 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         }
         // 3. Class attributes, non-data descriptors and methods.
         let Some(entry) = entry else {
+            // A scalar subclass instance inherits the wrapped builtin's
+            // attribute surface (`class S(str): pass; S('a').upper`).
+            if let Some(payload) = value::scalar_payload(obj) {
+                return getattr_named(payload, attr);
+            }
             return attribute_error(obj, attr);
         };
         return match entry {
@@ -2856,6 +2953,24 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
                 return item;
             }
             Some(value::ClassEntry::Method(MethodKind::Property, _)) => {}
+            // A scalar subclass inherits the builtin's unbound dunders
+            // (`int.__str__` is a descriptor that takes the instance). Returning
+            // the function itself keeps `int.__str__(x)` and enum.py's
+            // `member_type.__str__` identity comparisons correct.
+            Some(value::ClassEntry::Method(_, function))
+                if value::native_scalar_base(obj).is_some()
+                    && matches!(
+                        value::function_native_name(function),
+                        Some(
+                            "__scalar_repr__"
+                                | "__scalar_str__"
+                                | "__scalar_format__"
+                                | "__scalar_new__"
+                        )
+                    ) =>
+            {
+                return function;
+            }
             Some(value::ClassEntry::Method(MethodKind::Normal, function))
                 if value::is_native_dict_method(function) =>
             {
@@ -3556,6 +3671,20 @@ fn is_builtin_bytes_type(obj: i64) -> bool {
     matches!(
         &function.body,
         value::FunctionBody::Builtin(hydro_ir::Builtin::Bytes)
+    )
+}
+
+/// Whether `obj` is the `float` builtin *type* value.
+///
+/// Like `int` and `bytes`, `float` is a builtin function value at runtime, so
+/// `float.fromhex(...)` reaches [`call`] with the function as the receiver.
+fn is_builtin_float_type(obj: i64) -> bool {
+    let Some(function) = value::as_function(obj) else {
+        return false;
+    };
+    matches!(
+        &function.body,
+        value::FunctionBody::Builtin(hydro_ir::Builtin::Float)
     )
 }
 
@@ -4293,6 +4422,57 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
                 return err;
             }
             value::str_alloc(s.to_lowercase())
+        }
+        "title" => {
+            if let Some(err) = check_arity("str", method, args.len(), 0, 0) {
+                return err;
+            }
+            let mut out = String::with_capacity(s.len());
+            let mut previous_cased = false;
+            for ch in s.chars() {
+                if ch.is_alphabetic() {
+                    if previous_cased {
+                        out.extend(ch.to_lowercase());
+                    } else {
+                        out.extend(ch.to_uppercase());
+                    }
+                    previous_cased = true;
+                } else {
+                    out.push(ch);
+                    previous_cased = false;
+                }
+            }
+            value::str_alloc(out)
+        }
+        "capitalize" => {
+            if let Some(err) = check_arity("str", method, args.len(), 0, 0) {
+                return err;
+            }
+            let mut chars = s.chars();
+            let mut out = String::with_capacity(s.len());
+            if let Some(first) = chars.next() {
+                out.extend(first.to_uppercase());
+                for ch in chars {
+                    out.extend(ch.to_lowercase());
+                }
+            }
+            value::str_alloc(out)
+        }
+        "swapcase" => {
+            if let Some(err) = check_arity("str", method, args.len(), 0, 0) {
+                return err;
+            }
+            let mut out = String::with_capacity(s.len());
+            for ch in s.chars() {
+                if ch.is_uppercase() {
+                    out.extend(ch.to_lowercase());
+                } else if ch.is_lowercase() {
+                    out.extend(ch.to_uppercase());
+                } else {
+                    out.push(ch);
+                }
+            }
+            value::str_alloc(out)
         }
         "strip" | "lstrip" | "rstrip" => {
             if let Some(err) = check_arity("str", method, args.len(), 0, 1) {
@@ -5094,6 +5274,25 @@ fn bytes_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String,
                 return type_error("maketrans() takes no keyword arguments".to_string());
             }
             bytes_maketrans(args)
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
+/// Class-level methods reached through the `float` builtin type value.
+///
+/// `fromhex` parses CPython's hexadecimal floating-point spelling through
+/// [`builtins::float_fromhex`].
+fn float_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    match method {
+        "fromhex" => {
+            if !keywords.is_empty() {
+                return type_error("fromhex() takes no keyword arguments".to_string());
+            }
+            if let Some(err) = check_arity("float", method, args.len(), 1, 1) {
+                return err;
+            }
+            builtins::float_fromhex(args[0])
         }
         _ => attribute_error(obj, method),
     }
@@ -6875,7 +7074,11 @@ fn dict_fromkeys(receiver: i64, rest: &[i64]) -> i64 {
     let roots = crate::heap::root_values(std::slice::from_ref(&storage));
     let result = dict_store_keys(storage, source, default);
     crate::heap::release_roots(roots);
-    result
+    if exc::pending() {
+        result
+    } else {
+        storage
+    }
 }
 
 /// Inserts every item of `source` with `default`; returns `NONE` on success.
@@ -9135,6 +9338,29 @@ mod tests {
     }
 
     #[test]
+    fn title_capitalize_and_swapcase() {
+        reset();
+        let text = |value: i64| value::as_str(value).unwrap_or("").to_string();
+        assert_eq!(
+            text(invoke(string("hello world"), "title", &[])),
+            "Hello World"
+        );
+        assert_eq!(
+            text(invoke(string("HELLO_world"), "title", &[])),
+            "Hello_World"
+        );
+        assert_eq!(
+            text(invoke(string("hELLO wORLD"), "capitalize", &[])),
+            "Hello world"
+        );
+        assert_eq!(
+            text(invoke(string("Hello World"), "swapcase", &[])),
+            "hELLO wORLD"
+        );
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
     fn list_append_extend_insert() {
         reset();
         let xs = list(&[int(1), int(2)]);
@@ -9535,6 +9761,15 @@ mod tests {
         assert_eq!(container::subscript(fromkeys, string("a")), int(0));
         assert_eq!(container::subscript(fromkeys, string("b")), int(0));
         assert_eq!(crate::builtins::len(fromkeys), int(2));
+
+        let plain = invoke(
+            value::dict_class(),
+            "fromkeys",
+            &[list(&[string("a"), string("b")]), int(1)],
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(container::subscript(plain, string("a")), int(1));
+        assert_eq!(container::subscript(plain, string("b")), int(1));
     }
 
     #[test]

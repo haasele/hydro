@@ -288,6 +288,12 @@ struct LoadedModule {
     templates: Vec<TemplateString>,
     /// Units this module imports, in discovery order.
     deps: Vec<usize>,
+    /// Dependencies linked only because a nested import names them (see
+    /// [`ModuleLoader::preload_deferred_site_modules`]). The importer's body
+    /// does not execute those imports, so the ordering pass may relax the edge
+    /// to break an initializer cycle; a module-level import of the same unit is
+    /// never recorded here.
+    deferred_deps: Vec<usize>,
     /// User modules this unit imports but cannot link directly: they are still
     /// initializing when the unit is loaded (an ancestor package, or a module
     /// that is importing this unit back). The lowerer binds their members late,
@@ -491,6 +497,7 @@ impl ModuleLoader {
             module,
             templates,
             deps: scan.deps,
+            deferred_deps: Vec::new(),
             late: scan.late,
             deferred: scan.deferred,
             star_imports: scan.star_imports,
@@ -593,6 +600,7 @@ impl ModuleLoader {
             module,
             templates,
             deps: scan.deps,
+            deferred_deps: Vec::new(),
             late: scan.late,
             deferred: scan.deferred,
             star_imports: scan.star_imports,
@@ -879,15 +887,22 @@ impl ModuleLoader {
         true
     }
 
-    /// Links declaration-only site-packages modules that are referenced only
-    /// from nested blocks.
+    /// Links site-packages modules that are referenced only from nested
+    /// blocks.
     ///
     /// They are loaded after the importer graph is complete, so package cycles
     /// (`rich.console` <-> `rich.status`) are no longer initializing. Each
     /// candidate is transactional: a module that triggers diagnostics stays
     /// deferred and leaves the loader state untouched.
+    ///
+    /// A deferred module may already be linked through another path (a static
+    /// import, another package's preload, a dynamic-import candidate). Those
+    /// importers still carry a runtime stub, so their edges are added and the
+    /// stubs dropped first: the function body must bind the linked module, not
+    /// look it up at call time, when its initializer may not have run.
     fn preload_deferred_site_modules(&mut self, root: &Path) {
         let old_len = self.units.len();
+        self.link_already_linked_deferred_modules(root);
         let candidates: Vec<String> = self
             .units
             .iter()
@@ -934,6 +949,7 @@ impl ModuleLoader {
                 if !self.depends_on(index, importer) {
                     if !self.units[importer].deps.contains(&index) {
                         self.units[importer].deps.push(index);
+                        self.units[importer].deferred_deps.push(index);
                     }
                     self.units[importer]
                         .deferred
@@ -944,6 +960,76 @@ impl ModuleLoader {
         if self.units.len() > old_len {
             self.reorder_preloaded(old_len);
         }
+    }
+
+    /// Turns a deferred stub into a dependency edge when its module is already
+    /// linked.
+    ///
+    /// The module value may still be unregistered when the importing function
+    /// runs (`pydantic.plugin._schema_validator` imports `._loader` from
+    /// `create_schema_validator`, which the package can call before `_loader`
+    /// initializes), so the stub must become a compile-time binding. Only
+    /// third-party site modules are rewired: project modules keep the deferred
+    /// semantics of conditional module-level imports. A cycle keeps the stub:
+    /// the module is on the same initialization path and the runtime lookup is
+    /// the only safe form.
+    ///
+    /// A `from <base> import <member>` pair whose member names a submodule that
+    /// is not linked is left deferred: the base edge alone would make the
+    /// lowerer treat the member as a package attribute and reject the program
+    /// (`pydantic/main.py` -> `from .deprecated import parse`). The submodule's
+    /// own deferred record is what the preload and the lowerer fallback use.
+    fn link_already_linked_deferred_modules(&mut self, root: &Path) {
+        let mut links: Vec<(usize, usize, String, Option<String>)> = Vec::new();
+        for (importer, unit) in self.units.iter().enumerate() {
+            for (module, member) in &unit.deferred {
+                let Some(&index) = self.by_name.get(module) else {
+                    continue;
+                };
+                if index == importer
+                    || !is_site_package_path(Path::new(&self.units[index].display))
+                    || self.depends_on(index, importer)
+                {
+                    continue;
+                }
+                if let Some(member) = member {
+                    if self.deferred_pair_names_unlinked_submodule(module, member, root) {
+                        continue;
+                    }
+                }
+                links.push((index, importer, module.clone(), member.clone()));
+            }
+        }
+        for (index, importer, module, member) in links {
+            // The edge makes the module's exports visible to the lowerer;
+            // dropping the stub then binds the name statically.
+            if !self.units[importer].deps.contains(&index) {
+                self.units[importer].deps.push(index);
+                self.units[importer].deferred_deps.push(index);
+            }
+            self.units[importer]
+                .deferred
+                .retain(|(deferred, existing)| {
+                    deferred != &module || existing.as_deref() != member.as_deref()
+                });
+        }
+    }
+
+    /// Whether a deferred `from <module> import <member>` pair names a
+    /// submodule that exists on the search path but is not linked yet.
+    ///
+    /// Such a pair must keep its runtime permission: the submodule is the real
+    /// import target, and only its own deferred record can be consumed by a
+    /// preload.
+    fn deferred_pair_names_unlinked_submodule(
+        &self,
+        module: &str,
+        member: &str,
+        root: &Path,
+    ) -> bool {
+        let full = format!("{module}.{member}");
+        !self.by_name.contains_key(&full)
+            && resolve_module(&module_search_roots(root, root), &full).is_some()
     }
 
     /// Links Python modules that a compiled extension's initializer imports.
@@ -1156,6 +1242,13 @@ impl ModuleLoader {
             unit.deps = unit.deps.iter().map(|dep| new_index[*dep]).collect();
             unit.deps.sort_unstable();
             unit.deps.dedup();
+            unit.deferred_deps = unit
+                .deferred_deps
+                .iter()
+                .map(|dep| new_index[*dep])
+                .collect();
+            unit.deferred_deps.sort_unstable();
+            unit.deferred_deps.dedup();
         }
         let by_name = std::mem::take(&mut self.by_name);
         for (name, index) in by_name {
@@ -1244,6 +1337,7 @@ impl ModuleLoader {
         };
         for unit in &mut ordered {
             unit.deps = unit.deps.iter().map(|dep| map(*dep)).collect();
+            unit.deferred_deps = unit.deferred_deps.iter().map(|dep| map(*dep)).collect();
         }
         let by_name = std::mem::take(&mut self.by_name);
         for (name, index) in by_name {
@@ -1307,10 +1401,20 @@ impl ModuleLoader {
 
     /// Whether a nested import of a site-packages module may be preloaded.
     ///
-    /// Only declaration-only modules (imports, functions, classes and a
-    /// skipped `__main__` guard) qualify: their compile-time initializer has
-    /// no observable side effects. Modules with executable top-level code
-    /// stay deferred so optional dependency graphs keep their lazy semantics.
+    /// A module whose body only declares names, definitions and data
+    /// bindings (see [`preloadable_body_stmt`]) has an initializer the
+    /// compiler can run early without changing observable behavior; its
+    /// imports are checked separately by
+    /// [`Self::preload_dependencies_available`], and a load that produces
+    /// diagnostics is rolled back transactionally. Modules with dynamic
+    /// control flow or call statements stay deferred so optional dependency
+    /// graphs keep their lazy semantics.
+    ///
+    /// Data bindings are included generically: `pydantic.plugin._loader`
+    /// binds its plugin cache and entry-point group with annotated
+    /// assignments before `get_plugins` is imported from a function body, and
+    /// Hydro has no runtime compiler, so leaving such a module deferred turns
+    /// the function-level import into a guaranteed `ModuleNotFoundError`.
     fn preloadable_nested_module(
         &self,
         name: &str,
@@ -1339,14 +1443,10 @@ impl ModuleLoader {
         else {
             return false;
         };
-        module.body.iter().all(|stmt| match stmt {
-            ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) => true,
-            ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) | ast::Stmt::ClassDef(_) => {
-                true
-            }
-            ast::Stmt::If(s) => lower::static_if_branch(&s.test, name) == Some(false),
-            _ => false,
-        })
+        module
+            .body
+            .iter()
+            .all(|stmt| preloadable_body_stmt(stmt, name))
     }
 
     /// Links a module imported by a module-level `try` body.
@@ -1476,29 +1576,11 @@ impl ModuleLoader {
                         }
                     }
                 }
-                ast::Stmt::FunctionDef(_)
-                | ast::Stmt::AsyncFunctionDef(_)
-                | ast::Stmt::ClassDef(_)
-                | ast::Stmt::Assign(_)
-                | ast::Stmt::AnnAssign(_)
-                | ast::Stmt::AugAssign(_)
-                | ast::Stmt::Pass(_) => {}
-                // Only a docstring is a side-effect-free expression.
-                ast::Stmt::Expr(s) => {
-                    if !matches!(
-                        &*s.value,
-                        ast::Expr::Constant(constant)
-                            if matches!(constant.value, ast::Constant::Str(_))
-                    ) {
+                other => {
+                    if !declaration_only_stmt(other, name) {
                         return false;
                     }
                 }
-                ast::Stmt::If(s) => {
-                    if lower::static_if_branch(&s.test, name) != Some(false) {
-                        return false;
-                    }
-                }
-                _ => return false,
             }
         }
         true
@@ -1712,6 +1794,24 @@ impl ModuleLoader {
                                             scan.deps.push(index);
                                         }
                                     }
+                                }
+                                // `from pkg import sub` names the submodule
+                                // `pkg.sub` whenever it exists on the search
+                                // path, exactly like CPython's import
+                                // machinery. Record it separately so the
+                                // deferred-site preload targets the module
+                                // itself instead of the package attribute:
+                                // Hydro compiles everything ahead of time, so
+                                // an unlinked submodule would otherwise turn
+                                // the call site into a `ModuleNotFoundError`.
+                                if self.by_name.contains_key(&full)
+                                    || resolve_module(
+                                        &module_search_roots(importer_dir, root),
+                                        &full,
+                                    )
+                                    .is_some()
+                                {
+                                    scan.record_deferred(&full, None);
                                 }
                                 scan.record_deferred(&module_name, Some(alias.name.as_str()));
                             }
@@ -2399,6 +2499,72 @@ fn module_search_roots_from(
     dirs
 }
 
+/// Whether one module-level statement only declares names or data.
+///
+/// Imports, definitions, assignments, docstrings and statically dead guards
+/// carry no control flow of their own, so an eager preload can run them early.
+/// Assignments are admitted generically — helper modules routinely bind caches
+/// and constants at module scope (`pydantic.plugin._loader` is the motivating
+/// example), and module-level `try` imports already link the same shape. The
+/// preload paths separately require every imported module to resolve and roll
+/// the load back on any diagnostic. Statements that run control flow of their
+/// own (`for`, `while`, `with`, `try`) and non-docstring expression statements
+/// stay deferred: they may perform observable work or depend on state the
+/// early initializer cannot see.
+fn declaration_only_stmt(stmt: &ast::Stmt, name: &str) -> bool {
+    match stmt {
+        ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) => true,
+        ast::Stmt::FunctionDef(_)
+        | ast::Stmt::AsyncFunctionDef(_)
+        | ast::Stmt::ClassDef(_)
+        | ast::Stmt::Assign(_)
+        | ast::Stmt::AnnAssign(_)
+        | ast::Stmt::AugAssign(_)
+        | ast::Stmt::Pass(_) => true,
+        // Only a docstring is a side-effect-free expression.
+        ast::Stmt::Expr(s) => matches!(
+            &*s.value,
+            ast::Expr::Constant(constant) if matches!(constant.value, ast::Constant::Str(_))
+        ),
+        // A statically dead branch never runs at import time; a taken one may
+        // contain control flow the preload must not move earlier.
+        ast::Stmt::If(s) => lower::static_if_branch(&s.test, name) == Some(false),
+        _ => false,
+    }
+}
+
+/// Whether one module-level statement of a deferred-preload candidate only
+/// declares names or data.
+///
+/// Like [`declaration_only_stmt`], with statically resolved branches entered:
+/// a *taken* branch runs at import time, so its body must satisfy the same
+/// rule, and the dead `else` is skipped. `pydantic/deprecated/parse.py` only
+/// binds a warning alias under `if not TYPE_CHECKING:`, and that shape must
+/// stay linkable. A dynamic branch may run, so it remains ineligible. The
+/// optional-import path keeps [`declaration_only_stmt`] because it additionally
+/// inspects imports inside taken branches for extension loaders.
+fn preloadable_body_stmt(stmt: &ast::Stmt, name: &str) -> bool {
+    match stmt {
+        ast::Stmt::If(s) => {
+            // `if not TYPE_CHECKING:` is taken at runtime even though the
+            // compiler keeps the branch dynamic; `parse.py` binds its warning
+            // alias there.
+            if lower::negated_type_checking(&s.test) {
+                return s.body.iter().all(|stmt| preloadable_body_stmt(stmt, name));
+            }
+            match lower::static_if_branch(&s.test, name) {
+                Some(true) => s.body.iter().all(|stmt| preloadable_body_stmt(stmt, name)),
+                Some(false) => s
+                    .orelse
+                    .iter()
+                    .all(|stmt| preloadable_body_stmt(stmt, name)),
+                None => false,
+            }
+        }
+        other => declaration_only_stmt(other, name),
+    }
+}
+
 /// Resolves `name` on the module search path.
 ///
 /// Returns the package ancestors and the module itself in order, so the loader
@@ -2990,7 +3156,9 @@ fn initializer_callable_names(
 /// alias, a star import, a submodule binding, an assignment/value export and
 /// every edge added by preload (extension support, deferred discovery) are
 /// conservative: the importer may read the target's namespace and must stay
-/// after it.
+/// after it. The exception is an edge linked from a *nested* import: its
+/// statement runs only when the enclosing function does, never while the
+/// importer's body initializes, so it may be relaxed to break a cycle.
 fn initializer_edge_is_soft(
     units: &[LoadedModule],
     by_name: &HashMap<String, usize>,
@@ -2998,6 +3166,9 @@ fn initializer_edge_is_soft(
     importer: usize,
     dep: usize,
 ) -> bool {
+    if units[importer].deferred_deps.contains(&dep) {
+        return true;
+    }
     let dep_unit = &units[dep];
     let callable = callables.get(&dep).cloned().unwrap_or_default();
     let mut imports = Vec::new();
@@ -3108,6 +3279,15 @@ fn initializer_reachable(
 /// back to the previous order. The entry unit always stays last.
 fn unit_initializer_order(units: &[LoadedModule], entry: usize) -> Vec<usize> {
     let count = units.len();
+    let debug = std::env::var_os("HYDRO_DEBUG_INIT_ORDER").is_some();
+    if debug {
+        for (index, unit) in units.iter().enumerate() {
+            eprintln!(
+                "init-unit {index} {} deps={:?} late={:?}",
+                unit.name, unit.deps, unit.late
+            );
+        }
+    }
     let identity: Vec<usize> = (0..count).collect();
     let by_name: HashMap<String, usize> = units
         .iter()
@@ -3143,7 +3323,13 @@ fn unit_initializer_order(units: &[LoadedModule], entry: usize) -> Vec<usize> {
         }
     }
     if constraints.is_empty() {
+        if debug {
+            eprintln!("init-constraints: none");
+        }
         return identity;
+    }
+    if debug {
+        eprintln!("init-constraints: {constraints:?}");
     }
 
     let callable = initializer_callable_names(units, &by_name);
@@ -3177,7 +3363,19 @@ fn unit_initializer_order(units: &[LoadedModule], entry: usize) -> Vec<usize> {
     constraints.retain(|&(package, unit)| {
         !initializer_reachable(unit, &hard_outgoing, &edges, &unplaced).contains(&package)
     });
+    if debug {
+        eprintln!("init-constraints-hard: {constraints:?}");
+        for (index, edge) in edges.iter().enumerate() {
+            eprintln!(
+                "init-edge {index} {} -> {} soft={}",
+                units[edge.dep].name, units[edge.importer].name, edge.soft
+            );
+        }
+    }
     if constraints.is_empty() {
+        if debug {
+            eprintln!("init-constraints: none after hard filter");
+        }
         return identity;
     }
 
@@ -3299,6 +3497,21 @@ fn unit_initializer_order(units: &[LoadedModule], entry: usize) -> Vec<usize> {
         }
     }
     order.push(entry);
+    if debug {
+        eprintln!(
+            "init-order: {:?}",
+            order.iter().map(|&index| units[index].name.as_str()).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "init-dropped: {:?}",
+            edges
+                .iter()
+                .enumerate()
+                .filter(|(_, edge)| edge.dropped)
+                .map(|(index, edge)| (index, units[edge.dep].name.as_str(), units[edge.importer].name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
     order
 }
 
@@ -5693,9 +5906,10 @@ def __getattr__(name):
             matches!(
                 &callee.kind,
                 ExprKind::DeferredImport { module, member, .. }
-                    if module == "pkg" && member.as_deref() == Some("sub.value")
+                    if module == "pkg.sub" && member.as_deref() == Some("value")
             ),
-            "the nested submodule import must stay deferred: {:?}",
+            "the nested submodule import must stay deferred and target the \
+             submodule itself: {:?}",
             callee.kind
         );
         assert!(
@@ -6524,6 +6738,352 @@ def __getattr__(name):
                 .iter()
                 .map(|id| &program.functions[*id as usize].name)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn deferred_import_in_a_nested_package_preloads_a_data_module() {
+        // `pydantic/plugin/_schema_validator.py` imports `._loader` inside a
+        // function body, and `_loader.py` binds its caches with annotated
+        // assignments before defining `get_plugins`. Declaration-only
+        // preloading must accept those data bindings (they perform no
+        // observable work), because Hydro has no runtime compiler: leaving the
+        // module deferred turns the function-level import into a guaranteed
+        // `ModuleNotFoundError: No module named 'pkg._loader'`.
+        let _env = env_lock();
+        let dir = TestDir::new("nested-deferred-data");
+        let site = dir.path.join("site");
+        let project = dir.path.join("project");
+        fs::create_dir_all(site.join("pkg")).expect("create site package");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(
+            site.join("pkg").join("__init__.py"),
+            "from ._schema import make\n",
+        )
+        .expect("write package init");
+        fs::write(
+            site.join("pkg").join("_schema.py"),
+            "def make():\n    from ._loader import get_plugins\n    return get_plugins()\n",
+        )
+        .expect("write schema module");
+        fs::write(
+            site.join("pkg").join("_loader.py"),
+            "from __future__ import annotations\n\n\
+             import os\n\
+             from typing import TYPE_CHECKING, Final\n\n\
+             if TYPE_CHECKING:\n    from pkg import Protocol\n\n\
+             GROUP: Final[str] = 'pkg'\n\
+             _plugins: dict[str, object] | None = None\n\
+             _loading: bool = False\n\n\
+             def get_plugins():\n    return ()\n",
+        )
+        .expect("write loader module");
+        let main = project.join("main.py");
+        fs::write(&main, "from pkg import make\nprint(make())\n").expect("write entry");
+
+        let _guard = EnvVar::set("HYDRO_SITE_PACKAGES", site.as_os_str());
+        let program = program(&main);
+        assert!(
+            initializer_slot(&program, "pkg._loader.<module>").is_some(),
+            "the deferred loader module must be preloaded: {:?}",
+            initializer_names(&program)
+        );
+    }
+
+    #[test]
+    fn already_linked_deferred_module_initializes_before_its_importer() {
+        // The same shape, but the entry links `pkg._loader` statically. The
+        // deferred stub inside `pkg._schema.make` must still be replaced by a
+        // dependency edge: a runtime lookup would run while `_loader`'s
+        // initializer has not registered the module yet, which is exactly the
+        // `No module named 'pydantic.plugin._loader'` failure.
+        let _env = env_lock();
+        let dir = TestDir::new("deferred-already-linked");
+        let site = dir.path.join("site");
+        let project = dir.path.join("project");
+        fs::create_dir_all(site.join("pkg")).expect("create site package");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(
+            site.join("pkg").join("__init__.py"),
+            "from ._schema import make\n",
+        )
+        .expect("write package init");
+        fs::write(
+            site.join("pkg").join("_schema.py"),
+            "def make():\n    from ._loader import get_plugins\n    return get_plugins()\n",
+        )
+        .expect("write schema module");
+        fs::write(
+            site.join("pkg").join("_loader.py"),
+            "from __future__ import annotations\n\n\
+             GROUP: str = 'pkg'\n\
+             _plugins: dict[str, object] | None = None\n\n\
+             def get_plugins():\n    return ()\n",
+        )
+        .expect("write loader module");
+        let main = project.join("main.py");
+        fs::write(
+            &main,
+            "import pkg._loader\nfrom pkg import make\nprint(make())\n",
+        )
+        .expect("write entry");
+
+        let _guard = EnvVar::set("HYDRO_SITE_PACKAGES", site.as_os_str());
+        let program = program(&main);
+        let loader = initializer_slot(&program, "pkg._loader.<module>").unwrap_or_else(|| {
+            panic!(
+                "pkg._loader must be linked: {:?}",
+                initializer_names(&program)
+            )
+        });
+        let schema = initializer_slot(&program, "pkg._schema.<module>").unwrap_or_else(|| {
+            panic!(
+                "pkg._schema must be linked: {:?}",
+                initializer_names(&program)
+            )
+        });
+        assert!(
+            loader < schema,
+            "the already-linked module must initialize first: {:?}",
+            initializer_names(&program)
+        );
+
+        use hydro_ir::{Callee, ExprKind};
+        let make = function_id(&program, "pkg._schema.make");
+        let returned = returned_expression(&program, make);
+        assert!(
+            matches!(
+                &returned.kind,
+                ExprKind::Call {
+                    callee: Callee::Function(_),
+                    ..
+                }
+            ),
+            "the deferred import must bind the linked function: {:?}",
+            returned.kind
+        );
+    }
+
+    #[test]
+    fn nested_from_import_of_a_submodule_alias_preloads_the_submodule() {
+        // `pydantic/version.py` does `from ._internal import _git as git`
+        // inside `version_info()`. The deferred scan records the *base*
+        // package (`pkg._internal`), but the import target is the submodule
+        // `pkg._internal._git`: the preload must link the submodule, or the
+        // lowerer treats `_git` as a missing package attribute and rejects the
+        // program (`module 'pkg._internal' does not export ...`). A second
+        // nested import keeps the deferred set non-empty, which is what made
+        // the fallback hide the bug in the empty case.
+        let _env = env_lock();
+        let dir = TestDir::new("nested-submodule-alias");
+        let site = dir.path.join("site");
+        let project = dir.path.join("project");
+        fs::create_dir_all(site.join("pkg").join("_internal")).expect("create site package");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(
+            site.join("pkg").join("__init__.py"),
+            "from .version import VERSION\n",
+        )
+        .expect("write package init");
+        fs::write(
+            site.join("pkg").join("version.py"),
+            r#"VERSION = '1.0'
+
+
+def version_info() -> str:
+    import definitely_missing_mod
+    from ._internal import _git as git
+
+    return git.git_revision()
+"#,
+        )
+        .expect("write version module");
+        fs::write(site.join("pkg").join("_internal").join("__init__.py"), "")
+            .expect("write internal package init");
+        fs::write(
+            site.join("pkg").join("_internal").join("_git.py"),
+            r#""""Git helpers."""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+
+def git_revision() -> str:
+    return 'rev'
+"#,
+        )
+        .expect("write _git module");
+        let main = project.join("main.py");
+        fs::write(
+            &main,
+            "import pkg.version\nprint(pkg.version.version_info())\n",
+        )
+        .expect("write entry");
+
+        let _guard = EnvVar::set("HYDRO_SITE_PACKAGES", site.as_os_str());
+        let program = program(&main);
+        let git = initializer_slot(&program, "pkg._internal._git.<module>").unwrap_or_else(|| {
+            panic!(
+                "the aliased submodule must be linked: {:?}",
+                initializer_names(&program)
+            )
+        });
+        let version = initializer_slot(&program, "pkg.version.<module>").unwrap_or_else(|| {
+            panic!(
+                "pkg.version must be linked: {:?}",
+                initializer_names(&program)
+            )
+        });
+        assert!(
+            git < version,
+            "the submodule must initialize before its importer: {:?}",
+            initializer_names(&program)
+        );
+
+        // The call binds through the linked submodule, never the runtime
+        // import stub.
+        use hydro_ir::{Callee, ExprKind};
+        let info = function_id(&program, "pkg.version.version_info");
+        let returned = returned_expression(&program, info);
+        let linked = match &returned.kind {
+            ExprKind::Call {
+                callee: Callee::Function(_),
+                ..
+            } => true,
+            ExprKind::Call {
+                callee: Callee::Extension { .. },
+                ..
+            } => false,
+            ExprKind::IndirectCall { callee, .. } => matches!(
+                &callee.kind,
+                ExprKind::ModuleAttr { module, name }
+                    if module == "pkg._internal._git" && name == "git_revision"
+            ),
+            _ => false,
+        };
+        assert!(
+            linked,
+            "`git.git_revision()` must bind the linked submodule: {:?}",
+            returned.kind
+        );
+    }
+
+    #[test]
+    fn nested_from_import_preloads_a_taken_static_branch_module() {
+        // `pydantic/deprecated/parse.py` binds a warning alias under
+        // `if not TYPE_CHECKING:` before defining its API. The branch is
+        // statically taken and the body is declaration-only, so the deferred
+        // preload must enter it and link the module; otherwise
+        // `from .deprecated import parse` in `pydantic/main.py` has no target.
+        let _env = env_lock();
+        let dir = TestDir::new("taken-branch-preload");
+        let site = dir.path.join("site");
+        let project = dir.path.join("project");
+        fs::create_dir_all(site.join("pkg").join("deprecated")).expect("create site package");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(
+            site.join("pkg").join("__init__.py"),
+            "from .main import run\n",
+        )
+        .expect("write package init");
+        fs::write(
+            site.join("pkg").join("main.py"),
+            "def run():\n\
+             \x20   import definitely_missing_mod\n\
+             \x20   from .deprecated import parse\n\
+             \x20   return parse.load_file()\n",
+        )
+        .expect("write main module");
+        fs::write(site.join("pkg").join("deprecated").join("__init__.py"), "")
+            .expect("write deprecated package init");
+        fs::write(
+            site.join("pkg").join("deprecated").join("parse.py"),
+            r#""""Deprecated parse helpers."""
+
+from __future__ import annotations
+
+import os
+from typing import TYPE_CHECKING
+
+if not TYPE_CHECKING:
+    FLAG = 1
+
+
+def load_file():
+    return os.getpid()
+"#,
+        )
+        .expect("write parse module");
+        let main = project.join("main.py");
+        fs::write(&main, "import pkg\nprint(pkg.run())\n").expect("write entry");
+
+        let _guard = EnvVar::set("HYDRO_SITE_PACKAGES", site.as_os_str());
+        let program = program(&main);
+        let parse =
+            initializer_slot(&program, "pkg.deprecated.parse.<module>").unwrap_or_else(|| {
+                panic!(
+                    "the taken-branch module must be preloaded: {:?}",
+                    initializer_names(&program)
+                )
+            });
+        let run = initializer_slot(&program, "pkg.main.<module>").unwrap_or_else(|| {
+            panic!("pkg.main must be linked: {:?}", initializer_names(&program))
+        });
+        assert!(
+            parse < run,
+            "the submodule must initialize before its importer: {:?}",
+            initializer_names(&program)
+        );
+    }
+
+    #[test]
+    fn nested_from_import_of_an_unloadable_submodule_stays_deferred() {
+        // When the member names a real submodule that the preload cannot link
+        // (executable module-level code), the binding must stay a deferred
+        // submodule stub instead of becoming an "does not export" error. The
+        // base package is linked, so only the submodule's own deferred record
+        // can authorise the runtime binding.
+        let _env = env_lock();
+        let dir = TestDir::new("deferred-submodule-fallback");
+        let site = dir.path.join("site");
+        let project = dir.path.join("project");
+        fs::create_dir_all(site.join("pkg").join("deprecated")).expect("create site package");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(
+            site.join("pkg").join("__init__.py"),
+            "from .main import run\n",
+        )
+        .expect("write package init");
+        fs::write(
+            site.join("pkg").join("main.py"),
+            "def run():\n\
+             \x20   import definitely_missing_mod\n\
+             \x20   from .deprecated import parse\n\
+             \x20   return parse.load_file()\n",
+        )
+        .expect("write main module");
+        fs::write(site.join("pkg").join("deprecated").join("__init__.py"), "")
+            .expect("write deprecated package init");
+        fs::write(
+            site.join("pkg").join("deprecated").join("parse.py"),
+            "import os\n\n\
+             print('module side effect')\n\n\
+             def load_file():\n    return os.getpid()\n",
+        )
+        .expect("write unloadable parse module");
+        let main = project.join("main.py");
+        fs::write(&main, "import pkg\nprint(pkg.run())\n").expect("write entry");
+
+        let _guard = EnvVar::set("HYDRO_SITE_PACKAGES", site.as_os_str());
+        // The program must compile: the alias binds the deferred submodule
+        // stub, not a missing package attribute.
+        let program = program(&main);
+        assert!(
+            initializer_slot(&program, "pkg.deprecated.parse.<module>").is_none(),
+            "an executable module body must stay deferred: {:?}",
+            initializer_names(&program)
         );
     }
 

@@ -564,6 +564,115 @@ assert len(seen) == 4
 }
 
 #[test]
+fn nested_function_defaults_are_evaluated_at_definition_time() {
+    run_source(
+        "\
+def outer():
+    for x in [1]:
+        def f(y=x):
+            return y
+        assert f() == 1
+
+outer()
+
+def parameter_default(a):
+    def f(y=a):
+        return y
+    return f()
+
+assert parameter_default(7) == 7
+
+def loop_values():
+    values = []
+    for x in [1, 2]:
+        def f(y=x):
+            return y
+        values.append(f())
+    return values
+
+# Each iteration creates a new function whose default is the current value.
+assert loop_values() == [1, 2]
+
+def lambda_default():
+    a = 5
+    f = lambda y=a: y
+    a = 9
+    return f()
+
+# The default was captured when the lambda was created.
+assert lambda_default() == 5
+
+def lambda_capturing_default():
+    a = 5
+    b = 2
+    f = lambda y=a: b + y
+    a = 9
+    return f()
+
+assert lambda_capturing_default() == 7
+
+def keyword_only_default(a):
+    def f(*, y=a):
+        return y
+    return f()
+
+assert keyword_only_default(3) == 3
+
+def nested_scopes(a):
+    def middle():
+        def inner(y=a):
+            return y
+        return inner
+    return middle()()
+
+# `middle` must carry `a` so the default is evaluated in its frame.
+assert nested_scopes(4) == 4
+
+def nested_lambda(a):
+    def middle():
+        return lambda y=a: y
+    return middle()()
+
+assert nested_lambda(6) == 6
+
+def positional_defaults(a, b):
+    def f(y=b, z=a):
+        return (y, z)
+    return f()
+
+y, z = positional_defaults(1, 2)
+assert y == 2
+assert z == 1
+
+def shared_mutable_default():
+    def f(acc=[]):
+        acc.append(1)
+        return acc
+    return f
+
+f = shared_mutable_default()
+# The default is evaluated once, when the `def` ran: both calls share it.
+assert f() == [1]
+assert f() == [1, 1]
+
+def fresh_defaults_per_iteration():
+    fns = []
+    for x in [1, 2]:
+        def f(seen=[]):
+            seen.append(x)
+            return seen
+        fns.append(f)
+    return fns[0], fns[1]
+
+first, second = fresh_defaults_per_iteration()
+# Every iteration creates a new function with its own default list.
+assert first() == [1]
+assert second() == [2]
+",
+    );
+}
+
+#[test]
 fn generators_and_async() {
     run_source(
         "\

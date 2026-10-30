@@ -3948,14 +3948,24 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(out, Ty::Concrete(Type::List));
             }
             Builtin::Map | Builtin::Filter => {
-                if count != 2 {
+                let invalid = if builtin == Builtin::Map {
+                    count < 2
+                } else {
+                    count != 2
+                };
+                if invalid {
                     self.error_code(
                         line,
                         col,
                         codes::CALL,
                         format!(
-                            "{}() takes exactly 2 positional arguments ({count} given)",
-                            builtin.name()
+                            "{}() takes {} positional arguments ({count} given)",
+                            builtin.name(),
+                            if builtin == Builtin::Map {
+                                "at least 2"
+                            } else {
+                                "exactly 2"
+                            }
                         ),
                     );
                     let _ = self.inf.unify(out, Ty::Concrete(Type::List));

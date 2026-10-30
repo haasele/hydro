@@ -92,10 +92,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 
 ## Package pins
 
-Versions and dist-info RECORD digests are verified before any case runs. The
-NumPy RECORD digest was refreshed on 2026-10-29 for the current
-`.hydro/ecosystem/site` tree; wheel digests remain unpinned, so this verifies
-tree integrity, not provenance.
+Versions and dist-info RECORD digests are verified before any case runs.
 
 | Package | Expected | Actual | RECORD SHA-256 | Wheel SHA-256 | Status |
 | --- | --- | --- | --- | --- | --- |
@@ -114,10 +111,8 @@ tree integrity, not provenance.
 
 | Status | Cases |
 | --- | ---: |
-| compile_error | 2 |
-| pass | 6 |
-| runtime_error | 2 |
-| **Total** | 10 |
+| aot_build_error | 2 |
+| **Total** | 2 |
 
 A case passes only when the oracle, Hydro JIT and (unless `--no-aot`) the AOT binary all exit 0 with byte-identical stdout.
 
@@ -125,15 +120,7 @@ A case passes only when the oracle, Hydro JIT and (unless `--no-aot`) the AOT bi
 
 | Case | CPython | Hydro JIT | Hydro AOT | Status | Detail |
 | --- | --- | --- | --- | --- | --- |
-| `numpy:import` | ok | exit 1 | - | runtime_error | jit: ImportError: No module named 'numpy.exceptions' |
-| `pandas:import` | ok | exit 1 | - | compile_error | jit: error[HYD0201]: module 'dataclasses' has no attribute 'is_dataclass' |
-| `pydantic:import` | ok | ok | - | pass | - |
-| `pydantic-core:import` | ok | ok | - | pass | - |
-| `python-dateutil:import` | ok | ok | - | pass | - |
-| `six:import` | ok | exit 1 | - | compile_error | jit: error[HYD0201]: module 'importlib.util' has no attribute 'spec_from_loader' |
-| `typing-extensions:import` | ok | ok | - | pass | - |
-| `typing-inspection:import` | ok | ok | - | pass | - |
-| `annotated-types:import` | ok | exit 1 | - | runtime_error | jit: AttributeError: 'function' object has no attribute 'islower' |
-| `tzdata:import` | ok | ok | - | pass | - |
+| `numpy:import` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 2): tea: C compiler 'cc' failed while linking '<tmp>/aot_binary' (exit code 1) |
+| `numpy:smoke` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 2): tea: C compiler 'cc' failed while linking '<tmp>/aot_binary' (exit code 1) |
 
 <!-- END GENERATED ECOSYSTEM RESULTS -->

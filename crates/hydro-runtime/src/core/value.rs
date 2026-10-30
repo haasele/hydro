@@ -192,6 +192,12 @@ pub(crate) const FUNCTION_FLAG_GENERATOR: u32 = 2;
 /// arguments; the wrapper binds defaults, the `*args` list and the `**kwargs`
 /// dict before calling the concrete function.
 pub(crate) const FUNCTION_FLAG_VARARGS: u32 = 4;
+/// Function flag: at least one parameter default is only known when the
+/// function value is created (`def f(x=expr)` where `expr` is not a literal).
+/// The generated wrapper can only embed literal `Const` defaults, so a plain
+/// call must route through the runtime binder, which applies the defaults
+/// stored in the attached signature (the evaluated `default_expr` results).
+pub(crate) const FUNCTION_FLAG_DYNAMIC_DEFAULTS: u32 = 8;
 
 /// Largest integer representable in a tagged immediate (`2^60 - 1`).
 pub(crate) const MAX_INT: i64 = i64::MAX >> 3;
@@ -424,8 +430,8 @@ pub(crate) struct FunctionObj {
     /// derived callables.
     pub(crate) signature: Vec<ParamMeta>,
     /// [`FUNCTION_FLAG_ASYNC`] / [`FUNCTION_FLAG_GENERATOR`] /
-    /// [`FUNCTION_FLAG_VARARGS`] bits for a generated wrapper. Native and
-    /// builtin bodies keep `0`.
+    /// [`FUNCTION_FLAG_VARARGS`] / [`FUNCTION_FLAG_DYNAMIC_DEFAULTS`] bits for
+    /// a generated wrapper. Native and builtin bodies keep `0`.
     pub(crate) flags: u32,
     /// User-visible positional parameter names of a generated wrapper.
     /// `functools.partial` uses them to bind keyword arguments by name; derived
@@ -3019,7 +3025,30 @@ pub(crate) fn as_integer(v: i64) -> Option<i64> {
             _ => None,
         };
     }
+    if let Some(payload) = scalar_payload(v) {
+        return as_integer(payload);
+    }
     as_bigint(v).and_then(|n| i64::try_from(n).ok())
+}
+
+/// Native scalar payload of an `int`/`str`/`bytes`/`float`/`bool` subclass
+/// instance, if `v` is one.
+///
+/// The payload lives in a reserved NUL-prefixed instance attribute so it is
+/// invisible in `__dict__` and traced by the collector like any other
+/// attribute. Every scalar view ([`as_integer`], [`as_float`], [`as_str`],
+/// [`as_bytes`]) unwraps it, which is what makes a subclass instance behave
+/// like the builtin value it wraps.
+pub(crate) fn scalar_payload(v: i64) -> Option<i64> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_INSTANCE {
+        return None;
+    }
+    instance_attr(v, SCALAR_PAYLOAD_ATTR)
 }
 
 /// True when `v` is a heap [`ObjData::BigInt`] payload.
@@ -3036,6 +3065,9 @@ pub(crate) fn is_bigint(v: i64) -> bool {
 pub(crate) fn as_bigint(v: i64) -> Option<&'static BigInt> {
     if !is_heap(v) {
         return None;
+    }
+    if let Some(payload) = scalar_payload(v) {
+        return as_bigint(payload);
     }
     // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
@@ -3184,6 +3216,9 @@ pub(crate) fn as_float(v: i64) -> Option<f64> {
     if !is_heap(v) {
         return None;
     }
+    if let Some(payload) = scalar_payload(v) {
+        return as_float(payload);
+    }
     // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_FLOAT {
@@ -3198,6 +3233,9 @@ pub(crate) fn as_float(v: i64) -> Option<f64> {
 pub(crate) fn as_str(v: i64) -> Option<&'static str> {
     if !is_heap(v) {
         return None;
+    }
+    if let Some(payload) = scalar_payload(v) {
+        return as_str(payload);
     }
     // SAFETY: heap tag checked; object rooted/immutable (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
@@ -3220,6 +3258,9 @@ pub(crate) fn as_str(v: i64) -> Option<&'static str> {
 pub(crate) fn as_bytes(v: i64) -> Option<&'static [u8]> {
     if !is_heap(v) {
         return None;
+    }
+    if let Some(payload) = scalar_payload(v) {
+        return as_bytes(payload);
     }
     // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
@@ -3511,6 +3552,12 @@ pub(crate) fn exception_data(v: i64) -> Option<&'static ExcData> {
         },
         _ => None,
     }
+}
+
+/// Tagged extension object preserved on an exception raised across the C-API
+/// boundary, if any.
+pub(crate) fn exception_ext_object(v: i64) -> Option<i64> {
+    exception_data(v).and_then(|data| data.object)
 }
 
 /// Borrows the state of a class object.
@@ -3876,7 +3923,15 @@ pub(crate) fn class_lookup_after(class: i64, start: i64, name: &str) -> Option<C
         }
     }
     // `object` is the implicit ancestor of every class, including one declared
-    // with no bases (`super().__setattr__` in `typing_extensions.sentinel`).
+    // with no bases (`super().__setattr__` in `typing_extensions.sentinel`,
+    // `super().__new__(cls)` in `numpy._globals._NoValueType`). A base-less
+    // class records no ancestors, so its `super()` lookup must still reach the
+    // `object` surface. Do not repeat `object` when it already sits in the
+    // linearization (or is the receiver): CPython's `super()` starts after the
+    // named class, and `object` has nothing after it.
+    if class != object_class() && !state.mro.contains(&object_class()) {
+        return class_own_lookup(object_class(), name);
+    }
     object_protocol_slot(name)
 }
 
@@ -4137,6 +4192,41 @@ pub(crate) fn instance_remove_attr(instance: i64, name: &str) -> Option<i64> {
     instance_attributes(instance)?.remove(name)
 }
 
+/// Installs the native scalar payload of a builtin-subclass instance.
+pub(crate) fn instance_set_scalar_payload(instance: i64, payload: i64) {
+    instance_setattr(instance, SCALAR_PAYLOAD_ATTR.to_string(), payload);
+}
+
+/// The native scalar builtin `class` derives from, if any.
+///
+/// The nearest marked native scalar ancestor decides, so `class B(bool)` is a
+/// `bool` even though `bool` itself derives from the native `int` class. The
+/// result names the constructor that supplies a subclass instance's payload.
+pub(crate) fn native_scalar_base(class: i64) -> Option<(&'static str, i64)> {
+    let state = as_class(class)?;
+    for ancestor in std::iter::once(class).chain(state.mro.iter().copied()) {
+        let Some(state) = as_class(ancestor) else {
+            continue;
+        };
+        if state.attr(SCALAR_CLASS_MARKER).is_none() {
+            continue;
+        }
+        return match state.name.as_str() {
+            name @ ("bool" | "int" | "float" | "str" | "bytes") => Some((name, ancestor)),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Name of a native function body (`None` for every other callable).
+pub(crate) fn function_native_name(function: i64) -> Option<&'static str> {
+    match &as_function(function)?.body {
+        FunctionBody::Native { name, .. } => Some(*name),
+        _ => None,
+    }
+}
+
 /// `dataclasses.replace(obj, **changes)`: shallow copy of `instance`'s
 /// attribute table into a fresh instance of the same class.
 ///
@@ -4318,6 +4408,28 @@ pub(crate) fn is_ext_object(v: i64) -> bool {
 /// Extension pointer behind an opaque handle.
 pub(crate) fn ext_object_pointer(v: i64) -> Option<*mut crate::capi::ShimObject> {
     as_ext_object(v).map(|state| state.object)
+}
+
+/// Python type name of an opaque extension handle, e.g.
+/// `"pydantic_core._pydantic_core.ValidationError"`.
+pub(crate) fn ext_object_type_name(v: i64) -> Option<&'static str> {
+    as_ext_object(v).map(|state| state.type_name.as_str())
+}
+
+/// `str()` delegated to an opaque extension handle.
+pub(crate) fn ext_object_str(v: i64) -> String {
+    match as_ext_object(v) {
+        Some(state) => crate::capi::object_str(state.object),
+        None => String::new(),
+    }
+}
+
+/// True when `v` is an opaque extension handle whose type is an exception.
+pub(crate) fn is_ext_exception(v: i64) -> bool {
+    match as_ext_object(v) {
+        Some(state) => crate::capi::object_is_exception(state.object),
+        None => false,
+    }
 }
 
 /// Compares two values where at least one is an opaque extension handle.
@@ -7541,7 +7653,7 @@ pub(crate) fn clear_type_class_cache() {
 /// dropped and the class is rebuilt. The hit is re-rooted (idempotently) so a
 /// cache entry can never rely on a root that a scoped `release_roots` marker
 /// has already removed.
-fn native_class(name: &str) -> i64 {
+pub(crate) fn native_class(name: &str) -> i64 {
     let generation = crate::heap::generation();
     let cached = TYPE_CLASS_CACHE.with(|cache| cache.borrow().get(name).copied());
     if let Some(CachedClass {
@@ -7581,7 +7693,7 @@ fn native_class(name: &str) -> i64 {
             vec![native_class("int")],
             NONE,
             Vec::new(),
-            Vec::new(),
+            vec![(SCALAR_CLASS_MARKER.to_string(), TRUE)],
         )
     } else if matches!(
         name,
@@ -7631,6 +7743,11 @@ const DICT_METHODS_CLASS_NAME: &str = "__hydro_dict_methods__";
 /// Marker attribute of the private class, so a user class that happens to use
 /// the same name is never mistaken for it.
 const DICT_METHODS_MARKER: &str = "\u{0}hydro_dict_methods";
+/// Reserved instance attribute holding the native scalar payload of an
+/// `int`/`str`/`bytes`/`float`/`bool` subclass instance.
+const SCALAR_PAYLOAD_ATTR: &str = "\u{0}hydro_scalar_payload";
+/// Marker attribute carried by every native scalar class.
+const SCALAR_CLASS_MARKER: &str = "\u{0}hydro_native_scalar";
 
 /// The native `dict` class, as `type({})` reports it.
 pub(crate) fn dict_class() -> i64 {
@@ -7895,13 +8012,20 @@ fn scalar_native_class(name: &str) -> i64 {
             native_function_new("builtins", "__scalar_str__", usize::MAX),
             MethodKind::Normal,
         ),
+        // The builtin hash of the wrapped value; without this slot a mixed-in
+        // base (enum.py's `Enum.__hash__`) would win the MRO for an `IntEnum`.
+        (
+            "__hash__".to_string(),
+            native_function_new("builtins", "__object_hash__", usize::MAX),
+            MethodKind::Normal,
+        ),
     ];
     class_new_multi(
         name.to_string(),
         vec![object_class()],
         NONE,
         methods,
-        Vec::new(),
+        vec![(SCALAR_CLASS_MARKER.to_string(), TRUE)],
     )
 }
 
@@ -8414,7 +8538,9 @@ pub(crate) fn truthy(v: i64) -> bool {
             // entries, like CPython.
             Some(ObjDataRef::Class(_)) => true,
             Some(ObjDataRef::Instance(state)) => {
-                if is_native_dict_subclass(state.class) {
+                if let Some(payload) = scalar_payload(v) {
+                    truthy(payload)
+                } else if is_native_dict_subclass(state.class) {
                     dict_instance_truthy(v, state.class)
                 } else {
                     true
@@ -8636,13 +8762,24 @@ pub(crate) fn to_string(v: i64) -> String {
                 ObjDataRef::MemoryView(state) => memoryview_repr(state),
                 ObjDataRef::DictView(state) => dict_view_repr(state),
                 ObjDataRef::Super(state) => super_repr(state),
-                // `str(exception instance)` is its message.
-                ObjDataRef::ExcInstance(state) => state.data.msg.clone(),
+                // `str(exception instance)` is its message, or the original
+                // extension object's `str()` when it came from a C extension.
+                ObjDataRef::ExcInstance(state) => match state.data.object {
+                    Some(object) => crate::capi::object_str(
+                        ext_object_pointer(object).unwrap_or(std::ptr::null_mut()),
+                    ),
+                    None => state.data.msg.clone(),
+                },
                 ObjDataRef::Descriptor(state) => descriptor_repr(state),
                 ObjDataRef::Float(f) => format_float(f),
                 ObjDataRef::BigInt(n) => n.to_string(),
                 // `str(exception)` is its message (Python behaviour).
-                ObjDataRef::Exception(e) => e.msg.clone(),
+                ObjDataRef::Exception(e) => match e.object {
+                    Some(object) => crate::capi::object_str(
+                        ext_object_pointer(object).unwrap_or(std::ptr::null_mut()),
+                    ),
+                    None => e.msg.clone(),
+                },
                 ObjDataRef::List(_)
                 | ObjDataRef::Dict(_)
                 | ObjDataRef::Tuple(_)
@@ -8717,6 +8854,15 @@ pub(crate) fn to_string(v: i64) -> String {
                 ),
                 ObjDataRef::Instance(state) => {
                     let class = state.class;
+                    if let Some(payload) = scalar_payload(v) {
+                        if let Some(ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
+                            class_lookup(class, "__str__")
+                        {
+                            if function_native_name(function) == Some("__scalar_str__") {
+                                return to_string(payload);
+                            }
+                        }
+                    }
                     if let Some(ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
                         class_lookup(class, "__str__")
                     {
@@ -8724,6 +8870,23 @@ pub(crate) fn to_string(v: i64) -> String {
                         if !crate::exc::pending() {
                             if let Some(text) = as_str(result) {
                                 return text.to_string();
+                            }
+                        }
+                    } else if let Some(ClassEntry::Attr(item)) = class_lookup(class, "__str__") {
+                        // A dunder assigned after class creation (`C.__str__ =
+                        // f`, how `enum.py` installs the mixed-in type's slot).
+                        if as_function(item).is_some() {
+                            let result = crate::core::methods::call(
+                                v,
+                                b"__str__".as_ptr(),
+                                7,
+                                0,
+                                std::ptr::null(),
+                            );
+                            if !crate::exc::pending() {
+                                if let Some(text) = as_str(result) {
+                                    return text.to_string();
+                                }
                             }
                         }
                     }
@@ -8846,6 +9009,12 @@ fn repr_depth(v: i64, depth: usize) -> String {
         // exception pending and yields the conventional address rendering.
         return crate::capi::object_repr(state.object);
     }
+    // An exception raised by an extension keeps the original instance, whose
+    // `__repr__` is authoritative.
+    if let Some(object) = exception_data(v).and_then(|data| data.object) {
+        let object = ext_object_pointer(object).unwrap_or(std::ptr::null_mut());
+        return crate::capi::object_repr(object);
+    }
     if let Some(s) = as_str(v) {
         return quote_str(s);
     }
@@ -8902,6 +9071,15 @@ fn repr_depth(v: i64, depth: usize) -> String {
     }
     if let Some(state) = as_instance(v) {
         let class = state.class;
+        if let Some(payload) = scalar_payload(v) {
+            if let Some(ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
+                class_lookup(class, "__repr__")
+            {
+                if function_native_name(function) == Some("__scalar_repr__") {
+                    return repr_depth(payload, depth);
+                }
+            }
+        }
         if let Some(ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
             class_lookup(class, "__repr__")
         {
@@ -8915,6 +9093,18 @@ fn repr_depth(v: i64, depth: usize) -> String {
             // this renderer returns a `String`, so the caller surfaces the
             // exception at its next check. Clearing it here would hide a real
             // user error; the default rendering below is only a fallback.
+        } else if let Some(ClassEntry::Attr(item)) = class_lookup(class, "__repr__") {
+            // A dunder assigned after class creation (`C.__repr__ = f`, how
+            // `enum.py` installs the mixed-in type's slot on `IntEnum`).
+            if as_function(item).is_some() {
+                let result =
+                    crate::core::methods::call(v, b"__repr__".as_ptr(), 8, 0, std::ptr::null());
+                if !crate::exc::pending() {
+                    if let Some(text) = as_str(result) {
+                        return text.to_string();
+                    }
+                }
+            }
         }
         return instance_default_repr(state);
     }

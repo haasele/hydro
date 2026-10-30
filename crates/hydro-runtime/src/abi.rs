@@ -974,6 +974,21 @@ pub extern "C" fn hydro_map(function: i64, iterable: i64) -> i64 {
     builtins::map(function, iterable)
 }
 
+/// `map(function, *iterables)`: variadic form used when the call has more
+/// than one source iterable. `argc` counts `function` plus the iterables.
+#[no_mangle]
+pub extern "C" fn hydro_map_many(argc: u64, argv: *const i64) -> i64 {
+    if argc < 2 || argv.is_null() {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "map() expects a function and at least one iterable",
+        );
+    }
+    // SAFETY: the codegen contract makes `argc` tagged values readable.
+    let arguments = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+    builtins::map_many(arguments[0], &arguments[1..])
+}
+
 /// `filter(function_or_none, iterable)`: materialised filtered list.
 #[no_mangle]
 pub extern "C" fn hydro_filter(function: i64, iterable: i64) -> i64 {

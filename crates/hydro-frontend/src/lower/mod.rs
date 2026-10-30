@@ -1065,6 +1065,21 @@ static TYPES_CELLTYPE_MEMBER: FunctionSpec = FunctionSpec {
     dynamic_keywords: false,
 };
 
+/// Members CPython exposes only on some builds.
+///
+/// `sys.pypy_version_info` exists only under PyPy, `os.O_BINARY` and
+/// `os.startfile` only on Windows. They stay out of the static spec (so
+/// `hasattr` keeps reporting the host's answer) but compile as runtime
+/// attribute reads: guarded code such as `if sys.platform == "win32":` or
+/// `is_pypy and ...` never evaluates them here, and an unguarded read raises
+/// the same `AttributeError` CPython does.
+fn runtime_conditional_member(module: &str, name: &str) -> bool {
+    matches!(
+        (module, name),
+        ("sys", "pypy_version_info") | ("os", "O_BINARY" | "startfile")
+    )
+}
+
 fn module_member(module: &'static ModuleSpec, name: &str) -> Option<ModuleMember> {
     if let Some(function) = module.functions.iter().find(|f| f.name == name) {
         return Some(ModuleMember::Function(function));
@@ -1780,6 +1795,21 @@ fn is_type_checking(test: &ast::Expr) -> bool {
     }
 }
 
+/// Whether `test` is `not TYPE_CHECKING`, a guard whose body runs at runtime
+/// (`typing.TYPE_CHECKING` is `False`).
+///
+/// The compiler keeps these branches dynamic because a module may rebind the
+/// name, but an eager preload can still treat the body as the executing path
+/// when it consists only of declarations.
+pub(crate) fn negated_type_checking(test: &ast::Expr) -> bool {
+    match test {
+        ast::Expr::UnaryOp(unary) if matches!(unary.op, ast::UnaryOp::Not) => {
+            is_type_checking(&unary.operand)
+        }
+        _ => false,
+    }
+}
+
 /// What a user module exports to importers.
 ///
 /// Functions keep their final [`FunctionId`] (dependencies are lowered first),
@@ -1972,6 +2002,9 @@ pub struct Lowerer<'a> {
     templates: Vec<TemplateString>,
     functions: Vec<HFunction>,
     fn_ids: HashMap<String, FunctionId>,
+    /// Source offset of each top-level `def`, so a star import only binds a
+    /// name that the module does not redefine later in the same body.
+    fn_definition_starts: HashMap<String, usize>,
     module_local_names: HashSet<String>,
     /// `import X as Y` bindings: alias -> module specification.
     module_aliases: HashMap<String, &'static ModuleSpec>,
@@ -2236,6 +2269,7 @@ impl<'a> Lowerer<'a> {
                 col: 1,
             }],
             fn_ids: HashMap::new(),
+            fn_definition_starts: HashMap::new(),
             module_local_names: HashSet::new(),
             module_aliases: HashMap::new(),
             user_module_aliases: HashMap::new(),
@@ -2455,6 +2489,35 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Whether a nested `from <module> import <member>` may stay a runtime
+    /// import stub.
+    ///
+    /// The loader records a submodule target separately when the member names
+    /// a real module (`from pkg import sub` records `pkg.sub`), and that
+    /// record survives even when the base package was linked or its own
+    /// record was consumed by a preload. The permission therefore also accepts
+    /// the submodule name; module-level imports keep the base-only rule.
+    fn may_defer_from(&self, module: &str, member: &str, nested: bool) -> bool {
+        if self.may_defer_at(module, nested) {
+            return true;
+        }
+        nested && self.may_defer(&format!("{module}.{member}"))
+    }
+
+    /// Records the runtime stub of a nested `from <module> import <member>`.
+    ///
+    /// When the loader deferred the submodule `module.member`, CPython imports
+    /// that module before reading a package attribute, so the stub targets the
+    /// submodule itself; otherwise it reads the member from the base module.
+    fn record_deferred_from(&mut self, binding: &str, module: &str, member: &str) {
+        let submodule = format!("{module}.{member}");
+        if self.deferred_modules.contains(&submodule) {
+            self.record_deferred(binding, &submodule, None);
+        } else {
+            self.record_deferred(binding, module, Some(member));
+        }
+    }
+
     /// Whether the unit writes its own namespace at runtime through
     /// `globals()`/`vars()`, so its static export table is incomplete.
     ///
@@ -2563,6 +2626,28 @@ impl<'a> Lowerer<'a> {
         self.module_all = module_all_names(&module.body);
         self.module_def_names.clear();
         collect_module_def_names(&module.body, &mut self.module_def_names);
+        // Star imports are expanded before signatures are registered, but a
+        // later top-level `def` shadows the imported name. Record the source
+        // offsets now so `import_user_star`/`import_native_star` can tell
+        // whether the definition comes after the import.
+        self.fn_definition_starts.clear();
+        for statement in &module.body {
+            match statement {
+                ast::Stmt::FunctionDef(function) => {
+                    self.fn_definition_starts.insert(
+                        function.name.to_string(),
+                        u32::from(function.range.start()) as usize,
+                    );
+                }
+                ast::Stmt::AsyncFunctionDef(function) => {
+                    self.fn_definition_starts.insert(
+                        function.name.to_string(),
+                        u32::from(function.range.start()) as usize,
+                    );
+                }
+                _ => {}
+            }
+        }
         // Builtin-shadow decisions for a session fragment must only see the
         // bindings of this unit (see `session_shadows_builtin`). Cleared here
         // so a lowerer that compiles another unit never leaks its names.
@@ -3001,7 +3086,7 @@ impl<'a> Lowerer<'a> {
         self.fn_ids.remove(&name);
         self.global_names.insert(name.clone());
         let start = u32::from(decl.range.start()) as usize;
-        let id = self.create_function_with_captures(&decl, name, false, &[], &[])?;
+        let id = self.create_function_with_captures(&decl, name, false, &[], &[], None)?;
         self.conditional_defs.insert(start, id);
         Some(id)
     }
@@ -5022,8 +5107,8 @@ impl<'a> Lowerer<'a> {
                             ));
                         }
                     }
-                    None if self.may_defer_at(imported, nested) => {
-                        self.record_deferred(binding, imported, Some(member));
+                    None if self.may_defer_from(imported, member, nested) => {
+                        self.record_deferred_from(binding, imported, member);
                     }
                     // The package is still initializing, so its exports are
                     // not known yet: read the attribute from its module table
@@ -5166,10 +5251,12 @@ impl<'a> Lowerer<'a> {
             ExtensionLookup::PackageInit { path, reason } => {
                 self.error_package_init_extension(s.range, &path, &reason);
             }
-            ExtensionLookup::Missing if self.may_defer_at(imported, nested) => {
+            ExtensionLookup::Missing => {
                 // The loader never probed this module, so it may simply not be
-                // a dependency. Record the bindings as deferred instead of
-                // rejecting the program at compile time.
+                // a dependency — or the member may name a submodule it recorded
+                // as deferred on its own (`from pkg import sub`). Bind those as
+                // runtime stubs instead of rejecting the program at compile
+                // time.
                 for alias in &s.names {
                     let member = alias.name.as_str();
                     if member == "*" {
@@ -5189,10 +5276,13 @@ impl<'a> Lowerer<'a> {
                     if !self.claim_import_binding(binding, nested) {
                         continue;
                     }
-                    self.record_deferred(binding, imported, Some(member));
+                    if self.may_defer_from(imported, member, nested) {
+                        self.record_deferred_from(binding, imported, member);
+                    } else {
+                        self.error_unsupported_module(alias.range, imported);
+                    }
                 }
             }
-            ExtensionLookup::Missing => self.error_unsupported_module(s.range, imported),
         }
     }
 
@@ -5274,6 +5364,19 @@ impl<'a> Lowerer<'a> {
         true
     }
 
+    /// Whether a top-level `def` later in the module body redefines `name`.
+    ///
+    /// Function definitions are registered before the module body is lowered,
+    /// so a star import cannot see source order on its own. A later `def`
+    /// replaces the imported binding at runtime and calls must resolve to it,
+    /// not to the imported signature (NumPy's `crackfortran` does this after
+    /// `from .auxfuncs import *`).
+    fn later_definition_shadows_star(&self, name: &str, statement: usize) -> bool {
+        self.fn_definition_starts
+            .get(name)
+            .is_some_and(|start| *start > statement)
+    }
+
     /// Expands `from <native module> import *` into the spec's public
     /// functions and constants. Underscore-prefixed spec entries are internal,
     /// exactly like CPython without `__all__`.
@@ -5285,6 +5388,9 @@ impl<'a> Lowerer<'a> {
     fn import_native_star(&mut self, module: &'static ModuleSpec, nested: bool, statement: usize) {
         for function in module.functions {
             if function.name.starts_with('_') {
+                continue;
+            }
+            if self.later_definition_shadows_star(function.name, statement) {
                 continue;
             }
             if !self.claim_import_binding(function.name, nested) {
@@ -5299,6 +5405,9 @@ impl<'a> Lowerer<'a> {
         }
         for constant in module.constants {
             if constant.name.starts_with('_') {
+                continue;
+            }
+            if self.later_definition_shadows_star(constant.name, statement) {
                 continue;
             }
             if !self.claim_import_binding(constant.name, nested) {
@@ -5361,6 +5470,9 @@ impl<'a> Lowerer<'a> {
             }
         };
         for name in names {
+            if self.later_definition_shadows_star(&name, statement) {
+                continue;
+            }
             if !self.claim_import_binding(&name, nested) {
                 continue;
             }
@@ -6328,7 +6440,26 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> Option<HExpr> {
-        match module_member(module, member)? {
+        let Some(found) = module_member(module, member) else {
+            // A build-specific attribute (`sys.pypy_version_info`,
+            // `os.O_BINARY`, `os.startfile`) is absent from this host's spec
+            // but present on another build. Resolve it at runtime so guarded
+            // code compiles; an unguarded read raises the same
+            // `AttributeError` CPython does.
+            if runtime_conditional_member(module.name, member) {
+                return Some(HExpr {
+                    kind: HExprKind::ModuleAttr {
+                        module: module.name.to_string(),
+                        name: member.to_string(),
+                    },
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                });
+            }
+            return None;
+        };
+        match found {
             ModuleMember::Function(function) => Some(HExpr {
                 kind: HExprKind::ModuleAttr {
                     module: module.name.to_string(),
@@ -6424,6 +6555,13 @@ impl<'a> Lowerer<'a> {
                 self.error_expr(call.range)
             }
             None => {
+                // A build-specific member (`os.startfile` is Windows-only)
+                // resolves at runtime, where this host reports the same
+                // `AttributeError` CPython does. The guard around the call
+                // keeps the read from running on the wrong platform.
+                if runtime_conditional_member(module.name, member) {
+                    return self.lower_dynamic_call(call, fs, line, col);
+                }
                 self.error_unknown_member(call.range, module, member);
                 self.error_expr(call.range)
             }
@@ -6462,6 +6600,10 @@ impl<'a> Lowerer<'a> {
         }
         // A user function may shadow a builtin (`def print(...)`): name
         // resolution prefers `fn_ids` over the builtin table.
+        if global {
+            self.fn_definition_starts
+                .insert(name.clone(), u32::from(decl.range.start()) as usize);
+        }
 
         self.create_function_named(&decl, name, global)
     }
@@ -6511,8 +6653,14 @@ impl<'a> Lowerer<'a> {
     ) -> Option<FunctionId> {
         let capture_names: Vec<String> = captures.iter().map(|(name, _)| name.clone()).collect();
         let capture_cells: Vec<bool> = captures.iter().map(|(_, cell)| *cell).collect();
-        let id =
-            self.create_function_with_captures(decl, name, false, &capture_names, &capture_cells)?;
+        let id = self.create_function_with_captures(
+            decl,
+            name,
+            false,
+            &capture_names,
+            &capture_cells,
+            None,
+        )?;
         if !capture_names.is_empty() {
             self.method_captures.insert(id, capture_names);
         }
@@ -6551,13 +6699,18 @@ impl<'a> Lowerer<'a> {
         name: String,
         global: bool,
     ) -> Option<FunctionId> {
-        self.create_function_with_captures(decl, name, global, &[], &[])
+        self.create_function_with_captures(decl, name, global, &[], &[], None)
     }
 
     /// Lower a function signature with optional leading closure-capture
     /// parameters. Captures are typed `Any` and become locals too, so the
     /// body resolves their names exactly like parameters. `capture_cells`
     /// marks the captures whose enclosing local is a cell.
+    ///
+    /// `default_scope` is the enclosing function state a nested definition
+    /// evaluates its parameter defaults in (CPython evaluates them once, when
+    /// the `def` executes). `None` lowers them in a module-like scope, which
+    /// is correct for a module-level definition.
     ///
     /// Every function decorator is applied at runtime, exactly like CPython.
     /// `@property`/`@classmethod`/`@staticmethod` are ordinary callables, so
@@ -6570,6 +6723,7 @@ impl<'a> Lowerer<'a> {
         global: bool,
         captures: &[String],
         capture_cells: &[bool],
+        mut default_scope: Option<&mut FuncState>,
     ) -> Option<FunctionId> {
         if !decl.type_params.is_empty() {
             self.error_at(decl.range, "type parameters are not supported in Phase 1");
@@ -6611,7 +6765,8 @@ impl<'a> Lowerer<'a> {
         // same name is forwarded to `**kwargs` or rejected.
         for arg in &args.posonlyargs {
             let default = self.param_default(arg.default.as_deref());
-            let default_expr = self.lowered_default(arg.default.as_deref());
+            let default_expr =
+                self.lowered_default(arg.default.as_deref(), default_scope.as_deref_mut());
             self.add_param(
                 &arg.def,
                 default,
@@ -6624,7 +6779,8 @@ impl<'a> Lowerer<'a> {
         }
         for arg in &args.args {
             let default = self.param_default(arg.default.as_deref());
-            let default_expr = self.lowered_default(arg.default.as_deref());
+            let default_expr =
+                self.lowered_default(arg.default.as_deref(), default_scope.as_deref_mut());
             self.add_param(
                 &arg.def,
                 default,
@@ -6651,7 +6807,8 @@ impl<'a> Lowerer<'a> {
         }
         for arg in &args.kwonlyargs {
             let default = self.param_default(arg.default.as_deref());
-            let default_expr = self.lowered_default(arg.default.as_deref());
+            let default_expr =
+                self.lowered_default(arg.default.as_deref(), default_scope.as_deref_mut());
             self.add_param(
                 &arg.def,
                 default,
@@ -7915,13 +8072,21 @@ impl<'a> Lowerer<'a> {
         locals.push(HLocal { name, ty });
     }
 
-    /// Lowers a non-literal parameter default in a module-like scope: it is
-    /// evaluated when the function value is created. Diagnostics from
-    /// unsupported shapes are rolled back, leaving the default `None`.
-    fn lowered_default(&mut self, default: Option<&ast::Expr>) -> Option<HExpr> {
+    /// Lowers a non-literal parameter default where the function value is
+    /// created. CPython evaluates a `def`'s defaults once, in the enclosing
+    /// scope, at the moment the `def` statement runs, so `scope` must be the
+    /// enclosing function's state for a nested `def` (loop variables and
+    /// parameters included); `None` lowers in a module-like scope, which is
+    /// what a module-level definition needs. Diagnostics from unsupported
+    /// shapes are rolled back, leaving the default `None`.
+    fn lowered_default(
+        &mut self,
+        default: Option<&ast::Expr>,
+        scope: Option<&mut FuncState>,
+    ) -> Option<HExpr> {
         let default = default?;
         let diagnostics = self.diags.len();
-        let mut fs = FuncState {
+        let mut module_scope = FuncState {
             fid: 0,
             is_module: true,
             locals: HashMap::new(),
@@ -7937,9 +8102,13 @@ impl<'a> Lowerer<'a> {
             genexp_frame: false,
             class_ns: None,
         };
+        let fs = match scope {
+            Some(scope) => scope,
+            None => &mut module_scope,
+        };
         let previous = self.in_default_expr;
         self.in_default_expr = true;
-        let result = self.expr(default, &mut fs);
+        let result = self.expr(default, fs);
         self.in_default_expr = previous;
         if self.diags.len() > diagnostics {
             self.diags.truncate(diagnostics);
@@ -8322,6 +8491,7 @@ impl<'a> Lowerer<'a> {
             false,
             &capture_names,
             &capture_cells,
+            Some(&mut *fs),
         )?;
         let body = self.lower_function_body(fid, decl.body);
         self.functions[fid as usize].body = body;
@@ -11296,6 +11466,21 @@ impl<'a> Lowerer<'a> {
                 line,
                 col,
             });
+        }
+        // A function imported from a compiled user module (`email.message`
+        // does `from email.iterators import walk` in its class body) is a
+        // direct function reference; a module-level value is read from the
+        // source module's global table.
+        if let Some(&id) = self.imported_user_functions.get(binding) {
+            return Some(HExpr {
+                kind: HExprKind::FunctionRef(id),
+                ty: Ty::Concrete(Type::Function),
+                line,
+                col,
+            });
+        }
+        if let Some(value) = self.imported_user_global_expr(binding, line, col) {
+            return Some(value);
         }
         if let Some((module, constant)) = self.imported_constants.get(binding).copied() {
             return Some(HExpr {
@@ -16552,19 +16737,6 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
-                } else if is_attribute_only_builtin(name) {
-                    // `setattr`/`delattr` live in the `builtins` module table
-                    // (the runtime implements them there) but are also
-                    // available unqualified, like every other builtin.
-                    HExpr {
-                        kind: HExprKind::ModuleAttr {
-                            module: "builtins".to_string(),
-                            name: name.to_string(),
-                        },
-                        ty: Ty::Concrete(Type::Function),
-                        line,
-                        col,
-                    }
                 } else if self.global_names.contains(name) {
                     // Module-level value read from a function. The module body
                     // mirrors every assignment into the runtime global table,
@@ -16576,6 +16748,21 @@ impl<'a> Lowerer<'a> {
                             name: name.to_string(),
                         },
                         ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
+                } else if is_attribute_only_builtin(name) {
+                    // `setattr`/`delattr`/`pow` live in the `builtins` module
+                    // table (the runtime implements them there) but are also
+                    // available unqualified, like every other builtin. A
+                    // module-level binding of the same name wins, as in
+                    // CPython.
+                    HExpr {
+                        kind: HExprKind::ModuleAttr {
+                            module: "builtins".to_string(),
+                            name: name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Function),
                         line,
                         col,
                     }
@@ -17460,35 +17647,6 @@ impl<'a> Lowerer<'a> {
         }
 
         let mut rejected = false;
-        // Defaults are evaluated where the lambda is created, like a `def`:
-        // literal defaults become parameter metadata and any other expression
-        // is lowered in a module-like scope.
-        for arg in &l.args.posonlyargs {
-            let default = self.param_default(arg.default.as_deref());
-            let default_expr = self.lowered_default(arg.default.as_deref());
-            self.add_param(
-                &arg.def,
-                default,
-                default_expr,
-                ParamKind::PosOnly,
-                &mut params,
-                &mut locals,
-                &mut seen,
-            );
-        }
-        for arg in &l.args.args {
-            let default = self.param_default(arg.default.as_deref());
-            let default_expr = self.lowered_default(arg.default.as_deref());
-            self.add_param(
-                &arg.def,
-                default,
-                default_expr,
-                ParamKind::Positional,
-                &mut params,
-                &mut locals,
-                &mut seen,
-            );
-        }
         if let Some(vararg) = &l.args.vararg {
             self.error_at(
                 vararg.range,
@@ -17509,6 +17667,151 @@ impl<'a> Lowerer<'a> {
         }
         if rejected {
             return self.error_expr(l.range);
+        }
+
+        // A parameter default is evaluated in the enclosing scope where the
+        // lambda value is created, exactly like a `def`. A name it reads must
+        // come from the enclosing locals even when the lambda body never reads
+        // it. A lambda without captures is a plain function reference created
+        // at this expression, so its defaults lower against the enclosing
+        // state; a capturing lambda is materialised inside the synthetic
+        // binder below, which therefore receives these extra values as leading
+        // parameters.
+        let mut binder_names = capture_names.clone();
+        let mut binder_locals = capture_locals.clone();
+        let mut binder_cells = capture_cells.clone();
+        if !capture_names.is_empty() {
+            for name in lambda_default_free_names(l) {
+                if binder_names.contains(&name) {
+                    continue;
+                }
+                let Some(local) = fs.lookup(&name) else {
+                    continue;
+                };
+                let module_binding = fs.is_module
+                    && self.functions[fs.fid as usize]
+                        .locals
+                        .get(local as usize)
+                        .is_some_and(|slot| slot.name == name);
+                if module_binding {
+                    continue;
+                }
+                binder_names.push(name);
+                binder_locals.push(local);
+                binder_cells.push(fs.is_cell(local));
+            }
+        }
+
+        // The binder is allocated before the defaults are lowered: a default
+        // may create synthetic functions (a comprehension), which must not
+        // shift the binder's id.
+        let binder = if capture_names.is_empty() {
+            None
+        } else {
+            let mut binder_function_locals: Vec<HLocal> = binder_names
+                .iter()
+                .map(|name| HLocal {
+                    name: name.clone(),
+                    ty: Ty::Concrete(Type::Any),
+                })
+                .collect();
+            binder_function_locals.push(HLocal {
+                name: "$closure".to_string(),
+                ty: Ty::Concrete(Type::Any),
+            });
+            let binder_params = binder_names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| HParam {
+                    local: index as LocalId,
+                    name: name.clone(),
+                    ty: Ty::Concrete(Type::Any),
+                    declared: false,
+                    default: None,
+                    default_expr: None,
+                    kind: ParamKind::Positional,
+                })
+                .collect();
+            let binder = self.functions.len() as FunctionId;
+            self.functions.push(HFunction {
+                name: "<lambda.bind>".to_string(),
+                params: binder_params,
+                capture_count: 0,
+                ret_ty: Ty::Concrete(Type::Any),
+                locals: binder_function_locals,
+                body: Vec::new(),
+                is_async: false,
+                is_generator: false,
+                is_module: false,
+                line,
+                col,
+            });
+            Some(binder)
+        };
+
+        // Lower every default where the lambda value is created: in the
+        // binder's frame for a capturing lambda (its parameters carry the
+        // enclosing values), in the enclosing frame otherwise.
+        let mut default_exprs = match binder {
+            Some(binder) => {
+                let cell_locals: HashSet<LocalId> = binder_cells
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cell)| **cell)
+                    .map(|(index, _)| index as LocalId)
+                    .collect();
+                let mut binder_scope = FuncState {
+                    fid: binder,
+                    is_module: false,
+                    locals: binder_names
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| (name.clone(), index as LocalId))
+                        .collect(),
+                    cells: cell_locals.clone(),
+                    cell_aliases: cell_locals,
+                    comp_shadowed: HashMap::new(),
+                    type_param_locals: HashMap::new(),
+                    globals: HashSet::new(),
+                    loop_depth: 0,
+                    in_lambda: false,
+                    is_async: false,
+                    is_generator: false,
+                    genexp_frame: false,
+                    class_ns: None,
+                };
+                self.lambda_default_exprs(l, &mut binder_scope).into_iter()
+            }
+            None => self.lambda_default_exprs(l, fs).into_iter(),
+        };
+
+        // Literal defaults become parameter metadata; any other expression is
+        // the value lowered above and stored in the function object.
+        for arg in &l.args.posonlyargs {
+            let default = self.param_default(arg.default.as_deref());
+            let default_expr = default_exprs.next().flatten();
+            self.add_param(
+                &arg.def,
+                default,
+                default_expr,
+                ParamKind::PosOnly,
+                &mut params,
+                &mut locals,
+                &mut seen,
+            );
+        }
+        for arg in &l.args.args {
+            let default = self.param_default(arg.default.as_deref());
+            let default_expr = default_exprs.next().flatten();
+            self.add_param(
+                &arg.def,
+                default,
+                default_expr,
+                ParamKind::Positional,
+                &mut params,
+                &mut locals,
+                &mut seen,
+            );
         }
 
         let fid = self.functions.len() as FunctionId;
@@ -17604,76 +17907,43 @@ impl<'a> Lowerer<'a> {
         self.functions[fid as usize].body = body;
 
         let function = self.fid_base + fid;
-        if capture_names.is_empty() {
+        let Some(binder) = binder else {
             return HExpr {
                 kind: HExprKind::FunctionRef(function),
                 ty: self.infer.fresh(),
                 line,
                 col,
             };
-        }
+        };
 
-        // Binder: transform the current capture values into the closure
-        // value. Its parameters are the capture slots in order, so a captured
-        // cell reaches the closure as the cell object itself.
-        let binder = self.functions.len() as FunctionId;
-        let mut binder_params = Vec::with_capacity(capture_names.len());
-        let mut binder_locals = Vec::with_capacity(capture_names.len() + 1);
-        for name in &capture_names {
-            let local = binder_locals.len() as LocalId;
-            binder_params.push(HParam {
-                local,
-                name: name.clone(),
-                ty: Ty::Concrete(Type::Any),
-                declared: false,
-                default: None,
-                default_expr: None,
-                kind: ParamKind::Positional,
-            });
-            binder_locals.push(HLocal {
-                name: name.clone(),
-                ty: Ty::Concrete(Type::Any),
-            });
-        }
-        let target = binder_locals.len() as LocalId;
-        binder_locals.push(HLocal {
-            name: "$closure".to_string(),
-            ty: Ty::Concrete(Type::Any),
-        });
+        // Binder: transform the current capture values (plus the enclosing
+        // values the defaults read) into the closure value. Its parameters are
+        // those slots in order, so a captured cell reaches the closure as the
+        // cell object itself; the defaults were lowered against the same
+        // slots above.
+        let target = binder_names.len() as LocalId;
         let closure_value = self.local_read_expr(target, Type::Any, line, col);
-        self.functions.push(HFunction {
-            name: "<lambda.bind>".to_string(),
-            params: binder_params,
-            capture_count: 0,
-            ret_ty: Ty::Concrete(Type::Any),
-            locals: binder_locals,
-            body: vec![
-                HStmt {
-                    kind: HStmtKind::Closure {
-                        target,
-                        function,
-                        captures: (0..capture_names.len() as LocalId).collect(),
-                    },
-                    line,
-                    col,
+        self.functions[binder as usize].body = vec![
+            HStmt {
+                kind: HStmtKind::Closure {
+                    target,
+                    function,
+                    captures: (0..capture_names.len() as LocalId).collect(),
                 },
-                HStmt {
-                    kind: HStmtKind::Return(Some(closure_value)),
-                    line,
-                    col,
-                },
-            ],
-            is_async: false,
-            is_generator: false,
-            is_module: false,
-            line,
-            col,
-        });
+                line,
+                col,
+            },
+            HStmt {
+                kind: HStmtKind::Return(Some(closure_value)),
+                line,
+                col,
+            },
+        ];
 
         HExpr {
             kind: HExprKind::Call {
                 callee: Callee::Function(self.fid_base + binder),
-                args: capture_locals
+                args: binder_locals
                     .iter()
                     .map(|local| self.local_read_expr(*local, Type::Any, line, col))
                     .collect(),
@@ -17682,6 +17952,22 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         }
+    }
+
+    /// Lowers a lambda's parameter defaults in the scope where the lambda
+    /// value is created, in parameter order (positional-only, then positional;
+    /// keyword-only parameters are rejected before this runs).
+    fn lambda_default_exprs(
+        &mut self,
+        l: &ast::ExprLambda,
+        fs: &mut FuncState,
+    ) -> Vec<Option<HExpr>> {
+        l.args
+            .posonlyargs
+            .iter()
+            .chain(l.args.args.iter())
+            .map(|arg| self.lowered_default(arg.default.as_deref(), Some(&mut *fs)))
+            .collect()
     }
 
     fn joined_str_expr(
@@ -19524,14 +19810,15 @@ impl<'a> Lowerer<'a> {
             };
         }
 
-        // `setattr`/`delattr` are served by the `builtins` module dispatch, so
-        // the call goes through the module ABI (which also validates arity).
+        // `setattr`/`delattr`/`pow` are served by the `builtins` module
+        // dispatch, so the call goes through the module ABI (which also
+        // validates arity).
         if is_attribute_only_builtin(name) && !self.session_shadows_builtin(name) {
             if call_has_dynamic_arguments(call) {
                 return self.lower_dynamic_call(call, fs, line, col);
             }
             let spec = stdlib::function("builtins", name)
-                .expect("setattr/delattr are declared in the builtins table");
+                .expect("attribute-only builtins are declared in the builtins table");
             let Some((args, keywords)) = self.module_arguments(call, fs, spec, line, col) else {
                 return self.error_expr(call.range);
             };
@@ -20045,12 +20332,14 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Lower every operand of a call in source order: the positional
-    /// arguments, at most one starred operand (which must be the last
-    /// positional operand, because the IR evaluates it after them), the named
-    /// keyword values and at most one `**mapping` (which must come last).
+    /// arguments, at most one starred operand, the named keyword values and at
+    /// most one `**mapping` (which must come last).
     ///
-    /// The restricted positions are diagnosed at the call site instead of
-    /// silently reordering side effects.
+    /// The IR has a single star slot, so positional operands written after
+    /// `*iterable` are folded into it as `tuple(iterable) + (rest)` (evaluated
+    /// in source order). A second `*` and a `**` that is not last are
+    /// diagnosed at the call site instead of silently reordering side
+    /// effects.
     #[allow(clippy::type_complexity)]
     fn call_operands(
         &mut self,
@@ -20059,6 +20348,7 @@ impl<'a> Lowerer<'a> {
     ) -> Option<LoweredCallOperands> {
         let mut args: Vec<HExpr> = Vec::with_capacity(call.args.len());
         let mut star: Option<HExpr> = None;
+        let mut post_star: Vec<HExpr> = Vec::new();
         for arg in &call.args {
             if let ast::Expr::Starred(starred) = arg {
                 if star.is_some() {
@@ -20073,14 +20363,36 @@ impl<'a> Lowerer<'a> {
                 continue;
             }
             if star.is_some() {
-                self.error_at_code(
-                    arg.range(),
-                    codes::CALL,
-                    "a positional argument cannot follow a starred argument",
-                );
-                return None;
+                // CPython allows positional operands after `*iterable`
+                // (`cls(*args, tz)`). The IR has one star slot, so fold them
+                // into it as a tuple concatenation: `*(tuple(star) + (rest))`.
+                // The star operand is evaluated (and consumed) first, then the
+                // trailing operands, which keeps Python's evaluation order.
+                post_star.push(self.expr(arg, fs));
+                continue;
             }
             args.push(self.expr(arg, fs));
+        }
+        if !post_star.is_empty() {
+            let (line, col) = self.span(call.range);
+            let prefix =
+                self.expr_to_tuple(star.take().expect("post-star needs a star"), line, col);
+            let suffix = HExpr {
+                kind: HExprKind::Tuple(post_star),
+                ty: Ty::Concrete(Type::Tuple),
+                line,
+                col,
+            };
+            star = Some(HExpr {
+                kind: HExprKind::Bin {
+                    op: BinOp::Add,
+                    lhs: Box::new(prefix),
+                    rhs: Box::new(suffix),
+                },
+                ty: Ty::Concrete(Type::Tuple),
+                line,
+                col,
+            });
         }
         let mut keywords: Vec<(String, HExpr)> = Vec::with_capacity(call.keywords.len());
         let mut double_star: Option<HExpr> = None;
@@ -21709,9 +22021,11 @@ fn builtin_by_name(name: &str) -> Option<Builtin> {
 
 /// Builtins that have no `hydro_ir::Builtin` variant of their own and are
 /// served by the `builtins` module dispatch: the runtime implements the
-/// attribute mutation of instances and classes there.
+/// attribute mutation of instances and classes there, and `pow` there because
+/// it is the only builtin with a three-argument form whose last parameter
+/// defaults to `None`.
 fn is_attribute_only_builtin(name: &str) -> bool {
-    matches!(name, "setattr" | "delattr")
+    matches!(name, "setattr" | "delattr" | "pow")
 }
 
 /// One `namespace[name] = value` store used while building a dynamic class
@@ -24559,9 +24873,17 @@ fn walk_free_stmts(
                 for name in function_free_names(&s.body, s.args.as_ref()) {
                     record_name_load(&name, shadowed, out, seen);
                 }
+                // The defaults are evaluated in this scope when the `def`
+                // executes, so this scope must make their names available.
+                for name in function_default_free_names(s.args.as_ref()) {
+                    record_name_load(&name, shadowed, out, seen);
+                }
             }
             ast::Stmt::AsyncFunctionDef(s) => {
                 for name in function_free_names(&s.body, s.args.as_ref()) {
+                    record_name_load(&name, shadowed, out, seen);
+                }
+                for name in function_default_free_names(s.args.as_ref()) {
                     record_name_load(&name, shadowed, out, seen);
                 }
             }
@@ -24713,6 +25035,38 @@ fn lambda_free_names(l: &ast::ExprLambda) -> Vec<String> {
     let mut seen = HashSet::new();
     walk_free_expr(&l.body, &HashSet::new(), &mut loads, &mut seen);
     loads.retain(|name| !params.contains(name));
+    loads
+}
+
+/// Free names read by a lambda's parameter defaults.
+///
+/// Defaults are evaluated in the enclosing scope when the lambda value is
+/// created, so they are free names of that scope: the lambda's own parameters
+/// do not shadow them (`lambda x, y=x: ...` reads the enclosing `x`).
+fn lambda_default_free_names(l: &ast::ExprLambda) -> Vec<String> {
+    function_default_free_names(l.args.as_ref())
+}
+
+/// Free names read by a function's (or lambda's) parameter defaults.
+///
+/// Defaults are evaluated in the enclosing scope when the `def` (or lambda)
+/// executes, so the definition's own parameters do not shadow them. A nested
+/// definition's defaults are reads of the scope that defines it, which is why
+/// intermediate closure scopes must capture them.
+fn function_default_free_names(args: &ast::Arguments) -> Vec<String> {
+    let empty = HashSet::new();
+    let mut loads = Vec::new();
+    let mut seen = HashSet::new();
+    for arg in args
+        .posonlyargs
+        .iter()
+        .chain(args.args.iter())
+        .chain(args.kwonlyargs.iter())
+    {
+        if let Some(default) = arg.default.as_deref() {
+            walk_free_expr(default, &empty, &mut loads, &mut seen);
+        }
+    }
     loads
 }
 
@@ -24878,9 +25232,14 @@ fn walk_free_expr(
         ast::Expr::Starred(s) => walk_free_expr(&s.value, shadowed, out, seen),
         // A lambda is a closure scope: its own free names are loads of this
         // scope too, so they are captured here and can pass through an
-        // intermediate function to the lambda that needs them.
+        // intermediate function to the lambda that needs them. Its parameter
+        // defaults are evaluated in this scope when the lambda is created, so
+        // they are loads of this scope as well.
         ast::Expr::Lambda(l) => {
             for name in lambda_free_names(l) {
+                record_name_load(&name, shadowed, out, seen);
+            }
+            for name in lambda_default_free_names(l) {
                 record_name_load(&name, shadowed, out, seen);
             }
         }
@@ -25237,9 +25596,9 @@ fn genexp_walrus_targets_in_expr(expr: &ast::Expr) -> Vec<String> {
 
 fn collect_genexp_walrus_stmt(stmt: &ast::Stmt, out: &mut Vec<String>, seen: &mut HashSet<String>) {
     match stmt {
-        // A definition's decorators and annotations are evaluated in this
-        // scope; its body is a separate scope handled by its own lowering
-        // pass, and parameter defaults use their own module-like scope.
+        // A definition's decorators, annotations and parameter defaults are
+        // evaluated in this scope; its body is a separate scope handled by
+        // its own lowering pass.
         ast::Stmt::FunctionDef(f) => {
             for decorator in &f.decorator_list {
                 collect_genexp_walrus_expr(decorator, false, out, seen);

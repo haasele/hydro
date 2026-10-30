@@ -1516,7 +1516,10 @@ fn cmp_big(a: BigOperand, b: BigOperand) -> Option<Ordering> {
 
 /// User-class rich comparisons. `__eq__`/`__ne__` also fall back to the
 /// reflected method, matching Python's budgeted method lookup for this slice.
-fn instance_comparison(op: u32, a: i64, b: i64) -> Option<i64> {
+///
+/// Also used by [`crate::container::equals`], so a user class defines the
+/// equality of its instances even when they sit inside tuples/lists/dicts.
+pub(crate) fn instance_comparison(op: u32, a: i64, b: i64) -> Option<i64> {
     let (method, reflected, invert) = match op {
         OP_EQ => ("__eq__", "__eq__", false),
         OP_NE => ("__eq__", "__eq__", true),

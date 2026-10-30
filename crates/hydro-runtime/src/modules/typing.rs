@@ -33,6 +33,23 @@
 //! eagerly (Hydro has no lazy annotation scope), which is the documented
 //! limitation.
 //!
+//! `NewType` is a real class like CPython 3.10+: `typing.NewType` is the
+//! class value (so `isinstance(x, typing.NewType)` works, which is what
+//! `typing_inspection.is_newtype` does), and `NewType('UserId', int)` returns
+//! a callable instance carrying `__name__`, `__qualname__`, `__supertype__`
+//! and `__module__`. The instance call is the identity (`_typing._idfunc`),
+//! and `typing_extensions.NewType` shares the class because it aliases the
+//! module attribute.
+//!
+//! `no_type_check(arg)` is the identity decorator that stamps
+//! `__no_type_check__` on a callable (recursively over a class's own methods
+//! and nested classes) and returns it unchanged; native callables and scalars
+//! reject the assignment with `AttributeError`, like CPython.
+//! `no_type_check_decorator(decorator)` is the deprecated wrapper that applies
+//! the same marking to another decorator's result (CPython removes it in
+//! 3.15). `typing.__all__` is built from the central spec, so the public
+//! export list tracks the module surface.
+//!
 //! PEP 695 generic classes work through the same machinery: a
 //! `class C[T]:` statement stores its parameter tuple as `__type_params__` on
 //! the class, and `C[int]` builds a `_GenericAlias` over the class through
@@ -156,6 +173,11 @@ pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
         // ParamSpec` and subclassing all need it).
         "ParamSpec" | "TypeVarTuple" => Some(typevar_like_class(name)),
         "TypeVar" => Some(typevar_class()),
+        // `NewType` is declared as a module function so calls lower as module
+        // calls, but the attribute value is the real class: CPython 3.10+
+        // makes `typing.NewType` a class and `typing_inspection.is_newtype`
+        // (pydantic) is an `isinstance` check against it.
+        "NewType" => Some(newtype_class()),
         // The call form is declared as a module function so keyword calls
         // lower as module calls, but the attribute value must stay the real
         // class: `isinstance(x, typing._ConcatenateGenericAlias)` and
@@ -163,6 +185,200 @@ pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
         "_ConcatenateGenericAlias" => Some(cached_class("_ConcatenateGenericAlias")),
         _ => None,
     }
+}
+
+/// Generation-tagged cache for the native `NewType` class.
+struct NewTypeState {
+    generation: u64,
+    class: i64,
+}
+
+static NEWTYPE: LazyLock<Mutex<Option<NewTypeState>>> = LazyLock::new(|| Mutex::new(None));
+
+/// A native method function with a declared signature and a full-entry
+/// trampoline, the shape the shared binder dispatches (`call_bound_entry`
+/// checks `function_signature`/`function_full_entry`). The function name is
+/// internal, so it needs no module spec.
+fn entry_method(name: &'static str, parameters: &[&str], entry: usize) -> i64 {
+    let signature = parameters
+        .iter()
+        .map(|parameter| value::ParamMeta {
+            name: (*parameter).to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        })
+        .collect();
+    let function = value::native_function_new("typing", name, usize::MAX);
+    value::function_set_signature(function, signature);
+    value::function_set_full_entry(function, entry);
+    function
+}
+
+/// `typing.NewType` as a real class value, like CPython 3.10+.
+///
+/// The class is what `isinstance(x, typing.NewType)` needs (pydantic's
+/// `typing_inspection.is_newtype`); construction returns an instance carrying
+/// `__name__`, `__qualname__`, `__supertype__` and `__module__`, and the
+/// instance stays callable as the identity function, matching CPython's
+/// `_typing._idfunc`.
+fn newtype_class() -> i64 {
+    let generation = heap::generation();
+    {
+        let guard = NEWTYPE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(state) = guard.as_ref() {
+            if state.generation == generation {
+                heap::add_thread_root(state.class);
+                return state.class;
+            }
+        }
+    }
+    let init = entry_method(
+        "_newtype_init",
+        &["self", "name", "tp"],
+        init_newtype as *const () as usize,
+    );
+    let call = entry_method(
+        "_newtype_call",
+        &["self", "x"],
+        call_newtype as *const () as usize,
+    );
+    let repr = entry_method(
+        "_newtype_repr",
+        &["self"],
+        repr_newtype as *const () as usize,
+    );
+    let roots = heap::root_values(&[init, call, repr]);
+    let class = value::class_new(
+        "NewType".to_string(),
+        NONE,
+        vec![
+            ("__init__".to_string(), init),
+            ("__call__".to_string(), call),
+            ("__repr__".to_string(), repr),
+        ],
+    );
+    heap::release_roots(roots);
+    heap::add_thread_root(class);
+    *NEWTYPE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(NewTypeState { generation, class });
+    class
+}
+
+/// `NewType(name, tp)`: the shared construction behind the class call (which
+/// runs `__init__` through the binder) and the module-call dispatch.
+fn new_newtype(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if args.len() > 2 {
+        return type_error(&format!(
+            "NewType() takes at most 2 positional arguments ({} given)",
+            args.len()
+        ));
+    }
+    let mut name = args.first().copied();
+    let mut supertype = args.get(1).copied();
+    for (keyword, item) in keywords {
+        match keyword.as_str() {
+            "name" => {
+                if name.is_some() {
+                    return type_error("NewType() got multiple values for argument 'name'");
+                }
+                name = Some(*item);
+            }
+            "tp" => {
+                if supertype.is_some() {
+                    return type_error("NewType() got multiple values for argument 'tp'");
+                }
+                supertype = Some(*item);
+            }
+            other => {
+                return type_error(&format!(
+                    "NewType() got an unexpected keyword argument '{other}'"
+                ))
+            }
+        }
+    }
+    let Some(name) = name else {
+        return type_error("NewType() missing required argument 'name' (pos 1)");
+    };
+    let Some(supertype) = supertype else {
+        return type_error("NewType() missing required argument 'tp' (pos 2)");
+    };
+    // The caller may pass a Rust-side buffer (a module-call dispatcher or a
+    // unit test), which the conservative collector does not scan.
+    let roots = heap::root_values(&[name, supertype]);
+    let class = newtype_class();
+    let class_roots = heap::root_values(&[class]);
+    let instance = value::instance_new(class);
+    let instance_roots = heap::root_values(&[instance]);
+    let status = populate_newtype(instance, name, supertype);
+    heap::release_roots(instance_roots);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    if status != NONE || exc::pending() {
+        NONE
+    } else {
+        instance
+    }
+}
+
+/// Native `NewType.__init__(self, name, tp)`: stores the CPython attribute
+/// set. `__module__` is the defining frame's module (CPython's `_caller()`),
+/// falling back to `__main__` when no generated activation is on the stack.
+extern "C" fn init_newtype(argv: *const i64) -> i64 {
+    // SAFETY: the class-call binder passes one slot per declared parameter.
+    let instance = unsafe { *argv };
+    let name = unsafe { *argv.add(1) };
+    let supertype = unsafe { *argv.add(2) };
+    populate_newtype(instance, name, supertype)
+}
+
+fn populate_newtype(instance: i64, name: i64, supertype: i64) -> i64 {
+    let Some(text) = value::as_str(name) else {
+        return type_error(&format!(
+            "NewType() argument 1 must be a string, not {}",
+            value::type_name(name)
+        ));
+    };
+    let roots = heap::root_values(&[instance, name, supertype]);
+    let qualname = value::str_alloc(text.to_string());
+    let qualname_roots = heap::root_values(&[qualname]);
+    // CPython keeps the last dotted component as `__name__` and the full
+    // string as `__qualname__`.
+    let short = text.rsplit('.').next().unwrap_or(text);
+    let short_name = value::str_alloc(short.to_string());
+    let short_roots = heap::root_values(&[short_name]);
+    let module = exc::frame_module_at(0).unwrap_or_else(|| "__main__".to_string());
+    let module = value::str_alloc(module);
+    value::instance_setattr(instance, "__qualname__".to_string(), qualname);
+    value::instance_setattr(instance, "__name__".to_string(), short_name);
+    value::instance_setattr(instance, "__supertype__".to_string(), supertype);
+    value::instance_setattr(instance, "__module__".to_string(), module);
+    heap::release_roots(short_roots);
+    heap::release_roots(qualname_roots);
+    heap::release_roots(roots);
+    NONE
+}
+
+/// Native `NewType.__call__(self, x)`: CPython's `_idfunc`, the identity.
+extern "C" fn call_newtype(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `self` followed by the one declared argument.
+    unsafe { *argv.add(1) }
+}
+
+/// Native `NewType.__repr__(self)`: `<module>.<qualname>`.
+extern "C" fn repr_newtype(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `self` first.
+    let instance = unsafe { *argv };
+    let module = value::instance_attr(instance, "__module__")
+        .and_then(value::as_str)
+        .unwrap_or("__main__");
+    let qualname = value::instance_attr(instance, "__qualname__")
+        .and_then(value::as_str)
+        .unwrap_or("NewType");
+    value::str_alloc(format!("{module}.{qualname}"))
 }
 
 fn forward_ref_class() -> i64 {
@@ -987,6 +1203,233 @@ fn override_marker(method: i64) -> i64 {
     method
 }
 
+/// Name stamped by `no_type_check`.
+const NO_TYPE_CHECK_ATTRIBUTE: &str = "__no_type_check__";
+
+/// Depth guard for [`stamp_no_type_check_members`]: a class attribute may
+/// reference the class itself, and CPython's `dir()`-style walk must
+/// terminate.
+const MAX_NO_TYPE_CHECK_DEPTH: usize = 16;
+
+/// `typing.no_type_check(arg)`: marks a callable as exempt from type checking
+/// and returns it unchanged.
+///
+/// CPython sets `arg.__no_type_check__ = True`; for a class it first walks the
+/// class's own members (directly defined functions and nested classes) and
+/// stamps those. Native callables and scalars reject the assignment with
+/// `AttributeError`, exactly as CPython does (its `except TypeError` does not
+/// cover that).
+fn no_type_check_call(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let mut target = args.first().copied();
+    for (keyword, item) in keywords {
+        if keyword != "arg" {
+            return type_error(&format!(
+                "no_type_check() got an unexpected keyword argument '{keyword}'"
+            ));
+        }
+        if target.is_some() {
+            return type_error("no_type_check() got multiple values for argument 'arg'");
+        }
+        target = Some(*item);
+    }
+    let Some(target) = target else {
+        return type_error("no_type_check() missing required argument 'arg' (pos 1)");
+    };
+    no_type_check_value(target)
+}
+
+fn no_type_check_value(target: i64) -> i64 {
+    let roots = heap::root_values(&[target]);
+    if value::as_class(target).is_some() {
+        stamp_no_type_check_members(target, 0);
+        if exc::pending() {
+            heap::release_roots(roots);
+            return NONE;
+        }
+        value::class_set_attr(target, NO_TYPE_CHECK_ATTRIBUTE.to_string(), TRUE);
+        heap::release_roots(roots);
+        return target;
+    }
+    let _ = methods::setattr(
+        target,
+        NO_TYPE_CHECK_ATTRIBUTE.as_ptr(),
+        NO_TYPE_CHECK_ATTRIBUTE.len(),
+        TRUE,
+    );
+    let pending = exc::pending();
+    heap::release_roots(roots);
+    if pending {
+        NONE
+    } else {
+        target
+    }
+}
+
+/// Stamps `__no_type_check__` on a class's own namespace (its methods,
+/// function attributes and nested classes). Inherited members are untouched,
+/// matching CPython's direct-definition filter.
+fn stamp_no_type_check_members(class: i64, depth: usize) {
+    if depth > MAX_NO_TYPE_CHECK_DEPTH {
+        return;
+    }
+    for (_, item) in value::class_namespace(class) {
+        stamp_no_type_check_member(item, depth);
+    }
+}
+
+fn stamp_no_type_check_member(item: i64, depth: usize) {
+    if value::as_class(item).is_some() {
+        // CPython recurses with the full decorator, so the nested class is
+        // stamped as well as its own members.
+        stamp_no_type_check_members(item, depth + 1);
+        value::class_set_attr(item, NO_TYPE_CHECK_ATTRIBUTE.to_string(), TRUE);
+        return;
+    }
+    if value::as_function(item).is_some() {
+        stamp_no_type_check_function(item);
+        return;
+    }
+    // A `classmethod`/`staticmethod`/`property` descriptor holds its callable
+    // in `target` or the property components; CPython stamps `__func__`.
+    let Some(state) = value::as_descriptor(item) else {
+        return;
+    };
+    match state.kind {
+        value::DescriptorKind::Property => {
+            for function in [state.fget(), state.fset(), state.fdel()] {
+                if function != NONE && value::as_function(function).is_some() {
+                    stamp_no_type_check_function(function);
+                }
+            }
+        }
+        value::DescriptorKind::Classmethod | value::DescriptorKind::Staticmethod => {
+            stamp_no_type_check_member(state.target, depth + 1);
+        }
+        value::DescriptorKind::TypeAnnotations => {}
+    }
+}
+
+/// Stamps one class-member function. A member the runtime cannot annotate (a
+/// native callable) is skipped instead of failing the whole decorator, like
+/// CPython skipping objects that are not directly defined in the class.
+fn stamp_no_type_check_function(function: i64) {
+    let _ = methods::setattr(
+        function,
+        NO_TYPE_CHECK_ATTRIBUTE.as_ptr(),
+        NO_TYPE_CHECK_ATTRIBUTE.len(),
+        TRUE,
+    );
+    if exc::pending() {
+        exc::clear();
+    }
+}
+
+/// `typing.no_type_check_decorator(decorator)` (deprecated; removed in CPython
+/// 3.15): wraps `decorator` so every result it produces is passed through
+/// [`no_type_check_value`].
+fn no_type_check_decorator_call(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let mut decorator = args.first().copied();
+    for (keyword, item) in keywords {
+        match keyword.as_str() {
+            "decorator" => {
+                if decorator.is_some() {
+                    return type_error(
+                        "no_type_check_decorator() got multiple values for argument 'decorator'",
+                    );
+                }
+                decorator = Some(*item);
+            }
+            other => {
+                return type_error(&format!(
+                    "no_type_check_decorator() got an unexpected keyword argument '{other}'"
+                ))
+            }
+        }
+    }
+    let Some(decorator) = decorator else {
+        return type_error(
+            "no_type_check_decorator() missing required argument 'decorator' (pos 1)",
+        );
+    };
+    let roots = heap::root_values(&[decorator]);
+    let _ = super::warnings::warn_category(
+        "'typing.no_type_check_decorator' is deprecated and slated for removal in Python 3.15",
+        DEPRECATION_WARNING,
+    );
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let wrapper = value::closure_new_with_flags(
+        wrapped_decorator_entry as *const () as usize,
+        0,
+        "wrapped_decorator".to_string(),
+        vec![decorator],
+        value::FUNCTION_FLAG_VARARGS,
+    );
+    heap::release_roots(roots);
+    wrapper
+}
+
+/// Body of the `no_type_check_decorator` wrapper.
+///
+/// The varargs wrapper buffer is `[tagged total, <captured decorator>,
+/// user args...]` (see `builtins::call`'s `FunctionBody::Wrapper` arm).
+extern "C" fn wrapped_decorator_entry(argv: *const i64) -> i64 {
+    // SAFETY: the wrapper ABI always supplies the tagged count and the one
+    // capture before the user arguments.
+    let total = value::as_integer(unsafe { *argv }).unwrap_or(1).max(1) as usize;
+    let decorator = unsafe { *argv.add(1) };
+    let argc = total.saturating_sub(1);
+    let args: Vec<i64> = (0..argc)
+        .map(|index| unsafe { *argv.add(2 + index) })
+        .collect();
+    let roots = heap::root_values(&args);
+    let decorator_roots = heap::root_values(&[decorator]);
+    let decorated = crate::builtins::call(decorator, args.len(), args.as_ptr());
+    let result = if exc::pending() {
+        decorated
+    } else {
+        no_type_check_value(decorated)
+    };
+    heap::release_roots(decorator_roots);
+    heap::release_roots(roots);
+    result
+}
+
+/// `typing.__all__`: the public names this runtime's `typing` module exports.
+///
+/// Built from the central spec so the list cannot drift from the module
+/// surface: public function names first, then public constants. Private
+/// (`_`-prefixed) names and `__all__` itself are omitted, like CPython.
+fn typing_all() -> i64 {
+    let Some(spec) = hydro_ir::stdlib::module("typing") else {
+        return value::list_new(Vec::new());
+    };
+    let mut names: Vec<&'static str> = Vec::new();
+    for function in spec.functions {
+        if !function.name.starts_with('_') && !names.contains(&function.name) {
+            names.push(function.name);
+        }
+    }
+    for constant in spec.constants {
+        if constant.name == "__all__" || constant.name.starts_with('_') {
+            continue;
+        }
+        if !names.contains(&constant.name) {
+            names.push(constant.name);
+        }
+    }
+    let items: Vec<i64> = names
+        .into_iter()
+        .map(|name| value::str_alloc(name.to_string()))
+        .collect();
+    let roots = heap::root_values(&items);
+    let list = value::list_new(items);
+    heap::release_roots(roots);
+    list
+}
+
 /// A `frozenset`-shaped constant. Hydro has one set value type, so the
 /// constant is a set built once and cached (membership/iteration are what
 /// `typing_extensions` uses it for).
@@ -1586,6 +2029,7 @@ pub(crate) fn constant(name: &str) -> i64 {
         "_ASSERT_NEVER_REPR_MAX_LENGTH" => {
             value::encode_int(ASSERT_NEVER_REPR_MAX_LENGTH).unwrap_or(NONE)
         }
+        "__all__" => typing_all(),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'typing' has no attribute '{name}'"),
@@ -1605,6 +2049,10 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         // `@overload` records the stub for `get_overloads`; the callable is
         // returned so a direct call still reaches the annotated body.
         "overload" => overload(args.first().copied().unwrap_or(NONE)),
+        // `@no_type_check` is the identity decorator that stamps
+        // `__no_type_check__` (recursively on a class's own members).
+        "no_type_check" => no_type_check_call(args, &[]),
+        "no_type_check_decorator" => no_type_check_decorator_call(args, &[]),
         "get_overloads" => get_overloads(args.first().copied().unwrap_or(NONE)),
         "clear_overloads" => clear_overloads(),
         "disjoint_base" => disjoint_base(args.first().copied().unwrap_or(NONE)),
@@ -1625,9 +2073,9 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "TypeVar" => new_typevar(args, &[]),
         // Lowering target for a PEP 695 `type X = expr` statement.
         "_type_alias_new" => new_type_alias(args),
-        // `NewType("Name", int)` is called like the underlying type in the
-        // corpus, so the underlying type is the usable stand-in.
-        "NewType" => args.get(1).copied().unwrap_or(NONE),
+        // `NewType("Name", tp)` returns a callable NewType instance carrying
+        // `__supertype__` (CPython 3.10+ class semantics).
+        "NewType" => new_newtype(args, &[]),
         "get_type_hints" => get_type_hints(args, &[]),
         "_get_defaults" => get_defaults(args.first().copied().unwrap_or(NONE)),
         "get_args" => alias_args(args.first().copied().unwrap_or(NONE)),
@@ -1675,6 +2123,7 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
         "evaluate_forward_ref" => evaluate_forward_ref(args, keywords),
         "ParamSpec" | "TypeVarTuple" => new_typevar_like(function, args, keywords),
         "TypeVar" => new_typevar(args, keywords),
+        "NewType" => new_newtype(args, keywords),
         "_tp_cache" => tp_cache(args, keywords),
         "_type_convert" => type_convert(args, keywords),
         "_type_check" => type_check(args, keywords),
@@ -1683,6 +2132,8 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
         "dataclass_transform" => {
             value::identity_function_new("typing.dataclass_transform.<locals>.decorator")
         }
+        "no_type_check" => no_type_check_call(args, keywords),
+        "no_type_check_decorator" => no_type_check_decorator_call(args, keywords),
         "get_type_hints" => get_type_hints(args, keywords),
         "_get_defaults" => get_defaults(args.first().copied().unwrap_or(NONE)),
         _ => exc::raise_with_message(
@@ -3190,8 +3641,10 @@ mod tests {
         let function = text("f");
         assert_eq!(call("runtime_checkable", &[function]), function);
         assert_eq!(call("overload", &[function]), function);
-        // `NewType` stands in for the underlying type so calls work.
-        assert_eq!(call("NewType", &[text("TaskID"), function]), function);
+        // `NewType` is a real class on 3.10+ (see
+        // `newtype_is_a_class_with_cpython_attributes`).
+        let newtype = call("NewType", &[text("TaskID"), function]);
+        assert_eq!(value::instance_class_value(newtype), Some(newtype_class()));
 
         let plain = call("TypeVar", &[text("T")]);
         assert!(!exc::pending());
@@ -3281,6 +3734,267 @@ mod tests {
             value::instance_attr(named, "__name__").and_then(value::as_str),
             Some("N")
         );
+    }
+
+    #[test]
+    fn no_type_check_stamps_functions_and_classes() {
+        exc::init();
+        // `@typing.no_type_check` on a function: identity result, stamped.
+        let function = value::identity_function_new("f");
+        let function_roots = heap::root_values(&[function]);
+        assert_eq!(call("no_type_check", &[function]), function);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            value::function_attribute(function, "__no_type_check__"),
+            Some(TRUE)
+        );
+        // Keyword form (CPython's parameter is named `arg`).
+        let other = value::identity_function_new("g");
+        let other_roots = heap::root_values(&[other]);
+        assert_eq!(
+            call_kw("no_type_check", &[], &[("arg".to_string(), other)]),
+            other
+        );
+        assert_eq!(
+            value::function_attribute(other, "__no_type_check__"),
+            Some(TRUE)
+        );
+
+        // The module attribute and the `_typing` alias expose the decorator,
+        // and the spec backs its call dispatch (a native function value).
+        for module in ["typing", "_typing"] {
+            let exported = crate::modules::module_get_by_name(module, "no_type_check");
+            assert!(!exc::pending(), "{}", pending_message());
+            assert!(value::as_function(exported).is_some());
+            assert_eq!(value::function_name(exported), "no_type_check");
+        }
+        let exported = crate::modules::module_get_by_name("typing", "no_type_check");
+        let target = value::identity_function_new("h");
+        let roots = heap::root_values(&[exported, target]);
+        let decorated = crate::builtins::call(exported, 1, [target].as_ptr());
+        heap::release_roots(roots);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(decorated, target);
+        assert_eq!(
+            value::function_attribute(target, "__no_type_check__"),
+            Some(TRUE)
+        );
+
+        // Native callables reject the attribute assignment, like CPython
+        // (its `except TypeError` does not cover `AttributeError`).
+        let native = value::native_function_new("typing", "get_type_hints", 0);
+        call("no_type_check", &[native]);
+        assert_eq!(exc::pending_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        exc::clear();
+        heap::release_roots(other_roots);
+        heap::release_roots(function_roots);
+    }
+
+    #[test]
+    fn no_type_check_stamps_a_class_namespace() {
+        exc::init();
+        let method = value::identity_function_new("method");
+        let nested = value::class_new("Nested".to_string(), NONE, Vec::new());
+        let class = value::class_new_full(
+            "Model".to_string(),
+            NONE,
+            vec![("method".to_string(), method, hydro_ir::MethodKind::Normal)],
+            vec![("nested".to_string(), nested)],
+        );
+        let roots = heap::root_values(&[class]);
+        assert_eq!(call("no_type_check", &[class]), class);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert!(matches!(
+            value::class_lookup(class, "__no_type_check__"),
+            Some(value::ClassEntry::Attr(flag)) if flag == TRUE
+        ));
+        assert_eq!(
+            value::function_attribute(method, "__no_type_check__"),
+            Some(TRUE),
+            "directly defined methods are stamped"
+        );
+        assert!(matches!(
+            value::class_lookup(nested, "__no_type_check__"),
+            Some(value::ClassEntry::Attr(flag)) if flag == TRUE
+        ));
+        heap::release_roots(roots);
+    }
+
+    #[test]
+    fn no_type_check_decorator_wraps_and_marks_results() {
+        exc::init();
+        let identity = value::identity_function_new("decorator");
+        let identity_roots = heap::root_values(&[identity]);
+        let wrapped = call("no_type_check_decorator", &[identity]);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert!(value::as_function(wrapped).is_some());
+        assert_eq!(value::function_name(wrapped), "wrapped_decorator");
+
+        // The wrapper calls the wrapped decorator, then stamps its result.
+        let target = value::identity_function_new("decorated");
+        let roots = heap::root_values(&[wrapped, target]);
+        let decorated = crate::builtins::call(wrapped, 1, [target].as_ptr());
+        heap::release_roots(roots);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(decorated, target);
+        assert_eq!(
+            value::function_attribute(target, "__no_type_check__"),
+            Some(TRUE)
+        );
+
+        // Keyword form, and a missing argument raises (CPython does not
+        // validate the callable until the wrapper runs).
+        let keyword = call_kw(
+            "no_type_check_decorator",
+            &[],
+            &[("decorator".to_string(), identity)],
+        );
+        assert!(!exc::pending(), "{}", pending_message());
+        assert!(value::as_function(keyword).is_some());
+        call("no_type_check_decorator", &[]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+        heap::release_roots(identity_roots);
+    }
+
+    #[test]
+    fn typing_all_lists_the_public_module_surface() {
+        exc::init();
+        let all = constant("__all__");
+        assert!(!exc::pending(), "{}", pending_message());
+        let names = value::as_list(all).expect("__all__ must be a list");
+        let public: Vec<&str> = names
+            .iter()
+            .filter_map(|item| value::as_str(*item))
+            .collect();
+        for expected in ["Any", "NewType", "Union", "no_type_check", "overload"] {
+            assert!(public.contains(&expected), "__all__ is missing {expected}");
+        }
+        assert!(
+            public.iter().all(|name| !name.starts_with('_')),
+            "__all__ must not list private names"
+        );
+        // The spec constant makes the module attribute readable, and the
+        // `_typing` alias shares it.
+        for module in ["typing", "_typing"] {
+            let exported = crate::modules::module_get_by_name(module, "__all__");
+            assert!(!exc::pending(), "{}", pending_message());
+            assert!(value::as_list(exported).is_some());
+        }
+    }
+
+    #[test]
+    fn newtype_is_a_class_with_cpython_attributes() {
+        exc::init();
+        let class = crate::modules::module_get_by_name("typing", "NewType");
+        assert!(!exc::pending(), "{}", pending_message());
+        assert!(
+            value::as_class(class).is_some(),
+            "typing.NewType must be a class value"
+        );
+        assert_eq!(value::class_display_name(class), Some("NewType"));
+        // Module reads share one identity (`typing_extensions.NewType is
+        // typing.NewType` on 3.10+).
+        assert_eq!(
+            crate::modules::module_get_by_name("typing", "NewType"),
+            class
+        );
+
+        let supertype = value::class_new("int".to_string(), NONE, Vec::new());
+        let value_roots = heap::root_values(&[class, supertype]);
+        let arguments = [text("UserId"), supertype];
+        let argument_roots = heap::root_values(&arguments);
+        let newtype = crate::builtins::call(class, 2, arguments.as_ptr());
+        heap::release_roots(argument_roots);
+        assert!(!exc::pending(), "{}", pending_message());
+        let newtype_roots = heap::root_values(&[newtype]);
+        assert_eq!(value::instance_class_value(newtype), Some(class));
+        assert_eq!(
+            value::instance_attr(newtype, "__name__").and_then(value::as_str),
+            Some("UserId")
+        );
+        assert_eq!(
+            value::instance_attr(newtype, "__qualname__").and_then(value::as_str),
+            Some("UserId")
+        );
+        assert_eq!(
+            value::instance_attr(newtype, "__supertype__"),
+            Some(supertype)
+        );
+        // A unit test has no generated activation, so `__module__` falls back
+        // to `__main__` (CPython's `_caller()` default for a missing frame).
+        assert_eq!(
+            value::instance_attr(newtype, "__module__").and_then(value::as_str),
+            Some("__main__")
+        );
+        assert_eq!(value::repr(newtype), "__main__.UserId");
+
+        // `isinstance(nt, typing.NewType)` — pydantic's `is_newtype`.
+        let isinstance_args = [newtype, class];
+        let isinstance_roots = heap::root_values(&isinstance_args);
+        assert_eq!(
+            crate::builtins::call_builtin(Builtin::Isinstance, 2, isinstance_args.as_ptr()),
+            TRUE
+        );
+        heap::release_roots(isinstance_roots);
+        assert!(!exc::pending(), "{}", pending_message());
+
+        // The value is callable as CPython's `_idfunc`: the identity, not a
+        // `supertype` conversion.
+        let argument = value::encode_int(7).expect("representable int");
+        let call_args = [argument];
+        let call_roots = heap::root_values(&call_args);
+        assert_eq!(
+            crate::builtins::call(newtype, 1, call_args.as_ptr()),
+            argument
+        );
+        heap::release_roots(call_roots);
+        assert!(!exc::pending(), "{}", pending_message());
+
+        // Class construction and the module-call spelling agree, including
+        // the dotted-name rule (`__qualname__` keeps the full name).
+        let module_call = call("NewType", &[text("pkg.UserId"), supertype]);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::instance_class_value(module_call), Some(class));
+        assert_eq!(
+            value::instance_attr(module_call, "__name__").and_then(value::as_str),
+            Some("UserId")
+        );
+        assert_eq!(
+            value::instance_attr(module_call, "__qualname__").and_then(value::as_str),
+            Some("pkg.UserId")
+        );
+        assert_eq!(
+            value::instance_attr(module_call, "__supertype__"),
+            Some(supertype)
+        );
+
+        // Keyword construction through the module binder.
+        let keyword = call_kw(
+            "NewType",
+            &[],
+            &[
+                ("name".to_string(), text("Key")),
+                ("tp".to_string(), supertype),
+            ],
+        );
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            value::instance_attr(keyword, "__name__").and_then(value::as_str),
+            Some("Key")
+        );
+
+        // Both arguments are required, and the name must be a string.
+        exc::clear();
+        call("NewType", &[text("Only")]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+        call("NewType", &[value::encode_int(1).expect("int"), supertype]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+        heap::release_roots(newtype_roots);
+        heap::release_roots(value_roots);
+        assert!(!exc::pending());
     }
 
     #[test]

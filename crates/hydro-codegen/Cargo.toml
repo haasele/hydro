@@ -13,3 +13,9 @@ cranelift-module.workspace = true
 cranelift-jit.workspace = true
 cranelift-object.workspace = true
 cranelift-native.workspace = true
+
+# Source-level JIT regression tests: compile real Python through the frontend
+# and execute it. `hydro-frontend` does not depend on codegen, so there is no
+# cycle.
+[dev-dependencies]
+hydro-frontend.workspace = true

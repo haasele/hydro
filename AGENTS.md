@@ -32,6 +32,75 @@ tiers, HNA, roadmap), `docs/DIAGNOSTICS.md` (diagnostics) and
 Official `Lib/test` runs are a release gate; the offline manifest check runs
 in `scripts/verify.sh`/CI. LTS is policy only (P4-12).
 
+**2026-10-29 native-bindings checkpoint:**
+Objective
+- Continue the remaining TODO work from the previous session: ecosystem dynamic imports/smokes (NumPy, pandas, pydantic), stdlib blockers, native accelerator modules, then final verification/documentation.
+Requirements
+- A step counts as done only when the command/scenario was actually executed; update docs/TODO.md in the same change.
+- No invented measurements or "done" claims; test counts live only in AGENTS.md.
+- Do not change IR/ABI contracts without reporting deviations.
+- Keep changes consistent with repository style and preserve uncommitted user work.
+Decisions
+- Fixed NumPy's map(lambda x, y: ..., saveout, outneeds[n]) compile failure via the variadic hydro_map_many runtime path.
+- Added os.path.getsize/getmtime/getatime/getctime, time.asctime, and a frontend star-import shadowing rule to unblock NumPy.
+- Treat preload-linked deferred imports as soft ordering edges (deferred_deps): their statements run only when the enclosing function executes, so they may be relaxed to break an initializer cycle. This fixed NumPy's _dtype_like/_array_like ordering.
+- Base-less classes must resolve super() against object (e.g. super().__new__(cls)), so class_lookup_after now falls back to object when object is not already in the MRO.
+- Preserve the narrow construction fallback: class_lookup still reports no __init__/__new__ for base-less classes; only super() resolution sees object.
+Work State
+Completed
+- Variadic map codegen + runtime dispatch already existed and compiles.
+- Added os.path.getsize, getmtime, getatime, getctime to OS_PATH spec/runtime.
+- Added time.asctime with shared time_sequence_fields.
+- Fixed crackfortran.py false-positive arity error via fn_definition_starts + star-import shadowing.
+- Rebuilt Hydro release staticlib (cargo build --release -p hydro-runtime) and copied it to ../tea/target/release/libhydro_runtime.a; hydro_map_many is now present (AOT not yet rerun).
+- NumPy ordering fix verified: unit_initializer_order now places numpy before numpy._typing._dtype_like and numpy._typing._array_like; import advances past AttributeError: module 'numpy' has no attribute 'dtype'.
+- Fixed base-less super().__new__: minimal supernew.py now prints ok <A object>; NumPy import advances past 'super' object has no attribute '__new__'.
+- pydantic:import and pydantic:smoke passed in the last full ecosystem report.
+Active
+- Fixing NumPy extension init: _multiarray_umath now fails at TypeError: ArrayMethod provided object <class 'numpy.dtypes.Float16DType'> is not a DType.(method: half_sort).
+- Investigating PyType_Ready/adopt_static_type overwriting a heap dtype class's ob_type (PyArrayDTypeMeta_Type) with TYPE_TYPE, so PyObject_TypeCheck(Float16DType, PyArrayDTypeMeta_Type) fails.
+Blocked
+- NumPy import: ArrayMethod DType check during register_all_sorts/set_typeinfo in _multiarray_umath_exec.
+- pandas import/smoke not yet retried; previously blocked on os.symlink/os.link.
+- six import still blocked on importlib.util.spec_from_loader and types.ClassType.
+- Full ecosystem report/docs/verification not yet rerun after this slice.
+- Temporary debug instrumentation must be removed before finalizing.
+Next Move
+1. In crates/hydro-runtime/src/capi/type.rs, preserve a known non-NULL metatype in adopt_static_type instead of forcing ob_type = TYPE_TYPE; update is_type_pointer/as_type so types whose ob_type is a remembered custom metatype (e.g. numpy._DTypeMeta) are still recognized as type objects.
+2. Consider implementing real PyType_FromMetaclass support for non-type metaclasses if NumPy relies on it; verify with gdb breakpoints.
+3. Rebuild Tea release (cd ../tea && cargo build --release) and rerun python3 scripts/ecosystem_compat.py --only numpy --timeout 180; iterate on the next missing stdlib/ABI member.
+4. Then run pandas and six, regenerate the full ecosystem report, and update docs/ECOSYSTEM.md, docs/TODO.md, AGENTS.md only with observed results.
+5. Remove HYDRO_DEBUG_INIT_ORDER and HYDRO_DEBUG_SUPER instrumentation and debug markers in /tmp/opencode/site-debug before finalizing.
+6. Add regression tests: variadic map, os.path.getsize/time, time.asctime, star-import/local-def shadowing, deferred-preload ordering, and base-less super().__new__.
+7. Run cargo nextest run --workspace, cargo fmt --all -- --check, cargo clippy --workspace --all-targets -- -D warnings, ./scripts/verify.sh.
+Relevant Files
+- /mnt/Vault/GitHub/hydro/crates/hydro-frontend/src/lib.rs: deferred_deps field/recording/remapping, initializer_edge_is_soft, unit_initializer_order, temporary HYDRO_DEBUG_INIT_ORDER.
+- /mnt/Vault/GitHub/hydro/crates/hydro-runtime/src/capi/type.rs: adopt_static_type, is_type_pointer, as_type, hydro_class_metatype, PyType_Ready.
+- /mnt/Vault/GitHub/hydro/crates/hydro-runtime/src/capi/mod.rs: PyType_FromMetaclass, kind_type, PyObject_SetAttrString.
+- /mnt/Vault/GitHub/hydro/crates/hydro-runtime/src/core/value.rs: class_lookup_after object fallback, class_lookup, object_protocol_slot.
+- /mnt/Vault/GitHub/hydro/crates/hydro-runtime/src/core/methods.rs: super_getattr/super_method, temporary HYDRO_DEBUG_SUPER.
+- /mnt/Vault/GitHub/hydro/crates/hydro-runtime/src/core/builtins.rs: updated object_protocol_slots_resolve_past_a_plain_class test.
+- /mnt/Vault/GitHub/hydro/crates/hydro-runtime/src/core/container.rs: container/value helpers touched in this slice.
+- /mnt/Vault/GitHub/hydro/crates/hydro-runtime/src/modules/mod.rs: os.path/time dispatch.
+- /mnt/Vault/GitHub/hydro/crates/hydro-ir/src/stdlib/specs.rs: OS_PATH/TIME specs.
+- /mnt/Vault/GitHub/hydro/crates/hydro-codegen/src/lower/mod.rs: map_many codegen arm.
+- /mnt/Vault/GitHub/hydro/scripts/ecosystem_compat.py: ecosystem gate runner.
+- /mnt/Vault/GitHub/hydro/docs/ECOSYSTEM.md: current ecosystem status.
+- /mnt/Vault/GitHub/hydro/docs/TODO.md: NB-4/NB-1 work list.
+- /mnt/Vault/GitHub/tea: Tea repo; release staticlib copy and rebuild.
+- /tmp/opencode/site-debug/numpy/_core/overrides.py: debug copy with markers (not repo).
+Important Context
+- Build: export PATH="$HOME/.cargo/bin:$PATH"; cargo build --release -p hydro-runtime; then cp target/release/libhydro_runtime.a ../tea/target/release/libhydro_runtime.a; cd ../tea && cargo build --release.
+- Probe env: PYTHONPATH=/mnt/Vault/GitHub/hydro/.hydro/ecosystem/site HYDRO_SITE_PACKAGES=/mnt/Vault/GitHub/hydro/.hydro/ecosystem/site HYDRO_STDLIB=/usr/lib/python3.14.
+- Current NumPy failure: Traceback ... File "import_numpy.py", line 83, in numpy._core.overrides.<module> / TypeError: ArrayMethod provided object <class 'numpy.dtypes.Float16DType'> is not a DType.(method: half_sort).
+- gdb shows failure in _multiarray_umath_exec -> set_typeinfo -> register_all_sorts -> make_sorts_<...> -> PyArrayMethod_FromSpec_int -> PyErr_Format.
+- gdb shows dtype classes are readied via PyType_Ready (e.g. numpy.dtypes.Float16DType), with no PyType_FromSpec/PyType_FromMetaclass calls observed; adopt_static_type sets ob_type = TYPE_TYPE.
+- is_type_pointer currently requires ob_type == TYPE_TYPE; preserving custom metatypes requires relaxing this consistently.
+- hydro_class_metatype creates a fresh synthetic metatype deriving from type per Hydro class instead of returning the actual metaclass; may matter for Hydro classes derived from extension types.
+- Separate pre-existing bug found: print(namedtuple_instance) causes a stack overflow (namedtuple3.py); creation and attribute access work.
+- Working tree is large and uncommitted (~33 modified files, ~8k insertions) on top of 4f5bf23; do not discard.
+- Test count canonical location remains AGENTS.md; update only with real runs.
+
 **2026-10-29 native-bindings checkpoint:** HNA v1 is implemented and tested:
 the header `include/hydro_native.h`, the `hydro-hna` crate, loader and
 persistent root/projection services, `.hna.so` discovery with ambiguity and

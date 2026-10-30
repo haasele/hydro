@@ -1006,6 +1006,19 @@ pub(crate) fn ensure_builtin_types() {
         // so `PyDate_Check` accepts datetime handles.
         (*ptr::addr_of_mut!(DATETIME_CAPI_TYPE)).tp_base = ptr::addr_of_mut!(DATE_CAPI_TYPE);
         (*ptr::addr_of_mut!(TIMEZONE_CAPI_TYPE)).tp_base = ptr::addr_of_mut!(TZINFO_CAPI_TYPE);
+        // PyO3 allows `#[pyclass(extends=PyTzInfo)]` (pydantic-core's datetime
+        // types) and fetches the base constructor through `PyType_GetSlot`.
+        for pointer in [
+            ptr::addr_of_mut!(DATE_CAPI_TYPE),
+            ptr::addr_of_mut!(DATETIME_CAPI_TYPE),
+            ptr::addr_of_mut!(TIME_CAPI_TYPE),
+            ptr::addr_of_mut!(TIMEDELTA_CAPI_TYPE),
+            ptr::addr_of_mut!(TZINFO_CAPI_TYPE),
+            ptr::addr_of_mut!(TIMEZONE_CAPI_TYPE),
+        ] {
+            (*pointer).tp_new = native_base_new as *const () as usize;
+            (*pointer).tp_free = instance_free as *const () as usize;
+        }
         let seq_iterator = ptr::addr_of_mut!(SEQITER_TYPE);
         (*seq_iterator).tp_iter = super::PyObject_SelfIter as *const () as usize;
         (*seq_iterator).tp_iternext = super::seqiter_next as *const () as usize;
@@ -3497,6 +3510,68 @@ pub(crate) fn gc_walk_tracked(
     }
 }
 
+/// One synthetic metatype for a Hydro class exposed through the C API.
+///
+/// `PyType_Check` is an inline flag test on `Py_TYPE(op)`, so a Hydro class
+/// handle needs an `ob_type` whose `tp_flags` include
+/// `Py_TPFLAGS_TYPE_SUBCLASS`. The metatype is leaked: every handle created
+/// from the class keeps naming it.
+#[repr(C)]
+struct HydroClassMetatype {
+    object: TypeObject,
+    name: CString,
+}
+
+/// Per-generation metatypes for Hydro class values. A runtime reset frees the
+/// Hydro heap, so tagged values (and therefore the cache keys) are invalidated
+/// with it.
+static HYDRO_CLASS_METATYPES: LazyLock<Mutex<(u64, HashMap<i64, usize>)>> =
+    LazyLock::new(|| Mutex::new((u64::MAX, HashMap::new())));
+
+/// Metatype used as `Py_TYPE` of a Hydro class handle.
+///
+/// Its `tp_base` is `type`, so `PyType_IsSubtype(metatype, &PyType_Type)` and
+/// `PyObject_IsInstance(handle, type)` succeed, and its flags make CPython's
+/// inline `PyType_Check` accept the handle. Returns `None` for Hydro values
+/// that are not classes.
+pub(crate) fn hydro_class_metatype(value: i64) -> Option<*mut TypeObject> {
+    crate::value::as_class(value)?;
+    ensure_builtin_types();
+    let generation = crate::heap::generation();
+    let mut cache = HYDRO_CLASS_METATYPES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if cache.0 != generation {
+        cache.0 = generation;
+        cache.1.clear();
+    }
+    if let Some(&pointer) = cache.1.get(&value) {
+        return Some(pointer as *mut TypeObject);
+    }
+    let name = crate::value::class_qualname(value)
+        .unwrap_or_else(|| crate::value::class_display_name(value).unwrap_or("type"))
+        .to_string();
+    let c_name = CString::new(name).ok()?;
+    let metatype = Box::into_raw(Box::new(HydroClassMetatype {
+        object: TypeObject::builtin(
+            ptr::null(),
+            TypeRole::Shim,
+            PY_TPFLAGS_READY | PY_TPFLAGS_BASETYPE | PY_TPFLAGS_TYPE_SUBCLASS,
+        ),
+        name: c_name,
+    }));
+    // SAFETY: the box is leaked, its first field is the type object and the
+    // name buffer lives in the same allocation.
+    unsafe {
+        (*metatype).object.tp_name = (*metatype).name.as_ptr();
+        (*metatype).object.ob_type = ptr::addr_of_mut!(TYPE_TYPE);
+        (*metatype).object.tp_base = ptr::addr_of_mut!(TYPE_TYPE);
+    }
+    cache.1.insert(value, metatype as usize);
+    // SAFETY: `metatype` is the leaked box allocated above.
+    Some(unsafe { ptr::addr_of_mut!((*metatype).object) })
+}
+
 /// CPython's `PyObject_IS_GC`: `HAVE_GC` plus an optional `tp_is_gc` filter.
 pub(crate) fn object_is_gc(object: *mut ShimObject) -> bool {
     let type_object = type_of(object);
@@ -3618,6 +3693,39 @@ pub(crate) fn allocate_named_type(name: &str, flags: c_ulong) -> *mut TypeObject
     pointer
 }
 
+/// `tp_new` for native base types that extension classes may inherit from.
+///
+/// CPython's exception and datetime C-API bases expose a real constructor;
+/// PyO3's `PyClassInitializer` fetches it through `PyType_GetSlot` and calls
+/// it as `tp_new(subtype, (), NULL)` to allocate the base part of a Python
+/// subclass. Allocate the *subtype* exactly as CPython's `BaseException_new`
+/// does; PyO3 then initialises its own fields.
+///
+/// # Safety
+/// `subtype` must be a live type object or NULL; the return value is a new
+/// reference.
+pub(crate) unsafe extern "C" fn native_base_new(
+    subtype: *mut TypeObject,
+    _args: *mut ShimObject,
+    _kwargs: *mut ShimObject,
+) -> *mut ShimObject {
+    if subtype.is_null() {
+        set_error("SystemError: native base constructor requires a type");
+        return ptr::null_mut();
+    }
+    // SAFETY: `subtype` was validated by the caller (it is the class being
+    // constructed).
+    let allocator = unsafe { (*subtype).tp_alloc };
+    if allocator != 0 && allocator != PyType_GenericAlloc as *const () as usize {
+        // SAFETY: `allocfunc` has this signature.
+        let allocate: unsafe extern "C" fn(*mut TypeObject, isize) -> *mut ShimObject =
+            unsafe { std::mem::transmute(allocator as *const c_void) };
+        // SAFETY: the caller handed us a live type.
+        return unsafe { allocate(subtype, 0) };
+    }
+    allocate_instance(subtype, 0)
+}
+
 /// Allocates an immortal exception class.
 ///
 /// Exception classes use [`TypeRole::Shim`] so instances of them can carry the
@@ -3631,6 +3739,12 @@ pub(crate) fn allocate_exception_type(name: &str, flags: c_ulong) -> *mut TypeOb
         // SAFETY: freshly allocated, uniquely owned box.
         unsafe {
             (*type_object).role = TypeRole::Shim;
+            // PyO3 subclasses of `Exception`/`ValueError` allocate their base
+            // part through this slot and free it through `tp_free` when the
+            // subclass deallocator runs (its `BaseException_dealloc`
+            // equivalent is not modelled here).
+            (*type_object).tp_new = native_base_new as *const () as usize;
+            (*type_object).tp_free = instance_free as *const () as usize;
         }
     }
     type_object
@@ -5626,14 +5740,24 @@ pub extern "C" fn PyType_Freeze(object: *mut ShimObject) -> c_int {
 #[no_mangle]
 pub extern "C" fn PyType_IsSubtype(type_object: *mut ShimObject, base: *mut ShimObject) -> c_int {
     // Hydro classes answer from their own linearization.
-    if let (Some(derived), Some(base_class)) = (
-        super::hydro_class_value(type_object),
-        super::hydro_class_value(base),
-    ) {
-        return match super::hydro_issubclass(derived, base_class) {
-            Ok(subtype) => subtype as c_int,
-            Err(_) => 0,
-        };
+    if let Some(derived) = super::hydro_class_value(type_object) {
+        if let Some(base_class) = super::hydro_class_value(base) {
+            return match super::hydro_issubclass(derived, base_class) {
+                Ok(subtype) => subtype as c_int,
+                Err(_) => 0,
+            };
+        }
+        // A class object is an instance of `type`; its synthetic metatype
+        // derives from `type`, which is what PyO3's PyType_Check exercises.
+        if base == ptr::addr_of_mut!(TYPE_TYPE) as *mut ShimObject {
+            return 1;
+        }
+        if let Some(metatype) = hydro_class_metatype(derived) {
+            if is_type_pointer(base) {
+                return is_subtype(metatype, base as *mut TypeObject) as c_int;
+            }
+        }
+        return 0;
     }
     if !is_type_pointer(type_object) || !is_type_pointer(base) {
         return 0;

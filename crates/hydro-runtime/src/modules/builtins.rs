@@ -33,18 +33,35 @@
 //! stable synthetic value is derived from the tagged encoding.
 
 use hydro_ir::{stdlib, Builtin};
+use num_bigint::BigInt;
 
 use crate::builtins as core_builtins;
 use crate::container;
 use crate::core::globals;
 use crate::exc::{
     self, ATTRIBUTE_ERROR, IMPORT_ERROR, KEY_ERROR, NOT_IMPLEMENTED_ERROR, RUNTIME_ERROR,
-    TYPE_ERROR,
+    TYPE_ERROR, VALUE_ERROR,
 };
 use crate::methods;
 use crate::modules;
 use crate::ops;
 use crate::value::{self, NONE, NOT_IMPLEMENTED};
+
+/// Copies `args`, replacing a leading native scalar subclass instance with the
+/// builtin value it wraps.
+///
+/// The scalar class slots (`__repr__`, `__str__`, `__format__`) dispatch here;
+/// unwrapping the receiver keeps them from re-entering the instance renderer
+/// (`repr(instance)` → `__scalar_repr__` → `repr(instance)`).
+fn scalar_receiver_args(args: &[i64]) -> Vec<i64> {
+    let mut call_args = args.to_vec();
+    if let Some(first) = call_args.first_mut() {
+        if let Some(payload) = value::scalar_payload(*first) {
+            *first = payload;
+        }
+    }
+    call_args
+}
 
 /// Dispatches an attribute-only builtin. Names present in
 /// `Builtin::from_name` are handled first.
@@ -69,33 +86,61 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "__object_format__" => {
             core_builtins::call_builtin(Builtin::Format, args.len(), args.as_ptr())
         }
-        "__object_eq__" => value::bool_value(args.first() == args.get(1)),
-        "__object_ne__" => value::bool_value(args.first() != args.get(1)),
+        // Identity for plain objects, but a native scalar subclass instance
+        // compares as the builtin value it wraps (CPython inherits
+        // `int.__eq__`/`str.__eq__` there, not `object.__eq__`).
+        "__object_eq__" => {
+            let equal = match (args.first(), args.get(1)) {
+                (Some(left), Some(right)) => {
+                    if value::scalar_payload(*left).is_some()
+                        || value::scalar_payload(*right).is_some()
+                    {
+                        container::equals(*left, *right)
+                    } else {
+                        left == right
+                    }
+                }
+                _ => false,
+            };
+            value::bool_value(equal)
+        }
+        "__object_ne__" => {
+            let equal = match (args.first(), args.get(1)) {
+                (Some(left), Some(right)) => {
+                    if value::scalar_payload(*left).is_some()
+                        || value::scalar_payload(*right).is_some()
+                    {
+                        container::equals(*left, *right)
+                    } else {
+                        left == right
+                    }
+                }
+                _ => false,
+            };
+            value::bool_value(!equal)
+        }
         "__object_hash__" => core_builtins::call_builtin(Builtin::Hash, args.len(), args.as_ptr()),
         "__object_dir__" => dir(args),
         "__object_sizeof__" => value::encode_int(0).unwrap_or(NONE),
         "__object_reduce_ex__" => NONE,
+        // `format(N(3), 'd')` formats the wrapped scalar, not the instance.
         "__scalar_format__" => {
-            core_builtins::call_builtin(Builtin::Format, args.len(), args.as_ptr())
+            let call_args = scalar_receiver_args(args);
+            core_builtins::call_builtin(Builtin::Format, call_args.len(), call_args.as_ptr())
         }
-        "__scalar_repr__" => core_builtins::call_builtin(Builtin::Repr, args.len(), args.as_ptr()),
-        "__scalar_str__" => core_builtins::call_builtin(Builtin::Str, args.len(), args.as_ptr()),
-        "__scalar_new__" => {
-            let builtin = match value::as_class(args.first().copied().unwrap_or(NONE))
-                .map(|class| class.name.as_str())
-            {
-                Some("int") => Builtin::Int,
-                Some("float") => Builtin::Float,
-                Some("str") => Builtin::Str,
-                Some("bytes") => Builtin::Bytes,
-                _ => return args.first().copied().unwrap_or(NONE),
-            };
-            core_builtins::call_builtin(
-                builtin,
-                args.len().saturating_sub(1),
-                args.as_ptr().wrapping_add(1),
-            )
+        "__scalar_repr__" => {
+            let call_args = scalar_receiver_args(args);
+            core_builtins::call_builtin(Builtin::Repr, call_args.len(), call_args.as_ptr())
         }
+        "__scalar_str__" => {
+            let call_args = scalar_receiver_args(args);
+            core_builtins::call_builtin(Builtin::Str, call_args.len(), call_args.as_ptr())
+        }
+        // `int.__new__(cls, ...)` (and the same slot on `float`/`str`/
+        // `bytes`/`bool`): `args[0]` is the class, so a subclass gets an
+        // instance carrying the scalar payload while the exact native class
+        // returns the plain value.
+        "__scalar_new__" => core_builtins::scalar_new_from_args(args.len(), args.as_ptr()),
         "__object_getattribute__" => {
             if args.len() != 2 {
                 return type_error("__getattribute__() takes exactly 2 arguments");
@@ -117,6 +162,9 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         }
         "setattr" => setattr(args),
         "delattr" => delattr(args),
+        // `pow(base, exp[, mod])`: the two-argument form is the `**` operator
+        // and the three-argument form is integer modular exponentiation.
+        "pow" => pow_builtin(args),
         "complex" => core_builtins::complex_new(args),
         "slice" => core_builtins::slice_new(args),
         "id" => id_value(args[0]),
@@ -560,6 +608,90 @@ fn missing_attribute(name: &str) -> i64 {
 
 fn type_error(message: &str) -> i64 {
     exc::raise_with_message(TYPE_ERROR, message)
+}
+
+/// `pow(base, exp[, mod])`.
+///
+/// The two-argument form is the `**` operator (integers, floats and complex
+/// values follow the binary-power rules). The three-argument form is exact
+/// integer modular exponentiation; a negative exponent uses the modular
+/// inverse, and the result's sign follows the modulus like CPython's.
+fn pow_builtin(args: &[i64]) -> i64 {
+    match args {
+        [base, exponent] => ops::binop(ops::OP_POW, *base, *exponent),
+        // `pow(base, exp, None)` is the documented way to spell the
+        // two-argument form through the three-argument signature.
+        [base, exponent, modulus] if *modulus == NONE => ops::binop(ops::OP_POW, *base, *exponent),
+        [base, exponent, modulus] => modular_pow(*base, *exponent, *modulus),
+        _ => type_error(&format!(
+            "pow() takes 2 or 3 arguments ({} given)",
+            args.len()
+        )),
+    }
+}
+
+/// Integer `pow(base, exp, mod)`.
+fn modular_pow(base: i64, exponent: i64, modulus: i64) -> i64 {
+    let (Some(base), Some(exponent), Some(modulus)) = (
+        value::to_bigint(base),
+        value::to_bigint(exponent),
+        value::to_bigint(modulus),
+    ) else {
+        return type_error("pow() 3rd argument not allowed unless all arguments are integers");
+    };
+    let zero = BigInt::from(0);
+    if modulus == zero {
+        return exc::raise_with_message(VALUE_ERROR, "pow() 3rd argument cannot be 0");
+    }
+    let negative_modulus = modulus < zero;
+    let modulus = if negative_modulus { -modulus } else { modulus };
+    // Normalise the base into `[0, modulus)`; BigInt's `%` keeps the
+    // dividend's sign.
+    let mut base = base % &modulus;
+    if base < zero {
+        base += &modulus;
+    }
+    let result = if exponent < zero {
+        let Some(inverse) = modular_inverse(&base, &modulus) else {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                "base is not invertible for the given modulus",
+            );
+        };
+        inverse.modpow(&-exponent, &modulus)
+    } else {
+        base.modpow(&exponent, &modulus)
+    };
+    // CPython reports the residue with the modulus' sign: `pow(2, 3, -5)` is
+    // `-2`, not `3`.
+    let result = if negative_modulus && result != zero {
+        result - modulus
+    } else {
+        result
+    };
+    value::bigint_new(result)
+}
+
+/// Multiplicative inverse of `value` modulo `modulus` (`modulus > 0`), or
+/// `None` when the two are not coprime.
+fn modular_inverse(value: &BigInt, modulus: &BigInt) -> Option<BigInt> {
+    let (mut old_r, mut r) = (value.clone(), modulus.clone());
+    let (mut old_s, mut s) = (BigInt::from(1), BigInt::from(0));
+    while r != BigInt::from(0) {
+        let quotient = &old_r / &r;
+        let next_r = &old_r - &quotient * &r;
+        old_r = std::mem::replace(&mut r, next_r);
+        let next_s = &old_s - &quotient * &s;
+        old_s = std::mem::replace(&mut s, next_s);
+    }
+    if old_r != BigInt::from(1) {
+        return None;
+    }
+    let mut inverse = old_s % modulus;
+    if inverse < BigInt::from(0) {
+        inverse += modulus;
+    }
+    Some(inverse)
 }
 
 /// Maps a builtin exception name to the runtime taxonomy tag.
@@ -1079,6 +1211,64 @@ mod tests {
         // The first result already equals the sentinel, so iteration ends.
         assert_eq!(call("next", &[iterator]), NONE);
         assert_eq!(exc::pending_tag(), exc::STOP_ITERATION as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn pow_supports_two_and_three_argument_forms() {
+        exc::init();
+        assert_eq!(
+            value::as_integer(call("pow", &[int(2), int(10)])),
+            Some(1024)
+        );
+        // An explicit `mod=None` selects the two-argument form.
+        assert_eq!(
+            value::as_integer(call("pow", &[int(2), int(10), NONE])),
+            Some(1024)
+        );
+        assert_eq!(
+            value::as_integer(call("pow", &[int(2), int(10), int(5)])),
+            Some(4)
+        );
+        // The result's sign follows the modulus, like CPython.
+        assert_eq!(
+            value::as_integer(call("pow", &[int(2), int(3), int(-5)])),
+            Some(-2)
+        );
+        // A negative exponent uses the modular inverse.
+        assert_eq!(
+            value::as_integer(call("pow", &[int(3), int(-1), int(7)])),
+            Some(5)
+        );
+        // The arbitrary-precision constant `_pydecimal` computes at import.
+        let modulus = BigInt::from(2_305_843_009_213_693_951i64); // 2^61 - 1
+        let exponent = &modulus - BigInt::from(2);
+        let hashed = call(
+            "pow",
+            &[
+                int(10),
+                value::bigint_new(exponent),
+                value::bigint_new(modulus.clone()),
+            ],
+        );
+        assert!(
+            !exc::pending(),
+            "unexpected exception: {}",
+            pending_message()
+        );
+        let hashed = value::as_integer(hashed).expect("fits i64");
+        assert!(BigInt::from(hashed) < modulus);
+
+        // A base that is not invertible, and a zero modulus, are ValueErrors.
+        assert_eq!(call("pow", &[int(2), int(-1), int(4)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+        assert_eq!(call("pow", &[int(2), int(3), int(0)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+        // A non-integer operand is rejected by the three-argument form.
+        assert_eq!(call("pow", &[value::float_new(2.0), int(3), int(5)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         exc::clear();
     }
 }

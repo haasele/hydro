@@ -35,6 +35,9 @@
 //! CPython spells the attributes as keyword arguments; the frontend has no
 //! `**kwargs` lowering for native module functions yet, so the runtime takes
 //! the equivalent mapping instead of rejecting the constructor outright.
+//! The module value itself is the cached `SimpleNamespace` class carrying a
+//! `__repr__` member, because `Lib/pprint.py` keys its dispatch table by
+//! `_types.SimpleNamespace.__repr__` while the module body runs.
 
 use hydro_ir::{MethodKind, ParamKind};
 
@@ -49,6 +52,15 @@ use crate::value::{self, NONE};
 pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
     if module == "types" && name == "DynamicClassAttribute" {
         return Some(dynamic_class_attribute_class());
+    }
+    // `Lib/pprint.py` registers `_dispatch[_types.SimpleNamespace.__repr__]`
+    // while the module body runs. The name is declared as a module function so
+    // `SimpleNamespace(...)` lowers as a module call, but the value itself
+    // must be a class carrying a real `__repr__` member: a constructor
+    // function in that slot raises
+    // `AttributeError: 'function' object has no attribute '__repr__'`.
+    if module == "types" && name == "SimpleNamespace" {
+        return Some(simple_namespace_class());
     }
     None
 }
@@ -90,6 +102,9 @@ pub(crate) fn constant(name: &str) -> i64 {
         "FunctionType" => function_type_class(),
         "UnionType" => union_type_class(),
         "DynamicClassAttribute" => dynamic_class_attribute_class(),
+        // The module value is the cached class (see [`class_value`]); the
+        // constructor remains the module call handled by [`call`].
+        "SimpleNamespace" => simple_namespace_class(),
         "NoneType" => value::type_class(NONE),
         "EllipsisType" => value::type_class(crate::modules::builtins::constant("Ellipsis")),
         "NotImplementedType" => value::type_class(value::NOT_IMPLEMENTED),
@@ -1015,6 +1030,40 @@ extern "C" fn union_ror_method(argv: *const i64) -> i64 {
     }
 }
 
+/// Identity-stable `types.SimpleNamespace` class.
+///
+/// `pprint` keys its dispatch table by `_types.SimpleNamespace.__repr__`, so
+/// the module value must be a class carrying a `__repr__` member (a module
+/// function has no `__repr__` attribute at all). The member is stored as a
+/// class attribute rather than a method entry, so every read returns the same
+/// function object, which is what a dispatch-table key needs. Its body is the
+/// builtin `repr`, so the class-level entry renders a namespace payload the
+/// same way `repr(ns)` does.
+///
+/// Construction stays on the module-call path ([`simple_namespace`]), which
+/// returns the native namespace object `argparse` and `pprint` read
+/// attributes through. The class exists for the type surface `pprint`,
+/// `isinstance` and dispatch tables need.
+pub(crate) fn simple_namespace_class() -> i64 {
+    const KEY: &str = "types.SimpleNamespace.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let repr = value::native_function_new("builtins", "repr", 1);
+    let roots = heap::root_values(std::slice::from_ref(&repr));
+    let class = value::class_new_full(
+        "SimpleNamespace".to_string(),
+        NONE,
+        Vec::new(),
+        vec![("__repr__".to_string(), repr)],
+    );
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    class
+}
+
 /// `SimpleNamespace(mapping=None)`: copies the mapping into a namespace.
 fn simple_namespace(mapping: i64) -> i64 {
     if mapping == NONE {
@@ -1155,6 +1204,60 @@ mod tests {
         assert_eq!(value::as_str(pairs[0].1), Some("rich"));
         assert_eq!(pairs[1].0, "width");
         assert_eq!(value::as_integer(pairs[1].1), Some(80));
+    }
+
+    #[test]
+    fn simple_namespace_is_a_class_with_a_pprint_repr_dispatch_key() {
+        exc::init();
+        let class = simple_namespace_class();
+        assert_eq!(class, constant("SimpleNamespace"));
+        assert_eq!(
+            class,
+            class_value("types", "SimpleNamespace").expect("class value")
+        );
+        // `pprint` reads the name off its `_types` alias; both spellings must
+        // hand out the identical class.
+        assert_eq!(
+            class,
+            crate::modules::module_get_by_name("_types", "SimpleNamespace")
+        );
+        assert!(!exc::pending(), "_types.SimpleNamespace raised");
+        assert!(as_class(class).is_some(), "module value must be a class");
+        // `pprint` needs `SimpleNamespace.__repr__` to exist and be callable
+        // while the module body runs; the dispatch table also requires a
+        // stable key, so repeated class reads must be one function object.
+        assert!(
+            matches!(
+                value::class_lookup(class, "__repr__"),
+                Some(value::ClassEntry::Attr(_))
+            ),
+            "SimpleNamespace.__repr__ must be a class attribute"
+        );
+        let attr_name = "__repr__";
+        let key = methods::getattr(class, attr_name.as_ptr(), attr_name.len());
+        assert!(!exc::pending(), "SimpleNamespace.__repr__ raised");
+        assert!(
+            value::as_function(key).is_some(),
+            "SimpleNamespace.__repr__ must be callable"
+        );
+        assert_eq!(
+            key,
+            methods::getattr(class, attr_name.as_ptr(), attr_name.len()),
+            "repeated __repr__ reads must share identity"
+        );
+        let dispatch = value::dict_new(Vec::new());
+        let handler = value::native_function_new("pprint", "_pprint_simplenamespace", 0);
+        crate::container::dict_set(dispatch, key, handler);
+        assert!(!exc::pending(), "dispatch insert raised");
+        assert!(
+            crate::container::dict_find(value::as_dict(dispatch).expect("dispatch dict"), key)
+                .is_some(),
+            "dispatch lost the class repr key"
+        );
+        // Construction keeps returning the namespace payload consumers read.
+        let namespace = call("SimpleNamespace", &[]);
+        assert!(!exc::pending());
+        assert_eq!(as_namespace(namespace).map(|pairs| pairs.len()), Some(0));
     }
 
     #[test]

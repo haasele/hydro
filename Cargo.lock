@@ -393,6 +393,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
+ "hydro-frontend",
  "hydro-ir",
  "hydro-runtime",
 ]

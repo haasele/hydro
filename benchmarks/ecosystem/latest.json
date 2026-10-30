@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-10-28T23:45:30Z",
+    "date": "2026-10-30T18:48:28Z",
     "python": "CPython 3.14.9",
     "python_version": "3.14.9",
     "python_executable": "/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14",
@@ -15,14 +15,16 @@
     ],
     "pins": "/mnt/Vault/GitHub/hydro/benchmarks/ecosystem/pins.json",
     "options": {
-      "suite": "import",
-      "only": null,
-      "timeout": 120.0,
-      "aot": false,
+      "suite": "all",
+      "only": [
+        "numpy"
+      ],
+      "timeout": 180.0,
+      "aot": true,
       "tests": null
     },
     "cwd": "/mnt/Vault/GitHub/hydro",
-    "elapsed_seconds": 11.8,
+    "elapsed_seconds": 35.8,
     "pins_ok": true,
     "upstream_note": null
   },
@@ -169,13 +171,11 @@
     }
   ],
   "counts": {
-    "total": 10,
-    "pass": 6,
-    "failed": 4,
+    "total": 2,
+    "pass": 0,
+    "failed": 2,
     "by_status": {
-      "compile_error": 2,
-      "pass": 6,
-      "runtime_error": 2
+      "aot_build_error": 2
     }
   },
   "cases": [
@@ -183,14 +183,14 @@
       "id": "numpy:import",
       "package": "numpy",
       "kind": "import",
-      "status": "runtime_error",
-      "detail": "jit: ImportError: No module named 'numpy.exceptions'",
+      "status": "aot_build_error",
+      "detail": "AOT build failed (exit 2): tea: C compiler 'cc' failed while linking '<tmp>/aot_binary' (exit code 1)",
       "differences": {},
       "runs": {
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 207.9,
+          "duration_ms": 106.7,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -199,285 +199,61 @@
         "jit": {
           "exit": 1,
           "timed_out": false,
-          "duration_ms": 4557.5,
+          "duration_ms": 9016.8,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
-          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-smspjlg2/import_numpy.py\", line 12, in numpy._core.umath.<module>\nImportError: No module named 'numpy.exceptions'\n"
+          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-n6_glvck/import_numpy.py\", line 37, in numpy._typing._dtype_like.<module>\nAttributeError: module 'numpy' has no attribute 'dtype'\n"
         },
         "aot": null
       },
-      "aot_build": null
+      "aot_build": {
+        "exit": 2,
+        "timed_out": false,
+        "duration_ms": 9380.6,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": "/usr/bin/ld: /tmp/tea-1098974-1793386090592370132-0.o: in function `__hydro_fn_1768':\nhydro_module:(.text+0x1ce658a): undefined reference to `hydro_map_many'\n/usr/bin/ld: /tmp/tea-1098974-1793386090592370132-0.o: in function `__hydro_fn_2124':\nhydro_module:(.text+0x2174fd3): undefined reference to `hydro_map_many'\n/usr/bin/ld: /tmp/tea-1098974-1793386090592370132-0.o: in function `__hydro_fn_2149':\nhydro_module:(.text+0x220f24c): undefined reference to `hydro_map_many'\ncollect2: error: ld returned 1 exit status\ntea: C compiler 'cc' failed while linking '/tmp/hydro-ecosystem-n6_glvck/aot_binary' (exit code 1)\n"
+      }
     },
     {
-      "id": "pandas:import",
-      "package": "pandas",
-      "kind": "import",
-      "status": "compile_error",
-      "detail": "jit: error[HYD0201]: module 'dataclasses' has no attribute 'is_dataclass'",
+      "id": "numpy:smoke",
+      "package": "numpy",
+      "kind": "smoke",
+      "status": "aot_build_error",
+      "detail": "AOT build failed (exit 2): tea: C compiler 'cc' failed while linking '<tmp>/aot_binary' (exit code 1)",
       "differences": {},
       "runs": {
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 1009.3,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
+          "duration_ms": 156.4,
+          "stdout_sha256": "0323dea80ac074f1bd604113f98b1dbb4ead84e0c3423ee62aede3d3ec5712e1",
+          "stdout_bytes": 763,
+          "stdout": "numpy 2.5.0\narray (3, 4) <i8 [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]\nreduce 66 5.5 11\naxis [6, 22, 38]\nslice [[4, 6], [8, 10]]\ntranspose (4, 3) [0, 4, 8]\nlinspace [0.0, 0.25, 0.5, 0.75, 1.0]\nbroadcast [[10, 21, 32, 43], [14, 25, 36, 47]]\nufunc [1.0, 1.414214, 1.732051, 2.0, 2.236068]\nwhere [[0, -1, 2, -1], [4, -1, 6, -1], [8, -1, 10, -1]]\nclip [[2, 2, 2, 3], [4, 5, 6, 7], [7, 7, 7, 7]]\nunique [0, 1, 2, 3, 4]\ndet 11.0\ninv [[0.272727, -0.090909], [-0.090909, 0.363636]]\nsolve [0.090909, 0.636364]\neigh [2.381966, 4.618034]\nmatmul [[58, 64], [139, 154]]\neinsum [[58, 64], [139, 154]]\nrandom [0.205682, 0.738822, 0.125443, 0.517044]\nrandom_int [93, 1, 57, 31, 97]\nsave_load (3, 4) <i8 True\nargmax [3, 3, 3]\nsort [1, 2, 3]\nastype 66.0\ndatetime64 2020-01-06 8\n",
           "stderr_tail": ""
         },
         "jit": {
           "exit": 1,
           "timed_out": false,
-          "duration_ms": 1802.3,
+          "duration_ms": 7296.5,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
-          "stderr_tail": "error[HYD0201]: module 'dataclasses' has no attribute 'is_dataclass'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/core/dtypes/inference.py:518:16\n     |\n 518 |         return dataclasses.is_dataclass(item) and not isinstance(item, type)\n     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nerror: could not compile '/tmp/hydro-ecosystem-f78tphcj/import_pandas.py' due to 1 previous error(s)\n"
+          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-b028b2nz/numpy_smoke.py\", line 37, in numpy._typing._dtype_like.<module>\nAttributeError: module 'numpy' has no attribute 'dtype'\n"
         },
         "aot": null
       },
-      "aot_build": null
-    },
-    {
-      "id": "pydantic:import",
-      "package": "pydantic",
-      "kind": "import",
-      "status": "pass",
-      "detail": null,
-      "differences": {},
-      "runs": {
-        "cpython": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 52.2,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "jit": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 1641.6,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "aot": null
-      },
-      "aot_build": null
-    },
-    {
-      "id": "pydantic-core:import",
-      "package": "pydantic-core",
-      "kind": "import",
-      "status": "pass",
-      "detail": null,
-      "differences": {},
-      "runs": {
-        "cpython": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 33.6,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "jit": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 1574.4,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "aot": null
-      },
-      "aot_build": null
-    },
-    {
-      "id": "python-dateutil:import",
-      "package": "python-dateutil",
-      "kind": "import",
-      "status": "pass",
-      "detail": null,
-      "differences": {},
-      "runs": {
-        "cpython": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 10.3,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "jit": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 8.8,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "aot": null
-      },
-      "aot_build": null
-    },
-    {
-      "id": "six:import",
-      "package": "six",
-      "kind": "import",
-      "status": "compile_error",
-      "detail": "jit: error[HYD0201]: module 'importlib.util' has no attribute 'spec_from_loader'",
-      "differences": {},
-      "runs": {
-        "cpython": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 15.8,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "jit": {
-          "exit": 1,
-          "timed_out": false,
-          "duration_ms": 26.3,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": "error[HYD0201]: module 'importlib.util' has no attribute 'spec_from_loader'\n   --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:75:32\n    |\n 75 |     from importlib.util import spec_from_loader\n    |                                ^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'types' has no attribute 'ClassType'\n   --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:51:26\n    |\n 51 |     class_types = (type, types.ClassType)\n    |                          ^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'operator' has no attribute 'methodcaller'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:615:16\n     |\n 615 |     viewkeys = operator.methodcaller(\"keys\")\n     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'operator' has no attribute 'methodcaller'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:617:18\n     |\n 617 |     viewvalues = operator.methodcaller(\"values\")\n     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'operator' has no attribute 'methodcaller'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:619:17\n     |\n 619 |     viewitems = operator.methodcaller(\"items\")\n     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'operator' has no attribute 'methodcaller'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:633:16\n     |\n 633 |     viewkeys = operator.methodcaller(\"viewkeys\")\n     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'operator' has no attribute 'methodcaller'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:635:18\n     |\n 635 |     viewvalues = operator.methodcaller(\"viewvalues\")\n     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'operator' has no attribute 'methodcaller'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:637:17\n     |\n 637 |     viewitems = operator.methodcaller(\"viewitems\")\n     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'itertools' has no attribute 'imap'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:688:35\n     |\n 688 |     iterbytes = functools.partial(itertools.imap, ord)\n     |                                   ^^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'sys' has no attribute 'meta_path'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:991:4\n     |\n 991 | if sys.meta_path:\n     |    ^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'sys' has no attribute 'meta_path'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:992:34\n     |\n 992 |     for i, importer in enumerate(sys.meta_path):\n     |                                  ^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'sys' has no attribute 'meta_path'\n    --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:999:17\n     |\n 999 |             del sys.meta_path[i]\n     |                 ^^^^^^^^^^^^^\n\nerror[HYD0201]: module 'sys' has no attribute 'meta_path'\n     --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/six.py:1003:1\n      |\n 1003 | sys.meta_path.append(_importer)\n      | ^^^^^^^^^^^^^\nerror: could not compile '/tmp/hydro-ecosystem-gn_37o2f/import_six.py' due to 13 previous error(s)\n"
-        },
-        "aot": null
-      },
-      "aot_build": null
-    },
-    {
-      "id": "typing-extensions:import",
-      "package": "typing-extensions",
-      "kind": "import",
-      "status": "pass",
-      "detail": null,
-      "differences": {},
-      "runs": {
-        "cpython": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 22.9,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "jit": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 772.2,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "aot": null
-      },
-      "aot_build": null
-    },
-    {
-      "id": "typing-inspection:import",
-      "package": "typing-inspection",
-      "kind": "import",
-      "status": "pass",
-      "detail": null,
-      "differences": {},
-      "runs": {
-        "cpython": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 8.3,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "jit": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 3.9,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "aot": null
-      },
-      "aot_build": null
-    },
-    {
-      "id": "annotated-types:import",
-      "package": "annotated-types",
-      "kind": "import",
-      "status": "runtime_error",
-      "detail": "jit: AttributeError: 'function' object has no attribute 'islower'",
-      "differences": {},
-      "runs": {
-        "cpython": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 28.0,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "jit": {
-          "exit": 1,
-          "timed_out": false,
-          "duration_ms": 50.4,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-aw956qcf/import_annotated_types.py\", line 359, in annotated_types.<module>\nAttributeError: 'function' object has no attribute 'islower'\n"
-        },
-        "aot": null
-      },
-      "aot_build": null
-    },
-    {
-      "id": "tzdata:import",
-      "package": "tzdata",
-      "kind": "import",
-      "status": "pass",
-      "detail": null,
-      "differences": {},
-      "runs": {
-        "cpython": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 10.0,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "jit": {
-          "exit": 0,
-          "timed_out": false,
-          "duration_ms": 3.8,
-          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "stdout_bytes": 0,
-          "stdout": "",
-          "stderr_tail": ""
-        },
-        "aot": null
-      },
-      "aot_build": null
+      "aot_build": {
+        "exit": 2,
+        "timed_out": false,
+        "duration_ms": 9884.3,
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_bytes": 0,
+        "stdout": "",
+        "stderr_tail": "/usr/bin/ld: /tmp/tea-1099084-1793386107801558380-0.o: in function `__hydro_fn_1768':\nhydro_module:(.text+0x1ce65c2): undefined reference to `hydro_map_many'\n/usr/bin/ld: /tmp/tea-1099084-1793386107801558380-0.o: in function `__hydro_fn_2124':\nhydro_module:(.text+0x217500b): undefined reference to `hydro_map_many'\n/usr/bin/ld: /tmp/tea-1099084-1793386107801558380-0.o: in function `__hydro_fn_2149':\nhydro_module:(.text+0x220f284): undefined reference to `hydro_map_many'\ncollect2: error: ld returned 1 exit status\ntea: C compiler 'cc' failed while linking '/tmp/hydro-ecosystem-b028b2nz/aot_binary' (exit code 1)\n"
+      }
     }
   ]
 }

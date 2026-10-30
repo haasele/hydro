@@ -223,4 +223,43 @@ mod tests {
         assert_eq!(default, 0);
         assert_eq!(profiled, default);
     }
+
+    /// Runs source through the frontend and the JIT; an `assert` inside the
+    /// program must hold (a failure raises and yields exit code 1).
+    fn run_source(source: &str) {
+        let program = hydro_frontend::check_source(source, "jit_test.py").expect("frontend");
+        let code = run_jit(&program).expect("jit");
+        assert_eq!(code, 0, "the program raised: {source}");
+    }
+
+    #[test]
+    fn dynamic_signature_non_literal_defaults_are_bound_at_call_time() {
+        // A default that is not a literal (`y=a`) only exists when the function
+        // value is created, so the generated wrapper cannot embed it. A plain
+        // (non-keyword) indirect call must apply the value stored in the
+        // attached signature instead of the wrapper's `None` fallback.
+        run_source(
+            "\
+def keyword_only(a):
+    def f(*, y=a):
+        return y
+    return f()
+
+assert keyword_only(3) == 3
+
+def positional(a):
+    def f(*args, y=a):
+        return y
+    return f()
+
+assert positional(4) == 4
+
+def literal(*args, y=5):
+    return y
+
+g = literal
+assert g() == 5
+",
+        );
+    }
 }

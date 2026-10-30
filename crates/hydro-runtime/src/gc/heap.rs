@@ -3704,6 +3704,11 @@ unsafe fn trace(addr: usize) {
                     if let Some(context) = state.data.context {
                         mark_value(context);
                     }
+                    // The original extension exception instance is a GC edge
+                    // too; its payload owns one C reference.
+                    if let Some(object) = state.data.object {
+                        mark_value(object);
+                    }
                     for &(_, value) in attrs.iter() {
                         mark_value(value);
                     }
@@ -3843,6 +3848,11 @@ unsafe fn trace(addr: usize) {
                     }
                     for &(_, value) in &exception.keywords {
                         mark_value(value);
+                    }
+                    // The original extension exception instance is a GC edge
+                    // too; its payload owns one C reference.
+                    if let Some(object) = exception.object {
+                        mark_value(object);
                     }
                 }
                 // Scalars, ranges, locks, events, cross-process

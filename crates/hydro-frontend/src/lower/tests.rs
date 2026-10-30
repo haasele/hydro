@@ -357,6 +357,78 @@ fn unknown_module_attribute_value_is_rejected() {
 }
 
 #[test]
+fn build_specific_module_members_resolve_at_runtime() {
+    // PyPy-only and Windows-only members stay out of the static spec (so
+    // `hasattr` keeps reporting the host's answer) but compile as runtime
+    // reads: guarded code never evaluates them here, and an unguarded read
+    // raises CPython's `AttributeError`.
+    let source = "import os\nimport sys\n\
+                  a = sys.pypy_version_info\n\
+                  b = os.O_BINARY\n\
+                  c = os.startfile\n\
+                  d = os.startfile('x')\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn pow_lowers_through_the_builtins_module() {
+    // `pow` has no `hydro_ir::Builtin` variant; the runtime serves it from the
+    // `builtins` module dispatch (two- and three-argument forms).
+    let source = "a = pow(2, 10)\nb = pow(2, 10, 5)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    for name in ["a", "b"] {
+        let HExprKind::ModuleCall {
+            module, function, ..
+        } = &assigned(&hir, name).kind
+        else {
+            panic!(
+                "expected a module call, got {:?}",
+                assigned(&hir, name).kind
+            );
+        };
+        assert_eq!(module, "builtins");
+        assert_eq!(function, "pow");
+    }
+}
+
+#[test]
+fn float_fromhex_is_a_classmethod_attribute() {
+    let source = "f = float.fromhex\nx = float.fromhex('0x1p3')\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(matches!(
+        &assigned(&hir, "f").kind,
+        HExprKind::GetAttr { name, .. } if name == "fromhex"
+    ));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn class_body_import_binds_a_user_module_function() {
+    let source = "class Message:\n    from email.iterators import walk\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "email/message.py", &mut infer);
+    lowerer.set_mirror_all_globals(true);
+    lowerer.set_user_modules(HashMap::from([(
+        "email.iterators".to_string(),
+        UserModule {
+            name: "email.iterators".to_string(),
+            exports: HashMap::from([("walk".to_string(), UserExport::Function(9))]),
+            all: None,
+            dynamic_globals: false,
+            extension_stars: Vec::new(),
+            module_getattr: false,
+        },
+    )]));
+    let _hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
 fn stdlib_module_values_are_accepted() {
     // A standard-library module is a first-class value; user modules still
     // report the "not supported yet" diagnostic (covered by the CLI tests).
@@ -8417,6 +8489,162 @@ fn nested_function_in_a_loop_captures_the_current_iteration_value() {
 }
 
 #[test]
+fn nested_function_defaults_are_lowered_in_the_enclosing_scope() {
+    // A parameter default is evaluated once, where the `def` executes, in the
+    // enclosing scope: a loop variable or a parameter must become a local
+    // read, not a dropped default (`None`) or a missing global.
+    let source = "\
+def outer(a):
+    for x in [1, 2]:
+        def f(y=x, *, z=a):
+            return y + z
+    return f
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let outer = function(&hir, "outer");
+    let local_of = |name: &str| {
+        outer
+            .locals
+            .iter()
+            .position(|local| local.name == name)
+            .unwrap_or_else(|| panic!("outer has no local '{name}'")) as LocalId
+    };
+    let x = local_of("x");
+    let a = local_of("a");
+
+    let f = function(&hir, "outer.f");
+    assert_eq!(f.capture_count, 0);
+    assert_eq!(f.params.len(), 2);
+    assert_eq!(f.params[0].name, "y");
+    assert_eq!(f.params[0].default, Some(Const::None));
+    let Some(default) = &f.params[0].default_expr else {
+        panic!("the loop-variable default was dropped");
+    };
+    assert!(
+        matches!(&default.kind, HExprKind::Local(local) if *local == x),
+        "expected a read of the enclosing loop variable, got {:?}",
+        default.kind
+    );
+
+    assert_eq!(f.params[1].name, "z");
+    assert_eq!(f.params[1].kind, ParamKind::KwOnly);
+    let Some(default) = &f.params[1].default_expr else {
+        panic!("the parameter default was dropped");
+    };
+    assert!(
+        matches!(&default.kind, HExprKind::Local(local) if *local == a),
+        "expected a read of the enclosing parameter, got {:?}",
+        default.kind
+    );
+}
+
+#[test]
+fn non_capturing_lambda_default_reads_the_enclosing_scope() {
+    // The lambda body never reads `a`, so the value stays a plain function
+    // reference; its default is still evaluated at that expression in the
+    // enclosing frame.
+    let source = "def outer(a):\n    return lambda y=a: y\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let outer = function(&hir, "outer");
+    let a = outer
+        .locals
+        .iter()
+        .position(|local| local.name == "a")
+        .expect("outer parameter a") as LocalId;
+    let HStmtKind::Return(Some(value)) = &outer.body[0].kind else {
+        panic!("expected the returned lambda");
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::FunctionRef(_)),
+        "a lambda without captures is a function reference: {:?}",
+        value.kind
+    );
+    let lambda = function(&hir, "<lambda>");
+    assert_eq!(lambda.capture_count, 0);
+    assert_eq!(lambda.params.len(), 1);
+    let Some(default) = &lambda.params[0].default_expr else {
+        panic!("the lambda default was dropped");
+    };
+    assert!(
+        matches!(&default.kind, HExprKind::Local(local) if *local == a),
+        "expected a read of the enclosing parameter, got {:?}",
+        default.kind
+    );
+}
+
+#[test]
+fn capturing_lambda_forwards_enclosing_values_its_defaults_read() {
+    // The body captures `b`; the default reads `a`, which the binder must
+    // therefore receive too so the default is evaluated in the enclosing
+    // frame, not in the lambda's scope.
+    let source = "def outer(a, b):\n    return lambda y=a: b + y\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let outer = function(&hir, "outer");
+    let local_of = |name: &str| {
+        outer
+            .locals
+            .iter()
+            .position(|local| local.name == name)
+            .unwrap_or_else(|| panic!("outer has no local '{name}'")) as LocalId
+    };
+    let a = local_of("a");
+    let b = local_of("b");
+
+    let (lambda, binder, forwarded) = capturing_lambda(&hir);
+    assert_eq!(lambda.capture_count, 1);
+    assert_eq!(
+        lambda
+            .params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["b", "y"]
+    );
+    assert_eq!(
+        binder
+            .params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["b", "a"]
+    );
+    assert_eq!(forwarded, vec![0]);
+
+    let Some(default) = &lambda.params[1].default_expr else {
+        panic!("the lambda default was dropped");
+    };
+    assert!(
+        matches!(&default.kind, HExprKind::Local(1)),
+        "the default reads the binder's `a` slot: {:?}",
+        default.kind
+    );
+
+    let HStmtKind::Return(Some(value)) = &outer.body[0].kind else {
+        panic!("expected the returned lambda binder call");
+    };
+    let HExprKind::Call { args, .. } = &value.kind else {
+        panic!("expected the binder call, got {:?}", value.kind);
+    };
+    assert_eq!(args.len(), 2);
+    assert!(
+        matches!(&args[0].kind, HExprKind::Local(local) if *local == b),
+        "{:?}",
+        args[0].kind
+    );
+    assert!(
+        matches!(&args[1].kind, HExprKind::Local(local) if *local == a),
+        "{:?}",
+        args[1].kind
+    );
+}
+
+#[test]
 fn nested_functions_propagate_captures_through_intermediate_scopes() {
     let source = "def outer(x):\n    def middle():\n        def inner():\n            return x\n        return inner\n    return middle\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
@@ -12484,7 +12712,7 @@ fn starred_module_function_calls_use_the_general_abi() {
 }
 
 #[test]
-fn starred_calls_diagnose_multiple_or_trailing_arguments() {
+fn starred_calls_diagnose_multiple_arguments() {
     let source = "def f(*args):\n    return args\n\
                   xs = (1, 2)\n\
                   a = f(*xs, *xs)\n";
@@ -12496,16 +12724,24 @@ fn starred_calls_diagnose_multiple_or_trailing_arguments() {
         "{diags:?}"
     );
 
+    // CPython allows a positional operand after `*iterable`; the frontend
+    // folds the trailing operands into the star operand.
     let source = "def f(*args):\n    return args\n\
                   xs = (1, 2)\n\
                   a = f(*xs, 3)\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert!(
-        diags
-            .iter()
-            .any(|diag| diag.message.contains("cannot follow a starred argument")),
-        "{diags:?}"
-    );
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::IndirectCall { star, .. } = &assigned(&hir, "a").kind else {
+        panic!(
+            "expected an indirect call, got {:?}",
+            assigned(&hir, "a").kind
+        );
+    };
+    assert!(matches!(
+        star.as_deref().map(|value| &value.kind),
+        Some(HExprKind::Bin { op: BinOp::Add, .. })
+    ));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
 
 #[test]
@@ -15035,27 +15271,26 @@ class Derived(Base):
 }
 
 #[test]
-fn super_init_rejects_unsupported_star_shapes() {
-    // Python allows several starred operands, but the runtime method ABI has a
-    // single star slot; the position is diagnosed instead of being dropped.
-    for (source, message) in [
-        (
-            "class Base:\n    def __init__(self, *args):\n        pass\nclass Derived(Base):\n    def __init__(self, a, b):\n        super().__init__(*a, b)\n",
-            "cannot follow a starred argument",
-        ),
-        (
-            "class Base:\n    def __init__(self, *args):\n        pass\nclass Derived(Base):\n    def __init__(self, a, b):\n        super().__init__(*a, *b)\n",
-            "only one starred argument",
-        ),
-    ] {
-        let (_, _, diags) = lower_source(source, &parse(source));
-        assert_eq!(diags.len(), 1, "{source}: {diags:?}");
-        assert!(
-            diags[0].message.contains(message),
-            "{source}: {}",
-            diags[0].message
-        );
-    }
+fn super_init_accepts_positional_after_star() {
+    // Python allows a positional operand after `*iterable`; the frontend
+    // folds the trailing operand into the star slot.
+    let source = "class Base:\n    def __init__(self, *args):\n        pass\nclass Derived(Base):\n    def __init__(self, a, b):\n        super().__init__(*a, b)\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{source}: {diags:?}");
+}
+
+#[test]
+fn super_init_rejects_multiple_starred_operands() {
+    // The runtime method ABI has a single star slot; a second `*` is
+    // diagnosed instead of being dropped.
+    let source = "class Base:\n    def __init__(self, *args):\n        pass\nclass Derived(Base):\n    def __init__(self, a, b):\n        super().__init__(*a, *b)\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{source}: {diags:?}");
+    assert!(
+        diags[0].message.contains("only one starred argument"),
+        "{source}: {}",
+        diags[0].message
+    );
 }
 
 #[test]

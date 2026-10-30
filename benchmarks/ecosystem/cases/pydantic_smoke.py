@@ -9,6 +9,7 @@ import pydantic
 import pydantic_core
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from pydantic_core import SchemaValidator, core_schema
+from pydantic.json_schema import GenerateJsonSchema
 
 print("pydantic", pydantic.VERSION, "core", pydantic_core.__version__)
 
@@ -35,7 +36,7 @@ user = User(
 print("dump", user.model_dump())
 print("dump_alias", user.model_dump(by_alias=True))
 print("json", user.model_dump_json())
-print("roundtrip", User.model_validate_json(user.model_dump_json()) == user)
+print("roundtrip", User.model_validate_json(user.model_dump_json(by_alias=True)) == user)
 
 try:
     User(id="x", name=123)
@@ -56,12 +57,12 @@ adapter = TypeAdapter(list[int])
 print("adapter", adapter.validate_python(["1", 2, 3]))
 print("adapter_json", adapter.validate_json("[4,5]"))
 
-schema = User.model_json_schema()
+schema = User.model_json_schema(schema_generator=GenerateJsonSchema)
 print("schema_keys", sorted(schema.keys()))
 print("schema_properties", sorted(schema["properties"].keys()))
 print("schema_required", sorted(schema["required"]))
 
-ref_schema = User.model_json_schema(ref_template="#/$defs/{model}")
+ref_schema = User.model_json_schema(schema_generator=GenerateJsonSchema, ref_template="#/$defs/{model}")
 print("defs", sorted(ref_schema.get("$defs", {}).keys()))
 
 validator = SchemaValidator(core_schema.int_schema())

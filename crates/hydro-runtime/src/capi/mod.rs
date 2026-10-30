@@ -234,7 +234,7 @@ pub(crate) use types::{
 };
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::ptr;
@@ -253,6 +253,13 @@ const METH_VARARGS: c_int = 0x0001;
 const METH_KEYWORDS: c_int = 0x0002;
 const METH_NOARGS: c_int = 0x0004;
 const METH_O: c_int = 0x0008;
+/// `METH_CLASS`: a type method that receives the class as its receiver.
+const METH_CLASS: c_int = 0x0010;
+/// `METH_STATIC`: a type method that receives NULL as its receiver.
+const METH_STATIC: c_int = 0x0020;
+/// `METH_COEXIST`: a type method replaces an inherited attribute of the same
+/// name instead of being skipped. It has no call-time meaning.
+const METH_COEXIST: c_int = 0x0040;
 /// `METH_FASTCALL` (stable ABI since 3.10) selects the
 /// `_PyCFunctionFast`/`_PyCFunctionFastWithKeywords` calling convention.
 const METH_FASTCALL: c_int = 0x0080;
@@ -260,7 +267,13 @@ const METH_FASTCALL: c_int = 0x0080;
 /// (`PyCMethod`). Creation is supported; invocation is reported as unsupported
 /// because this host has no `PyCMethod` call convention.
 const METH_METHOD: c_int = 0x0200;
-const METHOD_FLAGS: c_int = METH_VARARGS | METH_KEYWORDS | METH_NOARGS | METH_O | METH_FASTCALL;
+/// Bits that select the calling convention. CPython's `PyCMethod_New` masks
+/// the same bits when choosing a vectorcall entry point, so the binding-only
+/// `METH_CLASS`/`METH_STATIC`/`METH_COEXIST` flags do not affect a call.
+const METHOD_CALL_FLAGS: c_int =
+    METH_VARARGS | METH_KEYWORDS | METH_NOARGS | METH_O | METH_FASTCALL;
+/// Flags that only affect how a type method is bound as an attribute.
+const METHOD_BINDING_FLAGS: c_int = METH_CLASS | METH_STATIC | METH_COEXIST;
 
 /// `Py_GetConstant` identifiers from CPython 3.13's `object.h`.
 const PY_CONSTANT_NONE: c_uint = 0;
@@ -539,6 +552,9 @@ pub(crate) enum ShimValue {
     List(Vec<ShimValue>),
     Tuple(Vec<ShimValue>),
     Dict(Vec<(ShimValue, ShimValue)>),
+    /// A set of contract values. Hydro has a single set kind, so a C
+    /// `frozenset` converts to this arm as well.
+    Set(Vec<ShimValue>),
     /// Opaque pointer capsule. The pointer belongs to the extension; its
     /// destructor now runs when the handle is freed.
     Capsule {
@@ -1130,6 +1146,10 @@ pub(crate) fn new_tuple(items: Vec<usize>) -> *mut ShimObject {
 fn prefix_words(kind: &ShimKind) -> (isize, usize) {
     match kind {
         ShimKind::List(items) => (items.len() as isize, list_items_pointer(items)),
+        // CPython's `PyDictObject.ma_used` sits where the shim header keeps
+        // `ob_size`; C code (PyO3's dict iterator, among others) reads it
+        // directly, so it always mirrors the entry count.
+        ShimKind::Dict(pairs) => (pairs.len() as isize, 0),
         ShimKind::Bytes { data, .. } => {
             (data.len() as isize, tuple_layout::TUPLE_HASH_UNSET as usize)
         }
@@ -1259,7 +1279,10 @@ fn kind_type(kind: &ShimKind) -> *mut TypeObject {
         // values instead point at the `datetime_CAPI` class objects, so the
         // CPython header macros (`PyDate_Check`, `PyDateTime_Check`, ...)
         // answer exactly as they do for a CPython datetime instance.
+        // A Hydro class handle is a Python type: its metatype opts into
+        // `Py_TPFLAGS_TYPE_SUBCLASS` (`PyType_Check`) and derives from `type`.
         ShimKind::Hydro(value) => types::datetime_capi_type_for(value.value())
+            .or_else(|| types::hydro_class_metatype(value.value()))
             .unwrap_or(ptr::addr_of_mut!(types::HYDRO_TYPE)),
         ShimKind::Error => ptr::addr_of_mut!(types::ERROR_TYPE),
     }
@@ -2247,6 +2270,12 @@ pub(crate) fn value_object(value: ShimValue) -> *mut ShimObject {
                 .map(|(key, value)| (value_object(key) as usize, value_object(value) as usize))
                 .collect(),
         )),
+        ShimValue::Set(items) => new_object(ShimKind::Set(
+            items
+                .into_iter()
+                .map(|item| value_object(item) as usize)
+                .collect(),
+        )),
         ShimValue::Capsule { ptr, name } => new_object(ShimKind::Capsule {
             ptr,
             name: name.and_then(|name| CString::new(name).ok()),
@@ -2413,6 +2442,22 @@ fn object_to_value_at(
             path.pop();
             Ok(ShimValue::Dict(converted))
         }
+        ShimKind::Set(items) | ShimKind::FrozenSet(items) => {
+            begin_container(object as usize, "set", depth, path)?;
+            let mut converted = Vec::with_capacity(items.len());
+            for &item in items {
+                if item == 0 {
+                    return Err("extension returned a set with an uninitialized item".to_string());
+                }
+                converted.push(object_to_value_at(
+                    item as *mut ShimObject,
+                    depth + 1,
+                    path,
+                )?);
+            }
+            path.pop();
+            Ok(ShimValue::Set(converted))
+        }
         ShimKind::Capsule { ptr, name, .. } => {
             // A Hydro capsule stores only the raw pointer; it has no
             // ownership protocol or destructor slot. Retain the handle so the
@@ -2461,6 +2506,473 @@ fn begin_container(
     }
     path.push(address);
     Ok(())
+}
+
+/// Converts an extension result graph directly into Hydro values, preserving
+/// the identity of containers.
+///
+/// One source object always maps to one Hydro value, so a mutation made
+/// through one alias is visible through every other alias: pydantic's
+/// `gather_schemas_for_cleaning` returns the schema dictionary both as the
+/// root and nested in `definition-ref` entries and mutates the nested copy in
+/// place. List and dict cycles survive; Hydro tuples are immutable, so only a
+/// cycle running through a tuple is rejected.
+fn object_to_hydro(object: *mut ShimObject) -> Result<i64, String> {
+    object_to_hydro_with(object, &HashMap::new())
+}
+
+/// Converts a result graph, mapping objects that were materialised from a
+/// Hydro argument back to that same Hydro value (`origins`). A C function may
+/// return a container it received, and the caller then mutates it in place
+/// expecting the original Hydro object to change.
+fn object_to_hydro_with(
+    object: *mut ShimObject,
+    origins: &HashMap<usize, i64>,
+) -> Result<i64, String> {
+    let mut converted: HashMap<usize, i64> = HashMap::new();
+    let mut tuple_stack: HashSet<usize> = HashSet::new();
+    object_to_hydro_at(object, 0, &mut converted, &mut tuple_stack, origins)
+}
+
+fn object_to_hydro_at(
+    object: *mut ShimObject,
+    depth: usize,
+    converted: &mut HashMap<usize, i64>,
+    tuple_stack: &mut HashSet<usize>,
+    origins: &HashMap<usize, i64>,
+) -> Result<i64, String> {
+    if object.is_null() {
+        return Err("cannot convert a NULL object".to_string());
+    }
+    if depth >= MAX_CONVERSION_DEPTH {
+        return Err(format!(
+            "extension returned a value nested more than {MAX_CONVERSION_DEPTH} levels deep"
+        ));
+    }
+    let address = object as usize;
+    if let Some(&value) = origins.get(&address) {
+        return Ok(value);
+    }
+    if let Some(&value) = converted.get(&address) {
+        return Ok(value);
+    }
+    if types::is_type_pointer(object) {
+        return Ok(opaque_hydro_object(
+            object,
+            types::type_name(object as *mut TypeObject),
+        ));
+    }
+    let Some(kind) = kind_ref(object) else {
+        return Ok(opaque_hydro_object(object, object_type_name(object)));
+    };
+    match kind {
+        ShimKind::None => Ok(crate::value::NONE),
+        ShimKind::Bool(flag) => Ok(crate::value::bool_value(*flag)),
+        ShimKind::Int(number) => crate::value::encode_int(*number).ok_or_else(|| {
+            format!("integer result {number} is outside the supported Hydro int range")
+        }),
+        ShimKind::Float(number) => Ok(crate::value::float_new(*number)),
+        ShimKind::Str { text, .. } => Ok(crate::value::str_alloc(text.clone())),
+        ShimKind::Bytes { data, .. } => Ok(crate::value::bytes_new(data.clone())),
+        ShimKind::List(items) => {
+            // Publish the empty container before converting the items so a
+            // back-reference resolves to this same Hydro list.
+            let list = crate::value::list_new(Vec::new());
+            let roots = crate::heap::root_values(&[list]);
+            converted.insert(address, list);
+            let outcome = (|| -> Result<(), String> {
+                for &item in items {
+                    if item == 0 {
+                        return Err(
+                            "extension returned a list with an uninitialized item".to_string()
+                        );
+                    }
+                    let item = object_to_hydro_at(
+                        item as *mut ShimObject,
+                        depth + 1,
+                        converted,
+                        tuple_stack,
+                        origins,
+                    )?;
+                    crate::container::list_append(list, item);
+                }
+                Ok(())
+            })();
+            crate::heap::release_roots(roots);
+            outcome?;
+            Ok(list)
+        }
+        ShimKind::Tuple(items) => {
+            if !tuple_stack.insert(address) {
+                return Err(
+                    "extension returned a cyclic tuple object, which cannot be converted"
+                        .to_string(),
+                );
+            }
+            // Accumulate in a rooted list so every converted item stays
+            // reachable while the later ones allocate.
+            let accumulator = crate::value::list_new(Vec::new());
+            let roots = crate::heap::root_values(&[accumulator]);
+            let outcome = (|| -> Result<Vec<i64>, String> {
+                for &item in items {
+                    if item == 0 {
+                        return Err(
+                            "extension returned a tuple with an uninitialized item".to_string()
+                        );
+                    }
+                    let item = object_to_hydro_at(
+                        item as *mut ShimObject,
+                        depth + 1,
+                        converted,
+                        tuple_stack,
+                        origins,
+                    )?;
+                    crate::container::list_append(accumulator, item);
+                }
+                Ok(crate::value::as_list(accumulator)
+                    .map(|items| items.to_vec())
+                    .unwrap_or_default())
+            })();
+            let tuple = outcome.map(crate::value::tuple_new);
+            crate::heap::release_roots(roots);
+            tuple_stack.remove(&address);
+            let tuple = tuple?;
+            converted.insert(address, tuple);
+            Ok(tuple)
+        }
+        ShimKind::Dict(pairs) => {
+            let dict = crate::value::dict_new(Vec::new());
+            let roots = crate::heap::root_values(&[dict]);
+            converted.insert(address, dict);
+            let outcome = (|| -> Result<(), String> {
+                for &(key, item) in pairs {
+                    if key == 0 || item == 0 {
+                        return Err(
+                            "extension returned a dict with an uninitialized entry".to_string()
+                        );
+                    }
+                    let key = object_to_hydro_at(
+                        key as *mut ShimObject,
+                        depth + 1,
+                        converted,
+                        tuple_stack,
+                        origins,
+                    )?;
+                    let item = object_to_hydro_at(
+                        item as *mut ShimObject,
+                        depth + 1,
+                        converted,
+                        tuple_stack,
+                        origins,
+                    )?;
+                    crate::container::dict_set(dict, key, item);
+                    if crate::exc::pending() {
+                        return Err(take_hydro_error(
+                            "cannot convert an extension dictionary key",
+                        ));
+                    }
+                }
+                Ok(())
+            })();
+            crate::heap::release_roots(roots);
+            outcome?;
+            Ok(dict)
+        }
+        // Hydro has a single set representation (`frozenset` builds a set
+        // too), so both C kinds convert to a Hydro set. Sets cannot contain
+        // themselves or be nested in a hashable tuple, so no cycle can run
+        // through one.
+        ShimKind::Set(items) | ShimKind::FrozenSet(items) => {
+            let set = crate::value::set_new(Vec::new());
+            let roots = crate::heap::root_values(&[set]);
+            converted.insert(address, set);
+            let outcome = (|| -> Result<(), String> {
+                for &item in items {
+                    if item == 0 {
+                        return Err(
+                            "extension returned a set with an uninitialized item".to_string()
+                        );
+                    }
+                    let item = object_to_hydro_at(
+                        item as *mut ShimObject,
+                        depth + 1,
+                        converted,
+                        tuple_stack,
+                        origins,
+                    )?;
+                    crate::container::set_add(set, item);
+                    if crate::exc::pending() {
+                        return Err(take_hydro_error("cannot convert an extension set item"));
+                    }
+                }
+                Ok(())
+            })();
+            crate::heap::release_roots(roots);
+            outcome?;
+            Ok(set)
+        }
+        ShimKind::Capsule { ptr, name, .. } => {
+            // The Hydro capsule names the C pointer; keep the source handle
+            // (and therefore its destructor) alive for as long as the value
+            // can be observed.
+            inc_ref(object);
+            Ok(crate::value::capsule_new(
+                *ptr,
+                name.as_ref()
+                    .map(|name| name.to_string_lossy().into_owned()),
+            ))
+        }
+        ShimKind::Hydro(handle) => Ok(handle.value()),
+        ShimKind::NotImplemented => Ok(crate::value::NOT_IMPLEMENTED),
+        ShimKind::Ellipsis => {
+            Err("extension returned the Ellipsis singleton, which has no Hydro value".to_string())
+        }
+        ShimKind::Error => Err("extension returned an error object".to_string()),
+        _ => Ok(opaque_hydro_object(object, object_type_name(object))),
+    }
+}
+
+/// Wraps an opaque extension handle as a Hydro extension object owning one new
+/// reference.
+fn opaque_hydro_object(object: *mut ShimObject, type_name: String) -> i64 {
+    inc_ref(object);
+    crate::value::ext_object_new(object, type_name)
+}
+
+/// Materialises one Hydro argument as a C handle.
+///
+/// Container and extension-object identities are preserved through `created`
+/// (the same Hydro value yields the same C object, so cycles and aliases in an
+/// argument graph survive), and `origins` records the reverse mapping so a
+/// result that returns this object converts back to the original Hydro value
+/// instead of a copy.
+fn hydro_to_object(
+    value_arg: i64,
+    depth: usize,
+    created: &mut HashMap<i64, usize>,
+    origins: &mut HashMap<usize, i64>,
+) -> Result<*mut ShimObject, String> {
+    if value_arg == crate::value::NONE {
+        return Ok(value_object(ShimValue::None));
+    }
+    if value_arg == crate::value::TRUE {
+        return Ok(value_object(ShimValue::Bool(true)));
+    }
+    if value_arg == crate::value::FALSE {
+        return Ok(value_object(ShimValue::Bool(false)));
+    }
+    if value_arg == crate::value::NOT_IMPLEMENTED {
+        return Ok(value_object(ShimValue::NotImplemented));
+    }
+    if crate::value::is_int(value_arg) {
+        return Ok(new_int(value_arg >> 3));
+    }
+    if let Some(number) = crate::value::as_float(value_arg) {
+        return Ok(value_object(ShimValue::Float(number)));
+    }
+    if let Some(text) = crate::value::as_str(value_arg) {
+        return Ok(new_str(text.to_string()));
+    }
+    if let Some(bytes) = crate::value::as_bytes(value_arg) {
+        return Ok(new_bytes(bytes.to_vec()));
+    }
+    if let Some(state) = crate::value::as_ext_object(value_arg) {
+        if let Some(&cached) = created.get(&value_arg) {
+            let object = cached as *mut ShimObject;
+            inc_ref(object);
+            return Ok(object);
+        }
+        let object = state.object;
+        inc_ref(object);
+        created.insert(value_arg, object as usize);
+        origins.insert(object as usize, value_arg);
+        return Ok(object);
+    }
+    if let Some((pointer, name)) = crate::value::as_capsule(value_arg) {
+        if let Some(&cached) = created.get(&value_arg) {
+            let object = cached as *mut ShimObject;
+            inc_ref(object);
+            return Ok(object);
+        }
+        let capsule = value_object(ShimValue::Capsule {
+            ptr: pointer,
+            name: name.map(str::to_string),
+        });
+        if capsule.is_null() {
+            return Err("MemoryError: cannot create a capsule argument".to_string());
+        }
+        created.insert(value_arg, capsule as usize);
+        origins.insert(capsule as usize, value_arg);
+        return Ok(capsule);
+    }
+    if let Some(items) = crate::value::as_list(value_arg) {
+        if let Some(&cached) = created.get(&value_arg) {
+            let object = cached as *mut ShimObject;
+            inc_ref(object);
+            return Ok(object);
+        }
+        if depth >= MAX_CONVERSION_DEPTH {
+            return Err(format!(
+                "cannot pass a 'list' object nested more than {MAX_CONVERSION_DEPTH} levels \
+                 deep to a C extension function"
+            ));
+        }
+        let list = PyList_New(0);
+        if list.is_null() {
+            return Err(take_error()
+                .unwrap_or_else(|| "MemoryError: cannot create an argument list".to_string()));
+        }
+        created.insert(value_arg, list as usize);
+        origins.insert(list as usize, value_arg);
+        for &item in items {
+            let object = match hydro_to_object(item, depth + 1, created, origins) {
+                Ok(object) => object,
+                Err(error) => {
+                    dec_ref(list);
+                    return Err(error);
+                }
+            };
+            if PyList_Append(list, object) != 0 {
+                dec_ref(object);
+                dec_ref(list);
+                return Err(take_error().unwrap_or_else(|| {
+                    "TypeError: cannot append to an argument list".to_string()
+                }));
+            }
+            dec_ref(object);
+        }
+        return Ok(list);
+    }
+    if let Some(items) = crate::value::as_tuple(value_arg) {
+        if let Some(&cached) = created.get(&value_arg) {
+            let object = cached as *mut ShimObject;
+            inc_ref(object);
+            return Ok(object);
+        }
+        if depth >= MAX_CONVERSION_DEPTH {
+            return Err(format!(
+                "cannot pass a 'tuple' object nested more than {MAX_CONVERSION_DEPTH} levels \
+                 deep to a C extension function"
+            ));
+        }
+        let tuple = PyTuple_New(items.len() as isize);
+        if tuple.is_null() {
+            return Err(take_error()
+                .unwrap_or_else(|| "MemoryError: cannot create an argument tuple".to_string()));
+        }
+        created.insert(value_arg, tuple as usize);
+        origins.insert(tuple as usize, value_arg);
+        for (index, &item) in items.iter().enumerate() {
+            let object = match hydro_to_object(item, depth + 1, created, origins) {
+                Ok(object) => object,
+                Err(error) => {
+                    dec_ref(tuple);
+                    return Err(error);
+                }
+            };
+            if PyTuple_SetItem(tuple, index as isize, object) != 0 {
+                dec_ref(object);
+                dec_ref(tuple);
+                return Err(take_error()
+                    .unwrap_or_else(|| "TypeError: cannot fill an argument tuple".to_string()));
+            }
+        }
+        return Ok(tuple);
+    }
+    if let Some(pairs) = crate::value::as_dict(value_arg) {
+        if let Some(&cached) = created.get(&value_arg) {
+            let object = cached as *mut ShimObject;
+            inc_ref(object);
+            return Ok(object);
+        }
+        if depth >= MAX_CONVERSION_DEPTH {
+            return Err(format!(
+                "cannot pass a 'dict' object nested more than {MAX_CONVERSION_DEPTH} levels \
+                 deep to a C extension function"
+            ));
+        }
+        let dict = PyDict_New();
+        if dict.is_null() {
+            return Err(take_error()
+                .unwrap_or_else(|| "MemoryError: cannot create an argument dict".to_string()));
+        }
+        created.insert(value_arg, dict as usize);
+        origins.insert(dict as usize, value_arg);
+        for &(key, item) in pairs {
+            let key = match hydro_to_object(key, depth + 1, created, origins) {
+                Ok(object) => object,
+                Err(error) => {
+                    dec_ref(dict);
+                    return Err(error);
+                }
+            };
+            let item = match hydro_to_object(item, depth + 1, created, origins) {
+                Ok(object) => object,
+                Err(error) => {
+                    dec_ref(key);
+                    dec_ref(dict);
+                    return Err(error);
+                }
+            };
+            if PyDict_SetItem(dict, key, item) != 0 {
+                dec_ref(key);
+                dec_ref(item);
+                dec_ref(dict);
+                return Err(take_error()
+                    .unwrap_or_else(|| "TypeError: cannot fill an argument dict".to_string()));
+            }
+            dec_ref(key);
+            dec_ref(item);
+        }
+        return Ok(dict);
+    }
+    if let Some(items) = crate::value::as_set(value_arg) {
+        if let Some(&cached) = created.get(&value_arg) {
+            let object = cached as *mut ShimObject;
+            inc_ref(object);
+            return Ok(object);
+        }
+        if depth >= MAX_CONVERSION_DEPTH {
+            return Err(format!(
+                "cannot pass a 'set' object nested more than {MAX_CONVERSION_DEPTH} levels \
+                 deep to a C extension function"
+            ));
+        }
+        // Hydro has one set representation, so it crosses as a mutable C set.
+        let set = PySet_New(ptr::null_mut());
+        if set.is_null() {
+            return Err(take_error()
+                .unwrap_or_else(|| "MemoryError: cannot create an argument set".to_string()));
+        }
+        created.insert(value_arg, set as usize);
+        origins.insert(set as usize, value_arg);
+        for &item in items {
+            let object = match hydro_to_object(item, depth + 1, created, origins) {
+                Ok(object) => object,
+                Err(error) => {
+                    dec_ref(set);
+                    return Err(error);
+                }
+            };
+            if PySet_Add(set, object) != 0 {
+                dec_ref(object);
+                dec_ref(set);
+                return Err(take_error()
+                    .unwrap_or_else(|| "TypeError: cannot add to an argument set".to_string()));
+            }
+            // The C set owns its own reference to every inserted item.
+            dec_ref(object);
+        }
+        return Ok(set);
+    }
+    // Classes, instances, functions and modules cross as rooted handles.
+    if crate::modules::extension::hydro_handle_supported(value_arg) {
+        return Ok(value_object(ShimValue::Hydro(HydroValue::new(value_arg))));
+    }
+    Err(format!(
+        "cannot pass '{}' object to a C extension function",
+        crate::value::type_name(value_arg)
+    ))
 }
 
 /// Formats one component of a complex number the way `complex.__repr__` does:
@@ -2706,6 +3218,16 @@ std::thread_local! {
     /// and the instance is materialised on demand by
     /// `PyErr_GetRaisedException`.
     static CALL_ERROR: RefCell<RaisedError> = const { RefCell::new(RaisedError::EMPTY) };
+
+    /// Exception instance that accompanied the most recently consumed error
+    /// message, keyed by that message.
+    ///
+    /// The C error state owns one reference to a raised exception instance;
+    /// [`take_error`] moves it here so the Hydro raise path can preserve the
+    /// original object instead of only its text. The next `take_error`
+    /// replaces (and releases) it.
+    static TAKEN_ERROR_EXCEPTION: RefCell<Option<(usize, String)>> =
+        const { RefCell::new(None) };
 }
 
 /// Thread-local exception state shared by the error API.
@@ -2760,6 +3282,10 @@ pub extern "C" fn hydro_capi_set_type_error(message: *const c_char) {
 
 fn clear_error() {
     replace_error_state(None, None);
+    let previous = TAKEN_ERROR_EXCEPTION.with(|slot| slot.replace(None));
+    if let Some((previous, _)) = previous {
+        dec_ref(previous as *mut ShimObject);
+    }
 }
 
 pub(crate) fn error_pending() -> bool {
@@ -2767,9 +3293,77 @@ pub(crate) fn error_pending() -> bool {
 }
 
 pub(crate) fn take_error() -> Option<String> {
-    let message = CALL_ERROR.with(|slot| slot.borrow_mut().message.take());
+    let (message, exception) = CALL_ERROR.with(|slot| {
+        let mut state = slot.borrow_mut();
+        (state.message.take(), state.exception.take())
+    });
     replace_error_state(None, None);
+    // Hand the exception reference to the raise path; a later `take_error`
+    // releases it. Nothing else observes it, so a caller that only wants the
+    // text simply leaves it for the next error. The message keys the entry so
+    // a stale exception cannot attach to an unrelated raise.
+    let stashed = match (message.as_ref(), exception) {
+        (Some(message), Some(exception)) => Some((exception, message.clone())),
+        (_, exception) => {
+            if let Some(exception) = exception {
+                dec_ref(exception as *mut ShimObject);
+            }
+            None
+        }
+    };
+    let previous = TAKEN_ERROR_EXCEPTION.with(|slot| slot.replace(stashed));
+    if let Some((previous, _)) = previous {
+        dec_ref(previous as *mut ShimObject);
+    }
     message
+}
+
+/// Takes the exception instance recorded with the consumed error `message`, if
+/// the C error state carried one, as an owned reference.
+///
+/// `PyErr_Restore` wraps an extension-owned exception instance it cannot
+/// classify as a shim exception into a shim exception whose sole argument is
+/// the original instance; that wrapper is unwrapped here so the Hydro raise
+/// path preserves the extension object itself. Returns `None` for plain shim
+/// exceptions, whose Hydro payload already renders correctly.
+pub(crate) fn take_error_exception(message: &str) -> Option<*mut ShimObject> {
+    let taken = TAKEN_ERROR_EXCEPTION.with(|slot| slot.take())?;
+    let (object, recorded) = taken;
+    if recorded != message {
+        dec_ref(object as *mut ShimObject);
+        return None;
+    }
+    let object = object as *mut ShimObject;
+    // An opaque extension instance is already the original object.
+    if kind_ref(object).is_none() {
+        if object_is_exception(object) {
+            return Some(object);
+        }
+        dec_ref(object);
+        return None;
+    }
+    // `PyErr_Restore`/`PyErr_NormalizeException` wrap an extension instance
+    // they cannot classify into a shim exception of that same class whose sole
+    // argument is the original instance.
+    let inner = match kind_ref(object) {
+        Some(ShimKind::Exception { exc_type, args, .. }) => match args.as_slice() {
+            [argument]
+                if kind_ref(*argument as *mut ShimObject).is_none()
+                    && type_of(*argument as *mut ShimObject) as usize == *exc_type =>
+            {
+                *argument as *mut ShimObject
+            }
+            _ => ptr::null_mut(),
+        },
+        _ => ptr::null_mut(),
+    };
+    if inner.is_null() || !object_is_exception(inner) {
+        dec_ref(object);
+        return None;
+    }
+    inc_ref(inner);
+    dec_ref(object);
+    Some(inner)
 }
 
 // ---------------------------------------------------------------------------
@@ -2983,6 +3577,20 @@ fn dict_position(pairs: &[(usize, usize)], key: *mut ShimObject) -> Option<usize
 }
 
 /// Stores a key/value pair, taking a new reference to both.
+/// Republishes a dict's entry count into the `ma_used` header word.
+pub(crate) fn sync_dict_prefix(dict: *mut ShimObject) {
+    let Ok(pairs) = dict_slots(dict) else {
+        return;
+    };
+    // SAFETY: `dict` is a live header-bearing handle (validated by
+    // `dict_slots`); `ob_size` is the CPython `ma_used` slot.
+    unsafe {
+        (*dict)
+            .ob_size
+            .store(pairs.len() as isize, Ordering::Relaxed);
+    }
+}
+
 fn dict_set(
     dict: *mut ShimObject,
     key: *mut ShimObject,
@@ -3001,6 +3609,7 @@ fn dict_set(
             if previous != 0 {
                 dec_ref(previous as *mut ShimObject);
             }
+            sync_dict_prefix(dict);
             Ok(())
         }
         None => {
@@ -3013,6 +3622,7 @@ fn dict_set(
                 return Err("MemoryError: cannot grow dict".to_string());
             }
             pairs.push((key as usize, value as usize));
+            sync_dict_prefix(dict);
             Ok(())
         }
     }
@@ -3603,12 +4213,37 @@ pub(crate) fn extension_type_layout(address: usize) -> Result<(isize, isize, boo
     }
 }
 
-/// Calls a method of a loaded module with contract values.
-pub(crate) fn call_method(
+/// Runs one module method and returns its owned result, releasing the
+/// materialised argument handles first.
+#[cfg(test)]
+fn call_method_raw(
     module: u64,
     method: u32,
     args: &[ShimValue],
-) -> Result<ShimValue, String> {
+) -> Result<*mut ShimObject, String> {
+    let objects: Vec<usize> = args
+        .iter()
+        .cloned()
+        .map(|value| value_object(value) as usize)
+        .collect();
+    let pointers: Vec<*mut ShimObject> = objects
+        .iter()
+        .map(|&object| object as *mut ShimObject)
+        .collect();
+    let result = invoke_module_method(module, method, &pointers, ptr::null_mut());
+    for object in objects {
+        dec_ref(object as *mut ShimObject);
+    }
+    result
+}
+
+/// Runs one module method with already-materialised C arguments.
+fn invoke_module_method(
+    module: u64,
+    method: u32,
+    pointers: &[*mut ShimObject],
+    kwnames: *mut ShimObject,
+) -> Result<*mut ShimObject, String> {
     let (spec, module_object) = {
         let registry = registry_lock();
         let entry = registry
@@ -3622,16 +4257,6 @@ pub(crate) fn call_method(
             .ok_or_else(|| format!("module '{}' has no method {method}", entry.name))?;
         (spec, entry.module_object as *mut ShimObject)
     };
-
-    let objects: Vec<usize> = args
-        .iter()
-        .cloned()
-        .map(|value| value_object(value) as usize)
-        .collect();
-    let pointers: Vec<*mut ShimObject> = objects
-        .iter()
-        .map(|&object| object as *mut ShimObject)
-        .collect();
     let result = {
         let _gripper = GilGuard::new();
         invoke_method(
@@ -3639,30 +4264,73 @@ pub(crate) fn call_method(
             spec.flags,
             module_object,
             &spec.name,
-            &pointers,
-            ptr::null_mut(),
+            pointers,
+            kwnames,
         )
     };
-    let outcome = take_result_value(result);
-    for object in objects {
-        dec_ref(object as *mut ShimObject);
-    }
-    outcome
-}
-
-/// Converts a *new reference* result into a contract value and releases it.
-fn take_result_value(result: *mut ShimObject) -> Result<ShimValue, String> {
     if result.is_null() {
         return Err(take_error().unwrap_or_else(|| "extension function failed".to_string()));
     }
     clear_error();
+    Ok(result)
+}
+
+/// Shim-value form of the module call, used by the in-crate tests that
+/// inspect a result through [`ShimValue`] rather than Hydro.
+#[cfg(test)]
+fn call_method(module: u64, method: u32, args: &[ShimValue]) -> Result<ShimValue, String> {
+    let result = call_method_raw(module, method, args)?;
     let value = object_to_value(result);
     dec_ref(result);
     value
 }
 
-/// Calls a heap type object with contract values.
-pub(crate) fn call_type_object(address: usize, args: &[ShimValue]) -> Result<ShimValue, String> {
+/// Calls a module method with Hydro arguments, preserving argument identity.
+///
+/// The same Hydro container becomes one C object (aliases and cycles survive
+/// the call), and a result that returns such an object converts back to the
+/// original Hydro value, so an in-place mutation performed after the call is
+/// visible through every alias in the caller's graph.
+pub(crate) fn call_method_hydro_args(
+    module: u64,
+    method: u32,
+    args: &[i64],
+) -> Result<i64, String> {
+    let mut created: HashMap<i64, usize> = HashMap::new();
+    let mut origins: HashMap<usize, i64> = HashMap::new();
+    let mut pointers: Vec<*mut ShimObject> = Vec::with_capacity(args.len());
+    for &arg in args {
+        match hydro_to_object(arg, 0, &mut created, &mut origins) {
+            Ok(pointer) => pointers.push(pointer),
+            Err(error) => {
+                for pointer in pointers {
+                    dec_ref(pointer);
+                }
+                return Err(error);
+            }
+        }
+    }
+    let result = match invoke_module_method(module, method, &pointers, ptr::null_mut()) {
+        Ok(result) => result,
+        Err(error) => {
+            for pointer in pointers {
+                dec_ref(pointer);
+            }
+            return Err(error);
+        }
+    };
+    let value = object_to_hydro_with(result, &origins);
+    dec_ref(result);
+    // Release the arguments only after the result was converted: an extension
+    // may return one of them, and the origin map keys on their addresses.
+    for pointer in pointers {
+        dec_ref(pointer);
+    }
+    value
+}
+
+/// Runs a heap type object and returns its owned result.
+fn call_type_object_raw(address: usize, args: &[ShimValue]) -> Result<*mut ShimObject, String> {
     let type_object = address as *mut ShimObject;
     types::as_type(type_object)?;
     let objects: Vec<usize> = args
@@ -3683,11 +4351,31 @@ pub(crate) fn call_type_object(address: usize, args: &[ShimValue]) -> Result<Shi
             ptr::null_mut(),
         )
     };
-    let outcome = take_result_value(result);
     for object in objects {
         dec_ref(object as *mut ShimObject);
     }
-    outcome
+    if result.is_null() {
+        return Err(take_error().unwrap_or_else(|| "extension constructor failed".to_string()));
+    }
+    clear_error();
+    Ok(result)
+}
+
+/// Shim-value form of [`call_type_object_hydro`], used by the in-crate tests.
+#[cfg(test)]
+fn call_type_object(address: usize, args: &[ShimValue]) -> Result<ShimValue, String> {
+    let result = call_type_object_raw(address, args)?;
+    let value = object_to_value(result);
+    dec_ref(result);
+    value
+}
+
+/// Like [`call_type_object`], preserving container identity in the result.
+pub(crate) fn call_type_object_hydro(address: usize, args: &[ShimValue]) -> Result<i64, String> {
+    let result = call_type_object_raw(address, args)?;
+    let value = object_to_hydro(result);
+    dec_ref(result);
+    value
 }
 
 /// Full name of a type handle, for diagnostics in the extension bridge.
@@ -3710,71 +4398,93 @@ pub(crate) fn object_callable(object: *mut ShimObject) -> bool {
     types::PyCallable_Check(object) != 0
 }
 
-/// Looks up `name` on an arbitrary extension handle.
-///
-/// The returned contract value owns its own reference; the lookup reference is
-/// released here. A missing attribute is reported with CPython's
-/// `AttributeError` spelling so the Hydro bridge raises `AttributeError`.
-pub(crate) fn object_get_attr(object: *mut ShimObject, name: &str) -> Result<ShimValue, String> {
+/// Looks up `name` on an arbitrary extension handle and returns the owned
+/// attribute reference.
+fn object_get_attr_raw(object: *mut ShimObject, name: &str) -> Result<*mut ShimObject, String> {
     if object.is_null() {
         return Err(format!(
             "AttributeError: NULL object has no attribute '{name}'"
         ));
     }
-    let attribute = attribute_lookup(object, name)?;
-    let converted = object_to_value(attribute);
+    attribute_lookup(object, name)
+}
+
+/// Like [`object_get_attr`], preserving container identity in the result.
+pub(crate) fn object_get_attr_hydro(object: *mut ShimObject, name: &str) -> Result<i64, String> {
+    let attribute = object_get_attr_raw(object, name)?;
+    let converted = object_to_hydro(attribute);
     dec_ref(attribute);
     converted
 }
 
 /// Builds the keyword dictionary for a vectorcall from contract values.
-fn keyword_dict(keywords: &[(String, ShimValue)]) -> Result<*mut ShimObject, String> {
+///
+/// Materialises a Hydro argument list and the C keyword dictionary.
+fn materialize_hydro_call(
+    args: &[i64],
+    keywords: &[(String, i64)],
+    created: &mut HashMap<i64, usize>,
+    origins: &mut HashMap<usize, i64>,
+    pointers: &mut Vec<*mut ShimObject>,
+) -> Result<*mut ShimObject, String> {
+    for &arg in args {
+        pointers.push(hydro_to_object(arg, 0, created, origins)?);
+    }
     if keywords.is_empty() {
         return Ok(ptr::null_mut());
     }
-    let dict = PyDict_New();
-    if dict.is_null() {
+    let kwargs = PyDict_New();
+    if kwargs.is_null() {
         return Err(take_error()
             .unwrap_or_else(|| "MemoryError: cannot allocate a keyword dictionary".to_string()));
     }
-    for (name, value) in keywords {
+    for (name, value_arg) in keywords {
         let key = new_str(name.clone());
-        let item = value_object(value.clone());
-        let status = PyDict_SetItem(dict, key, item);
-        dec_ref(key);
-        dec_ref(item);
-        if status != 0 {
-            let error =
-                take_error().unwrap_or_else(|| format!("TypeError: cannot bind keyword '{name}'"));
-            dec_ref(dict);
-            return Err(error);
+        let value = match hydro_to_object(*value_arg, 0, created, origins) {
+            Ok(value) => value,
+            Err(error) => {
+                dec_ref(key);
+                dec_ref(kwargs);
+                return Err(error);
+            }
+        };
+        if PyDict_SetItem(kwargs, key, value) != 0 {
+            dec_ref(key);
+            dec_ref(value);
+            dec_ref(kwargs);
+            return Err(
+                take_error().unwrap_or_else(|| format!("TypeError: cannot bind keyword '{name}'"))
+            );
         }
+        dec_ref(key);
+        dec_ref(value);
     }
-    Ok(dict)
+    Ok(kwargs)
 }
 
-/// Calls an arbitrary extension handle with contract arguments.
-///
-/// Positional and keyword arguments are materialised as fresh handles and
-/// released once the call returns; the result converts recursively.
-pub(crate) fn object_call(
+/// Calls an arbitrary extension handle with Hydro arguments, preserving
+/// argument identity in the same way as [`call_method_hydro_args`].
+pub(crate) fn object_call_hydro_args(
     object: *mut ShimObject,
-    args: &[ShimValue],
-    keywords: &[(String, ShimValue)],
-) -> Result<ShimValue, String> {
+    args: &[i64],
+    keywords: &[(String, i64)],
+) -> Result<i64, String> {
     if object.is_null() {
         return Err("TypeError: cannot call a NULL object".to_string());
     }
-    let objects: Vec<usize> = args
-        .iter()
-        .cloned()
-        .map(|value| value_object(value) as usize)
-        .collect();
-    let pointers: Vec<*mut ShimObject> = objects
-        .iter()
-        .map(|&object| object as *mut ShimObject)
-        .collect();
-    let kwargs = keyword_dict(keywords)?;
+    let mut created: HashMap<i64, usize> = HashMap::new();
+    let mut origins: HashMap<usize, i64> = HashMap::new();
+    let mut pointers: Vec<*mut ShimObject> = Vec::with_capacity(args.len());
+    let kwargs =
+        match materialize_hydro_call(args, keywords, &mut created, &mut origins, &mut pointers) {
+            Ok(kwargs) => kwargs,
+            Err(error) => {
+                for pointer in pointers {
+                    dec_ref(pointer);
+                }
+                return Err(error);
+            }
+        };
     let result = if kwargs.is_null() {
         PyObject_Vectorcall(object, pointers.as_ptr(), pointers.len(), ptr::null_mut())
     } else {
@@ -3783,22 +4493,32 @@ pub(crate) fn object_call(
     if !kwargs.is_null() {
         dec_ref(kwargs);
     }
-    let outcome = take_result_value(result);
-    for object in objects {
-        dec_ref(object as *mut ShimObject);
+    if result.is_null() {
+        for pointer in pointers {
+            dec_ref(pointer);
+        }
+        return Err(take_error().unwrap_or_else(|| "extension call failed".to_string()));
     }
-    outcome
+    clear_error();
+    let value = object_to_hydro_with(result, &origins);
+    dec_ref(result);
+    // Arguments stay alive until the result has been mapped back to its
+    // Hydro origins (an extension may return one of them).
+    for pointer in pointers {
+        dec_ref(pointer);
+    }
+    value
 }
 
-/// Resolves `name` on `object` and calls the result with contract arguments.
-pub(crate) fn object_call_method(
+/// Resolves `name` on `object` and calls it with Hydro arguments.
+pub(crate) fn object_call_method_hydro_args(
     object: *mut ShimObject,
     name: &str,
-    args: &[ShimValue],
-    keywords: &[(String, ShimValue)],
-) -> Result<ShimValue, String> {
+    args: &[i64],
+    keywords: &[(String, i64)],
+) -> Result<i64, String> {
     let method = attribute_lookup(object, name)?;
-    let outcome = object_call(method, args, keywords);
+    let outcome = object_call_hydro_args(method, args, keywords);
     dec_ref(method);
     outcome
 }
@@ -3826,6 +4546,57 @@ pub(crate) fn object_repr(object: *mut ShimObject) -> String {
     };
     dec_ref(result);
     text
+}
+
+/// `str()` of an arbitrary extension handle, falling back to the address
+/// rendering when `tp_str` fails (the pending C error is consumed).
+pub(crate) fn object_str(object: *mut ShimObject) -> String {
+    if object.is_null() {
+        return "<NULL>".to_string();
+    }
+    let result = PyObject_Str(object);
+    if result.is_null() {
+        let _ = take_error();
+        return format!(
+            "<{} object at 0x{:x}>",
+            object_type_name(object),
+            object as usize
+        );
+    }
+    let text = match kind_ref(result) {
+        Some(ShimKind::Str { text, .. }) => text.clone(),
+        _ => object_type_name(result),
+    };
+    dec_ref(result);
+    text
+}
+
+/// True when `object` is an exception instance: a shim exception payload or an
+/// extension-owned instance whose MRO reaches `BaseException`.
+pub(crate) fn object_is_exception(object: *mut ShimObject) -> bool {
+    if object.is_null() {
+        return false;
+    }
+    if matches!(kind_ref(object), Some(ShimKind::Exception { .. })) {
+        return true;
+    }
+    let type_object = type_of(object);
+    if type_object.is_null() {
+        return false;
+    }
+    initialize_exception_types();
+    // SAFETY: the static exception table is initialised above.
+    let base = unsafe { PyExc_BaseException as *mut TypeObject };
+    types::is_subtype(type_object, base)
+}
+
+/// Wraps an owned extension exception instance as a Hydro extension object.
+///
+/// The reference is transferred to the payload, which releases it when the
+/// collector drops the object.
+pub(crate) fn exception_object_to_hydro(exception: *mut ShimObject) -> i64 {
+    let type_name = object_type_name(exception);
+    crate::value::ext_object_new(exception, type_name)
 }
 
 /// Truthiness of an arbitrary extension handle.
@@ -4083,6 +4854,26 @@ pub(crate) fn hydro_type_qualname_text(object: *mut ShimObject) -> Option<String
         return Some(text.to_string());
     }
     crate::value::class_display_name(value).map(str::to_string)
+}
+
+/// Module component of a Hydro class handle (`__module__`).
+pub(crate) fn hydro_type_module_text(object: *mut ShimObject) -> Option<String> {
+    let value = hydro_class_value(object)?;
+    let _gripper = GilGuard::new();
+    let module = crate::methods::getattr(value, b"__module__".as_ptr(), 10);
+    if !crate::exc::pending() {
+        if let Some(text) = crate::value::as_str(module) {
+            return Some(text.to_string());
+        }
+    } else {
+        crate::exc::clear();
+    }
+    let name = crate::value::class_qualname(value)?;
+    Some(
+        name.rsplit_once('.')
+            .map(|(module, _)| module.to_string())
+            .unwrap_or_else(|| "builtins".to_string()),
+    )
 }
 
 /// Flags reported for a Hydro class handle.
@@ -5968,6 +6759,13 @@ pub extern "C" fn PyMutex_IsLocked(mutex: *mut u8) -> c_int {
 /// `PyType_GetModuleName`: the module component of `tp_name`.
 #[no_mangle]
 pub extern "C" fn PyType_GetModuleName(type_object: *mut ShimObject) -> *mut ShimObject {
+    if let Some(module) = hydro_type_module_text(type_object) {
+        return value_object(ShimValue::Str(module));
+    }
+    if hydro_tagged(type_object).is_some() {
+        set_error("TypeError: PyType_GetModuleName: expected a class object");
+        return ptr::null_mut();
+    }
     match types::as_type(type_object) {
         Ok(type_object) => {
             let name = types::type_name(type_object);
@@ -6700,7 +7498,15 @@ pub extern "C" fn PyErr_SetObject(exception: *mut ShimObject, value: *mut ShimOb
         Some(ShimKind::Str { text, .. }) => text.clone(),
         _ => shim_repr(value),
     };
-    set_error(format!("{}: {text}", exception_prefix(exception)));
+    let message = format!("{}: {text}", exception_prefix(exception));
+    // CPython normalizes an instance value into the raised exception; keep the
+    // instance so the Hydro raise path can preserve the original object.
+    if object_is_exception(value) {
+        inc_ref(value);
+        replace_error_state(Some(message), Some(value as usize));
+    } else {
+        set_error(message);
+    }
 }
 
 /// `PyErr_NoMemory`.
@@ -6864,7 +7670,13 @@ fn invoke_method(
         set_error(format!("SystemError: {name}() has a NULL implementation"));
         return ptr::null_mut();
     }
-    if flags & !METHOD_FLAGS != 0 {
+    if flags & METH_CLASS != 0 && flags & METH_STATIC != 0 {
+        set_error(format!(
+            "ValueError: {name}() cannot be both class and static"
+        ));
+        return ptr::null_mut();
+    }
+    if flags & !(METHOD_CALL_FLAGS | METHOD_BINDING_FLAGS) != 0 {
         set_error(format!(
             "TypeError: {name}() uses unsupported METH flags {flags:#x}"
         ));
@@ -6903,12 +7715,12 @@ fn invoke_method(
     }
     // CPython's vectorcall layout: `values[..positional_count]` are the
     // positional arguments and the trailing `kwcount` values are the keyword
-    // values, paired in order with `kwnames`. `nargs` handed to a FASTCALL
-    // callee is the total (`positional_count + kwcount`), exactly as
-    // `cfunction_vectorcall_FASTCALL_KEYWORDS` does.
+    // values, paired in order with `kwnames`. A FASTCALL callee receives
+    // `nargs = positional_count`; keyword values follow in the same array
+    // (`_PyCFunctionFastWithKeywords` indexes them at `args + nargs`).
     let positional_count = values.len() - kwcount;
     let pointer = values.as_ptr();
-    let nargs = (positional_count + kwcount) as isize;
+    let nargs = positional_count as isize;
 
     clear_error();
     let address = function as *const c_void;
@@ -7056,9 +7868,12 @@ fn type_call(
         return ptr::null_mut();
     }
     let new_function = unsafe { (*type_object).tp_new };
-    if new_function == 0 {
-        // Static exception classes have no `tp_new` here; calling them builds
-        // the documented instance holding the positional arguments.
+    // A static exception class now exposes `tp_new` for PyO3 inheritance, but
+    // constructing it from Python still builds the shim exception instance
+    // holding the positional arguments (the previous tp_new-less path).
+    let static_exception = unsafe { (*type_object).role == TypeRole::Shim }
+        && flags & types::PY_TPFLAGS_BASE_EXC_SUBCLASS != 0;
+    if new_function == 0 || static_exception {
         initialize_exception_types();
         let base = unsafe { PyExc_BaseException as *mut TypeObject };
         if !base.is_null() && types::is_subtype(type_object, base) {
@@ -7841,7 +8656,25 @@ fn type_attribute(
                 }
                 Ok(tuple)
             }
-            _ => return None,
+            // Static and class methods are reachable through the class, as in
+            // CPython; a plain instance method still requires an instance.
+            _ => match types::find_method(type_object, name) {
+                Some(spec) if spec.flags & (METH_STATIC | METH_CLASS) != 0 => {
+                    let receiver = if spec.flags & METH_STATIC != 0 {
+                        ptr::null_mut()
+                    } else {
+                        type_pointer
+                    };
+                    let method = spec.definition as *mut PyMethodDefMirror;
+                    match PyCFunction_NewEx(method, receiver, ptr::null_mut()) {
+                        function if !function.is_null() => Ok(function),
+                        _ => Err(take_error().unwrap_or_else(|| {
+                            format!("AttributeError: cannot bind method '{name}'")
+                        })),
+                    }
+                }
+                _ => return None,
+            },
         })
     }
 }
@@ -7967,7 +8800,17 @@ fn generic_attribute(object: *mut ShimObject, name: &str) -> Result<*mut ShimObj
     if let Some(spec) = types::find_method(type_object, name) {
         // SAFETY: the definition belongs to the live extension.
         let method = spec.definition as *mut PyMethodDefMirror;
-        let result = PyCFunction_NewEx(method, object, ptr::null_mut());
+        // `METH_STATIC` methods receive NULL; `METH_CLASS` methods receive
+        // the class the attribute was read from; everything else is bound to
+        // the receiver itself, as CPython's method descriptors do.
+        let receiver = if spec.flags & METH_STATIC != 0 {
+            ptr::null_mut()
+        } else if spec.flags & METH_CLASS != 0 {
+            type_of(object) as *mut ShimObject
+        } else {
+            object
+        };
+        let result = PyCFunction_NewEx(method, receiver, ptr::null_mut());
         if result.is_null() {
             return Err(take_error()
                 .unwrap_or_else(|| format!("AttributeError: cannot bind method '{name}'")));
@@ -9033,6 +9876,7 @@ pub extern "C" fn PyDict_Clear(object: *mut ShimObject) {
         dec_ref(key as *mut ShimObject);
         dec_ref(value as *mut ShimObject);
     }
+    sync_dict_prefix(object);
 }
 
 /// `PyDict_Contains`: 1 present, 0 absent, -1 error.
@@ -9128,6 +9972,7 @@ pub extern "C" fn PyDict_DelItem(object: *mut ShimObject, key: *mut ShimObject) 
     };
     dec_ref(removed.0 as *mut ShimObject);
     dec_ref(removed.1 as *mut ShimObject);
+    sync_dict_prefix(object);
     0
 }
 
@@ -15763,22 +16608,76 @@ mod tests {
         nargs: isize,
         kwnames: *mut ShimObject,
     ) -> *mut ShimObject {
+        // `nargs` counts positional arguments only; keyword values follow
+        // them in the same vector, as `_PyCFunctionFastWithKeywords` defines.
+        let positional_count = nargs.max(0) as usize;
+        let keyword_count = if kwnames.is_null() {
+            0
+        } else {
+            PyTuple_Size(kwnames).max(0) as usize
+        };
         let mut total = 0i64;
-        for index in 0..nargs.max(0) as usize {
+        for index in 0..positional_count + keyword_count {
             let item = unsafe { *args.add(index) };
             if let Some(ShimKind::Int(value)) = kind_ref(item) {
                 total += *value;
             }
         }
-        // `kwnames` in a FASTCALL|KEYWORDS callee is a tuple of names, not the
-        // keyword dict used by `PyArg_ParseTupleAndKeywords`. Count it the
-        // CPython way (`PyTuple_GET_SIZE`).
-        let keyword_count = if kwnames.is_null() {
-            0
-        } else {
-            PyTuple_Size(kwnames).max(0)
-        };
         PyLong_FromLong((total + 1000 * keyword_count as i64) as c_long)
+    }
+
+    /// `_PyCFunctionFastWithKeywords` receives the *positional* count; the
+    /// keyword values follow in the same vector. PyO3's argument extractor
+    /// relies on this (`args + nargs` are the keyword values).
+    #[test]
+    fn fastcall_nargs_counts_positional_arguments_only() {
+        anchor();
+        clear_error();
+        static RECORDED_NARGS: std::sync::atomic::AtomicIsize =
+            std::sync::atomic::AtomicIsize::new(-1);
+        static RECORDED_KEYWORDS: std::sync::atomic::AtomicIsize =
+            std::sync::atomic::AtomicIsize::new(-1);
+        unsafe extern "C" fn record(
+            _self_object: *mut ShimObject,
+            _args: *const *mut ShimObject,
+            nargs: isize,
+            kwnames: *mut ShimObject,
+        ) -> *mut ShimObject {
+            RECORDED_NARGS.store(nargs, SEQ);
+            RECORDED_KEYWORDS.store(
+                if kwnames.is_null() {
+                    0
+                } else {
+                    PyTuple_Size(kwnames)
+                },
+                SEQ,
+            );
+            ptr::addr_of_mut!(_Py_NoneStruct)
+        }
+        let mut definition = PyMethodDefMirror {
+            ml_name: c"record".as_ptr(),
+            ml_meth: record as *const () as *mut c_void,
+            ml_flags: METH_FASTCALL | METH_KEYWORDS,
+            ml_doc: ptr::null(),
+        };
+        let function = PyCFunction_New(&mut definition, ptr::null_mut());
+        assert!(!function.is_null(), "{:?}", take_error());
+        let values = [PyLong_FromLong(1), PyLong_FromLong(2), PyLong_FromLong(3)];
+        let names = PyTuple_New(1);
+        assert_eq!(
+            PyTuple_SetItem(names, 0, PyUnicode_FromString(c"three".as_ptr())),
+            0
+        );
+        let result = PyObject_Vectorcall(function, values.as_ptr(), 3, names);
+        assert!(!result.is_null(), "{:?}", take_error());
+        assert_eq!(RECORDED_NARGS.load(SEQ), 2, "nargs excludes keywords");
+        assert_eq!(RECORDED_KEYWORDS.load(SEQ), 1);
+        dec_ref(result);
+        dec_ref(names);
+        dec_ref(function);
+        for value in values {
+            dec_ref(value);
+        }
     }
 
     fn fast_method_def() -> PyMethodDefMirror {
@@ -16492,6 +17391,297 @@ mod tests {
         assert!(take_error().unwrap().contains("not a static type object"));
         assert_eq!(PyLong_AsLong(number), 7, "the instance was not modified");
         Py_DecRef(number);
+    }
+
+    /// CPython stores a dict's entry count in the `ma_used` word at offset 16,
+    /// the shim header's `ob_size`. Extensions (PyO3's dict iterator) read it
+    /// directly instead of calling `PyDict_Size`, so it must track mutations.
+    #[test]
+    fn dict_header_publishes_cpython_ma_used() {
+        anchor();
+        clear_error();
+        let dict = PyDict_New();
+        assert!(!dict.is_null(), "{:?}", take_error());
+        assert_eq!(unsafe { (*dict).ob_size.load(SEQ) }, 0);
+        let key_a = new_str("a".to_string());
+        let key_b = new_str("b".to_string());
+        let key_c = new_str("c".to_string());
+        let value = new_int(1);
+        assert_eq!(PyDict_SetItemString(dict, c"a".as_ptr(), value), 0);
+        assert_eq!(unsafe { (*dict).ob_size.load(SEQ) }, 1);
+        assert_eq!(PyDict_SetItemString(dict, c"b".as_ptr(), value), 0);
+        assert_eq!(PyDict_SetItemString(dict, c"c".as_ptr(), value), 0);
+        assert_eq!(unsafe { (*dict).ob_size.load(SEQ) }, 3);
+        // Replacing a value does not change the entry count.
+        assert_eq!(PyDict_SetItemString(dict, c"a".as_ptr(), key_a), 0);
+        assert_eq!(unsafe { (*dict).ob_size.load(SEQ) }, 3);
+        assert_eq!(PyDict_DelItemString(dict, c"b".as_ptr()), 0);
+        assert_eq!(unsafe { (*dict).ob_size.load(SEQ) }, 2);
+        assert_eq!(
+            unsafe { super::container_api::PyDict_Pop(dict, key_c, ptr::null_mut()) },
+            1
+        );
+        assert_eq!(unsafe { (*dict).ob_size.load(SEQ) }, 1);
+        PyDict_Clear(dict);
+        assert_eq!(unsafe { (*dict).ob_size.load(SEQ) }, 0);
+        dec_ref(dict);
+        dec_ref(key_a);
+        dec_ref(key_b);
+        dec_ref(key_c);
+        dec_ref(value);
+    }
+
+    /// PyO3's `PyClassInitializer` fetches the container base's `tp_new` and
+    /// calls it as `tp_new(subtype, (), NULL)` to allocate a Python subclass
+    /// (pydantic-core's `ValidationError` extends `ValueError`). Static
+    /// exception classes expose that slot, while constructing them directly
+    /// still yields the shim exception instance.
+    #[test]
+    fn native_exception_base_exposes_tp_new_for_pyo3_subclasses() {
+        anchor();
+        clear_error();
+        let exception = unsafe { PyExc_ValueError };
+        let slot = PyType_GetSlot(exception, 65);
+        assert!(!slot.is_null(), "PyExc_ValueError must expose Py_tp_new");
+        assert!(
+            !PyType_GetSlot(exception, 74).is_null(),
+            "PyExc_ValueError must expose Py_tp_free for the subclass deallocator"
+        );
+
+        // `#[pyclass(extends=PyTzInfo)]` (pydantic-core's datetime types) also
+        // fetches the base constructor and free hook from the datetime C API
+        // type objects.
+        let tzinfo = ptr::addr_of_mut!(types::TZINFO_CAPI_TYPE) as *mut ShimObject;
+        assert!(!PyType_GetSlot(tzinfo, 65).is_null(), "tzinfo tp_new");
+        assert!(!PyType_GetSlot(tzinfo, 74).is_null(), "tzinfo tp_free");
+
+        let mut slots = empty_slots();
+        let mut spec = PyTypeSpecMirror {
+            name: c"probe.ExceptionSubclass".as_ptr(),
+            basicsize: 0,
+            itemsize: 0,
+            flags: 0,
+            slots: slots.as_mut_ptr(),
+        };
+        let bases = PyTuple_New(1);
+        inc_ref(exception);
+        assert_eq!(PyTuple_SetItem(bases, 0, exception), 0);
+        let subclass = PyType_FromSpecWithBases(&mut spec, bases);
+        assert!(!subclass.is_null(), "{:?}", take_error());
+
+        // SAFETY: the slot is the exported native base constructor.
+        let new_function: unsafe extern "C" fn(
+            *mut types::TypeObject,
+            *mut ShimObject,
+            *mut ShimObject,
+        ) -> *mut ShimObject = unsafe { std::mem::transmute(slot) };
+        let empty = PyTuple_New(0);
+        let instance =
+            unsafe { new_function(subclass as *mut types::TypeObject, empty, ptr::null_mut()) };
+        assert!(!instance.is_null(), "{:?}", take_error());
+        assert_eq!(Py_TYPE(instance) as *mut ShimObject, subclass);
+        dec_ref(empty);
+        dec_ref(instance);
+        dec_ref(subclass);
+        dec_ref(bases);
+
+        // Constructing the static class itself still builds the shim payload.
+        let arguments = PyTuple_New(1);
+        let message = new_str("boom".to_string());
+        assert_eq!(PyTuple_SetItem(arguments, 0, message), 0);
+        let raised = PyObject_CallObject(exception, arguments);
+        assert!(!raised.is_null(), "{:?}", take_error());
+        assert!(matches!(kind_ref(raised), Some(ShimKind::Exception { .. })));
+        dec_ref(raised);
+        dec_ref(arguments);
+    }
+
+    /// A raise that crosses the C-API boundary keeps the extension exception
+    /// instance: the Hydro exception delegates `str`, attributes and methods
+    /// to it while still carrying the handler-compatible tag.
+    #[test]
+    fn extension_exception_instance_survives_the_hydro_raise() {
+        anchor();
+        clear_error();
+
+        unsafe extern "C" fn str_slot(_self: *mut ShimObject) -> *mut ShimObject {
+            PyUnicode_FromString(c"boom".as_ptr())
+        }
+        unsafe extern "C" fn errors_method(
+            _self: *mut ShimObject,
+            _args: *mut ShimObject,
+        ) -> *mut ShimObject {
+            let list = PyList_New(0);
+            let item = PyUnicode_FromString(c"x".as_ptr());
+            assert_eq!(PyList_Append(list, item), 0);
+            dec_ref(item);
+            list
+        }
+
+        let mut methods = [
+            PyMethodDefMirror {
+                ml_name: c"errors".as_ptr(),
+                ml_meth: errors_method as *const () as *mut c_void,
+                ml_flags: METH_VARARGS,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDefMirror {
+                ml_name: ptr::null(),
+                ml_meth: ptr::null_mut(),
+                ml_flags: 0,
+                ml_doc: ptr::null(),
+            },
+        ];
+        let mut slots = [
+            PyTypeSlotMirror {
+                slot: 64, // Py_tp_methods
+                pfunc: methods.as_mut_ptr() as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 70, // Py_tp_str
+                pfunc: str_slot as *const () as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 0,
+                pfunc: ptr::null_mut(),
+            },
+        ];
+        let exception = unsafe { PyExc_ValueError };
+        let mut spec = PyTypeSpecMirror {
+            name: c"probe.ExtensionError".as_ptr(),
+            basicsize: 0,
+            itemsize: 0,
+            flags: 0,
+            slots: slots.as_mut_ptr(),
+        };
+        let bases = PyTuple_New(1);
+        inc_ref(exception);
+        assert_eq!(PyTuple_SetItem(bases, 0, exception), 0);
+        let subclass = PyType_FromSpecWithBases(&mut spec, bases);
+        assert!(!subclass.is_null(), "{:?}", take_error());
+
+        // Allocate an opaque instance through the exception base's `tp_new`,
+        // exactly as PyO3's `PyClassInitializer` does.
+        let slot = PyType_GetSlot(exception, 65);
+        // SAFETY: the slot is the exported native base constructor.
+        let new_function: unsafe extern "C" fn(
+            *mut types::TypeObject,
+            *mut ShimObject,
+            *mut ShimObject,
+        ) -> *mut ShimObject = unsafe { std::mem::transmute(slot) };
+        let empty = PyTuple_New(0);
+        let instance =
+            unsafe { new_function(subclass as *mut types::TypeObject, empty, ptr::null_mut()) };
+        assert!(!instance.is_null(), "{:?}", take_error());
+        dec_ref(empty);
+        assert!(object_is_exception(instance));
+
+        // Raising it stores the instance in the C error state; the bridge
+        // recovers it from the consumed message and preserves it in the
+        // pending Hydro exception.
+        PyErr_SetRaisedException(instance);
+        let message = take_error().expect("raised exception message");
+        let preserved = take_error_exception(&message).expect("extension instance");
+        assert!(object_is_exception(preserved));
+        let object = exception_object_to_hydro(preserved);
+        assert_eq!(
+            crate::exc::raise_extension(object, crate::exc::RUNTIME_ERROR, &message),
+            crate::value::NONE
+        );
+        let pending = crate::exc::pending_value();
+        assert_eq!(
+            crate::exc::pending_tag(),
+            crate::exc::RUNTIME_ERROR as i64,
+            "the frontend approximation is the handler tag"
+        );
+        assert_eq!(
+            crate::value::exception_data(pending).and_then(|data| data.object),
+            Some(object)
+        );
+
+        // `str` and methods delegate to the original instance. The raise
+        // machinery's pending exception stays pending here because no
+        // generated handler consumed it; dispatch must neither replace it nor
+        // leave a new exception behind.
+        assert_eq!(crate::value::to_string(pending), "boom");
+        let errors = crate::methods::call(pending, b"errors".as_ptr(), 6, 0, ptr::null());
+        let pending_after = crate::exc::pending_value();
+        if pending_after != pending {
+            let data = crate::value::exception_data(pending_after);
+            panic!(
+                "extension method dispatch raised tag {:?}: {:?}",
+                data.map(|data| data.tag),
+                data.map(|data| data.msg.clone())
+            );
+        }
+        let items = crate::value::as_list(errors).expect("list result");
+        assert_eq!(items.len(), 1);
+        assert_eq!(crate::value::as_str(items[0]), Some("x"));
+
+        crate::exc::clear();
+        dec_ref(subclass);
+        dec_ref(bases);
+    }
+
+    /// A Hydro class crossing to an extension must pass CPython's inline
+    /// `PyType_Check` (`Py_TYPE(op)->tp_flags & Py_TPFLAGS_TYPE_SUBCLASS`), so
+    /// PyO3's `&Bound<PyType>` extraction accepts pydantic's model `cls`.
+    #[test]
+    fn hydro_class_handles_pass_c_type_checks_and_expose_names() {
+        anchor();
+        clear_error();
+        let class = crate::value::class_new("CProbe".to_string(), crate::value::NONE, Vec::new());
+        let module = crate::value::str_alloc("probe_module".to_string());
+        assert!(crate::value::class_set_attr(
+            class,
+            "__module__".to_string(),
+            module
+        ));
+        let roots = crate::heap::root_values(&[class]);
+        let handle = value_object(ShimValue::Hydro(HydroValue::new(class)));
+
+        let metatype = Py_TYPE(handle);
+        assert!(!metatype.is_null());
+        // SAFETY: metatype is the synthetic type object owned by the handle.
+        assert_ne!(
+            unsafe { (*metatype).tp_flags } & types::PY_TPFLAGS_TYPE_SUBCLASS,
+            0,
+            "PyType_Check must accept a class handle"
+        );
+        assert_eq!(
+            types::PyType_IsSubtype(
+                handle,
+                std::ptr::addr_of_mut!(types::TYPE_TYPE) as *mut ShimObject
+            ),
+            1,
+            "a class handle is a subtype of type"
+        );
+        assert_eq!(
+            PyObject_IsInstance(
+                handle,
+                std::ptr::addr_of_mut!(types::TYPE_TYPE) as *mut ShimObject
+            ),
+            1,
+            "isinstance(cls, type)"
+        );
+
+        let name = PyType_GetName(handle);
+        assert_eq!(
+            as_string(name).as_deref(),
+            Some("CProbe"),
+            "{:?}",
+            take_error()
+        );
+        dec_ref(name);
+        let qualname = PyType_GetQualName(handle);
+        assert_eq!(as_string(qualname).as_deref(), Some("CProbe"));
+        dec_ref(qualname);
+        let module_name = PyType_GetModuleName(handle);
+        assert_eq!(as_string(module_name).as_deref(), Some("probe_module"));
+        dec_ref(module_name);
+
+        dec_ref(handle);
+        crate::heap::release_roots(roots);
     }
 
     // -- GC traverse / clear ----------------------------------------------
@@ -20971,6 +22161,600 @@ long hydro_fixture_last_op(void) { return last_op; }
 
         dec_ref(text);
         dec_ref(number);
+    }
+
+    /// `METH_STATIC`/`METH_CLASS`/`METH_COEXIST` are binding flags: they do
+    /// not change the calling convention (`PyCMethod_New` masks them out), and
+    /// a static type method is bound with a NULL receiver while a class method
+    /// receives the class it was read from.
+    #[test]
+    fn method_flags_static_class_and_coexist_dispatch() {
+        anchor();
+        clear_error();
+        static METHOD_SELF: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(usize::MAX);
+        static FASTCALL_SELF: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(usize::MAX);
+        static FASTCALL_NARGS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+        unsafe extern "C" fn record_varargs(
+            self_object: *mut ShimObject,
+            _args: *mut ShimObject,
+        ) -> *mut ShimObject {
+            METHOD_SELF.store(self_object as usize, SEQ);
+            ptr::addr_of_mut!(_Py_NoneStruct)
+        }
+        unsafe extern "C" fn record_fastcall(
+            self_object: *mut ShimObject,
+            _args: *const *mut ShimObject,
+            nargs: isize,
+            _kwnames: *mut ShimObject,
+        ) -> *mut ShimObject {
+            FASTCALL_SELF.store(self_object as usize, SEQ);
+            FASTCALL_NARGS.store(nargs as usize, SEQ);
+            ptr::addr_of_mut!(_Py_NoneStruct)
+        }
+
+        let mut methods = [
+            PyMethodDefMirror {
+                ml_name: c"probe_static".as_ptr(),
+                ml_meth: record_varargs as *const () as *mut c_void,
+                // COEXIST only affects type-dict replacement, never the call.
+                ml_flags: METH_VARARGS | METH_STATIC | METH_COEXIST,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDefMirror {
+                ml_name: c"probe_class".as_ptr(),
+                ml_meth: record_varargs as *const () as *mut c_void,
+                ml_flags: METH_VARARGS | METH_CLASS,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDefMirror {
+                ml_name: ptr::null(),
+                ml_meth: ptr::null_mut(),
+                ml_flags: 0,
+                ml_doc: ptr::null(),
+            },
+        ];
+        let mut slots = [
+            PyTypeSlotMirror {
+                slot: 64, // Py_tp_methods
+                pfunc: methods.as_mut_ptr() as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 0,
+                pfunc: ptr::null_mut(),
+            },
+        ];
+        let type_object = make_type(
+            c"probe.MethodFlags",
+            PY_OBJECT_HEAD_SIZE as c_int,
+            0,
+            0,
+            &mut slots,
+        );
+        let instance = PyType_GenericAlloc(type_object, 0);
+        assert!(!instance.is_null(), "{:?}", take_error());
+
+        // A static method read from the class or an instance receives NULL.
+        for receiver in [type_object, instance] {
+            METHOD_SELF.store(usize::MAX, SEQ);
+            let function = PyObject_GetAttrString(receiver, c"probe_static".as_ptr());
+            assert!(!function.is_null(), "{:?}", take_error());
+            let result = PyObject_Vectorcall(function, ptr::null(), 0, ptr::null_mut());
+            assert!(!result.is_null(), "{:?}", take_error());
+            assert_eq!(METHOD_SELF.load(SEQ), 0, "METH_STATIC passes NULL");
+            dec_ref(result);
+            dec_ref(function);
+        }
+
+        // A class method receives the class it was read from.
+        for receiver in [type_object, instance] {
+            METHOD_SELF.store(usize::MAX, SEQ);
+            let function = PyObject_GetAttrString(receiver, c"probe_class".as_ptr());
+            assert!(!function.is_null(), "{:?}", take_error());
+            let result = PyObject_Vectorcall(function, ptr::null(), 0, ptr::null_mut());
+            assert!(!result.is_null(), "{:?}", take_error());
+            assert_eq!(
+                METHOD_SELF.load(SEQ),
+                type_object as usize,
+                "METH_CLASS passes the accessed class"
+            );
+            dec_ref(result);
+            dec_ref(function);
+        }
+
+        // A PyCFunction with NumPy/PyO3's `FASTCALL|KEYWORDS|STATIC` flags is
+        // dispatched as fastcall with its bound receiver, exactly as CPython
+        // (the static bit never changes the calling convention).
+        let mut definition = PyMethodDefMirror {
+            ml_name: c"module_static".as_ptr(),
+            ml_meth: record_fastcall as *const () as *mut c_void,
+            ml_flags: METH_FASTCALL | METH_KEYWORDS | METH_STATIC,
+            ml_doc: ptr::null(),
+        };
+        let marker = new_int(1010);
+        let function = PyCFunction_NewEx(&mut definition, marker, ptr::null_mut());
+        assert!(!function.is_null(), "{:?}", take_error());
+        FASTCALL_SELF.store(usize::MAX, SEQ);
+        FASTCALL_NARGS.store(usize::MAX, SEQ);
+        let result = PyObject_Vectorcall(function, ptr::null(), 0, ptr::null_mut());
+        assert!(!result.is_null(), "{:?}", take_error());
+        assert_eq!(FASTCALL_SELF.load(SEQ), marker as usize);
+        assert_eq!(FASTCALL_NARGS.load(SEQ), 0);
+        dec_ref(result);
+        dec_ref(function);
+        dec_ref(marker);
+
+        dec_ref(instance);
+        dec_ref(type_object);
+    }
+
+    /// A returned container graph keeps CPython aliasing: the same C object
+    /// maps to one Hydro object, so a mutation through one alias is visible
+    /// through every other alias, and a list/dict cycle survives. pydantic's
+    /// `gather_schemas_for_cleaning` depends on this.
+    #[test]
+    fn extension_result_preserves_container_aliases_and_cycles() {
+        anchor();
+        clear_error();
+        unsafe extern "C" fn aliased_graph(
+            _self_object: *mut ShimObject,
+            _args: *mut ShimObject,
+        ) -> *mut ShimObject {
+            let inner = PyDict_New();
+            let outer = PyDict_New();
+            if inner.is_null() || outer.is_null() {
+                dec_ref(inner);
+                dec_ref(outer);
+                return ptr::null_mut();
+            }
+            if PyDict_SetItemString(outer, c"first".as_ptr(), inner) != 0
+                || PyDict_SetItemString(outer, c"second".as_ptr(), inner) != 0
+                || PyDict_SetItemString(outer, c"self".as_ptr(), outer) != 0
+            {
+                dec_ref(inner);
+                dec_ref(outer);
+                return ptr::null_mut();
+            }
+            dec_ref(inner);
+            outer
+        }
+        let mut methods = [
+            PyMethodDefMirror {
+                ml_name: c"aliased_graph".as_ptr(),
+                ml_meth: aliased_graph as *const () as *mut c_void,
+                ml_flags: METH_VARARGS,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDefMirror {
+                ml_name: ptr::null(),
+                ml_meth: ptr::null_mut(),
+                ml_flags: 0,
+                ml_doc: ptr::null(),
+            },
+        ];
+        let mut definition = empty_definition();
+        definition.m_name = c"hydro_alias_probe".as_ptr();
+        definition.m_methods = methods.as_mut_ptr();
+        let module = PyModule_Create2(&mut definition, 3);
+        assert!(!module.is_null(), "{:?}", take_error());
+        let id = module_id(module).expect("module id");
+        let value = super::call_method_hydro_args(id, 0, &[]).expect("the graph converts");
+        let roots = crate::heap::root_values(&[value]);
+
+        let pairs = crate::value::as_dict(value).expect("Hydro dict");
+        let field = |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| crate::value::as_str(*key) == Some(name))
+                .map(|&(_, item)| item)
+        };
+        let first = field("first").expect("first entry");
+        let second = field("second").expect("second entry");
+        assert_eq!(first, second, "one C dict maps to one Hydro object");
+        assert_eq!(
+            field("self"),
+            Some(value),
+            "a dict that contains itself keeps its identity"
+        );
+
+        // Mutating the alias changes the shared object pydantic later reads.
+        let key = crate::value::str_alloc("resolved".to_string());
+        let marker = crate::value::str_alloc("yes".to_string());
+        crate::container::dict_set(first, key, marker);
+        assert!(!crate::exc::pending(), "the mutation must not raise");
+        let shared = crate::value::as_dict(second).expect("second dict");
+        assert!(
+            shared
+                .iter()
+                .any(|&(k, v)| crate::value::as_str(k) == Some("resolved")
+                    && crate::value::as_str(v) == Some("yes")),
+            "a mutation through one alias is visible through the other"
+        );
+
+        crate::heap::release_roots(roots);
+        dec_ref(module);
+    }
+
+    /// A C-returned `set`/`frozenset` becomes one Hydro set: iterable, equal
+    /// to a set built from the same items, and aliased like other containers.
+    /// pydantic's `__pydantic_fields_set__` is such an extension set.
+    #[test]
+    fn extension_result_converts_c_sets_to_hydro_sets() {
+        anchor();
+        clear_error();
+        unsafe extern "C" fn set_graph(
+            _self_object: *mut ShimObject,
+            _args: *mut ShimObject,
+        ) -> *mut ShimObject {
+            let items = PyList_New(0);
+            if items.is_null() {
+                return ptr::null_mut();
+            }
+            for number in [2i64, 1] {
+                let item = PyLong_FromLong(number);
+                if item.is_null() || PyList_Append(items, item) != 0 {
+                    dec_ref(item);
+                    dec_ref(items);
+                    return ptr::null_mut();
+                }
+                dec_ref(item);
+            }
+            let mutable = PySet_New(items);
+            let frozen = PyFrozenSet_New(items);
+            dec_ref(items);
+            if mutable.is_null() || frozen.is_null() {
+                dec_ref(mutable);
+                dec_ref(frozen);
+                return ptr::null_mut();
+            }
+            let outer = PyDict_New();
+            if outer.is_null() {
+                dec_ref(mutable);
+                dec_ref(frozen);
+                return ptr::null_mut();
+            }
+            if PyDict_SetItemString(outer, c"set".as_ptr(), mutable) != 0
+                || PyDict_SetItemString(outer, c"set_alias".as_ptr(), mutable) != 0
+                || PyDict_SetItemString(outer, c"frozen".as_ptr(), frozen) != 0
+            {
+                dec_ref(mutable);
+                dec_ref(frozen);
+                dec_ref(outer);
+                return ptr::null_mut();
+            }
+            dec_ref(mutable);
+            dec_ref(frozen);
+            outer
+        }
+        let mut methods = [
+            PyMethodDefMirror {
+                ml_name: c"set_graph".as_ptr(),
+                ml_meth: set_graph as *const () as *mut c_void,
+                ml_flags: METH_VARARGS,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDefMirror {
+                ml_name: ptr::null(),
+                ml_meth: ptr::null_mut(),
+                ml_flags: 0,
+                ml_doc: ptr::null(),
+            },
+        ];
+        let mut definition = empty_definition();
+        definition.m_name = c"hydro_set_probe".as_ptr();
+        definition.m_methods = methods.as_mut_ptr();
+        let module = PyModule_Create2(&mut definition, 3);
+        assert!(!module.is_null(), "{:?}", take_error());
+        let id = module_id(module).expect("module id");
+        let value = super::call_method_hydro_args(id, 0, &[]).expect("the sets convert");
+        let roots = crate::heap::root_values(&[value]);
+
+        let pairs = crate::value::as_dict(value).expect("Hydro dict");
+        let field = |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| crate::value::as_str(*key) == Some(name))
+                .map(|&(_, item)| item)
+        };
+        let set = field("set").expect("set entry");
+        assert_eq!(
+            field("set_alias"),
+            Some(set),
+            "one C set maps to one Hydro object"
+        );
+
+        let expected = crate::value::set_new(vec![
+            crate::value::encode_int(1).expect("int"),
+            crate::value::encode_int(2).expect("int"),
+        ]);
+        let expected_roots = crate::heap::root_values(&[expected]);
+        for name in ["set", "frozen"] {
+            let set = field(name).unwrap_or_else(|| panic!("{name} entry"));
+            assert!(
+                crate::value::as_set(set).is_some(),
+                "{name} must convert to a Hydro set"
+            );
+            assert!(
+                crate::container::equals(set, expected),
+                "{name} must equal a Hydro set built from the same items"
+            );
+            assert!(crate::container::equals(expected, set));
+
+            let iterator = crate::iter::iter_of(set);
+            let iterator_roots = crate::heap::root_values(&[iterator]);
+            assert!(!crate::exc::pending(), "{name} must be iterable");
+            let mut seen = Vec::new();
+            let mut item = crate::value::NONE;
+            while crate::iter::iter_next(iterator, &mut item) == 1 {
+                seen.push(item);
+            }
+            assert!(!crate::exc::pending(), "{name} iteration must not raise");
+            assert_eq!(seen.len(), 2, "{name} yields both items");
+            let seen_set = crate::value::set_new(seen);
+            let seen_roots = crate::heap::root_values(&[seen_set]);
+            assert!(
+                crate::container::equals(seen_set, expected),
+                "{name} iteration yields the same items"
+            );
+            crate::heap::release_roots(seen_roots);
+            crate::heap::release_roots(iterator_roots);
+        }
+        crate::heap::release_roots(expected_roots);
+        crate::heap::release_roots(roots);
+        dec_ref(module);
+    }
+
+    /// A Hydro set crosses inbound as a real C set: the callee sees every
+    /// item, and returning the handle maps back to the caller's set.
+    #[test]
+    fn hydro_set_arguments_cross_as_c_sets_and_come_back() {
+        anchor();
+        clear_error();
+        unsafe extern "C" fn inspect_set(
+            _self_object: *mut ShimObject,
+            args: *mut ShimObject,
+        ) -> *mut ShimObject {
+            let set = PyTuple_GetItem(args, 0);
+            if set.is_null() {
+                return ptr::null_mut();
+            }
+            let one = PyLong_FromLong(1);
+            let two = PyLong_FromLong(2);
+            if one.is_null() || two.is_null() {
+                dec_ref(one);
+                dec_ref(two);
+                return ptr::null_mut();
+            }
+            let contains_one = PySet_Contains(set, one);
+            let contains_two = PySet_Contains(set, two);
+            dec_ref(one);
+            dec_ref(two);
+            if contains_one != 1 || contains_two != 1 || PySet_Size(set) != 2 {
+                set_error("the inbound set lost its items".to_string());
+                return ptr::null_mut();
+            }
+            inc_ref(set);
+            set
+        }
+        let mut methods = [
+            PyMethodDefMirror {
+                ml_name: c"inspect_set".as_ptr(),
+                ml_meth: inspect_set as *const () as *mut c_void,
+                ml_flags: METH_VARARGS,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDefMirror {
+                ml_name: ptr::null(),
+                ml_meth: ptr::null_mut(),
+                ml_flags: 0,
+                ml_doc: ptr::null(),
+            },
+        ];
+        let mut definition = empty_definition();
+        definition.m_name = c"hydro_inbound_set_probe".as_ptr();
+        definition.m_methods = methods.as_mut_ptr();
+        let module = PyModule_Create2(&mut definition, 3);
+        assert!(!module.is_null(), "{:?}", take_error());
+        let id = module_id(module).expect("module id");
+
+        let set = crate::value::set_new(vec![
+            crate::value::encode_int(1).expect("int"),
+            crate::value::encode_int(2).expect("int"),
+        ]);
+        let roots = crate::heap::root_values(&[set]);
+        let result = super::call_method_hydro_args(id, 0, &[set])
+            .expect("the set crosses inbound and returns");
+        let result_roots = crate::heap::root_values(&[result]);
+        assert_eq!(
+            result, set,
+            "returning the C set maps back to the caller's Hydro set"
+        );
+        assert!(crate::value::as_set(result).is_some());
+        crate::heap::release_roots(result_roots);
+        crate::heap::release_roots(roots);
+        dec_ref(module);
+    }
+
+    /// Reading a Hydro instance attribute that holds a set through the C API
+    /// yields a real C set (pydantic reads `__pydantic_fields_set__` this
+    /// way before serialising).
+    #[test]
+    fn hydro_set_attribute_reads_back_as_a_c_set() {
+        anchor();
+        clear_error();
+        let object = crate::value::object_class();
+        let class = crate::value::class_new("SetReadProbe".to_string(), object, Vec::new());
+        let class_roots = crate::heap::root_values(&[class]);
+        let instance = crate::value::instance_new(class);
+        let instance_roots = crate::heap::root_values(&[instance]);
+        let set = crate::value::set_new(vec![
+            crate::value::encode_int(1).expect("int"),
+            crate::value::encode_int(2).expect("int"),
+        ]);
+        let set_roots = crate::heap::root_values(&[set]);
+        crate::methods::setattr(instance, b"fields".as_ptr(), 6, set);
+        assert!(
+            !crate::exc::pending(),
+            "the attribute assignment must not raise"
+        );
+
+        let handle = value_object(hydro_shim(instance));
+        let read = super::hydro_attribute(handle, "fields")
+            .expect("a Hydro set attribute must cross back as a C set");
+        dec_ref(handle);
+        assert!(
+            matches!(kind_ref(read), Some(ShimKind::Set(_))),
+            "the attribute crosses as a C set, not an opaque handle"
+        );
+        assert_eq!(PySet_Size(read), 2);
+        let one = PyLong_FromLong(1);
+        let two = PyLong_FromLong(2);
+        assert_eq!(PySet_Contains(read, one), 1);
+        assert_eq!(PySet_Contains(read, two), 1);
+        dec_ref(one);
+        dec_ref(two);
+        dec_ref(read);
+        crate::heap::release_roots(set_roots);
+        crate::heap::release_roots(instance_roots);
+        crate::heap::release_roots(class_roots);
+    }
+
+    /// A set assigned through the C attribute API (pydantic's
+    /// `__pydantic_fields_set__`) is stored as a Hydro set, so Hydro can
+    /// iterate and compare it afterwards.
+    #[test]
+    fn c_set_attribute_assignment_stores_a_hydro_set() {
+        anchor();
+        clear_error();
+        let object = crate::value::object_class();
+        let class = crate::value::class_new("SetAttrProbe".to_string(), object, Vec::new());
+        let class_roots = crate::heap::root_values(&[class]);
+        let instance = crate::value::instance_new(class);
+        let instance_roots = crate::heap::root_values(&[instance]);
+
+        let set = PySet_New(ptr::null_mut());
+        assert!(!set.is_null(), "{:?}", take_error());
+        for number in [2i64, 1] {
+            let item = PyLong_FromLong(number);
+            assert!(!item.is_null(), "{:?}", take_error());
+            assert_eq!(PySet_Add(set, item), 0, "{:?}", take_error());
+            dec_ref(item);
+        }
+        let handle = value_object(hydro_shim(instance));
+        super::hydro_attribute_set(handle, "fields", set)
+            .expect("attribute assignment converts the set");
+        dec_ref(handle);
+        dec_ref(set);
+
+        let stored = crate::methods::getattr(instance, b"fields".as_ptr(), 6);
+        assert!(!crate::exc::pending(), "the stored attribute is readable");
+        assert!(
+            crate::value::as_set(stored).is_some(),
+            "the attribute is a Hydro set"
+        );
+        let expected = crate::value::set_new(vec![
+            crate::value::encode_int(1).expect("int"),
+            crate::value::encode_int(2).expect("int"),
+        ]);
+        let expected_roots = crate::heap::root_values(&[expected]);
+        assert!(crate::container::equals(stored, expected));
+        crate::heap::release_roots(expected_roots);
+        crate::heap::release_roots(instance_roots);
+        crate::heap::release_roots(class_roots);
+    }
+
+    /// A result that hands back an argument container must convert to the
+    /// caller's *original* Hydro object, not a copy: pydantic mutates the
+    /// gathered `definition-ref` dictionaries in place and expects the root
+    /// schema to observe it.
+    #[test]
+    fn extension_result_maps_argument_objects_back_to_hydro_identity() {
+        anchor();
+        clear_error();
+        unsafe extern "C" fn wrap_first(
+            _self_object: *mut ShimObject,
+            args: *mut ShimObject,
+        ) -> *mut ShimObject {
+            let item = PyTuple_GetItem(args, 0);
+            if item.is_null() {
+                return ptr::null_mut();
+            }
+            let outer = PyDict_New();
+            if outer.is_null() {
+                return ptr::null_mut();
+            }
+            if PyDict_SetItemString(outer, c"inner".as_ptr(), item) != 0 {
+                dec_ref(outer);
+                return ptr::null_mut();
+            }
+            outer
+        }
+        let mut methods = [
+            PyMethodDefMirror {
+                ml_name: c"wrap_first".as_ptr(),
+                ml_meth: wrap_first as *const () as *mut c_void,
+                ml_flags: METH_VARARGS,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDefMirror {
+                ml_name: ptr::null(),
+                ml_meth: ptr::null_mut(),
+                ml_flags: 0,
+                ml_doc: ptr::null(),
+            },
+        ];
+        let mut definition = empty_definition();
+        definition.m_name = c"hydro_origin_probe".as_ptr();
+        definition.m_methods = methods.as_mut_ptr();
+        let module = PyModule_Create2(&mut definition, 3);
+        assert!(!module.is_null(), "{:?}", take_error());
+        let id = module_id(module).expect("module id");
+
+        // Hydro argument: {"a": 1}
+        let argument = crate::value::dict_new(Vec::new());
+        let argument_roots = crate::heap::root_values(&[argument]);
+        crate::container::dict_set(
+            argument,
+            crate::value::str_alloc("a".to_string()),
+            crate::value::encode_int(1).expect("int"),
+        );
+
+        let result =
+            super::call_method_hydro_args(id, 0, &[argument]).expect("the wrapped result converts");
+        let roots = crate::heap::root_values(&[result]);
+        let pairs = crate::value::as_dict(result).expect("result dict");
+        let inner = pairs
+            .iter()
+            .find(|(key, _)| crate::value::as_str(*key) == Some("inner"))
+            .map(|&(_, item)| item)
+            .expect("inner entry");
+        assert_eq!(
+            inner, argument,
+            "an argument container keeps its Hydro identity across the call"
+        );
+
+        // Mutating the returned entry changes the caller's object.
+        crate::container::dict_set(
+            inner,
+            crate::value::str_alloc("seen".to_string()),
+            crate::value::str_alloc("yes".to_string()),
+        );
+        assert!(!crate::exc::pending(), "the mutation must not raise");
+        let updated = crate::value::as_dict(argument).expect("argument dict");
+        assert!(
+            updated
+                .iter()
+                .any(|&(k, v)| crate::value::as_str(k) == Some("seen")
+                    && crate::value::as_str(v) == Some("yes")),
+            "the caller's dict observes the mutation"
+        );
+
+        crate::heap::release_roots(roots);
+        crate::heap::release_roots(argument_roots);
+        dec_ref(module);
     }
     #[test]
     fn hydro_handles_wrap_hydro_values() {
