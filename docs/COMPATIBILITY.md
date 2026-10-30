@@ -37,18 +37,18 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 50 | 2 |
-| pure | 174 | 125 | 49 |
-| extension | 63 | 35 | 28 |
+| pure | 174 | 133 | 41 |
+| extension | 63 | 50 | 13 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 210 | 87 |
+| **Total** | 297 | 233 | 64 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:HYD0002 | 39 |
-| compile_error:HYD0201 | 24 |
-| runtime_error | 12 |
+| compile_error:HYD0002 | 21 |
+| compile_error:HYD0201 | 20 |
+| runtime_error | 11 |
 | cpython_failed | 9 |
 | compile_error:HYD0103 | 2 |
 | compile_error:HYD0101 | 1 |
@@ -120,7 +120,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_aix_support` | ok | ok | ok | - |
 | `_android_support` | ok | ok | ok | - |
 | `_apple_support` | ok | ok | ok | - |
-| `_ast_unparse` | ok | exit 1 | runtime_error | AttributeError: 'super' object has no attribute '__setitem__' |
+| `_ast_unparse` | ok | ok | ok | - |
 | `_colorize` | ok | ok | ok | - |
 | `_compat_pickle` | ok | ok | ok | - |
 | `_ios_support` | ok | ok | ok | - |
@@ -145,15 +145,15 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `base64` | ok | ok | ok | - |
 | `bdb` | ok | ok | ok | - |
 | `bisect` | ok | ok | ok | - |
-| `bz2` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_bz2' not found: not supported on the import search path |
+| `bz2` | ok | ok | ok | - |
 | `cProfile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
-| `calendar` | ok | exit 1 | runtime_error | AttributeError: 'super' object has no attribute '__setitem__' |
-| `cmd` | ok | ok | ok | - |
-| `code` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions' |
+| `calendar` | ok | exit 1 | runtime_error | TypeError: MappingProxyType() takes no arguments |
+| `cmd` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'readline' has no attribute 'backend' |
+| `code` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: type 'None' has no method '_generate_suggestions' |
 | `codeop` | ok | ok | ok | - |
 | `collections` | ok | ok | ok | - |
 | `colorsys` | ok | ok | ok | - |
-| `compileall` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions' |
+| `compileall` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: type 'None' has no method '_generate_suggestions' |
 | `compression` | ok | ok | ok | - |
 | `concurrent` | ok | ok | ok | - |
 | `configparser` | ok | ok | ok | - |
@@ -163,23 +163,23 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `copyreg` | ok | ok | ok | - |
 | `csv` | ok | ok | ok | - |
 | `ctypes` | ok | ok | ok | - |
-| `curses` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_curses' not found: not supported on the import search path |
+| `curses` | ok | exit 1 | runtime_error | AttributeError: module '_curses' has no attribute 'ACS_ULCORNER' |
 | `dataclasses` | ok | ok | ok | - |
 | `datetime` | ok | ok | ok | - |
 | `dbm` | ok | ok | ok | - |
 | `decimal` | ok | ok | ok | - |
 | `difflib` | ok | ok | ok | - |
 | `dis` | ok | ok | ok | - |
-| `doctest` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions' |
+| `doctest` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'readline' has no attribute 'backend' |
 | `email` | ok | ok | ok | - |
 | `encodings` | ok | ok | ok | - |
 | `ensurepip` | ok | ok | ok | - |
 | `enum` | ok | ok | ok | - |
 | `filecmp` | ok | ok | ok | - |
-| `fileinput` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'chmod' |
+| `fileinput` | ok | ok | ok | - |
 | `fnmatch` | ok | ok | ok | - |
 | `fractions` | ok | ok | ok | - |
-| `ftplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'ssl' has no attribute '_create_stdlib_context' |
+| `ftplib` | ok | ok | ok | - |
 | `functools` | ok | ok | ok | - |
 | `getopt` | ok | ok | ok | - |
 | `getpass` | ok | ok | ok | - |
@@ -189,11 +189,11 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `gzip` | ok | ok | ok | - |
 | `hashlib` | ok | ok | ok | - |
 | `heapq` | ok | ok | ok | - |
-| `hmac` | ok | exit 1 | runtime_error | AttributeError: 'NoneType' object has no attribute 'compare_digest' |
+| `hmac` | ok | ok | ok | - |
 | `html` | ok | ok | ok | - |
 | `http` | ok | ok | ok | - |
 | `idlelib` | ok | ok | ok | - |
-| `imaplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'ssl' has no attribute '_create_stdlib_context' |
+| `imaplib` | ok | exit 1 | compile_error:HYD0103 | error[HYD0103]: Popen() got an unexpected keyword argument 'bufsize' |
 | `importlib` | ok | ok | ok | - |
 | `inspect` | ok | ok | ok | - |
 | `ipaddress` | ok | ok | ok | - |
@@ -201,51 +201,51 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `keyword` | ok | ok | ok | - |
 | `linecache` | ok | ok | ok | - |
 | `locale` | ok | ok | ok | - |
-| `logging` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions' |
-| `lzma` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lzma' not found: not supported on the import search path |
-| `mailbox` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'binascii' has no attribute 'a2b_uu' |
+| `logging` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: type 'None' has no method '_generate_suggestions' |
+| `lzma` | ok | ok | ok | - |
+| `mailbox` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: class-body import binding 'walk' is not supported: only native modules an… |
 | `mimetypes` | ok | ok | ok | - |
 | `modulefinder` | ok | ok | ok | - |
 | `multiprocessing` | ok | ok | ok | - |
 | `netrc` | ok | ok | ok | - |
-| `nturl2path` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'ntpath' has no attribute 'splitroot' |
+| `nturl2path` | ok | exit 1 | runtime_error | TypeError: _deprecated() got an unexpected keyword argument 'message' |
 | `numbers` | ok | ok | ok | - |
 | `opcode` | ok | ok | ok | - |
 | `operator` | ok | ok | ok | - |
 | `optparse` | ok | exit 1 | runtime_error | TypeError: FileNotFoundError() takes at most 1 argument (3 given) |
 | `pathlib` | ok | ok | ok | - |
-| `pdb` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions' |
+| `pdb` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'readline' has no attribute 'backend' |
 | `pickle` | ok | ok | ok | - |
-| `pickletools` | ok | exit 1 | runtime_error | AssertionError: |
+| `pickletools` | ok | exit 1 | runtime_error | name 'BINPERSID' with code 'Q' |
 | `pkgutil` | ok | ok | ok | - |
 | `platform` | ok | ok | ok | - |
-| `plistlib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
-| `poplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'ssl' has no attribute '_create_stdlib_context' |
+| `plistlib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'SEEK_END' |
+| `poplib` | ok | ok | ok | - |
 | `pprint` | ok | exit 1 | runtime_error | AttributeError: 'function' object has no attribute '__repr__' |
 | `profile` | ok | ok | ok | - |
-| `pstats` | ok | exit 1 | runtime_error | AttributeError: 'super' object has no attribute '__setitem__' |
+| `pstats` | ok | exit 1 | runtime_error | AttributeError: 'function' object has no attribute '__func__' |
 | `pty` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'fcntl' has no attribute 'I_PUSH' |
-| `py_compile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions' |
+| `py_compile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: type 'None' has no method '_generate_suggestions' |
 | `pyclbr` | ok | ok | ok | - |
-| `pydoc` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_frozen_importlib' has no attribute '_gcd_import' |
+| `pydoc` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_frozen_importlib' has no attribute '_find_spec' |
 | `pydoc_data` | ok | ok | ok | - |
 | `queue` | ok | ok | ok | - |
 | `quopri` | ok | ok | ok | - |
 | `random` | ok | ok | ok | - |
 | `re` | ok | ok | ok | - |
 | `reprlib` | ok | ok | ok | - |
-| `rlcompleter` | ok | ok | ok | - |
+| `rlcompleter` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'readline' has no attribute 'redisplay' |
 | `sched` | ok | ok | ok | - |
-| `secrets` | ok | exit 1 | runtime_error | AttributeError: 'NoneType' object has no attribute 'compare_digest' |
+| `secrets` | ok | ok | ok | - |
 | `selectors` | ok | ok | ok | - |
 | `shelve` | ok | ok | ok | - |
 | `shlex` | ok | ok | ok | - |
 | `shutil` | ok | ok | ok | - |
-| `signal` | ok | exit 1 | runtime_error | AttributeError: 'super' object has no attribute '__setitem__' |
-| `smtplib` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'binascii' has no attribute 'a2b_uu' |
+| `signal` | ok | exit 1 | runtime_error | TypeError: _add_alias_() missing required argument 'name' |
+| `smtplib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: class-body import binding 'walk' is not supported: only native modules an… |
 | `socket` | ok | ok | ok | - |
 | `socketserver` | ok | ok | ok | - |
-| `sqlite3` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sqlite3' not found: not supported on the import search path |
+| `sqlite3` | ok | ok | ok | - |
 | `sre_compile` | ok | ok | ok | - |
 | `sre_constants` | ok | ok | ok | - |
 | `sre_parse` | ok | ok | ok | - |
@@ -258,7 +258,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `symtable` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_symtable' not found: not supported on the import search path |
 | `sysconfig` | ok | ok | ok | - |
 | `tabnanny` | ok | ok | ok | - |
-| `tarfile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'mknod' |
+| `tarfile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'makedev' |
 | `tempfile` | ok | ok | ok | - |
 | `textwrap` | ok | ok | ok | - |
 | `this` | ok | ok | ok | - |
@@ -267,9 +267,9 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `tkinter` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
 | `token` | ok | ok | ok | - |
 | `tokenize` | ok | ok | ok | - |
-| `tomllib` | ok | exit 1 | compile_error:HYD0103 | error[HYD0103]: str.count() takes 1 positional argument(s) (3 given) |
+| `tomllib` | ok | exit 1 | runtime_error | TypeError: MappingProxyType() takes no arguments |
 | `trace` | ok | ok | ok | - |
-| `traceback` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions' |
+| `traceback` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: type 'None' has no method '_generate_suggestions' |
 | `tracemalloc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path |
 | `tty` | ok | ok | ok | - |
 | `turtle` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
@@ -278,8 +278,8 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `typing` | ok | ok | ok | - |
 | `unittest` | ok | ok | ok | - |
 | `urllib` | ok | ok | ok | - |
-| `uuid` | ok | exit 1 | runtime_error | AttributeError: 'super' object has no attribute '__setitem__' |
-| `venv` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions' |
+| `uuid` | ok | ok | ok | - |
+| `venv` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: type 'None' has no method '_generate_suggestions' |
 | `warnings` | ok | ok | ok | - |
 | `wave` | ok | ok | ok | - |
 | `weakref` | ok | ok | ok | - |
@@ -298,21 +298,21 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_asyncio` | ok | ok | ok | - |
 | `_bisect` | ok | ok | ok | - |
 | `_blake2` | ok | ok | ok | - |
-| `_bz2` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_bz2' not found: not supported on the import search path |
-| `_codecs_cn` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_codecs_cn' not found: not supported on the import search path |
-| `_codecs_hk` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_codecs_hk' not found: not supported on the import search path |
-| `_codecs_iso2022` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_codecs_iso2022' not found: not supported on the import search pa… |
-| `_codecs_jp` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_codecs_jp' not found: not supported on the import search path |
-| `_codecs_kr` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_codecs_kr' not found: not supported on the import search path |
-| `_codecs_tw` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_codecs_tw' not found: not supported on the import search path |
+| `_bz2` | ok | ok | ok | - |
+| `_codecs_cn` | ok | ok | ok | - |
+| `_codecs_hk` | ok | ok | ok | - |
+| `_codecs_iso2022` | ok | ok | ok | - |
+| `_codecs_jp` | ok | ok | ok | - |
+| `_codecs_kr` | ok | ok | ok | - |
+| `_codecs_tw` | ok | ok | ok | - |
 | `_csv` | ok | ok | ok | - |
 | `_ctypes` | ok | ok | ok | - |
-| `_curses` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_curses' not found: not supported on the import search path |
+| `_curses` | ok | ok | ok | - |
 | `_curses_panel` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_curses_panel' not found: not supported on the import search path |
-| `_dbm` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_dbm' not found: not supported on the import search path |
+| `_dbm` | ok | ok | ok | - |
 | `_decimal` | ok | ok | ok | - |
 | `_elementtree` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_elementtree' not found: not supported on the import search path |
-| `_gdbm` | exit 1 | exit 1 | cpython_failed | error[HYD0002]: module '_gdbm' not found: not supported on the import search path |
+| `_gdbm` | exit 1 | ok | cpython_failed | ModuleNotFoundError: No module named '_gdbm' |
 | `_hashlib` | ok | ok | ok | - |
 | `_heapq` | ok | ok | ok | - |
 | `_hmac` | ok | ok | ok | - |
@@ -321,9 +321,9 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_interpreters` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
 | `_json` | ok | ok | ok | - |
 | `_lsprof` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
-| `_lzma` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lzma' not found: not supported on the import search path |
+| `_lzma` | ok | ok | ok | - |
 | `_md5` | ok | ok | ok | - |
-| `_multibytecodec` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_multibytecodec' not found: not supported on the import search pa… |
+| `_multibytecodec` | ok | ok | ok | - |
 | `_multiprocessing` | ok | ok | ok | - |
 | `_pickle` | ok | ok | ok | - |
 | `_posixshmem` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_posixshmem' not found: not supported on the import search path |
@@ -335,14 +335,14 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_sha2` | ok | ok | ok | - |
 | `_sha3` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sha3' not found: not supported on the import search path |
 | `_socket` | ok | ok | ok | - |
-| `_sqlite3` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_sqlite3' not found: not supported on the import search path |
+| `_sqlite3` | ok | ok | ok | - |
 | `_ssl` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_ssl' not found: not supported on the import search path |
 | `_statistics` | ok | ok | ok | - |
 | `_struct` | ok | ok | ok | - |
 | `_tkinter` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
 | `_uuid` | ok | ok | ok | - |
 | `_zoneinfo` | ok | ok | ok | - |
-| `_zstd` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_zstd' not found: not supported on the import search path |
+| `_zstd` | ok | ok | ok | - |
 | `array` | ok | ok | ok | - |
 | `binascii` | ok | ok | ok | - |
 | `cmath` | ok | ok | ok | - |
@@ -350,8 +350,8 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `grp` | ok | ok | ok | - |
 | `math` | ok | ok | ok | - |
 | `mmap` | ok | ok | ok | - |
-| `pyexpat` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'pyexpat' not found: not supported on the import search path |
-| `readline` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module 'readline' not found: not supported on the import search path |
+| `pyexpat` | ok | ok | ok | - |
+| `readline` | ok | ok | ok | - |
 | `resource` | ok | ok | ok | - |
 | `select` | ok | ok | ok | - |
 | `syslog` | ok | ok | ok | - |

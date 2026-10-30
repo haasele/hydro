@@ -62,6 +62,11 @@ pub(crate) fn call(
     let Some(method) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    // `builtins.str`/`builtins.int` read as native module function values;
+    // canonicalise them to the compiler builtin value so the shared type-level
+    // dispatch (`int_class_method`, the unbound-method forwarding below, ...)
+    // applies exactly as it does to the source spelling.
+    let obj = canonical_builtin_type(obj);
     // `dict.__repr__(value)` lowers to a method call on the builtin type
     // value instead of an attribute read, so dispatch the type-level `repr`
     // slot here as well as through `getattr`.
@@ -161,6 +166,20 @@ pub(crate) fn call(
     // `Class.method(...)` resolves through the class namespace; the binding
     // kind decides whether the class or no receiver is prepended.
     if value::as_class(obj).is_some() {
+        // The unbound native `dict` mapping methods are bound to a private
+        // marker class; the mapping operand is the first argument.
+        if value::is_dict_method_receiver(obj) {
+            let Some(args) = copy_args(argc, argv) else {
+                return type_error(format!(
+                    "{}() received {argc} argument(s) without an argument buffer",
+                    method
+                ));
+            };
+            let roots = crate::heap::root_values(&args);
+            let result = dict_native_method(&method, &args, &[]);
+            crate::heap::release_roots(roots);
+            return result;
+        }
         return class_member_method(obj, &method, argc, argv);
     }
     let Some(args) = copy_args(argc, argv) else {
@@ -276,6 +295,19 @@ pub(crate) fn call(
     if value::as_socket(obj).is_some() {
         return crate::modules::socket::method(obj, &method, &args);
     }
+    // `dict` is a builtin function value too, so `dict.__getitem__(mapping,
+    // key)` and `dict.update(mapping, **kw)` arrive here with the type value as
+    // the receiver instead of through the attribute read in [`getattr`].
+    if is_builtin_dict_type(obj) {
+        if let Some(function) = value::native_dict_method(&method) {
+            if method == "fromkeys" {
+                let bound = value::partial_new(function, vec![value::dict_class()]);
+                return builtins::call(bound, argc, argv);
+            }
+            return builtins::call(function, argc, argv);
+        }
+        return attribute_error(obj, &method);
+    }
     // The `int`/`bytes` builtin type values are function objects at runtime,
     // so `int.from_bytes(...)`/`bytes.fromhex(...)` arrive here with the type
     // value as the receiver.
@@ -289,6 +321,45 @@ pub(crate) fn call(
     // `type.__new__`/`type.__subclasscheck__` through the same value.
     if is_builtin_type_type(obj) {
         return type_class_method(obj, &method, &args, &[]);
+    }
+    // Unbound methods of builtin type spellings: `str.islower("ABC")`,
+    // `list.append(items, 1)`. The first argument is the receiver, exactly
+    // like CPython's method descriptors. Only documented method names reach
+    // here (see `builtin_type_method_names`), so a typo still reports the
+    // ordinary `AttributeError` at the attribute read.
+    if let Some(type_name) = value::builtin_type_class(obj).and_then(value::class_display_name) {
+        if builtin_type_method_names(type_name)
+            .is_some_and(|methods| methods.contains(&method.as_str()))
+        {
+            // `str.maketrans`/`bytes.maketrans` are static methods: every
+            // argument is a table operand, so none of them is the unbound
+            // receiver.
+            if method == "maketrans" {
+                let roots = crate::heap::root_values(&args);
+                let result = match type_name {
+                    "str" => str_maketrans(&args),
+                    "bytes" | "bytearray" => bytes_maketrans(&args),
+                    _ => attribute_error(obj, &method),
+                };
+                crate::heap::release_roots(roots);
+                return result;
+            }
+            let Some((&receiver, rest)) = args.split_first() else {
+                return type_error(format!(
+                    "unbound method {type_name}.{method}() needs an argument"
+                ));
+            };
+            let roots = crate::heap::root_values(&args);
+            let result = call(
+                receiver,
+                method.as_ptr(),
+                method.len(),
+                rest.len(),
+                rest.as_ptr(),
+            );
+            crate::heap::release_roots(roots);
+            return result;
+        }
     }
     if is_integer_value(obj) {
         return int_method(obj, &method, &args, &[]);
@@ -661,6 +732,48 @@ fn bind_builtin_descriptor(
     }
 }
 
+/// The function object bound by `f = receiver.method`: `f.__func__`.
+///
+/// A bound value stores `(receiver, method name)`, so the function is
+/// re-resolved through the receiver's class (or its metaclass), honoring
+/// descriptors stored in dynamic class namespaces (`staticmethod(...)`,
+/// `classmethod(...)`); a bound classmethod descriptor unwraps to its target.
+fn bound_method_function(receiver: i64, method: &str) -> Option<i64> {
+    let class = if value::as_class(receiver).is_some() {
+        receiver
+    } else {
+        value::instance_class_value(receiver)?
+    };
+    let entry = match value::class_lookup(class, method) {
+        Some(entry) => entry,
+        None => {
+            let metaclass = value::class_metaclass(class);
+            if metaclass == NONE {
+                return None;
+            }
+            value::class_lookup(metaclass, method)?
+        }
+    };
+    match entry {
+        value::ClassEntry::Method(MethodKind::Property, _) => None,
+        value::ClassEntry::Method(_, function) => Some(function),
+        value::ClassEntry::Attr(item) => {
+            let instance = if value::as_class(receiver).is_some() {
+                NONE
+            } else {
+                receiver
+            };
+            let resolved = descriptor_get(item, instance, class)?;
+            match value::as_function(resolved).map(|function| &function.body) {
+                Some(value::FunctionBody::Partial {
+                    function: inner, ..
+                }) => Some(*inner),
+                _ => Some(resolved),
+            }
+        }
+    }
+}
+
 /// Calls a callable with `receiver` bound as its first positional argument.
 ///
 /// Generated functions bind through the keyword binder (so defaults and
@@ -1000,12 +1113,42 @@ fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) 
         return call_bound_entry(class, metaclass, entry, method, &args, &[]);
     }
     let (kind, function) = match entry {
-        value::ClassEntry::Attr(value) => return builtins::call(value, argc, argv),
+        // A `classmethod(...)`/`staticmethod(...)` (or other descriptor)
+        // stored in the class namespace as an attribute resolves through
+        // `__get__`, exactly like a read does: `C.method(...)` calls the
+        // wrapped function and a classmethod call binds the class. A plain
+        // attribute value (including an ordinary function) has no `__get__`
+        // and is called as-is.
+        value::ClassEntry::Attr(item) => {
+            return match descriptor_get(item, NONE, class) {
+                Some(resolved) => builtins::call(resolved, argc, argv),
+                None => builtins::call(item, argc, argv),
+            };
+        }
         value::ClassEntry::Method(MethodKind::Property, _) => {
             return attribute_error(class, method)
         }
         value::ClassEntry::Method(kind, function) => (kind, function),
     };
+    // Native `dict` methods are unbound functions in `dict.__dict__`, so the
+    // caller supplies the mapping operand (`D.__getitem__(d, key)`).
+    // `fromkeys` keeps its classmethod binding and builds an instance of the
+    // class it was reached through, exactly like CPython.
+    if value::is_native_dict_method(function) {
+        if method == "fromkeys" {
+            let mut call_args: Vec<i64> = Vec::with_capacity(argc + 1);
+            call_args.push(class);
+            if argc > 0 {
+                // SAFETY: argument buffer validated above.
+                call_args.extend_from_slice(unsafe { std::slice::from_raw_parts(argv, argc) });
+            }
+            let roots = crate::heap::root_values(&call_args);
+            let result = builtins::call(function, call_args.len(), call_args.as_ptr());
+            crate::heap::release_roots(roots);
+            return result;
+        }
+        return builtins::call(function, argc, argv);
+    }
     if matches!(kind, MethodKind::Classmethod | MethodKind::Staticmethod)
         && !value::function_signature(function).is_empty()
         && value::function_full_entry(function) != 0
@@ -1370,6 +1513,13 @@ pub(crate) fn call_kw(
         Ok(keywords) => keywords,
         Err(err) => return err,
     };
+    // Unbound native `dict` mapping methods (see `value::dict_native_class`).
+    if value::is_dict_method_receiver(obj) {
+        let roots = crate::heap::root_values(&args);
+        let result = dict_native_method(&method, &args, &keywords.items);
+        crate::heap::release_roots(roots);
+        return result;
+    }
     if value::as_ext_object(obj).is_some() {
         return modules::extension::ext_object_method_kw(obj, &method, argc, argv, kwargc, kw_argv);
     }
@@ -1439,13 +1589,24 @@ pub(crate) fn call_kw(
         return crate::modules::argparse::method_kw(obj, &method, &mut args, &keywords);
     }
     if value::as_class(obj).is_some() {
-        if let Some(value::ClassEntry::Method(kind, function)) = value::class_lookup(obj, &method) {
-            if matches!(kind, MethodKind::Classmethod | MethodKind::Staticmethod)
-                && !value::function_signature(function).is_empty()
-                && value::function_full_entry(function) != 0
+        match value::class_lookup(obj, &method) {
+            Some(value::ClassEntry::Method(kind, function))
+                if matches!(kind, MethodKind::Classmethod | MethodKind::Staticmethod)
+                    && !value::function_signature(function).is_empty()
+                    && value::function_full_entry(function) != 0 =>
             {
                 return call_user_method(obj, obj, kind, function, &method, &args, &keywords.items);
             }
+            // A dynamically built class stores `staticmethod(...)` and
+            // `classmethod(...)` results as descriptor attributes. Resolve
+            // them exactly like the read path and forward the keywords to the
+            // wrapped callable: `Meta.static(x=1)`, `Meta.cm(x=1)`.
+            Some(value::ClassEntry::Attr(item)) => {
+                if let Some(resolved) = descriptor_get(item, NONE, obj) {
+                    return builtins::call_kw(resolved, args.len(), args.as_ptr(), kwargc, kw_argv);
+                }
+            }
+            _ => {}
         }
         return keywords.reject("class", &method);
     }
@@ -1479,6 +1640,36 @@ pub(crate) fn call_kw(
                         }
                     }
                 }
+                // A class-body value can be a callable *wrapper* rather than a
+                // generated method: `@contextmanager` stores a partial that
+                // binds the decorated generator, and decorators may store a
+                // bound method. Such a value must forward the receiver and the
+                // keywords to its own binder even when the entry still carries
+                // stale signature metadata, so this runs before the generated
+                // binder below (which would reject a name the wrapper accepts).
+                let forwards_keywords = matches!(
+                    value::as_function(function).map(|function| &function.body),
+                    Some(
+                        value::FunctionBody::Partial { .. }
+                            | value::FunctionBody::BoundMethod { .. }
+                    )
+                );
+                if forwards_keywords && kind != MethodKind::Property {
+                    let mut call_args = Vec::with_capacity(args.len() + 1);
+                    match kind {
+                        MethodKind::Staticmethod => {}
+                        MethodKind::Classmethod => call_args.push(state.class),
+                        _ => call_args.push(obj),
+                    }
+                    call_args.extend_from_slice(&args);
+                    return builtins::call_kw(
+                        function,
+                        call_args.len(),
+                        call_args.as_ptr(),
+                        kwargc,
+                        kw_argv,
+                    );
+                }
                 if kind != MethodKind::Property
                     && !value::function_signature(function).is_empty()
                     && value::function_full_entry(function) != 0
@@ -1491,6 +1682,41 @@ pub(crate) fn call_kw(
                         &method,
                         &args,
                         &keywords,
+                    );
+                }
+            }
+            // Descriptor attributes (a dynamically stored `staticmethod(...)`
+            // or a property object) resolve through `__get__` before the
+            // keyword call, matching the attribute-read path.
+            if let Some(value::ClassEntry::Attr(item)) = value::class_lookup(state.class, &method) {
+                if let Some(resolved) = descriptor_get(item, obj, state.class) {
+                    return builtins::call_kw(resolved, argc, argv, kwargc, kw_argv);
+                }
+                // A decorated method is stored as a plain attribute whose
+                // value is a callable wrapper (`@contextmanager` stores a
+                // partial binding the decorated generator). It is not a
+                // descriptor, so the read returns it unchanged; the positional
+                // path binds the receiver through `call_bound_entry`, and the
+                // keyword path must do the same and forward the names to the
+                // wrapper instead of rejecting them.
+                let forwards = value::as_function(item).is_some_and(|function| {
+                    matches!(
+                        &function.body,
+                        value::FunctionBody::Partial { .. }
+                            | value::FunctionBody::BoundMethod { .. }
+                    )
+                }) || (!value::function_signature(item).is_empty()
+                    && value::function_full_entry(item) != 0);
+                if forwards {
+                    let mut call_args = Vec::with_capacity(args.len() + 1);
+                    call_args.push(obj);
+                    call_args.extend_from_slice(&args);
+                    return builtins::call_kw(
+                        item,
+                        call_args.len(),
+                        call_args.as_ptr(),
+                        kwargc,
+                        kw_argv,
                     );
                 }
             }
@@ -1507,6 +1733,14 @@ pub(crate) fn call_kw(
         // Function values carry no parameter names in this ABI, so user
         // methods only support positional arguments.
         return keywords.reject(&value::type_name_of(obj), &method);
+    }
+    // `dict` reaches here as the builtin type value for a keyword call such as
+    // `dict.update(mapping, **kw)`; the mapping operand is the first argument.
+    if is_builtin_dict_type(obj) {
+        if let Some(function) = value::native_dict_method(&method) {
+            return builtins::call_kw(function, argc, argv, kwargc, kw_argv);
+        }
+        return attribute_error(obj, &method);
     }
     // `int.from_bytes` binds `byteorder` and the keyword-only `signed`;
     // `to_bytes`/`bit_length` do the same for integer receivers.
@@ -1631,8 +1865,9 @@ pub(crate) fn method_star_kw(
     result
 }
 
-/// Keyword dispatch for string methods: `split`, `replace`, `startswith` and
-/// `endswith` bind their named parameters; every other method rejects them.
+/// Keyword dispatch for string methods: `split`, `rsplit`, `splitlines`,
+/// `replace`, `startswith`, `endswith`, `removeprefix`, `removesuffix` and
+/// `count` bind their named parameters; every other method rejects them.
 fn str_method_kw(
     obj: i64,
     s: String,
@@ -1652,6 +1887,9 @@ fn str_method_kw(
         "replace" => (&["old", "new", "count"], 2),
         "startswith" => (&["prefix"], 1),
         "endswith" => (&["suffix"], 1),
+        "removeprefix" => (&["prefix"], 1),
+        "removesuffix" => (&["suffix"], 1),
+        "count" => (&["sub", "start", "end"], 1),
         _ => return keywords.reject("str", method),
     };
     if let Err(err) = keywords.bind("str", method, params, min_args, args) {
@@ -1752,6 +1990,238 @@ fn builtin_type_repr(name: &'static str) -> i64 {
     wrapper
 }
 
+/// Non-dunder methods of a builtin type spelling.
+///
+/// `str.islower` is CPython's unbound method descriptor; the runtime exposes
+/// it as a stable callable that applies the method to its first argument. Only
+/// the documented names are listed, so `str.nonsense` still reports
+/// `AttributeError`; the value-level dispatchers accept a wider internal
+/// vocabulary.
+fn builtin_type_method_names(name: &str) -> Option<&'static [&'static str]> {
+    /// `bool` inherits `int`'s method surface.
+    const INT_METHODS: &[&str] = &["bit_length", "from_bytes", "to_bytes"];
+    Some(match name {
+        "int" | "bool" => INT_METHODS,
+        "str" => &[
+            "capitalize",
+            "casefold",
+            "center",
+            "count",
+            "encode",
+            "endswith",
+            "expandtabs",
+            "find",
+            "format",
+            "format_map",
+            "index",
+            "isalnum",
+            "isalpha",
+            "isascii",
+            "isdecimal",
+            "isdigit",
+            "isidentifier",
+            "islower",
+            "isnumeric",
+            "isprintable",
+            "isspace",
+            "istitle",
+            "isupper",
+            "join",
+            "ljust",
+            "lower",
+            "lstrip",
+            "maketrans",
+            "partition",
+            "removeprefix",
+            "removesuffix",
+            "replace",
+            "rfind",
+            "rindex",
+            "rjust",
+            "rpartition",
+            "rsplit",
+            "rstrip",
+            "split",
+            "splitlines",
+            "startswith",
+            "strip",
+            "swapcase",
+            "title",
+            "translate",
+            "upper",
+            "zfill",
+        ],
+        "bytes" => &[
+            "capitalize",
+            "center",
+            "count",
+            "decode",
+            "endswith",
+            "expandtabs",
+            "find",
+            "hex",
+            "index",
+            "isalnum",
+            "isalpha",
+            "isascii",
+            "isdigit",
+            "islower",
+            "isspace",
+            "istitle",
+            "isupper",
+            "join",
+            "ljust",
+            "lower",
+            "lstrip",
+            "maketrans",
+            "partition",
+            "removeprefix",
+            "removesuffix",
+            "replace",
+            "rfind",
+            "rindex",
+            "rjust",
+            "rpartition",
+            "rsplit",
+            "rstrip",
+            "split",
+            "splitlines",
+            "startswith",
+            "strip",
+            "swapcase",
+            "title",
+            "translate",
+            "upper",
+            "zfill",
+        ],
+        "bytearray" => &[
+            "append",
+            "capitalize",
+            "center",
+            "clear",
+            "copy",
+            "count",
+            "decode",
+            "endswith",
+            "expandtabs",
+            "extend",
+            "find",
+            "fromhex",
+            "hex",
+            "index",
+            "insert",
+            "isalnum",
+            "isalpha",
+            "isascii",
+            "isdigit",
+            "islower",
+            "isspace",
+            "istitle",
+            "isupper",
+            "join",
+            "ljust",
+            "lower",
+            "lstrip",
+            "maketrans",
+            "partition",
+            "pop",
+            "remove",
+            "removeprefix",
+            "removesuffix",
+            "replace",
+            "reverse",
+            "rfind",
+            "rindex",
+            "rjust",
+            "rpartition",
+            "rsplit",
+            "rstrip",
+            "split",
+            "splitlines",
+            "startswith",
+            "strip",
+            "swapcase",
+            "title",
+            "translate",
+            "upper",
+            "zfill",
+        ],
+        "list" => &[
+            "append", "clear", "copy", "count", "extend", "index", "insert", "pop", "remove",
+            "reverse", "sort",
+        ],
+        "tuple" => &["count", "index"],
+        "set" => &[
+            "add",
+            "clear",
+            "copy",
+            "difference",
+            "difference_update",
+            "discard",
+            "intersection",
+            "intersection_update",
+            "isdisjoint",
+            "issubset",
+            "issuperset",
+            "pop",
+            "remove",
+            "symmetric_difference",
+            "symmetric_difference_update",
+            "union",
+            "update",
+        ],
+        "frozenset" => &[
+            "copy",
+            "difference",
+            "intersection",
+            "isdisjoint",
+            "issubset",
+            "issuperset",
+            "symmetric_difference",
+            "union",
+        ],
+        "range" => &["index"],
+        "memoryview" => &["cast", "release", "tobytes", "tolist"],
+        _ => return None,
+    })
+}
+
+thread_local! {
+    /// Stable unbound-method callables of builtin type spellings, keyed by
+    /// `(type, method)` and tagged with the heap generation that owns them.
+    static BUILTIN_TYPE_METHODS: RefCell<HashMap<(String, String), (u64, i64)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Stable unbound-method callable of a builtin type spelling.
+///
+/// `str.islower`, `list.append`, ... read back the same object every time,
+/// like CPython's method descriptors (`str.islower is str.islower`). The
+/// callable carries the type spelling as its receiver: invoking it applies the
+/// method to the first argument (see the forwarding arm in [`call`]).
+fn builtin_type_method(obj: i64, type_name: &str, method: &str) -> i64 {
+    let generation = crate::heap::generation();
+    let cached = BUILTIN_TYPE_METHODS.with(|cache| {
+        cache
+            .borrow()
+            .get(&(type_name.to_string(), method.to_string()))
+            .filter(|(cached, _)| *cached == generation)
+            .map(|(_, value)| *value)
+    });
+    if let Some(value) = cached {
+        return value;
+    }
+    let unbound = value::bound_method_new(obj, method.to_string());
+    crate::heap::add_thread_root(unbound);
+    BUILTIN_TYPE_METHODS.with(|cache| {
+        cache.borrow_mut().insert(
+            (type_name.to_string(), method.to_string()),
+            (generation, unbound),
+        );
+    });
+    unbound
+}
+
 /// Dispatches `obj.<name>` for data attributes of native objects, class
 /// instances, class objects and built-in exception objects.
 ///
@@ -1765,47 +2235,180 @@ fn builtin_type_repr(name: &'static str) -> i64 {
 /// `__suppress_context__` and `__traceback__` through
 /// [`crate::exc::exception_attr`]. Unknown names and receivers without
 /// attributes report a pending `AttributeError` and return `None`.
+///
+/// Class instances follow Python's attribute protocol: a class-defined
+/// `__getattribute__` runs first, and an attribute the default lookup cannot
+/// find falls back to a class-defined `__getattr__`. `object`'s own slots are
+/// the default implementations, so they never re-enter the hooks.
 pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
-    // `__class__` is universal for every Python object, including dict views
-    // and immediate singletons. Object-specific branches below still handle
-    // their more specific attributes.
+    if let Some(class) = value::instance_class_value(obj) {
+        if let Some(entry) = instance_attribute_hook(class, "__getattribute__") {
+            let name_value = value::str_alloc(attr);
+            let roots = crate::heap::root_values(&[name_value]);
+            let result =
+                call_bound_entry(obj, class, entry, "__getattribute__", &[name_value], &[]);
+            crate::heap::release_roots(roots);
+            return result;
+        }
+    }
+    let result = getattr_named(obj, &attr);
+    if !exc::pending() || exc::pending_tag() != ATTRIBUTE_ERROR as i64 {
+        return result;
+    }
+    let Some(class) = value::instance_class_value(obj) else {
+        return result;
+    };
+    let Some(entry) = instance_attribute_hook(class, "__getattr__") else {
+        return result;
+    };
+    exc::clear();
+    let name_value = value::str_alloc(attr);
+    let roots = crate::heap::root_values(&[name_value]);
+    let result = call_bound_entry(obj, class, entry, "__getattr__", &[name_value], &[]);
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// Class entry of a user-defined attribute-protocol hook (`__getattribute__`,
+/// `__getattr__`, `__setattr__`, `__delattr__`).
+///
+/// `object`'s entry is the default implementation and is skipped, as are
+/// properties and plain class attributes: only methods are protocol slots.
+fn instance_attribute_hook(class: i64, name: &str) -> Option<value::ClassEntry> {
+    if value::class_lookup_owner(class, name).is_some_and(value::is_object_class) {
+        return None;
+    }
+    match value::class_lookup(class, name)? {
+        entry @ value::ClassEntry::Method(
+            MethodKind::Normal | MethodKind::Classmethod | MethodKind::Staticmethod,
+            _,
+        ) => Some(entry),
+        _ => None,
+    }
+}
+
+/// `object.__getattribute__(self, name)`: the default lookup, ignoring any
+/// class-defined `__getattribute__` override (CPython's slot calls the base
+/// implementation directly).
+pub(crate) extern "C" fn object_getattribute_entry(argv: *const i64) -> i64 {
+    // SAFETY: `value::object_native_class` registers this wrapper with arity 2.
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let Some(attr) = value::as_str(args[1]) else {
+        return type_error(format!(
+            "attribute name must be string, not '{}'",
+            value::type_name(args[1])
+        ));
+    };
+    if value::instance_class_value(args[0]).is_none() {
+        return type_error(format!(
+            "descriptor '__getattribute__' for 'object' objects doesn't apply to a '{}' object",
+            value::type_name(args[0])
+        ));
+    }
+    let attr = attr.to_string();
+    getattr_named(args[0], &attr)
+}
+
+/// `object.__setattr__(self, name, value)`: the default assignment, bypassing
+/// any class-defined `__setattr__` override.
+pub(crate) extern "C" fn object_setattr_entry(argv: *const i64) -> i64 {
+    // SAFETY: `value::object_native_class` registers this wrapper with arity 3.
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    let Some(attr) = value::as_str(args[1]) else {
+        return type_error(format!(
+            "attribute name must be string, not '{}'",
+            value::type_name(args[1])
+        ));
+    };
+    let attr = attr.to_string();
+    if value::as_class(args[0]).is_some() {
+        return type_error("can't apply this __setattr__ to type object".to_string());
+    }
+    if value::instance_class_value(args[0]).is_none() {
+        return type_error(format!(
+            "descriptor '__setattr__' requires a 'object' object but received a '{}'",
+            value::type_name(args[0])
+        ));
+    }
+    setattr_named(args[0], &attr, args[2])
+}
+
+/// `object.__delattr__(self, name)`: the default deletion, bypassing any
+/// class-defined `__delattr__` override.
+pub(crate) extern "C" fn object_delattr_entry(argv: *const i64) -> i64 {
+    // SAFETY: `value::object_native_class` registers this wrapper with arity 2.
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let Some(attr) = value::as_str(args[1]) else {
+        return type_error(format!(
+            "attribute name must be string, not '{}'",
+            value::type_name(args[1])
+        ));
+    };
+    let attr = attr.to_string();
+    if value::as_class(args[0]).is_some() {
+        return type_error("can't apply this __delattr__ to type object".to_string());
+    }
+    if value::instance_class_value(args[0]).is_none() {
+        return type_error(format!(
+            "descriptor '__delattr__' requires a 'object' object but received a '{}'",
+            value::type_name(args[0])
+        ));
+    }
+    delete_attr_named(args[0], &attr)
+}
+
+/// `type([...]).copy(value)`: the unbound `copy` slot of a builtin container
+/// class, which `copy.copy` calls as `cls.copy(x)`. A tuple copies to itself;
+/// the mutable containers run their ordinary value-level `copy` method.
+pub(crate) extern "C" fn container_copy_entry(argv: *const i64) -> i64 {
+    // SAFETY: `value::container_native_class` registers this wrapper with arity 1.
+    let target = unsafe { *argv };
+    if value::as_tuple(target).is_some() {
+        return target;
+    }
+    call(target, b"copy".as_ptr(), "copy".len(), 0, std::ptr::null())
+}
+
+/// The default attribute lookup: data descriptors, the instance dictionary,
+/// class attributes and every native receiver kind.
+fn getattr_named(obj: i64, attr: &str) -> i64 {
     if attr == "__class__" {
         return value::type_class(obj);
     }
-    if let Some(attribute) = modules::extension::ext_function_getattr(obj, &attr) {
+    if let Some(attribute) = modules::extension::ext_function_getattr(obj, attr) {
         return attribute;
     }
     if value::as_ext_function(obj).is_some() {
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if value::as_ext_object(obj).is_some() {
-        if let Some(attribute) = modules::extension::ext_object_metadata_getattr(obj, &attr) {
+        if let Some(attribute) = modules::extension::ext_object_metadata_getattr(obj, attr) {
             return attribute;
         }
-        return modules::extension::ext_object_getattr(obj, &attr);
+        return modules::extension::ext_object_getattr(obj, attr);
     }
     // PEP 750 template values expose `strings`, `interpolations`, `values`
     // and the interpolation fields directly.
-    if let Some(attribute) = crate::core::template::getattr(obj, &attr) {
+    if let Some(attribute) = crate::core::template::getattr(obj, attr) {
         return attribute;
     }
     if value::as_frame(obj).is_some() {
-        if let Some(attribute) = exc::frame_attr(obj, &attr) {
+        if let Some(attribute) = exc::frame_attr(obj, attr) {
             return attribute;
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if value::as_code(obj).is_some() {
-        if let Some(attribute) = exc::code_attr(obj, &attr) {
+        if let Some(attribute) = exc::code_attr(obj, attr) {
             return attribute;
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if let Some(module) = value::as_module(obj) {
-        return crate::modules::module_attr(module, &attr);
+        return crate::modules::module_attr(module, attr);
     }
     // Function metadata: the generated code stores the bare definition name,
     // so `f.__name__`/`f.__qualname__` report it and `__doc__` stays `None`
@@ -1828,11 +2431,9 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         if matches!(
             &function.body,
             value::FunctionBody::Builtin(hydro_ir::Builtin::Int)
-        ) && matches!(
-            attr.as_str(),
-            "from_bytes" | "to_bytes" | "bit_length" | "__new__"
-        ) {
-            return value::bound_method_new(obj, attr);
+        ) && matches!(attr, "from_bytes" | "to_bytes" | "bit_length" | "__new__")
+        {
+            return value::bound_method_new(obj, attr.to_string());
         }
         // The `bytes` builtin type value exposes its classmethods the same
         // way (`bytes.fromhex('00')`).
@@ -1841,7 +2442,7 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             value::FunctionBody::Builtin(hydro_ir::Builtin::Bytes)
         ) && attr == "fromhex"
         {
-            return value::bound_method_new(obj, attr);
+            return value::bound_method_new(obj, attr.to_string());
         }
         // The `type` metaclass exposes its C-level class operations as
         // attributes; metaclasses assign them into their own namespace
@@ -1852,12 +2453,43 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             &function.body,
             value::FunctionBody::Builtin(hydro_ir::Builtin::Type)
         ) {
-            match attr.as_str() {
+            match attr {
                 "__dict__" => return value::type_namespace(obj),
                 "__annotations__" => return value::type_annotations(),
                 "__new__" | "__call__" | "__subclasscheck__" | "__instancecheck__" | "__hash__"
                 | "__repr__" | "__prepare__" | "__getattribute__" | "mro" => {
-                    return value::bound_method_new(obj, attr)
+                    return value::bound_method_new(obj, attr.to_string())
+                }
+                _ => {}
+            }
+        }
+        // The `dict` builtin type value exposes the native mapping surface as
+        // unbound functions, like CPython's type object: `dict.__getitem__(d,
+        // key)` runs the native slot and `dict.fromkeys` stays a classmethod
+        // bound to the class.
+        if matches!(
+            &function.body,
+            value::FunctionBody::Builtin(hydro_ir::Builtin::Dict)
+        ) {
+            if let Some(method) = value::native_dict_method(attr) {
+                if attr == "fromkeys" {
+                    return value::partial_new(method, vec![value::dict_class()]);
+                }
+                return method;
+            }
+        }
+        // CPython's bound-method metadata: `f.__self__` is the bound receiver
+        // (the class for a classmethod, the instance for a method) and
+        // `f.__func__` the underlying function. pydantic compares
+        // `Cls.method.__func__` with the class attribute it wraps.
+        if let value::FunctionBody::BoundMethod { receiver, method } = &function.body {
+            match attr {
+                "__self__" => return *receiver,
+                "__func__" => {
+                    return match bound_method_function(*receiver, method) {
+                        Some(inner) => inner,
+                        None => attribute_error(obj, attr),
+                    }
                 }
                 _ => {}
             }
@@ -1870,9 +2502,26 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         {
             // CPython's `functools.partial` exposes the wrapped callable, the
             // bound positional arguments and the bound keywords.
-            match attr.as_str() {
+            match attr {
                 "func" => return *target,
                 "args" => return value::tuple_new(args.clone()),
+                // A `classmethod(...)` descriptor read binds the class as the
+                // single positional argument; expose the bound-method metadata
+                // so `Cls.method.__func__` works for dynamic class namespaces.
+                "__self__"
+                    if keywords.is_empty()
+                        && args.len() == 1
+                        && value::as_class(args[0]).is_some() =>
+                {
+                    return args[0];
+                }
+                "__func__"
+                    if keywords.is_empty()
+                        && args.len() == 1
+                        && value::as_class(args[0]).is_some() =>
+                {
+                    return *target;
+                }
                 "keywords" => {
                     let mark = crate::heap::root_values(&[]);
                     let pairs: Vec<(i64, i64)> = keywords
@@ -1886,28 +2535,51 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 _ => {}
             }
         }
-        return match attr.as_str() {
+        // A builtin type spelling exposes its documented class methods as
+        // unbound callables (`str.islower("ABC")`, `list.append(items, 1)`),
+        // like CPython's method descriptors. The dedicated arms above cover
+        // `int.from_bytes`/`bytes.fromhex`/`dict.*`/`type.*`; this handles the
+        // remaining documented surfaces. Unknown names still raise
+        // `AttributeError`.
+        if let Some(type_name) = value::builtin_type_class(obj).and_then(value::class_display_name)
+        {
+            if builtin_type_method_names(type_name).is_some_and(|methods| methods.contains(&attr)) {
+                return builtin_type_method(obj, type_name, attr);
+            }
+        }
+        return match attr {
             "__name__" => value::str_alloc(value::function_name(obj)),
             "__qualname__" => value::str_alloc(value::function_qualname(obj)),
-            "__doc__" => value::function_doc(obj),
+            // `str.__doc__`/`str.__module__` describe the type, not a plain
+            // function; `inspect_namespace` reads them off `value.__class__`.
+            "__doc__" => match value::function_doc(obj) {
+                doc if doc != NONE => doc,
+                doc => match value::builtin_type_name(obj) {
+                    Some(name) => value::str_alloc(format!("{name} built-in type")),
+                    None => doc,
+                },
+            },
             "__module__" => match value::function_module(obj) {
                 Some(module) => module,
-                None => attribute_error(obj, &attr),
+                None if value::builtin_type_name(obj).is_some() => {
+                    value::str_alloc("builtins".to_string())
+                }
+                None => attribute_error(obj, attr),
             },
             "__annotations__" => match value::function_annotations(obj) {
                 Some(annotations) => annotations,
-                None => attribute_error(obj, &attr),
+                None => attribute_error(obj, attr),
             },
             "__dict__" => {
                 if value::function_has_attributes(obj) {
                     value::function_dict(obj).unwrap_or(NONE)
                 } else {
-                    attribute_error(obj, &attr)
+                    attribute_error(obj, attr)
                 }
             }
-            _ => match value::function_attribute(obj, &attr) {
+            _ => match value::function_attribute(obj, attr) {
                 Some(attribute) => attribute,
-                None => attribute_error(obj, &attr),
+                None => attribute_error(obj, attr),
             },
         };
     }
@@ -1915,18 +2587,18 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     // `__context__`, `__suppress_context__` and `__traceback__`. The check is
     // before the instance/class branches because exception objects are not
     // class instances.
-    if let Some(attribute) = exc::exception_attr(obj, &attr) {
+    if let Some(attribute) = exc::exception_attr(obj, attr) {
         return attribute;
     }
     if value::as_path(obj).is_some() {
-        return path_attr(obj, &attr);
+        return path_attr(obj, attr);
     }
     if value::as_file(obj).is_some() {
-        return file_attr(obj, &attr);
+        return file_attr(obj, attr);
     }
     if value::as_list(obj).is_some() {
         if matches!(
-            attr.as_str(),
+            attr,
             "append"
                 | "extend"
                 | "insert"
@@ -1939,13 +2611,13 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 | "index"
                 | "sort"
         ) {
-            return value::bound_method_new(obj, attr);
+            return value::bound_method_new(obj, attr.to_string());
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if value::as_dict(obj).is_some() {
         if matches!(
-            attr.as_str(),
+            attr,
             "get"
                 | "keys"
                 | "values"
@@ -1960,15 +2632,15 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 | "__contains__"
                 | "__len__"
         ) {
-            return value::bound_method_new(obj, attr);
+            return value::bound_method_new(obj, attr.to_string());
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if value::as_set(obj).is_some() {
         // Native bound method values let set methods be passed as callbacks
         // (`_SINGLE_CELLS.issuperset` in rich) as well as called.
         if matches!(
-            attr.as_str(),
+            attr,
             "add"
                 | "remove"
                 | "discard"
@@ -1987,66 +2659,66 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 | "issuperset"
                 | "isdisjoint"
         ) {
-            return value::bound_method_new(obj, attr);
+            return value::bound_method_new(obj, attr.to_string());
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if value::as_thread(obj).is_some() {
-        return thread_attr(obj, &attr);
+        return thread_attr(obj, attr);
     }
     if value::as_process(obj).is_some() {
-        return process_attr(obj, &attr);
+        return process_attr(obj, attr);
     }
     if value::as_namespace(obj).is_some() {
         let Some(pairs) = value::as_namespace(obj) else {
-            return attribute_error(obj, &attr);
+            return attribute_error(obj, attr);
         };
         if let Some((_, value)) = pairs.iter().find(|(name, _)| name.as_str() == attr) {
             return *value;
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if value::as_arg_parser(obj).is_some() {
-        if let Some(result) = crate::modules::argparse::parser_attr(obj, &attr) {
+        if let Some(result) = crate::modules::argparse::parser_attr(obj, attr) {
             return result;
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if value::as_defaultdict(obj).is_some() {
-        if let Some(result) = crate::modules::collections::getattr(obj, &attr) {
+        if let Some(result) = crate::modules::collections::getattr(obj, attr) {
             return result;
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if value::as_pattern(obj).is_some() {
         if matches!(
-            attr.as_str(),
+            attr,
             "search" | "match" | "fullmatch" | "findall" | "finditer" | "sub" | "split"
         ) {
-            return value::bound_method_new(obj, attr);
+            return value::bound_method_new(obj, attr.to_string());
         }
-        if let Some(result) = crate::modules::re::pattern_attr(obj, &attr) {
+        if let Some(result) = crate::modules::re::pattern_attr(obj, attr) {
             return result;
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if value::as_match(obj).is_some() {
         if matches!(
-            attr.as_str(),
+            attr,
             "group" | "groups" | "groupdict" | "start" | "end" | "span"
         ) {
-            return value::bound_method_new(obj, attr);
+            return value::bound_method_new(obj, attr.to_string());
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if let Some(class) = value::instance_class_value(obj) {
         if attr == "__dict__" {
             if !value::class_has_dict(class) {
-                return attribute_error(obj, &attr);
+                return attribute_error(obj, attr);
             }
             return match value::instance_dict(obj) {
                 Some(mapping) => mapping,
-                None => attribute_error(obj, &attr),
+                None => attribute_error(obj, attr),
             };
         }
         // `__class__` is a data descriptor on every Python object, so it wins
@@ -2054,7 +2726,7 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         if attr == "__class__" {
             return class;
         }
-        let entry = value::class_lookup(class, &attr);
+        let entry = value::class_lookup(class, attr);
         // 1. A data descriptor wins over the instance dictionary.
         if let Some(entry) = entry.as_ref().filter(|entry| is_data_descriptor(entry)) {
             if let Some(result) = data_descriptor_get(obj, class, entry) {
@@ -2062,12 +2734,12 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             }
         }
         // 2. The instance dictionary.
-        if let Some(attribute) = value::instance_attr(obj, &attr) {
+        if let Some(attribute) = value::instance_attr(obj, attr) {
             return attribute;
         }
         // 3. Class attributes, non-data descriptors and methods.
         let Some(entry) = entry else {
-            return attribute_error(obj, &attr);
+            return attribute_error(obj, attr);
         };
         return match entry {
             // A non-data descriptor resolves `__get__(instance, owner)`.
@@ -2078,7 +2750,7 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 if value::as_function(item).is_some() {
                     // A function assigned to the class binds the receiver,
                     // exactly like a class-body method.
-                    return value::bound_method_new(obj, attr);
+                    return value::bound_method_new(obj, attr.to_string());
                 }
                 item
             }
@@ -2086,7 +2758,7 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 let args = [obj];
                 builtins::call(function, 1, args.as_ptr())
             }
-            value::ClassEntry::Method(_, _) => value::bound_method_new(obj, attr),
+            value::ClassEntry::Method(_, _) => value::bound_method_new(obj, attr.to_string()),
         };
     }
     if let Some(class) = value::as_class(obj) {
@@ -2101,7 +2773,7 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         // Every class object knows its Python-visible name; its attributes
         // were frozen when the class statement ran and later assignments live
         // in the overlay.
-        match attr.as_str() {
+        match attr {
             // `Cls.__name__`/`__qualname__` honor a runtime rename: classes
             // created by `type.__new__` are frequently renamed in place (the
             // `typing_extensions` TypedDict metaclass allocates under the
@@ -2115,6 +2787,35 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             }
             "__qualname__" => {
                 return value::str_alloc(value::class_qualname(obj).unwrap_or_default().to_string())
+            }
+            // `Cls.__module__` is stored in the class namespace by the class
+            // statement. Builtin type classes (`type(1)`, `str`, ...) have no
+            // module of their own and report `builtins`, like CPython.
+            "__module__" => {
+                if let Some(value::ClassEntry::Attr(module)) =
+                    value::class_own_lookup(obj, "__module__")
+                {
+                    return module;
+                }
+                if value::is_cached_type_class(obj) {
+                    return value::str_alloc("builtins".to_string());
+                }
+            }
+            // Builtin type classes expose a doc string; a user class reports
+            // its namespace `__doc__`, or `None` when the body has none
+            // (CPython does not inherit `__doc__`).
+            "__doc__" => {
+                if let Some(value::ClassEntry::Attr(doc)) = value::class_own_lookup(obj, "__doc__")
+                {
+                    return doc;
+                }
+                if value::is_cached_type_class(obj) {
+                    return value::str_alloc(format!(
+                        "{} built-in type",
+                        value::class_display_name(obj).unwrap_or("object")
+                    ));
+                }
+                return NONE;
             }
             // `type.__annotations__`/`type.__annotate__` are getset descriptors
             // on the metatype: they report the class's *own* mapping/callable
@@ -2143,9 +2844,9 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             _ => {}
         }
         if attr == "__new__" && value::class_lookup(obj, "__new__").is_none() {
-            return value::bound_method_new(obj, attr);
+            return value::bound_method_new(obj, attr.to_string());
         }
-        match value::class_lookup(obj, &attr) {
+        match value::class_lookup(obj, attr) {
             Some(value::ClassEntry::Attr(item)) => {
                 // A descriptor stored as a class attribute receives
                 // `(None, owner)` when read from the class.
@@ -2155,8 +2856,19 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 return item;
             }
             Some(value::ClassEntry::Method(MethodKind::Property, _)) => {}
+            Some(value::ClassEntry::Method(MethodKind::Normal, function))
+                if value::is_native_dict_method(function) =>
+            {
+                // `dict`'s mapping methods are plain functions in the class
+                // namespace, so `D.__getitem__(d, key)` passes the mapping
+                // explicitly. `fromkeys` is the classmethod that binds `D`.
+                if attr == "fromkeys" {
+                    return value::partial_new(function, vec![obj]);
+                }
+                return function;
+            }
             Some(value::ClassEntry::Method(_, _)) => {
-                return value::bound_method_new(obj, attr);
+                return value::bound_method_new(obj, attr.to_string());
             }
             None => {}
         }
@@ -2164,16 +2876,16 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         // metaclass, as in CPython: this is how `ABCMeta.register`,
         // `__instancecheck__`, `__subclasscheck__` and `__abstractmethods__`
         // reach every class created with that metaclass.
-        if let Some(metaclass) = metaclass_attribute(obj, &attr) {
+        if let Some(metaclass) = metaclass_attribute(obj, attr) {
             return metaclass;
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if value::as_super(obj).is_some() {
-        if let Some(result) = super_getattr(obj, &attr) {
+        if let Some(result) = super_getattr(obj, attr) {
             return result;
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if let Some(state) = value::as_descriptor(obj) {
         // `property` exposes `getter`/`setter`/`deleter` returning new
@@ -2183,28 +2895,28 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
         // (`p.member = ...` in `enum`). The `type.__annotations__` getset
         // descriptor exposes only the descriptor protocol itself.
         if state.kind == value::DescriptorKind::Property {
-            return match attr.as_str() {
+            return match attr {
                 "getter" | "setter" | "deleter" | "__get__" | "__set__" | "__delete__"
-                | "__set_name__" => value::bound_method_new(obj, attr),
+                | "__set_name__" => value::bound_method_new(obj, attr.to_string()),
                 "fget" => state.fget(),
                 "fset" => state.fset(),
                 "fdel" => state.fdel(),
-                _ => match state.attr(attr.as_str()) {
+                _ => match state.attr(attr) {
                     Some(item) => item,
-                    None => attribute_error(obj, &attr),
+                    None => attribute_error(obj, attr),
                 },
             };
         }
-        return match attr.as_str() {
+        return match attr {
             "__get__" | "__set__" if state.kind == value::DescriptorKind::TypeAnnotations => {
-                value::bound_method_new(obj, attr)
+                value::bound_method_new(obj, attr.to_string())
             }
-            _ => attribute_error(obj, &attr),
+            _ => attribute_error(obj, attr),
         };
     }
     if value::as_bytearray(obj).is_some() {
         if matches!(
-            attr.as_str(),
+            attr,
             "append"
                 | "extend"
                 | "insert"
@@ -2217,6 +2929,7 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 | "hex"
                 | "count"
                 | "find"
+                | "maketrans"
                 | "replace"
                 | "split"
                 | "strip"
@@ -2233,15 +2946,15 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 | "__delitem__"
                 | "__contains__"
         ) {
-            return value::bound_method_new(obj, attr);
+            return value::bound_method_new(obj, attr.to_string());
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if let Some(view) = value::as_memoryview(obj) {
         if view.released {
             return exc::raise_with_message(exc::VALUE_ERROR, value::MEMORYVIEW_RELEASED);
         }
-        return match attr.as_str() {
+        return match attr {
             "format" => value::str_alloc(view.format.to_string()),
             "itemsize" => ops::int_result(view.itemsize as i64),
             "ndim" => ops::int_result(1),
@@ -2252,24 +2965,24 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             "contiguous" => value::TRUE,
             "obj" => view.buffer,
             "tobytes" | "tolist" | "release" | "cast" | "__len__" | "__getitem__"
-            | "__setitem__" | "__contains__" => value::bound_method_new(obj, attr),
-            _ => attribute_error(obj, &attr),
+            | "__setitem__" | "__contains__" => value::bound_method_new(obj, attr.to_string()),
+            _ => attribute_error(obj, attr),
         };
     }
     if let Some(view) = value::as_dict_view(obj) {
-        return match attr.as_str() {
+        return match attr {
             "mapping" => view.dict,
             "__len__" | "__iter__" | "__contains__" | "isdisjoint" => {
-                value::bound_method_new(obj, attr)
+                value::bound_method_new(obj, attr.to_string())
             }
-            _ => attribute_error(obj, &attr),
+            _ => attribute_error(obj, attr),
         };
     }
     if value::as_range(obj).is_some() {
         if attr == "index" {
-            return value::bound_method_new(obj, attr);
+            return value::bound_method_new(obj, attr.to_string());
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     // Every Python object answers `__class__`, including immediate
     // singletons such as `NotImplemented`, `None` and booleans.
@@ -2278,10 +2991,10 @@ pub(crate) fn getattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     }
     // Integer values expose their bytes-conversion and bit-length methods as
     // bound-method values (`f = (255).to_bytes`).
-    if is_integer_value(obj) && matches!(attr.as_str(), "to_bytes" | "bit_length") {
-        return value::bound_method_new(obj, attr);
+    if is_integer_value(obj) && matches!(attr, "to_bytes" | "bit_length") {
+        return value::bound_method_new(obj, attr.to_string());
     }
-    attribute_error(obj, &attr)
+    attribute_error(obj, attr)
 }
 
 /// `hasattr(obj, name)`: whether the attribute exists.
@@ -2310,14 +3023,39 @@ pub(crate) fn hasattr(obj: i64, name: *const u8, name_len: usize) -> i64 {
 /// assignment; otherwise the instance dictionary stores it, subject to
 /// `__slots__` restrictions. Class assignment writes the runtime overlay, so
 /// it never mutates the frozen class body.
+///
+/// A class-defined `__setattr__` runs first for class instances; the
+/// `object.__setattr__(...)` slot is the default assignment below, so it
+/// bypasses the override exactly like CPython.
 pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64) -> i64 {
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    if let Some(class) = value::instance_class_value(obj) {
+        if let Some(entry) = instance_attribute_hook(class, "__setattr__") {
+            let name_value = value::str_alloc(attr);
+            let roots = crate::heap::root_values(&[name_value, new_value]);
+            let result = call_bound_entry(
+                obj,
+                class,
+                entry,
+                "__setattr__",
+                &[name_value, new_value],
+                &[],
+            );
+            crate::heap::release_roots(roots);
+            return result;
+        }
+    }
+    setattr_named(obj, &attr, new_value)
+}
+
+/// The default `obj.name = value` assignment (see [`setattr`]).
+fn setattr_named(obj: i64, attr: &str, new_value: i64) -> i64 {
     // Extension functions keep writable metadata in the shim slot; opaque
     // handles use a metadata overlay for the four dunder slots and delegate
     // every other assignment to the extension's `tp_setattro`.
-    if let Some(result) = modules::extension::ext_function_setattr(obj, &attr, new_value) {
+    if let Some(result) = modules::extension::ext_function_setattr(obj, attr, new_value) {
         return result;
     }
     if value::as_ext_function(obj).is_some() {
@@ -2327,17 +3065,17 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
         );
     }
     if value::as_ext_object(obj).is_some() {
-        if let Some(result) = modules::extension::ext_object_metadata_setattr(obj, &attr, new_value)
+        if let Some(result) = modules::extension::ext_object_metadata_setattr(obj, attr, new_value)
         {
             return result;
         }
-        return modules::extension::ext_object_setattr(obj, &attr, new_value);
+        return modules::extension::ext_object_setattr(obj, attr, new_value);
     }
     // Module attributes are writable: a native module keeps its spec as the
     // default resolution and stores the assignment as an override, while a
     // user module also mirrors it into the globals store behind its namespace.
     if let Some(module) = value::as_module(obj) {
-        return modules::module_set_attr(module, &attr, new_value);
+        return modules::module_set_attr(module, attr, new_value);
     }
     // Python-level functions and partial objects have CPython's writable
     // attribute surface: the `__name__`/`__qualname__`/`__doc__`/`__module__`/
@@ -2348,11 +3086,11 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
         // `functools.partial`'s `func`/`args`/`keywords` are read-only slots,
         // like CPython; every other name uses the function attribute surface.
         if matches!(&function.body, value::FunctionBody::Partial { .. })
-            && matches!(attr.as_str(), "func" | "args" | "keywords")
+            && matches!(attr, "func" | "args" | "keywords")
         {
-            return attribute_error(obj, &attr);
+            return attribute_error(obj, attr);
         }
-        match attr.as_str() {
+        match attr {
             "__name__" | "__qualname__" if value::as_str(new_value).is_none() => {
                 return type_error(format!("{attr} must be set to a string object"));
             }
@@ -2376,10 +3114,10 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
             value::set_type_annotations(new_value);
             return NONE;
         }
-        if value::function_setattr(obj, &attr, new_value) {
+        if value::function_setattr(obj, attr, new_value) {
             return NONE;
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     // A built-in `property` object has a writable attribute table: `enum`
     // redirects descriptors by assigning `member`, `fget`, `_get`, ... .
@@ -2388,10 +3126,10 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
         if state.kind == value::DescriptorKind::Property
             && !(attr.starts_with("__") && attr.ends_with("__") && attr.len() > 4)
         {
-            state.set_attr(obj, attr, new_value);
+            state.set_attr(obj, attr.to_string(), new_value);
             return NONE;
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if let Some(class) = value::instance_class_value(obj) {
         if attr == "__dict__" {
@@ -2400,7 +3138,7 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
             }
             return type_error("__dict__ must be set to a dict".to_string());
         }
-        if let Some(entry) = value::class_lookup(class, &attr).filter(is_data_descriptor) {
+        if let Some(entry) = value::class_lookup(class, attr).filter(is_data_descriptor) {
             match &entry {
                 value::ClassEntry::Method(MethodKind::Property, _) => {
                     let name = value::instance_class_name(obj).unwrap_or("object");
@@ -2441,30 +3179,28 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
                 value::ClassEntry::Method(_, _) => {}
             }
         }
-        if !value::class_allows_attr(class, &attr) {
+        if !value::class_allows_attr(class, attr) {
             let name = value::instance_class_name(obj).unwrap_or("object");
             return exc::raise_with_message(
                 ATTRIBUTE_ERROR,
                 &format!("'{name}' object has no attribute '{attr}'"),
             );
         }
-        value::instance_setattr(obj, attr, new_value);
+        value::instance_setattr(obj, attr.to_string(), new_value);
         return NONE;
     }
     if let Some(class) = value::as_class(obj) {
         // `Cls.__name__`/`Cls.__qualname__` accept only strings, like
         // `type.__name__`'s setter.
-        if matches!(attr.as_str(), "__name__" | "__qualname__")
-            && value::as_str(new_value).is_none()
-        {
+        if matches!(attr, "__name__" | "__qualname__") && value::as_str(new_value).is_none() {
             return type_error(format!("{attr} must be set to a string object"));
         }
-        if value::class_set_attr(obj, attr, new_value) {
+        if value::class_set_attr(obj, attr.to_string(), new_value) {
             return NONE;
         }
         return type_error(format!("cannot set attributes of class '{}'", class.name));
     }
-    attribute_error(obj, &attr)
+    attribute_error(obj, attr)
 }
 
 /// `del obj.name` for modules, class instances and classes.
@@ -2474,17 +3210,34 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
 /// the deletion; otherwise the instance attribute is removed. Class deletion
 /// tombstones the name (or drops a runtime assignment). Every other receiver
 /// reports `AttributeError`.
+///
+/// A class-defined `__delattr__` runs first for class instances;
+/// `object.__delattr__(...)` is the default deletion below.
 pub(crate) fn delete_attr(obj: i64, name: *const u8, name_len: usize) -> i64 {
     let Some(attr) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
+    if let Some(class) = value::instance_class_value(obj) {
+        if let Some(entry) = instance_attribute_hook(class, "__delattr__") {
+            let name_value = value::str_alloc(attr);
+            let roots = crate::heap::root_values(&[name_value]);
+            let result = call_bound_entry(obj, class, entry, "__delattr__", &[name_value], &[]);
+            crate::heap::release_roots(roots);
+            return result;
+        }
+    }
+    delete_attr_named(obj, &attr)
+}
+
+/// The default `del obj.name` deletion (see [`delete_attr`]).
+fn delete_attr_named(obj: i64, attr: &str) -> i64 {
     // Deleting a module attribute drops the override (restoring the spec
     // default) or the user module's global binding.
     if let Some(module) = value::as_module(obj) {
-        return modules::module_del_attr(module, &attr);
+        return modules::module_del_attr(module, attr);
     }
     if let Some(class) = value::instance_class_value(obj) {
-        if let Some(value::ClassEntry::Attr(descriptor)) = value::class_lookup(class, &attr) {
+        if let Some(value::ClassEntry::Attr(descriptor)) = value::class_lookup(class, attr) {
             if let Some(state) = value::as_descriptor(descriptor) {
                 let deleter = state.fdel();
                 if state.kind == value::DescriptorKind::Property && deleter != NONE {
@@ -2497,13 +3250,13 @@ pub(crate) fn delete_attr(obj: i64, name: *const u8, name_len: usize) -> i64 {
                 }
             }
         }
-        if value::instance_remove_attr(obj, &attr).is_some() {
+        if value::instance_remove_attr(obj, attr).is_some() {
             return NONE;
         }
-        return attribute_error(obj, &attr);
+        return attribute_error(obj, attr);
     }
     if let Some(class) = value::as_class(obj) {
-        if value::class_delete_attr(obj, &attr) {
+        if value::class_delete_attr(obj, attr) {
             return NONE;
         }
         return type_error(format!(
@@ -2511,7 +3264,7 @@ pub(crate) fn delete_attr(obj: i64, name: *const u8, name_len: usize) -> i64 {
             attr, class.name
         ));
     }
-    attribute_error(obj, &attr)
+    attribute_error(obj, attr)
 }
 
 /// Data attributes of `pathlib.Path`.
@@ -2707,6 +3460,44 @@ fn int_arg(v: i64) -> Result<i64, i64> {
     })
 }
 
+/// Resolves an optional `start`/`end` bound of a searching method to an
+/// offset in `0..=length`.
+///
+/// `NONE` means "omitted" and yields `default`; integers follow
+/// `slice.indices` semantics, counting negative values from the end and
+/// clamping out-of-range values instead of raising. Every other value raises
+/// the same `TypeError` as CPython.
+fn slice_bound(arg: i64, length: usize, default: usize) -> Result<usize, i64> {
+    if arg == NONE {
+        return Ok(default);
+    }
+    let Some(index) = value::as_integer(arg) else {
+        // CPython clips huge `__index__` results instead of rejecting them.
+        if let Some(big) = value::as_bigint(arg) {
+            return Ok(if big.sign() == Sign::Minus { 0 } else { length });
+        }
+        return Err(type_error(
+            "slice indices must be integers or None or have an __index__ method".to_string(),
+        ));
+    };
+    let limit = i64::try_from(length).unwrap_or(i64::MAX);
+    let index = if index < 0 {
+        index.saturating_add(limit)
+    } else {
+        index
+    };
+    // `clamp` leaves a non-negative value that always fits `usize`.
+    Ok(index.clamp(0, limit) as usize)
+}
+
+/// Returns the byte offset of the `index`-th character of `text`, or the
+/// byte length when `index` is past the end.
+fn char_offset(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
 // int
 
 /// Whether `obj` is the `int` builtin *type* value.
@@ -2727,6 +3518,33 @@ fn is_builtin_int_type(obj: i64) -> bool {
     )
 }
 
+/// Canonical compiler builtin value of a `builtins`-module type spelling.
+///
+/// `builtins.str` is a native module function value while the compiler
+/// spelling `str` is a `Builtin` function value; both name the same type. The
+/// type-level dispatchers only recognise the latter, so the module spelling is
+/// mapped to it before dispatch. Every other receiver is returned unchanged.
+fn canonical_builtin_type(obj: i64) -> i64 {
+    let Some(function) = value::as_function(obj) else {
+        return obj;
+    };
+    let value::FunctionBody::Native {
+        module: "builtins",
+        name,
+    } = &function.body
+    else {
+        return obj;
+    };
+    let Some(builtin) = hydro_ir::Builtin::from_name(name) else {
+        return obj;
+    };
+    if value::is_builtin_type(&builtin) {
+        value::builtin_function_new(builtin)
+    } else {
+        obj
+    }
+}
+
 /// Whether `obj` is the `bytes` builtin *type* value.
 ///
 /// Like `int`, `bytes` is a builtin function value at runtime, so
@@ -2738,6 +3556,21 @@ fn is_builtin_bytes_type(obj: i64) -> bool {
     matches!(
         &function.body,
         value::FunctionBody::Builtin(hydro_ir::Builtin::Bytes)
+    )
+}
+
+/// Whether `obj` is the `dict` builtin *type* value.
+///
+/// `dict` is a builtin function value at runtime, so `dict.__getitem__(m, k)`
+/// reaches [`call`] with the function as the receiver; the mapping operand is
+/// the explicit first argument.
+fn is_builtin_dict_type(obj: i64) -> bool {
+    let Some(function) = value::as_function(obj) else {
+        return false;
+    };
+    matches!(
+        &function.body,
+        value::FunctionBody::Builtin(hydro_ir::Builtin::Dict)
     )
 }
 
@@ -3334,8 +4167,121 @@ fn padding_fill(argument: Option<i64>) -> Result<char, i64> {
     }
 }
 
+/// `str.maketrans(x[, y[, z]])`: builds a `str.translate` table.
+///
+/// This is a static method on the type (and reachable through instances, as
+/// in CPython), so the receiver is ignored by every caller. One argument must
+/// be an exact dict whose string keys of length one become ordinals; two
+/// arguments are equal-length strings mapping character by character; a third
+/// string lists characters that translate to `None`. Values in the input dict
+/// are copied unchanged.
+fn str_maketrans(args: &[i64]) -> i64 {
+    if let Some(err) = check_arity("str", "maketrans", args.len(), 1, 3) {
+        return err;
+    }
+    // CPython's clinic signature parses `y` and `z` as strings before the
+    // table operand is examined, so their type errors come first.
+    let first = args[0];
+    let y = match args.get(1) {
+        Some(&argument) => match str_arg("maketrans", 2, argument) {
+            Ok(text) => Some(text),
+            Err(err) => return err,
+        },
+        None => None,
+    };
+    let z = match args.get(2) {
+        Some(&argument) => match str_arg("maketrans", 3, argument) {
+            Ok(text) => Some(text),
+            Err(err) => return err,
+        },
+        None => None,
+    };
+    let mut pairs: Vec<(i64, i64)> = Vec::new();
+    match y {
+        Some(y) => {
+            let Some(x) = value::as_str(first) else {
+                return type_error(
+                    "first maketrans argument must be a string if there is a second argument"
+                        .to_string(),
+                );
+            };
+            let x_chars: Vec<char> = x.chars().collect();
+            let y_chars: Vec<char> = y.chars().collect();
+            if x_chars.len() != y_chars.len() {
+                return exc::raise_with_message(
+                    VALUE_ERROR,
+                    "the first two maketrans arguments must have equal length",
+                );
+            }
+            for (from, to) in x_chars.iter().zip(y_chars.iter()) {
+                // Every Unicode scalar fits the tagged integer range.
+                if let (Some(from), Some(to)) = (
+                    value::encode_int(*from as i64),
+                    value::encode_int(*to as i64),
+                ) {
+                    pairs.push((from, to));
+                }
+            }
+            if let Some(z) = z {
+                for deleted in z.chars() {
+                    if let Some(ordinal) = value::encode_int(deleted as i64) {
+                        pairs.push((ordinal, NONE));
+                    }
+                }
+            }
+        }
+        None => {
+            let Some(source) = value::as_dict_data(first) else {
+                return type_error(
+                    "if you give only one argument to maketrans it must be a dict".to_string(),
+                );
+            };
+            for &(key, item) in source.entries() {
+                if let Some(text) = value::as_str(key) {
+                    let mut chars = text.chars();
+                    let (Some(character), None) = (chars.next(), chars.next()) else {
+                        return exc::raise_with_message(
+                            VALUE_ERROR,
+                            "string keys in translatetable must be of length 1",
+                        );
+                    };
+                    let Some(ordinal) = value::encode_int(character as i64) else {
+                        continue;
+                    };
+                    pairs.push((ordinal, item));
+                } else if value::as_integer(key).is_some() {
+                    pairs.push((key, item));
+                } else {
+                    return type_error(
+                        "keys in translate table mustbe strings or integers".to_string(),
+                    );
+                }
+            }
+        }
+    }
+    // The converted keys are immediates, but the copied values may be heap
+    // objects that only the source dict and the pending pairs keep alive.
+    let mut rooted: Vec<i64> = Vec::with_capacity(2 * pairs.len() + args.len() + 1);
+    rooted.extend_from_slice(args);
+    for &(key, item) in &pairs {
+        rooted.push(key);
+        rooted.push(item);
+    }
+    let roots = crate::heap::root_values(&rooted);
+    let table = value::dict_new(Vec::new());
+    crate::heap::push_scoped_root(table);
+    for (key, item) in pairs {
+        container::dict_set(table, key, item);
+    }
+    crate::heap::release_roots(roots);
+    table
+}
+
 fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
     match method {
+        // `str.maketrans` is a static method, so instances reach it too; the
+        // receiver is ignored.
+        "maketrans" => str_maketrans(args),
         "upper" => {
             if let Some(err) = check_arity("str", method, args.len(), 0, 0) {
                 return err;
@@ -3644,14 +4590,32 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
                 };
                 if let Some(position) = table.find(key) {
                     let replacement = table.entries()[position].1;
-                    if replacement != NONE {
-                        let Some(text) = value::as_str(replacement) else {
-                            return type_error(format!(
-                                "character mapping must return integer, None or str, not '{}'",
-                                value::type_name(replacement)
-                            ));
-                        };
+                    if replacement == NONE {
+                        continue;
+                    }
+                    if let Some(text) = value::as_str(replacement) {
                         out.push_str(text);
+                    } else if let Some(ordinal) = value::as_integer(replacement) {
+                        // Integer values name a replacement code point.
+                        match u32::try_from(ordinal).ok().and_then(char::from_u32) {
+                            Some(mapped) => out.push(mapped),
+                            None => {
+                                return exc::raise_with_message(
+                                    VALUE_ERROR,
+                                    "character mapping must be in range(0x110000)",
+                                )
+                            }
+                        }
+                    } else if value::is_bigint(replacement) {
+                        return exc::raise_with_message(
+                            VALUE_ERROR,
+                            "character mapping must be in range(0x110000)",
+                        );
+                    } else {
+                        return type_error(format!(
+                            "character mapping must return integer, None or str, not '{}'",
+                            value::type_name(replacement)
+                        ));
                     }
                 } else {
                     out.push(ch);
@@ -3715,18 +4679,58 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
             };
             ops::int_result(position)
         }
-        "count" => {
+        // CPython only strips the affix when it is actually there; an empty
+        // affix always matches, so those calls return the receiver unchanged.
+        "removeprefix" | "removesuffix" => {
             if let Some(err) = check_arity("str", method, args.len(), 1, 1) {
+                return err;
+            }
+            let affix = match str_arg(method, 1, args[0]) {
+                Ok(s) => s,
+                Err(err) => return err,
+            };
+            let stripped = if method == "removeprefix" {
+                s.strip_prefix(affix.as_str())
+            } else {
+                s.strip_suffix(affix.as_str())
+            };
+            value::str_alloc(stripped.unwrap_or(s.as_str()).to_string())
+        }
+        "count" => {
+            if let Some(err) = check_arity("str", method, args.len(), 1, 3) {
                 return err;
             }
             let pat = match str_arg(method, 1, args[0]) {
                 Ok(s) => s,
                 Err(err) => return err,
             };
-            let n = if pat.is_empty() {
-                s.chars().count() + 1
+            // `start`/`end` are slice indices over characters, not bytes.
+            let length = s.chars().count();
+            let start = match args.get(1) {
+                Some(arg) => match slice_bound(*arg, length, 0) {
+                    Ok(index) => index,
+                    Err(err) => return err,
+                },
+                None => 0,
+            };
+            let end = match args.get(2) {
+                Some(arg) => match slice_bound(*arg, length, length) {
+                    Ok(index) => index,
+                    Err(err) => return err,
+                },
+                None => length,
+            };
+            let n = if start > end {
+                // `start` past `end` selects no characters, so no pattern
+                // (not even the empty one) can match.
+                0
             } else {
-                s.matches(pat.as_str()).count()
+                let hay = &s[char_offset(&s, start)..char_offset(&s, end)];
+                if pat.is_empty() {
+                    hay.chars().count() + 1
+                } else {
+                    hay.matches(pat.as_str()).count()
+                }
             };
             ops::int_result(n as i64)
         }
@@ -4023,10 +5027,57 @@ fn strip_bytes(data: &[u8], chars: Option<&[u8]>, left: bool, right: bool) -> Ve
     data[start..end].to_vec()
 }
 
+/// Copies one `bytes.maketrans` operand from the buffer protocol.
+///
+/// `bytes`, `bytearray` and `memoryview` are accepted, like CPython's
+/// `Py_buffer` converter; every other object reports the buffer-protocol
+/// message instead of the byte-string wording used by value methods.
+fn maketrans_buffer(argument: i64) -> Result<Vec<u8>, i64> {
+    if let Some(bytes) = value::as_bytes(argument) {
+        return Ok(bytes.to_vec());
+    }
+    if let Some(view) = value::as_memoryview(argument) {
+        return value::memoryview_bytes(view)
+            .map_err(|message| exc::raise_with_message(VALUE_ERROR, message));
+    }
+    Err(type_error(format!(
+        "a bytes-like object is required, not '{}'",
+        value::type_name(argument)
+    )))
+}
+
+/// `bytes.maketrans(frm, to)`: 256-byte translation table for
+/// `bytes.translate`/`bytearray.translate`.
+///
+/// The static method takes exactly the two buffers (CPython 3.14 dropped the
+/// single-argument table form) and ignores any receiver.
+fn bytes_maketrans(args: &[i64]) -> i64 {
+    if let Some(err) = check_arity("bytes", "maketrans", args.len(), 2, 2) {
+        return err;
+    }
+    let from = match maketrans_buffer(args[0]) {
+        Ok(bytes) => bytes,
+        Err(err) => return err,
+    };
+    let to = match maketrans_buffer(args[1]) {
+        Ok(bytes) => bytes,
+        Err(err) => return err,
+    };
+    if from.len() != to.len() {
+        return exc::raise_with_message(VALUE_ERROR, "maketrans arguments must have same length");
+    }
+    let mut table: Vec<u8> = (0..=u8::MAX).collect();
+    for (index, byte) in from.iter().enumerate() {
+        table[*byte as usize] = to[index];
+    }
+    value::bytes_new(table)
+}
+
 /// Class-level methods reached through the `bytes` builtin type value.
 ///
 /// `fromhex` reuses [`builtins::bytes_fromhex`], the CPython-faithful decoder
-/// that also backs `bytearray.fromhex`.
+/// that also backs `bytearray.fromhex`; `maketrans` is the byte-sequence
+/// static table builder.
 fn bytes_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     match method {
         "fromhex" => {
@@ -4038,12 +5089,21 @@ fn bytes_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String,
             }
             builtins::bytes_fromhex(args[0])
         }
+        "maketrans" => {
+            if !keywords.is_empty() {
+                return type_error("maketrans() takes no keyword arguments".to_string());
+            }
+            bytes_maketrans(args)
+        }
         _ => attribute_error(obj, method),
     }
 }
 
 fn bytes_method(obj: i64, data: Vec<u8>, method: &str, args: &[i64]) -> i64 {
     match method {
+        // `bytes.maketrans` is a static method, so instances reach it too;
+        // the receiver is ignored.
+        "maketrans" => bytes_maketrans(args),
         "decode" => {
             if let Some(err) = check_arity("bytes", method, args.len(), 0, 2) {
                 return err;
@@ -4075,14 +5135,34 @@ fn bytes_method(obj: i64, data: Vec<u8>, method: &str, args: &[i64]) -> i64 {
             value::str_alloc(hex_bytes(&data))
         }
         "count" => {
-            if let Some(err) = check_arity("bytes", method, args.len(), 1, 1) {
+            if let Some(err) = check_arity("bytes", method, args.len(), 1, 3) {
                 return err;
             }
             let needle = match bytes_arg(method, 1, args[0]) {
                 Ok(bytes) => bytes,
                 Err(err) => return err,
             };
-            ops::int_result(count_sub(&data, &needle) as i64)
+            // `bytes` bounds are plain byte offsets and clamp like slices.
+            let start = match args.get(1) {
+                Some(arg) => match slice_bound(*arg, data.len(), 0) {
+                    Ok(index) => index,
+                    Err(err) => return err,
+                },
+                None => 0,
+            };
+            let end = match args.get(2) {
+                Some(arg) => match slice_bound(*arg, data.len(), data.len()) {
+                    Ok(index) => index,
+                    Err(err) => return err,
+                },
+                None => data.len(),
+            };
+            let n = if start > end {
+                0
+            } else {
+                count_sub(&data[start..end], &needle)
+            };
+            ops::int_result(n as i64)
         }
         "find" => {
             if let Some(err) = check_arity("bytes", method, args.len(), 1, 1) {
@@ -4436,7 +5516,7 @@ fn bytearray_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             value::bytearray_new(copy)
         }
         // Read-only byte-string methods; transformations return a bytearray.
-        "decode" | "hex" | "count" | "find" | "startswith" | "endswith" => {
+        "decode" | "hex" | "count" | "find" | "startswith" | "endswith" | "maketrans" => {
             let data = value::as_bytearray(obj).cloned().unwrap_or_default();
             bytes_method(obj, data, method, args)
         }
@@ -5488,6 +6568,361 @@ fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
         }
         _ => attribute_error(obj, method),
     }
+}
+
+// -------------------------------------------------------------------------
+// Native `dict` subclasses
+// -------------------------------------------------------------------------
+
+/// Runs one unbound native `dict` mapping method.
+///
+/// `args[0]` is the mapping operand — a `dict`, a `defaultdict` or a native
+/// `dict` subclass instance — and the rest are the method arguments. Keyword
+/// pairs are accepted only by `__init__` and `update`. Every entry of the
+/// native `dict` class is a bound-method value on a private marker class, so
+/// the dispatcher routes `super().__setitem__(key, value)`,
+/// `dict.__getitem__(mapping, key)` and `d.keys()` here (see
+/// `value::dict_native_class`).
+fn dict_native_method(method: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let Some(&receiver) = args.first() else {
+        return type_error(format!(
+            "descriptor '{method}' of 'dict' object needs an argument"
+        ));
+    };
+    let rest = &args[1..];
+    if method == "fromkeys" {
+        return dict_fromkeys(receiver, rest);
+    }
+    let Some(storage) = dict_mapping_storage(receiver) else {
+        return type_error(format!(
+            "descriptor '{method}' for 'dict' objects doesn't apply to a '{}' object",
+            value::type_name_of(receiver)
+        ));
+    };
+    match method {
+        "__init__" | "update" => dict_update(storage, rest, keywords),
+        "__eq__" | "__ne__" => {
+            if let Some(err) = check_arity("dict", method, rest.len(), 1, 1) {
+                return err;
+            }
+            if let Some(err) = reject_dict_keywords(method, keywords) {
+                return err;
+            }
+            let equal = match (
+                value::mapping_pairs(receiver),
+                value::mapping_pairs(rest[0]),
+            ) {
+                (Some(left), Some(right)) => dict_pairs_equal(left, right),
+                _ => false,
+            };
+            value::bool_value(if method == "__eq__" { equal } else { !equal })
+        }
+        "__repr__" | "__str__" => {
+            if let Some(err) = check_arity("dict", method, rest.len(), 0, 0) {
+                return err;
+            }
+            if let Some(err) = reject_dict_keywords(method, keywords) {
+                return err;
+            }
+            // A `dict` subclass renders exactly like a dict, never with the
+            // subclass's own `<... object>` form.
+            value::str_alloc(value::repr(storage))
+        }
+        "__iter__" => {
+            if let Some(err) = check_arity("dict", method, rest.len(), 0, 0) {
+                return err;
+            }
+            if let Some(err) = reject_dict_keywords(method, keywords) {
+                return err;
+            }
+            crate::iter::iter_new(storage)
+        }
+        "__reversed__" => {
+            if let Some(err) = check_arity("dict", method, rest.len(), 0, 0) {
+                return err;
+            }
+            if let Some(err) = reject_dict_keywords(method, keywords) {
+                return err;
+            }
+            dict_reversed_iter(storage)
+        }
+        "__or__" | "__ror__" => {
+            if let Some(err) = check_arity("dict", method, rest.len(), 1, 1) {
+                return err;
+            }
+            if let Some(err) = reject_dict_keywords(method, keywords) {
+                return err;
+            }
+            let Some(other) = value::mapping_pairs(rest[0]) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let other = other.to_vec();
+            // `dict | other` builds a plain dict in CPython, never the subclass.
+            let (first, second) = if method == "__or__" {
+                (dict_pairs_snapshot(storage), other)
+            } else {
+                (other, dict_pairs_snapshot(storage))
+            };
+            let result = value::dict_new(first);
+            let roots = crate::heap::root_values(std::slice::from_ref(&result));
+            for (key, item) in second {
+                container::dict_set(result, key, item);
+                if exc::pending() {
+                    break;
+                }
+            }
+            crate::heap::release_roots(roots);
+            result
+        }
+        "__ior__" => {
+            if let Some(err) = check_arity("dict", method, rest.len(), 1, 1) {
+                return err;
+            }
+            if let Some(err) = reject_dict_keywords(method, keywords) {
+                return err;
+            }
+            let result = dict_update(storage, rest, &[]);
+            if exc::pending() {
+                return result;
+            }
+            receiver
+        }
+        "popitem" => {
+            if let Some(err) = check_arity("dict", method, rest.len(), 0, 0) {
+                return err;
+            }
+            if let Some(err) = reject_dict_keywords(method, keywords) {
+                return err;
+            }
+            dict_popitem(receiver, storage)
+        }
+        "__getitem__" | "__setitem__" | "__delitem__" | "__contains__" | "__len__" | "get"
+        | "keys" | "values" | "items" | "setdefault" | "pop" | "copy" | "clear" => {
+            if let Some(err) = reject_dict_keywords(method, keywords) {
+                return err;
+            }
+            dict_method(storage, method, rest)
+        }
+        _ => attribute_error(receiver, method),
+    }
+}
+
+/// Full-argv trampoline of the native `dict.__init__` entry.
+///
+/// The declared `(self, *args, **kwargs)` signature binds through
+/// [`call_user_method_kw`] for class instantiation and `super().__init__(...)`
+/// calls, which invoke this with the three bound slots.
+pub(crate) extern "C" fn dict_init_entry(argv: *const i64) -> i64 {
+    dict_keyword_entry(argv, "__init__")
+}
+
+/// Full-argv trampoline of the native `dict.update` entry.
+pub(crate) extern "C" fn dict_update_entry(argv: *const i64) -> i64 {
+    dict_keyword_entry(argv, "update")
+}
+
+fn dict_keyword_entry(argv: *const i64, method: &str) -> i64 {
+    if argv.is_null() {
+        return type_error(format!("dict.{method}() received no argument buffer"));
+    }
+    // SAFETY: the binder passes the three slots the signature declares.
+    let slots = unsafe { std::slice::from_raw_parts(argv, 3) };
+    let roots = crate::heap::root_values(slots);
+    let mut args: Vec<i64> = Vec::with_capacity(2);
+    args.push(slots[0]);
+    if let Some(items) = value::as_list(slots[1]) {
+        args.extend_from_slice(items);
+    }
+    let keywords: Vec<(String, i64)> = value::as_dict(slots[2])
+        .map(|pairs| {
+            pairs
+                .iter()
+                .filter_map(|(name, item)| {
+                    value::as_str(*name).map(|name| (name.to_string(), *item))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let result = dict_native_method(method, &args, &keywords);
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// The real dict holding a mapping operand's entries.
+///
+/// A plain `dict` is its own storage; a native `dict` subclass instance gets
+/// its reserved storage dict, created on demand.
+fn dict_mapping_storage(receiver: i64) -> Option<i64> {
+    if value::as_dict_data(receiver).is_some() {
+        return Some(receiver);
+    }
+    value::native_dict_data(receiver, true)
+}
+
+/// `dict.__init__`/`dict.update`: merge one optional source and the keywords.
+///
+/// `dict.__init__` never clears an existing mapping, so both entry points share
+/// this merge; CPython keeps the entries of an already-initialised subclass.
+fn dict_update(storage: i64, rest: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if rest.len() > 1 {
+        return type_error(format!(
+            "dict expected at most 1 argument, got {}",
+            rest.len()
+        ));
+    }
+    if let Some(&source) = rest.first() {
+        // Any mapping source (`dict`, `defaultdict`, a `dict` subclass
+        // instance) contributes pairs; everything else is an iterable of
+        // two-item sequences.
+        if let Some(pairs) = value::mapping_pairs(source) {
+            let pairs = pairs.to_vec();
+            if let Some(mut target) = value::dict_pairs_mut(storage) {
+                for (key, item) in pairs {
+                    container::dict_insert_barrier(storage, &mut target, key, item);
+                }
+            }
+        } else {
+            let result = dict_method(storage, "update", std::slice::from_ref(&source));
+            if exc::pending() {
+                return result;
+            }
+        }
+    }
+    for (name, item) in keywords {
+        let key = value::str_alloc(name.clone());
+        let roots = crate::heap::root_values(&[key, *item]);
+        if let Some(mut pairs) = value::dict_pairs_mut(storage) {
+            container::dict_insert_barrier(storage, &mut pairs, key, *item);
+        }
+        crate::heap::release_roots(roots);
+        if exc::pending() {
+            return NONE;
+        }
+    }
+    NONE
+}
+
+fn dict_popitem(receiver: i64, storage: i64) -> i64 {
+    let last = value::as_dict(storage).and_then(|pairs| pairs.last().map(|(key, _)| *key));
+    let Some(key) = last else {
+        return exc::raise_with_message(KEY_ERROR, "popitem(): dictionary is empty");
+    };
+    let Some(mut pairs) = value::dict_pairs_mut(storage) else {
+        return attribute_error(receiver, "popitem");
+    };
+    match pairs.remove(key) {
+        Some((key, item)) => {
+            drop(pairs);
+            value::tuple_new(vec![key, item])
+        }
+        None => {
+            drop(pairs);
+            exc::raise_with_message(KEY_ERROR, "popitem(): dictionary is empty")
+        }
+    }
+}
+
+/// `reversed(d)`: an iterator over the mapping's keys from the last inserted.
+fn dict_reversed_iter(storage: i64) -> i64 {
+    let mut keys: Vec<i64> = value::as_dict(storage)
+        .map(|pairs| pairs.iter().map(|(key, _)| *key).collect())
+        .unwrap_or_default();
+    keys.reverse();
+    let items = value::list_new(keys);
+    let roots = crate::heap::root_values(std::slice::from_ref(&items));
+    let iterator = crate::iter::iter_new(items);
+    crate::heap::release_roots(roots);
+    iterator
+}
+
+/// `dict.fromkeys(iterable, value=None)`.
+///
+/// `dict.fromkeys` builds a plain dict, while a subclass's classmethod builds
+/// an instance of that subclass, exactly like CPython.
+fn dict_fromkeys(receiver: i64, rest: &[i64]) -> i64 {
+    let Some(&source) = rest.first() else {
+        return type_error(format!(
+            "fromkeys expected at least 1 argument, got {}",
+            rest.len()
+        ));
+    };
+    let default = rest.get(1).copied().unwrap_or(NONE);
+    // `dict.fromkeys` (the native class) builds a plain dict; a subclass binds
+    // its own class and builds an instance of it.
+    let class = if value::as_class(receiver).is_some() {
+        if value::is_native_dict_class(receiver) {
+            NONE
+        } else {
+            receiver
+        }
+    } else if let Some(class) = value::instance_class_value(receiver) {
+        class
+    } else {
+        return type_error(format!(
+            "descriptor 'fromkeys' for 'dict' objects doesn't apply to a '{}' object",
+            value::type_name_of(receiver)
+        ));
+    };
+    if class != NONE {
+        let instance = value::instance_new(class);
+        let roots = crate::heap::root_values(std::slice::from_ref(&instance));
+        let storage = value::native_dict_data(instance, true).unwrap_or(NONE);
+        let filled = dict_store_keys(storage, source, default);
+        crate::heap::release_roots(roots);
+        return if exc::pending() { filled } else { instance };
+    }
+    let storage = value::dict_new(Vec::new());
+    let roots = crate::heap::root_values(std::slice::from_ref(&storage));
+    let result = dict_store_keys(storage, source, default);
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// Inserts every item of `source` with `default`; returns `NONE` on success.
+fn dict_store_keys(storage: i64, source: i64, default: i64) -> i64 {
+    let iterator = crate::iter::iter_new(source);
+    if exc::pending() {
+        return NONE;
+    }
+    let roots = crate::heap::root_values(&[iterator, default]);
+    loop {
+        let mut item = NONE;
+        let status = crate::iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            break;
+        }
+        if status == 0 {
+            break;
+        }
+        container::dict_set(storage, item, default);
+        if exc::pending() {
+            break;
+        }
+    }
+    crate::heap::release_roots(roots);
+    NONE
+}
+
+fn dict_pairs_equal(left: &[(i64, i64)], right: &[(i64, i64)]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(key, item)| {
+            container::dict_find(right, *key)
+                .map(|position| container::equals(*item, right[position].1))
+                .unwrap_or(false)
+        })
+}
+
+fn dict_pairs_snapshot(storage: i64) -> Vec<(i64, i64)> {
+    value::as_dict(storage)
+        .map(|pairs| pairs.to_vec())
+        .unwrap_or_default()
+}
+
+/// Rejects keywords for a native `dict` method that declares none.
+fn reject_dict_keywords(method: &str, keywords: &[(String, i64)]) -> Option<i64> {
+    keywords
+        .first()
+        .map(|_| type_error(format!("dict.{method}() takes no keyword arguments")))
 }
 
 /// `d.update(iterable)`: copies an iterable of key/value pairs into `d`.
@@ -7072,10 +8507,10 @@ fn coroutine_method(obj: i64, method: &str, args: &[i64]) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{call, call_kw, delete_attr, getattr};
+    use super::{call, call_kw, delete_attr, getattr, setattr};
     use crate::container;
     use crate::value::{self, encode_int, FALSE, NONE, TRUE};
-    use hydro_ir::MethodKind;
+    use hydro_ir::{MethodKind, ParamKind};
 
     fn int(n: i64) -> i64 {
         encode_int(n).expect("representable")
@@ -7468,6 +8903,179 @@ mod tests {
     }
 
     #[test]
+    fn count_bounds() {
+        reset();
+        let hay = string("banana");
+        // `start`/`end` are character indices and clamp like slices.
+        assert_eq!(invoke(hay, "count", &[string("na"), int(2)]), int(2));
+        assert_eq!(
+            invoke(hay, "count", &[string("na"), int(0), int(4)]),
+            int(1)
+        );
+        assert_eq!(invoke(hay, "count", &[string("na"), int(-2)]), int(1));
+        assert_eq!(invoke(hay, "count", &[string(""), int(2), int(4)]), int(3));
+        // `start == end` is an empty slice, which holds exactly one empty
+        // match; `start > end` holds none.
+        assert_eq!(invoke(hay, "count", &[string(""), int(3), int(3)]), int(1));
+        assert_eq!(invoke(hay, "count", &[string(""), int(4), int(2)]), int(0));
+        // Out-of-range bounds clamp instead of raising.
+        assert_eq!(invoke(hay, "count", &[string("a"), int(99)]), int(0));
+        assert_eq!(
+            invoke(hay, "count", &[string("a"), int(-99), int(99)]),
+            int(3)
+        );
+
+        // Non-ASCII receivers count characters, not bytes.
+        assert_eq!(
+            invoke(string("äää"), "count", &[string("ä"), int(1), int(2)]),
+            int(1)
+        );
+
+        crate::exc::clear();
+        invoke(hay, "count", &[string("a"), string("x")]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "slice indices must be integers or None or have an __index__ method"
+        );
+
+        crate::exc::clear();
+        // An explicit `None` bound means "omitted", as in CPython.
+        assert_eq!(invoke(hay, "count", &[string("a"), int(0), NONE]), int(3));
+
+        // `bytes.count` takes the same optional bounds.
+        let data = value::bytes_new(b"banana".to_vec());
+        let needle = value::bytes_new(b"na".to_vec());
+        assert_eq!(invoke(data, "count", &[needle, int(0), int(4)]), int(1));
+        assert_eq!(invoke(data, "count", &[needle, int(-2)]), int(1));
+    }
+
+    #[test]
+    fn remove_prefix_and_suffix() {
+        reset();
+        assert_eq!(
+            text(invoke(
+                string("filename.txt"),
+                "removeprefix",
+                &[string("file")]
+            )),
+            "name.txt"
+        );
+        // Only a real prefix is removed; otherwise the receiver is returned.
+        assert_eq!(
+            text(invoke(
+                string("filename.txt"),
+                "removeprefix",
+                &[string("name")]
+            )),
+            "filename.txt"
+        );
+        // An empty affix matches, and identical affixes empty the string.
+        assert_eq!(
+            text(invoke(string("abc"), "removeprefix", &[string("")])),
+            "abc"
+        );
+        assert_eq!(
+            text(invoke(string("abc"), "removeprefix", &[string("abc")])),
+            ""
+        );
+        // Multi-byte affixes never split a character.
+        assert_eq!(
+            text(invoke(string("äöü"), "removeprefix", &[string("ä")])),
+            "öü"
+        );
+
+        assert_eq!(
+            text(invoke(
+                string("filename.txt"),
+                "removesuffix",
+                &[string(".txt")]
+            )),
+            "filename"
+        );
+        assert_eq!(
+            text(invoke(
+                string("filename.txt"),
+                "removesuffix",
+                &[string(".md")]
+            )),
+            "filename.txt"
+        );
+        assert_eq!(
+            text(invoke(string("abc"), "removesuffix", &[string("")])),
+            "abc"
+        );
+        assert_eq!(
+            text(invoke(string("abc"), "removesuffix", &[string("abc")])),
+            ""
+        );
+
+        invoke(string("abc"), "removeprefix", &[int(1)]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "removeprefix() argument 1 must be str, not int");
+
+        crate::exc::clear();
+        invoke(string("abc"), "removesuffix", &[string("c"), string("d")]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "str.removesuffix() takes exactly one argument (2 given)"
+        );
+    }
+
+    #[test]
+    fn affix_and_count_keywords() {
+        reset();
+        let prefix_pairs = [string("prefix"), string("abc")];
+        assert_eq!(
+            text(call_kw(
+                string("abcd"),
+                b"removeprefix".as_ptr(),
+                12,
+                0,
+                std::ptr::null(),
+                1,
+                prefix_pairs.as_ptr(),
+            )),
+            "d"
+        );
+        let suffix_pairs = [string("suffix"), string("cd")];
+        assert_eq!(
+            text(call_kw(
+                string("abcd"),
+                b"removesuffix".as_ptr(),
+                12,
+                0,
+                std::ptr::null(),
+                1,
+                suffix_pairs.as_ptr(),
+            )),
+            "ab"
+        );
+        // `count` binds `sub`, `start` and `end` by name.
+        let count_pairs = [
+            string("sub"),
+            string("a"),
+            string("start"),
+            int(1),
+            string("end"),
+            int(3),
+        ];
+        assert_eq!(
+            call_kw(
+                string("banana"),
+                b"count".as_ptr(),
+                5,
+                0,
+                std::ptr::null(),
+                3,
+                count_pairs.as_ptr(),
+            ),
+            int(1)
+        );
+    }
+
+    #[test]
     fn prefix_suffix_and_predicates() {
         reset();
         assert_eq!(invoke(string("hello"), "startswith", &[string("he")]), TRUE);
@@ -7772,6 +9380,161 @@ mod tests {
         invoke(dict(&[]), "pop", &[dict(&[])]);
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
         assert_eq!(message(), "unhashable type: 'dict'");
+    }
+
+    #[test]
+    fn user_dict_subclasses_own_real_mapping_storage() {
+        reset();
+        // `class D(dict): pass`
+        let base = value::dict_class();
+        let derived = value::class_new_full("D".to_string(), base, Vec::new(), Vec::new());
+        let instance = value::instance_new(derived);
+
+        // `d['a'] = 1` and `d['a']` need no override: the native slots run.
+        assert_eq!(
+            container::subscript_set(instance, string("a"), int(1)),
+            NONE
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(container::subscript(instance, string("a")), int(1));
+        assert_eq!(crate::builtins::len(instance), int(1));
+        assert_eq!(invoke(instance, "__contains__", &[string("a")]), TRUE);
+        assert_eq!(invoke(instance, "get", &[string("z")]), NONE);
+        assert_eq!(invoke(instance, "get", &[string("z"), int(5)]), int(5));
+        assert_eq!(
+            invoke(instance, "setdefault", &[string("b"), int(2)]),
+            int(2)
+        );
+        assert_eq!(crate::builtins::len(instance), int(2));
+        assert_eq!(invoke(instance, "pop", &[string("b")]), int(2));
+        assert_eq!(crate::builtins::len(instance), int(1));
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // `dict.__getitem__(d, 'a')` is the unbound native slot.
+        let dict_builtin = value::builtin_function_new(hydro_ir::Builtin::Dict);
+        let getitem = getattr(dict_builtin, b"__getitem__".as_ptr(), 11);
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(
+            crate::builtins::call(getitem, 2, [instance, string("a")].as_ptr()),
+            int(1)
+        );
+
+        // The mapping renders, compares and iterates like a dict, and a
+        // `dict` subclass instance is unhashable.
+        assert_eq!(value::repr(instance), "{'a': 1}");
+        assert_eq!(
+            invoke(instance, "__eq__", &[dict(&[(string("a"), int(1))])]),
+            TRUE
+        );
+        assert_eq!(invoke(instance, "__eq__", &[dict(&[])]), FALSE);
+        assert_eq!(invoke(instance, "__ne__", &[dict(&[])]), TRUE);
+        let iterator = crate::iter::iter_new(instance);
+        let mut item = NONE;
+        assert_eq!(crate::iter::iter_next(iterator, &mut item), 1);
+        assert_eq!(text(item), "a");
+        assert!(!crate::exc::pending(), "{}", message());
+        assert!(value::truthy(instance));
+        assert!(!value::truthy(value::instance_new(derived)));
+        crate::builtins::hash(instance);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "unhashable type: 'dict'");
+
+        // `popitem` removes the last inserted entry and returns it.
+        crate::exc::clear();
+        let popped = invoke(instance, "popitem", &[]);
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(rendered_list(popped), "('a', 1)");
+        assert!(!value::truthy(instance));
+
+        // Plain instance attributes keep working and stay out of the mapping
+        // (and the reserved storage stays out of `__dict__`).
+        value::instance_setattr(instance, "note".to_string(), int(7));
+        assert_eq!(getattr(instance, b"note".as_ptr(), 4), int(7));
+        assert_eq!(crate::builtins::len(instance), int(0));
+        let namespace = value::instance_dict(instance).expect("instance dict");
+        assert_eq!(value::as_dict(namespace).map(|pairs| pairs.len()), Some(1));
+        assert!(!crate::exc::pending(), "{}", message());
+    }
+
+    #[test]
+    fn dict_subclass_super_reaches_native_mapping_slots() {
+        reset();
+        // `class D(dict): def __setitem__(self, k, v): super().__setitem__(k, v)`
+        // The lowered `super()` is the proxy the runtime builds for the
+        // method, so driving the proxy exercises exactly that path.
+        let base = value::dict_class();
+        let derived = value::class_new_full("D".to_string(), base, Vec::new(), Vec::new());
+        let instance = value::instance_new(derived);
+        let proxy = value::super_new(derived, instance);
+        assert_eq!(invoke(proxy, "__setitem__", &[string("a"), int(1)]), NONE);
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(
+            value::mapping_pairs(instance).map(|pairs| pairs.len()),
+            Some(1)
+        );
+        assert_eq!(invoke(proxy, "__getitem__", &[string("a")]), int(1));
+        assert_eq!(invoke(proxy, "__len__", &[]), int(1));
+        assert_eq!(invoke(proxy, "__contains__", &[string("a")]), TRUE);
+
+        // `super().__init__()` from a subclass initializer binds through the
+        // keyword binder and never clears existing entries.
+        assert_eq!(invoke(instance, "$super_init", &[]), NONE);
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(crate::builtins::len(instance), int(1));
+
+        // `class E(D)` resolves the same native slots past both classes.
+        let child = value::class_new_full("E".to_string(), derived, Vec::new(), Vec::new());
+        let nested = value::instance_new(child);
+        let nested_proxy = value::super_new(child, nested);
+        assert_eq!(
+            invoke(nested_proxy, "__setitem__", &[string("e"), int(3)]),
+            NONE
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(container::subscript(nested, string("e")), int(3));
+        assert_eq!(crate::builtins::len(nested), int(1));
+        assert_eq!(invoke(nested_proxy, "__len__", &[]), int(1));
+
+        // The class call path runs the native `__init__` with positional and
+        // keyword sources, like `D({'x': 9})` and `D(x=9)`.
+        let source = dict(&[(string("x"), int(9))]);
+        let built = crate::builtins::call(derived, 1, [source].as_ptr());
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(container::subscript(built, string("x")), int(9));
+        let key = string("y");
+        let keyword_pairs = [key, int(8)];
+        let built =
+            crate::builtins::call_kw(derived, 0, std::ptr::null(), 1, keyword_pairs.as_ptr());
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(container::subscript(built, string("y")), int(8));
+        // `d.update(**kwargs)` binds through the same signature.
+        let extra = string("z");
+        let extra_pairs = [extra, int(4)];
+        crate::core::methods::call_kw(
+            built,
+            b"update".as_ptr(),
+            6,
+            0,
+            std::ptr::null(),
+            1,
+            extra_pairs.as_ptr(),
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(container::subscript(built, string("z")), int(4));
+        assert_eq!(container::subscript(built, string("y")), int(8));
+
+        // `D.fromkeys(...)` builds an instance of the subclass, while
+        // `dict.fromkeys(...)` builds a plain dict.
+        let fromkeys = invoke(
+            derived,
+            "fromkeys",
+            &[list(&[string("a"), string("b")]), int(0)],
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::type_class(fromkeys), derived);
+        assert_eq!(container::subscript(fromkeys, string("a")), int(0));
+        assert_eq!(container::subscript(fromkeys, string("b")), int(0));
+        assert_eq!(crate::builtins::len(fromkeys), int(2));
     }
 
     #[test]
@@ -8175,6 +9938,20 @@ mod tests {
         unsafe { *args }
     }
 
+    /// Returns `(slot0, slot1)`: a signature-declared trampoline probe.
+    extern "C" fn keyword_pair(args: *const i64) -> i64 {
+        // SAFETY: signature-declared trampolines receive one slot per parameter.
+        let (left, right) = unsafe { (*args, *args.add(1)) };
+        value::tuple_new(vec![left, right])
+    }
+
+    /// Returns `(slot0, slot1, slot2)`: a three-parameter trampoline probe.
+    extern "C" fn keyword_triple(args: *const i64) -> i64 {
+        // SAFETY: signature-declared trampolines receive one slot per parameter.
+        let (first, second, third) = unsafe { (*args, *args.add(1), *args.add(2)) };
+        value::tuple_new(vec![first, second, third])
+    }
+
     fn method(name: &str, arity: usize, kind: MethodKind) -> (String, i64, MethodKind) {
         (
             name.to_string(),
@@ -8551,6 +10328,965 @@ mod tests {
         assert!(!crate::exc::pending());
         assert_eq!(getattr(class, b"limit".as_ptr(), 5), int(6));
         assert_eq!(getattr(instance, b"limit".as_ptr(), 5), int(6));
+    }
+
+    #[test]
+    fn object_attribute_slots_run_the_default_protocol() {
+        reset();
+        let object = value::object_class();
+        let class = value::class_new("C".to_string(), NONE, Vec::new());
+        let instance = value::instance_new(class);
+
+        // `object.__setattr__` stores through the default assignment.
+        assert_eq!(
+            invoke(object, "__setattr__", &[instance, string("slot"), int(7)]),
+            NONE
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(
+            invoke(object, "__getattribute__", &[instance, string("slot")]),
+            int(7)
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        // `object.__delattr__` removes it; the missing attribute then reports
+        // the default `AttributeError`.
+        assert_eq!(
+            invoke(object, "__delattr__", &[instance, string("slot")]),
+            NONE
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        invoke(object, "__getattribute__", &[instance, string("slot")]);
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        crate::exc::clear();
+
+        // The slots only accept class instances, with CPython's errors.
+        invoke(object, "__setattr__", &[int(1), string("x"), int(2)]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "descriptor '__setattr__' requires a 'object' object but received a 'int'"
+        );
+        crate::exc::clear();
+        invoke(object, "__setattr__", &[class, string("x"), int(2)]);
+        assert_eq!(message(), "can't apply this __setattr__ to type object");
+        crate::exc::clear();
+        invoke(object, "__delattr__", &[class, string("x")]);
+        assert_eq!(message(), "can't apply this __delattr__ to type object");
+        crate::exc::clear();
+        invoke(object, "__getattribute__", &[int(1), string("x")]);
+        assert_eq!(
+            message(),
+            "descriptor '__getattribute__' for 'object' objects doesn't apply to a 'int' object"
+        );
+        crate::exc::clear();
+        invoke(object, "__setattr__", &[instance, int(3), int(2)]);
+        assert_eq!(message(), "attribute name must be string, not 'int'");
+        crate::exc::clear();
+    }
+
+    #[test]
+    fn class_attribute_hooks_override_the_default_protocol() {
+        reset();
+        let object = value::object_class();
+        // Every hook returns its receiver, which proves it ran and lets the
+        // test compare the result against the instance.
+        let hook = |name: &str, arity: usize| {
+            (
+                name.to_string(),
+                value::function_new(
+                    first_argument as *const () as usize,
+                    arity,
+                    name.to_string(),
+                ),
+                MethodKind::Normal,
+            )
+        };
+        let class = value::class_new_full(
+            "Hook".to_string(),
+            NONE,
+            vec![
+                hook("__setattr__", 3),
+                hook("__getattribute__", 2),
+                hook("__delattr__", 2),
+            ],
+            Vec::new(),
+        );
+        let instance = value::instance_new(class);
+
+        // Assignment runs `__setattr__` (nothing is stored).
+        assert_eq!(setattr(instance, b"x".as_ptr(), 1, int(7)), instance);
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::instance_attr(instance, "x"), None);
+        // `object.__setattr__` bypasses it and stores.
+        assert_eq!(
+            invoke(object, "__setattr__", &[instance, string("x"), int(7)]),
+            NONE
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::instance_attr(instance, "x"), Some(int(7)));
+
+        // Reading runs `__getattribute__`; the slot still reads the value.
+        assert_eq!(getattr(instance, b"x".as_ptr(), 1), instance);
+        assert_eq!(
+            invoke(object, "__getattribute__", &[instance, string("x")]),
+            int(7)
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        // Reading a missing name runs the hook too, so no AttributeError is
+        // raised while it is installed.
+        assert_eq!(getattr(instance, b"missing".as_ptr(), 7), instance);
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // Deletion runs `__delattr__`; the slot bypasses and removes.
+        assert_eq!(delete_attr(instance, b"x".as_ptr(), 1), instance);
+        assert_eq!(value::instance_attr(instance, "x"), Some(int(7)));
+        assert_eq!(
+            invoke(object, "__delattr__", &[instance, string("x")]),
+            NONE
+        );
+        assert_eq!(value::instance_attr(instance, "x"), None);
+    }
+
+    #[test]
+    fn super_reaches_the_object_protocol_slots() {
+        reset();
+        // `typing_extensions.sentinel` declares no base, so its linearization
+        // never reaches the cached `object` class; `super().__setattr__(...)`
+        // inside such a class must still resolve the native slot.
+        let class = value::class_new_full(
+            "Sentinel".to_string(),
+            NONE,
+            vec![(
+                "__setattr__".to_string(),
+                value::function_new(
+                    first_argument as *const () as usize,
+                    3,
+                    "__setattr__".to_string(),
+                ),
+                MethodKind::Normal,
+            )],
+            Vec::new(),
+        );
+        let instance = value::instance_new(class);
+        // The class-level read resolves the inherited slot instead of
+        // reporting AttributeError.
+        let inherited = getattr(class, b"__setattr__".as_ptr(), 11);
+        assert!(value::as_function(inherited).is_some(), "{}", message());
+        assert!(!crate::exc::pending(), "{}", message());
+
+        let proxy = value::super_new(class, instance);
+        assert_eq!(
+            invoke(proxy, "__setattr__", &[string("_name"), string("x")]),
+            NONE
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(
+            value::instance_attr(instance, "_name").map(text),
+            Some("x".to_string())
+        );
+        assert_eq!(
+            text(invoke(proxy, "__getattribute__", &[string("_name")])),
+            "x"
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(invoke(proxy, "__delattr__", &[string("_name")]), NONE);
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::instance_attr(instance, "_name"), None);
+
+        // A declared subclass chain resolves the same slots: `super(Base,
+        // self)` skips `Base` and reaches `object`.
+        let derived = value::class_new_full("Derived".to_string(), class, Vec::new(), Vec::new());
+        let derived_instance = value::instance_new(derived);
+        let chained = value::super_new(class, derived_instance);
+        assert_eq!(invoke(chained, "__setattr__", &[string("y"), int(1)]), NONE);
+        assert_eq!(value::instance_attr(derived_instance, "y"), Some(int(1)));
+        // `Plain.__setattr__(obj, ...)` is the unbound native slot too.
+        let plain = value::class_new("Plain".to_string(), NONE, Vec::new());
+        let plain_instance = value::instance_new(plain);
+        assert_eq!(
+            invoke(plain, "__setattr__", &[plain_instance, string("z"), int(2)]),
+            NONE
+        );
+        assert_eq!(value::instance_attr(plain_instance, "z"), Some(int(2)));
+        assert_eq!(
+            invoke(plain, "__getattribute__", &[plain_instance, string("z")]),
+            int(2)
+        );
+        assert_eq!(
+            invoke(plain, "__delattr__", &[plain_instance, string("z")]),
+            NONE
+        );
+        assert_eq!(value::instance_attr(plain_instance, "z"), None);
+        assert!(!crate::exc::pending(), "{}", message());
+    }
+
+    #[test]
+    fn builtin_type_spellings_expose_unbound_methods() {
+        reset();
+        let str_builtin = value::builtin_function_new(hydro_ir::Builtin::Str);
+        let islower = getattr(str_builtin, b"islower".as_ptr(), 7);
+        assert!(value::as_function(islower).is_some(), "{}", message());
+        // The callable is stable across reads, like a method descriptor.
+        assert_eq!(getattr(str_builtin, b"islower".as_ptr(), 7), islower);
+        // Calling it applies the method to the receiver argument:
+        // `Predicate(str.islower)("ABC")` in annotated_types.
+        assert_eq!(
+            crate::builtins::call(islower, 1, [string("ABC")].as_ptr()),
+            FALSE
+        );
+        assert_eq!(
+            crate::builtins::call(islower, 1, [string("abc")].as_ptr()),
+            TRUE
+        );
+        assert_eq!(text(getattr(islower, b"__name__".as_ptr(), 8)), "islower");
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // Container methods: `list.append(items, value)` is the unbound form.
+        let list_builtin = value::builtin_function_new(hydro_ir::Builtin::List);
+        let items = list(&[]);
+        let append = getattr(list_builtin, b"append".as_ptr(), 6);
+        let args = [items, int(3)];
+        assert_eq!(crate::builtins::call(append, 2, args.as_ptr()), NONE);
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::as_list(items), Some(&[int(3)][..]));
+        let copies = crate::builtins::call(
+            getattr(list_builtin, b"copy".as_ptr(), 4),
+            1,
+            [items].as_ptr(),
+        );
+        assert_eq!(value::as_list(copies), Some(&[int(3)][..]));
+        assert_ne!(copies, items);
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // `int.bit_length` keeps its existing unbound form.
+        let int_builtin = value::builtin_function_new(hydro_ir::Builtin::Int);
+        let bit_length = getattr(int_builtin, b"bit_length".as_ptr(), 10);
+        assert_eq!(
+            crate::builtins::call(bit_length, 1, [int(5)].as_ptr()),
+            int(3)
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // The `builtins.str` module spelling routes to the same methods.
+        let native_str = value::native_function_new("builtins", "str", 1);
+        let native_islower = getattr(native_str, b"islower".as_ptr(), 7);
+        assert_eq!(
+            crate::builtins::call(native_islower, 1, [string("abc")].as_ptr()),
+            TRUE
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // A missing receiver reports the descriptor error; unknown names keep
+        // reporting `AttributeError`.
+        crate::exc::clear();
+        crate::builtins::call(islower, 0, std::ptr::null());
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "unbound method str.islower() needs an argument");
+        crate::exc::clear();
+        getattr(str_builtin, b"nonsense".as_ptr(), 8);
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        crate::exc::clear();
+    }
+
+    #[test]
+    fn maketrans_tables() {
+        reset();
+        let str_builtin = value::builtin_function_new(hydro_ir::Builtin::Str);
+        // One dict argument: one-character string keys become ordinals, values
+        // are copied unchanged, and a later integer key wins.
+        let table = invoke(
+            str_builtin,
+            "maketrans",
+            &[dict(&[(string("a"), string("xy")), (int(97), string("z"))])],
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(text(invoke(string("ab"), "translate", &[table])), "zb");
+
+        // Two arguments map character by character.
+        let table = invoke(str_builtin, "maketrans", &[string("ab"), string("cd")]);
+        assert_eq!(text(invoke(string("abc"), "translate", &[table])), "cdc");
+
+        // A third argument lists characters that `translate` deletes.
+        let table = invoke(
+            str_builtin,
+            "maketrans",
+            &[string("ab"), string("cd"), string("ef")],
+        );
+        assert_eq!(
+            text(invoke(string("abcdef"), "translate", &[table])),
+            "cdcd"
+        );
+
+        // The static method is reachable through instances and through the
+        // stable `str.maketrans` attribute, as in CPython.
+        let table = invoke(
+            string("ignored"),
+            "maketrans",
+            &[string("ab"), string("cd")],
+        );
+        assert_eq!(text(invoke(string("ab"), "translate", &[table])), "cd");
+        let maketrans = getattr(str_builtin, b"maketrans".as_ptr(), 9);
+        assert_eq!(getattr(str_builtin, b"maketrans".as_ptr(), 9), maketrans);
+        let table = crate::builtins::call(maketrans, 2, [string("ab"), string("cd")].as_ptr());
+        assert_eq!(text(invoke(string("ab"), "translate", &[table])), "cd");
+        assert!(!crate::exc::pending(), "{}", message());
+
+        crate::exc::clear();
+        invoke(str_builtin, "maketrans", &[string("abc")]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "if you give only one argument to maketrans it must be a dict"
+        );
+
+        crate::exc::clear();
+        invoke(str_builtin, "maketrans", &[dict(&[(string("ab"), int(1))])]);
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "string keys in translatetable must be of length 1"
+        );
+
+        crate::exc::clear();
+        invoke(
+            str_builtin,
+            "maketrans",
+            &[dict(&[(tuple(&[int(1)]), int(1))])],
+        );
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "keys in translate table mustbe strings or integers"
+        );
+
+        crate::exc::clear();
+        invoke(str_builtin, "maketrans", &[string("a"), int(2)]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "maketrans() argument 2 must be str, not int");
+
+        crate::exc::clear();
+        invoke(str_builtin, "maketrans", &[string("a"), string("bc")]);
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "the first two maketrans arguments must have equal length"
+        );
+
+        crate::exc::clear();
+        invoke(str_builtin, "maketrans", &[int(2), string("b")]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "first maketrans argument must be a string if there is a second argument"
+        );
+    }
+
+    #[test]
+    fn bytes_maketrans_tables() {
+        reset();
+        let bytes_builtin = value::builtin_function_new(hydro_ir::Builtin::Bytes);
+        let from = value::bytes_new(b"ab".to_vec());
+        let to = value::bytes_new(b"cd".to_vec());
+        let table = invoke(bytes_builtin, "maketrans", &[from, to]);
+        assert!(!crate::exc::pending(), "{}", message());
+        let table_bytes = value::as_bytes(table).expect("bytes table");
+        assert_eq!(table_bytes.len(), 256);
+        assert_eq!(
+            (
+                table_bytes[b'a' as usize],
+                table_bytes[b'b' as usize],
+                table_bytes[0]
+            ),
+            (b'c', b'd', 0)
+        );
+
+        // `bytearray.maketrans` and the instance spellings return bytes.
+        let bytearray_builtin = value::builtin_function_new(hydro_ir::Builtin::ByteArray);
+        assert_eq!(
+            value::as_bytes(invoke(bytearray_builtin, "maketrans", &[from, to]))
+                .and_then(|table| table.get(b'a' as usize).copied()),
+            Some(b'c')
+        );
+        let bytearray = value::bytearray_new(b"x".to_vec());
+        assert_eq!(
+            value::as_bytes(invoke(bytearray, "maketrans", &[from, to]))
+                .and_then(|table| table.get(b'b' as usize).copied()),
+            Some(b'd')
+        );
+
+        crate::exc::clear();
+        invoke(bytes_builtin, "maketrans", &[from]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "bytes.maketrans() takes exactly 2 arguments (1 given)"
+        );
+
+        crate::exc::clear();
+        invoke(
+            bytes_builtin,
+            "maketrans",
+            &[from, value::bytes_new(b"cde".to_vec())],
+        );
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(message(), "maketrans arguments must have same length");
+
+        crate::exc::clear();
+        invoke(bytes_builtin, "maketrans", &[string("a"), to]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "a bytes-like object is required, not 'str'");
+    }
+
+    #[test]
+    fn class_attribute_calls_unwrap_static_and_classmethods() {
+        reset();
+        // `pydantic._internal._model_construction` builds its metaclass
+        // dynamically, so `staticmethod(...)`/`classmethod(...)` land in the
+        // class namespace as descriptor objects (not MethodKind entries).
+        let collect = value::function_new(
+            first_argument as *const () as usize,
+            1,
+            "_collect_bases_data".to_string(),
+        );
+        let make = value::function_new(first_argument as *const () as usize, 1, "make".to_string());
+        let namespace = dict(&[
+            (
+                string("_collect_bases_data"),
+                value::staticmethod_new(collect),
+            ),
+            (string("make"), value::classmethod_new(make)),
+        ]);
+        let arguments = [string("Meta"), tuple(&[]), NONE, namespace];
+        let class = crate::builtins::call_builtin(
+            hydro_ir::Builtin::ClassFromNamespace,
+            4,
+            arguments.as_ptr(),
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::class_display_name(class), Some("Meta"));
+
+        // `mcs._collect_bases_data(bases)`: a direct class-attribute call runs
+        // the wrapped function with exactly the call arguments, no receiver.
+        let bases = tuple(&[int(1)]);
+        assert_eq!(invoke(class, "_collect_bases_data", &[bases]), bases);
+        assert!(!crate::exc::pending(), "{}", message());
+        // The read path returns the same unwrapped function, so passing it as
+        // a function parameter keeps working.
+        let read = getattr(class, b"_collect_bases_data".as_ptr(), 19);
+        assert_eq!(read, collect);
+        assert_eq!(crate::builtins::call(read, 1, [bases].as_ptr()), bases);
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // A classmethod descriptor binds the class for a direct call.
+        assert_eq!(invoke(class, "make", &[]), class);
+        assert_eq!(
+            crate::builtins::call(getattr(class, b"make".as_ptr(), 4), 0, std::ptr::null()),
+            class
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // A plain attribute value that is not a descriptor keeps its old
+        // behaviour: an ordinary function is called with the supplied args.
+        let plain =
+            value::function_new(first_argument as *const () as usize, 1, "plain".to_string());
+        let class = value::class_new_full(
+            "Plain".to_string(),
+            NONE,
+            Vec::new(),
+            vec![("plain".to_string(), plain)],
+        );
+        assert_eq!(invoke(class, "plain", &[int(9)]), int(9));
+        assert!(!crate::exc::pending(), "{}", message());
+    }
+
+    #[test]
+    fn class_descriptor_calls_bind_keyword_arguments() {
+        reset();
+        // Generated-function metadata: `from_annotation(x, source)` and
+        // `make(cls, x)`; both trampolines return their two slots.
+        let static_target = value::function_new(
+            keyword_pair as *const () as usize,
+            2,
+            "from_annotation".to_string(),
+        );
+        value::function_set_signature(
+            static_target,
+            vec![
+                value::ParamMeta {
+                    name: "x".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "source".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+            ],
+        );
+        value::function_set_full_entry(static_target, keyword_pair as *const () as usize);
+        let method_target =
+            value::function_new(keyword_pair as *const () as usize, 2, "make".to_string());
+        value::function_set_signature(
+            method_target,
+            vec![
+                value::ParamMeta {
+                    name: "cls".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "x".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+            ],
+        );
+        value::function_set_full_entry(method_target, keyword_pair as *const () as usize);
+
+        let namespace = dict(&[
+            (
+                string("from_annotation"),
+                value::staticmethod_new(static_target),
+            ),
+            (string("make"), value::classmethod_new(method_target)),
+        ]);
+        let arguments = [string("Meta"), tuple(&[]), NONE, namespace];
+        let class = crate::builtins::call_builtin(
+            hydro_ir::Builtin::ClassFromNamespace,
+            4,
+            arguments.as_ptr(),
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // `Meta.from_annotation(x=1, source='s')`: the staticmethod target is
+        // called with the keywords bound to its parameters, no receiver.
+        let pairs = [string("x"), int(1), string("source"), string("s")];
+        let result = call_kw(
+            class,
+            b"from_annotation".as_ptr(),
+            15,
+            0,
+            std::ptr::null(),
+            2,
+            pairs.as_ptr(),
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        let slots = value::as_tuple(result).expect("tuple result");
+        assert_eq!(slots[0], int(1));
+        assert_eq!(text(slots[1]), "s");
+
+        // `Meta.make(x=5)`: the classmethod target binds the class first and
+        // receives the keyword in the second slot.
+        let pairs = [string("x"), int(5)];
+        let result = call_kw(
+            class,
+            b"make".as_ptr(),
+            4,
+            0,
+            std::ptr::null(),
+            1,
+            pairs.as_ptr(),
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        let slots = value::as_tuple(result).expect("tuple result");
+        assert_eq!(slots[0], class);
+        assert_eq!(slots[1], int(5));
+
+        // An unknown keyword is still reported rather than dropped.
+        let pairs = [string("nope"), int(1)];
+        call_kw(
+            class,
+            b"from_annotation".as_ptr(),
+            15,
+            0,
+            std::ptr::null(),
+            1,
+            pairs.as_ptr(),
+        );
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        crate::exc::clear();
+    }
+
+    #[test]
+    fn wrapper_methods_forward_keywords_with_the_receiver() {
+        reset();
+        // `@contextmanager` stores a partial binding the decorated callable as
+        // the class-body value (no Hydro signature), so instance keyword calls
+        // must prepend the receiver and forward the names to the wrapper.
+        let inner = value::function_new(
+            keyword_triple as *const () as usize,
+            3,
+            "_contextmanager_call".to_string(),
+        );
+        value::function_set_signature(
+            inner,
+            vec![
+                value::ParamMeta {
+                    name: "func".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "self".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "ref".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+            ],
+        );
+        value::function_set_full_entry(inner, keyword_triple as *const () as usize);
+        let decorated = int(0); // stands in for the decorated generator
+        let wrapper = value::partial_new(inner, vec![decorated]);
+
+        let class = value::class_new_full(
+            "_Definitions".to_string(),
+            NONE,
+            vec![(
+                "get_definition_ref_schema".to_string(),
+                wrapper,
+                MethodKind::Normal,
+            )],
+            Vec::new(),
+        );
+        let instance = value::instance_new(class);
+
+        // `self.get_definition_ref_schema(ref=...)`: the receiver is prepended
+        // and the keyword is forwarded through the partial to the inner
+        // keyword binder.
+        let pairs = [string("ref"), int(7)];
+        let result = call_kw(
+            instance,
+            b"get_definition_ref_schema".as_ptr(),
+            25,
+            0,
+            std::ptr::null(),
+            1,
+            pairs.as_ptr(),
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        let slots = value::as_tuple(result).expect("tuple result");
+        assert_eq!(slots[0], decorated);
+        assert_eq!(slots[1], instance);
+        assert_eq!(slots[2], int(7));
+    }
+
+    #[test]
+    fn contextmanager_method_accepts_keywords() {
+        reset();
+        // The decorated generator: a generated-style function whose parameters
+        // are `(self, ref)`; its trampoline exposes the bound slots.
+        let generator_fn = value::function_new(
+            keyword_pair as *const () as usize,
+            2,
+            "get_definition_ref_schema".to_string(),
+        );
+        value::function_set_signature(
+            generator_fn,
+            vec![
+                value::ParamMeta {
+                    name: "self".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "ref".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+            ],
+        );
+        value::function_set_full_entry(generator_fn, keyword_pair as *const () as usize);
+
+        // Exactly what `contextlib.contextmanager` builds: a partial binding
+        // `_contextmanager_call` to the decorated function.
+        let wrapper = value::partial_new(
+            value::native_function_new("contextlib", "_contextmanager_call", usize::MAX),
+            vec![generator_fn],
+        );
+        // The entry may still carry signature metadata; the wrapper must be
+        // forwarded before the generated binder (which would reject `ref`).
+        value::function_set_signature(
+            wrapper,
+            vec![value::ParamMeta {
+                name: "ref".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            }],
+        );
+        value::function_set_full_entry(wrapper, keyword_pair as *const () as usize);
+
+        let class = value::class_new_full(
+            "_Definitions".to_string(),
+            NONE,
+            vec![(
+                "get_definition_ref_schema".to_string(),
+                wrapper,
+                MethodKind::Normal,
+            )],
+            Vec::new(),
+        );
+        let instance = value::instance_new(class);
+        let pairs = [string("ref"), int(7)];
+        let manager = call_kw(
+            instance,
+            b"get_definition_ref_schema".as_ptr(),
+            25,
+            0,
+            std::ptr::null(),
+            1,
+            pairs.as_ptr(),
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        // `contextmanager_wrap` stored the decorated call's result: the
+        // receiver and the `ref` keyword reached the generator binder.
+        let gen = value::instance_attr(manager, "gen").expect("manager stores the call result");
+        let slots = value::as_tuple(gen).expect("generator call result");
+        assert_eq!(slots[0], instance);
+        assert_eq!(slots[1], int(7));
+    }
+
+    #[test]
+    fn contextmanager_attribute_method_accepts_keywords() {
+        reset();
+        // Exact repro shape: a decorated method stored as a plain class
+        // *attribute* (`ClassEntry::Attr`), `def f(self, *, ref)`.
+        let generator_fn =
+            value::function_new(keyword_pair as *const () as usize, 2, "f".to_string());
+        value::function_set_signature(
+            generator_fn,
+            vec![
+                value::ParamMeta {
+                    name: "self".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "ref".to_string(),
+                    kind: ParamKind::KwOnly,
+                    default: None,
+                },
+            ],
+        );
+        value::function_set_full_entry(generator_fn, keyword_pair as *const () as usize);
+        let wrapper = value::partial_new(
+            value::native_function_new("contextlib", "_contextmanager_call", usize::MAX),
+            vec![generator_fn],
+        );
+        let class = value::class_new_full(
+            "D".to_string(),
+            NONE,
+            Vec::new(),
+            vec![("f".to_string(), wrapper)],
+        );
+        assert!(matches!(
+            value::class_lookup(class, "f"),
+            Some(value::ClassEntry::Attr(_))
+        ));
+        let instance = value::instance_new(class);
+
+        let pairs = [string("ref"), int(1)];
+        let manager = call_kw(
+            instance,
+            b"f".as_ptr(),
+            1,
+            0,
+            std::ptr::null(),
+            1,
+            pairs.as_ptr(),
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+        let gen = value::instance_attr(manager, "gen").expect("manager stores the call result");
+        let slots = value::as_tuple(gen).expect("generator call result");
+        assert_eq!(slots[0], instance);
+        assert_eq!(slots[1], int(1));
+    }
+
+    #[test]
+    fn generator_keyword_binding_creates_a_fiber() {
+        reset();
+        // A generator with a keyword-capable signature: the runtime binder
+        // fills the slots, and the call must create the suspended fiber
+        // through the full-entry trampoline instead of reporting
+        // "does not accept keyword arguments".
+        let generator_fn = value::function_new_with_flags(
+            keyword_pair as *const () as usize,
+            2,
+            "f".to_string(),
+            value::FUNCTION_FLAG_GENERATOR,
+        );
+        value::function_set_signature(
+            generator_fn,
+            vec![
+                value::ParamMeta {
+                    name: "self".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "ref".to_string(),
+                    kind: ParamKind::KwOnly,
+                    default: None,
+                },
+            ],
+        );
+        value::function_set_full_entry(generator_fn, keyword_pair as *const () as usize);
+        let pairs = [string("ref"), int(1)];
+        let created =
+            crate::builtins::call_kw(generator_fn, 1, [int(0)].as_ptr(), 1, pairs.as_ptr());
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::type_name(created), "generator");
+    }
+
+    #[test]
+    fn bound_methods_expose_func_and_self() {
+        reset();
+        let (_, make, _) = method("make", 1, MethodKind::Classmethod);
+        let (_, value_fn, _) = method("value", 1, MethodKind::Normal);
+        let class = value::class_new_full(
+            "BaseModel_".to_string(),
+            NONE,
+            vec![
+                ("make".to_string(), make, MethodKind::Classmethod),
+                ("value".to_string(), value_fn, MethodKind::Normal),
+            ],
+            Vec::new(),
+        );
+        let instance = value::instance_new(class);
+
+        // Classmethod read: `BaseModel_.make.__func__` is the function and
+        // `.__self__` the class (pydantic compares the function by identity).
+        let bound = getattr(class, b"make".as_ptr(), 4);
+        assert_eq!(getattr(bound, b"__func__".as_ptr(), 8), make);
+        assert_eq!(getattr(bound, b"__self__".as_ptr(), 8), class);
+        assert_eq!(text(getattr(bound, b"__name__".as_ptr(), 8)), "make");
+        assert_eq!(text(getattr(bound, b"__qualname__".as_ptr(), 12)), "make");
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // Instance method read binds the instance.
+        let bound = getattr(instance, b"value".as_ptr(), 5);
+        assert_eq!(getattr(bound, b"__func__".as_ptr(), 8), value_fn);
+        assert_eq!(getattr(bound, b"__self__".as_ptr(), 8), instance);
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // A dynamically stored `classmethod(...)` descriptor reports the same
+        // metadata through its class-bound partial.
+        let namespace = dict(&[(string("make"), value::classmethod_new(make))]);
+        let arguments = [string("Dynamic"), tuple(&[]), NONE, namespace];
+        let dynamic = crate::builtins::call_builtin(
+            hydro_ir::Builtin::ClassFromNamespace,
+            4,
+            arguments.as_ptr(),
+        );
+        let bound = getattr(dynamic, b"make".as_ptr(), 4);
+        assert_eq!(getattr(bound, b"__func__".as_ptr(), 8), make);
+        assert_eq!(getattr(bound, b"__self__".as_ptr(), 8), dynamic);
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // A staticmethod read exposes the wrapped function identity through
+        // `__func__` as well (the runtime keeps a bound value for it).
+        let helper = value::function_new(
+            first_argument as *const () as usize,
+            1,
+            "helper".to_string(),
+        );
+        let with_static = value::class_new_full(
+            "S".to_string(),
+            NONE,
+            vec![("helper".to_string(), helper, MethodKind::Staticmethod)],
+            Vec::new(),
+        );
+        let bound = getattr(with_static, b"helper".as_ptr(), 6);
+        assert_eq!(getattr(bound, b"__func__".as_ptr(), 8), helper);
+        assert!(!crate::exc::pending(), "{}", message());
+    }
+
+    #[test]
+    fn builtin_types_expose_builtin_metadata() {
+        reset();
+        // Class view (`value.__class__`): `__module__` is `builtins` for the
+        // cached type classes and the names/mro/doc stay available.
+        for (probe, name) in [
+            (string("x"), "str"),
+            (int(1), "int"),
+            (list(&[]), "list"),
+            (dict(&[]), "dict"),
+        ] {
+            let class = value::type_class(probe);
+            assert_eq!(
+                text(getattr(class, b"__module__".as_ptr(), 10)),
+                "builtins",
+                "{name}"
+            );
+            assert_eq!(text(getattr(class, b"__name__".as_ptr(), 8)), name);
+            assert_eq!(text(getattr(class, b"__qualname__".as_ptr(), 12)), name);
+            assert!(value::as_str(getattr(class, b"__doc__".as_ptr(), 7)).is_some());
+            assert!(value::as_tuple(getattr(class, b"__mro__".as_ptr(), 7)).is_some());
+            assert!(!crate::exc::pending(), "{name}: {}", message());
+        }
+        // Spelling view: `str.__module__`, `int.__module__`, `list.__module__`.
+        for builtin in [
+            hydro_ir::Builtin::Str,
+            hydro_ir::Builtin::Int,
+            hydro_ir::Builtin::List,
+        ] {
+            let spelling = value::builtin_function_new(builtin);
+            assert_eq!(
+                text(getattr(spelling, b"__module__".as_ptr(), 10)),
+                "builtins"
+            );
+            assert_eq!(
+                text(getattr(spelling, b"__name__".as_ptr(), 8)),
+                builtin.name()
+            );
+            assert_eq!(
+                text(getattr(spelling, b"__qualname__".as_ptr(), 12)),
+                builtin.name()
+            );
+            assert!(value::as_str(getattr(spelling, b"__doc__".as_ptr(), 7)).is_some());
+            assert!(!crate::exc::pending(), "{}", message());
+        }
+        // A user class with no docstring reports None, not AttributeError.
+        let plain = value::class_new("Plain".to_string(), NONE, Vec::new());
+        assert_eq!(getattr(plain, b"__doc__".as_ptr(), 7), NONE);
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn getattr_falls_back_to_class_getattr() {
+        reset();
+        // `__getattr__` receives the missing attribute name.
+        let fallback = value::function_new(
+            second_argument as *const () as usize,
+            2,
+            "__getattr__".to_string(),
+        );
+        let class = value::class_new_full(
+            "Fallback".to_string(),
+            NONE,
+            vec![("__getattr__".to_string(), fallback, MethodKind::Normal)],
+            Vec::new(),
+        );
+        let instance = value::instance_new(class);
+        assert_eq!(text(getattr(instance, b"missing".as_ptr(), 7)), "missing");
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // The default slot does not consult `__getattr__`.
+        let object = value::object_class();
+        crate::exc::clear();
+        invoke(object, "__getattribute__", &[instance, string("missing")]);
+        assert_eq!(error_tag(), crate::exc::ATTRIBUTE_ERROR as i64);
+        crate::exc::clear();
+    }
+
+    /// Returns its second argument: a stand-in for `__getattr__(self, name)`.
+    extern "C" fn second_argument(args: *const i64) -> i64 {
+        // SAFETY: wrappers created with arity 2 are called with two arguments.
+        unsafe { *args.add(1) }
     }
 
     #[test]

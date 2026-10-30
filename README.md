@@ -30,7 +30,7 @@ monorepo carries the unit/integration suites; CLI/E2E/AOT tests live in Tea.
 Compatibility target: **CPython 3.14.9**; the official `Lib/test` baseline is
 **3/398** (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`), tracked in
 [`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md). The generated stdlib import
-matrix is **210/297** ([`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).
+matrix is **233/297** ([`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).
 Hydro JIT (`tea infuse`) and AOT (`tea build`) share this runtime and IR.
 Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), work list in
 [`docs/TODO.md`](docs/TODO.md), source tree in
@@ -283,7 +283,7 @@ User decorators and pattern matching remain incomplete; `except*` grouping and
 `await`/cancellation edge cases are still open. The general descriptor and
 metaclass protocols, `bytearray`/`memoryview`, async generators and async
 comprehensions are implemented. Arbitrary C extensions/full CPython ABI
-semantics and the complete stdlib remain open (210/297 modules import; see
+semantics and the complete stdlib remain open (233/297 modules import; see
 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). A general `sys.path`/
 `sys.modules` model, dynamic imports from unlinked packages, namespace/zip/
 frozen imports and `from x import *` are incomplete; packages, dotted/relative
@@ -320,8 +320,8 @@ documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 - `./scripts/verify.sh`: `cargo fmt --check`, Clippy (`-D warnings`), runtime
   build, **`cargo nextest run --workspace` on all cores**, fuzz smoke and the
-  offline CPython manifest check. The 2026-10-30 run lists 2764 tests
-  (2764 passed, 1 skipped). CLI/E2E/AOT gates live in the Tea repository.
+  offline CPython manifest check. The 2026-10-30 run lists 2905 tests
+  (2905 passed, 1 skipped). CLI/E2E/AOT gates live in the Tea repository.
 - CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Ubuntu, stable
   Rust, fmt/clippy/nextest/verify, no secrets).
 - Benchmarks: [`benchmarks/HYDRO.md`](benchmarks/HYDRO.md) describes readiness and

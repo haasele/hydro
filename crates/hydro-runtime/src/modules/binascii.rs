@@ -5,7 +5,10 @@
 //! positive `bytes_per_sep` and left-anchored grouping for a negative value,
 //! `unhexlify` rejects odd-length and non-hex input, and `a2b_base64` follows
 //! the `strict_mode` state machine of the C module (including its padding
-//! rules). The legacy `adler32` checksum, dropped from CPython 3.14, is kept
+//! rules). `a2b_uu`/`b2a_uu` implement the same one-line uuencode format as
+//! `binascii_a2b_uu_impl`/`binascii_b2a_uu_impl`, including the 45-byte line
+//! limit and the historical backtick-for-zero switch. The legacy `adler32`
+//! checksum, dropped from CPython 3.14, is kept
 //! because `zlib.adler32` remains part of the compatibility target. The
 //! module-level base64 helpers are shared with the `base64` module.
 //!
@@ -363,6 +366,112 @@ fn a2b_base64(args: &[i64]) -> i64 {
     }
 }
 
+/// `a2b_uu(data)`: decodes one line of uuencoded data.
+///
+/// The first byte carries the number of binary bytes on the line (`(byte -
+/// ' ') & 0o77`); the remaining groups of four characters encode three bytes
+/// each. `\n`, `\r` and the end of the buffer act as padding, and a backtick
+/// may stand in for a space, matching `binascii_a2b_uu_impl` in
+/// `Modules/binascii.c`. Any other character is an error, as is non-padding
+/// text left over after the declared byte count.
+fn a2b_uu(args: &[i64]) -> i64 {
+    let data = match bytes_argument(argument(args, 0), "data") {
+        Ok(data) => data,
+        Err(error) => return error,
+    };
+    let Some(&first) = data.first() else {
+        return value_error("Missing length byte");
+    };
+    let mut bin_len = (first.wrapping_sub(b' ') & 0o77) as usize;
+    let mut decoded = Vec::with_capacity(bin_len);
+    let mut leftchar: u32 = 0;
+    let mut leftbits: u32 = 0;
+    // The C loop consumes one input byte per iteration and keeps counting
+    // `ascii_len` below zero; those iterations feed zero padding bits.
+    let mut remaining = data.len() as i64 - 1;
+    let mut position = 1usize;
+    while bin_len > 0 {
+        let this_ch = if remaining > 0 { data[position] } else { 0 };
+        let this_ch = if this_ch == b'\n' || this_ch == b'\r' || remaining <= 0 {
+            0
+        } else {
+            // `64` rather than `63`: some encoders emit '`' for zero.
+            if !(b' '..=b' ' + 64).contains(&this_ch) {
+                return value_error("Illegal char");
+            }
+            (this_ch - b' ') & 0o77
+        };
+        leftchar = (leftchar << 6) | u32::from(this_ch);
+        leftbits += 6;
+        if leftbits >= 8 {
+            leftbits -= 8;
+            decoded.push(((leftchar >> leftbits) & 0xff) as u8);
+            leftchar &= (1u32 << leftbits) - 1;
+            bin_len -= 1;
+        }
+        remaining -= 1;
+        position += 1;
+    }
+    // Anything after the declared bytes must be whitespace or '`' padding.
+    while remaining > 0 {
+        let this_ch = data[position];
+        position += 1;
+        remaining -= 1;
+        if this_ch != b' ' && this_ch != b' ' + 64 && this_ch != b'\n' && this_ch != b'\r' {
+            return value_error("Trailing garbage");
+        }
+    }
+    value::bytes_new(decoded)
+}
+
+/// `b2a_uu(data, *, backtick=False)`: encodes at most 45 bytes as one
+/// uuencoded line (including the trailing newline).
+///
+/// `backtick` is CPython's compatibility switch: a zero six-bit group and the
+/// empty line's length byte are written as '`' instead of space, for the
+/// encoders that historically used it.
+fn b2a_uu(args: &[i64]) -> i64 {
+    let data = match bytes_argument(argument(args, 0), "data") {
+        Ok(data) => data,
+        Err(error) => return error,
+    };
+    if data.len() > 45 {
+        return value_error("At most 45 bytes at once");
+    }
+    let backtick = flag_argument(argument(args, 1), false);
+    let mut encoded = Vec::with_capacity(2 + data.len().div_ceil(3) * 4);
+    if backtick && data.is_empty() {
+        encoded.push(b'`');
+    } else {
+        encoded.push(b' ' + data.len() as u8);
+    }
+    let mut leftchar: u32 = 0;
+    let mut leftbits: u32 = 0;
+    let mut bin_len = data.len() as i64;
+    let mut position = 0usize;
+    while bin_len > 0 || leftbits != 0 {
+        if bin_len > 0 {
+            leftchar = (leftchar << 8) | u32::from(data[position]);
+            position += 1;
+        } else {
+            leftchar <<= 8;
+        }
+        leftbits += 8;
+        while leftbits >= 6 {
+            let this_ch = ((leftchar >> (leftbits - 6)) & 0x3f) as u8;
+            leftbits -= 6;
+            if backtick && this_ch == 0 {
+                encoded.push(b'`');
+            } else {
+                encoded.push(this_ch + b' ');
+            }
+        }
+        bin_len -= 1;
+    }
+    encoded.push(b'\n');
+    value::bytes_new(encoded)
+}
+
 /// `crc32(data, value=0)`: the initial CRC is the previous result.
 fn crc32(args: &[i64]) -> i64 {
     let data = match bytes_argument(argument(args, 0), "data") {
@@ -408,6 +517,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "unhexlify" | "a2b_hex" => unhexlify(args),
         "b2a_base64" => b2a_base64(args),
         "a2b_base64" => a2b_base64(args),
+        "b2a_uu" => b2a_uu(args),
+        "a2b_uu" => a2b_uu(args),
         "crc32" => crc32(args),
         "adler32" => adler32(args),
         _ => exc::raise_with_message(
@@ -415,6 +526,38 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             &format!("module 'binascii' has no attribute '{function}'"),
         ),
     }
+}
+
+/// Keyword-aware dispatch for `binascii`.
+///
+/// Only `b2a_uu` has a keyword-only parameter (`backtick`); the binder has
+/// already moved every declared positional parameter into its slot, so a
+/// remaining name here is either `backtick` or an error.
+pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if function != "b2a_uu" {
+        if let Some((name, _)) = keywords.first() {
+            return type_error(&format!(
+                "binascii.{function}() got an unexpected keyword argument '{name}'"
+            ));
+        }
+        return call(function, args);
+    }
+    let mut bound = args.to_vec();
+    for (name, item) in keywords {
+        if name != "backtick" {
+            return type_error(&format!(
+                "b2a_uu() got an unexpected keyword argument '{name}'"
+            ));
+        }
+        while bound.len() < 2 {
+            bound.push(NONE);
+        }
+        if bound[1] != NONE {
+            return type_error("b2a_uu() got multiple values for argument 'backtick'");
+        }
+        bound[1] = *item;
+    }
+    b2a_uu(&bound)
 }
 
 #[cfg(test)]
@@ -543,6 +686,95 @@ mod tests {
     }
 
     #[test]
+    fn uuencode_known_vectors_and_backtick() {
+        exc::init();
+        assert_eq!(output(call("b2a_uu", &[bytes(b"")])), b" \n");
+        assert_eq!(
+            output(call_kw(
+                "b2a_uu",
+                &[bytes(b"")],
+                &[("backtick".to_string(), value::TRUE)]
+            )),
+            b"`\n"
+        );
+        assert_eq!(output(call("b2a_uu", &[bytes(b"Cat")])), b"#0V%T\n");
+        assert_eq!(
+            output(call("b2a_uu", &[bytes(b"hello world")])),
+            b"+:&5L;&\\@=V]R;&0 \n"
+        );
+        // `backtick=True` writes zero six-bit groups as '`' padding.
+        assert_eq!(
+            output(call_kw(
+                "b2a_uu",
+                &[bytes(b"hello world")],
+                &[("backtick".to_string(), value::TRUE)]
+            )),
+            b"+:&5L;&\\@=V]R;&0`\n"
+        );
+        // The keyword spelling and the lowered positional slot reach the same
+        // encoder (the compiler turns named parameters into slots).
+        assert_eq!(
+            output(call("b2a_uu", &[bytes(b"Cat"), value::TRUE])),
+            b"#0V%T\n"
+        );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn uudecode_known_vectors_and_round_trip() {
+        exc::init();
+        assert_eq!(output(call("a2b_uu", &[bytes(b"#0V%T\n")])), b"Cat");
+        assert_eq!(
+            output(call("a2b_uu", &[bytes(b"+:&5L;&\\@=V]R;&0`\n")])),
+            b"hello world"
+        );
+        // A space or backtick length byte is an empty line; '`' zero groups
+        // decode like spaces.
+        assert_eq!(output(call("a2b_uu", &[bytes(b"  \n")])), b"");
+        assert_eq!(output(call("a2b_uu", &[bytes(b"`\n")])), b"");
+        assert_eq!(output(call("a2b_uu", &[bytes(b"!")])), b"\x00");
+        for payload in [
+            &b""[..],
+            &b"Cat"[..],
+            &b"hello world"[..],
+            &[0u8, 1, 2, 0xff][..],
+        ] {
+            let encoded = call("b2a_uu", &[bytes(payload)]);
+            assert_eq!(output(call("a2b_uu", &[encoded])), payload);
+        }
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn uu_errors_match_cpython() {
+        exc::init();
+        call("b2a_uu", &[bytes(&[b'x'; 46])]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "At most 45 bytes at once"
+        );
+        exc::clear();
+
+        call("a2b_uu", &[bytes(b"")]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "Missing length byte"
+        );
+        exc::clear();
+
+        call("a2b_uu", &[bytes(b"#0V%T X")]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(value::to_string(exc::pending_value()), "Trailing garbage");
+        exc::clear();
+
+        call("a2b_uu", &[bytes(b"#0V%T\x01")]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
     fn checksums_match_cpython() {
         exc::init();
         assert_eq!(number(call("crc32", &[bytes(b"")])), 0);
@@ -570,7 +802,10 @@ mod tests {
     #[test]
     fn unknown_function_is_an_attribute_error() {
         exc::init();
-        call("a2b_uu", &[]);
+        // `a2b_uu`/`b2a_uu` are implemented now, so pick a name the module
+        // never declares: the spec lookup reports AttributeError before any
+        // arity check.
+        call("definitely_missing", &[]);
         assert!(exc::pending());
         assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
         exc::clear();

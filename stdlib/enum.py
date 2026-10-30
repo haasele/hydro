@@ -8,7 +8,7 @@
 # Licensed under the PSF License Version 2 -- see stdlib/LICENSE.
 import sys
 import builtins as bltns
-from types import MappingProxyType, DynamicClassAttribute
+from types import MappingProxyType, DynamicClassAttribute, FunctionType
 
 
 __all__ = [
@@ -48,7 +48,22 @@ def _is_descriptor(obj):
     return (
             hasattr(obj, '__get__') or
             hasattr(obj, '__set__') or
-            hasattr(obj, '__delete__')
+            hasattr(obj, '__delete__') or
+            # Hydro: functions defined in Python (methods, including the
+            # functions behind `@property`/`@staticmethod`/`@classmethod`) do
+            # not expose the descriptor protocol attributes above, while
+            # native builtins such as `len` do not define `__dict__`; recognize
+            # Python functions by that pair so methods stay non-members just
+            # like CPython's function descriptors, while builtin function
+            # values remain members. The builtin `type` value is also a
+            # FunctionType with a `__dict__` in Hydro, but it is a class (and a
+            # member in CPython), so exclude type-like values. Native
+            # `staticmethod`/`classmethod` wrappers also lack `__get__` but are
+            # descriptors in CPython.
+            (isinstance(obj, FunctionType)
+                    and hasattr(obj, '__dict__')
+                    and not hasattr(obj, '__subclasscheck__')) or
+            isinstance(obj, (staticmethod, classmethod))
             )
 
 def _is_dunder(name):
@@ -1900,7 +1915,11 @@ def _simple_enum(etype=Enum, *, boundary=None, use_args=None):
                     # finish creating member
                     member._name_ = name
                     member.__objclass__ = enum_class
-                    member.__init__(value)
+                    # Hydro: unlike CPython, an instance of a plain class
+                    # offers no implicit `object.__init__` attribute, so only
+                    # call `__init__` when the converted class defines one.
+                    if hasattr(member, '__init__'):
+                        member.__init__(value)
                     member._sort_order_ = len(member_names)
                     if name not in ('name', 'value'):
                         setattr(enum_class, name, member)
@@ -1957,7 +1976,11 @@ def _simple_enum(etype=Enum, *, boundary=None, use_args=None):
                     # finish creating member
                     member._name_ = name
                     member.__objclass__ = enum_class
-                    member.__init__(value)
+                    # Hydro: unlike CPython, an instance of a plain class
+                    # offers no implicit `object.__init__` attribute, so only
+                    # call `__init__` when the converted class defines one.
+                    if hasattr(member, '__init__'):
+                        member.__init__(value)
                     member._sort_order_ = len(member_names)
                     if name not in ('name', 'value'):
                         setattr(enum_class, name, member)

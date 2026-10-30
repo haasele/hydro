@@ -3,14 +3,16 @@
 //!
 //! The digest implementations are self-contained Rust (no new dependencies):
 //! MD5 (RFC 1321), SHA-1 (FIPS 180-4), SHA-224/256/384/512 (FIPS 180-4),
-//! BLAKE2b/BLAKE2s (RFC 7693, including the keyed and tree parameters),
-//! HMAC (RFC 2104) and PBKDF2-HMAC (RFC 8018). Every hash object keeps its
-//! running state in a hidden instance attribute, so `update`, `copy`,
-//! `digest` and `hexdigest` are incremental and independent.
+//! SHA3-224/256/384/512 and SHAKE-128/256 (FIPS 202, built on the native
+//! Keccak-f[1600] permutation), BLAKE2b/BLAKE2s (RFC 7693, including the
+//! keyed and tree parameters), HMAC (RFC 2104) and PBKDF2-HMAC (RFC 8018).
+//! Every hash object keeps its running state in a hidden instance attribute,
+//! so `update`, `copy`, `digest` and `hexdigest` are incremental and
+//! independent. The SHAKE objects take the requested output length as
+//! `digest(length)`/`hexdigest(length)`, exactly like CPython.
 //!
-//! Algorithms that need SHA-3/SHAKE are not implemented; `new`,
-//! `algorithms_guaranteed`/`algorithms_available` therefore report only the
-//! algorithms that really exist and never fabricate a digest. The `uuid1`,
+//! `algorithms_guaranteed`/`algorithms_available` list exactly the algorithms
+//! that really exist and never fabricate a digest. The `uuid1`,
 //! `uuid4` and `uuid5` helpers return canonical UUID strings, matching
 //! `str(uuid.uuidN(...))`; `uuid5` hashes with the native SHA-1. Only
 //! `_uuid.generate_time_safe()` returns the raw 16-byte form its caller
@@ -40,19 +42,6 @@ const STATE_ATTR: &str = "\u{0}hashlib.state";
 const INNER_ATTR: &str = "\u{0}hashlib.inner";
 const OUTER_ATTR: &str = "\u{0}hashlib.outer";
 
-/// The methods every hash object exposes. `arity` includes `self`.
-///
-/// The native name is bare (`update`, ...), exactly like the other native
-/// class tables: `methods.rs` prepends the receiver, `resolve_native` matches
-/// `hashlib.update` in the supplemental table, and the receiver decides
-/// whether the HASH or HMAC implementation runs.
-const HASH_METHODS: [(&str, &str, usize); 4] = [
-    ("update", "update", 2),
-    ("digest", "digest", 1),
-    ("hexdigest", "hexdigest", 1),
-    ("copy", "copy", 1),
-];
-
 /// The methods every HMAC object exposes.
 const HMAC_METHODS: [(&str, &str, usize); 4] = [
     ("update", "update", 2),
@@ -62,7 +51,9 @@ const HMAC_METHODS: [(&str, &str, usize); 4] = [
 ];
 
 const MAX_DIGEST_BYTES: usize = 64;
-const MAX_BLOCK_BYTES: usize = 128;
+/// The longest block any algorithm buffers: SHAKE-128's 168-byte sponge rate
+/// (BLAKE2b/2s buffer at most 128 bytes, the SHA-2 family less).
+const MAX_BLOCK_BYTES: usize = 168;
 
 fn type_error(message: &str) -> i64 {
     exc::raise_with_message(TYPE_ERROR, message)
@@ -97,13 +88,20 @@ enum Algo {
     Sha512,
     Blake2b,
     Blake2s,
+    Sha3_224,
+    Sha3_256,
+    Sha3_384,
+    Sha3_512,
+    Shake128,
+    Shake256,
 }
 
 impl Algo {
     fn from_name(name: &str) -> Option<Algo> {
         // CPython accepts the OpenSSL spellings for the SHA-2 family. The
         // BLAKE2 constructors are lower-case only, which `new` enforces
-        // separately.
+        // separately. SHA-3 accepts the underscore and dash spellings; SHAKE
+        // also accepts OpenSSL's separator-free alias (`SHAKE128`).
         match name.to_ascii_lowercase().as_str() {
             "md5" => Some(Algo::Md5),
             "sha1" | "sha-1" => Some(Algo::Sha1),
@@ -111,6 +109,12 @@ impl Algo {
             "sha256" | "sha-256" | "sha2-256" => Some(Algo::Sha256),
             "sha384" | "sha-384" | "sha2-384" => Some(Algo::Sha384),
             "sha512" | "sha-512" | "sha2-512" => Some(Algo::Sha512),
+            "sha3_224" | "sha3-224" => Some(Algo::Sha3_224),
+            "sha3_256" | "sha3-256" => Some(Algo::Sha3_256),
+            "sha3_384" | "sha3-384" => Some(Algo::Sha3_384),
+            "sha3_512" | "sha3-512" => Some(Algo::Sha3_512),
+            "shake_128" | "shake-128" | "shake128" => Some(Algo::Shake128),
+            "shake_256" | "shake-256" | "shake256" => Some(Algo::Shake256),
             "blake2b" => Some(Algo::Blake2b),
             "blake2s" => Some(Algo::Blake2s),
             _ => None,
@@ -127,6 +131,12 @@ impl Algo {
             Algo::Sha512 => "sha512",
             Algo::Blake2b => "blake2b",
             Algo::Blake2s => "blake2s",
+            Algo::Sha3_224 => "sha3_224",
+            Algo::Sha3_256 => "sha3_256",
+            Algo::Sha3_384 => "sha3_384",
+            Algo::Sha3_512 => "sha3_512",
+            Algo::Shake128 => "shake_128",
+            Algo::Shake256 => "shake_256",
         }
     }
 
@@ -140,6 +150,12 @@ impl Algo {
             Algo::Sha512 => 64,
             Algo::Blake2b => 64,
             Algo::Blake2s => 32,
+            Algo::Sha3_224 => 28,
+            Algo::Sha3_256 => 32,
+            Algo::Sha3_384 => 48,
+            Algo::Sha3_512 => 64,
+            // SHAKE has no fixed output length; `digest(length)` decides it.
+            Algo::Shake128 | Algo::Shake256 => 0,
         }
     }
 
@@ -148,11 +164,43 @@ impl Algo {
             Algo::Md5 | Algo::Sha1 | Algo::Sha224 | Algo::Sha256 => 64,
             Algo::Sha384 | Algo::Sha512 | Algo::Blake2b => 128,
             Algo::Blake2s => 64,
+            // The sponge rate: 200 - 2 * (capacity / 2).
+            Algo::Sha3_224 => 144,
+            Algo::Sha3_256 => 136,
+            Algo::Sha3_384 => 104,
+            Algo::Sha3_512 => 72,
+            Algo::Shake128 => 168,
+            Algo::Shake256 => 136,
         }
     }
 
     fn is_blake2(self) -> bool {
         matches!(self, Algo::Blake2b | Algo::Blake2s)
+    }
+
+    fn is_keccak(self) -> bool {
+        matches!(
+            self,
+            Algo::Sha3_224
+                | Algo::Sha3_256
+                | Algo::Sha3_384
+                | Algo::Sha3_512
+                | Algo::Shake128
+                | Algo::Shake256
+        )
+    }
+
+    fn is_shake(self) -> bool {
+        matches!(self, Algo::Shake128 | Algo::Shake256)
+    }
+
+    /// FIPS 202 domain-separation suffix: `01` for SHA-3, `1111` for SHAKE.
+    fn domain(self) -> u8 {
+        if self.is_shake() {
+            0x1f
+        } else {
+            0x06
+        }
     }
 
     fn tag(self) -> u8 {
@@ -165,6 +213,12 @@ impl Algo {
             Algo::Sha512 => 5,
             Algo::Blake2b => 6,
             Algo::Blake2s => 7,
+            Algo::Sha3_224 => 8,
+            Algo::Sha3_256 => 9,
+            Algo::Sha3_384 => 10,
+            Algo::Sha3_512 => 11,
+            Algo::Shake128 => 12,
+            Algo::Shake256 => 13,
         }
     }
 
@@ -178,6 +232,12 @@ impl Algo {
             5 => Algo::Sha512,
             6 => Algo::Blake2b,
             7 => Algo::Blake2s,
+            8 => Algo::Sha3_224,
+            9 => Algo::Sha3_256,
+            10 => Algo::Sha3_384,
+            11 => Algo::Sha3_512,
+            12 => Algo::Shake128,
+            13 => Algo::Shake256,
             _ => return None,
         })
     }
@@ -204,6 +264,9 @@ struct DigestState {
     buf: Vec<u8>,
     outlen: usize,
     last_node: bool,
+    /// Keccak-f[1600] lanes for the SHA-3/SHAKE sponge; all zero for every
+    /// other algorithm.
+    keccak: [u64; 25],
 }
 
 const MD5_IV: [u64; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
@@ -290,13 +353,21 @@ impl DigestState {
     }
 
     fn new_plain(algo: Algo) -> DigestState {
-        let (words, outlen): (&[u64], usize) = match algo {
-            Algo::Md5 => (&MD5_IV, 16),
-            Algo::Sha1 => (&SHA1_IV, 20),
-            Algo::Sha224 => (&SHA224_IV, 28),
-            Algo::Sha256 => (&SHA256_IV, 32),
-            Algo::Sha384 => (&SHA384_IV, 48),
-            Algo::Sha512 => (&SHA512_IV, 64),
+        // The SHA-3/SHAKE sponge starts from an all-zero lane array and has
+        // no fixed output length (SHAKE reports `digest_size` 0).
+        let words: &[u64] = match algo {
+            Algo::Md5 => &MD5_IV,
+            Algo::Sha1 => &SHA1_IV,
+            Algo::Sha224 => &SHA224_IV,
+            Algo::Sha256 => &SHA256_IV,
+            Algo::Sha384 => &SHA384_IV,
+            Algo::Sha512 => &SHA512_IV,
+            Algo::Sha3_224
+            | Algo::Sha3_256
+            | Algo::Sha3_384
+            | Algo::Sha3_512
+            | Algo::Shake128
+            | Algo::Shake256 => &[],
             Algo::Blake2b | Algo::Blake2s => {
                 return DigestState::new(algo);
             }
@@ -309,8 +380,9 @@ impl DigestState {
             hlen: words.len(),
             len: 0,
             buf: Vec::new(),
-            outlen,
+            outlen: algo.digest_size(),
             last_node: false,
+            keccak: [0u64; 25],
         }
     }
 
@@ -377,10 +449,14 @@ impl DigestState {
             buf,
             outlen,
             last_node,
+            keccak: [0u64; 25],
         }
     }
 
     fn serialize(&self) -> Vec<u8> {
+        if self.algo.is_keccak() {
+            return self.serialize_keccak();
+        }
         let mut out = Vec::with_capacity(24 + self.hlen * 8 + self.buf.len());
         out.push(self.algo.tag());
         out.push(self.outlen as u8);
@@ -389,6 +465,23 @@ impl DigestState {
         out.push(self.hlen as u8);
         for word in &self.h[..self.hlen] {
             out.extend_from_slice(&word.to_le_bytes());
+        }
+        out.push(self.buf.len() as u8);
+        out.extend_from_slice(&self.buf);
+        out
+    }
+
+    /// Serialized form of a sponge state. `hlen` is 0 (the sponge has no
+    /// 8-word hash state) and the 25 lanes follow little-endian.
+    fn serialize_keccak(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(24 + 200 + self.buf.len());
+        out.push(self.algo.tag());
+        out.push(self.outlen as u8);
+        out.push(u8::from(self.last_node));
+        out.extend_from_slice(&self.len.to_le_bytes());
+        out.push(0);
+        for lane in &self.keccak {
+            out.extend_from_slice(&lane.to_le_bytes());
         }
         out.push(self.buf.len() as u8);
         out.extend_from_slice(&self.buf);
@@ -407,6 +500,36 @@ impl DigestState {
         at += 16;
         let hlen = usize::from(*bytes.get(at)?);
         at += 1;
+        if algo.is_keccak() {
+            if hlen != 0 || outlen != algo.digest_size() || last_node {
+                return None;
+            }
+            let mut keccak = [0u64; 25];
+            for lane in keccak.iter_mut() {
+                *lane = u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?);
+                at += 8;
+            }
+            let buf_len = usize::from(*bytes.get(at)?);
+            at += 1;
+            if buf_len > MAX_BLOCK_BYTES || buf_len >= algo.block_size() {
+                return None;
+            }
+            let buf = bytes.get(at..at + buf_len)?.to_vec();
+            at += buf_len;
+            if at != bytes.len() {
+                return None;
+            }
+            return Some(DigestState {
+                algo,
+                h: [0u64; 8],
+                hlen: 0,
+                len,
+                buf,
+                outlen,
+                last_node: false,
+                keccak,
+            });
+        }
         if hlen == 0 || hlen > 8 || outlen == 0 || outlen > MAX_DIGEST_BYTES {
             return None;
         }
@@ -433,10 +556,15 @@ impl DigestState {
             buf,
             outlen,
             last_node,
+            keccak: [0u64; 25],
         })
     }
 
     fn update(&mut self, data: &[u8]) {
+        if self.algo.is_keccak() {
+            self.keccak_update(data);
+            return;
+        }
         let block = self.algo.block_size();
         let blake = self.algo.is_blake2();
         let DigestState {
@@ -484,7 +612,34 @@ impl DigestState {
         buf.extend_from_slice(data);
     }
 
+    /// Absorbs `data` into the sponge, permuting every time a full rate-sized
+    /// block is available. Padding is deferred to `finalize_keccak`.
+    fn keccak_update(&mut self, data: &[u8]) {
+        let rate = self.algo.block_size();
+        self.len += data.len() as u128;
+        let mut data = data;
+        if !self.buf.is_empty() {
+            let take = (rate - self.buf.len()).min(data.len());
+            self.buf.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buf.len() == rate {
+                keccak_absorb(&mut self.keccak, &self.buf[..rate]);
+                keccak_f1600(&mut self.keccak);
+                self.buf.clear();
+            }
+        }
+        while data.len() >= rate {
+            keccak_absorb(&mut self.keccak, &data[..rate]);
+            keccak_f1600(&mut self.keccak);
+            data = &data[rate..];
+        }
+        self.buf.extend_from_slice(data);
+    }
+
     fn finalize(&self) -> Vec<u8> {
+        if self.algo.is_keccak() {
+            return self.finalize_keccak(self.outlen);
+        }
         let mut copy = self.clone();
         let block = copy.algo.block_size();
         if copy.algo.is_blake2() {
@@ -531,7 +686,14 @@ impl DigestState {
                 copy.buf.extend_from_slice(&(bit_len as u64).to_be_bytes());
             }
             Algo::Sha384 | Algo::Sha512 => copy.buf.extend_from_slice(&bit_len.to_be_bytes()),
-            Algo::Blake2b | Algo::Blake2s => unreachable!(),
+            Algo::Blake2b
+            | Algo::Blake2s
+            | Algo::Sha3_224
+            | Algo::Sha3_256
+            | Algo::Sha3_384
+            | Algo::Sha3_512
+            | Algo::Shake128
+            | Algo::Shake256 => unreachable!(),
         }
         {
             let DigestState { algo, h, buf, .. } = &mut copy;
@@ -573,9 +735,43 @@ impl DigestState {
                     out.extend_from_slice(&word.to_be_bytes());
                 }
             }
-            Algo::Blake2b | Algo::Blake2s => unreachable!(),
+            Algo::Blake2b
+            | Algo::Blake2s
+            | Algo::Sha3_224
+            | Algo::Sha3_256
+            | Algo::Sha3_384
+            | Algo::Sha3_512
+            | Algo::Shake128
+            | Algo::Shake256 => unreachable!(),
         }
         out.truncate(copy.outlen);
+        out
+    }
+
+    /// Pads, absorbs and squeezes `outlen` bytes out of a clone of the
+    /// sponge. `self` is untouched, so `digest()` is repeatable and SHAKE's
+    /// output length is chosen by the caller.
+    fn finalize_keccak(&self, outlen: usize) -> Vec<u8> {
+        let rate = self.algo.block_size();
+        let mut state = self.keccak;
+        let mut block = self.buf.clone();
+        block.push(self.algo.domain());
+        block.resize(rate, 0);
+        block[rate - 1] |= 0x80;
+        keccak_absorb(&mut state, &block);
+        keccak_f1600(&mut state);
+        let mut out = Vec::with_capacity(outlen);
+        while out.len() < outlen {
+            for index in 0..rate {
+                if out.len() == outlen {
+                    break;
+                }
+                out.push((state[index / 8] >> (8 * (index % 8))) as u8);
+            }
+            if out.len() < outlen {
+                keccak_f1600(&mut state);
+            }
+        }
         out
     }
 }
@@ -606,6 +802,14 @@ fn compress(algo: Algo, h: &mut [u64; 8], block: &[u8], t: u128, last: bool, las
         Algo::Sha384 | Algo::Sha512 => sha512_compress(h, block),
         Algo::Blake2b => blake2b_compress(h, block, t, last, last_node),
         Algo::Blake2s => blake2s_compress(h, block, t, last, last_node),
+        // The sponge is absorbed lane-wise by `keccak_update`, never through
+        // the 8-word `h` state.
+        Algo::Sha3_224
+        | Algo::Sha3_256
+        | Algo::Sha3_384
+        | Algo::Sha3_512
+        | Algo::Shake128
+        | Algo::Shake256 => unreachable!(),
     }
 }
 
@@ -1036,6 +1240,96 @@ fn sha512_compress(h: &mut [u64; 8], block: &[u8]) {
 }
 
 // -------------------------------------------------------------------------
+// SHA-3 / SHAKE (FIPS 202)
+// -------------------------------------------------------------------------
+
+/// The 24 round constants of Keccak-f[1600] (FIPS 202 §3.2.5).
+const KECCAK_ROUND_CONSTANTS: [u64; 24] = [
+    0x0000_0000_0000_0001,
+    0x0000_0000_0000_8082,
+    0x8000_0000_0000_808a,
+    0x8000_0000_8000_8000,
+    0x0000_0000_0000_808b,
+    0x0000_0000_8000_0001,
+    0x8000_0000_8000_8081,
+    0x8000_0000_0000_8009,
+    0x0000_0000_0000_008a,
+    0x0000_0000_0000_0088,
+    0x0000_0000_8000_8009,
+    0x0000_0000_8000_000a,
+    0x0000_0000_8000_808b,
+    0x8000_0000_0000_008b,
+    0x8000_0000_0000_8089,
+    0x8000_0000_0000_8003,
+    0x8000_0000_0000_8002,
+    0x8000_0000_0000_0080,
+    0x0000_0000_0000_800a,
+    0x8000_0000_8000_000a,
+    0x8000_0000_8000_8081,
+    0x8000_0000_0000_8080,
+    0x0000_0000_8000_0001,
+    0x8000_0000_8000_8008,
+];
+
+/// Rho rotation offsets indexed by `x + 5 * y` (FIPS 202 §3.2.2).
+const KECCAK_ROTATIONS: [u32; 25] = [
+    0, 1, 62, 28, 27, //
+    36, 44, 6, 55, 20, //
+    3, 10, 43, 25, 39, //
+    41, 45, 15, 21, 8, //
+    18, 2, 61, 56, 14,
+];
+
+/// XORs one rate-sized block into the low lanes of the sponge.
+fn keccak_absorb(state: &mut [u64; 25], block: &[u8]) {
+    for (lane, chunk) in state.iter_mut().zip(block.as_chunks::<8>().0) {
+        *lane ^= u64::from_le_bytes(*chunk);
+    }
+}
+
+/// Keccak-f[1600]: theta, rho+pi, chi and iota for 24 rounds.
+fn keccak_f1600(state: &mut [u64; 25]) {
+    for &round_constant in &KECCAK_ROUND_CONSTANTS {
+        // theta: mix each column's parity into its neighbours.
+        let mut column = [0u64; 5];
+        for (x, slot) in column.iter_mut().enumerate() {
+            *slot = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+        }
+        for x in 0..5 {
+            let delta = column[(x + 4) % 5] ^ column[(x + 1) % 5].rotate_left(1);
+            for y in (0..25).step_by(5) {
+                state[y + x] ^= delta;
+            }
+        }
+        // rho (lane rotation) and pi (lane permutation) in one pass.
+        let mut permuted = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                let from = x + 5 * y;
+                let to = y + 5 * ((2 * x + 3 * y) % 5);
+                permuted[to] = state[from].rotate_left(KECCAK_ROTATIONS[from]);
+            }
+        }
+        // chi: the only non-linear step.
+        for y in 0..5 {
+            let row = 5 * y;
+            let source = [
+                permuted[row],
+                permuted[row + 1],
+                permuted[row + 2],
+                permuted[row + 3],
+                permuted[row + 4],
+            ];
+            for x in 0..5 {
+                state[row + x] = source[x] ^ ((!source[(x + 1) % 5]) & source[(x + 2) % 5]);
+            }
+        }
+        // iota
+        state[0] ^= round_constant;
+    }
+}
+
+// -------------------------------------------------------------------------
 // BLAKE2
 // -------------------------------------------------------------------------
 
@@ -1279,8 +1573,74 @@ fn class_with_methods(
     class
 }
 
+/// The digest methods carry full parameter metadata: SHAKE's `digest(length)`
+/// takes an argument, and the runtime binder needs the signature to supply it
+/// positionally or by keyword (every other algorithm rejects it).
+fn shake_method(native: &'static str, entry: extern "C" fn(*const i64) -> i64) -> i64 {
+    let function = value::native_function_new(MODULE, native, usize::MAX);
+    value::function_set_signature(
+        function,
+        vec![
+            value::ParamMeta {
+                name: "self".to_string(),
+                kind: hydro_ir::ParamKind::PosOnly,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "length".to_string(),
+                kind: hydro_ir::ParamKind::Positional,
+                default: Some(NONE),
+            },
+        ],
+    );
+    value::function_set_full_entry(function, entry as *const () as usize);
+    function
+}
+
+extern "C" fn hash_digest_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes the signature's two slots.
+    let instance = unsafe { *argv };
+    let length = unsafe { *argv.add(1) };
+    if length == NONE {
+        hash_digest(&[instance], &[], false)
+    } else {
+        hash_digest(&[instance, length], &[], false)
+    }
+}
+
+extern "C" fn hash_hexdigest_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes the signature's two slots.
+    let instance = unsafe { *argv };
+    let length = unsafe { *argv.add(1) };
+    if length == NONE {
+        hash_digest(&[instance], &[], true)
+    } else {
+        hash_digest(&[instance, length], &[], true)
+    }
+}
+
 fn hash_class() -> i64 {
-    class_with_methods(HASH_CLASS_KEY, "HASH", &HASH_METHODS)
+    if let Some(cached) = globals::registry_get(HASH_CLASS_KEY) {
+        return cached;
+    }
+    let update = value::native_function_new(MODULE, "update", 2);
+    let copy = value::native_function_new(MODULE, "copy", 1);
+    let digest = shake_method("digest", hash_digest_entry);
+    let hexdigest = shake_method("hexdigest", hash_hexdigest_entry);
+    let values = vec![update, copy, digest, hexdigest];
+    let method_roots = heap::root_values(&values);
+    let methods = vec![
+        ("update".to_string(), update, MethodKind::Normal),
+        ("digest".to_string(), digest, MethodKind::Normal),
+        ("hexdigest".to_string(), hexdigest, MethodKind::Normal),
+        ("copy".to_string(), copy, MethodKind::Normal),
+    ];
+    let class = value::class_new_full("HASH".to_string(), NONE, methods, Vec::new());
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(HASH_CLASS_KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
 }
 
 fn hmac_class() -> i64 {
@@ -1356,6 +1716,14 @@ fn construct_plain(
     function: &str,
     data_index: usize,
 ) -> i64 {
+    // The SHA-3/SHAKE constructors take at most the single `data` positional
+    // argument; CPython rejects a second one instead of ignoring it.
+    if algo.is_keccak() && args.len() > data_index + 1 {
+        return type_error(&format!(
+            "{function}() takes at most 1 positional argument ({} given)",
+            args.len() - data_index
+        ));
+    }
     let data = match take(args, keywords, data_index, "data") {
         Ok(data) => data,
         Err(err) => return err,
@@ -1590,14 +1958,70 @@ fn hash_update(args: &[i64]) -> i64 {
     NONE
 }
 
-fn hash_digest(args: &[i64], hex: bool) -> i64 {
+/// Reads the SHAKE output length from `digest(length)`/`hexdigest(length)`.
+/// CPython accepts `length` positionally and by keyword.
+fn shake_length(method: &str, args: &[i64], keywords: &[(String, i64)]) -> Result<usize, i64> {
+    if let Some((name, _)) = keywords.iter().find(|(name, _)| name != "length") {
+        return Err(type_error(&format!(
+            "{method}() got an unexpected keyword argument '{name}'"
+        )));
+    }
+    let positional = args.get(1).copied().filter(|value| *value != NONE);
+    let named = keywords
+        .iter()
+        .find(|(name, _)| name == "length")
+        .map(|(_, value_arg)| *value_arg);
+    let value_arg = match (positional, named) {
+        (Some(_), Some(_)) => {
+            return Err(type_error(&format!(
+                "{method}() got multiple values for argument 'length'"
+            )))
+        }
+        (Some(value_arg), None) | (None, Some(value_arg)) => value_arg,
+        (None, None) => {
+            return Err(type_error(&format!(
+                "{method}() missing required argument 'length' (pos 1)"
+            )))
+        }
+    };
+    let Some(length) = value::as_integer(value_arg) else {
+        return Err(type_error(&format!(
+            "{} object cannot be interpreted as an integer",
+            value::type_name(value_arg)
+        )));
+    };
+    let Ok(length) = usize::try_from(length) else {
+        return Err(value_error("length must be non-negative"));
+    };
+    Ok(length)
+}
+
+fn hash_digest(args: &[i64], keywords: &[(String, i64)], hex: bool) -> i64 {
+    let method = if hex { "hexdigest" } else { "digest" };
     let Some(&obj) = args.first() else {
-        return type_error("digest() missing required argument 'self'");
+        return type_error(&format!("{method}() missing required argument 'self'"));
     };
     let Some(state) = state_of(obj) else {
-        return type_error("digest() requires a hashlib hash object");
+        return type_error(&format!("{method}() requires a hashlib hash object"));
     };
-    let digest = state.finalize();
+    let digest = if state.algo.is_shake() {
+        // SHAKE has no fixed digest size: every call picks the length.
+        match shake_length(method, args, keywords) {
+            Ok(length) => state.finalize_keccak(length),
+            Err(err) => return err,
+        }
+    } else {
+        if !keywords.is_empty() {
+            return type_error(&format!("{method}() takes no keyword arguments"));
+        }
+        if args.len() > 1 {
+            return type_error(&format!(
+                "{method}() takes no arguments ({} given)",
+                args.len() - 1
+            ));
+        }
+        state.finalize()
+    };
     if hex {
         value::str_alloc(to_hex(&digest))
     } else {
@@ -1682,10 +2106,20 @@ fn is_callable(arg: i64) -> bool {
             || crate::modules::extension::ext_object_is_callable(arg))
 }
 
+/// HMAC needs a fixed digest size, so the extensible-output SHAKE family is
+/// not usable as a `digestmod`; OpenSSL rejects it with this exact message.
+fn hmac_algo(algo: Algo) -> Result<Algo, i64> {
+    if algo.is_shake() {
+        return Err(value_error("no reason supplied"));
+    }
+    Ok(algo)
+}
+
 fn resolve_digestmod(digestmod: i64) -> Result<Algo, i64> {
     if let Some(name) = value::as_str(digestmod) {
         return Algo::from_name(name)
-            .ok_or_else(|| value_error(&format!("unsupported hash type {name}")));
+            .ok_or_else(|| value_error(&format!("unsupported hash type {name}")))
+            .and_then(hmac_algo);
     }
     if is_callable(digestmod) {
         let produced = crate::builtins::call(digestmod, 0, std::ptr::null());
@@ -1693,7 +2127,7 @@ fn resolve_digestmod(digestmod: i64) -> Result<Algo, i64> {
             return Err(NONE);
         }
         if let Some(state) = state_of(produced) {
-            return Ok(state.algo);
+            return hmac_algo(state.algo);
         }
         let name = methods::getattr(produced, b"name".as_ptr(), 4);
         if exc::pending() {
@@ -1701,7 +2135,7 @@ fn resolve_digestmod(digestmod: i64) -> Result<Algo, i64> {
         }
         if let Some(text) = value::as_str(name) {
             if let Some(algo) = Algo::from_name(text) {
-                return Ok(algo);
+                return hmac_algo(algo);
             }
         }
         return Err(type_error(
@@ -1895,6 +2329,11 @@ fn pbkdf2_call(args: &[i64], keywords: &mut Vec<(String, i64)>) -> i64 {
         Some(_) => return value_error("key length must be greater than 0."),
         None => algo.digest_size(),
     };
+    if dklen == 0 {
+        // Only SHAKE reaches here: it has no default digest size and PBKDF2
+        // cannot derive an empty key (CPython's OpenSSL reports this message).
+        return value_error("key length must be greater than 0.");
+    }
     if dklen > i32::MAX as usize {
         return overflow_error("key length is too great.");
     }
@@ -2418,7 +2857,20 @@ fn to_hex(bytes: &[u8]) -> String {
 
 fn algorithm_set() -> i64 {
     let names = [
-        "md5", "sha1", "sha224", "sha256", "sha384", "sha512", "blake2b", "blake2s",
+        "md5",
+        "sha1",
+        "sha224",
+        "sha256",
+        "sha384",
+        "sha512",
+        "sha3_224",
+        "sha3_256",
+        "sha3_384",
+        "sha3_512",
+        "shake_128",
+        "shake_256",
+        "blake2b",
+        "blake2s",
     ];
     let items = names
         .iter()
@@ -2458,10 +2910,27 @@ fn openssl_constructor(bare: &str) -> Option<(Algo, Option<usize>)> {
         "openssl_sha256" => (Algo::Sha256, None),
         "openssl_sha384" => (Algo::Sha384, None),
         "openssl_sha512" => (Algo::Sha512, None),
+        "openssl_sha3_224" => (Algo::Sha3_224, None),
+        "openssl_sha3_256" => (Algo::Sha3_256, None),
+        "openssl_sha3_384" => (Algo::Sha3_384, None),
+        "openssl_sha3_512" => (Algo::Sha3_512, None),
+        "openssl_shake_128" => (Algo::Shake128, Some(0)),
+        "openssl_shake_256" => (Algo::Shake256, Some(0)),
         "openssl_blake2b512" => (Algo::Blake2b, Some(64)),
         "openssl_blake2s256" => (Algo::Blake2s, Some(32)),
         _ => return None,
     })
+}
+
+/// Whether `args`/`keywords` describe a SHAKE `digest`/`hexdigest` call, whose
+/// only keyword is `length`. Every other hash method is positional-only.
+fn shake_digest_call(args: &[i64], keywords: &[(String, i64)], method: &str) -> bool {
+    matches!(method, "digest" | "hexdigest")
+        && keywords.iter().all(|(name, _)| name == "length")
+        && args
+            .first()
+            .and_then(|&obj| state_of(obj))
+            .is_some_and(|state| state.algo.is_shake())
 }
 
 fn method_dispatch(function: &str, args: &[i64], keywords: &[(String, i64)]) -> Option<i64> {
@@ -2479,21 +2948,21 @@ fn method_dispatch(function: &str, args: &[i64], keywords: &[(String, i64)]) -> 
     if !is_method {
         return None;
     }
-    if !keywords.is_empty() {
+    let bare = function.rsplit('.').next().unwrap_or(function);
+    if !keywords.is_empty() && !shake_digest_call(args, keywords, bare) {
         let receiver = if function.starts_with("hashlib.HMAC.") {
             "HMAC"
         } else {
             "HASH"
         };
         return Some(type_error(&format!(
-            "{receiver}.{}() takes no keyword arguments",
-            function.rsplit('.').next().unwrap_or(function)
+            "{receiver}.{bare}() takes no keyword arguments"
         )));
     }
     Some(match function {
         "hashlib.update" => hash_update(args),
-        "hashlib.digest" => hash_digest(args, false),
-        "hashlib.hexdigest" => hash_digest(args, true),
+        "hashlib.digest" => hash_digest(args, keywords, false),
+        "hashlib.hexdigest" => hash_digest(args, keywords, true),
         "hashlib.copy" => hash_copy(args),
         "hashlib.HMAC.update" => hmac_update(args),
         "hashlib.HMAC.digest" => hmac_digest(args, false),
@@ -2509,11 +2978,6 @@ fn bare_method_dispatch(function: &str, args: &[i64], keywords: &[(String, i64)]
     if !matches!(function, "update" | "digest" | "hexdigest" | "copy") {
         return None;
     }
-    if !keywords.is_empty() {
-        return Some(type_error(&format!(
-            "{function}() takes no keyword arguments"
-        )));
-    }
     let Some(&obj) = args.first() else {
         return Some(type_error(&format!(
             "{function}() missing required argument 'self'"
@@ -2521,11 +2985,17 @@ fn bare_method_dispatch(function: &str, args: &[i64], keywords: &[(String, i64)]
     };
     let hashed = value::instance_attr(obj, STATE_ATTR).is_some();
     let mac = value::instance_attr(obj, INNER_ATTR).is_some();
+    let keywords_allowed = hashed && shake_digest_call(args, keywords, function);
+    if !keywords.is_empty() && !keywords_allowed {
+        return Some(type_error(&format!(
+            "{function}() takes no keyword arguments"
+        )));
+    }
     if hashed {
         Some(match function {
             "update" => hash_update(args),
-            "digest" => hash_digest(args, false),
-            "hexdigest" => hash_digest(args, true),
+            "digest" => hash_digest(args, keywords, false),
+            "hexdigest" => hash_digest(args, keywords, true),
             "copy" => hash_copy(args),
             _ => unreachable!(),
         })
@@ -2592,6 +3062,12 @@ pub(crate) fn call_named_kw(
         "sha256" => construct(Algo::Sha256, args, &mut keywords),
         "sha384" => construct(Algo::Sha384, args, &mut keywords),
         "sha512" => construct(Algo::Sha512, args, &mut keywords),
+        "sha3_224" => construct(Algo::Sha3_224, args, &mut keywords),
+        "sha3_256" => construct(Algo::Sha3_256, args, &mut keywords),
+        "sha3_384" => construct(Algo::Sha3_384, args, &mut keywords),
+        "sha3_512" => construct(Algo::Sha3_512, args, &mut keywords),
+        "shake_128" => construct(Algo::Shake128, args, &mut keywords),
+        "shake_256" => construct(Algo::Shake256, args, &mut keywords),
         "blake2b" => construct_blake(Algo::Blake2b, args, &mut keywords, "blake2b", 0),
         "blake2s" => construct_blake(Algo::Blake2s, args, &mut keywords, "blake2s", 0),
         "pbkdf2_hmac" => pbkdf2_call(args, &mut keywords),
@@ -3013,7 +3489,7 @@ c6d5c277c110ef86c959ed63e6ecaaaceaaff38019a43264ae06acf73b9550b1"
         assert_eq!(clear_error(), TYPE_ERROR);
         assert_eq!(bad, NONE);
 
-        let bad = call("new", &[text("sha3_256")]);
+        let bad = call("new", &[text("shake_64")]);
         assert_eq!(clear_error(), VALUE_ERROR);
         assert_eq!(bad, NONE);
 
@@ -3122,5 +3598,364 @@ c6d5c277c110ef86c959ed63e6ecaaaceaaff38019a43264ae06acf73b9550b1"
             to_hex(value::as_bytes(good).unwrap()),
             "120fb6cffcf8b32c43e7225256c4f837a86548c9"
         );
+    }
+
+    fn shake_hex(algo: Algo, data: &[u8], outlen: usize) -> String {
+        let mut state = DigestState::new(algo);
+        state.update(data);
+        to_hex(&state.finalize_keccak(outlen))
+    }
+
+    #[test]
+    fn sha3_known_vectors() {
+        assert_eq!(
+            digest_hex(Algo::Sha3_224, b""),
+            "6b4e03423667dbb73b6e15454f0eb1abd4597f9a1b078e3f5b5a6bc7"
+        );
+        assert_eq!(
+            digest_hex(Algo::Sha3_224, b"abc"),
+            "e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf"
+        );
+        assert_eq!(
+            digest_hex(
+                Algo::Sha3_224,
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            ),
+            "8a24108b154ada21c9fd5574494479ba5c7e7ab76ef264ead0fcce33"
+        );
+        assert_eq!(
+            digest_hex(Algo::Sha3_256, b""),
+            "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a"
+        );
+        assert_eq!(
+            digest_hex(Algo::Sha3_256, b"abc"),
+            "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532"
+        );
+        assert_eq!(
+            digest_hex(
+                Algo::Sha3_256,
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            ),
+            "41c0dba2a9d6240849100376a8235e2c82e1b9998a999e21db32dd97496d3376"
+        );
+        assert_eq!(
+            digest_hex(Algo::Sha3_384, b""),
+            "0c63a75b845e4f7d01107d852e4c2485c51a50aaaa94fc61995e71bbee983a2a\
+c3713831264adb47fb6bd1e058d5f004"
+        );
+        assert_eq!(
+            digest_hex(Algo::Sha3_384, b"abc"),
+            "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b2\
+98d88cea927ac7f539f1edf228376d25"
+        );
+        assert_eq!(
+            digest_hex(
+                Algo::Sha3_384,
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            ),
+            "991c665755eb3a4b6bbdfb75c78a492e8c56a22c5c4d7e429bfdbc32b9d4ad5a\
+a04a1f076e62fea19eef51acd0657c22"
+        );
+        assert_eq!(
+            digest_hex(Algo::Sha3_512, b""),
+            "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a6\
+15b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26"
+        );
+        assert_eq!(
+            digest_hex(Algo::Sha3_512, b"abc"),
+            "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e\
+10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0"
+        );
+        assert_eq!(
+            digest_hex(
+                Algo::Sha3_512,
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            ),
+            "04a371e84ecfb5b8b77cb48610fca8182dd457ce6f326a0fd3d7ec2f1e91636d\
+ee691fbe0c985302ba1b0d8dc78c086346b533b49c030d99a27daf1139d6e75e"
+        );
+
+        // Multi-block inputs: 200 bytes crosses every sponge rate, and 168 /
+        // 169 bytes straddle a full 136-byte SHA3-256 block.
+        assert_eq!(
+            digest_hex(Algo::Sha3_224, &[b'a'; 200]),
+            "455e0ccfc6010738ed93a793dffd79aff36debbd1a7eb6621bd6c722"
+        );
+        assert_eq!(
+            digest_hex(Algo::Sha3_256, &[b'a'; 200]),
+            "cce34485baf2bf2aca99b94833892a4f52896d3d153f7b840cc4f9fe695f1387"
+        );
+        assert_eq!(
+            digest_hex(Algo::Sha3_384, &[b'a'; 200]),
+            "f97756776c1874724c94a8008f7f155553b4bf00fbf8fbeac246624ad59c258a\
+3c0977d9f2543d7cbd75b9ac8fdc0d40"
+        );
+        assert_eq!(
+            digest_hex(Algo::Sha3_512, &[b'a'; 200]),
+            "eae6c85c6904f11075de9f9d5e1064371d000510fa3d2d79d40cf9be34892fb0\
+1859d0a0234e138bcb0ad5c84f6c0dca226a414b0c9a2897cb695f5185fe36ec"
+        );
+        assert_eq!(
+            digest_hex(Algo::Sha3_256, &[b'x'; 168]),
+            "c4fecd1bae7eb8e8a1faddc88c33027cc09dbbbcdd42182880940407e7a56f9b"
+        );
+        assert_eq!(
+            digest_hex(Algo::Sha3_256, &[b'x'; 169]),
+            "3f72c3684c1997c4d61fff78adfe9ad5f57a71220453ca5f03f2b80ee0694831"
+        );
+    }
+
+    #[test]
+    fn shake_known_vectors() {
+        assert_eq!(
+            shake_hex(Algo::Shake128, b"", 32),
+            "7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef26"
+        );
+        assert_eq!(
+            shake_hex(Algo::Shake128, b"abc", 32),
+            "5881092dd818bf5cf8a3ddb793fbcba74097d5c526a6d35f97b83351940f2cc8"
+        );
+        assert_eq!(
+            shake_hex(Algo::Shake256, b"", 64),
+            "46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762f\
+d75dc4ddd8c0f200cb05019d67b592f6fc821c49479ab48640292eacb3b7c4be"
+        );
+        assert_eq!(
+            shake_hex(Algo::Shake256, b"abc", 64),
+            "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739\
+d5a15bef186a5386c75744c0527e1faa9f8726e462a12a4feb06bd8801e751e4"
+        );
+        // 200 bytes of output crosses SHAKE-128's 168-byte rate.
+        assert_eq!(
+            shake_hex(Algo::Shake128, b"abc", 200),
+            "5881092dd818bf5cf8a3ddb793fbcba74097d5c526a6d35f97b83351940f2cc8\
+44c50af32acd3f2cdd066568706f509bc1bdde58295dae3f891a9a0fca578378\
+9a41f8611214ce612394df286a62d1a2252aa94db9c538956c717dc2bed4f232\
+a0294c857c730aa16067ac1062f1201fb0d377cfb9cde4c63599b27f3462bba4\
+a0ed296c801f9ff7f57302bb3076ee145f97a32ae68e76ab66c48d51675bd49a\
+cc29082f5647584e6aa01b3f5af057805f973ff8ecb8b226ac32ada6f01c1fcd\
+4818cb006aa5b4cd"
+        );
+        assert_eq!(
+            shake_hex(Algo::Shake256, b"abc", 200),
+            "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739\
+d5a15bef186a5386c75744c0527e1faa9f8726e462a12a4feb06bd8801e751e4\
+1385141204f329979fd3047a13c5657724ada64d2470157b3cdc288620944d78\
+dbcddbd912993f0913f164fb2ce95131a2d09a3e6d51cbfc622720d7a75c6334\
+e8a2d7ec71a7cc29cf0ea610eeff1a588290a53000faa79932becec0bd3cd0b3\
+3a7e5d397fed1ada9442b99903f4dcfd8559ed3950faf40fe6f3b5d710ed3b67\
+7513771af6bfe119"
+        );
+        // A zero-length squeeze is legal and empty.
+        assert_eq!(shake_hex(Algo::Shake128, b"abc", 0), "");
+    }
+
+    #[test]
+    fn sha3_streaming_and_serialized_states() {
+        let data: Vec<u8> = (0..500u32).map(|index| (index % 251) as u8).collect();
+        for algo in [
+            Algo::Sha3_224,
+            Algo::Sha3_256,
+            Algo::Sha3_384,
+            Algo::Sha3_512,
+            Algo::Shake128,
+            Algo::Shake256,
+        ] {
+            let outlen = if algo.is_shake() {
+                72
+            } else {
+                algo.digest_size()
+            };
+            let mut whole = DigestState::new(algo);
+            whole.update(&data);
+            let expected = whole.finalize_keccak(outlen);
+            assert_eq!(
+                to_hex(&whole.finalize_keccak(outlen)),
+                to_hex(&expected),
+                "{algo:?} finalize is repeatable"
+            );
+
+            let mut chunked = DigestState::new(algo);
+            for chunk in data.chunks(7) {
+                chunked.update(chunk);
+            }
+            assert_eq!(
+                to_hex(&chunked.finalize_keccak(outlen)),
+                to_hex(&expected),
+                "{algo:?} streaming"
+            );
+
+            let mut resumed = DigestState::deserialize(&chunked.serialize()).expect("state");
+            resumed.update(b"tail");
+            let mut direct = chunked.clone();
+            direct.update(b"tail");
+            assert_eq!(
+                resumed.finalize_keccak(outlen),
+                direct.finalize_keccak(outlen),
+                "{algo:?} serialized resume"
+            );
+        }
+    }
+
+    #[test]
+    fn sha3_feeds_hmac_and_pbkdf2() {
+        // RFC 2104 construction over the native SHA3-256 compression.
+        assert_eq!(
+            hmac_hex(Algo::Sha3_256, &[0x0b; 20], b"Hi There"),
+            "ba85192310dffa96e2a3a40e69774351140bb7185e1202cdcc917589f95e16bb"
+        );
+        assert_eq!(
+            to_hex(&pbkdf2_hmac(Algo::Sha3_256, b"password", b"salt", 1, 20)),
+            "94613f3ee2ea730e0b06754f3fc816d4f87c9be9"
+        );
+    }
+
+    #[test]
+    fn sha3_algorithm_names_and_sizes() {
+        for (name, algo) in [
+            ("sha3_224", Algo::Sha3_224),
+            ("sha3-256", Algo::Sha3_256),
+            ("sha3_384", Algo::Sha3_384),
+            ("sha3-512", Algo::Sha3_512),
+            ("shake_128", Algo::Shake128),
+            ("shake128", Algo::Shake128),
+            ("shake_256", Algo::Shake256),
+        ] {
+            assert_eq!(Algo::from_name(name), Some(algo), "{name}");
+            assert_eq!(Algo::from_tag(algo.tag()), Some(algo));
+        }
+        assert_eq!(Algo::from_name("sha4_256"), None);
+        assert_eq!(Algo::Sha3_224.block_size(), 144);
+        assert_eq!(Algo::Sha3_256.block_size(), 136);
+        assert_eq!(Algo::Sha3_384.block_size(), 104);
+        assert_eq!(Algo::Sha3_512.block_size(), 72);
+        assert_eq!(Algo::Shake128.block_size(), 168);
+        assert_eq!(Algo::Shake256.block_size(), 136);
+        assert_eq!(Algo::Sha3_512.digest_size(), 64);
+        assert_eq!(Algo::Shake128.digest_size(), 0);
+        assert!(Algo::Shake256.is_shake() && Algo::Shake256.is_keccak());
+        assert!(!Algo::Sha3_256.is_shake() && Algo::Sha3_256.is_keccak());
+    }
+
+    #[test]
+    fn sha3_runtime_surface() {
+        exc::init();
+        let hash = call("sha3_256", &[bytes(b"abc")]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_str(value::instance_attr(hash, "name").unwrap()).unwrap(),
+            "sha3_256"
+        );
+        assert_eq!(
+            as_int(value::instance_attr(hash, "digest_size").unwrap()),
+            32
+        );
+        assert_eq!(
+            as_int(value::instance_attr(hash, "block_size").unwrap()),
+            136
+        );
+        assert_eq!(
+            value::as_str(call("hashlib.hexdigest", &[hash])).unwrap(),
+            "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532"
+        );
+
+        // `new` and the `_hashlib` OpenSSL alias build the same object.
+        let via_new = call("new", &[text("sha3-384"), bytes(b"abc")]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_str(call("hashlib.hexdigest", &[via_new])).unwrap(),
+            "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b2\
+98d88cea927ac7f539f1edf228376d25"
+        );
+        let via_openssl = call("openssl_sha3_512", &[bytes(b"abc")]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_str(call("hashlib.hexdigest", &[via_openssl])).unwrap(),
+            "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e\
+10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0"
+        );
+
+        let shake = call("shake_128", &[bytes(b"abc")]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_str(value::instance_attr(shake, "name").unwrap()).unwrap(),
+            "shake_128"
+        );
+        assert_eq!(
+            as_int(value::instance_attr(shake, "digest_size").unwrap()),
+            0
+        );
+        assert_eq!(
+            as_int(value::instance_attr(shake, "block_size").unwrap()),
+            168
+        );
+        assert_eq!(
+            value::as_str(call("hashlib.hexdigest", &[shake, int_result(4)])).unwrap(),
+            "5881092d"
+        );
+        assert!(
+            value::as_bytes(call("hashlib.digest", &[shake, int_result(0)]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            value::as_str(call_kw(
+                "hashlib.hexdigest",
+                &[shake],
+                &[("length".to_string(), int_result(4))],
+            ))
+            .unwrap(),
+            "5881092d"
+        );
+
+        // `copy()` is independent of the original sponge.
+        let copy = call("hashlib.copy", &[shake]);
+        call("hashlib.update", &[copy, bytes(b"more")]);
+        assert_eq!(
+            value::as_str(call("hashlib.hexdigest", &[shake, int_result(4)])).unwrap(),
+            "5881092d"
+        );
+
+        // SHAKE needs an explicit length; a negative or non-integer one is an
+        // error, and non-SHAKE hashes reject the keyword.
+        let bad = call("hashlib.digest", &[shake]);
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+        let bad = call("hashlib.digest", &[shake, int_result(-1)]);
+        assert_eq!(clear_error(), VALUE_ERROR);
+        assert_eq!(bad, NONE);
+        let bad = call("hashlib.digest", &[shake, text("4")]);
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+        let bad = call_kw(
+            "hashlib.hexdigest",
+            &[hash],
+            &[("length".to_string(), int_result(4))],
+        );
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+        let bad = call("shake_128", &[bytes(b"abc"), int_result(4)]);
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+
+        // Both algorithm sets name every implemented digest.
+        for constant in ["algorithms_guaranteed", "algorithms_available"] {
+            let set = constant_named("hashlib", constant).unwrap();
+            let names: Vec<&str> = value::as_set(set)
+                .unwrap()
+                .iter()
+                .filter_map(|&item| value::as_str(item))
+                .collect();
+            for name in [
+                "sha3_224",
+                "sha3_256",
+                "sha3_384",
+                "sha3_512",
+                "shake_128",
+                "shake_256",
+            ] {
+                assert!(names.contains(&name), "{constant} missing {name}");
+            }
+        }
     }
 }

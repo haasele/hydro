@@ -2749,6 +2749,53 @@ fn adopt_static_type(pointer: *mut TypeObject) -> Result<*mut TypeObject, String
     Ok(pointer)
 }
 
+/// Readies `type_object`, first making every `tp_base` in its chain a type
+/// object and ready.
+///
+/// CPython's `PyType_Ready` readies an unready base on demand, and extensions
+/// rely on that: NumPy points `numpy.dtypes.Int8DType.tp_base` at
+/// `PyArray_IntAbstractDType`, a static type readied later in the same module
+/// initialization. A base that is not a type object is still rejected.
+fn ready_with_bases(type_object: *mut TypeObject) -> Result<(), String> {
+    let mut chain: Vec<*mut TypeObject> = Vec::new();
+    let mut current = type_object;
+    loop {
+        if chain.len() >= 64 {
+            return Err(format!(
+                "SystemError: PyType_Ready: type '{}' has a tp_base chain that is too deep",
+                type_name(type_object)
+            ));
+        }
+        if chain.contains(&current) {
+            return Err(format!(
+                "SystemError: PyType_Ready: type '{}' has a cyclic tp_base chain",
+                type_name(type_object)
+            ));
+        }
+        chain.push(current);
+        // SAFETY: `current` is a type object (the argument or an adopted base)
+        // and `tp_base` is inside the CPython prefix.
+        let base = unsafe { (*current).tp_base };
+        if base.is_null() {
+            break;
+        }
+        if !is_type_pointer(base as *mut ShimObject) {
+            adopt_static_type(base).map_err(|error| {
+                format!(
+                    "TypeError: PyType_Ready: type '{}' has an invalid tp_base: {error}",
+                    type_name(type_object)
+                )
+            })?;
+        }
+        current = base;
+    }
+    // Ancestors first, so every `static_ancestors` walk sees ready types.
+    for &entry in chain.iter().rev() {
+        ensure_ready(entry)?;
+    }
+    Ok(())
+}
+
 /// `PyType_Ready`: finalises a heap type from `PyType_FromSpec` or adopts a
 /// statically declared C `PyTypeObject`.
 #[no_mangle]
@@ -2783,7 +2830,7 @@ pub extern "C" fn PyType_Ready(type_object: *mut ShimObject) -> c_int {
             }
         },
     };
-    match ensure_ready(pointer) {
+    match ready_with_bases(pointer) {
         Ok(()) => 0,
         Err(error) => {
             set_error(error);

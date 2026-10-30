@@ -93,11 +93,14 @@ fn parse_module(
 ///
 /// `import foo` / `from foo import f` are resolved as Python modules: first
 /// next to the importing file, then through `HYDRO_SITE_PACKAGES`, the
-/// `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages directories, `PYTHONPATH`,
-/// `HYDRO_STDLIB` (a CPython `Lib` directory backing the standard library
-/// sources) and finally the pure-Python modules vendored in Hydro's own
-/// `stdlib/` tree. Explicit roots win over the vendored tree, so an override
-/// placed there is observable. Both plain modules (`foo.py`) and packages
+/// `VIRTUAL_ENV`/`CONDA_PREFIX` site-packages directories and `PYTHONPATH`,
+/// then the pure-Python modules vendored in Hydro's own `stdlib/` tree, and
+/// finally `HYDRO_STDLIB` (a CPython `Lib` directory backing every standard
+/// library module Hydro does not vendor). User and project roots therefore win
+/// over the standard library, while a vendored adaptation (for example the
+/// patched `enum.py`) wins over the generic `Lib` source even for a module
+/// whose own directory is inside that `Lib` tree. Both plain modules
+/// (`foo.py`) and packages
 /// (`foo/__init__.py`) are supported, including dotted names, submodules and
 /// relative imports. A directory without `__init__.py` is a namespace-package
 /// segment: it is importable and acts as a search root for its submodules, but
@@ -2250,13 +2253,16 @@ fn is_site_package_path(path: &Path) -> bool {
 /// Directories searched for user modules, in order: the importing file's
 /// directory, the root of the current package chain (so `pkg.a` can import
 /// `pkg.b`), `HYDRO_SITE_PACKAGES`, the site-packages directories of
-/// `VIRTUAL_ENV`/`CONDA_PREFIX`, `PYTHONPATH`, `HYDRO_STDLIB` and finally the
-/// vendored `stdlib/` tree shipped with Hydro.
+/// `VIRTUAL_ENV`/`CONDA_PREFIX`, `PYTHONPATH`, the vendored `stdlib/` tree
+/// shipped with Hydro and finally `HYDRO_STDLIB`.
 ///
 /// `HYDRO_STDLIB` is a CPython `Lib` directory that backs the standard library
-/// sources (`<cpython>/Lib`). It and every other explicit root precede the
-/// vendored `stdlib/` tree, so project modules, site-packages, `PYTHONPATH`
-/// entries and an explicit `HYDRO_STDLIB` always win over the bundled modules.
+/// sources (`<cpython>/Lib`). Project modules, site-packages and `PYTHONPATH`
+/// entries precede it, but the vendored modules follow them and precede
+/// `HYDRO_STDLIB`: they are Hydro's compatibility adaptations, so an override
+/// installed in `stdlib/` stays observable even for an importer that lives
+/// inside the `Lib` tree. Modules Hydro does not vendor fall through to
+/// `HYDRO_STDLIB`.
 fn module_search_roots(importer_dir: &Path, module_root: &Path) -> Vec<PathBuf> {
     let hydro_site_packages = std::env::var_os("HYDRO_SITE_PACKAGES");
     let pythonpath = std::env::var_os("PYTHONPATH");
@@ -2285,8 +2291,9 @@ fn module_search_roots(importer_dir: &Path, module_root: &Path) -> Vec<PathBuf> 
 /// lives in `<prefix>/bin`. Executable-relative candidates come first so a
 /// shipped tree is never shadowed by the checkout of the machine that built
 /// it. `None` when no candidate exists. Do not confuse this root with
-/// `HYDRO_STDLIB`: that variable names a CPython `Lib` tree and takes
-/// precedence.
+/// `HYDRO_STDLIB`: that variable names a CPython `Lib` tree, and the vendored
+/// modules here are the compatibility adaptations that must win over it
+/// (see [`module_search_roots_from`]).
 fn bundled_stdlib_root() -> Option<&'static Path> {
     static ROOT: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::new(|| {
         let mut candidates = Vec::new();
@@ -2315,14 +2322,22 @@ fn bundled_stdlib_root() -> Option<&'static Path> {
 ///
 /// Order: the importing directory and the current package root, then
 /// `HYDRO_SITE_PACKAGES`, the site-packages directories of `VIRTUAL_ENV` and
-/// `CONDA_PREFIX`, `PYTHONPATH`, `HYDRO_STDLIB`, and finally the vendored
-/// `stdlib/` tree ([`bundled_stdlib_root`]). Every explicit user location
-/// therefore takes precedence over the standard library sources, and
-/// `HYDRO_STDLIB` wins over the bundled modules, matching CPython's `sys.path`
-/// layout.
+/// `CONDA_PREFIX`, `PYTHONPATH`, the vendored `stdlib/` tree
+/// ([`bundled_stdlib_root`]) and finally `HYDRO_STDLIB`. Every user location
+/// therefore takes precedence over the standard library, while a vendored
+/// adaptation wins over the generic `Lib` source.
+///
+/// The importing directory and the current package root normally come first so
+/// relative and sibling imports resolve like CPython's. When the importer
+/// itself lives inside the `HYDRO_STDLIB` tree those two roots *are* the
+/// sysroot: a standard-library module importing `enum` would otherwise resolve
+/// its own `Lib/enum.py` and bypass the vendored adaptation. They are moved
+/// after the vendored tree (and before `HYDRO_STDLIB`, whose entries still
+/// cover everything Hydro does not vendor).
 ///
 /// Missing and non-directory entries are dropped and duplicates are searched
-/// only once. The importing file's directory always comes first.
+/// only once. The importing file's directory comes first unless it is part of
+/// the `HYDRO_STDLIB` sysroot.
 #[allow(clippy::too_many_arguments)]
 fn module_search_roots_from(
     importer_dir: &Path,
@@ -2334,23 +2349,44 @@ fn module_search_roots_from(
     conda_prefix: Option<&Path>,
     bundled_stdlib: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let mut dirs = vec![importer_dir.to_path_buf(), module_root.to_path_buf()];
+    let mut early = vec![importer_dir.to_path_buf(), module_root.to_path_buf()];
     for list in [hydro_site_packages].into_iter().flatten() {
-        dirs.extend(std::env::split_paths(list));
+        early.extend(std::env::split_paths(list));
     }
     for prefix in [virtual_env, conda_prefix].into_iter().flatten() {
-        dirs.extend(lower::prefix_site_packages(prefix));
+        early.extend(lower::prefix_site_packages(prefix));
     }
     for list in [pythonpath].into_iter().flatten() {
-        dirs.extend(std::env::split_paths(list));
+        early.extend(std::env::split_paths(list));
+    }
+    let mut sysroot: Vec<PathBuf> = Vec::new();
+    if let Some(list) = hydro_stdlib {
+        sysroot.extend(std::env::split_paths(list));
+    }
+    // Roots inside `HYDRO_STDLIB` are the sysroot seen through the importer's
+    // location, not user overrides: they must not shadow a vendored module.
+    let mut sysroot_scoped: Vec<PathBuf> = Vec::new();
+    if !sysroot.is_empty() {
+        let canonical: Vec<PathBuf> = sysroot
+            .iter()
+            .map(|dir| fs::canonicalize(dir).unwrap_or_else(|_| dir.clone()))
+            .collect();
+        early.retain(|dir| {
+            let resolved = fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+            let inside = canonical.iter().any(|root| resolved.starts_with(root));
+            if inside {
+                sysroot_scoped.push(dir.clone());
+            }
+            !inside
+        });
     }
     // Vendored modules are Hydro's own compatibility shims (for example the
     // patched `enum.py`); they must win over a generic CPython `Lib` sysroot
     // while every module Hydro does not vendor still falls through to it.
+    let mut dirs = early;
     dirs.extend(bundled_stdlib.map(Path::to_path_buf));
-    for list in [hydro_stdlib].into_iter().flatten() {
-        dirs.extend(std::env::split_paths(list));
-    }
+    dirs.extend(sysroot_scoped);
+    dirs.extend(sysroot);
 
     let mut seen = HashSet::new();
     dirs.retain(|dir| {
@@ -4745,6 +4781,86 @@ mod tests {
     }
 
     #[test]
+    fn vendored_stdlib_wins_over_hydro_stdlib_inside_the_sysroot() {
+        // A standard-library module that imports `enum` lives in `HYDRO_STDLIB`
+        // itself, so its own directory is the sysroot: without an explicit
+        // ordering rule it resolves `Lib/enum.py` and bypasses the vendored
+        // adaptation. The vendored tree must come first for those importers
+        // too, while a module Hydro does not vendor still falls through to
+        // `HYDRO_STDLIB`, and user/project roots keep their precedence.
+        let _env = env_lock();
+        let dir = TestDir::new("vendored-precedence");
+        let lib = dir.path.join("Lib");
+        let project = dir.path.join("project");
+        let support = lib.join("test").join("support");
+        fs::create_dir_all(&support).expect("create test.support");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(lib.join("test").join("__init__.py"), "").expect("write test init");
+        // A sysroot `enum` that cannot compile: choosing it over the vendored
+        // module fails the whole check, so the entry program is the assertion.
+        fs::write(
+            lib.join("enum.py"),
+            "import definitely_missing_sysroot_module\n",
+        )
+        .expect("write decoy enum");
+        // Not vendored by Hydro: it must still resolve from the sysroot.
+        fs::write(lib.join("copy.py"), "VALUE = 7\n").expect("write sysroot copy");
+        fs::write(
+            support.join("__init__.py"),
+            "import copy\nimport enum\n\nMARK = copy.VALUE + len(enum.__all__)\n",
+        )
+        .expect("write support init");
+        let main = project.join("main.py");
+        fs::write(&main, "import test.support\nprint(test.support.MARK)\n").expect("write entry");
+
+        let bundled = bundled_stdlib_root().expect("the vendored stdlib root is discoverable");
+        let roots = module_search_roots_from(
+            &support,
+            &lib,
+            None,
+            None,
+            Some(lib.as_os_str()),
+            None,
+            None,
+            Some(bundled),
+        );
+        assert_eq!(
+            roots,
+            vec![bundled.to_path_buf(), support.clone(), lib.clone()],
+            "a sysroot importer must see the vendored overrides first"
+        );
+        let chain = resolve_module(&roots, "enum").expect("enum must resolve");
+        assert_eq!(chain[0].path, bundled.join("enum.py"));
+        let chain = resolve_module(&roots, "copy").expect("copy is supplied by HYDRO_STDLIB");
+        assert_eq!(chain[0].path, lib.join("copy.py"));
+
+        // A root outside the sysroot keeps its precedence over both.
+        let outside = module_search_roots_from(
+            &project,
+            &project,
+            None,
+            None,
+            Some(lib.as_os_str()),
+            None,
+            None,
+            Some(bundled),
+        );
+        assert_eq!(
+            outside,
+            vec![project.clone(), bundled.to_path_buf(), lib.clone()],
+            "project modules still win over the standard library"
+        );
+
+        let _stdlib = EnvVar::set("HYDRO_STDLIB", lib.as_os_str());
+        let _pythonpath = EnvVar::unset("PYTHONPATH");
+        let program = program(&main);
+        let names = initializer_names(&program);
+        assert!(names.contains(&"enum.<module>"), "{names:?}");
+        assert!(names.contains(&"copy.<module>"), "{names:?}");
+        assert!(names.contains(&"test.support.<module>"), "{names:?}");
+    }
+
+    #[test]
     fn bundled_enum_compiles_a_subclass_and_member_access() {
         let _env = env_lock();
         let _stdlib = EnvVar::unset("HYDRO_STDLIB");
@@ -5207,6 +5323,92 @@ def __getattr__(name):
     }
 
     #[test]
+    fn dynamic_import_dispatch_matches_the_pydantic_table_shape() {
+        // The pinned pydantic 2.14 `__init__` names its public API through an
+        // *annotated* `_dynamic_imports` table whose values are
+        // `(__spec__.parent, '.module')` pairs, repeats one module under many
+        // attribute names, keeps an `'__module__'` sentinel for the
+        // `dataclasses` entry, and calls `import_module` from `__getattr__`.
+        // `pkg.main` imports the package back (`from . import SUPPORT`), which
+        // the real `pydantic.main` does too. Every relative target links once,
+        // after the package body; the sentinel and the function-local f-string
+        // name nothing.
+        let dir = TestDir::new("dynamic-pydantic-shape");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            r#"from importlib import import_module
+
+SUPPORT = 'support'
+
+_dynamic_imports: 'dict[str, tuple[str, str]]' = {
+    'dataclasses': (__spec__.parent, '__module__'),
+    'Model': (__spec__.parent, '.main'),
+    'create_model': (__spec__.parent, '.main'),
+    'Field': (__spec__.parent, '.fields'),
+}
+
+def __getattr__(name):
+    dynamic_attr = _dynamic_imports.get(name)
+    if dynamic_attr is None:
+        raise AttributeError(name)
+    package, module_name = dynamic_attr
+    if module_name == '__module__':
+        return import_module(f'.{name}', package=package)
+    module = import_module(module_name, package=package)
+    return getattr(module, name)
+"#,
+        )
+        .expect("write package init");
+        fs::write(
+            pkg.join("main.py"),
+            "from . import SUPPORT\n\nclass Model:\n    support = SUPPORT\n",
+        )
+        .expect("write main");
+        fs::write(
+            pkg.join("fields.py"),
+            "Field = 'field'\ncreate_model = None\n",
+        )
+        .expect("write fields");
+        let main = dir.write(
+            "main.py",
+            "from pkg import Model, Field\nvalue = (Model, Field)\n",
+        );
+        let program = program(&main);
+
+        let initializers = initializer_names(&program);
+        for target in ["pkg.main.<module>", "pkg.fields.<module>"] {
+            assert_eq!(
+                initializers.iter().filter(|name| **name == target).count(),
+                1,
+                "each dispatched module must own exactly one unit: {initializers:?}"
+            );
+        }
+        let package_at = initializers
+            .iter()
+            .position(|name| *name == "pkg.<module>")
+            .expect("the package must initialize");
+        for target in ["pkg.main.<module>", "pkg.fields.<module>"] {
+            let at = initializers
+                .iter()
+                .position(|name| *name == target)
+                .expect(target);
+            assert!(
+                package_at < at,
+                "the package body must run before {target}: {initializers:?}"
+            );
+        }
+        // The `__module__` sentinel (the `dataclasses` entry) names no module.
+        assert!(
+            !initializers
+                .iter()
+                .any(|name| name.starts_with("pkg.dataclasses")),
+            "{initializers:?}"
+        );
+    }
+
+    #[test]
     fn nested_package_dynamic_literals_stay_lazy() {
         // A top-level package's table is preloaded (`pkg` -> `.sub`), but a
         // nested package's table is not (`pkg.sub` -> `.leaf`). CPython only
@@ -5627,6 +5829,122 @@ def __getattr__(name):
             matches!(&stored.kind, ExprKind::ModuleRef { module } if module == "pkg.sub"),
             "the binding must be a module reference: {:?}",
             stored.kind
+        );
+    }
+
+    #[test]
+    fn module_try_import_initializes_the_local_a_handler_shadows() {
+        // `uuid.py` imports the native `_uuid` extension in a module-level
+        // `try` whose `except ImportError:` handler rebinds `_uuid = None`.
+        // That handler assignment claims a module-local slot, which shadows
+        // the compile-time import binding for the reads that follow, so the
+        // import statement must initialize the slot itself. Before this, an
+        // infallible (native) import emitted no binding and the try body read
+        // an uninitialized local — `_uuid` was `None` at the
+        // `_uuid.has_stable_extractable_node` read.
+        let dir = TestDir::new("try-import-shadowed-local");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            "try:\n    import _uuid\n    STABLE = _uuid.has_stable_extractable_node\nexcept ImportError:\n    _uuid = None\n    STABLE = False\n",
+        )
+        .expect("write package init");
+        let main = dir.write("main.py", "import pkg\nprint(pkg.STABLE)\n");
+        let program = program(&main);
+
+        use hydro_ir::StmtKind;
+        let init = &program.functions[program.initializers[0] as usize];
+        assert_eq!(init.name, "pkg.<module>");
+        let mut local_binding = false;
+        let mut global_binding = false;
+        // A multi-binding import statement is wrapped in `if True:` so every
+        // store runs where the statement runs.
+        fn scan_local_import(
+            body: &[hydro_ir::Stmt],
+            init: &hydro_ir::Function,
+            local_binding: &mut bool,
+            global_binding: &mut bool,
+        ) {
+            use hydro_ir::{ExprKind, StmtKind};
+            for stmt in body {
+                match &stmt.kind {
+                    StmtKind::Assign { target, value } if init.local(*target).name == "_uuid" => {
+                        *local_binding = matches!(
+                            &value.kind,
+                            ExprKind::ModuleRef { module } if module == "_uuid"
+                        );
+                    }
+                    StmtKind::GlobalSet { name, value, .. } if name == "_uuid" => {
+                        *global_binding = matches!(&value.kind, ExprKind::Local(_));
+                    }
+                    StmtKind::If { then_body, .. } => {
+                        scan_local_import(then_body, init, local_binding, global_binding);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for stmt in &init.body {
+            let StmtKind::Try { body, .. } = &stmt.kind else {
+                continue;
+            };
+            scan_local_import(body, init, &mut local_binding, &mut global_binding);
+        }
+        assert!(
+            local_binding,
+            "the import must initialize the `_uuid` local the handler shadows"
+        );
+        assert!(
+            global_binding,
+            "the module value must be published from the same local"
+        );
+    }
+
+    #[test]
+    fn a_prior_units_builtin_binding_does_not_shadow_it_in_the_next_unit() {
+        // `pkg/__init__.py` binds `type`; `pkg/child.py` still calls the
+        // builtin. Each unit is lowered against its own module bindings, so the
+        // child's `type` must stay a builtin call and never become a runtime
+        // global read of the package's table (where `type` is a string; a
+        // leaked lookup is what made pydantic's preloaded `copy` see a foreign
+        // global).
+        let dir = TestDir::new("builtin-unit-isolation");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            "type = 'shadowed in the package'\n",
+        )
+        .expect("write package init");
+        fs::write(pkg.join("child.py"), "value = type(1)\n").expect("write child");
+        let main = dir.write("main.py", "from pkg.child import value\nprint(value)\n");
+        let program = program(&main);
+
+        use hydro_ir::{Callee, ExprKind, StmtKind};
+        let child = program.function(function_id(&program, "pkg.child.<module>"));
+        let mut builtin_call = false;
+        let mut leaked_global = false;
+        for stmt in &child.body {
+            let StmtKind::Assign { target: _, value } = &stmt.kind else {
+                continue;
+            };
+            match &value.kind {
+                ExprKind::Call { callee, .. } => {
+                    builtin_call = matches!(callee, Callee::Builtin(hydro_ir::Builtin::Type));
+                }
+                ExprKind::GlobalGet { name, .. } if name == "type" => leaked_global = true,
+                _ => {}
+            }
+        }
+        assert!(
+            !leaked_global,
+            "the child's `type` must not read another unit's global"
+        );
+        assert!(
+            builtin_call,
+            "the child must call the builtin `type`: {:?}",
+            child.body
         );
     }
 

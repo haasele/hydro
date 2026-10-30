@@ -74,16 +74,17 @@ annotated-types on a native-method attribute. The link-time ABI inventory is
 complete (0 missing symbols); these are semantic/dynamic-import blockers.
 Smoke/AOT/upstream runs are not claimed until the runner observes them.
 
-**Status note (2026-10-29):** the report below was *not* regenerated for the
+**Status note (2026-10-30):** the report below was *not* regenerated for the
 HNA v1/bindgen/sidecar/packaging work or for the CPython-compatible
 handle/tuple/list layout. The generated table therefore remains the honest
 last observed evidence, not the current state of every case. Current known
-blockers beyond that table: pydantic 2.14.1 imports through the vendored
-`enum`/typing surface, but model smoke still stops on lazy `pydantic.main`
-dynamic imports (unlinked package submodules); NumPy 2.5 now reaches
-`_multiarray_umath`'s `Py_BuildValue` after `sys.flags`/`PyType_Ready`/
-`PyContextVar_New` fixes; pandas remains blocked behind earlier gaps. No "all
-ecosystem" claim is made; there is no passing upstream-suite record yet.
+blockers beyond that table: `pydantic_core` loads through the real extension,
+but importing `pydantic` stops at native-scalar subclass allocation for
+`IntEnum` (`AnnotationSource.ANY`); NumPy
+2.5 passes `sys.flags`/`PyType_Ready`/`PyContextVar_New`/`Py_BuildValue`/
+`PyErr_Format` and stops on a DType/ArrayMethod check; pandas is not reached.
+No "all ecosystem" claim is made; there is no passing upstream-suite record
+yet.
 
 <!-- BEGIN GENERATED ECOSYSTEM RESULTS -->
 

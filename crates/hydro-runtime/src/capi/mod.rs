@@ -4873,26 +4873,66 @@ pub extern "C" fn PyState_FindModule(definition: *mut PyModuleDefMirror) -> *mut
 
 // -- imports ----------------------------------------------------------------
 
+/// Mirrors CPython's submodule binding: a successful import of `pkg.sub`
+/// stores `sub` on the `pkg` namespace.
+///
+/// CPython's importer sets the attribute on the parent package as part of the
+/// import. Compiled code that reads `from pkg import sub` without a statically
+/// linked binding resolves the name from `pkg`'s global table, so the attribute
+/// must exist there after an extension imports the submodule at runtime
+/// (NumPy's `_multiarray_umath` imports `numpy.dtypes`, whose
+/// `_add_dtype_helper` reads `from numpy import dtypes`).
+///
+/// Native modules resolve members from their central spec and keep no global
+/// side store, so only compiled/user parents are updated. The parent does not
+/// need to be fully initialized: a package that is still running its body
+/// already owns a global table, exactly like CPython's partially initialized
+/// module.
+fn publish_submodule(name: &str) {
+    let Some((parent, leaf)) = name.rsplit_once('.') else {
+        return;
+    };
+    if parent.is_empty() || leaf.is_empty() || hydro_ir::stdlib::module(parent).is_some() {
+        return;
+    }
+    // Only a module the runtime registry knows can be published; a failed body
+    // publishes nothing, so a missing name stays visible to the caller.
+    let Some(value) = crate::modules::registry_lookup(name) else {
+        return;
+    };
+    crate::core::globals::set_value(parent, leaf, value);
+}
+
 /// Looks up a loaded module by name and returns it with a new reference.
 fn import_loaded(name: &str) -> Result<*mut ShimObject, String> {
-    {
+    let existing = {
         let registry = registry_lock();
-        if let Some(id) = registry.by_name.get(name).copied() {
-            let Some(entry) = registry.modules.get(&id) else {
-                return Err(format!(
-                    "ImportError: dangling module registry entry for '{name}'"
-                ));
-            };
-            let module = entry.module_object as *mut ShimObject;
-            inc_ref(module);
-            return Ok(module);
+        match registry.by_name.get(name).copied() {
+            Some(id) => {
+                let Some(entry) = registry.modules.get(&id) else {
+                    return Err(format!(
+                        "ImportError: dangling module registry entry for '{name}'"
+                    ));
+                };
+                let module = entry.module_object as *mut ShimObject;
+                inc_ref(module);
+                Some(module)
+            }
+            None => None,
         }
+    };
+    if let Some(module) = existing {
+        // Outside the C registry lock: publishing a submodule touches the
+        // Hydro global store, which must never be acquired while holding it.
+        publish_submodule(name);
+        return Ok(module);
     }
     // Not a loaded DSO: fall back to the Hydro runtime registry, which holds
     // every native stdlib module and every compiled user module.
     if crate::modules::registry_lookup(name).is_some() {
         let (_, module) = create_runtime_module(name.to_string())?;
         inc_ref(module);
+        publish_submodule(name);
         return Ok(module);
     }
     // The name may be a compiled module whose body has not run yet. This is
@@ -4914,6 +4954,7 @@ fn import_loaded(name: &str) -> Result<*mut ShimObject, String> {
         // same module through an extension-visible module object.
         let (_, module) = create_runtime_module(name.to_string())?;
         inc_ref(module);
+        publish_submodule(name);
         return Ok(module);
     }
     Err(format!("ImportError: No module named '{name}'"))
@@ -16255,6 +16296,18 @@ mod tests {
         types::TypeObject::builtin(c"probe.StaticCustomMeta".as_ptr(), types::TypeRole::Shim, 0);
     static mut STATIC_METACLASS: types::TypeObject =
         types::TypeObject::builtin(c"probe.StaticMetaclass".as_ptr(), types::TypeRole::Shim, 0);
+    static mut STATIC_UNREADY_BASE: types::TypeObject = types::TypeObject::builtin(
+        c"probe.StaticUnreadyBase".as_ptr(),
+        types::TypeRole::Shim,
+        0,
+    );
+    static mut STATIC_DERIVED: types::TypeObject =
+        types::TypeObject::builtin(c"probe.StaticDerived".as_ptr(), types::TypeRole::Shim, 0);
+    static mut STATIC_INVALID_BASE: types::TypeObject = types::TypeObject::builtin(
+        c"probe.StaticInvalidBase".as_ptr(),
+        types::TypeRole::Shim,
+        0,
+    );
 
     #[test]
     fn py_type_ready_adopts_static_c_type_objects() {
@@ -16371,6 +16424,55 @@ mod tests {
             assert_eq!((*custom).ob_type, std::ptr::addr_of_mut!(types::TYPE_TYPE));
             assert_ne!((*custom).tp_flags & types::PY_TPFLAGS_READY, 0);
         }
+
+        // CPython readies an unready `tp_base` on demand, and NumPy relies on
+        // it: `numpy.dtypes.Int8DType.tp_base` names
+        // `PyArray_IntAbstractDType`, which the same module initialization
+        // readies later. Both types are static objects whose metatype is the
+        // adopted metaclass above.
+        let unready_base = std::ptr::addr_of_mut!(STATIC_UNREADY_BASE);
+        let derived = std::ptr::addr_of_mut!(STATIC_DERIVED);
+        unsafe {
+            (*unready_base).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+            (*unready_base).ob_type = metaclass;
+            (*unready_base).tp_flags = 0;
+            // Its own base is an already adopted static type, as NumPy's
+            // abstract dtype has `PyArrayDescr_Type`.
+            (*unready_base).tp_base = pointer;
+            (*derived).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+            (*derived).ob_type = metaclass;
+            (*derived).tp_flags = 0;
+            (*derived).tp_base = unready_base;
+        }
+        assert_eq!(
+            PyType_Ready(derived as *mut ShimObject),
+            0,
+            "{:?}",
+            take_error()
+        );
+        unsafe {
+            assert_ne!(
+                (*unready_base).tp_flags & types::PY_TPFLAGS_READY,
+                0,
+                "the unready base is readied first"
+            );
+            assert_ne!((*derived).tp_flags & types::PY_TPFLAGS_READY, 0);
+            assert_eq!((*derived).tp_base, unready_base);
+        }
+
+        // A base that is not a type object is still rejected.
+        let invalid = std::ptr::addr_of_mut!(STATIC_INVALID_BASE);
+        let instance = new_int(1008);
+        unsafe {
+            (*invalid).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+            (*invalid).ob_type = metaclass;
+            (*invalid).tp_flags = 0;
+            (*invalid).tp_base = instance as *mut types::TypeObject;
+        }
+        assert_eq!(PyType_Ready(invalid as *mut ShimObject), -1);
+        let message = take_error().expect("invalid tp_base");
+        assert!(message.contains("invalid tp_base"), "{message}");
+        dec_ref(instance);
 
         // A static type with a negative layout is rejected with a diagnostic
         // and left untouched.
@@ -19858,6 +19960,45 @@ long hydro_fixture_last_op(void) { return last_op; }
         crate::exc::raise_with_message(crate::exc::VALUE_ERROR, "on-demand import failed")
     }
 
+    unsafe extern "C" fn dotted_submodule_body() -> i64 {
+        crate::value::NONE
+    }
+
+    #[test]
+    fn import_publishes_a_compiled_submodule_on_its_parent() {
+        let _guard = initializer_test_guard();
+        anchor();
+        clear_error();
+        crate::exc::clear();
+        // The parent package is deliberately not registered: CPython binds a
+        // submodule on a partially initialized parent too, and compiled code
+        // reads `from pkg import sub` from that package's global table.
+        crate::module_init::register("hydro_publish_parent.child", dotted_submodule_body);
+
+        let module = PyImport_ImportModule(c"hydro_publish_parent.child".as_ptr());
+        assert!(!module.is_null(), "{:?}", take_error());
+        let child = crate::modules::registry_lookup("hydro_publish_parent.child")
+            .expect("the imported submodule is registered in sys.modules");
+        let published = crate::core::globals::lookup("hydro_publish_parent", "child")
+            .expect("the import must bind the submodule on its parent package");
+        assert_eq!(
+            published, child,
+            "the parent attribute is the imported module value"
+        );
+
+        // A second import resolves the C module registry and must keep the
+        // binding identical, not replace it with a fresh module object.
+        let again = PyImport_ImportModule(c"hydro_publish_parent.child".as_ptr());
+        assert!(!again.is_null(), "{:?}", take_error());
+        assert_eq!(
+            crate::core::globals::lookup("hydro_publish_parent", "child"),
+            Some(child)
+        );
+
+        dec_ref(again);
+        dec_ref(module);
+    }
+
     #[test]
     fn import_propagates_an_initializer_exception() {
         let _guard = initializer_test_guard();
@@ -20748,6 +20889,88 @@ long hydro_fixture_last_op(void) { return last_op; }
         let empty = unsafe { super::Py_BuildValue(c"".as_ptr()) as *mut ShimObject };
         assert_eq!(empty, ptr::addr_of_mut!(_Py_NoneStruct));
         dec_ref(empty);
+    }
+
+    /// `PyErr_Format` shares CPython's `PyUnicode_FromFormat` mini-language:
+    /// object conversions (`%R`/`%S`/`%A`/`%U`/`%V`/`%T`) plus C99 units,
+    /// flags, width and precision. NumPy formats error messages with these.
+    #[test]
+    fn py_err_format_uses_cpython_conversions() {
+        anchor();
+        clear_error();
+        let exception = unsafe { PyExc_ValueError } as *mut c_void;
+        let text = new_str("hello".to_string());
+        let number = new_int(1000);
+
+        // SAFETY: each format below consumes exactly the arguments it names.
+        unsafe { super::PyErr_Format(exception, c"%R".as_ptr(), text) };
+        assert_eq!(take_error().as_deref(), Some("ValueError: 'hello'"));
+
+        unsafe { super::PyErr_Format(exception, c"%S".as_ptr(), number) };
+        assert_eq!(take_error().as_deref(), Some("ValueError: 1000"));
+
+        unsafe { super::PyErr_Format(exception, c"%A".as_ptr(), text) };
+        assert_eq!(take_error().as_deref(), Some("ValueError: 'hello'"));
+
+        unsafe { super::PyErr_Format(exception, c"%U".as_ptr(), text) };
+        assert_eq!(take_error().as_deref(), Some("ValueError: hello"));
+
+        // C99 units keep their meaning, including the Py_ssize_t length.
+        unsafe {
+            super::PyErr_Format(
+                exception,
+                c"%s %d %zd %c".as_ptr(),
+                c"plain".as_ptr(),
+                5 as c_int,
+                7_isize,
+                b'A' as c_int,
+            )
+        };
+        let message = take_error().expect("formatted message");
+        assert!(message.starts_with("ValueError: plain 5 7 A"), "{message}");
+
+        unsafe { super::PyErr_Format(exception, c"%p".as_ptr(), text as *mut c_void) };
+        assert!(take_error().unwrap_or_default().contains("0x"));
+
+        // Flags, width and precision apply as in CPython.
+        unsafe { super::PyErr_Format(exception, c"%10R".as_ptr(), text) };
+        assert_eq!(take_error().as_deref(), Some("ValueError:    'hello'"));
+        unsafe { super::PyErr_Format(exception, c"%.3R".as_ptr(), text) };
+        assert_eq!(take_error().as_deref(), Some("ValueError: 'he"));
+
+        // `%V` falls back to its C string when the object is NULL.
+        unsafe {
+            super::PyErr_Format(
+                exception,
+                c"%V".as_ptr(),
+                ptr::null::<ShimObject>(),
+                c"fallback".as_ptr(),
+            )
+        };
+        assert_eq!(take_error().as_deref(), Some("ValueError: fallback"));
+
+        // `%T` renders the qualified type name.
+        unsafe {
+            super::PyErr_Format(
+                exception,
+                c"%T".as_ptr(),
+                ptr::addr_of_mut!(types::STR_TYPE) as *mut ShimObject,
+            )
+        };
+        let message = take_error().expect("type qualname");
+        assert!(message.contains("str"), "{message}");
+
+        // `%n` is refused instead of writing through the pointer.
+        clear_error();
+        unsafe { super::PyErr_Format(exception, c"%n".as_ptr(), ptr::null::<c_int>()) };
+        let message = take_error().expect("%n is rejected");
+        assert!(
+            message.contains("unsupported format character"),
+            "{message}"
+        );
+
+        dec_ref(text);
+        dec_ref(number);
     }
     #[test]
     fn hydro_handles_wrap_hydro_values() {

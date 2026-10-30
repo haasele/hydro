@@ -123,6 +123,11 @@ pub(crate) struct MatchState {
     pub(crate) pattern: String,
     pub(crate) text: String,
     pub(crate) groups: Vec<Option<(usize, usize)>>,
+    /// Capture names indexed by group number, exactly as
+    /// `Regex::capture_names()` reports them: entry 0 is the whole match and
+    /// always `None`, unnamed groups are `None`. The name itself is always a
+    /// `str`, including for a bytes match.
+    pub(crate) names: Vec<Option<String>>,
 }
 
 /// Sentinel appended to `MatchState::groups` for a bytes match.
@@ -478,11 +483,33 @@ fn byte_offset(text: &str, character: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-fn make_match(pattern: &str, text: &str, captures: &regex::Captures<'_>) -> i64 {
-    make_match_at(pattern, text, captures, 0)
+/// Capture names of a compiled pattern, indexed by group number.
+fn regex_names(regex: &Regex) -> Vec<Option<String>> {
+    regex
+        .capture_names()
+        .map(|name| name.map(|name| name.to_string()))
+        .collect()
 }
 
-fn make_match_at(pattern: &str, text: &str, captures: &regex::Captures<'_>, base: usize) -> i64 {
+/// [`regex_names`] for a bytes pattern; the names are `str` like CPython's.
+fn regex_names_bytes(regex: &regex_bytes::Regex) -> Vec<Option<String>> {
+    regex
+        .capture_names()
+        .map(|name| name.map(|name| name.to_string()))
+        .collect()
+}
+
+fn make_match(pattern: &str, text: &str, regex: &Regex, captures: &regex::Captures<'_>) -> i64 {
+    make_match_at(pattern, text, regex, captures, 0)
+}
+
+fn make_match_at(
+    pattern: &str,
+    text: &str,
+    regex: &Regex,
+    captures: &regex::Captures<'_>,
+    base: usize,
+) -> i64 {
     let groups = captures
         .iter()
         .map(|group| {
@@ -494,18 +521,29 @@ fn make_match_at(pattern: &str, text: &str, captures: &regex::Captures<'_>, base
             })
         })
         .collect();
-    value::match_new(pattern.to_string(), text.to_string(), groups)
+    value::match_new(
+        pattern.to_string(),
+        text.to_string(),
+        groups,
+        regex_names(regex),
+    )
 }
 
 /// Builds a `Match` for a bytes subject. `text` is the full raw subject;
 /// `base` is the byte offset of the searched slice inside it.
-fn make_match_bytes(source: &[u8], text: &[u8], captures: &regex_bytes::Captures<'_>) -> i64 {
-    make_match_bytes_at(source, text, captures, 0)
+fn make_match_bytes(
+    source: &[u8],
+    text: &[u8],
+    regex: &regex_bytes::Regex,
+    captures: &regex_bytes::Captures<'_>,
+) -> i64 {
+    make_match_bytes_at(source, text, regex, captures, 0)
 }
 
 fn make_match_bytes_at(
     source: &[u8],
     text: &[u8],
+    regex: &regex_bytes::Regex,
     captures: &regex_bytes::Captures<'_>,
     base: usize,
 ) -> i64 {
@@ -524,7 +562,12 @@ fn make_match_bytes_at(
     // Marks the bytes domain; the positions above are encoded-text offsets so
     // generic string slicing stays on character boundaries.
     groups.push(BYTES_MATCH);
-    value::match_new(latin1_string(source), encoded, groups)
+    value::match_new(
+        latin1_string(source),
+        encoded,
+        groups,
+        regex_names_bytes(regex),
+    )
 }
 
 /// Converts Python character offsets into a UTF-8 byte range, returning the
@@ -568,7 +611,7 @@ fn match_mode(source: &Source, subject: &Subject, full: bool, anchored: bool, fl
                 }
             };
             match regex.captures(text) {
-                Some(captures) => make_match(source, text, &captures),
+                Some(captures) => make_match(source, text, &regex, &captures),
                 None => NONE,
             }
         }
@@ -585,7 +628,7 @@ fn match_mode(source: &Source, subject: &Subject, full: bool, anchored: bool, fl
                 }
             };
             match regex.captures(text) {
-                Some(captures) => make_match_bytes(source, text, &captures),
+                Some(captures) => make_match_bytes(source, text, &regex, &captures),
                 None => NONE,
             }
         }
@@ -693,7 +736,7 @@ fn finditer(source: &Source, subject: &Subject, flags: i64) -> i64 {
             };
             let result = value::list_new(Vec::new());
             for captures in regex.captures_iter(text) {
-                let item = make_match(source, text, &captures);
+                let item = make_match(source, text, &regex, &captures);
                 if let Some(mut items) = value::list_items_mut(result) {
                     items.push(item);
                     crate::heap::write_barrier_edge(result, item);
@@ -708,7 +751,7 @@ fn finditer(source: &Source, subject: &Subject, flags: i64) -> i64 {
             };
             let result = value::list_new(Vec::new());
             for captures in regex.captures_iter(text) {
-                let item = make_match_bytes(source, text, &captures);
+                let item = make_match_bytes(source, text, &regex, &captures);
                 if let Some(mut items) = value::list_items_mut(result) {
                     items.push(item);
                     crate::heap::write_barrier_edge(result, item);
@@ -971,7 +1014,7 @@ fn replace_str_callable(
             continue;
         };
         out.push_str(&text[last..whole.start()]);
-        let match_object = make_match(pattern, text, &captures);
+        let match_object = make_match(pattern, text, regex, &captures);
         let replacement_value = crate::core::builtins::call(function, 1, [match_object].as_ptr());
         if exc::pending() {
             return Err(NONE);
@@ -1039,7 +1082,7 @@ fn replace_bytes_callable(
             continue;
         };
         out.extend_from_slice(&text[last..whole.start()]);
-        let match_object = make_match_bytes(pattern, text, &captures);
+        let match_object = make_match_bytes(pattern, text, regex, &captures);
         let replacement_value = crate::core::builtins::call(function, 1, [match_object].as_ptr());
         if exc::pending() {
             return Err(NONE);
@@ -1458,7 +1501,7 @@ pub(crate) fn pattern_method(obj: i64, name: &str, args: &[i64]) -> i64 {
                         return exc::raise_with_message(VALUE_ERROR, "invalid regular expression");
                     };
                     match regex.captures(slice) {
-                        Some(captures) => make_match_at(source, text, &captures, base),
+                        Some(captures) => make_match_at(source, text, &regex, &captures, base),
                         None => NONE,
                     }
                 }
@@ -1475,7 +1518,9 @@ pub(crate) fn pattern_method(obj: i64, name: &str, args: &[i64]) -> i64 {
                         return exc::raise_with_message(VALUE_ERROR, "invalid regular expression");
                     };
                     match regex.captures(slice) {
-                        Some(captures) => make_match_bytes_at(source, text, &captures, base),
+                        Some(captures) => {
+                            make_match_bytes_at(source, text, &regex, &captures, base)
+                        }
                         None => NONE,
                     }
                 }
@@ -1557,21 +1602,42 @@ fn match_offset(state: &MatchState, offset: usize, bytes: bool) -> usize {
     }
 }
 
-/// Methods of a `Match` (`group`, `start`, `end`, `span`).
+/// Group number of a capture name, if the pattern declared that name.
+fn group_index(state: &MatchState, name: &str) -> Option<usize> {
+    state
+        .names
+        .iter()
+        .position(|entry| entry.as_deref() == Some(name))
+}
+
+/// Methods of a `Match` (`group`, `groups`, `groupdict`, `start`, `end`,
+/// `span`).
 pub(crate) fn match_method(obj: i64, name: &str, args: &[i64]) -> i64 {
     let Some(state) = value::as_match(obj) else {
         return attribute_error("Match", name);
     };
+    let bytes = is_bytes_match(state);
     if name == "groupdict" {
-        if !args.is_empty() {
+        if args.len() > 1 {
             return type_error(&format!(
-                "Match.groupdict() takes no arguments ({} given)",
+                "groupdict() takes at most 1 argument ({} given)",
                 args.len()
             ));
         }
-        return value::dict_new(Vec::new());
+        let default = args.first().copied().unwrap_or(NONE);
+        let mut pairs = Vec::new();
+        for (group, group_name) in state.names.iter().enumerate().skip(1) {
+            let Some(group_name) = group_name else {
+                continue;
+            };
+            let item = match state.groups.get(group).copied().flatten() {
+                Some((start, end)) => match_group_value(state, start, end, bytes),
+                None => default,
+            };
+            pairs.push((value::str_alloc(group_name.clone()), item));
+        }
+        return value::dict_new(pairs);
     }
-    let bytes = is_bytes_match(state);
     if name == "groups" {
         if args.len() > 1 {
             return type_error(&format!(
@@ -1602,15 +1668,14 @@ pub(crate) fn match_method(obj: i64, name: &str, args: &[i64]) -> i64 {
         None | Some(NONE) => 0,
         Some(raw) => match value::as_integer(raw) {
             Some(group) if group >= 0 => group as usize,
-            Some(_) => {
-                return exc::raise_with_message(INDEX_ERROR, "no such group");
-            }
-            None => {
-                return type_error(&format!(
-                    "group index must be an integer, not {}",
-                    value::type_name(raw)
-                ))
-            }
+            Some(_) => return exc::raise_with_message(INDEX_ERROR, "no such group"),
+            // Anything else is treated as a group name, like CPython's
+            // `groupindex` lookup: an unknown name (or a non-`str` that is
+            // not an integer) is "no such group".
+            None => match value::as_str(raw).and_then(|name| group_index(state, name)) {
+                Some(group) => group,
+                None => return exc::raise_with_message(INDEX_ERROR, "no such group"),
+            },
         },
     };
     if group >= match_group_count(state) {
@@ -2129,6 +2194,248 @@ mod tests {
         exc::init();
         submodule_call("re._parser", "parse_template", &[]);
         assert_eq!(exc::pending_tag(), i64::from(ATTRIBUTE_ERROR));
+        exc::init();
+    }
+
+    /// `groupdict()` result as `(key, value)` strings (values render like
+    /// `str()`, so `None` shows as `None` and bytes show their repr).
+    fn dict_entries(v: i64) -> Vec<(String, String)> {
+        value::as_dict(v)
+            .unwrap_or_else(|| panic!("expected dict, got {}", value::type_name(v)))
+            .iter()
+            .map(|&(key, item)| (value::to_string(key), value::to_string(item)))
+            .collect()
+    }
+
+    fn span_numbers(v: i64) -> Vec<i64> {
+        value::as_tuple(v)
+            .expect("span tuple")
+            .iter()
+            .map(|&item| value::as_integer(item).expect("int offset"))
+            .collect()
+    }
+
+    #[test]
+    fn named_groups_resolve_on_str_matches() {
+        exc::init();
+        // Group 1 is anonymous; `epoch` is 2 and the optional `opt` is 3.
+        let pattern = text(r"(\d+)-(?P<epoch>\d+)-(?P<opt>a)?");
+        let found = call("search", &[pattern, text("7-12-")]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_str(match_method(found, "group", &[text("epoch")])),
+            Some("12")
+        );
+        // The whole-match spelling keeps working, including by number.
+        assert_eq!(
+            value::as_str(match_method(found, "group", &[])),
+            Some("7-12-")
+        );
+        assert_eq!(
+            value::as_str(match_method(found, "group", &[int(2)])),
+            Some("12")
+        );
+
+        assert_eq!(
+            value::as_integer(match_method(found, "start", &[text("epoch")])),
+            Some(2)
+        );
+        assert_eq!(
+            value::as_integer(match_method(found, "end", &[text("epoch")])),
+            Some(4)
+        );
+        assert_eq!(
+            span_numbers(match_method(found, "span", &[text("epoch")])),
+            vec![2, 4]
+        );
+
+        // An optional named group that did not participate.
+        assert_eq!(match_method(found, "group", &[text("opt")]), NONE);
+        assert_eq!(
+            value::as_integer(match_method(found, "start", &[text("opt")])),
+            Some(-1)
+        );
+        assert_eq!(
+            value::as_integer(match_method(found, "end", &[text("opt")])),
+            Some(-1)
+        );
+        assert_eq!(
+            span_numbers(match_method(found, "span", &[text("opt")])),
+            vec![-1, -1]
+        );
+
+        // Unknown names are CPython's `IndexError: no such group`.
+        match_method(found, "group", &[text("nope")]);
+        assert_eq!(exc::pending_tag(), i64::from(INDEX_ERROR));
+        assert_eq!(message(), "no such group");
+        exc::init();
+        match_method(found, "start", &[text("nope")]);
+        assert_eq!(exc::pending_tag(), i64::from(INDEX_ERROR));
+        exc::init();
+        match_method(found, "end", &[text("nope")]);
+        assert_eq!(exc::pending_tag(), i64::from(INDEX_ERROR));
+        exc::init();
+        match_method(found, "span", &[text("nope")]);
+        assert_eq!(exc::pending_tag(), i64::from(INDEX_ERROR));
+        exc::init();
+        // A pattern without names has no lookup table at all.
+        let plain = call("search", &[text(r"(\d+)"), text("12")]);
+        match_method(plain, "group", &[text("epoch")]);
+        assert_eq!(exc::pending_tag(), i64::from(INDEX_ERROR));
+        exc::init();
+    }
+
+    #[test]
+    fn groupdict_builds_named_groups_with_default() {
+        exc::init();
+        let pattern = text(r"(\d+)-(?P<epoch>\d+)-(?P<opt>a)?");
+        let found = call("search", &[pattern, text("7-12-")]);
+        assert!(!exc::pending());
+        assert_eq!(
+            dict_entries(match_method(found, "groupdict", &[])),
+            vec![
+                ("epoch".to_string(), "12".to_string()),
+                ("opt".to_string(), "None".to_string()),
+            ]
+        );
+        assert_eq!(
+            dict_entries(match_method(found, "groupdict", &[text("D")])),
+            vec![
+                ("epoch".to_string(), "12".to_string()),
+                ("opt".to_string(), "D".to_string()),
+            ]
+        );
+        // Matched groups ignore the default.
+        let full = call("search", &[pattern, text("7-12-a")]);
+        assert_eq!(
+            dict_entries(match_method(full, "groupdict", &[text("D")])),
+            vec![
+                ("epoch".to_string(), "12".to_string()),
+                ("opt".to_string(), "a".to_string()),
+            ]
+        );
+        // CPython's arity error, without a `Match.` prefix.
+        match_method(found, "groupdict", &[text("x"), text("y")]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        assert_eq!(message(), "groupdict() takes at most 1 argument (2 given)");
+        exc::init();
+
+        // A pattern with no named groups yields an empty dict.
+        let plain = call("search", &[text(r"(\d+)"), text("12")]);
+        assert_eq!(
+            dict_entries(match_method(plain, "groupdict", &[])),
+            Vec::new()
+        );
+        assert_eq!(
+            dict_entries(match_method(plain, "groupdict", &[text("D")])),
+            Vec::new()
+        );
+        exc::init();
+    }
+
+    #[test]
+    fn named_groups_resolve_on_bytes_matches() {
+        exc::init();
+        let pattern = bytes_value(br"(\d+)-(?P<epoch>\d+)-(?P<opt>a)?");
+        let found = call("search", &[pattern, bytes_value(b"7-12-")]);
+        assert!(!exc::pending());
+        // Names are `str` even for a bytes pattern; values stay bytes.
+        assert_eq!(
+            as_bytes(match_method(found, "group", &[text("epoch")])),
+            b"12"
+        );
+        assert_eq!(
+            value::as_integer(match_method(found, "start", &[text("epoch")])),
+            Some(2)
+        );
+        assert_eq!(
+            value::as_integer(match_method(found, "end", &[text("epoch")])),
+            Some(4)
+        );
+        assert_eq!(
+            span_numbers(match_method(found, "span", &[text("epoch")])),
+            vec![2, 4]
+        );
+        assert_eq!(match_method(found, "group", &[text("opt")]), NONE);
+        assert_eq!(
+            span_numbers(match_method(found, "span", &[text("opt")])),
+            vec![-1, -1]
+        );
+        assert_eq!(
+            dict_entries(match_method(found, "groupdict", &[])),
+            vec![
+                ("epoch".to_string(), "b'12'".to_string()),
+                ("opt".to_string(), "None".to_string()),
+            ]
+        );
+        assert_eq!(
+            dict_entries(match_method(found, "groupdict", &[bytes_value(b"d")])),
+            vec![
+                ("epoch".to_string(), "b'12'".to_string()),
+                ("opt".to_string(), "b'd'".to_string()),
+            ]
+        );
+        match_method(found, "group", &[text("nope")]);
+        assert_eq!(exc::pending_tag(), i64::from(INDEX_ERROR));
+        assert_eq!(message(), "no such group");
+        exc::init();
+        // A bytes subject still carries the names when reached through a
+        // compiled pattern and an explicit `endpos`.
+        let compiled = call("compile", &[bytes_value(br"(?P<epoch>\d+)")]);
+        let sliced = pattern_method(
+            compiled,
+            "search",
+            &[bytes_value(b"xx12yy"), int(2), int(4)],
+        );
+        assert_eq!(
+            as_bytes(match_method(sliced, "group", &[text("epoch")])),
+            b"12"
+        );
+        assert_eq!(
+            span_numbers(match_method(sliced, "span", &[text("epoch")])),
+            vec![2, 4]
+        );
+        exc::init();
+    }
+
+    #[test]
+    fn finditer_matches_keep_capture_names() {
+        exc::init();
+        let items = call(
+            "finditer",
+            &[text(r"(?P<key>\w+)=(?P<value>\d+)"), text("a=1 b=2")],
+        );
+        let items = value::as_list(items).unwrap().to_vec();
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            value::as_str(match_method(items[1], "group", &[text("key")])),
+            Some("b")
+        );
+        assert_eq!(
+            dict_entries(match_method(items[0], "groupdict", &[])),
+            vec![
+                ("key".to_string(), "a".to_string()),
+                ("value".to_string(), "1".to_string()),
+            ]
+        );
+
+        // The compiled-pattern path (`Pattern.search`) keeps them too.
+        let compiled = call("compile", &[text(r"(?P<key>\w+)=\d+")]);
+        let found = pattern_method(compiled, "search", &[text("xy a=1")]);
+        assert_eq!(
+            value::as_str(match_method(found, "group", &[text("key")])),
+            Some("a")
+        );
+        exc::init();
+    }
+
+    #[test]
+    fn duplicate_group_names_are_rejected_like_cpython() {
+        exc::init();
+        // CPython raises PatternError (a ValueError) for a redefinition; the
+        // Rust engine also refuses the duplicate, so no dict can be built.
+        call("compile", &[text(r"(?P<a>x)(?P<a>y)")]);
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
         exc::init();
     }
 }

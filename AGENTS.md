@@ -49,16 +49,19 @@ and must be released there, the manifest is optional when absent,
 `exec`/`eval` accept only a bounded source subset (no full runtime compiler;
 NB-3 panic fixture and NB-2 boundary-cost measurement open).
 
-**2026-10-29 ecosystem checkpoint:** the pinned CPython-3.14 wheels for NumPy
+**2026-10-30 ecosystem checkpoint:** the pinned CPython-3.14 wheels for NumPy
 2.5.0, pandas 3.1.0, pydantic 2.14.1 and pydantic-core 2.50.1 install into
 `.hydro/ecosystem/site`. The ABI inventory reports **0 missing required
-CPython symbols** across 68 extension modules (479 referenced, 593 exported),
-and Tier 3 now matches the CPython handle, tuple and list item layout.
-pydantic 2.14.1 imports, but pydantic model smoke still fails at typed-dict
-class naming/annotations; NumPy fails at delayed dtype/module init; pandas
-remains blocked. These are semantic/object-model blockers, not link-time
-symbol gaps. **All-core gate:** `cargo nextest run --workspace` is the default
-in `scripts/verify.sh`/CI (see the canonical counts below).
+CPython symbols** across 68 extension modules, and Tier 3 matches the CPython
+handle, tuple and list item layout with real `PyGC_Collect` traverse/clear.
+Pydantic passes `pydantic_core` import and the enum/uuid/object protocol
+surface but its package import is blocked by native-scalar subclass
+allocation for `IntEnum` (`AnnotationSource.ANY`) before model construction;
+NumPy advances through module init to a DType/ArrayMethod type check; pandas
+is not yet reached. These are semantic/object-model
+blockers, not link-time symbol gaps. **All-core gate:** `cargo nextest run
+--workspace` is the default in `scripts/verify.sh`/CI (see the canonical
+counts below).
 
 **2026-10-26 checkpoint:** the four open construction sites received a
 substantial implementation slice: import/module registry + `HYDRO_STDLIB`,
@@ -70,17 +73,17 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-10-30: **2764 tests run
-(2764 passed, 1 skipped)**; the per-crate breakdown below sums to 2764:
+`cargo nextest run --workspace` on 2026-10-30: **2905 tests run
+(2905 passed, 1 skipped)**; the per-crate breakdown below sums to 2905:
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 1728 |
-| frontend | 815 |
+| runtime (unit + integration) | 1860 |
+| frontend | 819 |
 | codegen | 76 |
-| IR | 60 |
+| IR | 64 |
 | bindgen | 42 |
-| interpreter | 24 |
+| interpreter | 25 |
 | parser | 19 |
 | hna | 0 |
 | hna-fixture | 0 |
@@ -92,8 +95,8 @@ Other docs must link here instead of repeating the total.
 
 ### Compatibility checkpoint (2026-10-30)
 
-- **Import matrix:** **210/297 modules importable** (50 builtin/frozen, 124 pure,
-  35 extension, 1 CPython-failing; 87 fail; 9 modules fail under CPython 3.14.9
+- **Import matrix:** **233/297 modules importable** (50 builtin/frozen, 133 pure,
+  50 extension, 1 CPython-failing; 64 fail; 9 modules fail under CPython 3.14.9
   itself). Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
 - **Official suite:** **3/398 passing** (`test_errno.py`,
@@ -102,12 +105,13 @@ Other docs must link here instead of repeating the total.
   733.8 s. Manifest `tests/compat/cpython-3.14.9.json` grows only from real
   `hydro_pass` runs.
 - **Ecosystem:** the ABI inventory reports **0 missing required symbols** across
-  68 pinned extension modules. `pydantic 2.14.1` imports through the real
-  `_pydantic_core` extension with the vendored `enum`/typing surface; model
-  smoke still stops on lazy `pydantic.main` dynamic imports. NumPy 2.5 now
-  reaches `_multiarray_umath`'s `Py_BuildValue` after `sys.flags`,
-  `PyType_Ready` and `PyContextVar_New` fixes; pandas remains blocked by
-  earlier semantic gaps. Pinned ecosystem report: `docs/ECOSYSTEM.md`.
+  68 pinned extension modules. Pydantic-core 2.14.1/2.50.1 loads through the
+  real extension, but importing `pydantic` is blocked by native-scalar
+  subclass allocation needed for `IntEnum` (`AnnotationSource.ANY`). NumPy
+  2.5 passes `sys.flags`, `PyType_Ready` base adoption, `PyContextVar_New`,
+  `Py_BuildValue` and `PyErr_Format` and now stops on a DType/ArrayMethod type
+  check; pandas is not reached. Pinned ecosystem report:
+  `docs/ECOSYSTEM.md`.
 - **Native bindings:** HNA v1, `hydro-bindgen` and `_hydro_sidecar` protocol v1
   are implemented and tested (see the checkpoint above and
   `docs/NATIVE_BINDINGS.md` §3.7); Tier 2 is implemented for the v1 slice and
@@ -137,7 +141,7 @@ Other docs must link here instead of repeating the total.
   resumes remain the narrowest compute result but are now faster than CPython
   (P5 focuses on PGO/inlining).
 - Full CPython stdlib/P7 parity, C extensions/full ABI behavior, and the
-  ecosystem suites remain open; 210/297 stdlib modules import.
+  ecosystem suites remain open; 233/297 stdlib modules import.
 - Imports: packages, dotted/relative imports, site-packages and vendored
   `stdlib/` work; dynamic imports of unlinked package submodules, namespace/
   zip/frozen imports and `from x import *` remain incomplete.

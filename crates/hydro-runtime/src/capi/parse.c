@@ -25,10 +25,11 @@
  * "did you mean" suggestions) but every rejection is a `TypeError` or a
  * `SystemError`, as in CPython.
  *
- * `PyErr_Format` formats with C99 `vsnprintf` semantics. The CPython-specific
- * conversions (`%R`, `%S`, `%V`, `%A`, `%U`, `%T`) would need Python objects
- * and `%n` would let a format string write through a caller pointer, so both
- * are rejected instead of being passed to `vsnprintf`.
+ * `PyErr_Format` uses the same format mini-language as CPython's
+ * `PyUnicode_FromFormat`: C99 conversions plus the object conversions
+ * (`%R` repr, `%S` str, `%A` ascii, `%U`/`%V` Unicode, `%T` qualified type),
+ * with flags, width and precision. `%n` is rejected because it would let a
+ * format string write through a caller pointer.
  */
 
 #include <stdarg.h>
@@ -614,102 +615,41 @@ int PyArg_UnpackTuple(PyObject *args, const char *name, Py_ssize_t min,
     return 1;
 }
 
+extern void Py_DecRef(PyObject *);
+extern const char *PyUnicode_AsUTF8(PyObject *);
+
+static PyObject *hydro_capi_unicode_from_format_va(const char *format,
+                                                   va_list *arguments);
+
 /*
- * Returns the first conversion character `PyErr_Format` cannot support, or 0
- * when every conversion is plain C99. `%R`, `%S`, `%V`, `%A`, `%U` and `%T`
- * need Python objects, and `%n` would let the format string write through a
- * caller pointer, so the host refuses both.
+ * `PyErr_Format` shares the `PyUnicode_FromFormat` mini-language, exactly as
+ * CPython does: C99 conversions plus `%R`/`%S`/`%A`/`%U`/`%V`/`%T` object
+ * conversions, flags, width and precision. `%n` stays rejected by the
+ * formatter, since it would write through a caller-supplied pointer.
  */
-static char hydro_capi_unsupported_conversion(const char *format)
-{
-    const char *cursor;
-
-    for (cursor = format; *cursor != '\0'; cursor++) {
-        if (*cursor != '%') {
-            continue;
-        }
-        cursor += 1;
-        if (*cursor == '%') {
-            continue;
-        }
-        /* Skip flags, width, precision and length modifiers. */
-        while (*cursor == '-' || *cursor == '+' || *cursor == ' ' ||
-               *cursor == '#' || *cursor == '0' || *cursor == '.' ||
-               (*cursor >= '0' && *cursor <= '9')) {
-            cursor += 1;
-        }
-        while (*cursor == 'h' || *cursor == 'l' || *cursor == 'L' ||
-               *cursor == 'j' || *cursor == 'z' || *cursor == 't' ||
-               *cursor == 'q') {
-            cursor += 1;
-        }
-        switch (*cursor) {
-        case 'R':
-        case 'S':
-        case 'V':
-        case 'A':
-        case 'U':
-        case 'T':
-        case 'n':
-            return *cursor;
-        case '\0':
-            return 0;
-        default:
-            break;
-        }
-    }
-    return 0;
-}
-
 PyObject *PyErr_Format(PyObject *exception, const char *format, ...)
 {
     va_list arguments;
-    va_list copy;
-    char stack_buffer[HYDRO_CAPI_MESSAGE_SIZE];
-    char *message = stack_buffer;
-    int needed;
+    PyObject *message;
+    const char *text;
 
     if (format == NULL) {
         hydro_capi_set_type_error("PyErr_Format: format is NULL");
         return NULL;
     }
-    {
-        char unsupported = hydro_capi_unsupported_conversion(format);
-        if (unsupported != 0) {
-            char message[96];
-            snprintf(message, sizeof message,
-                     "PyErr_Format: conversion '%%%c' is not supported",
-                     unsupported);
-            hydro_capi_set_type_error(message);
-            return NULL;
-        }
-    }
-
     va_start(arguments, format);
-    va_copy(copy, arguments);
-    needed = vsnprintf(stack_buffer, sizeof stack_buffer, format, arguments);
+    message = hydro_capi_unicode_from_format_va(format, &arguments);
     va_end(arguments);
-    if (needed < 0) {
-        va_end(copy);
-        hydro_capi_set_type_error("PyErr_Format: format string is invalid");
+    if (message == NULL) {
         return NULL;
     }
-    if ((size_t)needed >= sizeof stack_buffer) {
-        /* The message did not fit: format it again into an exact buffer. */
-        message = malloc((size_t)needed + 1);
-        if (message == NULL) {
-            va_end(copy);
-            hydro_capi_set_type_error("PyErr_Format: cannot allocate the message");
-            return NULL;
-        }
-        vsnprintf(message, (size_t)needed + 1, format, copy);
+    text = PyUnicode_AsUTF8(message);
+    if (text == NULL) {
+        Py_DecRef(message);
+        return NULL;
     }
-    va_end(copy);
-
-    hydro_capi_set_exception_message(exception, message);
-    if (message != stack_buffer) {
-        free(message);
-    }
+    hydro_capi_set_exception_message(exception, text);
+    Py_DecRef(message);
     return NULL;
 }
 
@@ -1695,12 +1635,12 @@ static int hydro_capi_fmt_append_snprintf(hydro_capi_fmt_buffer *buffer,
     return status;
 }
 
-/* Appends a rendered Python string, honouring an optional precision. */
+/* Appends a rendered Python string through `spec`, which ends in 's'. */
 static int hydro_capi_fmt_append_object(hydro_capi_fmt_buffer *buffer,
-                                        PyObject *object, int precision)
+                                        PyObject *object, const char *spec)
 {
     const char *utf8;
-    size_t length;
+    int status;
 
     if (object == NULL) {
         return -1;
@@ -1712,16 +1652,9 @@ static int hydro_capi_fmt_append_object(hydro_capi_fmt_buffer *buffer,
             "SystemError: PyUnicode_FromFormat: object conversion failed");
         return -1;
     }
-    length = strlen(utf8);
-    if (precision >= 0 && (size_t)precision < length) {
-        length = (size_t)precision;
-    }
-    if (hydro_capi_fmt_append(buffer, utf8, length) != 0) {
-        Py_DecRef(object);
-        return -1;
-    }
+    status = hydro_capi_fmt_append_snprintf(buffer, spec, utf8);
     Py_DecRef(object);
-    return 0;
+    return status;
 }
 
 static PyObject *hydro_capi_unicode_from_format_va(const char *format,
@@ -1944,35 +1877,52 @@ static PyObject *hydro_capi_unicode_from_format_va(const char *format,
         }
         else {
             PyObject *rendered = NULL;
+            PyObject *source = va_arg(*arguments, PyObject *);
+
             if (conversion == 'V') {
-                PyObject *object = va_arg(*arguments, PyObject *);
                 const char *fallback = va_arg(*arguments, const char *);
-                if (object == NULL) {
-                    const char *text = fallback != NULL ? fallback : "(null)";
-                    if (hydro_capi_fmt_append(&buffer, text, strlen(text)) != 0) {
+                if (source == NULL) {
+                    spec[spec_length++] = 's';
+                    spec[spec_length] = '\0';
+                    if (hydro_capi_fmt_append_snprintf(
+                            &buffer, spec,
+                            fallback != NULL ? fallback : "(null)") != 0) {
                         goto fail;
                     }
                     continue;
                 }
-                rendered = PyObject_Str(object);
+                rendered = PyObject_Str(source);
             }
-            else if (conversion == 'A') {
-                rendered = hydro_capi_ascii_repr(va_arg(*arguments, PyObject *));
-            }
-            else if (conversion == 'U' || conversion == 'S') {
-                rendered = PyObject_Str(va_arg(*arguments, PyObject *));
-            }
-            else if (conversion == 'R') {
-                rendered = PyObject_Repr(va_arg(*arguments, PyObject *));
-            }
-            else if (conversion == 'T') {
-                PyObject *type = va_arg(*arguments, PyObject *);
-                if (type == NULL) {
-                    hydro_capi_set_error(
-                        "SystemError: PyUnicode_FromFormat: %T needs a type");
-                    goto fail;
+            else if (conversion == 'A' || conversion == 'U' ||
+                     conversion == 'S' || conversion == 'R' ||
+                     conversion == 'T') {
+                if (source == NULL) {
+                    if (conversion == 'T') {
+                        hydro_capi_set_error(
+                            "SystemError: PyUnicode_FromFormat: %T needs a type");
+                        goto fail;
+                    }
+                    /* CPython renders a NULL object as `<NULL>`. */
+                    spec[spec_length++] = 's';
+                    spec[spec_length] = '\0';
+                    if (hydro_capi_fmt_append_snprintf(&buffer, spec,
+                                                       "<NULL>") != 0) {
+                        goto fail;
+                    }
+                    continue;
                 }
-                rendered = PyType_GetQualName(type);
+                if (conversion == 'A') {
+                    rendered = hydro_capi_ascii_repr(source);
+                }
+                else if (conversion == 'U' || conversion == 'S') {
+                    rendered = PyObject_Str(source);
+                }
+                else if (conversion == 'R') {
+                    rendered = PyObject_Repr(source);
+                }
+                else {
+                    rendered = PyType_GetQualName(source);
+                }
             }
             else {
                 char message[160];
@@ -1982,7 +1932,9 @@ static PyObject *hydro_capi_unicode_from_format_va(const char *format,
                 hydro_capi_set_error(message);
                 goto fail;
             }
-            if (hydro_capi_fmt_append_object(&buffer, rendered, precision) != 0) {
+            spec[spec_length++] = 's';
+            spec[spec_length] = '\0';
+            if (hydro_capi_fmt_append_object(&buffer, rendered, spec) != 0) {
                 goto fail;
             }
         }

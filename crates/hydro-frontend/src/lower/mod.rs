@@ -2064,6 +2064,16 @@ pub struct Lowerer<'a> {
     package: String,
     /// Module-level names mirrored into the runtime global table.
     global_names: HashSet<String>,
+    /// Every module-level name this unit binds itself — assignments,
+    /// definitions and import bindings, including those inside module-level
+    /// compound statements.
+    ///
+    /// Session builtin shadowing consults this set (together with
+    /// [`Self::session_globals`]) instead of [`Self::global_names`]: a name
+    /// another unit compiled by the same lowerer bound must never turn this
+    /// unit's builtin reference into a runtime global read. It is cleared at
+    /// the start of every [`Self::lower_module`].
+    unit_bound_names: HashSet<String>,
     /// Global names actually read by a function or method of this unit.
     /// Single-source checks and the entry module only mirror those; imported
     /// units mirror every exported name because importers read them.
@@ -2254,6 +2264,7 @@ impl<'a> Lowerer<'a> {
             dunder_name: "__main__".to_string(),
             package: String::new(),
             global_names: HashSet::new(),
+            unit_bound_names: HashSet::new(),
             used_globals: HashSet::new(),
             mirror_all_globals: false,
             future_annotations: false,
@@ -2383,6 +2394,21 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Whether `name` shadows a builtin in this session fragment.
+    ///
+    /// Only the session table and the bindings of *this* unit count. A lowerer
+    /// accumulates [`Self::global_names`] as it lowers (imports, conditional
+    /// definitions, handler fallbacks), and a session compilation shares one
+    /// global table across fragments; consulting the accumulated set would let
+    /// a name another unit bound turn this unit's builtin into a
+    /// [`HExprKind::GlobalGet`] — a read of a *different* unit's table — for
+    /// example `type(...)` inside `copy.py` after some other module bound
+    /// `type`.
+    fn session_shadows_builtin(&self, name: &str) -> bool {
+        self.session_mode
+            && (self.session_globals.contains(name) || self.unit_bound_names.contains(name))
+    }
+
     /// Makes resolved user modules (and their exported functions) visible.
     pub fn set_user_modules(&mut self, modules: HashMap<String, UserModule>) {
         self.user_modules = modules;
@@ -2507,6 +2533,15 @@ impl<'a> Lowerer<'a> {
     }
 
     pub fn lower_module(&mut self, module: &ast::ModModule) -> LHir {
+        // A lowerer compiles exactly one unit. Only the session table seeded by
+        // `set_session_globals` may survive into this unit's global-name set:
+        // names left behind by a previous compilation would otherwise turn
+        // this unit's builtin references into runtime global reads (`copy.py`'s
+        // `type` after another module bound `type`) and leak unrelated
+        // bindings into the module-global gates.
+        let session_table = &self.session_globals;
+        self.global_names
+            .retain(|name| session_table.contains(name));
         // `from __future__ import annotations` turns every annotation into
         // its source text when it reaches `__annotations__`, so annotation
         // expressions are never evaluated (and a forward reference to a
@@ -2528,6 +2563,14 @@ impl<'a> Lowerer<'a> {
         self.module_all = module_all_names(&module.body);
         self.module_def_names.clear();
         collect_module_def_names(&module.body, &mut self.module_def_names);
+        // Builtin-shadow decisions for a session fragment must only see the
+        // bindings of this unit (see `session_shadows_builtin`). Cleared here
+        // so a lowerer that compiles another unit never leaks its names.
+        self.unit_bound_names.clear();
+        // An augmented assignment alone does not bind a fresh module name: it
+        // reads the existing (session) value first, so it must not make the
+        // name shadow a builtin by itself.
+        collect_source_bound_names(&module.body, &mut self.unit_bound_names, false);
         let mut module_globals = HashSet::new();
         collect_global_names(&module.body, &mut module_globals);
         // PEP 562 hooks are ordinary module-level bindings: a `def` or an
@@ -5595,17 +5638,85 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Mirrors the bindings of a module-level `import` statement into the
-    /// runtime global table of this unit.
+    /// Records one binding of a module-level import statement.
     ///
-    /// A REPL fragment is compiled separately from the fragment that follows
-    /// it, so import names must live in the runtime table rather than only in
-    /// the binding tables of this compilation unit. Imported units mirror too:
-    /// a package `__init__.py` re-exports the modules it imported, and
-    /// importers read them through the module value. Extension module aliases
-    /// have no first-class value in the IR and are therefore not mirrored;
-    /// their members (`from ext import name`) are.
-    fn lower_session_import(&mut self, s: &ast::StmtImport, line: u32, col: u32) -> Option<HStmt> {
+    /// A module body keeps its module-level names in local slots. A name that
+    /// another module-level statement binds later claims such a slot, and it
+    /// then shadows the compile-time import binding for every read. The
+    /// import statement must initialize that slot itself: `uuid`'s
+    /// `try: import _uuid ... except ImportError: _uuid = None` (and the
+    /// simpler `import os; os = os`) otherwise read an uninitialized local
+    /// instead of the imported value. The runtime global table is published
+    /// from the same slot when this unit mirrors its bindings, so the module
+    /// body and importers observe one value.
+    fn import_binding_store(
+        &mut self,
+        stores: &mut Vec<HStmt>,
+        fs: &FuncState,
+        binding: &str,
+        value: HExpr,
+        line: u32,
+        col: u32,
+    ) {
+        let mirror = self.session_mode || self.mirror_all_globals;
+        // A linked function imported inside an `ImportError` try binds
+        // directly: the compiler checks `infallible_import_functions` before
+        // any local slot, so the module body never reads the local and the
+        // statement keeps its pure static link (the global mirror still
+        // publishes the value for importers in units that mirror).
+        if self.infallible_import_functions.contains_key(binding) {
+            if mirror {
+                stores.push(self.session_global_store(binding, value, line, col));
+            }
+            return;
+        }
+        let Some(local) = fs.lookup(binding) else {
+            if mirror {
+                stores.push(self.session_global_store(binding, value, line, col));
+            }
+            return;
+        };
+        let ty = self
+            .functions
+            .get(fs.fid as usize)
+            .and_then(|function| function.locals.get(local as usize))
+            .map(|local| local.ty)
+            .unwrap_or(Ty::Concrete(Type::Any));
+        stores.push(HStmt {
+            kind: HStmtKind::Assign {
+                target: local,
+                value,
+            },
+            line,
+            col,
+        });
+        if mirror {
+            let local_value = HExpr {
+                kind: HExprKind::Local(local),
+                ty,
+                line,
+                col,
+            };
+            stores.push(self.session_global_store(binding, local_value, line, col));
+        }
+    }
+
+    /// Lowers a module-level `import` statement.
+    ///
+    /// The imported value is stored into the module body's local slot when
+    /// that name has one (see [`Self::import_binding_store`]); a REPL fragment
+    /// is compiled separately from the fragment that follows it, so it also
+    /// publishes the name in the runtime global table. Imported units do the
+    /// same so importers can read them through the module value. Extension
+    /// module aliases have no first-class value in the IR and are therefore
+    /// not mirrored; their members (`from ext import name`) are.
+    fn lower_session_import(
+        &mut self,
+        s: &ast::StmtImport,
+        fs: &FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
         let mut stores = Vec::new();
         for alias in &s.names {
             let binding = import_binding(alias);
@@ -5616,7 +5727,7 @@ impl<'a> Lowerer<'a> {
             } else {
                 continue;
             };
-            stores.push(self.session_global_store(&binding, value, line, col));
+            self.import_binding_store(&mut stores, fs, &binding, value, line, col);
         }
         self.session_import_statement(stores, line, col)
     }
@@ -5628,6 +5739,7 @@ impl<'a> Lowerer<'a> {
     fn lower_session_import_from(
         &mut self,
         s: &ast::StmtImportFrom,
+        fs: &FuncState,
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
@@ -5707,7 +5819,7 @@ impl<'a> Lowerer<'a> {
             } else {
                 continue;
             };
-            stores.push(self.session_global_store(&binding, value, line, col));
+            self.import_binding_store(&mut stores, fs, &binding, value, line, col);
         }
         self.session_import_statement(stores, line, col)
     }
@@ -8878,10 +8990,10 @@ impl<'a> Lowerer<'a> {
                 if fs.is_module && self.optional_imports.contains_key(&statement) {
                     return self.lower_optional_import(statement, fs, line, col);
                 }
-                if (!self.session_mode && !self.mirror_all_globals) || !fs.is_module {
+                if !fs.is_module {
                     return None;
                 }
-                return self.lower_session_import(s, line, col);
+                return self.lower_session_import(s, fs, line, col);
             }
             ast::Stmt::ImportFrom(s) => {
                 if fs.class_ns.is_some() {
@@ -8891,10 +9003,10 @@ impl<'a> Lowerer<'a> {
                 if fs.is_module && self.optional_imports.contains_key(&statement) {
                     return self.lower_optional_import(statement, fs, line, col);
                 }
-                if (!self.session_mode && !self.mirror_all_globals) || !fs.is_module {
+                if !fs.is_module {
                     return None;
                 }
-                return self.lower_session_import_from(s, line, col);
+                return self.lower_session_import_from(s, fs, line, col);
             }
             ast::Stmt::With(s) => return self.lower_with(s, fs, line, col),
             ast::Stmt::AsyncWith(s) => return self.lower_async_with(s, fs, line, col),
@@ -16410,7 +16522,7 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     )
-                } else if self.session_mode && self.global_names.contains(name) {
+                } else if self.session_shadows_builtin(name) {
                     // A session name shadows builtins, functions and exception
                     // classes: in a REPL `list = ...` or `ValueError = ...`
                     // must win over the builtin of the same name. A local
@@ -19414,9 +19526,7 @@ impl<'a> Lowerer<'a> {
 
         // `setattr`/`delattr` are served by the `builtins` module dispatch, so
         // the call goes through the module ABI (which also validates arity).
-        if is_attribute_only_builtin(name)
-            && !(self.session_mode && self.global_names.contains(name))
-        {
+        if is_attribute_only_builtin(name) && !self.session_shadows_builtin(name) {
             if call_has_dynamic_arguments(call) {
                 return self.lower_dynamic_call(call, fs, line, col);
             }
@@ -19440,8 +19550,7 @@ impl<'a> Lowerer<'a> {
 
         // A builtin call binds the few keywords it supports (`max(key=...)`,
         // `min(key=...)`) and rejects the rest.
-        if let Some(builtin) = builtin_by_name(name)
-            .filter(|_| !(self.session_mode && self.global_names.contains(name)))
+        if let Some(builtin) = builtin_by_name(name).filter(|_| !self.session_shadows_builtin(name))
         {
             // `print(*args, sep=, end=, file=, flush=)` is the one builtin
             // whose keywords the runtime binder implements. Lower it through

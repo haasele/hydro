@@ -422,8 +422,8 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`); `required`
       stays empty until a never-regress subset is pinned. It grows only from
       real `hydro_pass` results.
-      Stdlib import baseline 2026-10-30: **210/297 importable** (50
-      builtin/frozen, 124 pure, 35 extension, 1 `cpython_failed`; 87 failed). Batch A of
+      Stdlib import baseline 2026-10-30: **233/297 importable** (50
+      builtin/frozen, 133 pure, 50 extension, 1 `cpython_failed`; 64 failed). Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
       `_heapq`/`heapq`, `colorsys`, `keyword`, `_stat`/`stat`,
       `_operator`, `_functools`, `_io`), the Batch B native core
@@ -794,7 +794,7 @@ code, span, help and stable exit code; `--json` is documented and tested.
 Goal: the CPython 3.14.9 standard library works on the Hydro runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
-from it). Status 2026-10-30: **210/297 modules importable**, **87 failed**
+from it). Status 2026-10-30: **233/297 modules importable**, **64 failed**
 (including 9 modules where CPython 3.14.9 itself fails on this host).
 
 The package/site-packages loader (P7-01) is in place: packages with
@@ -1053,7 +1053,7 @@ marks a module CPython ships only for a
 platform Hydro does not target on this host (Windows/Apple), tracked as
 platform-unsupported rather than implemented.
 
-Current matrix: 210/297 importable, 87 failed (including 9 modules CPython
+Current matrix: 233/297 importable, 64 failed (including 9 modules CPython
 3.14.9 itself fails). The ledger is the work list for the failed entries;
 checked entries count as delivered slices, not as complete parity.
 
@@ -1385,27 +1385,32 @@ is implemented for the v1 slice, and Tier 4/NB-6 is a tested pilot.
       C HNA adapter fixture; no JVM/.NET/Node adapter.
 - [ ] NB-1 Tier 1 completeness: every native stdlib module has one `ModuleSpec`
       entry, a Rust implementation and a CPython differential test. Batch A,
-      the POSIX basics, `array`, `cmath`, `_signal`/`termios`, `hashlib`/HMAC/
-      UUID, AST nodes, importlib finders and the related OS/IO surfaces are
-      delivered; `_sqlite3`, `_ssl`, `_bz2`, `_lzma`, `_curses`, `_tkinter`,
-      `pyexpat`, `readline`, `_codecs_*`, `_dbm`/`_gdbm` and the remaining
-      accelerator modules are open.
+      the POSIX basics, `array`, `cmath`, `_signal`/`termios`, `hashlib`/
+      SHA-3/HMAC/UUID, AST nodes, importlib finders, `_sqlite3`, `_bz2`,
+      `_lzma`, `pyexpat`, `readline`, `_curses`, CJK/ISO-2022 codec
+      accelerators, `_dbm`/`_gdbm`, `_zstd` and the related OS/IO surfaces are
+      delivered; `_ssl` (the `ssl` module itself has a context/factory
+      surface), `_tkinter`, `_curses_panel`, `_lsprof`, `_symtable`,
+      `_tracemalloc`, `_interpreters`/`_interpchannels`/`_interpqueues`,
+      `_posixshmem`, `_posixsubprocess`, `_elementtree` and
+      `_remote_debugging` remain open.
 - [ ] NB-4 Tier 3 completion (ecosystem):
       - [x] Link-time symbol surface for the pinned wheels; CPython-compatible
             handle/tuple/list layout; pydantic 2.14.1 import (with the vendored
             `enum`/typing surface).
-      - [ ] pydantic model smoke: TypedDict naming/PEP 649 annotations and
-            ConfigDict work; the smoke still stops on lazy `pydantic.main`
-            submodule import because dynamic imports of unlinked package
-            submodules remain unsupported.
-      - [ ] NumPy 2.5 import/smoke: `_multiarray_umath` init now reaches
-            `Py_BuildValue` after `sys.flags`/`PyType_Ready`/`PyContextVar_New`
-            fixes; delayed dtype/module init remains open.
-      - [ ] pandas 3.1 import/smoke: still blocked by earlier semantic gaps.
+      - [ ] pydantic model smoke: TypedDict naming/PEP 649 annotations,
+            ConfigDict, lazy `pydantic.main` dispatch, uuid/enum/object
+            protocol and model-field construction work; importing `pydantic`
+            is still blocked by native-scalar subclass allocation for
+            `IntEnum` (`AnnotationSource.ANY`).
+      - [ ] NumPy 2.5 import/smoke: module init passes `sys.flags`,
+            `PyType_Ready` base adoption, `PyContextVar_New`, `Py_BuildValue`
+            and `PyErr_Format`; it stops on a DType/ArrayMethod type check.
+      - [ ] pandas 3.1 import/smoke: not reached yet.
       - [x] Full `tp_traverse`/`tp_clear`, GIL/thread integration and the
             threaded callback + GC stress gate (`PyGC_Collect` production
             pass; visitproc order fixed).
-- [ ] NB-7 Stdlib parity: 210/297 importable; 297/297 must be accounted for
+- [ ] NB-7 Stdlib parity: 233/297 importable; 297/297 must be accounted for
       (import + mapped `Lib/test` subset green, or documented unsupported).
       Tracked by P7 above; P7 is **not** complete.
 

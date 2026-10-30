@@ -42,7 +42,7 @@ Compatibility target: **CPython 3.14.9**, defined once in
 
 | Tier | Input | Mechanism | Status (2026-10-29) |
 |---|---|---|---|
-| **0** | Pure-Python source (CPython `Lib`, site-packages, project `.py`) | Frontend importer compiles the source through the normal pipeline; search path includes `HYDRO_SITE_PACKAGES`, venv/conda site-packages, `PYTHONPATH`, `HYDRO_STDLIB` and the vendored `stdlib/` tree | **Partial.** Importer, packages and site-packages work; 210/297 stdlib modules import (124 pure, 50 builtin/frozen, 35 extension, 1 CPython-failing), 87 fail. See [`COMPATIBILITY.md`](COMPATIBILITY.md) |
+| **0** | Pure-Python source (CPython `Lib`, site-packages, project `.py`) | Frontend importer compiles the source through the normal pipeline; search path includes `HYDRO_SITE_PACKAGES`, venv/conda site-packages, `PYTHONPATH`, `HYDRO_STDLIB` and the vendored `stdlib/` tree | **Partial.** Importer, packages and site-packages work; 233/297 stdlib modules import (133 pure, 50 builtin/frozen, 50 extension, 1 CPython-failing), 64 fail. See [`COMPATIBILITY.md`](COMPATIBILITY.md) |
 | **1** | Hydro's own stdlib/native modules | Rust inside `hydro-runtime`, described by `ModuleSpec`, dispatched by `hydro_module_call`/`hydro_module_get`; **no C ABI, no `dlopen`** | **Implemented for the modules listed in `MODULES`** (Batch A plus selected later modules, e.g. `math`, `json`, `csv`, `re`, `socket`, `zlib`, `datetime`); per-module surface coverage and tests remain P7 work |
 | **2** | New compiled bindings (Rust-first; C/C++/Zig/Go via C ABI) | **HNA** — Hydro Native ABI: C symbol table, tagged `i64` values, explicit root/error/unwind contract, versioned manifest | **Implemented (HNA v1).** Header, crate, loader, root/projection services, `.hna.so` discovery with ambiguity diagnostics, Rust/C/Go fixtures, JIT+AOT, strict GC; see §3.7 |
 | **3** | Unmodified CPython C-extension wheels | Option-B shim in `hydro-runtime/src/capi/`; extensions are ordinary `.so` files whose undefined CPython symbols resolve from the Hydro process | **Partial.** abi3 slice, extension loader, full-ABI symbol surface (link-time complete for the pinned wheels); pydantic imports, NumPy/pandas semantic gates open; 12 extension modules import |
@@ -114,11 +114,14 @@ enter Hydro. A library that needs CPython objects, `PyObject*` layouts or
   startup or interpreter cost; no CPython runtime is initialized.
 - Current evidence: the ABI inventory reports 0 missing required CPython
   symbols across the 68 pinned extension modules (479 referenced, 593
-  exported); pydantic 2.14.1 imports through the real `_pydantic_core`;
-  NumPy/pandas stop on semantic/dynamic gaps (`numpy.exceptions`,
-  `dataclasses.is_dataclass` in the 2026-10-29 ecosystem report), not on link
-  errors. Full `PyTypeObject` behavior, `tp_traverse`/`tp_clear`, GIL/thread
-  integration and wheel installation remain open (P4-04c/d, P4-05).
+  exported); pydantic-core loads through the real `_pydantic_core`, but
+  importing `pydantic` stops before model construction on native-scalar
+  `IntEnum` subclass allocation. NumPy/pandas stop on semantic/dynamic gaps,
+  not link errors.
+  `PyGC_Collect` now drives real `tp_traverse`/`tp_clear`, and threaded
+  extension callbacks run under the emulated GIL with GC stress. Full
+  `PyTypeObject` behavior and wheel ecosystem suites remain open (P4-04c/d,
+  P4-05).
 - Policy: Tier 3 is never used for Hydro-native stdlib modules, never for
   new Hydro bindings and never as a way to import `libpython`.
 
@@ -566,11 +569,12 @@ source. The response is:
    (P7-02). `stdlib/enum.py` is the only vendored adaptation today; the tree
    is not a place to fork packages.
 
-Current state: 210/297 stdlib modules import; pydantic/pydantic-core import
-through the Tier 3 extension. The pydantic model smoke still stops on lazy
-`pydantic.main` dynamic imports; NumPy 2.5 now reaches `_multiarray_umath`'s
-`Py_BuildValue` after the `sys.flags`/`PyType_Ready`/`PyContextVar_New` fixes;
-pandas remains blocked by earlier semantic gaps. The pinned ecosystem tree is
+Current state: 233/297 stdlib modules import; pydantic-core loads through the Tier 3 extension, but importing `pydantic`
+is blocked by native-scalar subclass allocation for `IntEnum`
+(`AnnotationSource.ANY`). NumPy
+2.5 passes the module-init ABI path through `sys.flags`, `PyType_Ready`,
+`PyContextVar_New`, `Py_BuildValue` and `PyErr_Format` and stops on a
+DType/ArrayMethod check; pandas is not reached. The pinned ecosystem tree is
 installed and reported by [`ECOSYSTEM.md`](ECOSYSTEM.md).
 
 ## 7. Automatic Python→Rust conversion
@@ -633,7 +637,7 @@ column is the authoritative claim.
 | **NB-4** Tier 3 completion | P4-04c/d full ABI, NumPy/pandas semantics, GIL/threads, P4-05 wheel install | **partial**: link-time symbol surface, CPython handle/tuple/list layout, pydantic import, `PyGC_Collect` traverse/clear, threaded callback + GC stress; pydantic model/NumPy/pandas open | NumPy 2.5 array create/dtype/ops smoke matches the oracle; pydantic model validation matches; pandas import and basic DataFrame smoke pass; threaded extension callbacks + GC stress show no deadlock/race; an abi3 wheel installs and imports under JIT/AOT; `ldd` clean |
 | **NB-5** Packaging and coexistence | `hydro-manifest.toml`, Hydro wheel tag, ambiguity diagnostics, mixed packages | **done (tested slice)**: manifest parsing/verification, `hydro1_0` wheel tag, ambiguity diagnostics, mixed-artifact tests | an unmodified CPython wheel installed via Tea/uv imports with `RECORD` unchanged; a distribution with `.py` + HNA loads the right artifact; a duplicate-name distribution fails at compile time; manifest/descriptor mismatch fails at load |
 | **NB-6** Foreign runtime bridge | One sidecar pilot, one C-ABI adapter, versioned protocol | **done (pilots)**: `_hydro_sidecar` protocol v1 with a CPython worker and a C HNA adapter; no JVM/.NET/Node adapter | sidecar echo/call/error round-trip matches the CPython oracle and survives a worker restart; adapter fixture initializes and shuts down cleanly; unknown protocol version is rejected with a diagnostic; no source translation anywhere |
-| **NB-7** Stdlib parity | P7 batches, 297 modules accounted | **in progress** (210/297 importable; official suite 3/398) | 297/297 accounted for: importable and green in the mapped `Lib/test` subset, or listed as unsupported with a reason; both generated reports agree |
+| **NB-7** Stdlib parity | P7 batches, 297 modules accounted | **in progress** (233/297 importable; official suite 3/398) | 297/297 accounted for: importable and green in the mapped `Lib/test` subset, or listed as unsupported with a reason; both generated reports agree |
 
 Dependencies: NB-3 → NB-2; NB-5 → NB-2 and NB-4; NB-6 → NB-2. NB-1 and NB-7
 share the P7 work list; NB-4 follows P4-04c/d. A later phase MUST NOT start

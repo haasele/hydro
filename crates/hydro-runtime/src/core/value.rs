@@ -3788,6 +3788,23 @@ pub(crate) fn class_own_lookup(class: i64, name: &str) -> Option<ClassEntry> {
         .map(|(kind, function)| ClassEntry::Method(kind, function))
 }
 
+/// The `object` attribute-protocol slots every class inherits.
+///
+/// A class declared without a base (`class Sentinel:`) records no ancestors,
+/// so its linearization never reaches the cached `object` class — yet CPython
+/// still inherits `__setattr__`/`__getattribute__`/`__delattr__` from it, and
+/// `super().__setattr__(...)` inside such a class must resolve to the native
+/// slot. Only these three names fall back: `__init__`/`__new__` must keep
+/// their "absent means the default construction path" meaning.
+fn object_protocol_slot(name: &str) -> Option<ClassEntry> {
+    match name {
+        "__setattr__" | "__getattribute__" | "__delattr__" => {
+            class_own_lookup(object_class(), name)
+        }
+        _ => None,
+    }
+}
+
 /// Looks up `name` on `class` and its ancestors in C3 linearization order.
 ///
 /// The linearization is computed at class creation; the iteration cap below is
@@ -3803,21 +3820,21 @@ pub(crate) fn class_lookup(class: i64, name: &str) -> Option<ClassEntry> {
                 return Some(entry);
             }
         }
-        return None;
+        return object_protocol_slot(name);
     }
     // Defensive fallback for a class built before `mro` was populated (only
     // possible through a malformed heap object): walk the primary base chain.
     let mut current = state.base;
     for _ in 0..1024 {
         if current == NONE {
-            return None;
+            return object_protocol_slot(name);
         }
         if let Some(entry) = class_own_lookup(current, name) {
             return Some(entry);
         }
         current = as_class(current)?.base;
     }
-    None
+    object_protocol_slot(name)
 }
 
 /// Class value in `class`'s linearization that owns `name`, if any.
@@ -3830,11 +3847,16 @@ pub(crate) fn class_lookup_owner(class: i64, name: &str) -> Option<i64> {
     if class_own_lookup(class, name).is_some() {
         return Some(class);
     }
-    state
+    if let Some(owner) = state
         .mro
         .iter()
         .copied()
         .find(|&ancestor| class_own_lookup(ancestor, name).is_some())
+    {
+        return Some(owner);
+    }
+    // The protocol slots reported by [`class_lookup`] are owned by `object`.
+    object_protocol_slot(name).map(|_| object_class())
 }
 
 /// Looks up `name` in the MRO of `class` after the position of `start`.
@@ -3853,7 +3875,9 @@ pub(crate) fn class_lookup_after(class: i64, start: i64, name: &str) -> Option<C
             return Some(entry);
         }
     }
-    None
+    // `object` is the implicit ancestor of every class, including one declared
+    // with no bases (`super().__setattr__` in `typing_extensions.sentinel`).
+    object_protocol_slot(name)
 }
 
 /// Full C3 linearization of `class`, starting with the class itself.
@@ -4064,6 +4088,11 @@ pub(crate) fn instance_dict(instance: i64) -> Option<i64> {
     let result = dict_new(Vec::new());
     let root = crate::heap::root_values(&[result]);
     for (name, value) in snapshot {
+        if name.starts_with('\u{0}') {
+            // Reserved runtime storage (a native `dict` subclass's mapping, a
+            // Counter's counts) is not part of Python's `__dict__`.
+            continue;
+        }
         let key = str_alloc(name);
         crate::container::dict_set(result, key, value);
     }
@@ -5292,6 +5321,87 @@ fn compute_mro(bases: &[i64]) -> Option<Vec<i64>> {
     c3_merge(&sequences)
 }
 
+/// The cached native class a builtin type spelling denotes.
+///
+/// Python's builtin type names are both callables and class objects; the
+/// runtime represents the bare name (`int`, `list`, `type`, ...) as a builtin
+/// function value because it must stay callable, while `type(x)` and class
+/// bodies use the cached native class of the same name. Type checks accept
+/// either spelling as the class it names.
+pub(crate) fn builtin_type_class(v: i64) -> Option<i64> {
+    let function = as_function(v)?;
+    match &function.body {
+        FunctionBody::Builtin(builtin) if is_builtin_type(builtin) => {
+            Some(native_class(builtin.name()))
+        }
+        // `builtins.str` reads as a native module function value rather than a
+        // compiler builtin reference; it names the same type.
+        FunctionBody::Native {
+            module: "builtins",
+            name,
+        } => {
+            let builtin = hydro_ir::Builtin::from_name(name)?;
+            is_builtin_type(&builtin).then(|| native_class(builtin.name()))
+        }
+        _ => None,
+    }
+}
+
+/// The type name a builtin type spelling denotes (`str`, `int`, ...).
+pub(crate) fn builtin_type_name(v: i64) -> Option<&'static str> {
+    builtin_type_class(v).and_then(class_display_name)
+}
+
+/// Whether `builtin` spells one of Python's builtin types.
+///
+/// The set matches [`normalize_class_base`]'s base spellings plus `bool`
+/// (a type, but final: it cannot be subclassed) and `memoryview`.
+pub(crate) fn is_builtin_type(builtin: &hydro_ir::Builtin) -> bool {
+    matches!(
+        builtin,
+        hydro_ir::Builtin::Int
+            | hydro_ir::Builtin::Float
+            | hydro_ir::Builtin::Bool
+            | hydro_ir::Builtin::Str
+            | hydro_ir::Builtin::Bytes
+            | hydro_ir::Builtin::ByteArray
+            | hydro_ir::Builtin::List
+            | hydro_ir::Builtin::Tuple
+            | hydro_ir::Builtin::Dict
+            | hydro_ir::Builtin::Set
+            | hydro_ir::Builtin::Frozenset
+            | hydro_ir::Builtin::Range
+            | hydro_ir::Builtin::MemoryView
+            | hydro_ir::Builtin::Type
+    )
+}
+
+/// Canonical name of a builtin type spelling.
+///
+/// `type(x)` returns a cached native class while source code spells the same
+/// type as the builtin function value. Both denote one Python type, so
+/// container membership (`type(1) in (int, float)`), dict lookups and
+/// `copy`'s type dispatch compare them by this name.
+pub(crate) fn builtin_type_token(v: i64) -> Option<&'static str> {
+    if let Some(function) = as_function(v) {
+        return match &function.body {
+            FunctionBody::Builtin(builtin) if is_builtin_type(builtin) => Some(builtin.name()),
+            FunctionBody::Native {
+                module: "builtins",
+                name,
+            } => {
+                let builtin = hydro_ir::Builtin::from_name(name)?;
+                is_builtin_type(&builtin).then(|| builtin.name())
+            }
+            _ => None,
+        };
+    }
+    if as_class(v).is_some() && is_cached_type_class(v) {
+        return class_display_name(v);
+    }
+    None
+}
+
 /// Maps a class-base operand to the class value it denotes.
 ///
 /// Python's builtin type names are both callables and class objects; the
@@ -5300,28 +5410,8 @@ fn compute_mro(bases: &[i64]) -> Option<Vec<i64>> {
 /// `type.__new__`) each denotes the cached native class of that name, so the
 /// C3 merge sees real classes. Every other value is returned unchanged.
 pub(crate) fn normalize_class_base(v: i64) -> i64 {
-    if let Some(function) = as_function(v) {
-        if let FunctionBody::Builtin(builtin) = &function.body {
-            if matches!(
-                builtin,
-                hydro_ir::Builtin::Int
-                    | hydro_ir::Builtin::Float
-                    | hydro_ir::Builtin::Bool
-                    | hydro_ir::Builtin::Str
-                    | hydro_ir::Builtin::Bytes
-                    | hydro_ir::Builtin::ByteArray
-                    | hydro_ir::Builtin::List
-                    | hydro_ir::Builtin::Tuple
-                    | hydro_ir::Builtin::Dict
-                    | hydro_ir::Builtin::Set
-                    | hydro_ir::Builtin::Frozenset
-                    | hydro_ir::Builtin::Range
-                    | hydro_ir::Builtin::MemoryView
-                    | hydro_ir::Builtin::Type
-            ) {
-                return native_class(builtin.name());
-            }
-        }
+    if let Some(class) = builtin_type_class(v) {
+        return class;
     }
     // `class D(C[int])`: a PEP 695 specialization is a
     // `typing._GenericAlias`. CPython subclasses the origin (`C`), so the
@@ -6159,13 +6249,19 @@ pub(crate) fn pattern_new(source: String, flags: i64) -> i64 {
     )
 }
 
-pub(crate) fn match_new(pattern: String, text: String, groups: Vec<Option<(usize, usize)>>) -> i64 {
+pub(crate) fn match_new(
+    pattern: String,
+    text: String,
+    groups: Vec<Option<(usize, usize)>>,
+    names: Vec<Option<String>>,
+) -> i64 {
     alloc(
         KIND_MATCH,
         ObjData::Match(crate::modules::re::MatchState {
             pattern,
             text,
             groups,
+            names,
         }),
     )
 }
@@ -7330,7 +7426,10 @@ pub(crate) fn type_name(v: i64) -> &'static str {
             Some(ObjDataRef::Tuple(_)) => "tuple",
             Some(ObjDataRef::Set(_)) => "set",
             Some(ObjDataRef::Range { .. }) => "range",
-            Some(ObjDataRef::Function(_)) => "function",
+            Some(ObjDataRef::Function(function)) => match &function.body {
+                FunctionBody::Partial { .. } => "partial",
+                _ => "function",
+            },
             Some(ObjDataRef::Lock(_)) => "lock",
             Some(ObjDataRef::Thread(_)) => "Thread",
             Some(ObjDataRef::Event(_)) => "Event",
@@ -7383,11 +7482,23 @@ pub(crate) fn type_name(v: i64) -> &'static str {
     "object"
 }
 
+/// One entry of the per-thread native-class cache.
+///
+/// `generation` is the heap generation the class belongs to. A reset bumps the
+/// generation before freeing the heap, so a stale entry is rejected instead of
+/// handing user code a tagged value whose cell may already be reused.
+#[derive(Clone, Copy)]
+struct CachedClass {
+    generation: u64,
+    class: i64,
+}
+
 thread_local! {
     /// Cached native classes returned by `type()` for primitive values. The
-    /// classes are heap objects and are registered as GC roots; the cache is
-    /// cleared by the runtime reset before the heap is freed.
-    static TYPE_CLASS_CACHE: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
+    /// classes are heap objects and are registered as *permanent* thread roots
+    /// (`heap::add_thread_root`); the cache is cleared by the runtime reset
+    /// before the heap is freed.
+    static TYPE_CLASS_CACHE: RefCell<HashMap<String, CachedClass>> = RefCell::new(HashMap::new());
     /// Cached `type` metadata built on first use: the `__dict__` mapping, the
     /// `__annotations__` descriptor it holds and the `type.__annotations__`
     /// mapping. Registered as GC roots and cleared with the class cache, so a
@@ -7422,11 +7533,27 @@ pub(crate) fn clear_type_class_cache() {
     TYPE_METADATA.with(|cache| *cache.borrow_mut() = [None; 3]);
 }
 
-/// Cached native class named `name`, created (and registered as a collector
-/// root) on first use.
+/// Cached native class named `name`, created (and registered as a permanent
+/// collector root) on first use.
+///
+/// A hit is validated before it is handed out: the entry must belong to the
+/// current heap generation and still name a live class object, otherwise it is
+/// dropped and the class is rebuilt. The hit is re-rooted (idempotently) so a
+/// cache entry can never rely on a root that a scoped `release_roots` marker
+/// has already removed.
 fn native_class(name: &str) -> i64 {
-    if let Some(class) = TYPE_CLASS_CACHE.with(|cache| cache.borrow().get(name).copied()) {
-        return class;
+    let generation = crate::heap::generation();
+    let cached = TYPE_CLASS_CACHE.with(|cache| cache.borrow().get(name).copied());
+    if let Some(CachedClass {
+        generation: cached_generation,
+        class,
+    }) = cached
+    {
+        if cached_generation == generation && crate::heap::is_registered_class_named(class, name) {
+            crate::heap::add_thread_root(class);
+            return class;
+        }
+        TYPE_CLASS_CACHE.with(|cache| cache.borrow_mut().remove(name));
     }
     let class = if name == "type" {
         // `type` is a real class in CPython, and its C-level operations are
@@ -7436,13 +7563,309 @@ fn native_class(name: &str) -> i64 {
         type_native_class()
     } else if name == "object" {
         object_native_class()
+    } else if name == "dict" {
+        // `dict` is the one native class user code subclasses directly
+        // (`class EnumDict(dict)` in `enum.py`), so it carries CPython's
+        // mapping surface instead of an empty namespace.
+        dict_native_class()
+    } else if name == DICT_METHODS_CLASS_NAME {
+        dict_methods_native_class()
     } else if matches!(name, "int" | "str" | "float" | "bytes" | "complex") {
         scalar_native_class(name)
+    } else if name == "bool" {
+        // `bool` is its own class; `int`'s ancestry is modelled by the
+        // `isinstance`/`issubclass` type checks, but `class B(bool)` and
+        // `type(True)` still need a real class object.
+        class_new_multi(
+            "bool".to_string(),
+            vec![native_class("int")],
+            NONE,
+            Vec::new(),
+            Vec::new(),
+        )
+    } else if matches!(
+        name,
+        "list" | "set" | "frozenset" | "tuple" | "bytearray" | "range" | "memoryview"
+    ) {
+        container_native_class(name)
+    } else if name == "partial" {
+        class_new_multi(
+            "partial".to_string(),
+            vec![object_class()],
+            NONE,
+            Vec::new(),
+            Vec::new(),
+        )
     } else {
         class_new(name.to_string(), NONE, Vec::new())
     };
     crate::heap::add_thread_root(class);
-    TYPE_CLASS_CACHE.with(|cache| cache.borrow_mut().insert(name.to_string(), class));
+    TYPE_CLASS_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert(name.to_string(), CachedClass { generation, class })
+    });
+    class
+}
+
+// -------------------------------------------------------------------------
+// Native `dict` subclasses
+// -------------------------------------------------------------------------
+//
+// A class statement may derive from the native `dict` class (`class
+// EnumDict(dict)` in `enum.py`). In CPython such an instance *is* a dict: it
+// owns C-level mapping storage, `d[key] = value` needs no `__setitem__`
+// override, and `super().__setitem__` reaches the native slot. Hydro instances
+// are attribute bags, so the mapping lives in a real `dict` value held in a
+// reserved instance attribute (which the collector already traces with the
+// instance) and the native `dict` class supplies the mapping methods. The
+// reserved names start with NUL, which no Python attribute or class member can
+// spell, so the storage never collides with user data.
+
+/// Reserved instance attribute holding a native `dict` subclass's mapping.
+const NATIVE_DICT_DATA_ATTR: &str = "\u{0}hydro_dict_data";
+/// Marker attribute every native `dict` class carries.
+const NATIVE_DICT_MARKER: &str = "\u{0}hydro_native_dict";
+/// Name of the private class that receives the unbound `dict` methods.
+const DICT_METHODS_CLASS_NAME: &str = "__hydro_dict_methods__";
+/// Marker attribute of the private class, so a user class that happens to use
+/// the same name is never mistaken for it.
+const DICT_METHODS_MARKER: &str = "\u{0}hydro_dict_methods";
+
+/// The native `dict` class, as `type({})` reports it.
+pub(crate) fn dict_class() -> i64 {
+    native_class("dict")
+}
+
+/// Whether `v` is the native `dict` class.
+pub(crate) fn is_native_dict_class(v: i64) -> bool {
+    as_class(v).is_some_and(|state| state.attr(NATIVE_DICT_MARKER).is_some())
+}
+
+/// Whether `class` is the native `dict` class or derives from it.
+pub(crate) fn is_native_dict_subclass(class: i64) -> bool {
+    if is_native_dict_class(class) {
+        return true;
+    }
+    let Some(state) = as_class(class) else {
+        return false;
+    };
+    state
+        .mro
+        .iter()
+        .any(|&ancestor| is_native_dict_class(ancestor))
+}
+
+/// The private class whose values stand in for the unbound native `dict`
+/// methods (`dict.__setitem__`, `super().__len__`).
+///
+/// A bound-method value holds one receiver, while a class namespace is shared
+/// by every instance, so the receiver cannot be the operand. It is this marker
+/// class instead; [`crate::core::methods::call`] recognises it by name and
+/// marker — not by identity, so the class may be the calling thread's cached
+/// copy — and runs the operation on the mapping passed as the first argument.
+fn dict_methods_class() -> i64 {
+    native_class(DICT_METHODS_CLASS_NAME)
+}
+
+/// Builds the private method-receiver class: an empty class carrying only the
+/// marker attribute.
+fn dict_methods_native_class() -> i64 {
+    class_new_full(
+        DICT_METHODS_CLASS_NAME.to_string(),
+        NONE,
+        Vec::new(),
+        vec![(DICT_METHODS_MARKER.to_string(), TRUE)],
+    )
+}
+
+/// Whether `v` is the receiver the unbound native `dict` methods bind to.
+pub(crate) fn is_dict_method_receiver(v: i64) -> bool {
+    as_class(v).is_some_and(|state| {
+        state.name == DICT_METHODS_CLASS_NAME && state.attr(DICT_METHODS_MARKER).is_some()
+    })
+}
+
+/// Whether `function` is one of the unbound native `dict` mapping methods.
+pub(crate) fn is_native_dict_method(function: i64) -> bool {
+    match as_function(function).map(|function| &function.body) {
+        Some(FunctionBody::BoundMethod { receiver, .. }) => is_dict_method_receiver(*receiver),
+        _ => false,
+    }
+}
+
+/// The native `dict` mapping method value `name`, if the class declares one.
+pub(crate) fn native_dict_method(name: &str) -> Option<i64> {
+    match class_own_lookup(dict_class(), name)? {
+        ClassEntry::Method(_, function) if is_native_dict_method(function) => Some(function),
+        _ => None,
+    }
+}
+
+/// Mapping storage of a native `dict` subclass instance.
+///
+/// `None` when `v` is not an instance of such a class. The storage dict is
+/// created on demand (CPython gives every dict subclass instance one) and held
+/// in a reserved attribute, so the collector traces it as an instance edge.
+pub(crate) fn native_dict_data(instance: i64, create: bool) -> Option<i64> {
+    let class = instance_class_value(instance)?;
+    if !is_native_dict_subclass(class) {
+        return None;
+    }
+    if let Some(data) = instance_attr(instance, NATIVE_DICT_DATA_ATTR) {
+        return Some(data);
+    }
+    if !create {
+        return None;
+    }
+    let data = dict_new(Vec::new());
+    let roots = crate::heap::root_values(std::slice::from_ref(&data));
+    instance_setattr(instance, NATIVE_DICT_DATA_ATTR.to_string(), data);
+    crate::heap::release_roots(roots);
+    Some(data)
+}
+
+/// `(key, value)` pairs of any mapping operand: `dict`, `defaultdict` or a
+/// native `dict` subclass instance. Never creates storage.
+pub(crate) fn mapping_pairs(v: i64) -> Option<&'static [(i64, i64)]> {
+    if let Some(dict) = as_dict_data(v) {
+        return Some(dict.entries());
+    }
+    if let Some((pairs, _)) = as_defaultdict(v) {
+        return Some(pairs);
+    }
+    native_dict_data(v, false).and_then(as_dict)
+}
+
+/// Whether a native `dict` subclass instance is unhashable, following
+/// CPython's `dict` slot: a class that assigns its own `__hash__` decides for
+/// itself, and `__hash__ = None` makes it unhashable.
+pub(crate) fn dict_subclass_unhashable(v: i64) -> bool {
+    let Some(class) = instance_class_value(v) else {
+        return false;
+    };
+    if !is_native_dict_subclass(class) {
+        return false;
+    }
+    match class_lookup(class, "__hash__") {
+        None => true,
+        Some(ClassEntry::Attr(item)) => item == NONE,
+        Some(ClassEntry::Method(_, _)) => false,
+    }
+}
+
+/// Truthiness of a native `dict` subclass instance: CPython uses the mapping
+/// length, so an empty subclass instance is falsy.
+///
+/// A class that overrides `__bool__`/`__len__` keeps the runtime's generic
+/// instance rule, because those method calls cannot run from here.
+fn dict_instance_truthy(v: i64, class: i64) -> bool {
+    if class_lookup(class, "__bool__").is_some() {
+        return true;
+    }
+    if let Some(entry) = class_lookup(class, "__len__") {
+        match entry {
+            ClassEntry::Method(_, function) if is_native_dict_method(function) => {}
+            _ => return true,
+        }
+    }
+    native_dict_data(v, false)
+        .and_then(as_dict)
+        .map(|pairs| !pairs.is_empty())
+        .unwrap_or(false)
+}
+
+/// Native `dict` class carrying CPython's mapping surface.
+///
+/// Every entry is a bound-method value whose receiver is the private
+/// [`dict_methods_class`]; the method dispatcher recognises it and runs the
+/// operation on the mapping operand (the first argument). That is what makes
+/// `super().__setitem__(key, value)` inside a `dict` subclass a real mapping
+/// write instead of an `AttributeError`, and what gives `len(d)`, `iter(d)` and
+/// `d[key]` the native behaviour.
+///
+/// `__init__` and `update` declare `(self, *args, **kwargs)` and a full-argv
+/// trampoline, so the shared keyword binder can hand them class-call and
+/// `super()` keyword arguments.
+fn dict_native_class() -> i64 {
+    const MEMBERS: &[&str] = &[
+        "__init__",
+        "__setitem__",
+        "__getitem__",
+        "__delitem__",
+        "__contains__",
+        "__iter__",
+        "__len__",
+        "__eq__",
+        "__ne__",
+        "__repr__",
+        "__str__",
+        "__reversed__",
+        "__or__",
+        "__ror__",
+        "__ior__",
+        "get",
+        "keys",
+        "values",
+        "items",
+        "update",
+        "setdefault",
+        "pop",
+        "popitem",
+        "clear",
+        "copy",
+        "fromkeys",
+    ];
+    let receiver = dict_methods_class();
+    let mut methods: Vec<(String, i64, MethodKind)> = Vec::with_capacity(MEMBERS.len());
+    // The values live in Rust memory the collector cannot scan until the class
+    // owns them, so every one is rooted as soon as it is allocated.
+    let mut roots_start: Option<usize> = None;
+    for name in MEMBERS {
+        let function = bound_method_new(receiver, (*name).to_string());
+        if matches!(*name, "__init__" | "update") {
+            function_set_signature(
+                function,
+                vec![
+                    ParamMeta {
+                        name: "self".to_string(),
+                        kind: ParamKind::Positional,
+                        default: None,
+                    },
+                    ParamMeta {
+                        name: "args".to_string(),
+                        kind: ParamKind::VarArg,
+                        default: None,
+                    },
+                    ParamMeta {
+                        name: "kwargs".to_string(),
+                        kind: ParamKind::KwArg,
+                        default: None,
+                    },
+                ],
+            );
+            function_set_full_entry(
+                function,
+                if *name == "__init__" {
+                    crate::core::methods::dict_init_entry as *const () as usize
+                } else {
+                    crate::core::methods::dict_update_entry as *const () as usize
+                },
+            );
+        }
+        methods.push(((*name).to_string(), function, MethodKind::Normal));
+        let start = crate::heap::root_values(std::slice::from_ref(&function));
+        roots_start.get_or_insert(start);
+    }
+    let class = class_new_full(
+        "dict".to_string(),
+        NONE,
+        methods,
+        vec![(NATIVE_DICT_MARKER.to_string(), TRUE)],
+    );
+    if let Some(start) = roots_start {
+        crate::heap::release_roots(start);
+    }
     class
 }
 
@@ -7478,6 +7901,27 @@ fn scalar_native_class(name: &str) -> i64 {
         vec![object_class()],
         NONE,
         methods,
+        Vec::new(),
+    )
+}
+
+/// Native class of a builtin container type (`type([])`, `type(())`, ...).
+///
+/// Instances keep their dedicated runtime representation (a list is a list,
+/// not an attribute bag), so the class is a type record. It carries the
+/// unbound `copy` slot because `copy.copy` reaches builtin containers through
+/// `type(x).copy(x)`; the slot receives the container as its only argument.
+fn container_native_class(name: &str) -> i64 {
+    let copy = function_new(
+        crate::core::methods::container_copy_entry as *const () as usize,
+        1,
+        "copy".to_string(),
+    );
+    class_new_multi(
+        name.to_string(),
+        vec![object_class()],
+        NONE,
+        vec![("copy".to_string(), copy, MethodKind::Normal)],
         Vec::new(),
     )
 }
@@ -7542,9 +7986,36 @@ fn object_native_class() -> i64 {
             native_function_new("builtins", "__object_reduce_ex__", usize::MAX),
             MethodKind::Normal,
         ),
+        // The attribute protocol. These slots run the default lookup,
+        // assignment and deletion, so a class that overrides
+        // `__getattribute__`/`__setattr__`/`__delattr__` can still reach the
+        // base implementation through `object.__getattribute__(self, ...)`
+        // (CPython's own idiom).
         (
             "__getattribute__".to_string(),
-            native_function_new("builtins", "__object_getattribute__", usize::MAX),
+            function_new(
+                crate::core::methods::object_getattribute_entry as *const () as usize,
+                2,
+                "__getattribute__".to_string(),
+            ),
+            MethodKind::Normal,
+        ),
+        (
+            "__setattr__".to_string(),
+            function_new(
+                crate::core::methods::object_setattr_entry as *const () as usize,
+                3,
+                "__setattr__".to_string(),
+            ),
+            MethodKind::Normal,
+        ),
+        (
+            "__delattr__".to_string(),
+            function_new(
+                crate::core::methods::object_delattr_entry as *const () as usize,
+                2,
+                "__delattr__".to_string(),
+            ),
             MethodKind::Normal,
         ),
     ];
@@ -7754,19 +8225,45 @@ pub(crate) fn object_class() -> i64 {
 /// Unlike [`object_class`] this never creates the class, so a side-effect-free
 /// check is available on hot paths.
 pub(crate) fn is_object_class(v: i64) -> bool {
-    TYPE_CLASS_CACHE.with(|cache| cache.borrow().get("object").copied() == Some(v))
+    cached_class_name_is("object", v)
 }
 
 /// Whether `v` is the cached native `type` class, i.e. the metaclass of every
 /// class value.
 pub(crate) fn is_type_class(v: i64) -> bool {
-    TYPE_CLASS_CACHE.with(|cache| cache.borrow().get("type").copied() == Some(v))
+    cached_class_name_is("type", v)
 }
 
 /// Whether `class` is one of the cached native classes created by `type()` for
 /// primitives (or the cached `object`/`type` classes).
 pub(crate) fn is_cached_type_class(class: i64) -> bool {
-    TYPE_CLASS_CACHE.with(|cache| cache.borrow().values().any(|cached| *cached == class))
+    TYPE_CLASS_CACHE.with(|cache| cache.borrow().values().any(|cached| cached.class == class))
+}
+
+/// Whether `v` is the cached `functools.partial` class, i.e. what `type()`
+/// reports for a partial value.
+pub(crate) fn is_partial_class(v: i64) -> bool {
+    cached_class_name_is("partial", v)
+}
+
+/// Whether the cache entry for `name` is `value`.
+fn cached_class_name_is(name: &str, value: i64) -> bool {
+    TYPE_CLASS_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(name)
+            .is_some_and(|cached| cached.class == value)
+    })
+}
+
+/// The cached `functools.partial` class.
+///
+/// A partial's state (the wrapped callable and its bound arguments) lives in
+/// the function value, so the class only carries type identity: `type(p)`,
+/// `isinstance(p, functools.partial)` and union membership
+/// (`Callable | functools.partial`) name it.
+pub(crate) fn partial_class() -> i64 {
+    native_class("partial")
 }
 
 /// `type(value)`: the class object for instances, otherwise a cached native
@@ -7799,6 +8296,13 @@ pub(crate) fn type_class(v: i64) -> i64 {
     // `type(f) is io.BufferedReader` and `isinstance(f, ...)` agree.
     if let Some(file) = as_file(v) {
         return crate::modules::io_file_class(file.class());
+    }
+    // A `functools.partial` value is stored as a function value, but it is an
+    // instance of `functools.partial`, not of `function`.
+    if let Some(function) = as_function(v) {
+        if matches!(&function.body, FunctionBody::Partial { .. }) {
+            return partial_class();
+        }
     }
     let name = type_name_of(v);
     // Opaque runtime kinds report `object`; use the cached root class rather
@@ -7905,8 +8409,17 @@ pub(crate) fn truthy(v: i64) -> bool {
             Some(ObjDataRef::Pattern(_)) | Some(ObjDataRef::Match(_)) => true,
             // A socket object is always truthy.
             Some(ObjDataRef::Socket(_)) => true,
-            // Classes and instances are always truthy (there is no `__bool__`).
-            Some(ObjDataRef::Class(_)) | Some(ObjDataRef::Instance(_)) => true,
+            // Classes are always truthy (there is no `__bool__`); a native
+            // `dict` subclass instance is truthy exactly when its mapping has
+            // entries, like CPython.
+            Some(ObjDataRef::Class(_)) => true,
+            Some(ObjDataRef::Instance(state)) => {
+                if is_native_dict_subclass(state.class) {
+                    dict_instance_truthy(v, state.class)
+                } else {
+                    true
+                }
+            }
             // Generator and coroutine objects are always truthy.
             Some(ObjDataRef::Fiber(_)) => true,
             // Function objects are always truthy.
@@ -9028,5 +9541,90 @@ mod tests {
         assert_eq!(crate::exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
         crate::exc::clear();
         assert!(!crate::exc::pending());
+    }
+
+    /// Regression for the GC-rooting bug: a scoped `root_values` marker taken
+    /// before a native class is created must never release that class from the
+    /// thread's permanent roots. The cache hit after the release and a forced
+    /// collection must return the very same, still-live class object.
+    #[test]
+    fn native_class_cache_survives_scoped_release_and_collection() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        crate::exc::init();
+        // Registers the calling thread so the permanent-root set is real.
+        crate::heap::reset();
+        let marker = crate::heap::root_values(&[]);
+        let int_class = native_class("int");
+        let str_class = native_class("str");
+        assert!(crate::heap::is_registered_class_value(int_class));
+        assert!(crate::heap::permanent_root_contains(int_class));
+        crate::heap::release_roots(marker);
+        assert!(crate::heap::permanent_root_contains(int_class));
+        let _ = crate::heap::collect();
+        assert_eq!(native_class("int"), int_class);
+        assert_eq!(native_class("str"), str_class);
+        assert_eq!(
+            as_class(int_class).map(|state| state.name.as_str()),
+            Some("int")
+        );
+        // Repeated hits re-root idempotently: the permanent set does not grow.
+        let count = crate::heap::permanent_root_count();
+        assert_eq!(native_class("int"), int_class);
+        assert_eq!(crate::heap::permanent_root_count(), count);
+    }
+
+    /// A cache entry that no longer names a class object (the exact aliasing a
+    /// stale root produced: `types.FunctionType` resolving to a string or a
+    /// function) is rejected and rebuilt rather than returned.
+    #[test]
+    fn native_class_cache_rejects_aliased_entries() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        crate::exc::init();
+        crate::heap::reset();
+        let class = native_class("int");
+        assert!(crate::heap::is_registered_class_value(class));
+        let impostor = str_alloc("recycled".to_string());
+        let impostor_root = crate::heap::root_values(&[impostor]);
+        TYPE_CLASS_CACHE.with(|cache| {
+            cache.borrow_mut().insert(
+                "int".to_string(),
+                CachedClass {
+                    generation: crate::heap::generation(),
+                    class: impostor,
+                },
+            )
+        });
+        let rebuilt = native_class("int");
+        assert_ne!(rebuilt, impostor);
+        assert!(crate::heap::is_registered_class_value(rebuilt));
+        assert_eq!(
+            as_class(rebuilt).map(|state| state.name.as_str()),
+            Some("int")
+        );
+        crate::heap::release_roots(impostor_root);
+    }
+
+    /// A new heap generation invalidates the cache even when the TLS entry
+    /// survives (a reset that was not paired with `exc::init`): the old tagged
+    /// value is never handed out against the new heap.
+    #[test]
+    fn native_class_cache_rejects_stale_generations() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        crate::exc::init();
+        crate::heap::reset();
+        let stale = native_class("int");
+        assert!(crate::heap::is_registered_class_value(stale));
+        crate::heap::reset();
+        let fresh = native_class("int");
+        assert!(crate::heap::is_registered_class_value(fresh));
+        TYPE_CLASS_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            let entry = cache.get("int").expect("rebuilt entry");
+            assert_eq!(entry.generation, crate::heap::generation());
+        });
+        assert_eq!(
+            as_class(fresh).map(|state| state.name.as_str()),
+            Some("int")
+        );
     }
 }

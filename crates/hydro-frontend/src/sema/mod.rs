@@ -463,7 +463,29 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
         ),
     ),
     ("find", MethodSig::new(1, 1, &[ArgKind::Str], Type::Int)),
-    ("count", MethodSig::new(1, 1, &[ArgKind::Str], Type::Int)),
+    (
+        "count",
+        MethodSig::new(1, 3, &[ArgKind::Str, ArgKind::Int, ArgKind::Int], Type::Int),
+    ),
+    (
+        "removeprefix",
+        MethodSig::new(1, 1, &[ArgKind::Str], Type::Str),
+    ),
+    (
+        "removesuffix",
+        MethodSig::new(1, 1, &[ArgKind::Str], Type::Str),
+    ),
+    // `str.maketrans` is a static method on the type, so instances accept the
+    // same table operands; the receiver is not part of the ABI.
+    (
+        "maketrans",
+        MethodSig::new(
+            1,
+            3,
+            &[ArgKind::Any, ArgKind::Str, ArgKind::Str],
+            Type::Dict,
+        ),
+    ),
     (
         "encode",
         MethodSig::new(0, 2, &[ArgKind::Str, ArgKind::Str], Type::Bytes),
@@ -482,7 +504,21 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
 const BYTES_METHODS: &[(&str, MethodSig)] = &[
     ("decode", MethodSig::new(0, 1, &[ArgKind::Str], Type::Str)),
     ("hex", MethodSig::new(0, 0, &[], Type::Str)),
-    ("count", MethodSig::new(1, 1, &[ArgKind::Bytes], Type::Int)),
+    // `bytes.maketrans` is a static method: two buffer operands, receiver
+    // ignored, and always a 256-byte table.
+    (
+        "maketrans",
+        MethodSig::new(2, 2, &[ArgKind::Any, ArgKind::Any], Type::Bytes),
+    ),
+    (
+        "count",
+        MethodSig::new(
+            1,
+            3,
+            &[ArgKind::Bytes, ArgKind::Int, ArgKind::Int],
+            Type::Int,
+        ),
+    ),
     ("find", MethodSig::new(1, 1, &[ArgKind::Bytes], Type::Int)),
     (
         "startswith",
@@ -748,9 +784,11 @@ fn builtin_class_method_result(builtin: Builtin, method: &str) -> Option<Type> {
         (Builtin::Int, "bit_length") => Type::Int,
         (Builtin::Str, "maketrans") => Type::Dict,
         (Builtin::Bytes, "fromhex") => Type::Bytes,
+        (Builtin::Bytes, "maketrans") => Type::Bytes,
         // `bytearray` shares the byte-sequence static type; the type lattice
         // has no separate mutable-bytes variant.
         (Builtin::ByteArray, "fromhex") => Type::Bytes,
+        (Builtin::ByteArray, "maketrans") => Type::Bytes,
         (Builtin::Dict, "fromkeys") => Type::Dict,
         (Builtin::Float, "fromhex") => Type::Float,
         // `type` is the metaclass every class value carries. Its class-level

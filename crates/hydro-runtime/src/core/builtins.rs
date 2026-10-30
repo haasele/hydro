@@ -1237,7 +1237,10 @@ pub(crate) fn dict_build(source: Option<i64>, keywords: &[(String, i64)]) -> i64
 /// position and the last value. The result itself roots every pair inserted
 /// so far.
 pub(crate) fn dict_from(iterable: i64) -> i64 {
-    if let Some(pairs) = value::as_dict(iterable) {
+    // Any mapping source (`dict`, `defaultdict`, a native `dict` subclass
+    // instance) copies its pairs directly; everything else is an iterable of
+    // two-item sequences.
+    if let Some(pairs) = value::mapping_pairs(iterable) {
         let result = value::dict_new(Vec::new());
         if let Some(mut dst) = value::dict_pairs_mut(result) {
             dst.extend_from_slice(pairs);
@@ -2297,6 +2300,18 @@ pub(crate) fn call_kw(
         if let Some(tag) = exc::exception_tag_of_class(class) {
             return instantiate_exception_kw(tag, &args, &keywords);
         }
+        // `functools.partial` is a real class value (its type checks and PEP
+        // 604 union membership need one), so calling the value must still
+        // build the partial function object rather than a blank instance.
+        if value::is_partial_class(class) {
+            let Some((&target, bound)) = args.split_first() else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "type 'functools.partial' takes at least one argument",
+                );
+            };
+            return value::partial_new_with_keywords(target, bound.to_vec(), keywords);
+        }
         // `datetime.date(...)`, `datetime.timedelta(days=...)`, ... bind their
         // declared parameters by name. The name check keeps the registry
         // lookups off the hot path for ordinary user classes.
@@ -3079,22 +3094,40 @@ pub(crate) fn call_kw(
     }
     if func.flags & (value::FUNCTION_FLAG_ASYNC | value::FUNCTION_FLAG_GENERATOR) != 0 {
         // Generator/coroutine calls must create a suspended fiber instead of
-        // running the concrete entry. Plain positional signatures can go
-        // through the regular wrapper with the fully bound slot vector.
-        if signature.iter().all(|param| param.kind.is_positional()) {
-            return call(function, full.len(), full.as_ptr());
+        // running the concrete entry. A plain positional signature goes
+        // through the regular wrapper with the fully bound slot vector; a
+        // keyword-bearing signature cannot, because the generated prologue
+        // re-binds user positional arguments and rejects the keyword slots
+        // (`function takes at most N positional arguments`). Such calls resume
+        // through the uniform full-entry trampoline with the complete vector.
+        if !signature.iter().all(|param| param.kind.is_positional()) && entry != 0 {
+            let roots = crate::heap::root_values(&full);
+            let created = if func.flags & value::FUNCTION_FLAG_ASYNC != 0 {
+                if func.flags & value::FUNCTION_FLAG_GENERATOR != 0 {
+                    value::fiber_async_generator_new(entry, name.clone(), full)
+                } else {
+                    value::fiber_coroutine_new(entry, name.clone(), full)
+                }
+            } else {
+                value::fiber_generator_new(entry, name.clone(), full)
+            };
+            crate::heap::release_roots(roots);
+            return match created {
+                Some(fiber) => fiber,
+                None => exc::raise_with_message(
+                    RUNTIME_ERROR,
+                    "cannot allocate a generator/coroutine stack",
+                ),
+            };
         }
-        return exc::raise_with_message(
-            TYPE_ERROR,
-            &format!("{name}() does not accept keyword arguments"),
-        );
+        return call(function, full.len(), full.as_ptr());
     }
     call_full_entry(entry, &full)
 }
 
 /// Calls a generated full-argv trampoline while keeping every argument value
-/// visible to the conservative collector. Small vectors are copied to a stack
-/// array; unusually large signatures fall back to permanent thread roots.
+/// visible to the collector. Small vectors are copied to a stack array;
+/// unusually large signatures root the array for the duration of the call.
 pub(crate) fn call_full_entry(entry: usize, args: &[i64]) -> i64 {
     // SAFETY: `entry` is the generated trampoline for this exact argument count.
     let trampoline: extern "C" fn(*const i64) -> i64 =
@@ -3105,10 +3138,10 @@ pub(crate) fn call_full_entry(entry: usize, args: &[i64]) -> i64 {
         buffer[..args.len()].copy_from_slice(args);
         return trampoline(buffer.as_ptr());
     }
-    for &argument in args {
-        crate::heap::add_thread_root(argument);
-    }
-    trampoline(args.as_ptr())
+    let roots = crate::heap::root_values(args);
+    let result = trampoline(args.as_ptr());
+    crate::heap::release_roots(roots);
+    result
 }
 
 /// Resolves a name bound by an import that was deferred at compile time.
@@ -3534,6 +3567,23 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     // blank instance. The name check keeps the registry lookup off the hot
     // path for ordinary user classes.
     let native_name = value::class_display_name(class);
+    // `functools.partial`'s module value is a class so type checks and unions
+    // work; calling it constructs the real partial function object.
+    if value::is_partial_class(class) {
+        let args: &[i64] = if argc == 0 {
+            &[]
+        } else {
+            // SAFETY: argc > 0 implies a non-null, readable buffer.
+            unsafe { std::slice::from_raw_parts(argv, argc) }
+        };
+        let Some((&target, bound)) = args.split_first() else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "type 'functools.partial' takes at least one argument",
+            );
+        };
+        return value::partial_new(target, bound.to_vec());
+    }
     if native_name == Some("complex") && globals::registry_get("builtins.complex") == Some(class) {
         let args: &[i64] = if argc == 0 {
             &[]
@@ -6579,12 +6629,19 @@ enum SubclassError {
 
 /// Tri-state check for `issubclass`, with the offending argument on failure.
 fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
+    // The builtin type spellings (`int`, `list`, `type`, ...) are function
+    // values that also name the cached class of the same type; both spellings
+    // are class operands here.
+    let subclass = value::builtin_type_class(subclass).unwrap_or(subclass);
+    let class = value::builtin_type_class(class).unwrap_or(class);
     if let Some(types) = value::as_tuple(class) {
         if value::as_class(subclass).is_none() {
             return Err(SubclassError::Subclass);
         }
         for &candidate in types {
-            if value::as_class(candidate).is_none() {
+            if value::as_class(candidate).is_none()
+                && value::builtin_type_class(candidate).is_none()
+            {
                 return Err(SubclassError::Class);
             }
             if subclass_check(subclass, candidate)? {
@@ -6763,8 +6820,10 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
             .unwrap_or(false),
         "list" => value::as_list(value).is_some(),
         "dict" => {
-            value::as_dict(value).is_some()
-                || value::as_defaultdict(value).is_some()
+            // A native `dict` subclass instance is a dict too; `mapping_pairs`
+            // resolves the real mapping storage (and a plain dict or a
+            // defaultdict) without creating anything.
+            value::mapping_pairs(value).is_some()
                 || crate::modules::collections::is_counter_instance(value)
         }
         "tuple" => {
@@ -6782,15 +6841,24 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
         // socket object, so `isinstance(s, socket.SocketType)` holds.
         "socket" => value::as_socket(value).is_some(),
         // `types.FunctionType`: every function value (`def`, lambda,
-        // builtin/bound/native) reports the cached `function` type name.
-        "function" => value::as_function(value).is_some(),
+        // builtin/bound/native) reports the cached `function` type name, but a
+        // `functools.partial` is an instance of `functools.partial`.
+        "function" => value::as_function(value)
+            .is_some_and(|function| !matches!(&function.body, FunctionBody::Partial { .. })),
+        // `functools.partial` is stored as a function value; its cached class
+        // is the value the module name resolves to, so both the class and the
+        // `type(p)` name reach this arm.
+        "partial" => value::as_function(value)
+            .is_some_and(|function| matches!(&function.body, FunctionBody::Partial { .. })),
         // Native descriptor/module/iterator classes are spellings of builtin
         // function values rather than class objects; their runtime type name
         // is still the CPython class name.
         "staticmethod" | "classmethod" | "property" | "module" | "method" | "generator"
         | "frame" | "code" => value::type_name(value) == name,
         "object" => true,
-        "type" => value::as_class(value).is_some(),
+        // A class, or the builtin type spelling source code names it by, is an
+        // instance of `type`.
+        "type" => value::as_class(value).is_some() || value::builtin_type_class(value).is_some(),
         _ => return None,
     })
 }
@@ -6836,7 +6904,13 @@ fn instance_of(value: i64, class: i64) -> bool {
         }
     }
     if value::is_type_class(class) {
-        return value::as_class(value).is_some();
+        return value::as_class(value).is_some() || value::builtin_type_class(value).is_some();
+    }
+    // A `functools.partial` value is stored as a function object, but its
+    // type is the cached `partial` class (see `value::type_class`).
+    if value::is_partial_class(class) {
+        return value::as_function(value)
+            .is_some_and(|function| matches!(&function.body, FunctionBody::Partial { .. }));
     }
     if is_protocol_class(class) {
         return protocol_instance_of(value, class);
@@ -7728,6 +7802,40 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(pending_message(), "'int' object is not iterable");
         exc::init();
+    }
+
+    #[test]
+    fn dict_subclass_instances_are_dicts() {
+        exc::init();
+        // `class D(dict): pass`
+        let derived =
+            value::class_new_full("D".to_string(), value::dict_class(), Vec::new(), Vec::new());
+        let instance = value::instance_new(derived);
+        let storage = value::native_dict_data(instance, true).expect("mapping storage");
+        container::dict_set(storage, string("a"), int(1));
+        assert!(!exc::pending());
+
+        // `isinstance(d, dict)` follows the native class ancestry, and the
+        // class itself still matches.
+        let dict_type = value::builtin_function_new(Builtin::Dict);
+        assert_eq!(isinstance(instance, dict_type), TRUE);
+        assert_eq!(isinstance(instance, derived), TRUE);
+        // An instance of an unrelated class is not a dict.
+        let other = value::instance_new(value::class_new("Other".to_string(), NONE, Vec::new()));
+        assert_eq!(isinstance(other, dict_type), FALSE);
+        assert!(!exc::pending());
+
+        // `dict(d)` copies the mapping instead of iterating its keys, and the
+        // copy is a plain dict.
+        let copied = dict_from(instance);
+        assert!(!exc::pending());
+        assert_eq!(rendered(copied), "{'a': 1}");
+        assert!(value::as_instance(copied).is_none());
+        // `d` itself is untouched.
+        assert_eq!(
+            value::mapping_pairs(instance).map(|pairs| pairs.len()),
+            Some(1)
+        );
     }
 
     #[test]
@@ -8719,6 +8827,160 @@ mod tests {
         assert_eq!(isinstance(int(1), none_class), FALSE);
         assert!(!exc::pending());
         exc::init();
+    }
+
+    #[test]
+    fn builtin_type_spellings_act_as_class_operands() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        let type_builtin = value::builtin_function_new(Builtin::Type);
+        let int_builtin = value::builtin_function_new(Builtin::Int);
+        let list_builtin = value::builtin_function_new(Builtin::List);
+
+        // `isinstance(type, type)`; classes and their builtin spellings are
+        // instances of `type`, plain values are not.
+        assert_eq!(isinstance(type_builtin, type_builtin), TRUE);
+        assert_eq!(isinstance(int_builtin, type_builtin), TRUE);
+        assert_eq!(isinstance(value::type_class(int(1)), type_builtin), TRUE);
+        assert_eq!(isinstance(int(1), type_builtin), FALSE);
+        assert!(!exc::pending());
+
+        // `issubclass(int, type)` is False (int is an *instance* of type) and
+        // no longer raises; class operands compare by the class they name.
+        assert_eq!(issubclass(int_builtin, type_builtin), FALSE);
+        assert_eq!(issubclass(type_builtin, type_builtin), TRUE);
+        assert_eq!(issubclass(int_builtin, int_builtin), TRUE);
+        assert_eq!(issubclass(int_builtin, value::object_class()), TRUE);
+        assert_eq!(issubclass(int_builtin, list_builtin), FALSE);
+        // A tuple target accepts the builtin spellings too.
+        assert_eq!(
+            issubclass(
+                int_builtin,
+                value::tuple_new(vec![list_builtin, int_builtin])
+            ),
+            TRUE
+        );
+        assert!(!exc::pending());
+
+        // `copy`'s dispatch compares `type(x)` against the builtin spelling:
+        // a cached scalar/container class equals its builtin function value.
+        let int_class = value::type_class(int(1));
+        let list_class = value::type_class(value::list_new(Vec::new()));
+        assert!(crate::container::equals(int_class, int_builtin));
+        assert!(crate::container::equals(list_class, list_builtin));
+        assert!(!crate::container::equals(int_class, list_builtin));
+
+        // The class exposes the unbound `copy` slot `copy.copy` calls as
+        // `cls.copy(x)`.
+        let items = value::list_new(vec![int(1), int(2)]);
+        let copy = methods::getattr(list_class, b"copy".as_ptr(), "copy".len());
+        let result = crate::builtins::call(copy, 1, [items].as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            value::as_list(result).map(|items| items.to_vec()),
+            Some(vec![int(1), int(2)])
+        );
+        assert_ne!(result, items);
+        // A tuple's copy is the tuple itself.
+        let pair = value::tuple_new(vec![int(3)]);
+        let tuple_copy = methods::getattr(value::type_class(pair), b"copy".as_ptr(), "copy".len());
+        assert_eq!(crate::builtins::call(tuple_copy, 1, [pair].as_ptr()), pair);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn functools_partial_is_a_class_for_type_checks_and_unions() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        let target = value::builtin_function_new(Builtin::Str);
+        let partial = value::partial_new(target, Vec::new());
+        let partial_class = value::partial_class();
+
+        assert!(value::is_partial_class(value::type_class(partial)));
+        assert_eq!(value::type_name(partial), "partial");
+        assert_eq!(isinstance(partial, partial_class), TRUE);
+        assert_eq!(isinstance(target, partial_class), FALSE);
+        assert_eq!(isinstance(partial, target), FALSE);
+        assert_eq!(issubclass(partial_class, value::object_class()), TRUE);
+
+        // Calling the class still builds a real partial, which stays callable.
+        let made = crate::builtins::call(partial_class, 1, [target].as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(isinstance(made, partial_class), TRUE);
+        let bound = crate::builtins::call(made, 1, [int(4)].as_ptr());
+        assert_eq!(value::as_str(bound), Some("4"));
+
+        // `FunctionType | partial` composes as a PEP 604 type union.
+        let function_class = crate::modules::types::function_type_class();
+        assert_eq!(issubclass(partial_class, function_class), FALSE);
+        let union = crate::ops::binop(crate::ops::OP_BIT_OR, function_class, partial_class);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert!(crate::modules::types::is_union(union));
+        let members = value::instance_attr(union, "__args__")
+            .and_then(value::as_tuple)
+            .expect("union members")
+            .to_vec();
+        assert_eq!(members, vec![function_class, partial_class]);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn object_protocol_slots_resolve_past_a_plain_class() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        // `typing_extensions.sentinel` declares no base, so the class records
+        // an empty linearization; `super()` inside it must still reach the
+        // `object` attribute slots.
+        let class = value::class_new("Sentinel".to_string(), NONE, Vec::new());
+        for name in ["__setattr__", "__getattribute__", "__delattr__"] {
+            assert!(
+                matches!(
+                    value::class_lookup_after(class, class, name),
+                    Some(value::ClassEntry::Method(MethodKind::Normal, _))
+                ),
+                "{name} must resolve through super()"
+            );
+            assert_eq!(
+                value::class_lookup_owner(class, name),
+                Some(value::object_class()),
+                "{name} is owned by object"
+            );
+        }
+        // The fallback is limited to the attribute protocol: construction
+        // still treats a missing `__init__` as "no initializer".
+        assert!(value::class_lookup_after(class, class, "__init__").is_none());
+        assert!(value::class_lookup(class, "__init__").is_none());
+
+        // The `sentinel.__init__` body (`self._name = name` through the
+        // overridden `__setattr__`) forwards to `super().__setattr__`, which
+        // must perform the default store.
+        let instance = value::instance_new(class);
+        let proxy = value::super_new(class, instance);
+        let name = string("_name");
+        let stored = string("x");
+        let args = [name, stored];
+        assert_eq!(
+            crate::methods::call(proxy, b"__setattr__".as_ptr(), 11, 2, args.as_ptr()),
+            NONE
+        );
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            value::instance_attr(instance, "_name").map(value::to_string),
+            Some("x".to_string())
+        );
+        // Reading the stored attribute back through the proxy's slot.
+        let name = string("_name");
+        let read = crate::methods::call(proxy, b"__getattribute__".as_ptr(), 16, 1, &name);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::to_string(read), "x");
+        // And deletion.
+        let name = string("_name");
+        assert_eq!(
+            crate::methods::call(proxy, b"__delattr__".as_ptr(), 11, 1, &name),
+            NONE
+        );
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::instance_attr(instance, "_name"), None);
     }
 
     #[test]

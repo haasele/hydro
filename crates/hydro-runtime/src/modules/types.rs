@@ -703,9 +703,19 @@ pub(crate) fn type_check_target(value_arg: i64, name: &str) -> Option<bool> {
 ///
 /// Every function value reports this class from `type()`, so
 /// `types.FunctionType` must be the same heap value rather than a new class.
+///
+/// The registry entry is validated on every hit: a class from a previous heap
+/// generation (or one whose cell no longer holds a class, for example after a
+/// `reset`) is rebuilt instead of being handed out. The returned class is
+/// additionally rooted on the calling thread, so the identity cache never
+/// depends on a scoped root that an in-flight `release_roots` marker could
+/// truncate.
 pub(crate) fn function_type_class() -> i64 {
     if let Some(class) = globals::registry_get("types.function") {
-        return class;
+        if heap::is_registered_class_named(class, "function") {
+            heap::add_thread_root(class);
+            return class;
+        }
     }
     // `type()` of a function value resolves the runtime's cached `function`
     // class; a throwaway probe avoids exposing a private `value` helper.
@@ -713,6 +723,9 @@ pub(crate) fn function_type_class() -> i64 {
     let roots = heap::root_values(&[probe]);
     let class = value::type_class(probe);
     heap::release_roots(roots);
+    // Root before publishing: a collection on another thread must never see
+    // the registry entry before its value is marked reachable.
+    heap::add_thread_root(class);
     globals::registry_set("types.function", class);
     class
 }
@@ -888,8 +901,14 @@ pub(crate) fn union_new(values: &[i64]) -> i64 {
             let class = union_type_class();
             let instance = value::instance_new(class);
             let args_tuple = value::tuple_new(unique.clone());
-            let tail = heap::root_values(&[instance, args_tuple]);
+            let name = value::str_alloc("Union".to_string());
+            let qualname = value::str_alloc("Union".to_string());
+            let module = value::str_alloc("types".to_string());
+            let tail = heap::root_values(&[instance, args_tuple, name, qualname, module]);
             value::instance_setattr(instance, "__args__".to_string(), args_tuple);
+            value::instance_setattr(instance, "__name__".to_string(), name);
+            value::instance_setattr(instance, "__qualname__".to_string(), qualname);
+            value::instance_setattr(instance, "__module__".to_string(), module);
             heap::release_roots(tail);
             heap::release_roots(roots);
             instance
@@ -1052,6 +1071,65 @@ mod tests {
             assert!(class.methods.is_empty());
         }
         assert!(!exc::pending());
+    }
+
+    /// Regression for the GC-rooting bug: a scoped `root_values` marker taken
+    /// before the shared function class is created must not be able to release
+    /// it, and the registry cache must validate/re-root on every hit.
+    ///
+    /// This mirrors the pydantic_core sequence (`import pydantic_core; import
+    /// gc; gc.collect(); type(lambda: 0)`), where a container builder's release
+    /// marker used to truncate the class root and let the collector recycle the
+    /// cell, so `types.FunctionType` became a string or a function.
+    #[test]
+    fn function_type_class_survives_release_and_collection() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        crate::heap::reset();
+        let probe = value::native_function_new("types", "_function_type_probe", 0);
+        // The marker exists before the class is rooted.
+        let outer = crate::heap::root_values(&[probe]);
+        let class = function_type_class();
+        assert_eq!(value::type_class(probe), class);
+        crate::heap::release_roots(outer);
+        let _ = crate::heap::collect();
+        assert!(crate::heap::is_registered_class_value(class));
+        assert_eq!(function_type_class(), class);
+        assert_eq!(
+            as_class(class).map(|state| state.name.as_str()),
+            Some("function")
+        );
+        // A function created after the collection still reports the class.
+        let function = value::native_function_new("types", "_function_after_gc", 0);
+        let function_root = crate::heap::root_values(&[function]);
+        assert_eq!(value::type_class(function), class);
+        crate::heap::release_roots(function_root);
+        assert_eq!(constant("FunctionType"), class);
+        // Repeated hits re-root idempotently: no permanent-root growth.
+        let count = crate::heap::permanent_root_count();
+        assert_eq!(function_type_class(), class);
+        assert_eq!(crate::heap::permanent_root_count(), count);
+    }
+
+    /// The `types.function` registry entry belongs to the heap generation that
+    /// created it; a new generation (reset) must rebuild it instead of handing
+    /// back a tagged value whose cell the freed heap reused.
+    #[test]
+    fn function_type_class_rebuilds_for_a_new_generation() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        crate::heap::reset();
+        let first = function_type_class();
+        assert!(crate::heap::is_registered_class_value(first));
+        // Skip `exc::init` so the registry entry survives into the new heap.
+        crate::heap::reset();
+        let second = function_type_class();
+        assert!(crate::heap::is_registered_class_value(second));
+        assert_eq!(
+            as_class(second).map(|state| state.name.as_str()),
+            Some("function")
+        );
+        assert_eq!(function_type_class(), second);
     }
 
     #[test]

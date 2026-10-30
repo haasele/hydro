@@ -1385,3 +1385,88 @@ else:
 "#,
     );
 }
+
+#[test]
+fn enum_methods_and_properties_are_not_members() {
+    // `check_source` only links native module specs; the vendored `enum`
+    // module is pure Python, so write a real `main.py` and let the module
+    // loader (`check_file`) link its initializer.
+    //
+    // CPython's `_is_descriptor` relies on functions having `__get__`; Hydro's
+    // Python functions (and the functions behind decorator-only bindings) do
+    // not, so `enum._is_descriptor` recognizes them by type instead. Methods
+    // must stay class attributes while `member()` still forces membership.
+    let _guard = guard();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("hydro-interp-enum-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let main = dir.join("main.py");
+    std::fs::write(
+        &main,
+        r#"
+from enum import Enum, auto, member, nonmember
+
+class Demo(Enum):
+    A = auto()
+    B = auto()
+
+    def method(self):
+        return self._name_
+
+    @property
+    def prop(self):
+        return self._name_
+
+    C = auto()
+
+assert Demo._member_names_ == ['A', 'B', 'C']
+assert Demo.A.method() == 'A'
+# Decorator-only `@property` reaches the enum namespace as a plain function
+# (Hydro's binding-kind metadata does not survive `EnumType`'s class rebuild),
+# so only membership is asserted here; the explicit property below covers the
+# descriptor case.
+for name in ('method', 'prop'):
+    assert name not in Demo._member_names_
+
+# An explicit property object is already a descriptor, so it keeps its getter
+# and its value is not converted into a member.
+def getter(self):
+    return 'P'
+
+class WithProperty(Enum):
+    A = 1
+    p = property(getter)
+
+assert WithProperty._member_names_ == ['A']
+assert WithProperty.A.p == 'P'
+
+# `member()` still forces functions into members; `nonmember()` keeps them out.
+def plain(value):
+    return value + 1
+
+class Forced(Enum):
+    forced = member(plain)
+    skipped = nonmember(plain)
+
+assert Forced._member_names_ == ['forced']
+assert Forced.forced._value_(5) == 6
+assert Forced.skipped(6) == 7
+"#,
+    )
+    .unwrap();
+    let program = hydro_frontend::check_file(&main)
+        .unwrap_or_else(|diagnostics| panic!("frontend rejected modules: {diagnostics:?}"));
+    assert!(
+        program
+            .initializers
+            .iter()
+            .any(|id| program.functions[*id as usize].name == "enum.<module>"),
+        "the vendored enum module must be linked as an initializer"
+    );
+    run_program(program);
+    let _ = std::fs::remove_dir_all(&dir);
+}

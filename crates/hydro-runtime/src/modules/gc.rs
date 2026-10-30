@@ -85,13 +85,13 @@ fn get_stats() -> i64 {
         ("uncollectable", 0),
     ] {
         let key = value::str_alloc(name.to_string());
-        heap::add_thread_root(key);
+        heap::push_scoped_root(key);
         let number = ops::int_result(count);
-        heap::add_thread_root(number);
+        heap::push_scoped_root(number);
         pairs.push((key, number));
     }
     let dict = value::dict_new(pairs);
-    heap::add_thread_root(dict);
+    heap::push_scoped_root(dict);
     let result = value::list_new(vec![dict]);
     heap::release_roots(start);
     result

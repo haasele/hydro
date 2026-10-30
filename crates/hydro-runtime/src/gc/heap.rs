@@ -88,6 +88,15 @@
 //!
 //! Persistent roots (`add_persistent_root`) belong to a thread registration
 //! and survive ordinary collections until removed or cleared by [`reset`].
+//! Out-of-stack roots come in two flavours: scoped roots (`root_values`,
+//! `push_scoped_root`) live in a LIFO vector and are dropped by a
+//! [`release_roots`] marker, while
+//! permanent roots (`add_thread_root`) live in a separate de-duplicated vector
+//! that no marker can truncate. Scoped entries are dropped by their marker;
+//! both vectors are cleared by thread exit or [`reset`]. Keeping the two
+//! apart is a soundness requirement: a cache such as `type()`'s native-class
+//! table roots a class for the rest of the thread's life, so an unrelated
+//! marker created earlier in the call stack must never be able to release it.
 //! Process-wide roots (`add_global_root`) belong to no thread: they keep the
 //! values of thread-independent runtime state (module globals, attribute
 //! overrides, cached module views) alive after the writing thread exits, and
@@ -881,6 +890,65 @@ fn registered_object(addr: usize) -> bool {
     }
 }
 
+/// Whether the tagged value `v` is still a live class object of the active
+/// heap.
+///
+/// Test-only assertion helper for Rust-side class caches. Production hits are
+/// validated with [`is_registered_class_named`], which additionally rejects a
+/// recycled cell holding a *different* class.
+///
+/// Never dereferences a cell that is not registered: a stale address is
+/// rejected by the address-set test first.
+#[cfg(test)]
+pub(crate) fn is_registered_class_value(v: i64) -> bool {
+    with_registered_class(v, |_| ()).is_some()
+}
+
+/// Whether `v` is a live class object named `name`.
+///
+/// A stricter form of `is_registered_class_value` for caches keyed by a
+/// Python-visible name: a cell recycled into a *different* class is rejected
+/// instead of being returned under the cached name.
+pub(crate) fn is_registered_class_named(v: i64, name: &str) -> bool {
+    with_registered_class(v, |state| state.name.as_str() == name).unwrap_or(false)
+}
+
+/// Runs `check` on the class state of tagged value `v` under the heap lock.
+///
+/// Returns `None` when `v` is not a registered class. The lock keeps the cell
+/// alive for the duration of `check`, so the borrowed state is never read
+/// after a concurrent sweep could have released it.
+fn with_registered_class<R>(
+    v: i64,
+    check: impl FnOnce(&crate::value::ClassState) -> R,
+) -> Option<R> {
+    if v & crate::value::TAG_MASK != crate::value::TAG_HEAP {
+        return None;
+    }
+    let addr = (v & !crate::value::TAG_MASK) as usize;
+    if addr == 0 {
+        return None;
+    }
+    let inspect = |addresses: &AddressSet| {
+        if !addresses.contains(&addr) {
+            return None;
+        }
+        // SAFETY: the address is registered and the caller holds the heap
+        // lock, which keeps the cell alive for this check.
+        let obj = unsafe { object_at(addr) };
+        match obj.data_ref() {
+            ObjDataRef::Class(state) => Some(check(state)),
+            _ => None,
+        }
+    };
+    if shared() {
+        let heap = lock_global();
+        inspect(&heap.addresses)
+    } else {
+        HEAP.with(|cell| inspect(&cell.borrow().addresses))
+    }
+}
+
 /// Records `reference` as a weak reference to `target` with no callback.
 #[allow(dead_code)] // Convenience wrapper retained for tests/embedding.
 pub(crate) fn weakref_register(reference: i64, target: i64) -> bool {
@@ -1425,11 +1493,16 @@ const REG_WORDS: usize = 16;
 ///   can mark exception objects owned by parked threads.
 /// * `handled` mirrors the thread's active exception-handler stack so
 ///   exceptions reachable only through implicit chaining stay alive.
-/// * `roots` holds tagged values that are only reachable from a Rust heap
-///   closure (e.g. the arguments of `_thread.start_new_thread`). It is set
-///   before the thread is inserted into the registry and is therefore visible
-///   to a collector before the thread can run user code; it is cleared when
-///   the thread exits.
+/// * `roots` holds *scoped* tagged values pushed by [`root_values`] and
+///   dropped by [`release_roots`]. The marker returned by `root_values` is an
+///   index into this vector, so entries are only ever truncated LIFO and never
+///   hold a permanent root.
+/// * `permanent_roots` holds tagged values that are only reachable from
+///   Rust-side state which outlives the current call (e.g. the arguments of
+///   `_thread.start_new_thread` and the classes cached by `type()`). It is
+///   append-only for the lifetime of the registration, de-duplicated, cleared
+///   only by thread exit or [`reset`], and therefore can never be reached by a
+///   [`release_roots`] marker created before or after the root was added.
 pub(crate) struct ThreadGc {
     id: i64,
     /// Unique OS-thread token used to associate suspended fiber root ranges.
@@ -1449,7 +1522,12 @@ pub(crate) struct ThreadGc {
     saved_regs: Mutex<[usize; REG_WORDS]>,
     pending: AtomicI64,
     handled: Mutex<Vec<i64>>,
+    /// Scoped roots (`root_values`): truncated LIFO by `release_roots`.
     roots: Mutex<Vec<i64>>,
+    /// Permanent out-of-stack roots (`add_thread_root`): append-only for the
+    /// registration's lifetime and de-duplicated, so no `release_roots` marker
+    /// can remove them.
+    permanent_roots: Mutex<Vec<i64>>,
     /// Persistent roots (`add_persistent_root`): tagged values that stay
     /// reachable for the lifetime of the registration or until the explicit
     /// slot is removed. Async loop roots and similar long-lived Rust-side
@@ -1705,22 +1783,38 @@ pub(crate) fn set_handled_mirror(values: &[i64]) {
     }
 }
 
-/// Adds `value` to the calling thread's out-of-stack roots so a collection
-/// keeps it alive while it is only reachable from Rust-side state (the
-/// unittest class registry). A no-op outside the runtime, where no collector
-/// can run.
+/// Adds `value` to the calling thread's permanent out-of-stack roots so a
+/// collection keeps it alive while it is only reachable from Rust-side state
+/// (the unittest class registry, the `type()` class caches, the exception
+/// class cache).
+///
+/// A permanent root is append-only for the lifetime of the thread
+/// registration and is *not* indexed by [`root_values`]' marker space, so a
+/// later [`release_roots`] can never drop it. Re-adding a value is a no-op, so
+/// callers may re-root a cached value on every hit without growing the set.
+/// For a value whose lifetime ends at an enclosing [`root_values`] marker use
+/// [`push_scoped_root`] instead.
+/// A no-op outside the runtime, where no collector can run.
 pub(crate) fn add_thread_root(value: i64) {
-    if let Some(gc) = current_gc() {
-        gc.roots
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(value);
+    let Some(gc) = current_gc() else {
+        return;
+    };
+    let mut roots = gc
+        .permanent_roots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !roots.contains(&value) {
+        roots.push(value);
     }
 }
 
-/// Pushes `values` onto the calling thread's out-of-stack roots and returns a
-/// marker for [`release_roots`]. Used by container builders whose payloads
-/// live in Rust heap memory that the conservative collector cannot scan.
+/// Pushes `values` onto the calling thread's scoped out-of-stack roots and
+/// returns a marker for [`release_roots`]. Used by container builders whose
+/// payloads live in Rust heap memory that the conservative collector cannot
+/// scan.
+///
+/// The marker indexes the scoped vector only: it can never release a permanent
+/// root added with [`add_thread_root`], nor a persistent root.
 pub(crate) fn root_values(values: &[i64]) -> usize {
     if let Some(gc) = current_gc() {
         let mut roots = gc
@@ -1735,7 +1829,26 @@ pub(crate) fn root_values(values: &[i64]) -> usize {
     }
 }
 
-/// Drops the roots added since `start`.
+/// Pushes a single `value` onto the calling thread's scoped out-of-stack
+/// roots.
+///
+/// Use this — not [`add_thread_root`] — for a value that only has to live
+/// until the enclosing [`root_values`] marker is released (a temporary in a
+/// native helper). The permanent vector is never touched, so nested cache
+/// roots are safe. A no-op outside the runtime.
+pub(crate) fn push_scoped_root(value: i64) {
+    if let Some(gc) = current_gc() {
+        gc.roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(value);
+    }
+}
+
+/// Drops the scoped roots added since `start`.
+///
+/// Only the scoped vector is touched: permanent roots (and persistent slots)
+/// live elsewhere and cannot be truncated by a marker, however old.
 pub(crate) fn release_roots(start: usize) {
     if let Some(gc) = current_gc() {
         let mut roots = gc
@@ -1746,6 +1859,52 @@ pub(crate) fn release_roots(start: usize) {
             roots.truncate(start);
         }
     }
+}
+
+/// Test-only: number of scoped roots (`root_values`) held by the calling
+/// thread's registration.
+#[cfg(test)]
+pub(crate) fn scoped_root_count() -> usize {
+    current_gc().map_or(0, |gc| {
+        gc.roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    })
+}
+
+/// Test-only: number of permanent roots (`add_thread_root`) held by the
+/// calling thread's registration.
+#[cfg(test)]
+pub(crate) fn permanent_root_count() -> usize {
+    current_gc().map_or(0, |gc| {
+        gc.permanent_roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    })
+}
+
+/// Test-only: whether `value` is a scoped root of the calling thread.
+#[cfg(test)]
+pub(crate) fn scoped_root_contains(value: i64) -> bool {
+    current_gc().is_some_and(|gc| {
+        gc.roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&value)
+    })
+}
+
+/// Test-only: whether `value` is a permanent root of the calling thread.
+#[cfg(test)]
+pub(crate) fn permanent_root_contains(value: i64) -> bool {
+    current_gc().is_some_and(|gc| {
+        gc.permanent_roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&value)
+    })
 }
 
 /// Registers a persistent root and returns its stable slot index.
@@ -2246,6 +2405,10 @@ pub(crate) fn reset() {
     {
         let registry = lock_thread_registry();
         for gc in registry.values() {
+            gc.permanent_roots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
             gc.persistent
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2320,7 +2483,10 @@ struct RootSnapshot {
     regs: [usize; REG_WORDS],
     pending: i64,
     handled: Vec<i64>,
+    /// Scoped roots (`root_values`), truncated by `release_roots`.
     roots: Vec<i64>,
+    /// Permanent out-of-stack roots (`add_thread_root`).
+    permanent_roots: Vec<i64>,
     /// Persistent roots of the thread registration.
     persistent: Vec<i64>,
     /// Precise frames/ranges active in this thread's context (published by
@@ -2379,6 +2545,11 @@ fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnap
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let permanent_roots = gc
+            .permanent_roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let handled = gc
             .handled
             .lock()
@@ -2427,6 +2598,7 @@ fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnap
                 pending,
                 handled,
                 roots,
+                permanent_roots,
                 persistent,
                 precise,
                 suspended,
@@ -2453,6 +2625,7 @@ fn snapshot_roots(registry: &HashMap<i64, Arc<ThreadGc>>) -> Option<Vec<RootSnap
             pending,
             handled,
             roots,
+            permanent_roots,
             persistent,
             precise,
             suspended,
@@ -2550,6 +2723,9 @@ fn mark_roots(
             mark_word(value as usize, addresses);
         }
         for &root in &thread.roots {
+            mark_word(root as usize, addresses);
+        }
+        for &root in &thread.permanent_roots {
             mark_word(root as usize, addresses);
         }
         for &root in &thread.persistent {
@@ -2894,7 +3070,11 @@ fn register_current_thread(id: i64, roots: Vec<i64>) {
         saved_regs: Mutex::new([0; REG_WORDS]),
         pending: AtomicI64::new(crate::value::NONE),
         handled: Mutex::new(Vec::new()),
-        roots: Mutex::new(roots),
+        roots: Mutex::new(Vec::new()),
+        // The spawn arguments are installed before the registration becomes
+        // visible, so a collector already sees them. They are permanent (not
+        // scoped) so no `release_roots` marker on the new thread can drop them.
+        permanent_roots: Mutex::new(roots),
         persistent: Mutex::new(Vec::new()),
     });
     GC_SELF.with(|cell| *cell.borrow_mut() = Some(gc.clone()));
@@ -2932,10 +3112,14 @@ pub(crate) fn leave_thread() {
         GC_CONDVAR.notify_all();
         // Drop the registry lock before the roots lock, matching the
         // collector's registry-then-roots order. The spawn arguments (tagged
-        // values owned by the thread's Rust closure) and the persistent
-        // roots are released here.
+        // values owned by the thread's Rust closure), the permanent
+        // out-of-stack roots and the persistent roots are released here.
         drop(registry);
         gc.roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        gc.permanent_roots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
@@ -3102,14 +3286,23 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
             STAT_PRECISE_FRAMES.store(precise.frames().len() as u64, Ordering::Relaxed);
         }
         // Rust-side owners registered through `add_thread_root` (the unittest
-        // class registry) and persistent roots are invisible to the stack
-        // scan in local mode too.
+        // class registry, the `type()` class caches) and persistent roots are
+        // invisible to the stack scan in local mode too. Scoped roots use a
+        // separate vector so a stale `release_roots` marker cannot reach the
+        // permanent ones.
         if let Some(gc) = current_gc() {
             let roots = gc
                 .roots
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for &root in roots.iter() {
+                mark_word(root as usize, addresses);
+            }
+            let permanent = gc
+                .permanent_roots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for &root in permanent.iter() {
                 mark_word(root as usize, addresses);
             }
             let handled = gc
@@ -4124,6 +4317,58 @@ mod tests {
             crate::value::as_module(module).map(|state| state.name()),
             Some("unittest")
         );
+    }
+
+    #[test]
+    fn release_marker_cannot_drop_permanent_roots() {
+        let _guard = heap_reset_test_guard();
+        // Registers the calling thread, so `add_thread_root` has a root set.
+        reset();
+        let keep = allocate(KIND_STR, ObjData::Str(String::from("keep")));
+        let scoped = allocate(KIND_STR, ObjData::Str(String::from("scoped")));
+        // A single scoped push is released by its enclosing marker, exactly
+        // like a `root_values` entry.
+        let single_marker = root_values(&[]);
+        push_scoped_root(scoped);
+        assert!(scoped_root_contains(scoped));
+        release_roots(single_marker);
+        assert!(!scoped_root_contains(scoped));
+        // The marker exists *before* the permanent root is added: releasing it
+        // must only truncate the scoped vector.
+        let marker = root_values(&[]);
+        add_thread_root(keep);
+        add_thread_root(keep); // de-duplicated: one slot, not two
+        assert_eq!(permanent_root_count(), 1);
+        assert!(permanent_root_contains(keep));
+        let scoped_marker = root_values(&[scoped]);
+        assert!(scoped_root_contains(scoped));
+        release_roots(scoped_marker);
+        assert!(!scoped_root_contains(scoped));
+        release_roots(marker);
+        assert!(permanent_root_contains(keep));
+        assert_eq!(permanent_root_count(), 1);
+        assert_eq!(scoped_root_count(), 0);
+        let _ = collect_with_root(None);
+        assert!(crate::value::as_str(keep).is_some());
+    }
+
+    #[test]
+    fn permanent_roots_reset_with_the_generation() {
+        let _guard = heap_reset_test_guard();
+        reset();
+        let keep = allocate(KIND_STR, ObjData::Str(String::from("keep")));
+        add_thread_root(keep);
+        assert!(permanent_root_contains(keep));
+        let before = generation();
+        reset();
+        assert_ne!(generation(), before);
+        assert_eq!(permanent_root_count(), 0);
+        assert_eq!(scoped_root_count(), 0);
+        // A fresh run can root the same-tagged value again without inheriting
+        // the previous generation's entry.
+        let fresh = allocate(KIND_STR, ObjData::Str(String::from("keep")));
+        add_thread_root(fresh);
+        assert_eq!(permanent_root_count(), 1);
     }
 
     /// Untags a heap value into the raw cell address used by the registries.

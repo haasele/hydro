@@ -1197,16 +1197,16 @@ fn call_handler(handler: i64, method: &[u8], path: &[u8], body: &[u8]) -> Option
     // frames.
     let mark = heap::root_values(&[]);
     let method_value = value::bytes_new(method.to_vec());
-    heap::add_thread_root(method_value);
+    heap::push_scoped_root(method_value);
     let path_value = value::bytes_new(path.to_vec());
-    heap::add_thread_root(path_value);
+    heap::push_scoped_root(path_value);
     let body_value = value::bytes_new(body.to_vec());
-    heap::add_thread_root(body_value);
+    heap::push_scoped_root(body_value);
 
     let argv = [method_value, path_value, body_value];
     let result = crate::builtins::call(handler, argv.len(), argv.as_ptr());
     // Same rule for the result: root it before reading its payload.
-    heap::add_thread_root(result);
+    heap::push_scoped_root(result);
     let response = if exc::pending() {
         let _ = exc::clear();
         None

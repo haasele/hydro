@@ -405,6 +405,9 @@ pub static OS_PATH: ModuleSpec = ModuleSpec {
         // an empty drive on POSIX, preserving a `bytes` operand's flavour.
         f("normpath", 1, 1, Type::Any),
         f("splitdrive", 1, 1, Type::Tuple),
+        // `splitroot(path)`: the `(drive, root, tail)` triple (3.12+). Bytes
+        // operands keep their flavour, so the type is dynamic.
+        f("splitroot", 1, 1, Type::Any),
         // `normcase` is the identity on POSIX; `realpath(filename, *,
         // strict=False)` resolves symlinks component by component (the
         // keyword is parsed by the runtime).
@@ -505,6 +508,24 @@ pub static OS: ModuleSpec = ModuleSpec {
         // `os.mkdir(path, mode=0o777, *, dir_fd=None)`: a single directory
         // level, created through `mkdir(2)` so `mode` is honoured.
         kw("mkdir", 1, 3, Type::None, &["path", "mode", "dir_fd"]),
+        // `chmod(path, mode, *, dir_fd=None, follow_symlinks=True)` and
+        // `mknod(path, mode=0o600, device=0, *, dir_fd=None)`: the keyword-only
+        // options keep positional slots for the frontend binder; the runtime
+        // accepts them at those slots (`dir_fd` must be `None`).
+        kw(
+            "chmod",
+            1,
+            4,
+            Type::None,
+            &["path", "mode", "dir_fd", "follow_symlinks"],
+        ),
+        kw(
+            "mknod",
+            1,
+            4,
+            Type::None,
+            &["path", "mode", "device", "dir_fd"],
+        ),
         // `os.system(command)`: runs a shell command and returns its wait
         // status.
         f("system", 1, 1, Type::Any),
@@ -1999,8 +2020,19 @@ pub static SSL: ModuleSpec = ModuleSpec {
         f("_ssl_context_wrap_socket", 2, 3, Type::Any),
         f("_ssl_context_load_verify_locations", 1, 4, Type::Any),
         f("_ssl_context_load_cert_chain", 2, 4, Type::Any),
+        // The private context factories `urllib.request`/`http.client` use:
+        // `_create_stdlib_context`/`_create_unverified_context` accept the
+        // `SSLContext` keyword set, `_create_default_https_context` the
+        // `create_default_context` options.
+        kw_dynamic("_create_stdlib_context", 0, 9, Type::Any, &[]),
+        kw_dynamic("_create_unverified_context", 0, 9, Type::Any, &[]),
+        kw_dynamic("_create_default_https_context", 0, 4, Type::Any, &[]),
     ],
     constants: &[
+        // `ssl.Purpose` (the `SERVER_AUTH`/`CLIENT_AUTH` namespace) and the
+        // `SSLSocket` class value.
+        c("Purpose", Type::Any),
+        c("SSLSocket", Type::Any),
         c("CERT_NONE", Type::Int),
         c("CERT_OPTIONAL", Type::Int),
         c("CERT_REQUIRED", Type::Int),
@@ -2493,6 +2525,10 @@ pub static BINASCII: ModuleSpec = ModuleSpec {
         kw("a2b_base64", 1, 2, Type::Bytes, &["data", "strict_mode"]),
         kw("crc32", 1, 2, Type::Int, &["data", "value"]),
         kw("adler32", 1, 2, Type::Int, &["data", "value"]),
+        // The uuencode helpers: `a2b_uu(data)` and `b2a_uu(data,
+        // backtick=False)`.
+        f("a2b_uu", 1, 1, Type::Bytes),
+        kw("b2a_uu", 1, 2, Type::Bytes, &["data", "backtick"]),
     ],
     constants: &[],
 };
@@ -3645,6 +3681,10 @@ pub static IMPORTLIB: ModuleSpec = ModuleSpec {
         kw("import_module", 1, 2, Type::Any, &["name", "package"]),
         kw("reload", 1, 1, Type::Any, &["module"]),
         f("invalidate_caches", 0, 0, Type::None),
+        // `_gcd_import(name, package=None, level=0)`: the bootstrap primitive
+        // behind `import_module` (also reachable as
+        // `_frozen_importlib._gcd_import`).
+        f("_gcd_import", 1, 3, Type::Any),
     ],
     constants: &[
         c("util", Type::Any),
@@ -5220,6 +5260,14 @@ pub static HASHLIB: ModuleSpec = ModuleSpec {
         kw_dynamic("sha512", 0, 1, Type::Any, &["data"]),
         kw_dynamic("blake2b", 0, 1, Type::Any, &["data"]),
         kw_dynamic("blake2s", 0, 1, Type::Any, &["data"]),
+        // SHA-3 (FIPS 202) and the extendable-output SHAKE functions; both
+        // accept the `usedforsecurity` keyword through the dynamic binder.
+        kw_dynamic("sha3_224", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("sha3_256", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("sha3_384", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("sha3_512", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("shake_128", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("shake_256", 0, 1, Type::Any, &["data"]),
         kw(
             "pbkdf2_hmac",
             4,
@@ -5287,6 +5335,12 @@ pub static _HASHLIB: ModuleSpec = ModuleSpec {
         kw("openssl_sha512", 0, 1, Type::Any, &["data"]),
         kw("openssl_blake2b512", 0, 1, Type::Any, &["data"]),
         kw("openssl_blake2s256", 0, 1, Type::Any, &["data"]),
+        kw("openssl_sha3_224", 0, 1, Type::Any, &["data"]),
+        kw("openssl_sha3_256", 0, 1, Type::Any, &["data"]),
+        kw("openssl_sha3_384", 0, 1, Type::Any, &["data"]),
+        kw("openssl_sha3_512", 0, 1, Type::Any, &["data"]),
+        kw("openssl_shake_128", 0, 1, Type::Any, &["data"]),
+        kw("openssl_shake_256", 0, 1, Type::Any, &["data"]),
     ],
     constants: &[
         c("HASH", Type::Any),
@@ -5361,6 +5415,677 @@ pub static _UUID: ModuleSpec = ModuleSpec {
         c("NAMESPACE_URL", Type::Str),
         c("NAMESPACE_OID", Type::Str),
         c("NAMESPACE_X500", Type::Str),
+    ],
+};
+
+// ---------------------------------------------------------------------------
+// Compression, XML and SQLite native modules
+// ---------------------------------------------------------------------------
+
+/// `_bz2`: the libbz2 codec classes and their native method bodies. No module
+/// constants are exposed.
+pub static _BZ2: ModuleSpec = ModuleSpec {
+    name: "_bz2",
+    functions: &[
+        kw("BZ2Compressor", 0, 1, Type::Any, &["compresslevel"]),
+        f("BZ2Decompressor", 0, 0, Type::Any),
+        f("_bz2_compress", 2, 2, Type::Bytes),
+        f("_bz2_flush", 1, 1, Type::Bytes),
+        f("_bz2_decompress", 2, 3, Type::Bytes),
+        f("_bz2_compressor_init", 1, 2, Type::None),
+        f("_bz2_decompressor_init", 1, 1, Type::None),
+    ],
+    constants: &[],
+};
+
+/// `_lzma`: the liblzma codec classes, filter helpers and the format/check
+/// constants.
+pub static _LZMA: ModuleSpec = ModuleSpec {
+    name: "_lzma",
+    functions: &[
+        kw(
+            "LZMACompressor",
+            0,
+            4,
+            Type::Any,
+            &["format", "check", "preset", "filters"],
+        ),
+        kw(
+            "LZMADecompressor",
+            0,
+            3,
+            Type::Any,
+            &["format", "memlimit", "filters"],
+        ),
+        f("_lzma_compress", 2, 2, Type::Bytes),
+        f("_lzma_flush", 1, 1, Type::Bytes),
+        f("_lzma_decompress", 2, 3, Type::Bytes),
+        f("_lzma_compressor_init", 1, 5, Type::None),
+        f("_lzma_decompressor_init", 1, 4, Type::None),
+        f("is_check_supported", 1, 1, Type::Bool),
+        f("_encode_filter_properties", 1, 1, Type::Bytes),
+        f("_decode_filter_properties", 2, 2, Type::Any),
+    ],
+    constants: &[
+        c("LZMAError", Type::Any),
+        c("FORMAT_AUTO", Type::Int),
+        c("FORMAT_XZ", Type::Int),
+        c("FORMAT_ALONE", Type::Int),
+        c("FORMAT_RAW", Type::Int),
+        c("CHECK_NONE", Type::Int),
+        c("CHECK_CRC32", Type::Int),
+        c("CHECK_CRC64", Type::Int),
+        c("CHECK_SHA256", Type::Int),
+        c("CHECK_ID_MAX", Type::Int),
+        c("CHECK_UNKNOWN", Type::Int),
+        c("FILTER_LZMA1", Type::Int),
+        c("FILTER_LZMA2", Type::Int),
+        c("FILTER_DELTA", Type::Int),
+        c("FILTER_X86", Type::Int),
+        c("FILTER_POWERPC", Type::Int),
+        c("FILTER_IA64", Type::Int),
+        c("FILTER_ARM", Type::Int),
+        c("FILTER_ARMTHUMB", Type::Int),
+        c("FILTER_SPARC", Type::Int),
+        c("MF_HC3", Type::Int),
+        c("MF_HC4", Type::Int),
+        c("MF_BT2", Type::Int),
+        c("MF_BT3", Type::Int),
+        c("MF_BT4", Type::Int),
+        c("MODE_FAST", Type::Int),
+        c("MODE_NORMAL", Type::Int),
+        c("PRESET_DEFAULT", Type::Int),
+        c("PRESET_EXTREME", Type::Int),
+    ],
+};
+
+/// `pyexpat`: libexpat's XML parser. `ParserCreate` builds an `XMLParserType`
+/// instance; the `_pyexpat_*` entries are the native method/property bodies
+/// installed on that class (the receiver is included in each arity).
+pub static PYEXPAT: ModuleSpec = ModuleSpec {
+    name: "pyexpat",
+    functions: &[
+        kw(
+            "ParserCreate",
+            0,
+            3,
+            Type::Any,
+            &["encoding", "namespace_separator", "intern"],
+        ),
+        f("ErrorString", 1, 1, Type::Str),
+        f("_pyexpat_init", 1, 4, Type::None),
+        f("_pyexpat_parse", 2, 3, Type::Int),
+        f("_pyexpat_parse_file", 2, 2, Type::Int),
+        f("_pyexpat_set_base", 2, 2, Type::None),
+        f("_pyexpat_get_base", 1, 1, Type::Any),
+        f("_pyexpat_external_entity_parser_create", 2, 3, Type::Any),
+        f("_pyexpat_set_param_entity_parsing", 2, 2, Type::Bool),
+        f("_pyexpat_use_foreign_dtd", 1, 2, Type::None),
+        f("_pyexpat_get_buffer_text", 1, 1, Type::Bool),
+        f("_pyexpat_set_buffer_text", 2, 2, Type::None),
+        f("_pyexpat_get_buffer_size", 1, 1, Type::Int),
+        f("_pyexpat_set_buffer_size", 2, 2, Type::None),
+        f("_pyexpat_get_buffer_used", 1, 1, Type::Int),
+        f("_pyexpat_get_namespace_prefixes", 1, 1, Type::Bool),
+        f("_pyexpat_set_namespace_prefixes", 2, 2, Type::None),
+        f("_pyexpat_get_ordered_attributes", 1, 1, Type::Bool),
+        f("_pyexpat_set_ordered_attributes", 2, 2, Type::None),
+        f("_pyexpat_get_specified_attributes", 1, 1, Type::Bool),
+        f("_pyexpat_set_specified_attributes", 2, 2, Type::None),
+        f("_pyexpat_get_error_code", 1, 1, Type::Int),
+        f("_pyexpat_get_current_line", 1, 1, Type::Int),
+        f("_pyexpat_get_current_column", 1, 1, Type::Int),
+        f("_pyexpat_get_current_byte", 1, 1, Type::Int),
+    ],
+    constants: &[
+        c("ExpatError", Type::Any),
+        c("error", Type::Any),
+        c("XMLParserType", Type::Any),
+        c("errors", Type::Any),
+        c("model", Type::Any),
+        c("EXPAT_VERSION", Type::Str),
+        c("version_info", Type::Tuple),
+        c("native_encoding", Type::Str),
+        c("features", Type::List),
+        c("XML_PARAM_ENTITY_PARSING_NEVER", Type::Int),
+        c("XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE", Type::Int),
+        c("XML_PARAM_ENTITY_PARSING_ALWAYS", Type::Int),
+    ],
+};
+
+/// `sqlite3`: the DB-API 2.0 module backed by libsqlite3. `Connection` and
+/// `Cursor` are declared both as constructors (module-call lowering) and as
+/// constants (class values for `isinstance`/attribute reads).
+pub static SQLITE3: ModuleSpec = ModuleSpec {
+    name: "sqlite3",
+    functions: &[
+        // `connect(database, ..., uri=False)`: keyword-only `database=` is
+        // valid, so the entry is dynamic with zero fixed slots.
+        kw_dynamic("connect", 0, 8, Type::Any, &[]),
+        f("complete_statement", 1, 1, Type::Bool),
+        f("Connection", 1, 8, Type::Any),
+        f("Cursor", 1, 1, Type::Any),
+    ],
+    constants: &[
+        c("Connection", Type::Any),
+        c("Cursor", Type::Any),
+        c("Error", Type::Any),
+        c("Warning", Type::Any),
+        c("InterfaceError", Type::Any),
+        c("DatabaseError", Type::Any),
+        c("DataError", Type::Any),
+        c("OperationalError", Type::Any),
+        c("IntegrityError", Type::Any),
+        c("InternalError", Type::Any),
+        c("ProgrammingError", Type::Any),
+        c("NotSupportedError", Type::Any),
+        c("apilevel", Type::Str),
+        c("threadsafety", Type::Int),
+        c("paramstyle", Type::Str),
+        c("sqlite_version", Type::Str),
+        c("sqlite_version_info", Type::Tuple),
+        c("PARSE_DECLTYPES", Type::Int),
+        c("PARSE_COLNAMES", Type::Int),
+    ],
+};
+
+/// `_sqlite3`: the C accelerator spelling of `sqlite3`; same surface.
+pub static _SQLITE3: ModuleSpec = ModuleSpec {
+    name: "_sqlite3",
+    functions: SQLITE3.functions,
+    constants: SQLITE3.constants,
+};
+
+/// `_gdbm`: the libgdbm backend behind `dbm.gnu`. `open` returns a `gdbm`
+/// mapping object; the `_gdbm_*` entries are that object's native method
+/// bodies (the receiver is included in each arity).
+pub static GDBM: ModuleSpec = ModuleSpec {
+    name: "_gdbm",
+    functions: &[
+        f("open", 1, 3, Type::Any),
+        f("_gdbm_close", 1, 1, Type::None),
+        f("_gdbm_keys", 1, 1, Type::List),
+        f("_gdbm_get", 1, 3, Type::Any),
+        f("_gdbm_setdefault", 1, 3, Type::Any),
+        f("_gdbm_firstkey", 1, 1, Type::Any),
+        f("_gdbm_nextkey", 2, 2, Type::Any),
+        f("_gdbm_reorganize", 1, 1, Type::None),
+        f("_gdbm_sync", 1, 1, Type::None),
+        f("_gdbm_clear", 1, 1, Type::None),
+        f("_gdbm_contains", 2, 2, Type::Bool),
+        f("_gdbm_len", 1, 1, Type::Int),
+        f("_gdbm_bool", 1, 1, Type::Bool),
+        f("_gdbm_getitem", 2, 2, Type::Any),
+        f("_gdbm_setitem", 3, 3, Type::None),
+        f("_gdbm_delitem", 2, 2, Type::None),
+        f("_gdbm_enter", 1, 1, Type::Any),
+        f("_gdbm_exit", 1, 4, Type::None),
+    ],
+    constants: &[
+        c("error", Type::Any),
+        c("open_flags", Type::Str),
+        c("_GDBM_VERSION", Type::Tuple),
+    ],
+};
+
+/// `_dbm`: the NDBM backend behind `dbm.ndbm`. Its mapping object has no
+/// `firstkey`/`nextkey`/`sync`, matching CPython.
+pub static DBM: ModuleSpec = ModuleSpec {
+    name: "_dbm",
+    functions: &[
+        f("open", 1, 3, Type::Any),
+        f("_dbm_close", 1, 1, Type::None),
+        f("_dbm_keys", 1, 1, Type::List),
+        f("_dbm_get", 1, 3, Type::Any),
+        f("_dbm_setdefault", 1, 3, Type::Any),
+        f("_dbm_clear", 1, 1, Type::None),
+        f("_dbm_contains", 2, 2, Type::Bool),
+        f("_dbm_len", 1, 1, Type::Int),
+        f("_dbm_bool", 1, 1, Type::Bool),
+        f("_dbm_getitem", 2, 2, Type::Any),
+        f("_dbm_setitem", 3, 3, Type::None),
+        f("_dbm_delitem", 2, 2, Type::None),
+        f("_dbm_enter", 1, 1, Type::Any),
+        f("_dbm_exit", 1, 4, Type::None),
+    ],
+    constants: &[c("error", Type::Any), c("library", Type::Str)],
+};
+
+// ---------------------------------------------------------------------------
+// Terminal and codec accelerator modules
+// ---------------------------------------------------------------------------
+
+/// `readline`: GNU readline command-line editing and history. The module is
+/// only importable when the real library is present; every entry is
+/// positional as in CPython's C module.
+pub static READLINE: ModuleSpec = ModuleSpec {
+    name: "readline",
+    functions: &[
+        f("parse_and_bind", 1, 1, Type::None),
+        f("get_line_buffer", 0, 0, Type::Str),
+        f("insert_text", 1, 1, Type::None),
+        f("read_history_file", 0, 1, Type::None),
+        f("write_history_file", 0, 1, Type::None),
+        f("add_history", 1, 1, Type::None),
+        f("clear_history", 0, 0, Type::None),
+        f("get_history_length", 0, 0, Type::Int),
+        f("set_history_length", 1, 1, Type::None),
+        f("get_completer", 0, 0, Type::Any),
+        f("set_completer", 0, 1, Type::None),
+        f("get_begidx", 0, 0, Type::Int),
+        f("get_endidx", 0, 0, Type::Int),
+        f("set_completer_delims", 1, 1, Type::None),
+        f("get_completer_delims", 0, 0, Type::Str),
+        f("set_auto_history", 1, 1, Type::None),
+        f("get_current_history_length", 0, 0, Type::Int),
+    ],
+    constants: &[],
+};
+
+/// `_curses`: the ncurses screen surface. `window` and `error` are class
+/// values; the `KEY_*`/`A_*`/`ACS_*` constants are resolved dynamically by the
+/// runtime (state-dependent ones exist only after `initscr`/`start_color`).
+pub static CURSES: ModuleSpec = ModuleSpec {
+    name: "_curses",
+    functions: &[
+        f("initscr", 0, 0, Type::Any),
+        f("endwin", 0, 0, Type::None),
+        f("isendwin", 0, 0, Type::Bool),
+        f("newwin", 4, 4, Type::Any),
+        f("cbreak", 0, 1, Type::None),
+        f("nocbreak", 0, 1, Type::None),
+        f("echo", 0, 1, Type::None),
+        f("noecho", 0, 1, Type::None),
+        f("raw", 0, 1, Type::None),
+        f("noraw", 0, 1, Type::None),
+        f("nl", 0, 1, Type::None),
+        f("nonl", 0, 1, Type::None),
+        f("getch", 0, 0, Type::Int),
+        f("ungetch", 1, 1, Type::None),
+        f("addstr", 1, 4, Type::None),
+        f("addnstr", 2, 5, Type::None),
+        f("addch", 1, 3, Type::None),
+        f("getstr", 0, 3, Type::Bytes),
+        f("move", 2, 2, Type::None),
+        f("erase", 0, 0, Type::None),
+        f("clear", 0, 0, Type::None),
+        f("clrtobot", 0, 0, Type::None),
+        f("clrtoeol", 0, 0, Type::None),
+        f("standout", 0, 0, Type::None),
+        f("standend", 0, 0, Type::None),
+        f("refresh", 0, 0, Type::None),
+        f("doupdate", 0, 0, Type::None),
+        kw("setupterm", 0, 2, Type::None, &["term", "fd"]),
+        f("tigetstr", 1, 1, Type::Bytes),
+        f("tigetnum", 1, 1, Type::Int),
+        f("tigetflag", 1, 1, Type::Int),
+        f("keyname", 1, 1, Type::Str),
+        f("has_key", 1, 1, Type::Bool),
+        f("putp", 1, 1, Type::None),
+        f("termname", 0, 0, Type::Any),
+        f("longname", 0, 0, Type::Any),
+        f("unctrl", 1, 1, Type::Any),
+        f("start_color", 0, 0, Type::None),
+        f("has_colors", 0, 0, Type::Bool),
+        f("can_change_color", 0, 0, Type::Bool),
+        f("init_pair", 3, 3, Type::None),
+        f("init_color", 4, 4, Type::None),
+        f("color_content", 1, 1, Type::Tuple),
+        f("pair_content", 1, 1, Type::Tuple),
+        f("curs_set", 1, 1, Type::Int),
+        f("beep", 0, 0, Type::None),
+        f("flash", 0, 0, Type::None),
+        f("flushinp", 0, 0, Type::None),
+        f("savetty", 0, 0, Type::None),
+        f("resetty", 0, 0, Type::None),
+        f("delay_output", 1, 1, Type::None),
+        f("use_env", 0, 1, Type::None),
+        f("filter", 0, 0, Type::None),
+        f("get_escdelay", 0, 0, Type::Int),
+        f("set_escdelay", 1, 1, Type::None),
+    ],
+    constants: &[
+        // `KEY_*` from ncurses.
+        c("KEY_CODE_YES", Type::Int),
+        c("KEY_MIN", Type::Int),
+        c("KEY_BREAK", Type::Int),
+        c("KEY_DOWN", Type::Int),
+        c("KEY_UP", Type::Int),
+        c("KEY_LEFT", Type::Int),
+        c("KEY_RIGHT", Type::Int),
+        c("KEY_HOME", Type::Int),
+        c("KEY_BACKSPACE", Type::Int),
+        c("KEY_F0", Type::Int),
+        c("KEY_DL", Type::Int),
+        c("KEY_IL", Type::Int),
+        c("KEY_DC", Type::Int),
+        c("KEY_IC", Type::Int),
+        c("KEY_EIC", Type::Int),
+        c("KEY_CLEAR", Type::Int),
+        c("KEY_EOS", Type::Int),
+        c("KEY_EOL", Type::Int),
+        c("KEY_SF", Type::Int),
+        c("KEY_SR", Type::Int),
+        c("KEY_NPAGE", Type::Int),
+        c("KEY_PPAGE", Type::Int),
+        c("KEY_STAB", Type::Int),
+        c("KEY_CTAB", Type::Int),
+        c("KEY_CATAB", Type::Int),
+        c("KEY_ENTER", Type::Int),
+        c("KEY_SRESET", Type::Int),
+        c("KEY_RESET", Type::Int),
+        c("KEY_PRINT", Type::Int),
+        c("KEY_LL", Type::Int),
+        c("KEY_A1", Type::Int),
+        c("KEY_A3", Type::Int),
+        c("KEY_B2", Type::Int),
+        c("KEY_C1", Type::Int),
+        c("KEY_C3", Type::Int),
+        c("KEY_BTAB", Type::Int),
+        c("KEY_BEG", Type::Int),
+        c("KEY_CANCEL", Type::Int),
+        c("KEY_CLOSE", Type::Int),
+        c("KEY_COMMAND", Type::Int),
+        c("KEY_COPY", Type::Int),
+        c("KEY_CREATE", Type::Int),
+        c("KEY_END", Type::Int),
+        c("KEY_EXIT", Type::Int),
+        c("KEY_FIND", Type::Int),
+        c("KEY_HELP", Type::Int),
+        c("KEY_MARK", Type::Int),
+        c("KEY_MESSAGE", Type::Int),
+        c("KEY_MOVE", Type::Int),
+        c("KEY_NEXT", Type::Int),
+        c("KEY_OPEN", Type::Int),
+        c("KEY_OPTIONS", Type::Int),
+        c("KEY_PREVIOUS", Type::Int),
+        c("KEY_REDO", Type::Int),
+        c("KEY_REFERENCE", Type::Int),
+        c("KEY_REFRESH", Type::Int),
+        c("KEY_REPLACE", Type::Int),
+        c("KEY_RESTART", Type::Int),
+        c("KEY_RESUME", Type::Int),
+        c("KEY_SAVE", Type::Int),
+        c("KEY_SBEG", Type::Int),
+        c("KEY_SCANCEL", Type::Int),
+        c("KEY_SCOMMAND", Type::Int),
+        c("KEY_SCOPY", Type::Int),
+        c("KEY_SCREATE", Type::Int),
+        c("KEY_SDC", Type::Int),
+        c("KEY_SDL", Type::Int),
+        c("KEY_SELECT", Type::Int),
+        c("KEY_SEND", Type::Int),
+        c("KEY_SEOL", Type::Int),
+        c("KEY_SEXIT", Type::Int),
+        c("KEY_SFIND", Type::Int),
+        c("KEY_SHELP", Type::Int),
+        c("KEY_SHOME", Type::Int),
+        c("KEY_SIC", Type::Int),
+        c("KEY_SLEFT", Type::Int),
+        c("KEY_SMESSAGE", Type::Int),
+        c("KEY_SMOVE", Type::Int),
+        c("KEY_SNEXT", Type::Int),
+        c("KEY_SOPTIONS", Type::Int),
+        c("KEY_SPREVIOUS", Type::Int),
+        c("KEY_SPRINT", Type::Int),
+        c("KEY_SREDO", Type::Int),
+        c("KEY_SREPLACE", Type::Int),
+        c("KEY_SRIGHT", Type::Int),
+        c("KEY_SRSUME", Type::Int),
+        c("KEY_SSAVE", Type::Int),
+        c("KEY_SSUSPEND", Type::Int),
+        c("KEY_SUNDO", Type::Int),
+        c("KEY_SUSPEND", Type::Int),
+        c("KEY_UNDO", Type::Int),
+        c("KEY_MOUSE", Type::Int),
+        c("KEY_RESIZE", Type::Int),
+        c("KEY_MAX", Type::Int),
+        // `KEY_F1`..`KEY_F63` (dynamic in the runtime).
+        c("KEY_F1", Type::Int),
+        c("KEY_F2", Type::Int),
+        c("KEY_F3", Type::Int),
+        c("KEY_F4", Type::Int),
+        c("KEY_F5", Type::Int),
+        c("KEY_F6", Type::Int),
+        c("KEY_F7", Type::Int),
+        c("KEY_F8", Type::Int),
+        c("KEY_F9", Type::Int),
+        c("KEY_F10", Type::Int),
+        c("KEY_F11", Type::Int),
+        c("KEY_F12", Type::Int),
+        c("KEY_F13", Type::Int),
+        c("KEY_F14", Type::Int),
+        c("KEY_F15", Type::Int),
+        c("KEY_F16", Type::Int),
+        c("KEY_F17", Type::Int),
+        c("KEY_F18", Type::Int),
+        c("KEY_F19", Type::Int),
+        c("KEY_F20", Type::Int),
+        c("KEY_F21", Type::Int),
+        c("KEY_F22", Type::Int),
+        c("KEY_F23", Type::Int),
+        c("KEY_F24", Type::Int),
+        c("KEY_F25", Type::Int),
+        c("KEY_F26", Type::Int),
+        c("KEY_F27", Type::Int),
+        c("KEY_F28", Type::Int),
+        c("KEY_F29", Type::Int),
+        c("KEY_F30", Type::Int),
+        c("KEY_F31", Type::Int),
+        c("KEY_F32", Type::Int),
+        c("KEY_F33", Type::Int),
+        c("KEY_F34", Type::Int),
+        c("KEY_F35", Type::Int),
+        c("KEY_F36", Type::Int),
+        c("KEY_F37", Type::Int),
+        c("KEY_F38", Type::Int),
+        c("KEY_F39", Type::Int),
+        c("KEY_F40", Type::Int),
+        c("KEY_F41", Type::Int),
+        c("KEY_F42", Type::Int),
+        c("KEY_F43", Type::Int),
+        c("KEY_F44", Type::Int),
+        c("KEY_F45", Type::Int),
+        c("KEY_F46", Type::Int),
+        c("KEY_F47", Type::Int),
+        c("KEY_F48", Type::Int),
+        c("KEY_F49", Type::Int),
+        c("KEY_F50", Type::Int),
+        c("KEY_F51", Type::Int),
+        c("KEY_F52", Type::Int),
+        c("KEY_F53", Type::Int),
+        c("KEY_F54", Type::Int),
+        c("KEY_F55", Type::Int),
+        c("KEY_F56", Type::Int),
+        c("KEY_F57", Type::Int),
+        c("KEY_F58", Type::Int),
+        c("KEY_F59", Type::Int),
+        c("KEY_F60", Type::Int),
+        c("KEY_F61", Type::Int),
+        c("KEY_F62", Type::Int),
+        c("KEY_F63", Type::Int),
+        // `A_*` attributes.
+        c("A_NORMAL", Type::Int),
+        c("A_ATTRIBUTES", Type::Int),
+        c("A_CHARTEXT", Type::Int),
+        c("A_COLOR", Type::Int),
+        c("A_STANDOUT", Type::Int),
+        c("A_UNDERLINE", Type::Int),
+        c("A_REVERSE", Type::Int),
+        c("A_BLINK", Type::Int),
+        c("A_DIM", Type::Int),
+        c("A_BOLD", Type::Int),
+        c("A_ALTCHARSET", Type::Int),
+        c("A_INVIS", Type::Int),
+        c("A_PROTECT", Type::Int),
+        c("A_HORIZONTAL", Type::Int),
+        c("A_LEFT", Type::Int),
+        c("A_LOW", Type::Int),
+        c("A_RIGHT", Type::Int),
+        c("A_TOP", Type::Int),
+        c("A_VERTICAL", Type::Int),
+        c("A_ITALIC", Type::Int),
+        // `ACS_*` line-drawing characters.
+        c("ACS_ULCORNER", Type::Int),
+        c("ACS_LLCORNER", Type::Int),
+        c("ACS_URCORNER", Type::Int),
+        c("ACS_LRCORNER", Type::Int),
+        c("ACS_LTEE", Type::Int),
+        c("ACS_RTEE", Type::Int),
+        c("ACS_BTEE", Type::Int),
+        c("ACS_TTEE", Type::Int),
+        c("ACS_HLINE", Type::Int),
+        c("ACS_VLINE", Type::Int),
+        c("ACS_PLUS", Type::Int),
+        c("ACS_S1", Type::Int),
+        c("ACS_S9", Type::Int),
+        c("ACS_DIAMOND", Type::Int),
+        c("ACS_CKBOARD", Type::Int),
+        c("ACS_DEGREE", Type::Int),
+        c("ACS_PLMINUS", Type::Int),
+        c("ACS_BULLET", Type::Int),
+        c("ACS_LARROW", Type::Int),
+        c("ACS_RARROW", Type::Int),
+        c("ACS_DARROW", Type::Int),
+        c("ACS_UARROW", Type::Int),
+        c("ACS_BOARD", Type::Int),
+        c("ACS_LANTERN", Type::Int),
+        c("ACS_BLOCK", Type::Int),
+        c("ACS_S3", Type::Int),
+        c("ACS_S7", Type::Int),
+        c("ACS_LEQUAL", Type::Int),
+        c("ACS_GEQUAL", Type::Int),
+        c("ACS_PI", Type::Int),
+        c("ACS_NEQUAL", Type::Int),
+        c("ACS_STERLING", Type::Int),
+        // Screen state (present only after the matching call, like CPython).
+        c("LINES", Type::Int),
+        c("COLS", Type::Int),
+        c("COLORS", Type::Int),
+        c("COLOR_PAIRS", Type::Int),
+        // Class values.
+        c("error", Type::Any),
+        c("window", Type::Any),
+    ],
+};
+
+/// The per-language codec accelerators: each exposes `getcodec(name)`, the
+/// entry point `encodings/*.py` uses to obtain a codec object.
+pub static _CODECS_CN: ModuleSpec = ModuleSpec {
+    name: "_codecs_cn",
+    functions: &[f("getcodec", 1, 1, Type::Any)],
+    constants: &[],
+};
+
+pub static _CODECS_JP: ModuleSpec = ModuleSpec {
+    name: "_codecs_jp",
+    functions: &[f("getcodec", 1, 1, Type::Any)],
+    constants: &[],
+};
+
+pub static _CODECS_KR: ModuleSpec = ModuleSpec {
+    name: "_codecs_kr",
+    functions: &[f("getcodec", 1, 1, Type::Any)],
+    constants: &[],
+};
+
+pub static _CODECS_TW: ModuleSpec = ModuleSpec {
+    name: "_codecs_tw",
+    functions: &[f("getcodec", 1, 1, Type::Any)],
+    constants: &[],
+};
+
+pub static _CODECS_HK: ModuleSpec = ModuleSpec {
+    name: "_codecs_hk",
+    functions: &[f("getcodec", 1, 1, Type::Any)],
+    constants: &[],
+};
+
+pub static _CODECS_ISO2022: ModuleSpec = ModuleSpec {
+    name: "_codecs_iso2022",
+    functions: &[f("getcodec", 1, 1, Type::Any)],
+    constants: &[],
+};
+
+/// `_multibytecodec`: the incremental codec base classes the `encodings`
+/// wrappers derive from, plus `__create_codec` (wraps a codec object in a
+/// `MultibyteCodec`).
+pub static MULTIBYTECODEC: ModuleSpec = ModuleSpec {
+    name: "_multibytecodec",
+    functions: &[f("__create_codec", 1, 1, Type::Any)],
+    constants: &[
+        c("MultibyteCodec", Type::Any),
+        c("MultibyteIncrementalEncoder", Type::Any),
+        c("MultibyteIncrementalDecoder", Type::Any),
+        c("MultibyteStreamReader", Type::Any),
+        c("MultibyteStreamWriter", Type::Any),
+    ],
+};
+
+/// `_zstd`: the compiled Zstandard codec behind `compression.zstd`. The
+/// `Zstd*` classes are cached class values; the `_zstd_*` entries are their
+/// native method/descriptor bodies (receiver included in the arity).
+pub static _ZSTD: ModuleSpec = ModuleSpec {
+    name: "_zstd",
+    functions: &[
+        f("get_frame_size", 1, 1, Type::Int),
+        f("get_frame_info", 1, 1, Type::Tuple),
+        f("train_dict", 3, 3, Type::Bytes),
+        f("finalize_dict", 5, 5, Type::Bytes),
+        f("get_param_bounds", 2, 2, Type::Tuple),
+        f("set_parameter_types", 2, 2, Type::Any),
+        f("_zstd_compressor_init", 1, 4, Type::Any),
+        f("_zstd_compress", 2, 3, Type::Bytes),
+        f("_zstd_flush", 1, 2, Type::Bytes),
+        f("_zstd_set_pledged_input_size", 2, 2, Type::Any),
+        f("_zstd_decompressor_init", 1, 3, Type::Any),
+        f("_zstd_decompress", 2, 3, Type::Bytes),
+        f("_zstd_dict_init", 2, 3, Type::Any),
+        f("_zstd_dict_content", 1, 1, Type::Any),
+        f("_zstd_dict_id", 1, 1, Type::Int),
+        f("_zstd_dict_digested", 1, 1, Type::Tuple),
+        f("_zstd_dict_undigested", 1, 1, Type::Tuple),
+        f("_zstd_dict_prefix", 1, 1, Type::Tuple),
+        f("_zstd_dict_repr", 1, 1, Type::Str),
+    ],
+    constants: &[
+        c("ZstdCompressor", Type::Any),
+        c("ZstdDecompressor", Type::Any),
+        c("ZstdDict", Type::Any),
+        c("ZstdError", Type::Any),
+        c("zstd_version", Type::Str),
+        c("zstd_version_number", Type::Int),
+        c("ZSTD_CLEVEL_DEFAULT", Type::Int),
+        c("ZSTD_DStreamOutSize", Type::Int),
+        c("ZSTD_c_compressionLevel", Type::Int),
+        c("ZSTD_c_windowLog", Type::Int),
+        c("ZSTD_c_hashLog", Type::Int),
+        c("ZSTD_c_chainLog", Type::Int),
+        c("ZSTD_c_searchLog", Type::Int),
+        c("ZSTD_c_minMatch", Type::Int),
+        c("ZSTD_c_targetLength", Type::Int),
+        c("ZSTD_c_strategy", Type::Int),
+        c("ZSTD_c_enableLongDistanceMatching", Type::Int),
+        c("ZSTD_c_ldmHashLog", Type::Int),
+        c("ZSTD_c_ldmMinMatch", Type::Int),
+        c("ZSTD_c_ldmBucketSizeLog", Type::Int),
+        c("ZSTD_c_ldmHashRateLog", Type::Int),
+        c("ZSTD_c_contentSizeFlag", Type::Int),
+        c("ZSTD_c_checksumFlag", Type::Int),
+        c("ZSTD_c_dictIDFlag", Type::Int),
+        c("ZSTD_c_nbWorkers", Type::Int),
+        c("ZSTD_c_jobSize", Type::Int),
+        c("ZSTD_c_overlapLog", Type::Int),
+        c("ZSTD_d_windowLogMax", Type::Int),
+        c("ZSTD_fast", Type::Int),
+        c("ZSTD_dfast", Type::Int),
+        c("ZSTD_greedy", Type::Int),
+        c("ZSTD_lazy", Type::Int),
+        c("ZSTD_lazy2", Type::Int),
+        c("ZSTD_btlazy2", Type::Int),
+        c("ZSTD_btopt", Type::Int),
+        c("ZSTD_btultra", Type::Int),
+        c("ZSTD_btultra2", Type::Int),
     ],
 };
 
@@ -5492,11 +6217,11 @@ pub static FAULTHANDLER: ModuleSpec = ModuleSpec {
     constants: &[],
 };
 
-/// `_suggestions`: registered so imports resolve. The typo-suggestion helper
-/// has no callable surface in Hydro, so the module exposes no names.
+/// `_suggestions`: the typo-suggestion helper `traceback`/`name_error` use to
+/// propose the closest matching name.
 pub static _SUGGESTIONS: ModuleSpec = ModuleSpec {
     name: "_suggestions",
-    functions: &[],
+    functions: &[f("_generate_suggestions", 2, 2, Type::Any)],
     constants: &[],
 };
 
@@ -7276,6 +8001,58 @@ mod tests {
             (1, 3, Type::None)
         );
         assert_eq!(mkdir.params, &["path", "mode", "dir_fd"][..]);
+        let chmod = function("os", "chmod").expect("os.chmod");
+        assert_eq!(
+            (chmod.min_args, chmod.max_args, chmod.ret),
+            (1, 4, Type::None)
+        );
+        assert_eq!(
+            chmod.params,
+            &["path", "mode", "dir_fd", "follow_symlinks"][..]
+        );
+        let mknod = function("os", "mknod").expect("os.mknod");
+        assert_eq!(
+            (mknod.min_args, mknod.max_args, mknod.ret),
+            (1, 4, Type::None)
+        );
+        assert_eq!(mknod.params, &["path", "mode", "device", "dir_fd"][..]);
+        let splitroot = function("os.path", "splitroot").expect("os.path.splitroot");
+        assert_eq!(
+            (splitroot.min_args, splitroot.max_args, splitroot.ret),
+            (1, 1, Type::Any)
+        );
+        let gcd_import = function("importlib", "_gcd_import").expect("importlib._gcd_import");
+        assert_eq!(
+            (gcd_import.min_args, gcd_import.max_args, gcd_import.ret),
+            (1, 3, Type::Any)
+        );
+        assert!(
+            function("_frozen_importlib", "_gcd_import").is_some(),
+            "_frozen_importlib shares the importlib table"
+        );
+        for (name, max) in [
+            ("_create_stdlib_context", 9),
+            ("_create_unverified_context", 9),
+            ("_create_default_https_context", 4),
+        ] {
+            let spec = function("ssl", name).unwrap_or_else(|| panic!("ssl.{name}"));
+            assert_eq!(
+                (spec.min_args, spec.max_args, spec.ret),
+                (0, max, Type::Any)
+            );
+            assert!(spec.dynamic_keywords, "ssl.{name} accepts keywords");
+        }
+        let a2b_uu = function("binascii", "a2b_uu").expect("binascii.a2b_uu");
+        assert_eq!(
+            (a2b_uu.min_args, a2b_uu.max_args, a2b_uu.ret),
+            (1, 1, Type::Bytes)
+        );
+        let b2a_uu = function("binascii", "b2a_uu").expect("binascii.b2a_uu");
+        assert_eq!(
+            (b2a_uu.min_args, b2a_uu.max_args, b2a_uu.ret),
+            (1, 2, Type::Bytes)
+        );
+        assert_eq!(b2a_uu.params, &["data", "backtick"][..]);
         let readlink = function("os", "readlink").expect("os.readlink");
         assert_eq!(
             (readlink.min_args, readlink.max_args, readlink.ret),
@@ -7458,6 +8235,8 @@ mod tests {
             ("importlib", "_bootstrap_external", Type::Any),
             ("sys", "stdlib_module_names", Type::Set),
             ("pickle", "bytes_types", Type::Any),
+            ("ssl", "Purpose", Type::Any),
+            ("ssl", "SSLSocket", Type::Any),
             ("collections", "UserDict", Type::Any),
             ("collections", "UserList", Type::Any),
             ("collections", "UserString", Type::Any),
@@ -7755,11 +8534,17 @@ mod tests {
                 "{alias}.constants must be the {target} table"
             );
         }
-        for name in ["faulthandler", "_suggestions"] {
-            let spec = module(name).unwrap_or_else(|| panic!("{name}"));
-            assert!(spec.functions.is_empty(), "{name}");
-            assert!(spec.constants.is_empty(), "{name}");
-        }
+        let name = "faulthandler";
+        let spec = module(name).unwrap_or_else(|| panic!("{name}"));
+        assert!(spec.functions.is_empty(), "{name}");
+        assert!(spec.constants.is_empty(), "{name}");
+        // `_suggestions` now declares its real helper.
+        let suggestions =
+            function("_suggestions", "_generate_suggestions").expect("_suggestions helper");
+        assert_eq!(
+            (suggestions.min_args, suggestions.max_args, suggestions.ret),
+            (2, 2, Type::Any)
+        );
         // `runpy` is no longer empty: it declares its real entry points.
         let run_module = function("runpy", "run_module").expect("runpy.run_module");
         assert_eq!((run_module.min_args, run_module.max_args), (1, 4));
@@ -8066,6 +8851,441 @@ mod tests {
     }
 
     #[test]
+    fn compression_xml_and_sqlite_specs_are_registered() {
+        for (name, min, max, ret) in [
+            ("BZ2Compressor", 0, 1, Type::Any),
+            ("BZ2Decompressor", 0, 0, Type::Any),
+            ("_bz2_compress", 2, 2, Type::Bytes),
+            ("_bz2_flush", 1, 1, Type::Bytes),
+            ("_bz2_decompress", 2, 3, Type::Bytes),
+            ("_bz2_compressor_init", 1, 2, Type::None),
+            ("_bz2_decompressor_init", 1, 1, Type::None),
+        ] {
+            let spec = function("_bz2", name).unwrap_or_else(|| panic!("_bz2.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (min, max, ret));
+        }
+        assert!(module("_bz2").expect("_bz2").constants.is_empty());
+
+        for (name, min, max, ret) in [
+            ("LZMACompressor", 0, 4, Type::Any),
+            ("LZMADecompressor", 0, 3, Type::Any),
+            ("_lzma_compress", 2, 2, Type::Bytes),
+            ("_lzma_flush", 1, 1, Type::Bytes),
+            ("_lzma_decompress", 2, 3, Type::Bytes),
+            ("_lzma_compressor_init", 1, 5, Type::None),
+            ("_lzma_decompressor_init", 1, 4, Type::None),
+            ("is_check_supported", 1, 1, Type::Bool),
+            ("_encode_filter_properties", 1, 1, Type::Bytes),
+            ("_decode_filter_properties", 2, 2, Type::Any),
+        ] {
+            let spec = function("_lzma", name).unwrap_or_else(|| panic!("_lzma.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (min, max, ret));
+        }
+        assert_eq!(
+            constant("_lzma", "LZMAError").expect("LZMAError").ty,
+            Type::Any
+        );
+        for name in [
+            "FORMAT_AUTO",
+            "FORMAT_XZ",
+            "FORMAT_ALONE",
+            "FORMAT_RAW",
+            "CHECK_NONE",
+            "CHECK_CRC32",
+            "CHECK_CRC64",
+            "CHECK_SHA256",
+            "CHECK_ID_MAX",
+            "CHECK_UNKNOWN",
+            "FILTER_LZMA1",
+            "FILTER_LZMA2",
+            "FILTER_DELTA",
+            "FILTER_X86",
+            "FILTER_POWERPC",
+            "FILTER_IA64",
+            "FILTER_ARM",
+            "FILTER_ARMTHUMB",
+            "FILTER_SPARC",
+            "MF_HC3",
+            "MF_HC4",
+            "MF_BT2",
+            "MF_BT3",
+            "MF_BT4",
+            "MODE_FAST",
+            "MODE_NORMAL",
+            "PRESET_DEFAULT",
+            "PRESET_EXTREME",
+        ] {
+            assert_eq!(constant("_lzma", name).expect(name).ty, Type::Int, "{name}");
+        }
+
+        // pyexpat.
+        let create = function("pyexpat", "ParserCreate").expect("ParserCreate");
+        assert_eq!(
+            (create.min_args, create.max_args, create.ret),
+            (0, 3, Type::Any)
+        );
+        assert_eq!(
+            create.params,
+            &["encoding", "namespace_separator", "intern"][..]
+        );
+        let error_string = function("pyexpat", "ErrorString").expect("ErrorString");
+        assert_eq!(
+            (
+                error_string.min_args,
+                error_string.max_args,
+                error_string.ret
+            ),
+            (1, 1, Type::Str)
+        );
+        for (name, min, max) in [
+            ("_pyexpat_init", 1, 4),
+            ("_pyexpat_parse", 2, 3),
+            ("_pyexpat_parse_file", 2, 2),
+            ("_pyexpat_set_base", 2, 2),
+            ("_pyexpat_get_base", 1, 1),
+            ("_pyexpat_external_entity_parser_create", 2, 3),
+            ("_pyexpat_set_param_entity_parsing", 2, 2),
+            ("_pyexpat_use_foreign_dtd", 1, 2),
+            ("_pyexpat_get_buffer_text", 1, 1),
+            ("_pyexpat_set_buffer_text", 2, 2),
+            ("_pyexpat_get_buffer_size", 1, 1),
+            ("_pyexpat_set_buffer_size", 2, 2),
+            ("_pyexpat_get_buffer_used", 1, 1),
+            ("_pyexpat_get_namespace_prefixes", 1, 1),
+            ("_pyexpat_set_namespace_prefixes", 2, 2),
+            ("_pyexpat_get_ordered_attributes", 1, 1),
+            ("_pyexpat_set_ordered_attributes", 2, 2),
+            ("_pyexpat_get_specified_attributes", 1, 1),
+            ("_pyexpat_set_specified_attributes", 2, 2),
+            ("_pyexpat_get_error_code", 1, 1),
+            ("_pyexpat_get_current_line", 1, 1),
+            ("_pyexpat_get_current_column", 1, 1),
+            ("_pyexpat_get_current_byte", 1, 1),
+        ] {
+            let spec = function("pyexpat", name).unwrap_or_else(|| panic!("pyexpat.{name}"));
+            assert_eq!((spec.min_args, spec.max_args), (min, max), "{name}");
+        }
+        for (name, ty) in [
+            ("ExpatError", Type::Any),
+            ("error", Type::Any),
+            ("XMLParserType", Type::Any),
+            ("errors", Type::Any),
+            ("model", Type::Any),
+            ("EXPAT_VERSION", Type::Str),
+            ("version_info", Type::Tuple),
+            ("native_encoding", Type::Str),
+            ("features", Type::List),
+            ("XML_PARAM_ENTITY_PARSING_NEVER", Type::Int),
+            ("XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE", Type::Int),
+            ("XML_PARAM_ENTITY_PARSING_ALWAYS", Type::Int),
+        ] {
+            assert_eq!(
+                constant("pyexpat", name).expect(name).ty,
+                ty,
+                "pyexpat.{name}"
+            );
+        }
+
+        // sqlite3 / _sqlite3.
+        for module_name in ["sqlite3", "_sqlite3"] {
+            let connect = function(module_name, "connect").expect("connect");
+            assert_eq!(
+                (connect.min_args, connect.max_args, connect.ret),
+                (0, 8, Type::Any)
+            );
+            assert!(connect.dynamic_keywords);
+            let complete = function(module_name, "complete_statement").expect("complete_statement");
+            assert_eq!(
+                (complete.min_args, complete.max_args, complete.ret),
+                (1, 1, Type::Bool)
+            );
+            for name in ["Connection", "Cursor"] {
+                assert!(
+                    function(module_name, name).is_some(),
+                    "{module_name}.{name}"
+                );
+                assert_eq!(
+                    constant(module_name, name).expect(name).ty,
+                    Type::Any,
+                    "{module_name}.{name}"
+                );
+            }
+            for name in [
+                "Error",
+                "Warning",
+                "InterfaceError",
+                "DatabaseError",
+                "DataError",
+                "OperationalError",
+                "IntegrityError",
+                "InternalError",
+                "ProgrammingError",
+                "NotSupportedError",
+            ] {
+                assert_eq!(
+                    constant(module_name, name).expect(name).ty,
+                    Type::Any,
+                    "{module_name}.{name}"
+                );
+            }
+            for name in ["apilevel", "paramstyle", "sqlite_version"] {
+                assert_eq!(
+                    constant(module_name, name).expect(name).ty,
+                    Type::Str,
+                    "{module_name}.{name}"
+                );
+            }
+            for name in ["threadsafety", "PARSE_DECLTYPES", "PARSE_COLNAMES"] {
+                assert_eq!(
+                    constant(module_name, name).expect(name).ty,
+                    Type::Int,
+                    "{module_name}.{name}"
+                );
+            }
+            assert_eq!(
+                constant(module_name, "sqlite_version_info")
+                    .expect("sqlite_version_info")
+                    .ty,
+                Type::Tuple,
+                "{module_name}.sqlite_version_info"
+            );
+        }
+        let sqlite = module("sqlite3").expect("sqlite3");
+        let accelerator = module("_sqlite3").expect("_sqlite3");
+        assert!(std::ptr::eq(sqlite.functions, accelerator.functions));
+        assert!(std::ptr::eq(sqlite.constants, accelerator.constants));
+    }
+
+    #[test]
+    fn readline_curses_and_codec_specs_are_registered() {
+        for (name, min, max, ret) in [
+            ("parse_and_bind", 1, 1, Type::None),
+            ("get_line_buffer", 0, 0, Type::Str),
+            ("read_history_file", 0, 1, Type::None),
+            ("set_completer", 0, 1, Type::None),
+            ("get_completer", 0, 0, Type::Any),
+            ("get_begidx", 0, 0, Type::Int),
+            ("get_completer_delims", 0, 0, Type::Str),
+            ("get_current_history_length", 0, 0, Type::Int),
+        ] {
+            let spec = function("readline", name).unwrap_or_else(|| panic!("readline.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (min, max, ret));
+        }
+        assert!(module("readline").expect("readline").constants.is_empty());
+
+        let initscr = function("_curses", "initscr").expect("_curses.initscr");
+        assert_eq!(
+            (initscr.min_args, initscr.max_args, initscr.ret),
+            (0, 0, Type::Any)
+        );
+        let newwin = function("_curses", "newwin").expect("_curses.newwin");
+        assert_eq!(
+            (newwin.min_args, newwin.max_args, newwin.ret),
+            (4, 4, Type::Any)
+        );
+        let setupterm = function("_curses", "setupterm").expect("_curses.setupterm");
+        assert_eq!((setupterm.min_args, setupterm.max_args), (0, 2));
+        assert_eq!(setupterm.params, &["term", "fd"][..]);
+        for (name, min, max) in [
+            ("addstr", 1, 4),
+            ("addnstr", 2, 5),
+            ("addch", 1, 3),
+            ("getstr", 0, 3),
+            ("getch", 0, 0),
+            ("move", 2, 2),
+            ("cbreak", 0, 1),
+            ("has_key", 1, 1),
+        ] {
+            let spec = function("_curses", name).unwrap_or_else(|| panic!("_curses.{name}"));
+            assert_eq!((spec.min_args, spec.max_args), (min, max), "{name}");
+        }
+        for name in [
+            "KEY_UP",
+            "KEY_RESIZE",
+            "KEY_MAX",
+            "KEY_F1",
+            "KEY_F63",
+            "A_BOLD",
+            "A_ITALIC",
+            "ACS_HLINE",
+            "LINES",
+            "COLS",
+            "COLORS",
+            "COLOR_PAIRS",
+        ] {
+            assert_eq!(
+                constant("_curses", name).expect(name).ty,
+                Type::Int,
+                "_curses.{name}"
+            );
+        }
+        for name in ["error", "window"] {
+            assert_eq!(
+                constant("_curses", name).expect(name).ty,
+                Type::Any,
+                "_curses.{name}"
+            );
+        }
+
+        for module_name in [
+            "_codecs_cn",
+            "_codecs_jp",
+            "_codecs_kr",
+            "_codecs_tw",
+            "_codecs_hk",
+            "_codecs_iso2022",
+        ] {
+            let getcodec = function(module_name, "getcodec").expect("getcodec");
+            assert_eq!(
+                (getcodec.min_args, getcodec.max_args, getcodec.ret),
+                (1, 1, Type::Any),
+                "{module_name}.getcodec"
+            );
+            assert!(module(module_name).expect(module_name).constants.is_empty());
+        }
+        let create = function("_multibytecodec", "__create_codec").expect("__create_codec");
+        assert_eq!(
+            (create.min_args, create.max_args, create.ret),
+            (1, 1, Type::Any)
+        );
+        for name in [
+            "MultibyteCodec",
+            "MultibyteIncrementalEncoder",
+            "MultibyteIncrementalDecoder",
+            "MultibyteStreamReader",
+            "MultibyteStreamWriter",
+        ] {
+            assert_eq!(
+                constant("_multibytecodec", name).expect(name).ty,
+                Type::Any,
+                "_multibytecodec.{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn zstd_specs_are_registered() {
+        for (name, min, max, ret) in [
+            ("get_frame_size", 1, 1, Type::Int),
+            ("get_frame_info", 1, 1, Type::Tuple),
+            ("train_dict", 3, 3, Type::Bytes),
+            ("finalize_dict", 5, 5, Type::Bytes),
+            ("get_param_bounds", 2, 2, Type::Tuple),
+            ("set_parameter_types", 2, 2, Type::Any),
+            ("_zstd_compressor_init", 1, 4, Type::Any),
+            ("_zstd_compress", 2, 3, Type::Bytes),
+            ("_zstd_flush", 1, 2, Type::Bytes),
+            ("_zstd_set_pledged_input_size", 2, 2, Type::Any),
+            ("_zstd_decompressor_init", 1, 3, Type::Any),
+            ("_zstd_decompress", 2, 3, Type::Bytes),
+            ("_zstd_dict_init", 2, 3, Type::Any),
+            ("_zstd_dict_content", 1, 1, Type::Any),
+            ("_zstd_dict_id", 1, 1, Type::Int),
+            ("_zstd_dict_digested", 1, 1, Type::Tuple),
+            ("_zstd_dict_undigested", 1, 1, Type::Tuple),
+            ("_zstd_dict_prefix", 1, 1, Type::Tuple),
+            ("_zstd_dict_repr", 1, 1, Type::Str),
+        ] {
+            let spec = function("_zstd", name).unwrap_or_else(|| panic!("_zstd.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (min, max, ret));
+        }
+        for name in [
+            "ZstdCompressor",
+            "ZstdDecompressor",
+            "ZstdDict",
+            "ZstdError",
+        ] {
+            assert_eq!(
+                constant("_zstd", name).expect(name).ty,
+                Type::Any,
+                "_zstd.{name}"
+            );
+        }
+        assert_eq!(
+            constant("_zstd", "zstd_version").expect("zstd_version").ty,
+            Type::Str
+        );
+        for name in [
+            "zstd_version_number",
+            "ZSTD_CLEVEL_DEFAULT",
+            "ZSTD_DStreamOutSize",
+            "ZSTD_c_compressionLevel",
+            "ZSTD_c_strategy",
+            "ZSTD_d_windowLogMax",
+            "ZSTD_fast",
+            "ZSTD_btultra2",
+        ] {
+            assert_eq!(
+                constant("_zstd", name).expect(name).ty,
+                Type::Int,
+                "_zstd.{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn dbm_backend_specs_are_registered() {
+        let gdbm = function("_gdbm", "open").expect("_gdbm.open");
+        assert_eq!((gdbm.min_args, gdbm.max_args, gdbm.ret), (1, 3, Type::Any));
+        for (name, min, max, ret) in [
+            ("_gdbm_close", 1, 1, Type::None),
+            ("_gdbm_keys", 1, 1, Type::List),
+            ("_gdbm_get", 1, 3, Type::Any),
+            ("_gdbm_setdefault", 1, 3, Type::Any),
+            ("_gdbm_firstkey", 1, 1, Type::Any),
+            ("_gdbm_nextkey", 2, 2, Type::Any),
+            ("_gdbm_reorganize", 1, 1, Type::None),
+            ("_gdbm_sync", 1, 1, Type::None),
+            ("_gdbm_clear", 1, 1, Type::None),
+            ("_gdbm_contains", 2, 2, Type::Bool),
+            ("_gdbm_len", 1, 1, Type::Int),
+            ("_gdbm_bool", 1, 1, Type::Bool),
+            ("_gdbm_getitem", 2, 2, Type::Any),
+            ("_gdbm_setitem", 3, 3, Type::None),
+            ("_gdbm_delitem", 2, 2, Type::None),
+            ("_gdbm_enter", 1, 1, Type::Any),
+            ("_gdbm_exit", 1, 4, Type::None),
+        ] {
+            let spec = function("_gdbm", name).unwrap_or_else(|| panic!("_gdbm.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (min, max, ret));
+        }
+        assert_eq!(constant("_gdbm", "error").expect("error").ty, Type::Any);
+        assert_eq!(
+            constant("_gdbm", "open_flags").expect("open_flags").ty,
+            Type::Str
+        );
+        assert_eq!(
+            constant("_gdbm", "_GDBM_VERSION")
+                .expect("_GDBM_VERSION")
+                .ty,
+            Type::Tuple
+        );
+
+        let dbm = function("_dbm", "open").expect("_dbm.open");
+        assert_eq!((dbm.min_args, dbm.max_args, dbm.ret), (1, 3, Type::Any));
+        for (name, min, max, ret) in [
+            ("_dbm_close", 1, 1, Type::None),
+            ("_dbm_keys", 1, 1, Type::List),
+            ("_dbm_get", 1, 3, Type::Any),
+            ("_dbm_setdefault", 1, 3, Type::Any),
+            ("_dbm_clear", 1, 1, Type::None),
+            ("_dbm_contains", 2, 2, Type::Bool),
+            ("_dbm_len", 1, 1, Type::Int),
+            ("_dbm_bool", 1, 1, Type::Bool),
+            ("_dbm_getitem", 2, 2, Type::Any),
+            ("_dbm_setitem", 3, 3, Type::None),
+            ("_dbm_delitem", 2, 2, Type::None),
+            ("_dbm_enter", 1, 1, Type::Any),
+            ("_dbm_exit", 1, 4, Type::None),
+        ] {
+            let spec = function("_dbm", name).unwrap_or_else(|| panic!("_dbm.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (min, max, ret));
+        }
+        assert_eq!(constant("_dbm", "error").expect("error").ty, Type::Any);
+        assert_eq!(constant("_dbm", "library").expect("library").ty, Type::Str);
+    }
+
+    #[test]
     fn hashlib_accelerator_specs_are_registered() {
         for (name, min, max, ret, params) in [
             ("new", 1, 2, Type::Any, &["name", "data"][..]),
@@ -8077,6 +9297,12 @@ mod tests {
             ("sha512", 0, 1, Type::Any, &["data"][..]),
             ("blake2b", 0, 1, Type::Any, &["data"][..]),
             ("blake2s", 0, 1, Type::Any, &["data"][..]),
+            ("sha3_224", 0, 1, Type::Any, &["data"][..]),
+            ("sha3_256", 0, 1, Type::Any, &["data"][..]),
+            ("sha3_384", 0, 1, Type::Any, &["data"][..]),
+            ("sha3_512", 0, 1, Type::Any, &["data"][..]),
+            ("shake_128", 0, 1, Type::Any, &["data"][..]),
+            ("shake_256", 0, 1, Type::Any, &["data"][..]),
             (
                 "pbkdf2_hmac",
                 4,
@@ -8118,7 +9344,21 @@ mod tests {
         // `usedforsecurity` (and BLAKE2's extra parameters) are accepted as
         // dynamic keywords by the runtime binder.
         for name in [
-            "new", "md5", "sha1", "sha224", "sha256", "sha384", "sha512", "blake2b", "blake2s",
+            "new",
+            "md5",
+            "sha1",
+            "sha224",
+            "sha256",
+            "sha384",
+            "sha512",
+            "blake2b",
+            "blake2s",
+            "sha3_224",
+            "sha3_256",
+            "sha3_384",
+            "sha3_512",
+            "shake_128",
+            "shake_256",
         ] {
             assert!(
                 function("hashlib", name).expect(name).dynamic_keywords,
@@ -8157,6 +9397,12 @@ mod tests {
             "openssl_sha512",
             "openssl_blake2b512",
             "openssl_blake2s256",
+            "openssl_sha3_224",
+            "openssl_sha3_256",
+            "openssl_sha3_384",
+            "openssl_sha3_512",
+            "openssl_shake_128",
+            "openssl_shake_256",
         ] {
             assert!(
                 function("_hashlib", name).is_some(),

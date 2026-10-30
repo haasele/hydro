@@ -39,12 +39,16 @@ pub(crate) mod bisect;
 pub(crate) mod builtins;
 pub(crate) mod cmath;
 pub(crate) mod codecs;
+pub(crate) mod codecs_native;
 pub(crate) mod collections;
 pub(crate) mod collections_abc;
 pub(crate) mod colorsys;
+pub(crate) mod compression_native;
 pub(crate) mod contextvars;
 pub(crate) mod ctypes;
+pub(crate) mod curses_native;
 pub(crate) mod datetime;
+pub(crate) mod dbm_native;
 pub(crate) mod decimal;
 pub(crate) mod errno;
 pub(crate) mod extension;
@@ -76,9 +80,11 @@ pub(crate) mod mmap_mod;
 pub(crate) mod opcode;
 pub(crate) mod postgres;
 pub(crate) mod pwd;
+pub(crate) mod pyexpat_native;
 pub(crate) mod pytest;
 pub(crate) mod quopri;
 pub(crate) mod re;
+pub(crate) mod readline;
 pub(crate) mod resource;
 pub(crate) mod select;
 pub(crate) mod shutil;
@@ -86,10 +92,12 @@ pub(crate) mod sidecar;
 pub(crate) mod signal_mod;
 pub(crate) mod site;
 pub(crate) mod socket;
+pub(crate) mod sqlite3_native;
 pub(crate) mod stat;
 pub(crate) mod string;
 pub(crate) mod struct_mod;
 pub(crate) mod subprocess;
+pub(crate) mod suggestions;
 pub(crate) mod sys;
 pub(crate) mod sysconfig;
 pub(crate) mod syslog;
@@ -106,6 +114,7 @@ pub(crate) mod warnings;
 pub(crate) mod weakref;
 pub(crate) mod zlib_mod;
 pub(crate) mod zoneinfo;
+pub(crate) mod zstd_native;
 
 use crate::container;
 use crate::exc::{
@@ -268,6 +277,25 @@ const fn native_keyword_member(
         ret: hydro_ir::Type::Any,
         params,
         dynamic_keywords: false,
+    }
+}
+
+/// [`native_member`] with named parameters and dynamic keyword passthrough
+/// (the keyword binder fills the slots; remaining names reach the module's
+/// keyword dispatcher).
+const fn native_dynamic_member(
+    name: &'static str,
+    min_args: usize,
+    max_args: usize,
+    params: &'static [&'static str],
+) -> stdlib::FunctionSpec {
+    stdlib::FunctionSpec {
+        name,
+        min_args,
+        max_args,
+        ret: hydro_ir::Type::Any,
+        params,
+        dynamic_keywords: true,
     }
 }
 
@@ -1702,6 +1730,50 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
     // table predates them, so the runtime owns their arity.
     ("os.readlink", native_member("readlink", 1, 2)),
     ("os.strerror", native_member("strerror", 1, 1)),
+    // `os.chmod(path, mode, *, dir_fd=None, follow_symlinks=True)` and
+    // `os.mknod(path, mode=0o600, device=0, *, dir_fd=None)`. Keyword
+    // arguments are lowered into these positional slots by the compiler, so
+    // the runtime spec they are checked against includes the keyword-only
+    // names (a raw keyword call is still accepted through `os_call_kw`).
+    (
+        "os.chmod",
+        native_keyword_member(
+            "chmod",
+            2,
+            4,
+            &["path", "mode", "dir_fd", "follow_symlinks"],
+        ),
+    ),
+    (
+        "os.mknod",
+        native_keyword_member("mknod", 1, 4, &["path", "mode", "device", "dir_fd"]),
+    ),
+    // `os.path.splitroot` (CPython 3.14): the POSIX flavour for `os.path` /
+    // `posixpath`, and the Windows path grammar for `ntpath`.
+    ("os.path.splitroot", native_member("splitroot", 1, 1)),
+    ("posixpath.splitroot", native_member("splitroot", 1, 1)),
+    ("ntpath.splitroot", native_member("splitroot", 1, 1)),
+    // `binascii`'s uu helpers. `backtick` is keyword-only in CPython, but the
+    // compiler lowers named parameters into positional slots (the same shape
+    // as `b2a_base64`'s `newline`), so the runtime spec admits slot 2 while
+    // `call_kw` also accepts the raw keyword spelling.
+    ("binascii.a2b_uu", native_member("a2b_uu", 1, 1)),
+    (
+        "binascii.b2a_uu",
+        native_keyword_member("b2a_uu", 1, 2, &["data", "backtick"]),
+    ),
+    // `_suggestions._generate_suggestions(candidates, item, /)`.
+    (
+        "_suggestions._generate_suggestions",
+        native_member("_generate_suggestions", 2, 2),
+    ),
+    // `_frozen_importlib._gcd_import(name, package=None, level=0)`, the
+    // bootstrap primitive behind `importlib.import_module`.
+    ("importlib._gcd_import", native_member("_gcd_import", 1, 3)),
+    (
+        "_frozen_importlib._gcd_import",
+        native_member("_gcd_import", 1, 3),
+    ),
     // `os.unlink(path, *, dir_fd=None)`: the removal is `os.remove`; a
     // non-`None` `dir_fd` is rejected because there is no descriptor-relative
     // lookup, exactly like `os.stat`/`os.lstat`.
@@ -1716,6 +1788,397 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
     (
         "pickle.Unpickler.load",
         native_member("Unpickler.load", 1, 1),
+    ),
+    // `_curses.window` native method bodies. Every method takes the receiver
+    // plus its own positional arguments, so the shared supplemental spec is
+    // variadic above `self`.
+    (
+        "_curses.window.addch",
+        native_member("window.addch", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.addnstr",
+        native_member("window.addnstr", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.addstr",
+        native_member("window.addstr", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.attroff",
+        native_member("window.attroff", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.attron",
+        native_member("window.attron", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.attrset",
+        native_member("window.attrset", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.bkgd",
+        native_member("window.bkgd", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.bkgdset",
+        native_member("window.bkgdset", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.border",
+        native_member("window.border", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.box",
+        native_member("window.box", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.clear",
+        native_member("window.clear", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.clearok",
+        native_member("window.clearok", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.clrtobot",
+        native_member("window.clrtobot", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.clrtoeol",
+        native_member("window.clrtoeol", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.copywin",
+        native_member("window.copywin", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.delch",
+        native_member("window.delch", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.deleteln",
+        native_member("window.deleteln", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.derwin",
+        native_member("window.derwin", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.erase",
+        native_member("window.erase", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.getbegyx",
+        native_member("window.getbegyx", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.getch",
+        native_member("window.getch", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.getdelay",
+        native_member("window.getdelay", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.getkey",
+        native_member("window.getkey", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.getmaxyx",
+        native_member("window.getmaxyx", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.getparyx",
+        native_member("window.getparyx", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.getstr",
+        native_member("window.getstr", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.getyx",
+        native_member("window.getyx", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.hline",
+        native_member("window.hline", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.idlok",
+        native_member("window.idlok", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.immedok",
+        native_member("window.immedok", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.inch",
+        native_member("window.inch", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.insch",
+        native_member("window.insch", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.insdelln",
+        native_member("window.insdelln", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.insertln",
+        native_member("window.insertln", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.insnstr",
+        native_member("window.insnstr", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.insstr",
+        native_member("window.insstr", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.instr",
+        native_member("window.instr", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.is_wintouched",
+        native_member("window.is_wintouched", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.keypad",
+        native_member("window.keypad", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.leaveok",
+        native_member("window.leaveok", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.meta",
+        native_member("window.meta", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.move",
+        native_member("window.move", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.mvwin",
+        native_member("window.mvwin", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.nodelay",
+        native_member("window.nodelay", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.noutrefresh",
+        native_member("window.noutrefresh", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.notimeout",
+        native_member("window.notimeout", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.overlay",
+        native_member("window.overlay", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.overwrite",
+        native_member("window.overwrite", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.redrawwin",
+        native_member("window.redrawwin", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.refresh",
+        native_member("window.refresh", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.resize",
+        native_member("window.resize", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.scroll",
+        native_member("window.scroll", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.scrollok",
+        native_member("window.scrollok", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.standend",
+        native_member("window.standend", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.standout",
+        native_member("window.standout", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.subwin",
+        native_member("window.subwin", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.syncok",
+        native_member("window.syncok", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.timeout",
+        native_member("window.timeout", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.touchwin",
+        native_member("window.touchwin", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.vline",
+        native_member("window.vline", 1, usize::MAX),
+    ),
+    (
+        "_curses.window.wcursyncup",
+        native_member("window.wcursyncup", 1, usize::MAX),
+    ),
+    // `_multibytecodec` native method bodies (receiver first).
+    (
+        "_multibytecodec.MultibyteCodec.__init__",
+        native_member("MultibyteCodec.__init__", 1, 1),
+    ),
+    (
+        "_multibytecodec.MultibyteCodec.encode",
+        native_member("MultibyteCodec.encode", 3, 3),
+    ),
+    (
+        "_multibytecodec.MultibyteCodec.decode",
+        native_member("MultibyteCodec.decode", 3, 3),
+    ),
+    (
+        "_multibytecodec.MultibyteIncrementalEncoder.__init__",
+        native_member("MultibyteIncrementalEncoder.__init__", 2, 2),
+    ),
+    (
+        "_multibytecodec.MultibyteIncrementalEncoder.encode",
+        native_member("MultibyteIncrementalEncoder.encode", 3, 3),
+    ),
+    (
+        "_multibytecodec.MultibyteIncrementalEncoder.getstate",
+        native_member("MultibyteIncrementalEncoder.getstate", 1, 1),
+    ),
+    (
+        "_multibytecodec.MultibyteIncrementalEncoder.setstate",
+        native_member("MultibyteIncrementalEncoder.setstate", 2, 2),
+    ),
+    (
+        "_multibytecodec.MultibyteIncrementalEncoder.reset",
+        native_member("MultibyteIncrementalEncoder.reset", 1, 1),
+    ),
+    (
+        "_multibytecodec.MultibyteIncrementalDecoder.__init__",
+        native_member("MultibyteIncrementalDecoder.__init__", 2, 2),
+    ),
+    (
+        "_multibytecodec.MultibyteIncrementalDecoder.decode",
+        native_member("MultibyteIncrementalDecoder.decode", 3, 3),
+    ),
+    (
+        "_multibytecodec.MultibyteIncrementalDecoder.getstate",
+        native_member("MultibyteIncrementalDecoder.getstate", 1, 1),
+    ),
+    (
+        "_multibytecodec.MultibyteIncrementalDecoder.setstate",
+        native_member("MultibyteIncrementalDecoder.setstate", 2, 2),
+    ),
+    (
+        "_multibytecodec.MultibyteIncrementalDecoder.reset",
+        native_member("MultibyteIncrementalDecoder.reset", 1, 1),
+    ),
+    (
+        "_multibytecodec.MultibyteStreamReader.__init__",
+        native_member("MultibyteStreamReader.__init__", 3, 3),
+    ),
+    (
+        "_multibytecodec.MultibyteStreamWriter.__init__",
+        native_member("MultibyteStreamWriter.__init__", 3, 3),
+    ),
+    // `sqlite3.Connection`/`Cursor` native method bodies. The class tables
+    // store qualified names; the receiver is the first argument.
+    (
+        "sqlite3.sqlite3.Connection.__init__",
+        native_member("sqlite3.Connection.__init__", 9, 9),
+    ),
+    (
+        "sqlite3.sqlite3.Connection.cursor",
+        native_member("sqlite3.Connection.cursor", 2, 2),
+    ),
+    (
+        "sqlite3.sqlite3.Connection.execute",
+        native_member("sqlite3.Connection.execute", 3, 3),
+    ),
+    (
+        "sqlite3.sqlite3.Connection.executemany",
+        native_member("sqlite3.Connection.executemany", 3, 3),
+    ),
+    (
+        "sqlite3.sqlite3.Connection.commit",
+        native_member("sqlite3.Connection.commit", 1, 1),
+    ),
+    (
+        "sqlite3.sqlite3.Connection.rollback",
+        native_member("sqlite3.Connection.rollback", 1, 1),
+    ),
+    (
+        "sqlite3.sqlite3.Connection.close",
+        native_member("sqlite3.Connection.close", 1, 1),
+    ),
+    (
+        "sqlite3.sqlite3.Connection.create_function",
+        native_dynamic_member(
+            "sqlite3.Connection.create_function",
+            4,
+            4,
+            &["name", "narg", "func"],
+        ),
+    ),
+    (
+        "sqlite3.sqlite3.Connection.__enter__",
+        native_member("sqlite3.Connection.__enter__", 1, 1),
+    ),
+    (
+        "sqlite3.sqlite3.Connection.__exit__",
+        native_member("sqlite3.Connection.__exit__", 4, 4),
+    ),
+    (
+        "sqlite3.sqlite3.Cursor.__init__",
+        native_member("sqlite3.Cursor.__init__", 2, 2),
+    ),
+    (
+        "sqlite3.sqlite3.Cursor.execute",
+        native_member("sqlite3.Cursor.execute", 3, 3),
+    ),
+    (
+        "sqlite3.sqlite3.Cursor.executemany",
+        native_member("sqlite3.Cursor.executemany", 3, 3),
+    ),
+    (
+        "sqlite3.sqlite3.Cursor.fetchone",
+        native_member("sqlite3.Cursor.fetchone", 1, 1),
+    ),
+    (
+        "sqlite3.sqlite3.Cursor.fetchmany",
+        native_member("sqlite3.Cursor.fetchmany", 2, 2),
+    ),
+    (
+        "sqlite3.sqlite3.Cursor.fetchall",
+        native_member("sqlite3.Cursor.fetchall", 1, 1),
+    ),
+    (
+        "sqlite3.sqlite3.Cursor.close",
+        native_member("sqlite3.Cursor.close", 1, 1),
+    ),
+    (
+        "sqlite3.sqlite3.Cursor.__iter__",
+        native_member("sqlite3.Cursor.__iter__", 1, 1),
+    ),
+    (
+        "sqlite3.sqlite3.Cursor.__next__",
+        native_member("sqlite3.Cursor.__next__", 1, 1),
     ),
     // `runpy._get_module_details(mod_name, error=ImportError)`: `trace` asks
     // for the module spec before executing it.
@@ -1733,8 +2196,8 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         native_member("_classify_pyc", 3, 3),
     ),
     ("hashlib.update", native_member("update", 2, 2)),
-    ("hashlib.digest", native_member("digest", 1, 1)),
-    ("hashlib.hexdigest", native_member("hexdigest", 1, 1)),
+    ("hashlib.digest", native_member("digest", 1, 2)),
+    ("hashlib.hexdigest", native_member("hexdigest", 1, 2)),
     ("hashlib.copy", native_member("copy", 1, 1)),
     // `runpy.run_module(mod_name, init_globals=None, run_name=None,
     // alter_sys=False)`: the module runner is implemented by the importlib
@@ -1911,6 +2374,63 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         native_member("Random.shuffle", 2, 2),
     ),
     ("random.Random.sample", native_member("Random.sample", 3, 3)),
+    // The `random.SystemRandom` proxy carries the same method surface, bound
+    // to the OS-backed generator (`secrets` reads these off the instance).
+    (
+        "random.SystemRandom.__call__",
+        stdlib::FunctionSpec {
+            name: "SystemRandom.__call__",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::Any,
+            params: &["self", "seed"],
+            dynamic_keywords: true,
+        },
+    ),
+    (
+        "random.SystemRandom.getrandbits",
+        native_member("SystemRandom.getrandbits", 2, 2),
+    ),
+    (
+        "random.SystemRandom.random",
+        native_member("SystemRandom.random", 1, 1),
+    ),
+    (
+        "random.SystemRandom.seed",
+        native_member("SystemRandom.seed", 1, 2),
+    ),
+    (
+        "random.SystemRandom.randint",
+        native_member("SystemRandom.randint", 3, 3),
+    ),
+    (
+        "random.SystemRandom.randrange",
+        native_member("SystemRandom.randrange", 2, 4),
+    ),
+    (
+        "random.SystemRandom.choice",
+        native_member("SystemRandom.choice", 2, 2),
+    ),
+    (
+        "random.SystemRandom.uniform",
+        native_member("SystemRandom.uniform", 3, 3),
+    ),
+    (
+        "random.SystemRandom.shuffle",
+        native_member("SystemRandom.shuffle", 2, 2),
+    ),
+    (
+        "random.SystemRandom.sample",
+        native_member("SystemRandom.sample", 3, 3),
+    ),
+    (
+        "random.SystemRandom._randbelow",
+        native_member("SystemRandom._randbelow", 2, 2),
+    ),
+    (
+        "random.SystemRandom.randbytes",
+        native_member("SystemRandom.randbytes", 2, 2),
+    ),
     // `re._compiler`'s functions, reached as module attributes of the
     // deprecated `sre_compile` facade. They dispatch through `re`'s table.
     (
@@ -2269,6 +2789,16 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
             _ => {}
         }
     }
+    // `ntpath.splitroot` is the one member whose result is defined by the
+    // Windows path grammar rather than the platform's own `os.path`: the
+    // module must analyse drive/UNC prefixes even when the interpreter runs
+    // on POSIX. The value stays bound to the `ntpath` spelling so the call
+    // dispatch can route it to the Windows implementation (every other
+    // `ntpath` member keeps sharing `os.path`'s platform behaviour through
+    // the alias below).
+    if module == "ntpath" && name == "splitroot" {
+        return value::native_function_new("ntpath", "splitroot", 1);
+    }
     // Accelerator and platform alias modules (`_abc`, `_types`, `posix`,
     // `posixpath`, `_frozen_importlib_external`, ...) expose the members of
     // the module that implements them. `__name__`, `__dict__` and the import
@@ -2356,6 +2886,14 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if module == "functools" && name == "_singledispatchmethod_get" {
         return functools::singledispatchmethod_get_class();
     }
+    // `functools.partial` is declared as a function so calls lower as module
+    // calls, but the value itself is the cached class: `type(p)`,
+    // `isinstance(f, partial)` and PEP 604 unions (`FunctionType | partial`)
+    // need a type, not a function. Calls still construct real partials
+    // through the module dispatch (and the class constructor).
+    if module == "functools" && name == "partial" {
+        return value::partial_class();
+    }
     // `functools.partialmethod` is declared as a function so calls lower as
     // module calls, but the value itself is the real descriptor class:
     // `isinstance(pm, functools.partialmethod)` and descriptor access need it.
@@ -2406,6 +2944,21 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
         )
     {
         return datetime::constant(name);
+    }
+    if let Some(class) = zstd_native::class_value(module, name) {
+        return class;
+    }
+    if let Some(class) = curses_native::class_value(module, name) {
+        return class;
+    }
+    if let Some(class) = dbm_native::class_value(module, name) {
+        return class;
+    }
+    if let Some(class) = compression_native::class_value(module, name) {
+        return class;
+    }
+    if let Some(class) = sqlite3_native::class_value(module, name) {
+        return class;
     }
     if let Some(class) = inspect::class_value(module, name) {
         return class;
@@ -2461,6 +3014,13 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     // spellings work without a second generator representation.
     if module == "random" && name == "Random" {
         return random_class_proxy();
+    }
+    // `random.SystemRandom` is a class in CPython; `secrets` instantiates it
+    // and binds `getrandbits`/`choice`/`_randbelow`/`randbytes` from the
+    // instance, so the module value must expose the method surface bound to an
+    // OS-backed generator.
+    if module == "random" && name == "SystemRandom" {
+        return random_system_proxy();
     }
     // `pickle`'s three exception classes are part of its `__all__` and are
     // raised by CPython's implementation; expose the real subclass chain
@@ -2636,15 +3196,23 @@ fn supplemental_value(module: &str, name: &str) -> Option<i64> {
         // Directory iteration and descriptor inheritance: real filesystem and
         // `fcntl` operations the static `os` table predates.
         ("os", "scandir") => Some(value::native_function_new("os", "scandir", 1)),
+        // Permission and node creation: real `chmod(2)`/`mknod(2)` calls with
+        // CPython's keyword-only arguments.
+        ("os", "chmod") => Some(value::native_function_new("os", "chmod", 4)),
+        ("os", "mknod") => Some(value::native_function_new("os", "mknod", 4)),
         ("os", "set_inheritable") => Some(value::native_function_new("os", "set_inheritable", 2)),
         ("os", "get_inheritable") => Some(value::native_function_new("os", "get_inheritable", 1)),
         // `os.path` helpers consumed by `glob`/`tarfile`/`shutil`.
         ("os.path", "lexists") => Some(value::native_function_new("os.path", "lexists", 1)),
+        ("os.path", "splitroot") => Some(value::native_function_new("os.path", "splitroot", 1)),
         ("os.path", "commonpath") => Some(value::native_function_new("os.path", "commonpath", 1)),
         ("os.path", "commonprefix") => {
             Some(value::native_function_new("os.path", "commonprefix", 1))
         }
         ("os.path", "relpath") => Some(value::native_function_new("os.path", "relpath", 2)),
+        // `binascii`'s uu helpers predate the static table entry.
+        ("binascii", "a2b_uu") => Some(value::native_function_new("binascii", "a2b_uu", 1)),
+        ("binascii", "b2a_uu") => Some(value::native_function_new("binascii", "b2a_uu", 2)),
         ("sys", "exception") => Some(value::native_function_new("sys", "exception", 0)),
         ("runpy", "run_module") => Some(value::native_function_new("runpy", "run_module", 4)),
         ("runpy", "_get_module_details") => Some(value::native_function_new(
@@ -2652,6 +3220,18 @@ fn supplemental_value(module: &str, name: &str) -> Option<i64> {
             "_get_module_details",
             2,
         )),
+        // `traceback` reads this helper off the module value; the central spec
+        // may still be empty while the runtime table carries its arity.
+        ("_suggestions", "_generate_suggestions") => Some(value::native_function_new(
+            "_suggestions",
+            "_generate_suggestions",
+            2,
+        )),
+        // `importlib/__init__.py` resolves `import_module` through this
+        // frozen-bootstrap primitive; `_frozen_importlib` aliases `importlib`.
+        ("importlib", "_gcd_import") => {
+            Some(value::native_function_new("importlib", "_gcd_import", 3))
+        }
         _ => None,
     }
 }
@@ -2981,6 +3561,15 @@ fn call_native_kw_at(
 /// Keyword-aware dispatch; `functools.partial` and `dataclasses.replace` bind
 /// names.
 fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    if module == "ntpath" && function == "splitroot" {
+        if let Some((name, _)) = keywords.first() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("splitroot() got an unexpected keyword argument '{name}'"),
+            );
+        }
+        return ntpath_splitroot(args);
+    }
     let module = alias_target(module).unwrap_or(module);
     match module {
         "math" => math_call_kw(function, args, keywords),
@@ -3003,6 +3592,11 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         "contextlib" => contextlib_call_kw(function, args, &keywords),
         "types" => types::call_kw(function, args, &keywords),
         "io" | "_io" => io_call_kw(function, args, &keywords),
+        // `binascii.b2a_uu` has the keyword-only `backtick` compatibility
+        // switch; declared parameter names were already bound by the generic
+        // binder, so any name left here belongs to that switch (or is an
+        // error).
+        "binascii" => binascii::call_kw(function, args, &keywords),
         "os" => os_call_kw(function, args, keywords),
         "os.path" => os_path_call_kw(function, args, &keywords),
         // `random.Random.__call__(seed=...)` through the proxy value.
@@ -3012,6 +3606,18 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         // `textwrap`'s `wrap`/`fill`/`shorten`/`TextWrapper` take the
         // `TextWrapper` keyword set (`width`, `initial_indent`, ...).
         "textwrap" => textwrap::call_kw(function, args, &keywords),
+        "bz2" | "_bz2" | "lzma" | "_lzma" => {
+            compression_native::call_kw(module, function, args, &keywords)
+        }
+        "pyexpat" | "pyexpat.errors" | "pyexpat.model" => {
+            pyexpat_native::call_kw(function, args, &keywords)
+        }
+        "sqlite3" | "_sqlite3" => sqlite3_native::call_kw(function, args, &keywords),
+        "_zstd" => zstd_native::call_kw(function, args, &keywords),
+        "_codecs_cn" | "_codecs_jp" | "_codecs_kr" | "_codecs_tw" | "_codecs_hk"
+        | "_codecs_iso2022" | "_multibytecodec" => {
+            codecs_native::call_kw(module, function, args, &keywords)
+        }
         // `runpy.run_module(mod_name, init_globals, run_name, alter_sys)`: the
         // keyword binder has already moved declared names into their slots.
         "runpy" => importlib::runpy_call_kw(function, args, &keywords),
@@ -3507,7 +4113,7 @@ fn itertools_groupby(args: &[i64]) -> i64 {
     // on the Rust heap and are invisible to the conservative scanner.
     let mark = heap::root_values(&[]);
     let result = value::list_new(Vec::new());
-    heap::add_thread_root(result);
+    heap::push_scoped_root(result);
     let mut current_key = NONE;
     let mut group: Vec<i64> = Vec::new();
     let mut open = false;
@@ -3521,7 +4127,7 @@ fn itertools_groupby(args: &[i64]) -> i64 {
         if status == 0 {
             break;
         }
-        heap::add_thread_root(item);
+        heap::push_scoped_root(item);
         let key = if key_function == NONE {
             item
         } else {
@@ -3530,7 +4136,7 @@ fn itertools_groupby(args: &[i64]) -> i64 {
                 heap::release_roots(mark);
                 return produced;
             }
-            heap::add_thread_root(produced);
+            heap::push_scoped_root(produced);
             produced
         };
         let same = if open {
@@ -3620,6 +4226,12 @@ fn builtins_dispatch_kw(function: &str, args: &[i64], keywords: &[(String, i64)]
 }
 
 fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
+    // `ntpath.splitroot` keeps the Windows drive/UNC grammar even on POSIX
+    // (its name, not the platform, selects the path flavour). Every other
+    // `ntpath` member is aliased to the platform `os.path` below.
+    if module == "ntpath" && function == "splitroot" {
+        return ntpath_splitroot(args);
+    }
     let module = alias_target(module).unwrap_or(module);
     match module {
         "builtins" => builtins_dispatch(function, args),
@@ -3630,7 +4242,12 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "ast" => ast::call(function, args),
         "annotationlib" => annotationlib::call(function, args),
         "fractions" => fractions::call(function, args),
-        "importlib" => importlib::call(function, args),
+        "importlib" => match function {
+            // `_frozen_importlib` aliases `importlib`, and both spellings
+            // reach the bootstrap import primitive through this arm.
+            "_gcd_import" => importlib_gcd_import(args),
+            _ => importlib::call(function, args),
+        },
         // The native `runpy` surface (`run_module`) resolves modules through
         // the same registry/spec machinery as `importlib`.
         "runpy" => match runpy_details_call(function, args) {
@@ -3638,6 +4255,15 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
             None => importlib::runpy_call(function, args),
         },
         "importlib.util" => importlib_util::call(function, args),
+        "bz2" | "_bz2" | "lzma" | "_lzma" => compression_native::call(module, function, args),
+        "_gdbm" | "_dbm" => dbm_native::call(module, function, args),
+        "readline" => readline::call(function, args),
+        "_zstd" => zstd_native::call(function, args),
+        "_curses" | "curses" => curses_native::call(function, args),
+        "_codecs_cn" | "_codecs_jp" | "_codecs_kr" | "_codecs_tw" | "_codecs_hk"
+        | "_codecs_iso2022" | "_multibytecodec" => codecs_native::call(module, function, args),
+        "pyexpat" | "pyexpat.errors" | "pyexpat.model" => pyexpat_native::call(function, args),
+        "sqlite3" | "_sqlite3" => sqlite3_native::call(function, args),
         "importlib.machinery" => match importlib_bootstrap_external_call(function, args) {
             Some(result) => result,
             None => importlib_machinery::call(function, args),
@@ -3657,6 +4283,9 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "cmath" => cmath::call(function, args),
         "keyword" => keyword::call(function, args),
         "stat" | "_stat" => stat::call(function, args),
+        // `_suggestions`: the close-name helper `traceback` uses for
+        // "did you mean" hints. The implementation owns the matching rules.
+        "_suggestions" => suggestions::call(function, args),
         "time" => time_call(function, args),
         "_thread" => thread_call(function, args),
         "rich.status" => rich_status_call(function, args),
@@ -4584,6 +5213,25 @@ const STDLIB_MODULE_NAMES: &[&str] = &[
     "zoneinfo",
 ];
 
+/// Runs a native constant lookup whose failure mode is `AttributeError`.
+///
+/// The curses/readline tables are large and partly runtime-dependent, so an
+/// unknown name is not an error here: it simply is not a constant and the
+/// normal module lookup continues.
+fn optional_attribute_constant(lookup: impl FnOnce() -> i64) -> Option<i64> {
+    let value = lookup();
+    if exc::pending() {
+        if exc::pending_tag() == ATTRIBUTE_ERROR as i64 {
+            exc::clear();
+            None
+        } else {
+            Some(value)
+        }
+    } else {
+        Some(value)
+    }
+}
+
 /// Constants the runtime computes that the static spec table does not list.
 ///
 /// Everything here is a real property of this build: the `O_*` values are the
@@ -4615,6 +5263,13 @@ fn runtime_extra_constant(module: &str, name: &str) -> Option<i64> {
         "hashlib" | "_hashlib" | "_sha1" | "_sha2" | "_md5" | "_blake2" | "_hmac" | "_uuid" => {
             hashlib::constant_named(module, name)
         }
+        // `readline`/`_curses` expose long dynamic constant tables; probe the
+        // native lookup and treat a missing name as "not a constant".
+        "readline" => optional_attribute_constant(|| readline::constant(name)),
+        "_zstd" => optional_attribute_constant(|| zstd_native::constant(name)),
+        "_curses" | "curses" => optional_attribute_constant(|| curses_native::constant(name)),
+        "_codecs_cn" | "_codecs_jp" | "_codecs_kr" | "_codecs_tw" | "_codecs_hk"
+        | "_codecs_iso2022" | "_multibytecodec" => codecs_native::constant(module, name),
         // `importlib._bootstrap`: the frozen bootstrap module `pkgutil` reads
         // `_load` from. It is a module value so attribute access reaches the
         // runtime importer surface instead of failing at the constant.
@@ -4766,7 +5421,7 @@ fn sys_stdlib_module_names() -> i64 {
     for name in STDLIB_MODULE_NAMES {
         let item = value::str_alloc((*name).to_string());
         // The vector lives in Rust memory the collector does not scan.
-        heap::add_thread_root(item);
+        heap::push_scoped_root(item);
         items.push(item);
     }
     let set = value::set_new(items);
@@ -5312,6 +5967,22 @@ fn constant_value(module: &str, name: &str) -> i64 {
             name,
         ) => {
             hashlib::constant_named(module, name).unwrap_or_else(|| missing_attribute(module, name))
+        }
+        ("bz2" | "_bz2" | "lzma" | "_lzma", name) => compression_native::constant(module, name),
+        ("_gdbm" | "_dbm", name) => dbm_native::constant(module, name),
+        ("pyexpat" | "pyexpat.errors" | "pyexpat.model", name) => pyexpat_native::constant(name),
+        ("sqlite3" | "_sqlite3", name) => {
+            sqlite3_native::constant(name).unwrap_or_else(|| missing_attribute(module, name))
+        }
+        ("readline", name) => readline::constant(name),
+        ("_zstd", name) => zstd_native::constant(name),
+        ("_curses" | "curses", name) => curses_native::constant(name),
+        (
+            "_codecs_cn" | "_codecs_jp" | "_codecs_kr" | "_codecs_tw" | "_codecs_hk"
+            | "_codecs_iso2022" | "_multibytecodec",
+            name,
+        ) => {
+            codecs_native::constant(module, name).unwrap_or_else(|| missing_attribute(module, name))
         }
         ("_hydro_sidecar", name) => match sidecar::constant(name) {
             Some(value) => value,
@@ -6026,7 +6697,7 @@ fn exitstack_exit(stack: i64, exc_type: i64, exception: i64, traceback: i64) -> 
             let tag = exc::pending_tag();
             let error = exc::pending_value();
             let _ = exc::clear();
-            heap::add_thread_root(error);
+            heap::push_scoped_root(error);
             pending_raise = Some(error);
             details = [exc::exception_class(tag as u32), error, NONE];
             continue;
@@ -6885,6 +7556,109 @@ fn random_operation(rng: &value::RandomState, function: &str, args: &[i64]) -> i
 /// Cached proxy value for `random.Random`.
 ///
 /// CPython's `Random` is a class, so `Random.getrandbits` is a real attribute
+/// Cached OS-backed generator shared by the `SystemRandom` proxy. The
+/// registry keeps it alive for the collector.
+fn system_random_state() -> i64 {
+    const KEY: &str = "random.SystemRandom.state";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let state = value::random_new_os();
+    globals::registry_set(KEY, state);
+    state
+}
+
+/// `random.SystemRandom`: a cached proxy instance whose class carries the
+/// generator methods and whose bodies dispatch to [`system_random_state`]
+/// (never the module-level PRNG).
+fn random_system_proxy() -> i64 {
+    const KEY: &str = "random.SystemRandom.proxy";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let names: [(&str, &'static str); 12] = [
+        ("__call__", "SystemRandom.__call__"),
+        ("getrandbits", "SystemRandom.getrandbits"),
+        ("random", "SystemRandom.random"),
+        ("seed", "SystemRandom.seed"),
+        ("randint", "SystemRandom.randint"),
+        ("randrange", "SystemRandom.randrange"),
+        ("choice", "SystemRandom.choice"),
+        ("uniform", "SystemRandom.uniform"),
+        ("shuffle", "SystemRandom.shuffle"),
+        ("sample", "SystemRandom.sample"),
+        ("_randbelow", "SystemRandom._randbelow"),
+        ("randbytes", "SystemRandom.randbytes"),
+    ];
+    let methods: Vec<(String, i64)> = names
+        .iter()
+        .map(|&(name, qualified)| {
+            (
+                name.to_string(),
+                value::native_function_new("random", qualified, usize::MAX),
+            )
+        })
+        .collect();
+    let method_values: Vec<i64> = methods.iter().map(|(_, function)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new("SystemRandom".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    let proxy = value::instance_new(class);
+    let proxy_roots = heap::root_values(std::slice::from_ref(&proxy));
+    globals::registry_set(KEY, proxy);
+    heap::release_roots(proxy_roots);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    proxy
+}
+
+/// `n` bytes from the OS-backed generator (`SystemRandom.randbytes`).
+fn system_randbytes(rng: &value::RandomState, arg: i64) -> i64 {
+    let count = match random_int_arg(arg) {
+        Ok(count) => count,
+        Err(err) => return err,
+    };
+    if count < 0 {
+        return exc::raise_with_message(VALUE_ERROR, "number of bytes must be positive");
+    }
+    let count = count as usize;
+    if count > 1 << 20 {
+        return exc::raise_with_message(
+            OVERFLOW_ERROR,
+            "randbytes() result exceeds the maximum size",
+        );
+    }
+    let mut bytes = Vec::with_capacity(count);
+    while bytes.len() < count {
+        bytes.extend_from_slice(&rng.next_u64().to_le_bytes());
+    }
+    bytes.truncate(count);
+    value::bytes_new(bytes)
+}
+
+/// `SystemRandom._randbelow(n)`: a uniform draw in `0..n` from OS entropy.
+fn system_randbelow(rng: &value::RandomState, arg: i64) -> i64 {
+    let Some(bound) = value::to_bigint(arg) else {
+        return exc::raise_with_message(TYPE_ERROR, "n must be an integer");
+    };
+    if bound.sign() == Sign::Minus || bound == BigInt::zero() {
+        return exc::raise_with_message(VALUE_ERROR, "n must be positive");
+    }
+    let bits = bound.bits().min(MAX_GETRANDBITS as u64);
+    loop {
+        let drawn = random_getrandbits(rng, encode_int(bits as i64));
+        if exc::pending() {
+            return NONE;
+        }
+        let Some(candidate) = value::to_bigint(drawn) else {
+            return NONE;
+        };
+        if candidate < bound {
+            return drawn;
+        }
+    }
+}
+
 /// of the class value. Hydro's generator is a native `RandomState`, which a
 /// class cannot construct (the generic class path allocates an instance), so
 /// the module exposes a cached instance whose class carries the generator
@@ -6974,9 +7748,63 @@ fn random_call(function: &str, args: &[i64]) -> i64 {
         };
         return value::random_new(seed);
     }
+    if let Some(method) = function.strip_prefix("SystemRandom.") {
+        // The receiver is the cached `SystemRandom` proxy; its bodies operate
+        // on the shared OS-backed generator, never the module-level PRNG.
+        if method == "__call__" {
+            return random_system_proxy();
+        }
+        let method_args = args.get(1..).unwrap_or(&[]);
+        let state = system_random_state();
+        let Some(rng) = value::as_random(state) else {
+            return exc::raise_with_message(RUNTIME_ERROR, "SystemRandom state is invalid");
+        };
+        return match method {
+            "randbytes" => system_randbytes(rng, method_args.first().copied().unwrap_or(NONE)),
+            "_randbelow" => system_randbelow(rng, method_args.first().copied().unwrap_or(NONE)),
+            "getrandbits" | "random" | "seed" | "randint" | "randrange" | "choice" | "uniform"
+            | "shuffle" | "sample" => {
+                if let Some(err) = check_random_arity(
+                    method,
+                    method_args.len(),
+                    match method {
+                        "seed" => 0,
+                        "random" => 0,
+                        "randint" => 2,
+                        "randrange" => 1,
+                        "choice" => 1,
+                        "uniform" => 2,
+                        "shuffle" => 1,
+                        "getrandbits" => 1,
+                        "sample" => 2,
+                        _ => 0,
+                    },
+                    match method {
+                        "seed" => 1,
+                        "random" => 0,
+                        "randint" => 2,
+                        "randrange" => 3,
+                        "choice" => 1,
+                        "uniform" => 2,
+                        "shuffle" => 1,
+                        "getrandbits" => 1,
+                        "sample" => 2,
+                        _ => 0,
+                    },
+                ) {
+                    return err;
+                }
+                random_operation(rng, method, method_args)
+            }
+            _ => exc::raise_with_message(
+                ATTRIBUTE_ERROR,
+                &format!("'SystemRandom' object has no attribute '{method}'"),
+            ),
+        };
+    }
     if function == "SystemRandom" {
-        // Seeds are accepted and ignored, like CPython's entropy-only source.
-        return value::random_new_os();
+        // Calling the class value yields the cached proxy instance.
+        return random_system_proxy();
     }
     random_operation(&GLOBAL_RANDOM, function, args)
 }
@@ -11367,6 +12195,173 @@ fn os_path_splitdrive(arg: i64) -> i64 {
     value::tuple_new(vec![drive, path])
 }
 
+/// Byte offsets of a `(drive, root, tail)` split into the original operand.
+#[derive(Clone, Copy)]
+struct SplitRoot {
+    /// End of the drive part: `path[..drive_end]`.
+    drive_end: usize,
+    /// End of the root part: `path[drive_end..root_end]`.
+    root_end: usize,
+    /// Start of the tail part: `path[tail_start..]`.
+    tail_start: usize,
+}
+
+impl SplitRoot {
+    /// Everything is tail: a relative path with no drive and no root.
+    const EMPTY: Self = Self {
+        drive_end: 0,
+        root_end: 0,
+        tail_start: 0,
+    };
+}
+
+/// `posixpath.splitroot` boundaries.
+///
+/// A leading `/` is the root, `///` and longer runs collapse to the same
+/// single-root split, and a path with exactly two leading slashes keeps both
+/// (POSIX leaves that spelling implementation-defined).
+fn posix_splitroot(path: &[u8]) -> SplitRoot {
+    if path.first() != Some(&b'/') {
+        return SplitRoot::EMPTY;
+    }
+    if path.get(1) != Some(&b'/') || path.get(2) == Some(&b'/') {
+        return SplitRoot {
+            drive_end: 0,
+            root_end: 1,
+            tail_start: 1,
+        };
+    }
+    SplitRoot {
+        drive_end: 0,
+        root_end: 2,
+        tail_start: 2,
+    }
+}
+
+fn nt_is_separator(byte: u8) -> bool {
+    byte == b'\\' || byte == b'/'
+}
+
+/// `ntpath.splitroot` boundaries over the Windows path grammar.
+///
+/// The drive is a `X:` letter prefix or the `\\server\share` UNC prefix
+/// (including the `\\?\UNC\` long-path spelling), the root is the separator
+/// that follows it, and the tail is everything after that separator. Device
+/// paths (`\\.\device`) use the same UNC-shaped split without the `UNC`
+/// prefix.
+fn nt_splitroot(path: &[u8]) -> SplitRoot {
+    // Slashes and backslashes are interchangeable separators.
+    let normalized = |index: usize| {
+        path.get(index)
+            .map(|byte| if *byte == b'/' { b'\\' } else { *byte })
+    };
+    match normalized(0) {
+        Some(b'\\') => {
+            if normalized(1) != Some(b'\\') {
+                // Rooted path without a drive, e.g. `\Windows`.
+                return SplitRoot {
+                    drive_end: 0,
+                    root_end: 1,
+                    tail_start: 1,
+                };
+            }
+            // UNC (`\\server\share`, `\\?\UNC\server\share`) and device
+            // (`\\.\device`, `\\?\device`) paths.
+            let start = if path.len() >= 8 && path[..8].eq_ignore_ascii_case(b"\\\\?\\UNC\\") {
+                8
+            } else {
+                2
+            };
+            let Some(index) = (start..path.len()).find(|&index| nt_is_separator(path[index]))
+            else {
+                // An incomplete sharepoint: the whole path is the drive.
+                return SplitRoot {
+                    drive_end: path.len(),
+                    root_end: path.len(),
+                    tail_start: path.len(),
+                };
+            };
+            let Some(index2) = (index + 1..path.len()).find(|&index| nt_is_separator(path[index]))
+            else {
+                return SplitRoot {
+                    drive_end: path.len(),
+                    root_end: path.len(),
+                    tail_start: path.len(),
+                };
+            };
+            SplitRoot {
+                drive_end: index2,
+                root_end: index2 + 1,
+                tail_start: index2 + 1,
+            }
+        }
+        _ => {
+            if normalized(1) != Some(b':') {
+                // Relative path, e.g. `Windows`.
+                return SplitRoot::EMPTY;
+            }
+            if normalized(2) == Some(b'\\') {
+                // Absolute drive path, e.g. `C:\Windows`.
+                SplitRoot {
+                    drive_end: 2,
+                    root_end: 3,
+                    tail_start: 3,
+                }
+            } else {
+                // Drive-relative path, e.g. `C:Windows`.
+                SplitRoot {
+                    drive_end: 2,
+                    root_end: 2,
+                    tail_start: 2,
+                }
+            }
+        }
+    }
+}
+
+/// Builds the `(drive, root, tail)` tuple, preserving the operand flavour
+/// (str in, str out; bytes in, bytes out).
+fn splitroot_result(operand: OsPathOperand, split: SplitRoot) -> i64 {
+    match operand {
+        OsPathOperand::Text(path) => value::tuple_new(vec![
+            value::str_alloc(path[..split.drive_end].to_string()),
+            value::str_alloc(path[split.drive_end..split.root_end].to_string()),
+            value::str_alloc(path[split.tail_start..].to_string()),
+        ]),
+        OsPathOperand::Bytes(path) => value::tuple_new(vec![
+            value::bytes_new(path[..split.drive_end].to_vec()),
+            value::bytes_new(path[split.drive_end..split.root_end].to_vec()),
+            value::bytes_new(path[split.tail_start..].to_vec()),
+        ]),
+    }
+}
+
+/// `posixpath.splitroot(path)` on the running platform: `('/')`-rooted
+/// absolute paths split as `('', '/', tail)`.
+fn os_path_splitroot(arg: i64) -> i64 {
+    let Some(operand) = os_path_operand("splitroot", arg) else {
+        return NONE;
+    };
+    let split = match &operand {
+        OsPathOperand::Text(path) => posix_splitroot(path.as_bytes()),
+        OsPathOperand::Bytes(path) => posix_splitroot(path),
+    };
+    splitroot_result(operand, split)
+}
+
+/// `ntpath.splitroot(path)`: the Windows split, independent of the host.
+fn ntpath_splitroot(args: &[i64]) -> i64 {
+    let argument = args.first().copied().unwrap_or(NONE);
+    let Some(operand) = os_path_operand("splitroot", argument) else {
+        return NONE;
+    };
+    let split = match &operand {
+        OsPathOperand::Text(path) => nt_splitroot(path.as_bytes()),
+        OsPathOperand::Bytes(path) => nt_splitroot(path),
+    };
+    splitroot_result(operand, split)
+}
+
 /// One component while resolving symlinks.
 enum RealpathStep {
     Root,
@@ -11559,6 +12554,7 @@ fn os_path_call(function: &str, args: &[i64]) -> i64 {
         "split" => os_path_split_pair(args[0]),
         "normpath" => os_path_normpath(args[0]),
         "splitdrive" => os_path_splitdrive(args[0]),
+        "splitroot" => os_path_splitroot(args[0]),
         "normcase" => os_path_normcase(args[0]),
         "realpath" => os_path_realpath(args[0], args.get(1).is_some_and(|v| value::truthy(*v))),
         "expanduser" => os_path_expanduser(args[0]),
@@ -12933,6 +13929,42 @@ fn os_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64
         }
         return os_lstat(&[path, dir_fd]);
     }
+    if function == "chmod" || function == "mknod" {
+        // `chmod(path, mode, *, dir_fd=None, follow_symlinks=True)` and
+        // `mknod(path, mode=0o600, device=0, *, dir_fd=None)`. A spec may
+        // declare the keyword-only names as leading parameters (the binder
+        // then places them positionally); anything still in `keywords` is
+        // one of these slots and must fill it exactly once.
+        let mut bound = args.to_vec();
+        for (name, value) in keywords {
+            let slot = match (function, name.as_str()) {
+                ("chmod", "dir_fd") => 2,
+                ("chmod", "follow_symlinks") => 3,
+                ("mknod", "dir_fd") => 3,
+                _ => {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("os.{function}() got an unexpected keyword argument '{name}'"),
+                    )
+                }
+            };
+            while bound.len() <= slot {
+                bound.push(NONE);
+            }
+            if bound[slot] != NONE {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("os.{function}() got multiple values for argument '{name}'"),
+                );
+            }
+            bound[slot] = value;
+        }
+        return if function == "chmod" {
+            os_chmod(&bound)
+        } else {
+            os_mknod(&bound)
+        };
+    }
     if let Some((name, _)) = keywords.into_iter().next() {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -12998,6 +14030,180 @@ fn os_mkdir(args: &[i64]) -> i64 {
             Ok(()) => NONE,
             Err(error) => os_error_from_io("mkdir", error, Some(path)),
         }
+    }
+}
+
+/// `os.chmod(path, mode, *, dir_fd=None, follow_symlinks=True)`.
+///
+/// The permission bits go straight to `chmod(2)` (or `fchmodat(2)` with
+/// `AT_SYMLINK_NOFOLLOW` when links must not be followed) so every mode bit
+/// reaches the filesystem, including the setuid/setgid/sticky bits that
+/// `std::fs::set_permissions` would round-trip through a lossier
+/// representation. Platforms whose `fchmodat` cannot avoid following a link
+/// report CPython's `NotImplementedError`, and a non-`None` `dir_fd` is
+/// rejected like the other descriptor-relative `os` entry points.
+fn os_chmod(args: &[i64]) -> i64 {
+    let path_value = args.first().copied().unwrap_or(NONE);
+    let Some(mode) = args.get(1).copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "chmod() missing required argument 'mode' (pos 2)",
+        );
+    };
+    let Some(mode) = value::as_integer(mode) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "chmod() mode must be an integer, not {}",
+                value::type_name(mode)
+            ),
+        );
+    };
+    if let Some(dir_fd) = args.get(2).copied() {
+        if dir_fd != NONE {
+            return exc::raise_with_message(
+                NOT_IMPLEMENTED_ERROR,
+                "os.chmod: dir_fd is not supported",
+            );
+        }
+    }
+    let follow_symlinks = match args.get(3).copied() {
+        None | Some(NONE) => true,
+        Some(flag) => value::truthy(flag),
+    };
+    let Some(path) = value::as_path_like(path_value) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "chmod() argument must be a path string, not {}",
+                value::type_name(path_value)
+            ),
+        );
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = CString::new(std::ffi::OsStr::new(path).as_bytes()) else {
+            return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+        };
+        // SAFETY: `c_path` is a NUL-terminated path and the mode is a plain
+        // bitfield; both calls only read their arguments.
+        let result = unsafe {
+            if follow_symlinks {
+                libc::chmod(c_path.as_ptr(), mode as libc::mode_t)
+            } else {
+                libc::fchmodat(
+                    libc::AT_FDCWD,
+                    c_path.as_ptr(),
+                    mode as libc::mode_t,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            }
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if !follow_symlinks
+                && matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::ENOTSUP || code == libc::EOPNOTSUPP
+                )
+            {
+                return exc::raise_with_message(
+                    NOT_IMPLEMENTED_ERROR,
+                    "chmod: follow_symlinks unavailable on this platform",
+                );
+            }
+            return os_stat_error(error, path);
+        }
+        NONE
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (mode, follow_symlinks);
+        exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            "chmod: mode bits are unavailable on this platform",
+        )
+    }
+}
+
+/// `os.mknod(path, mode=0o600, device=0, *, dir_fd=None)`.
+///
+/// This is the real `mknod(2)`: a regular file, FIFO, socket or (where the
+/// process holds `CAP_MKNOD`) device node is created according to the file
+/// type bits in `mode`. The kernel's verdict is authoritative, so an
+/// unprivileged device-node request surfaces its `OSError`/`EPERM` unchanged
+/// instead of being special-cased.
+fn os_mknod(args: &[i64]) -> i64 {
+    let path_value = args.first().copied().unwrap_or(NONE);
+    if let Some(dir_fd) = args.get(3).copied() {
+        if dir_fd != NONE {
+            return exc::raise_with_message(
+                NOT_IMPLEMENTED_ERROR,
+                "os.mknod: dir_fd is not supported",
+            );
+        }
+    }
+    let mode = match args.get(1).copied() {
+        None | Some(NONE) => 0o600,
+        Some(mode) => match value::as_integer(mode) {
+            Some(mode) => mode,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "mknod() mode must be an integer, not {}",
+                        value::type_name(mode)
+                    ),
+                )
+            }
+        },
+    };
+    let device = match args.get(2).copied() {
+        None | Some(NONE) => 0,
+        Some(device) => match value::as_integer(device) {
+            Some(device) => device,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "mknod() device must be an integer, not {}",
+                        value::type_name(device)
+                    ),
+                )
+            }
+        },
+    };
+    let Some(path) = value::as_path_like(path_value) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "mknod() argument must be a path string, not {}",
+                value::type_name(path_value)
+            ),
+        );
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = CString::new(std::ffi::OsStr::new(path).as_bytes()) else {
+            return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+        };
+        // SAFETY: `c_path` is a NUL-terminated path; `mknod` only reads the
+        // pointed-to string and the scalar mode/device arguments.
+        let result =
+            unsafe { libc::mknod(c_path.as_ptr(), mode as libc::mode_t, device as libc::dev_t) };
+        if result != 0 {
+            // CPython's `mknod` reports the bare errno (no filename), keeping
+            // the OSError subtype implied by the code.
+            return os_error_from_io("mknod", std::io::Error::last_os_error(), None);
+        }
+        NONE
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (mode, device);
+        exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "mknod unavailable on this platform")
     }
 }
 
@@ -13095,6 +14301,8 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
             process::exit_now(code as i32)
         }
         "mkdir" => os_mkdir(args),
+        "chmod" => os_chmod(args),
+        "mknod" => os_mknod(args),
         // `os.remove` and `os.unlink` are the same operation in CPython; the
         // reported error keeps the spelling the caller used.
         "remove" => os_remove_path("remove", args),
@@ -14229,6 +15437,92 @@ fn runpy_details_call(function: &str, args: &[i64]) -> Option<i64> {
         return None;
     }
     Some(runpy_get_module_details(args))
+}
+
+/// `_frozen_importlib._gcd_import(name, package=None, level=0)`.
+///
+/// The frozen bootstrap's import primitive, called by `importlib.import_module`
+/// and `__import__`. Hydro compiles module bodies ahead of time, so the
+/// registry already holds every compiled and native module; the helper
+/// therefore reduces to `_sanity_check`'s argument validation followed by the
+/// same registry lookup `importlib.import_module` performs. A positive
+/// `level` resolves `name` against `package` (the `"." * level + name`
+/// spelling imported by `importlib`, which then uses the exact relative-name
+/// rules of the registry resolver).
+fn importlib_gcd_import(args: &[i64]) -> i64 {
+    let name_arg = args.first().copied().unwrap_or(NONE);
+    let Some(name) = value::as_str(name_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "module name must be str, not {}",
+                value::type_name(name_arg)
+            ),
+        );
+    };
+    let level = match args.get(2).copied() {
+        None | Some(NONE) => 0,
+        Some(level) => match value::as_integer(level) {
+            Some(level) => level,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("level must be an integer, not {}", value::type_name(level)),
+                )
+            }
+        },
+    };
+    if level < 0 {
+        return exc::raise_with_message(VALUE_ERROR, "level must be >= 0");
+    }
+    let package_arg = args.get(1).copied().unwrap_or(NONE);
+    if level > 0 {
+        let Some(package) = value::as_str(package_arg) else {
+            return exc::raise_with_message(TYPE_ERROR, "__package__ not set to a string");
+        };
+        if package.is_empty() {
+            return exc::raise_with_message(
+                IMPORT_ERROR,
+                "attempted relative import with no known parent package",
+            );
+        }
+        // `_resolve_name`: `package.rsplit('.', level - 1)` keeps the
+        // leftmost piece as the anchor. `rsplitn(level, ...)` yields the same
+        // pieces right-to-left, without materialising `level` dots first.
+        let Ok(level_width) = usize::try_from(level) else {
+            return exc::raise_with_message(
+                IMPORT_ERROR,
+                "attempted relative import beyond top-level package",
+            );
+        };
+        let mut bits: Vec<&str> = package.rsplitn(level_width, '.').collect();
+        if bits.len() < level_width {
+            return exc::raise_with_message(
+                IMPORT_ERROR,
+                "attempted relative import beyond top-level package",
+            );
+        }
+        let Some(base) = bits.pop() else {
+            return exc::raise_with_message(
+                IMPORT_ERROR,
+                "attempted relative import beyond top-level package",
+            );
+        };
+        let resolved = if name.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}.{name}")
+        };
+        let resolved = value::str_alloc(resolved);
+        let roots = heap::root_values(&[resolved]);
+        let result = importlib::call("import_module", &[resolved, NONE]);
+        heap::release_roots(roots);
+        return result;
+    }
+    if name.is_empty() {
+        return exc::raise_with_message(VALUE_ERROR, "Empty module name");
+    }
+    importlib::call("import_module", &[name_arg, package_arg])
 }
 
 fn runpy_get_module_details(args: &[i64]) -> i64 {
@@ -19054,6 +20348,37 @@ mod tests {
     }
 
     #[test]
+    fn system_random_proxy_exposes_the_secrets_surface() {
+        exc::init();
+        let proxy = get("random", "SystemRandom");
+        assert!(value::as_instance(proxy).is_some());
+        assert_eq!(get("random", "SystemRandom"), proxy);
+        // Attribute reads yield bound methods, like CPython's class instance.
+        let getrandbits = attribute(proxy, "getrandbits");
+        assert!(value::as_function(getrandbits).is_some());
+        let drawn = call_value(getrandbits, &[int(8)]);
+        assert!(!exc::pending());
+        assert!(as_int(drawn) < 256);
+
+        // `secrets` also binds `_randbelow`, `choice` and `randbytes`.
+        for _ in 0..8 {
+            let below = method(proxy, "_randbelow", &[int(4)]);
+            assert!(!exc::pending(), "_randbelow raised");
+            assert!((0..4).contains(&as_int(below)));
+        }
+        let picked = method(proxy, "choice", &[value::list_new(vec![int(1), int(2)])]);
+        assert!((1..=2).contains(&as_int(picked)));
+        let bytes_value = method(proxy, "randbytes", &[int(8)]);
+        assert!(!exc::pending(), "randbytes raised");
+        assert_eq!(
+            value::as_bytes(bytes_value).map(|bytes| bytes.len()),
+            Some(8)
+        );
+        // The module call still produces the proxy (callable class value).
+        assert_eq!(call("random", "SystemRandom", &[]), proxy);
+    }
+
+    #[test]
     fn random_system_random_draws_from_operating_system_entropy() {
         exc::init();
         let draw = |rng: i64, name: &str, args: &[i64]| {
@@ -19770,6 +21095,176 @@ mod tests {
 
         assert_eq!(call("os.path", "splitdrive", &[int(0)]), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn os_path_splitroot_posix_and_windows_spellings() {
+        exc::init();
+        let split = |module: &str, input: &str| {
+            let result = call(module, "splitroot", &[string(input)]);
+            assert!(!exc::pending(), "{module}.splitroot({input:?}) raised");
+            let parts = value::as_tuple(result).expect("splitroot tuple");
+            (
+                value::as_str(parts[0]).expect("drive str"),
+                value::as_str(parts[1]).expect("root str"),
+                value::as_str(parts[2]).expect("tail str"),
+            )
+        };
+        // POSIX: the platform `os.path` flavour.
+        assert_eq!(split("os.path", ""), ("", "", ""));
+        assert_eq!(split("os.path", "foo"), ("", "", "foo"));
+        assert_eq!(split("os.path", "/foo"), ("", "/", "foo"));
+        assert_eq!(split("os.path", "///foo"), ("", "/", "//foo"));
+        // Exactly two leading slashes stay the root.
+        assert_eq!(split("os.path", "//foo"), ("", "//", "foo"));
+        assert_eq!(split("posixpath", "//"), ("", "//", ""));
+        assert_eq!(split("posixpath", "C:\\foo"), ("", "", "C:\\foo"));
+
+        // Windows grammar, independent of the host: drive letter, UNC share
+        // and rooted/relative forms.
+        assert_eq!(split("ntpath", ""), ("", "", ""));
+        assert_eq!(split("ntpath", "relative"), ("", "", "relative"));
+        assert_eq!(split("ntpath", "C:\\foo"), ("C:", "\\", "foo"));
+        assert_eq!(split("ntpath", "C:foo"), ("C:", "", "foo"));
+        assert_eq!(
+            split("ntpath", "\\\\server\\share\\x"),
+            ("\\\\server\\share", "\\", "x")
+        );
+        assert_eq!(
+            split("ntpath", "\\\\server\\share"),
+            ("\\\\server\\share", "", "")
+        );
+        assert_eq!(
+            split("ntpath", "\\\\?\\UNC\\server\\share\\x"),
+            ("\\\\?\\UNC\\server\\share", "\\", "x")
+        );
+        assert_eq!(split("ntpath", "\\Windows"), ("", "\\", "Windows"));
+        // Alt separators are normalized only for the split decision, while
+        // the returned slices keep the original spelling.
+        assert_eq!(split("ntpath", "C:/foo/bar"), ("C:", "/", "foo/bar"));
+
+        // Bytes operands keep the bytes flavour.
+        let result = call(
+            "os.path",
+            "splitroot",
+            &[value::bytes_new(b"//x/y".to_vec())],
+        );
+        let parts = value::as_tuple(result).expect("splitroot tuple");
+        assert_eq!(value::as_bytes(parts[0]), Some(&b""[..]));
+        assert_eq!(value::as_bytes(parts[1]), Some(&b"//"[..]));
+        assert_eq!(value::as_bytes(parts[2]), Some(&b"x/y"[..]));
+        let result = call(
+            "ntpath",
+            "splitroot",
+            &[value::bytes_new(b"C:\\x".to_vec())],
+        );
+        let parts = value::as_tuple(result).expect("splitroot tuple");
+        assert_eq!(value::as_bytes(parts[0]), Some(&b"C:"[..]));
+        assert_eq!(value::as_bytes(parts[1]), Some(&b"\\"[..]));
+        assert_eq!(value::as_bytes(parts[2]), Some(&b"x"[..]));
+
+        assert_eq!(call("os.path", "splitroot", &[int(0)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_chmod_sets_the_requested_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        exc::init();
+        let root = temp_root("os-chmod");
+        let file = root.join("mode.txt");
+        std::fs::write(&file, b"x").expect("write file");
+        let path = string(&file.to_string_lossy());
+        assert_eq!(call("os", "chmod", &[path, int(0o640)]), NONE);
+        assert!(!exc::pending(), "{}", message());
+        let mode = std::fs::metadata(&file)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o640);
+
+        // The function value reaches the same implementation.
+        let chmod = get("os", "chmod");
+        assert_ne!(chmod, NONE);
+        assert_eq!(call_value(chmod, &[path, int(0o600)]), NONE);
+        let mode = std::fs::metadata(&file)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // A non-None dir_fd is unsupported, like `os.stat` (it is
+        // keyword-only in CPython, so the keyword form is the real spelling).
+        exc::init();
+        assert_eq!(
+            call_kw("os", "chmod", &[path, int(0o644)], &[("dir_fd", int(1))]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), NOT_IMPLEMENTED_ERROR as i64);
+        exc::clear();
+
+        // Missing mode is the usual TypeError.
+        assert_eq!(call("os", "chmod", &[path]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_mknod_creates_a_fifo_and_reports_errno() {
+        use std::os::unix::fs::FileTypeExt;
+        exc::init();
+        let root = temp_root("os-mknod");
+        let fifo = root.join("pipe");
+        assert_eq!(
+            call(
+                "os",
+                "mknod",
+                &[
+                    string(&fifo.to_string_lossy()),
+                    int(0o600 | libc::S_IFIFO as i64)
+                ]
+            ),
+            NONE
+        );
+        assert!(!exc::pending(), "{}", message());
+        let file_type = std::fs::symlink_metadata(&fifo)
+            .expect("metadata")
+            .file_type();
+        assert!(file_type.is_fifo());
+
+        // Creating over an existing path surfaces the kernel errno as an
+        // OSError instead of silently succeeding.
+        exc::init();
+        assert_eq!(
+            call(
+                "os",
+                "mknod",
+                &[
+                    string(&fifo.to_string_lossy()),
+                    int(0o600 | libc::S_IFIFO as i64)
+                ]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+        assert!(message().contains("[Errno 17]"), "{}", message());
+        exc::clear();
+
+        // A non-None dir_fd is unsupported (keyword-only in CPython).
+        assert_eq!(
+            call_kw(
+                "os",
+                "mknod",
+                &[string(&root.join("other").to_string_lossy()), int(0o600)],
+                &[("dir_fd", int(1))]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), NOT_IMPLEMENTED_ERROR as i64);
         exc::clear();
     }
 
@@ -21476,6 +22971,73 @@ mod tests {
             Some(0.25)
         );
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn frozen_importlib_gcd_import_resolves_absolute_and_relative_names() {
+        exc::init();
+        let math = call("_frozen_importlib", "_gcd_import", &[string("math")]);
+        assert_eq!(
+            value::as_module(math).map(|module| module.name()),
+            Some("math")
+        );
+        // A non-zero level resolves against the package; an empty relative
+        // name resolves to the package itself, and the entry module always
+        // exists, so this needs no registry fixture.
+        let main = call(
+            "_frozen_importlib",
+            "_gcd_import",
+            &[string(""), string("__main__"), int(1)],
+        );
+        assert_eq!(
+            value::as_module(main).map(|module| module.name()),
+            Some("__main__")
+        );
+        assert!(!exc::pending());
+
+        // `_sanity_check` errors.
+        exc::init();
+        assert_eq!(
+            call("_frozen_importlib", "_gcd_import", &[string("")]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+
+        assert_eq!(
+            call(
+                "_frozen_importlib",
+                "_gcd_import",
+                &[string("math"), NONE, int(-1)]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+
+        assert_eq!(
+            call(
+                "_frozen_importlib",
+                "_gcd_import",
+                &[string("math"), NONE, int(1)]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "__package__ not set to a string");
+        exc::clear();
+
+        // More levels than the package has segments.
+        assert_eq!(
+            call(
+                "_frozen_importlib",
+                "_gcd_import",
+                &[string(""), string("__main__"), int(2)]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), IMPORT_ERROR as i64);
+        exc::clear();
     }
 
     #[test]
@@ -25113,6 +26675,245 @@ mod tests {
         );
         assert_eq!(exc::pending_tag(), exc::IMPORT_ERROR as i64);
         exc::clear();
+    }
+
+    #[test]
+    fn native_compression_pyexpat_sqlite_are_wired() {
+        exc::init();
+        // BZ2 roundtrip through the constructor and native method entries.
+        let compressor = dispatch("bz2", "BZ2Compressor", &[int(9)]);
+        assert!(!exc::pending(), "BZ2Compressor constructor raised");
+        let first = dispatch(
+            "_bz2",
+            "_bz2_compress",
+            &[compressor, value::bytes_new(b"hello ".to_vec())],
+        );
+        let second = dispatch(
+            "_bz2",
+            "_bz2_compress",
+            &[compressor, value::bytes_new(b"world".to_vec())],
+        );
+        let tail = dispatch("_bz2", "_bz2_flush", &[compressor]);
+        assert!(!exc::pending(), "BZ2 compression raised");
+        let mut payload = value::as_bytes(first).expect("bytes").to_vec();
+        payload.extend_from_slice(value::as_bytes(second).expect("bytes"));
+        payload.extend_from_slice(value::as_bytes(tail).expect("bytes"));
+        let decompressor = dispatch("bz2", "BZ2Decompressor", &[]);
+        let restored = dispatch(
+            "_bz2",
+            "_bz2_decompress",
+            &[decompressor, value::bytes_new(payload)],
+        );
+        assert!(!exc::pending(), "BZ2 decompression raised");
+        assert_eq!(
+            value::as_bytes(restored).map(|b| b.to_vec()),
+            Some(b"hello world".to_vec())
+        );
+
+        // LZMA roundtrip uses the same entry shape.
+        let compressor = dispatch("lzma", "LZMACompressor", &[]);
+        assert!(!exc::pending(), "LZMACompressor raised");
+        let body = dispatch(
+            "_lzma",
+            "_lzma_compress",
+            &[compressor, value::bytes_new(b"payload".to_vec())],
+        );
+        let tail = dispatch("_lzma", "_lzma_flush", &[compressor]);
+        let mut compressed = value::as_bytes(body).expect("bytes").to_vec();
+        compressed.extend_from_slice(value::as_bytes(tail).expect("bytes"));
+        let decompressor = dispatch("lzma", "LZMADecompressor", &[]);
+        let restored = dispatch(
+            "_lzma",
+            "_lzma_decompress",
+            &[decompressor, value::bytes_new(compressed)],
+        );
+        assert!(!exc::pending(), "LZMA decompression raised");
+        assert_eq!(
+            value::as_bytes(restored).map(|b| b.to_vec()),
+            Some(b"payload".to_vec())
+        );
+
+        // The class hooks return cached class values, not constructors.
+        assert!(value::as_class(get("_lzma", "LZMAError")).is_some());
+        assert_eq!(get("_lzma", "LZMAError"), get("lzma", "LZMAError"));
+        assert_eq!(get("sqlite3", "Connection"), get("_sqlite3", "Connection"));
+
+        // Expat parses a simple document without error.
+        let parser = dispatch("pyexpat", "ParserCreate", &[]);
+        assert!(!exc::pending(), "ParserCreate raised");
+        // `Parse()` returns the integer 1 on success.
+        assert_eq!(
+            dispatch(
+                "pyexpat",
+                "_pyexpat_parse",
+                &[parser, string("<root>text</root>")]
+            ),
+            int(1)
+        );
+        assert!(!exc::pending(), "expat parse raised");
+
+        // sqlite3 :memory: wiring: execute a select and fetch the row.
+        let connection = dispatch("sqlite3", "connect", &[string(":memory:")]);
+        assert!(!exc::pending(), "sqlite3 connect raised");
+        let cursor = dispatch(
+            "sqlite3",
+            "sqlite3.Connection.execute",
+            &[connection, string("select 41 + 1")],
+        );
+        assert!(!exc::pending(), "execute raised");
+        let row = dispatch("sqlite3", "sqlite3.Cursor.fetchone", &[cursor]);
+        let items = value::as_tuple(row).expect("row tuple");
+        assert_eq!(as_int(items[0]), 42);
+        dispatch("sqlite3", "sqlite3.Connection.close", &[connection]);
+    }
+
+    #[test]
+    fn readline_curses_codecs_natives_are_wired() {
+        exc::init();
+        // readline: availability plus process-global history behaviour.
+        assert!(readline::available());
+        assert_eq!(dispatch("readline", "clear_history", &[]), NONE);
+        assert_eq!(
+            dispatch("readline", "add_history", &[string("entry")]),
+            NONE
+        );
+        assert_eq!(
+            as_int(dispatch("readline", "get_current_history_length", &[])),
+            1
+        );
+        assert_eq!(dispatch("readline", "clear_history", &[]), NONE);
+
+        // curses: the class hook and dynamic constant table resolve without a
+        // terminal (KEY_* is a plain table).
+        assert_eq!(get("_curses", "window"), get("_curses", "window"));
+        assert!(value::as_class(get("_curses", "window")).is_some());
+        assert!(value::as_class(get("_curses", "error")).is_some());
+        assert_eq!(as_int(get("_curses", "KEY_UP")), 259);
+        assert!(curses_native::available());
+
+        // GBK roundtrip through the multibyte codec accelerator.
+        let codec = dispatch("_codecs_cn", "getcodec", &[string("gbk")]);
+        assert!(!exc::pending(), "getcodec(gbk) raised");
+        let encoded = dispatch(
+            "_multibytecodec",
+            "MultibyteCodec.encode",
+            &[codec, string("中文"), string("strict")],
+        );
+        assert!(!exc::pending(), "gbk encode raised");
+        // The multibyte API returns `(data, consumed)` pairs.
+        let encoded_pair = value::as_tuple(encoded).expect("encode pair");
+        assert_eq!(
+            value::as_bytes(encoded_pair[0]).map(|bytes| bytes.to_vec()),
+            Some(b"\xd6\xd0\xce\xc4".to_vec())
+        );
+        let decoded = dispatch(
+            "_multibytecodec",
+            "MultibyteCodec.decode",
+            &[codec, encoded_pair[0], string("strict")],
+        );
+        assert!(!exc::pending(), "gbk decode raised");
+        let decoded_pair = value::as_tuple(decoded).expect("decode pair");
+        assert_eq!(value::as_str(decoded_pair[0]), Some("中文"));
+
+        // Class identity is cached and shared by repeated reads.
+        let codec_class = get("_multibytecodec", "MultibyteCodec");
+        assert!(value::as_class(codec_class).is_some());
+        assert_eq!(get("_multibytecodec", "MultibyteCodec"), codec_class);
+        assert!(value::as_class(get("_multibytecodec", "MultibyteIncrementalEncoder")).is_some());
+    }
+
+    #[test]
+    fn zstd_sha3_natives_are_wired() {
+        exc::init();
+        // Zstd roundtrip through the constructor and native method entries.
+        let compressor = dispatch("_zstd", "ZstdCompressor", &[]);
+        assert!(!exc::pending(), "ZstdCompressor raised");
+        let body = dispatch(
+            "_zstd",
+            "_zstd_compress",
+            &[compressor, value::bytes_new(b"zstd payload".to_vec())],
+        );
+        assert!(!exc::pending(), "zstd compress raised");
+        let tail = dispatch("_zstd", "_zstd_flush", &[compressor]);
+        let mut compressed = value::as_bytes(body).expect("bytes").to_vec();
+        compressed.extend_from_slice(value::as_bytes(tail).expect("bytes"));
+        let decompressor = dispatch("_zstd", "ZstdDecompressor", &[]);
+        let restored = dispatch(
+            "_zstd",
+            "_zstd_decompress",
+            &[decompressor, value::bytes_new(compressed)],
+        );
+        assert!(!exc::pending(), "zstd decompress raised");
+        assert_eq!(
+            value::as_bytes(restored).map(|bytes| bytes.to_vec()),
+            Some(b"zstd payload".to_vec())
+        );
+        // Class/constant hooks and digest arity.
+        assert!(value::as_class(get("_zstd", "ZstdError")).is_some());
+        let digest = dispatch(
+            "hashlib",
+            "new",
+            &[string("sha3_256"), value::bytes_new(b"abc".to_vec())],
+        );
+        assert!(!exc::pending(), "sha3_256 construction raised");
+        let hex = hashlib::call("hashlib.hexdigest", &[digest]);
+        assert_eq!(
+            value::as_str(hex),
+            Some("3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532")
+        );
+        // `digest(length)` / `hexdigest(length)` accept the optional XOF
+        // length (fixed-size hashes still reject it, like CPython).
+        let shake = dispatch(
+            "hashlib",
+            "new",
+            &[string("shake_128"), value::bytes_new(b"abc".to_vec())],
+        );
+        assert!(!exc::pending(), "shake_128 construction raised");
+        let truncated = hashlib::call("hashlib.digest", &[shake, int(8)]);
+        assert!(!exc::pending(), "shake digest(length) raised");
+        assert_eq!(
+            value::as_bytes(truncated).map(|bytes| bytes.to_vec()),
+            Some(vec![0x58, 0x81, 0x09, 0x2d, 0xd8, 0x18, 0xbf, 0x5c])
+        );
+        let truncated_hex = hashlib::call("hashlib.hexdigest", &[shake, int(8)]);
+        assert_eq!(value::as_str(truncated_hex), Some("5881092dd818bf5c"));
+    }
+
+    #[test]
+    fn dbm_native_roundtrip_uses_a_temp_file() {
+        exc::init();
+        let root = temp_root("dbm");
+        let path = root.join("test.db");
+        let path_string = string(path.to_str().expect("utf-8 path"));
+        let database = dispatch("_gdbm", "open", &[path_string, string("c")]);
+        assert!(!exc::pending(), "gdbm open raised");
+        assert_eq!(
+            dispatch(
+                "_gdbm",
+                "_gdbm_setitem",
+                &[
+                    database,
+                    value::bytes_new(b"key".to_vec()),
+                    value::bytes_new(b"value".to_vec())
+                ]
+            ),
+            NONE
+        );
+        let read = dispatch(
+            "_gdbm",
+            "_gdbm_getitem",
+            &[database, value::bytes_new(b"key".to_vec())],
+        );
+        assert!(!exc::pending(), "gdbm get raised");
+        assert_eq!(
+            value::as_bytes(read).map(|bytes| bytes.to_vec()),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(dispatch("_gdbm", "_gdbm_close", &[database]), NONE);
+        assert!(!exc::pending(), "gdbm close raised");
+        // The class hook resolves `_gdbm.error` without a spec entry.
+        assert!(value::as_class(get("_gdbm", "error")).is_some());
+        std::fs::remove_dir_all(&root).expect("remove scratch directory");
     }
 
     #[test]

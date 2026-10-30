@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-10-29T23:19:40Z",
+    "date": "2026-10-30T11:45:12Z",
     "python": "CPython 3.14.9",
     "python_version": "3.14.9",
     "python_executable": "/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14",
@@ -17,19 +17,19 @@
       "tests": null
     },
     "cwd": "/mnt/Vault/GitHub/hydro",
-    "elapsed_seconds": 14.1,
+    "elapsed_seconds": 15.4,
     "counts": {
       "total": 297,
-      "ok": 210,
-      "failed": 87,
+      "ok": 233,
+      "failed": 64,
       "by_status": {
-        "compile_error:HYD0002": 39,
+        "compile_error:HYD0002": 21,
         "compile_error:HYD0101": 1,
         "compile_error:HYD0103": 2,
-        "compile_error:HYD0201": 24,
+        "compile_error:HYD0201": 20,
         "cpython_failed": 9,
-        "ok": 210,
-        "runtime_error": 12
+        "ok": 233,
+        "runtime_error": 11
       },
       "by_layer": {
         "builtin/frozen": {
@@ -39,13 +39,13 @@
         },
         "pure": {
           "total": 174,
-          "ok": 125,
-          "failed": 49
+          "ok": 133,
+          "failed": 41
         },
         "extension": {
           "total": 63,
-          "ok": 35,
-          "failed": 28
+          "ok": 50,
+          "failed": 13
         },
         "unknown": {
           "total": 8,
@@ -63,13 +63,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.4
+        "duration_ms": 9.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.6,
+        "duration_ms": 3.6,
         "error": null
       },
       "status": "ok",
@@ -82,13 +82,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.4
+        "duration_ms": 8.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 2.7,
         "error": null
       },
       "status": "ok",
@@ -101,13 +101,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.2
+        "duration_ms": 9.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.9,
+        "duration_ms": 14.7,
         "error": null
       },
       "status": "ok",
@@ -120,13 +120,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 9.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 24.8,
+        "duration_ms": 25.2,
         "error": null
       },
       "status": "ok",
@@ -139,13 +139,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 9.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.7,
+        "duration_ms": 13.7,
         "error": null
       },
       "status": "ok",
@@ -158,13 +158,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 9.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 3.0,
         "error": null
       },
       "status": "ok",
@@ -177,17 +177,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.2
+        "duration_ms": 14.7
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 463.9,
-        "error": "AttributeError: 'super' object has no attribute '__setitem__'"
+        "duration_ms": 484.6,
+        "error": null
       },
-      "status": "runtime_error",
-      "error": "AttributeError: 'super' object has no attribute '__setitem__'"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "_asyncio",
@@ -196,13 +196,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 40.4
+        "duration_ms": 40.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 3.1,
+        "duration_ms": 3.3,
         "error": null
       },
       "status": "ok",
@@ -215,13 +215,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 3.2,
         "error": null
       },
       "status": "ok",
@@ -234,13 +234,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 2.9,
         "error": null
       },
       "status": "ok",
@@ -256,14 +256,14 @@
         "duration_ms": 7.5
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
-        "error": "error[HYD0002]: module '_bz2' not found: not supported on the import search path"
+        "duration_ms": 2.4,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_bz2' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "_codecs",
@@ -272,13 +272,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.7
+        "duration_ms": 7.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 2.8,
         "error": null
       },
       "status": "ok",
@@ -291,368 +291,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.7,
-        "error": "error[HYD0002]: module '_codecs_cn' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_codecs_cn' not found: not supported on the import search path"
-    },
-    {
-      "name": "_codecs_hk",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.8
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 2.2,
-        "error": "error[HYD0002]: module '_codecs_hk' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_codecs_hk' not found: not supported on the import search path"
-    },
-    {
-      "name": "_codecs_iso2022",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.1
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.9,
-        "error": "error[HYD0002]: module '_codecs_iso2022' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_codecs_iso2022' not found: not supported on the import search path"
-    },
-    {
-      "name": "_codecs_jp",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.9
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.7,
-        "error": "error[HYD0002]: module '_codecs_jp' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_codecs_jp' not found: not supported on the import search path"
-    },
-    {
-      "name": "_codecs_kr",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.4
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.6,
-        "error": "error[HYD0002]: module '_codecs_kr' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_codecs_kr' not found: not supported on the import search path"
-    },
-    {
-      "name": "_codecs_tw",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.0
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.6,
-        "error": "error[HYD0002]: module '_codecs_tw' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_codecs_tw' not found: not supported on the import search path"
-    },
-    {
-      "name": "_collections",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.8
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_collections_abc",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.2
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 1.9,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_colorize",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 22.9
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 54.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_compat_pickle",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.9
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 30.6,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_contextvars",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.9
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.3,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_csv",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.4
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.1,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_ctypes",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.9
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.4,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_curses",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.9
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.8,
-        "error": "error[HYD0002]: module '_curses' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_curses' not found: not supported on the import search path"
-    },
-    {
-      "name": "_curses_panel",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.6
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.4,
-        "error": "error[HYD0002]: module '_curses_panel' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_curses_panel' not found: not supported on the import search path"
-    },
-    {
-      "name": "_datetime",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.0
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 3.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_dbm",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.4
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.6,
-        "error": "error[HYD0002]: module '_dbm' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_dbm' not found: not supported on the import search path"
-    },
-    {
-      "name": "_decimal",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.5
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_elementtree",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 13.4
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.6,
-        "error": "error[HYD0002]: module '_elementtree' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_elementtree' not found: not supported on the import search path"
-    },
-    {
-      "name": "_frozen_importlib",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.3
+        "duration_ms": 7.7
       },
       "tea": {
         "exit": 0,
@@ -665,32 +304,70 @@
       "error": null
     },
     {
-      "name": "_frozen_importlib_external",
-      "layer": "builtin/frozen",
+      "name": "_codecs_hk",
+      "layer": "extension",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 7.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 2.7,
         "error": null
       },
       "status": "ok",
       "error": null
     },
     {
-      "name": "_functools",
-      "layer": "builtin/frozen",
+      "name": "_codecs_iso2022",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.6
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_codecs_jp",
+      "layer": "extension",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
         "duration_ms": 7.8
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.7,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_codecs_kr",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.3
       },
       "tea": {
         "exit": 0,
@@ -703,23 +380,346 @@
       "error": null
     },
     {
+      "name": "_codecs_tw",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.3
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.4,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_collections",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.0
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_collections_abc",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.0
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.7,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_colorize",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 22.8
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 55.3,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_compat_pickle",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.8
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 31.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_contextvars",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.6
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.7,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_csv",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.1
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.9,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_ctypes",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.0
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.6,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_curses",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_curses_panel",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.7
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 2.1,
+        "error": "error[HYD0002]: module '_curses_panel' not found: not supported on the import search path"
+      },
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: module '_curses_panel' not found: not supported on the import search path"
+    },
+    {
+      "name": "_datetime",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.9
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_dbm",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 12.3
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.2,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_decimal",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 10.7
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.9,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_elementtree",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 14.9
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 2.9,
+        "error": "error[HYD0002]: module '_elementtree' not found: not supported on the import search path"
+      },
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: module '_elementtree' not found: not supported on the import search path"
+    },
+    {
+      "name": "_frozen_importlib",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 10.1
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_frozen_importlib_external",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.8
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_functools",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.2
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.6,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
       "name": "_gdbm",
       "layer": "extension",
       "cpython": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 23.9
+        "duration_ms": 24.4
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.5,
-        "error": "error[HYD0002]: module '_gdbm' not found: not supported on the import search path"
+        "duration_ms": 3.5,
+        "error": "ModuleNotFoundError: No module named '_gdbm'"
       },
       "status": "cpython_failed",
-      "error": "error[HYD0002]: module '_gdbm' not found: not supported on the import search path"
+      "error": "ModuleNotFoundError: No module named '_gdbm'"
     },
     {
       "name": "_hashlib",
@@ -734,7 +734,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.5,
+        "duration_ms": 3.3,
         "error": null
       },
       "status": "ok",
@@ -747,254 +747,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.4,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_hmac",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.2
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.3,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_imp",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
         "duration_ms": 8.0
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.3,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_interpchannels",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.6
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.4,
-        "error": "error[HYD0002]: module '_interpchannels' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_interpchannels' not found: not supported on the import search path"
-    },
-    {
-      "name": "_interpqueues",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.9
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.7,
-        "error": "error[HYD0002]: module '_interpqueues' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_interpqueues' not found: not supported on the import search path"
-    },
-    {
-      "name": "_interpreters",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.6
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 2.0,
-        "error": "error[HYD0002]: module '_interpreters' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_interpreters' not found: not supported on the import search path"
-    },
-    {
-      "name": "_io",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.0
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_ios_support",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 25.5
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 11.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_json",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.2
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_locale",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.0
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_lsprof",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.5
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.8,
-        "error": "error[HYD0002]: module '_lsprof' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_lsprof' not found: not supported on the import search path"
-    },
-    {
-      "name": "_lzma",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.3
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.9,
-        "error": "error[HYD0002]: module '_lzma' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_lzma' not found: not supported on the import search path"
-    },
-    {
-      "name": "_markupbase",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 12.8
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 38.1,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_md5",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.8
       },
       "tea": {
         "exit": 0,
@@ -1007,26 +760,7 @@
       "error": null
     },
     {
-      "name": "_multibytecodec",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.5
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.8,
-        "error": "error[HYD0002]: module '_multibytecodec' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_multibytecodec' not found: not supported on the import search path"
-    },
-    {
-      "name": "_multiprocessing",
+      "name": "_hmac",
       "layer": "extension",
       "cpython": {
         "exit": 0,
@@ -1038,7 +772,273 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
+        "duration_ms": 3.7,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_imp",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.0
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.0,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_interpchannels",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.7
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 2.4,
+        "error": "error[HYD0002]: module '_interpchannels' not found: not supported on the import search path"
+      },
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: module '_interpchannels' not found: not supported on the import search path"
+    },
+    {
+      "name": "_interpqueues",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.0
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 1.8,
+        "error": "error[HYD0002]: module '_interpqueues' not found: not supported on the import search path"
+      },
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: module '_interpqueues' not found: not supported on the import search path"
+    },
+    {
+      "name": "_interpreters",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.7
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
         "duration_ms": 2.3,
+        "error": "error[HYD0002]: module '_interpreters' not found: not supported on the import search path"
+      },
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: module '_interpreters' not found: not supported on the import search path"
+    },
+    {
+      "name": "_io",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.5
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.7,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_ios_support",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 30.3
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 12.4,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_json",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.1
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.0,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_locale",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_lsprof",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.7
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 2.1,
+        "error": "error[HYD0002]: module '_lsprof' not found: not supported on the import search path"
+      },
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: module '_lsprof' not found: not supported on the import search path"
+    },
+    {
+      "name": "_lzma",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_markupbase",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 12.3
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 38.0,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_md5",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.3
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.7,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_multibytecodec",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.8
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.2,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_multiprocessing",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.7
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.7,
         "error": null
       },
       "status": "ok",
@@ -1051,45 +1051,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.3,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_opcode_metadata",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.6
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 24.3,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_operator",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 7.3
       },
       "tea": {
         "exit": 0,
@@ -1102,19 +1064,57 @@
       "error": null
     },
     {
+      "name": "_opcode_metadata",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.7
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 24.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_operator",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.9
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.3,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
       "name": "_osx_support",
       "layer": "pure",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.3
+        "duration_ms": 12.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 48.2,
+        "duration_ms": 51.0,
         "error": null
       },
       "status": "ok",
@@ -1127,13 +1127,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 24.0
+        "duration_ms": 24.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 2.3,
         "error": "error[HYD0002]: module '_overlapped' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -1146,13 +1146,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.0
+        "duration_ms": 10.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.9,
+        "duration_ms": 3.0,
         "error": null
       },
       "status": "ok",
@@ -1165,13 +1165,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.7
+        "duration_ms": 7.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 2.1,
         "error": "error[HYD0002]: module '_posixshmem' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1184,13 +1184,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 8.0
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_posixsubprocess' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1203,13 +1203,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.4
+        "duration_ms": 9.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 43.4,
+        "duration_ms": 44.3,
         "error": null
       },
       "status": "ok",
@@ -1222,13 +1222,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 20.5,
+        "duration_ms": 22.2,
         "error": "error[HYD0201]: type 'None' has no method 'getline'"
       },
       "status": "compile_error:HYD0201",
@@ -1241,13 +1241,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 11.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 314.1,
+        "duration_ms": 312.0,
         "error": "TypeError: timedelta() takes no arguments"
       },
       "status": "runtime_error",
@@ -1260,13 +1260,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.1
+        "duration_ms": 18.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 513.0,
+        "duration_ms": 510.5,
         "error": "error[HYD0101]: name 'pow' is not defined"
       },
       "status": "compile_error:HYD0101",
@@ -1279,13 +1279,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.1
+        "duration_ms": 11.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 122.3,
+        "duration_ms": 123.1,
         "error": "error[HYD0201]: module 'os' has no attribute 'O_BINARY'"
       },
       "status": "compile_error:HYD0201",
@@ -1298,13 +1298,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.4
+        "duration_ms": 16.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 53.4,
+        "duration_ms": 53.0,
         "error": "AttributeError: 'function' object has no attribute 'fromhex'"
       },
       "status": "runtime_error",
@@ -1317,13 +1317,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 4.2,
+        "duration_ms": 4.5,
         "error": null
       },
       "status": "ok",
@@ -1336,13 +1336,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 8.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 3.2,
         "error": null
       },
       "status": "ok",
@@ -1361,7 +1361,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.6,
+        "duration_ms": 2.7,
         "error": null
       },
       "status": "ok",
@@ -1374,13 +1374,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 7.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.6,
+        "duration_ms": 2.0,
         "error": "error[HYD0002]: module '_remote_debugging' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -1393,13 +1393,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 26.9
+        "duration_ms": 24.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module '_scproxy' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -1412,13 +1412,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 8.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.8,
+        "duration_ms": 3.0,
         "error": null
       },
       "status": "ok",
@@ -1431,159 +1431,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.8,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_sha3",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 10.0
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 2.0,
-        "error": "error[HYD0002]: module '_sha3' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_sha3' not found: not supported on the import search path"
-    },
-    {
-      "name": "_signal",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.3
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 3.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_sitebuiltins",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.0
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 17.0,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_socket",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 10.1
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 3.4,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_sqlite3",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 12.3
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.8,
-        "error": "error[HYD0002]: module '_sqlite3' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_sqlite3' not found: not supported on the import search path"
-    },
-    {
-      "name": "_sre",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.1
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.6,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_ssl",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.3
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 2.0,
-        "error": "error[HYD0002]: module '_ssl' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_ssl' not found: not supported on the import search path"
-    },
-    {
-      "name": "_stat",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.5
+        "duration_ms": 7.6
       },
       "tea": {
         "exit": 0,
@@ -1596,64 +1444,7 @@
       "error": null
     },
     {
-      "name": "_statistics",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.8
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.8,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_string",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.5
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.3,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_strptime",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 15.7
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 149.1,
-        "error": "error[HYD0103]: a positional argument cannot follow a starred argument"
-      },
-      "status": "compile_error:HYD0103",
-      "error": "error[HYD0103]: a positional argument cannot follow a starred argument"
-    },
-    {
-      "name": "_struct",
+      "name": "_sha3",
       "layer": "extension",
       "cpython": {
         "exit": 0,
@@ -1662,175 +1453,61 @@
         "duration_ms": 8.3
       },
       "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.4,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_suggestions",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.4
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.0,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_symtable",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.5
-      },
-      "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
-        "error": "error[HYD0002]: module '_symtable' not found: not supported on the import search path"
+        "duration_ms": 2.3,
+        "error": "error[HYD0002]: module '_sha3' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_symtable' not found: not supported on the import search path"
+      "error": "error[HYD0002]: module '_sha3' not found: not supported on the import search path"
     },
     {
-      "name": "_sysconfig",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.2
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.4,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_thread",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.7
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 3.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_threading_local",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 13.0
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 107.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_tkinter",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.9
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.8,
-        "error": "error[HYD0002]: module '_tkinter' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_tkinter' not found: not supported on the import search path"
-    },
-    {
-      "name": "_tokenize",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.0
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.4,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "_tracemalloc",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.7
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.6,
-        "error": "error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path"
-    },
-    {
-      "name": "_types",
+      "name": "_signal",
       "layer": "builtin/frozen",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
         "duration_ms": 8.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.0,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_sitebuiltins",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 15.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_socket",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.8
       },
       "tea": {
         "exit": 0,
@@ -1843,7 +1520,292 @@
       "error": null
     },
     {
-      "name": "_typing",
+      "name": "_sqlite3",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 10.2
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.7,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_sre",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.5
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.5,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_ssl",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.0
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 1.8,
+        "error": "error[HYD0002]: module '_ssl' not found: not supported on the import search path"
+      },
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: module '_ssl' not found: not supported on the import search path"
+    },
+    {
+      "name": "_stat",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.1
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.7,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_statistics",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.1
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.9,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_string",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.6
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.9,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_strptime",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 17.2
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 157.4,
+        "error": "error[HYD0103]: a positional argument cannot follow a starred argument"
+      },
+      "status": "compile_error:HYD0103",
+      "error": "error[HYD0103]: a positional argument cannot follow a starred argument"
+    },
+    {
+      "name": "_struct",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.7
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.2,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_suggestions",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.6
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.9,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_symtable",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.5
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 2.8,
+        "error": "error[HYD0002]: module '_symtable' not found: not supported on the import search path"
+      },
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: module '_symtable' not found: not supported on the import search path"
+    },
+    {
+      "name": "_sysconfig",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.0
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.7,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_thread",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.2
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.1,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_threading_local",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 12.6
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 107.0,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_tkinter",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 10.0
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 2.6,
+        "error": "error[HYD0002]: module '_tkinter' not found: not supported on the import search path"
+      },
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: module '_tkinter' not found: not supported on the import search path"
+    },
+    {
+      "name": "_tokenize",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.4,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_tracemalloc",
       "layer": "builtin/frozen",
       "cpython": {
         "exit": 0,
@@ -1852,10 +1814,48 @@
         "duration_ms": 7.8
       },
       "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 2.3,
+        "error": "error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path"
+      },
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path"
+    },
+    {
+      "name": "_types",
+      "layer": "builtin/frozen",
+      "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.6,
+        "duration_ms": 8.5
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.9,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "_typing",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.7,
         "error": null
       },
       "status": "ok",
@@ -1868,13 +1868,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.6
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.4,
+        "duration_ms": 3.1,
         "error": null
       },
       "status": "ok",
@@ -1887,13 +1887,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 8.8
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.4,
+        "duration_ms": 3.3,
         "error": null
       },
       "status": "ok",
@@ -1906,13 +1906,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 9.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 3.0,
         "error": null
       },
       "status": "ok",
@@ -1925,13 +1925,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 8.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 29.2,
+        "duration_ms": 30.6,
         "error": null
       },
       "status": "ok",
@@ -1944,13 +1944,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 24.3
+        "duration_ms": 25.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 2.2,
         "error": "error[HYD0002]: module '_winapi' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -1963,13 +1963,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 24.3
+        "duration_ms": 24.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module '_wmi' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -1982,13 +1982,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.5
+        "duration_ms": 11.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.8,
+        "duration_ms": 3.4,
         "error": null
       },
       "status": "ok",
@@ -2001,17 +2001,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 9.6
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 1.7,
-        "error": "error[HYD0002]: module '_zstd' not found: not supported on the import search path"
+        "duration_ms": 3.8,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_zstd' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "abc",
@@ -2026,7 +2026,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 3.6,
+        "duration_ms": 3.0,
         "error": null
       },
       "status": "ok",
@@ -2039,13 +2039,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.7
+        "duration_ms": 10.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.5,
+        "duration_ms": 2.6,
         "error": null
       },
       "status": "ok",
@@ -2058,13 +2058,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 165.7
+        "duration_ms": 175.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 19.3,
+        "duration_ms": 19.2,
         "error": "error[HYD0201]: module 'os' has no attribute 'startfile'"
       },
       "status": "compile_error:HYD0201",
@@ -2077,13 +2077,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.7
+        "duration_ms": 16.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.7,
+        "duration_ms": 3.9,
         "error": null
       },
       "status": "ok",
@@ -2096,13 +2096,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.6
+        "duration_ms": 10.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.9,
+        "duration_ms": 3.3,
         "error": null
       },
       "status": "ok",
@@ -2115,7 +2115,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.7
+        "duration_ms": 10.3
       },
       "tea": {
         "exit": 0,
@@ -2134,13 +2134,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 43.4
+        "duration_ms": 41.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 3.4,
+        "duration_ms": 4.4,
         "error": null
       },
       "status": "ok",
@@ -2153,13 +2153,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.5
+        "duration_ms": 8.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 3.0,
+        "duration_ms": 2.8,
         "error": null
       },
       "status": "ok",
@@ -2172,13 +2172,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.2
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.5,
+        "duration_ms": 2.9,
         "error": null
       },
       "status": "ok",
@@ -2191,13 +2191,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.7
+        "duration_ms": 19.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 206.4,
+        "duration_ms": 208.1,
         "error": null
       },
       "status": "ok",
@@ -2210,13 +2210,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.0
+        "duration_ms": 9.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.5,
+        "duration_ms": 3.5,
         "error": null
       },
       "status": "ok",
@@ -2229,13 +2229,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 2.9,
         "error": null
       },
       "status": "ok",
@@ -2248,13 +2248,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.3
+        "duration_ms": 8.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 3.4,
         "error": null
       },
       "status": "ok",
@@ -2267,17 +2267,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
+        "duration_ms": 8.8
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 2.5,
-        "error": "error[HYD0002]: module '_bz2' not found: not supported on the import search path"
+        "duration_ms": 59.3,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_bz2' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "cProfile",
@@ -2286,13 +2286,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 13.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 3.3,
+        "duration_ms": 4.9,
         "error": "error[HYD0002]: module '_lsprof' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -2305,17 +2305,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.2
+        "duration_ms": 14.2
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 367.4,
-        "error": "AttributeError: 'super' object has no attribute '__setitem__'"
+        "duration_ms": 390.2,
+        "error": "TypeError: MappingProxyType() takes no arguments"
       },
       "status": "runtime_error",
-      "error": "AttributeError: 'super' object has no attribute '__setitem__'"
+      "error": "TypeError: MappingProxyType() takes no arguments"
     },
     {
       "name": "cmath",
@@ -2324,13 +2324,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
+        "duration_ms": 8.9
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.5,
+        "duration_ms": 2.8,
         "error": null
       },
       "status": "ok",
@@ -2343,17 +2343,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 8.4
       },
       "tea": {
-        "exit": 0,
-        "ok": true,
+        "exit": 1,
+        "ok": false,
         "timed_out": false,
-        "duration_ms": 48.2,
-        "error": null
+        "duration_ms": 8.7,
+        "error": "error[HYD0201]: module 'readline' has no attribute 'backend'"
       },
-      "status": "ok",
-      "error": null
+      "status": "compile_error:HYD0201",
+      "error": "error[HYD0201]: module 'readline' has no attribute 'backend'"
     },
     {
       "name": "code",
@@ -2362,17 +2362,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 24.7
+        "duration_ms": 24.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 93.8,
-        "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
+        "duration_ms": 96.2,
+        "error": "error[HYD0201]: type 'None' has no method '_generate_suggestions'"
       },
       "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
+      "error": "error[HYD0201]: type 'None' has no method '_generate_suggestions'"
     },
     {
       "name": "codecs",
@@ -2381,13 +2381,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.6,
+        "duration_ms": 3.0,
         "error": null
       },
       "status": "ok",
@@ -2400,13 +2400,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 8.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 20.9,
+        "duration_ms": 20.8,
         "error": null
       },
       "status": "ok",
@@ -2419,13 +2419,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 9.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.4,
+        "duration_ms": 2.9,
         "error": null
       },
       "status": "ok",
@@ -2438,13 +2438,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 8.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.6,
+        "duration_ms": 2.5,
         "error": null
       },
       "status": "ok",
@@ -2457,17 +2457,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 25.9
+        "duration_ms": 28.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 194.3,
-        "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
+        "duration_ms": 199.3,
+        "error": "error[HYD0201]: type 'None' has no method '_generate_suggestions'"
       },
       "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
+      "error": "error[HYD0201]: type 'None' has no method '_generate_suggestions'"
     },
     {
       "name": "compression",
@@ -2476,7 +2476,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 0,
@@ -2495,13 +2495,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 7.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 3.7,
+        "duration_ms": 4.6,
         "error": null
       },
       "status": "ok",
@@ -2514,13 +2514,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.6
+        "duration_ms": 14.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 193.0,
+        "duration_ms": 194.2,
         "error": null
       },
       "status": "ok",
@@ -2533,13 +2533,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.8
+        "duration_ms": 11.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.7,
+        "duration_ms": 2.9,
         "error": null
       },
       "status": "ok",
@@ -2552,13 +2552,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 8.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 2.9,
         "error": null
       },
       "status": "ok",
@@ -2571,13 +2571,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.4
+        "duration_ms": 9.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 129.1,
+        "duration_ms": 130.2,
         "error": null
       },
       "status": "ok",
@@ -2590,13 +2590,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 24.7,
+        "duration_ms": 25.0,
         "error": null
       },
       "status": "ok",
@@ -2609,13 +2609,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 8.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.6,
+        "duration_ms": 2.7,
         "error": null
       },
       "status": "ok",
@@ -2634,7 +2634,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 3.5,
         "error": null
       },
       "status": "ok",
@@ -2647,17 +2647,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.3,
-        "error": "error[HYD0002]: module '_curses' not found: not supported on the import search path"
+        "duration_ms": 53.4,
+        "error": "AttributeError: module '_curses' has no attribute 'ACS_ULCORNER'"
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_curses' not found: not supported on the import search path"
+      "status": "runtime_error",
+      "error": "AttributeError: module '_curses' has no attribute 'ACS_ULCORNER'"
     },
     {
       "name": "dataclasses",
@@ -2666,13 +2666,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.1
+        "duration_ms": 20.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.7,
+        "duration_ms": 3.5,
         "error": null
       },
       "status": "ok",
@@ -2685,13 +2685,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 8.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 3.2,
         "error": null
       },
       "status": "ok",
@@ -2704,13 +2704,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 8.8
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 18.8,
+        "duration_ms": 20.5,
         "error": null
       },
       "status": "ok",
@@ -2723,13 +2723,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.8
+        "duration_ms": 10.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 2.9,
         "error": null
       },
       "status": "ok",
@@ -2742,13 +2742,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 9.5
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 181.1,
+        "duration_ms": 219.4,
         "error": null
       },
       "status": "ok",
@@ -2761,13 +2761,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.1
+        "duration_ms": 13.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 168.5,
+        "duration_ms": 194.6,
         "error": null
       },
       "status": "ok",
@@ -2780,17 +2780,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 58.7
+        "duration_ms": 76.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 256.7,
-        "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
+        "duration_ms": 160.3,
+        "error": "error[HYD0201]: module 'readline' has no attribute 'backend'"
       },
       "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
+      "error": "error[HYD0201]: module 'readline' has no attribute 'backend'"
     },
     {
       "name": "email",
@@ -2799,13 +2799,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 11.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.0,
+        "duration_ms": 13.1,
         "error": null
       },
       "status": "ok",
@@ -2818,13 +2818,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
+        "duration_ms": 11.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 50.2,
+        "duration_ms": 66.7,
         "error": null
       },
       "status": "ok",
@@ -2837,13 +2837,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 30.9
+        "duration_ms": 42.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 26.1,
+        "duration_ms": 34.0,
         "error": null
       },
       "status": "ok",
@@ -2856,13 +2856,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 11.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 270.2,
+        "duration_ms": 324.0,
         "error": null
       },
       "status": "ok",
@@ -2875,13 +2875,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 10.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.7,
+        "duration_ms": 3.7,
         "error": null
       },
       "status": "ok",
@@ -2894,13 +2894,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 9.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 3.7,
         "error": null
       },
       "status": "ok",
@@ -2913,13 +2913,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.4
+        "duration_ms": 11.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 3.9,
         "error": null
       },
       "status": "ok",
@@ -2932,13 +2932,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 10.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 34.9,
+        "duration_ms": 43.1,
         "error": null
       },
       "status": "ok",
@@ -2951,17 +2951,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 14.7
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 7.4,
-        "error": "error[HYD0201]: module 'os' has no attribute 'chmod'"
+        "duration_ms": 60.7,
+        "error": null
       },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module 'os' has no attribute 'chmod'"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "fnmatch",
@@ -2970,13 +2970,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.3
+        "duration_ms": 15.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.5,
+        "duration_ms": 3.7,
         "error": null
       },
       "status": "ok",
@@ -2989,7 +2989,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.0
+        "duration_ms": 17.2
       },
       "tea": {
         "exit": 0,
@@ -3008,17 +3008,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.6
+        "duration_ms": 17.0
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 27.3,
-        "error": "error[HYD0201]: module 'ssl' has no attribute '_create_stdlib_context'"
+        "duration_ms": 128.0,
+        "error": null
       },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module 'ssl' has no attribute '_create_stdlib_context'"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "functools",
@@ -3027,13 +3027,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 16.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.4,
+        "duration_ms": 4.7,
         "error": null
       },
       "status": "ok",
@@ -3046,13 +3046,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.4
+        "duration_ms": 12.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 4.0,
         "error": null
       },
       "status": "ok",
@@ -3065,13 +3065,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.5
+        "duration_ms": 10.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 22.7,
+        "duration_ms": 30.6,
         "error": null
       },
       "status": "ok",
@@ -3084,13 +3084,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.7
+        "duration_ms": 11.9
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 4.2,
         "error": null
       },
       "status": "ok",
@@ -3103,13 +3103,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.5
+        "duration_ms": 15.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 26.1,
+        "duration_ms": 38.5,
         "error": null
       },
       "status": "ok",
@@ -3122,13 +3122,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 12.8
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 66.4,
+        "duration_ms": 77.3,
         "error": null
       },
       "status": "ok",
@@ -3141,13 +3141,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.4
+        "duration_ms": 16.8
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 61.4,
+        "duration_ms": 73.5,
         "error": null
       },
       "status": "ok",
@@ -3160,13 +3160,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.9
+        "duration_ms": 11.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 26.0,
+        "duration_ms": 31.4,
         "error": null
       },
       "status": "ok",
@@ -3179,13 +3179,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
+        "duration_ms": 9.8
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 3.9,
         "error": null
       },
       "status": "ok",
@@ -3198,13 +3198,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.9
+        "duration_ms": 14.9
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 167.7,
+        "duration_ms": 188.6,
         "error": null
       },
       "status": "ok",
@@ -3217,13 +3217,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 13.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 5.0,
         "error": null
       },
       "status": "ok",
@@ -3236,463 +3236,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.1,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "hmac",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.7
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 31.5,
-        "error": "AttributeError: 'NoneType' object has no attribute 'compare_digest'"
-      },
-      "status": "runtime_error",
-      "error": "AttributeError: 'NoneType' object has no attribute 'compare_digest'"
-    },
-    {
-      "name": "html",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 14.2
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.8,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "http",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.3
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "idlelib",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.7
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 5.8,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "imaplib",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 22.4
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 188.5,
-        "error": "error[HYD0201]: module 'ssl' has no attribute '_create_stdlib_context'"
-      },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module 'ssl' has no attribute '_create_stdlib_context'"
-    },
-    {
-      "name": "importlib",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.5
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "inspect",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 18.2
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.4,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "io",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.6
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "ipaddress",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 11.5
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 240.3,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "itertools",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.9
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "json",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 14.0
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.4,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "keyword",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.9
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "linecache",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.5
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 29.8,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "locale",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 10.9
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.3,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "logging",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 25.6
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 99.6,
-        "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
-      },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
-    },
-    {
-      "name": "lzma",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.1
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 4.1,
-        "error": "error[HYD0002]: module '_lzma' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_lzma' not found: not supported on the import search path"
-    },
-    {
-      "name": "mailbox",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 24.1
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 303.8,
-        "error": "error[HYD0201]: module 'binascii' has no attribute 'a2b_uu'"
-      },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module 'binascii' has no attribute 'a2b_uu'"
-    },
-    {
-      "name": "marshal",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.7
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 3.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "math",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.3
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.3,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "mimetypes",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.0
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "mmap",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.3
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "modulefinder",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 10.8
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 229.7,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "msvcrt",
-      "layer": "unknown",
-      "cpython": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 24.5
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.9,
-        "error": "error[HYD0002]: module 'msvcrt' not found: not supported on the import search path"
-      },
-      "status": "cpython_failed",
-      "error": "error[HYD0002]: module 'msvcrt' not found: not supported on the import search path"
-    },
-    {
-      "name": "multiprocessing",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 15.8
+        "duration_ms": 10.7
       },
       "tea": {
         "exit": 0,
@@ -3705,51 +3249,393 @@
       "error": null
     },
     {
-      "name": "netrc",
+      "name": "hmac",
       "layer": "pure",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.4
+        "duration_ms": 12.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 28.1,
+        "duration_ms": 38.2,
         "error": null
       },
       "status": "ok",
       "error": null
     },
     {
-      "name": "nt",
-      "layer": "unknown",
+      "name": "html",
+      "layer": "pure",
       "cpython": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 26.5
+        "duration_ms": 21.3
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.9,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "http",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 10.9
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.5,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "idlelib",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 10.3
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "imaplib",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 29.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.8,
-        "error": "error[HYD0002]: module 'nt' not found: not supported on the import search path"
+        "duration_ms": 225.6,
+        "error": "error[HYD0103]: Popen() got an unexpected keyword argument 'bufsize'"
       },
-      "status": "cpython_failed",
-      "error": "error[HYD0002]: module 'nt' not found: not supported on the import search path"
+      "status": "compile_error:HYD0103",
+      "error": "error[HYD0103]: Popen() got an unexpected keyword argument 'bufsize'"
     },
     {
-      "name": "ntpath",
+      "name": "importlib",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 11.7
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.7,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "inspect",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 24.0
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 4.0,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "io",
       "layer": "builtin/frozen",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.1
+        "duration_ms": 10.9
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 4.5,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "ipaddress",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 15.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 282.1,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "itertools",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 11.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 5.4,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "json",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 17.6
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 4.2,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "keyword",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.1
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 4.2,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "linecache",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 10.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 39.0,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "locale",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 15.6
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 4.5,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "logging",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 33.8
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 127.2,
+        "error": "error[HYD0201]: type 'None' has no method '_generate_suggestions'"
+      },
+      "status": "compile_error:HYD0201",
+      "error": "error[HYD0201]: type 'None' has no method '_generate_suggestions'"
+    },
+    {
+      "name": "lzma",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 12.2
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 71.5,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "mailbox",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 31.2
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 376.1,
+        "error": "error[HYD0002]: class-body import binding 'walk' is not supported: only native modules and their members can be stored in a class namespace"
+      },
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: class-body import binding 'walk' is not supported: only native modules and their members can be stored in a class namespace"
+    },
+    {
+      "name": "marshal",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 11.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.9,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "math",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.7
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.5,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "mimetypes",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 10.2
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.4,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "mmap",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.1
       },
       "tea": {
         "exit": 0,
@@ -3762,23 +3648,137 @@
       "error": null
     },
     {
+      "name": "modulefinder",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 12.1
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 263.5,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "msvcrt",
+      "layer": "unknown",
+      "cpython": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 32.5
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 3.4,
+        "error": "error[HYD0002]: module 'msvcrt' not found: not supported on the import search path"
+      },
+      "status": "cpython_failed",
+      "error": "error[HYD0002]: module 'msvcrt' not found: not supported on the import search path"
+    },
+    {
+      "name": "multiprocessing",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 22.6
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 4.4,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "netrc",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 10.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 28.5,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "nt",
+      "layer": "unknown",
+      "cpython": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 26.4
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 2.4,
+        "error": "error[HYD0002]: module 'nt' not found: not supported on the import search path"
+      },
+      "status": "cpython_failed",
+      "error": "error[HYD0002]: module 'nt' not found: not supported on the import search path"
+    },
+    {
+      "name": "ntpath",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.9
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.2,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
       "name": "nturl2path",
       "layer": "pure",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.6
+        "duration_ms": 13.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.2,
-        "error": "error[HYD0201]: module 'ntpath' has no attribute 'splitroot'"
+        "duration_ms": 10.3,
+        "error": "TypeError: _deprecated() got an unexpected keyword argument 'message'"
       },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module 'ntpath' has no attribute 'splitroot'"
+      "status": "runtime_error",
+      "error": "TypeError: _deprecated() got an unexpected keyword argument 'message'"
     },
     {
       "name": "numbers",
@@ -3787,13 +3787,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.8
+        "duration_ms": 9.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 35.4,
+        "duration_ms": 37.8,
         "error": null
       },
       "status": "ok",
@@ -3806,13 +3806,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.9
+        "duration_ms": 8.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 39.2,
+        "duration_ms": 37.7,
         "error": null
       },
       "status": "ok",
@@ -3825,7 +3825,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.3
+        "duration_ms": 10.3
       },
       "tea": {
         "exit": 0,
@@ -3844,13 +3844,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.1
+        "duration_ms": 13.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 232.7,
+        "duration_ms": 219.6,
         "error": "TypeError: FileNotFoundError() takes at most 1 argument (3 given)"
       },
       "status": "runtime_error",
@@ -3863,13 +3863,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 9.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.5,
+        "duration_ms": 3.0,
         "error": null
       },
       "status": "ok",
@@ -3882,45 +3882,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.2
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "pdb",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 48.4
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 182.4,
-        "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
-      },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
-    },
-    {
-      "name": "pickle",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 11.3
+        "duration_ms": 14.4
       },
       "tea": {
         "exit": 0,
@@ -3933,23 +3895,61 @@
       "error": null
     },
     {
+      "name": "pdb",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 45.0
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 40.9,
+        "error": "error[HYD0201]: module 'readline' has no attribute 'backend'"
+      },
+      "status": "compile_error:HYD0201",
+      "error": "error[HYD0201]: module 'readline' has no attribute 'backend'"
+    },
+    {
+      "name": "pickle",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 11.9
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.1,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
       "name": "pickletools",
       "layer": "pure",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.8
+        "duration_ms": 15.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 210.7,
-        "error": "AssertionError:"
+        "duration_ms": 229.6,
+        "error": "name 'BINPERSID' with code 'Q'"
       },
       "status": "runtime_error",
-      "error": "AssertionError:"
+      "error": "name 'BINPERSID' with code 'Q'"
     },
     {
       "name": "pkgutil",
@@ -3958,13 +3958,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.6
+        "duration_ms": 11.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 42.5,
+        "duration_ms": 42.0,
         "error": null
       },
       "status": "ok",
@@ -3983,7 +3983,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.6,
+        "duration_ms": 3.0,
         "error": null
       },
       "status": "ok",
@@ -3996,17 +3996,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.4
+        "duration_ms": 14.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 8.3,
-        "error": "error[HYD0002]: module 'pyexpat' not found: not supported on the import search path"
+        "duration_ms": 132.5,
+        "error": "error[HYD0201]: module 'os' has no attribute 'SEEK_END'"
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module 'pyexpat' not found: not supported on the import search path"
+      "status": "compile_error:HYD0201",
+      "error": "error[HYD0201]: module 'os' has no attribute 'SEEK_END'"
     },
     {
       "name": "poplib",
@@ -4015,17 +4015,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 17.3
+        "duration_ms": 17.0
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 6.1,
-        "error": "error[HYD0201]: module 'ssl' has no attribute '_create_stdlib_context'"
+        "duration_ms": 40.6,
+        "error": null
       },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module 'ssl' has no attribute '_create_stdlib_context'"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "posix",
@@ -4034,13 +4034,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.7
+        "duration_ms": 9.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.5,
+        "duration_ms": 3.2,
         "error": null
       },
       "status": "ok",
@@ -4053,368 +4053,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "pprint",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.6
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 86.9,
-        "error": "AttributeError: 'function' object has no attribute '__repr__'"
-      },
-      "status": "runtime_error",
-      "error": "AttributeError: 'function' object has no attribute '__repr__'"
-    },
-    {
-      "name": "profile",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.5
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 58.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "pstats",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 20.0
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 325.4,
-        "error": "AttributeError: 'super' object has no attribute '__setitem__'"
-      },
-      "status": "runtime_error",
-      "error": "AttributeError: 'super' object has no attribute '__setitem__'"
-    },
-    {
-      "name": "pty",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.9
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 4.5,
-        "error": "error[HYD0201]: module 'fcntl' has no attribute 'I_PUSH'"
-      },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module 'fcntl' has no attribute 'I_PUSH'"
-    },
-    {
-      "name": "pwd",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.4
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.8,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "py_compile",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 24.9
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 194.7,
-        "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
-      },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
-    },
-    {
-      "name": "pyclbr",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 10.9
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 40.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "pydoc",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 27.6
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 65.8,
-        "error": "error[HYD0201]: module '_frozen_importlib' has no attribute '_gcd_import'"
-      },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module '_frozen_importlib' has no attribute '_gcd_import'"
-    },
-    {
-      "name": "pydoc_data",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.7
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 4.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "pyexpat",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.7
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.8,
-        "error": "error[HYD0002]: module 'pyexpat' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module 'pyexpat' not found: not supported on the import search path"
-    },
-    {
-      "name": "queue",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 10.4
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "quopri",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.4
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.3,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "random",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.5
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.1,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "re",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 11.6
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "readline",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.9
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 1.6,
-        "error": "error[HYD0002]: module 'readline' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module 'readline' not found: not supported on the import search path"
-    },
-    {
-      "name": "reprlib",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.8
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 31.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "resource",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.1
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.0,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "rlcompleter",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 18.3
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 25.8,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "runpy",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.5
+        "duration_ms": 7.6
       },
       "tea": {
         "exit": 0,
@@ -4427,19 +4066,380 @@
       "error": null
     },
     {
+      "name": "pprint",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.5
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 82.4,
+        "error": "AttributeError: 'function' object has no attribute '__repr__'"
+      },
+      "status": "runtime_error",
+      "error": "AttributeError: 'function' object has no attribute '__repr__'"
+    },
+    {
+      "name": "profile",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.0
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 58.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "pstats",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 20.5
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 339.0,
+        "error": "AttributeError: 'function' object has no attribute '__func__'"
+      },
+      "status": "runtime_error",
+      "error": "AttributeError: 'function' object has no attribute '__func__'"
+    },
+    {
+      "name": "pty",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.0
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 5.1,
+        "error": "error[HYD0201]: module 'fcntl' has no attribute 'I_PUSH'"
+      },
+      "status": "compile_error:HYD0201",
+      "error": "error[HYD0201]: module 'fcntl' has no attribute 'I_PUSH'"
+    },
+    {
+      "name": "pwd",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.8
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.2,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "py_compile",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 23.6
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 197.2,
+        "error": "error[HYD0201]: type 'None' has no method '_generate_suggestions'"
+      },
+      "status": "compile_error:HYD0201",
+      "error": "error[HYD0201]: type 'None' has no method '_generate_suggestions'"
+    },
+    {
+      "name": "pyclbr",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 11.3
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 40.4,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "pydoc",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 26.8
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 66.1,
+        "error": "error[HYD0201]: module '_frozen_importlib' has no attribute '_find_spec'"
+      },
+      "status": "compile_error:HYD0201",
+      "error": "error[HYD0201]: module '_frozen_importlib' has no attribute '_find_spec'"
+    },
+    {
+      "name": "pydoc_data",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.5
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 4.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "pyexpat",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.5
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.0,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "queue",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 10.8
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.9,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "quopri",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.7
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.7,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "random",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.3
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.9,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "re",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 11.9
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.6,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "readline",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.5
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.6,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "reprlib",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.9
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 32.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "resource",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.6
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "rlcompleter",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 18.8
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 4.1,
+        "error": "error[HYD0201]: module 'readline' has no attribute 'redisplay'"
+      },
+      "status": "compile_error:HYD0201",
+      "error": "error[HYD0201]: module 'readline' has no attribute 'redisplay'"
+    },
+    {
+      "name": "runpy",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.8
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
       "name": "sched",
       "layer": "pure",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 10.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 23.5,
+        "duration_ms": 26.2,
         "error": null
       },
       "status": "ok",
@@ -4452,17 +4452,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 10.8
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 34.4,
-        "error": "AttributeError: 'NoneType' object has no attribute 'compare_digest'"
+        "duration_ms": 35.9,
+        "error": null
       },
-      "status": "runtime_error",
-      "error": "AttributeError: 'NoneType' object has no attribute 'compare_digest'"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "select",
@@ -4471,13 +4471,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.8
+        "duration_ms": 9.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.4,
+        "duration_ms": 3.4,
         "error": null
       },
       "status": "ok",
@@ -4490,13 +4490,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.4
+        "duration_ms": 9.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 2.8,
         "error": null
       },
       "status": "ok",
@@ -4509,13 +4509,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.3
+        "duration_ms": 10.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 34.5,
+        "duration_ms": 35.8,
         "error": null
       },
       "status": "ok",
@@ -4528,13 +4528,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 37.5,
+        "duration_ms": 36.9,
         "error": null
       },
       "status": "ok",
@@ -4547,13 +4547,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.2
+        "duration_ms": 14.8
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 2.8,
         "error": null
       },
       "status": "ok",
@@ -4566,17 +4566,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.7
+        "duration_ms": 10.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 273.0,
-        "error": "AttributeError: 'super' object has no attribute '__setitem__'"
+        "duration_ms": 297.7,
+        "error": "TypeError: _add_alias_() missing required argument 'name'"
       },
       "status": "runtime_error",
-      "error": "AttributeError: 'super' object has no attribute '__setitem__'"
+      "error": "TypeError: _add_alias_() missing required argument 'name'"
     },
     {
       "name": "site",
@@ -4585,13 +4585,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.3
+        "duration_ms": 8.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 3.0,
         "error": null
       },
       "status": "ok",
@@ -4604,17 +4604,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 23.4
+        "duration_ms": 24.1
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 177.7,
-        "error": "error[HYD0201]: module 'binascii' has no attribute 'a2b_uu'"
+        "duration_ms": 175.9,
+        "error": "error[HYD0002]: class-body import binding 'walk' is not supported: only native modules and their members can be stored in a class namespace"
       },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module 'binascii' has no attribute 'a2b_uu'"
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: class-body import binding 'walk' is not supported: only native modules and their members can be stored in a class namespace"
     },
     {
       "name": "socket",
@@ -4623,13 +4623,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.8
+        "duration_ms": 11.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.8,
+        "duration_ms": 3.3,
         "error": null
       },
       "status": "ok",
@@ -4648,7 +4648,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 86.9,
+        "duration_ms": 83.7,
         "error": null
       },
       "status": "ok",
@@ -4661,17 +4661,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.2
+        "duration_ms": 11.7
       },
       "tea": {
-        "exit": 1,
-        "ok": false,
+        "exit": 0,
+        "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
-        "error": "error[HYD0002]: module '_sqlite3' not found: not supported on the import search path"
+        "duration_ms": 3.0,
+        "error": null
       },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_sqlite3' not found: not supported on the import search path"
+      "status": "ok",
+      "error": null
     },
     {
       "name": "sre_compile",
@@ -4680,13 +4680,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.7
+        "duration_ms": 13.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 5.3,
+        "duration_ms": 5.7,
         "error": null
       },
       "status": "ok",
@@ -4699,13 +4699,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.2
+        "duration_ms": 14.5
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 4.8,
+        "duration_ms": 5.8,
         "error": null
       },
       "status": "ok",
@@ -4718,13 +4718,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 12.8
+        "duration_ms": 13.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 5.3,
+        "duration_ms": 6.2,
         "error": null
       },
       "status": "ok",
@@ -4737,13 +4737,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.5
+        "duration_ms": 14.2
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 2.6,
         "error": null
       },
       "status": "ok",
@@ -4756,13 +4756,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.3
+        "duration_ms": 7.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.1,
+        "duration_ms": 3.0,
         "error": null
       },
       "status": "ok",
@@ -4775,13 +4775,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.1
+        "duration_ms": 16.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 4.1,
         "error": null
       },
       "status": "ok",
@@ -4794,7 +4794,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.1
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 0,
@@ -4813,7 +4813,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.7
+        "duration_ms": 8.5
       },
       "tea": {
         "exit": 0,
@@ -4832,13 +4832,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 9.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.2,
+        "duration_ms": 3.7,
         "error": null
       },
       "status": "ok",
@@ -4851,13 +4851,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 14.3
+        "duration_ms": 14.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.8,
+        "duration_ms": 2.7,
         "error": null
       },
       "status": "ok",
@@ -4870,13 +4870,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.0
+        "duration_ms": 9.5
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 8.6,
+        "duration_ms": 9.9,
         "error": "error[HYD0002]: module '_symtable' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -4889,254 +4889,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.3,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "sysconfig",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.9
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.1,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "syslog",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.2
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 1.9,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "tabnanny",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 13.4
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 109.2,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "tarfile",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 17.6
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 193.6,
-        "error": "error[HYD0201]: module 'os' has no attribute 'mknod'"
-      },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module 'os' has no attribute 'mknod'"
-    },
-    {
-      "name": "tempfile",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 16.8
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 3.1,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "termios",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.3
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.1,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "textwrap",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 19.3
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.5,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "this",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.5
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.1,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "threading",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.7
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.1,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "time",
-      "layer": "builtin/frozen",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.0
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.0,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "timeit",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.9
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.6,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "tkinter",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 15.4
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 16.3,
-        "error": "error[HYD0002]: module '_tkinter' not found: not supported on the import search path"
-      },
-      "status": "compile_error:HYD0002",
-      "error": "error[HYD0002]: module '_tkinter' not found: not supported on the import search path"
-    },
-    {
-      "name": "token",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 8.1
       },
       "tea": {
         "exit": 0,
@@ -5149,19 +4902,266 @@
       "error": null
     },
     {
+      "name": "sysconfig",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.4,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "syslog",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.2
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.3,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "tabnanny",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 15.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 101.0,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "tarfile",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 19.3
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 197.5,
+        "error": "error[HYD0201]: module 'os' has no attribute 'makedev'"
+      },
+      "status": "compile_error:HYD0201",
+      "error": "error[HYD0201]: module 'os' has no attribute 'makedev'"
+    },
+    {
+      "name": "tempfile",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 17.4
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.3,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "termios",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.7
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.2,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "textwrap",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 14.5
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 4.4,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "this",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 11.0
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.9,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "threading",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 9.5
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.8,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "time",
+      "layer": "builtin/frozen",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.1
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.6,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "timeit",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.7
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.3,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "tkinter",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 16.8
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 17.6,
+        "error": "error[HYD0002]: module '_tkinter' not found: not supported on the import search path"
+      },
+      "status": "compile_error:HYD0002",
+      "error": "error[HYD0002]: module '_tkinter' not found: not supported on the import search path"
+    },
+    {
+      "name": "token",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.8
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.6,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
       "name": "tokenize",
       "layer": "pure",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.1
+        "duration_ms": 13.6
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 74.1,
+        "duration_ms": 76.3,
         "error": null
       },
       "status": "ok",
@@ -5180,11 +5180,11 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 22.1,
-        "error": "error[HYD0103]: str.count() takes 1 positional argument(s) (3 given)"
+        "duration_ms": 91.7,
+        "error": "TypeError: MappingProxyType() takes no arguments"
       },
-      "status": "compile_error:HYD0103",
-      "error": "error[HYD0103]: str.count() takes 1 positional argument(s) (3 given)"
+      "status": "runtime_error",
+      "error": "TypeError: MappingProxyType() takes no arguments"
     },
     {
       "name": "trace",
@@ -5193,13 +5193,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.9
+        "duration_ms": 20.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 324.8,
+        "duration_ms": 311.1,
         "error": null
       },
       "status": "ok",
@@ -5212,17 +5212,17 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 24.9
+        "duration_ms": 25.7
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 97.3,
-        "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
+        "duration_ms": 96.6,
+        "error": "error[HYD0201]: type 'None' has no method '_generate_suggestions'"
       },
       "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
+      "error": "error[HYD0201]: type 'None' has no method '_generate_suggestions'"
     },
     {
       "name": "tracemalloc",
@@ -5231,13 +5231,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 15.4
+        "duration_ms": 14.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 4.1,
+        "duration_ms": 4.7,
         "error": "error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5250,13 +5250,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 9.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 33.0,
+        "duration_ms": 30.9,
         "error": null
       },
       "status": "ok",
@@ -5269,13 +5269,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 34.9
+        "duration_ms": 35.4
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 30.1,
+        "duration_ms": 27.0,
         "error": "error[HYD0002]: module '_tkinter' not found: not supported on the import search path"
       },
       "status": "compile_error:HYD0002",
@@ -5288,13 +5288,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.0
+        "duration_ms": 8.0
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 5.7,
+        "duration_ms": 6.5,
         "error": null
       },
       "status": "ok",
@@ -5307,13 +5307,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.2
+        "duration_ms": 8.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.6,
+        "duration_ms": 2.8,
         "error": null
       },
       "status": "ok",
@@ -5326,121 +5326,7 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 13.2
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 3.3,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "unicodedata",
-      "layer": "extension",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.2
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 2.9,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "unittest",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 32.8
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 3.1,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "urllib",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 8.4
-      },
-      "tea": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 3.8,
-        "error": null
-      },
-      "status": "ok",
-      "error": null
-    },
-    {
-      "name": "uuid",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 10.2
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 342.2,
-        "error": "AttributeError: 'super' object has no attribute '__setitem__'"
-      },
-      "status": "runtime_error",
-      "error": "AttributeError: 'super' object has no attribute '__setitem__'"
-    },
-    {
-      "name": "venv",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 30.9
-      },
-      "tea": {
-        "exit": 1,
-        "ok": false,
-        "timed_out": false,
-        "duration_ms": 98.5,
-        "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
-      },
-      "status": "compile_error:HYD0201",
-      "error": "error[HYD0201]: module '_suggestions' has no attribute '_generate_suggestions'"
-    },
-    {
-      "name": "warnings",
-      "layer": "pure",
-      "cpython": {
-        "exit": 0,
-        "ok": true,
-        "timed_out": false,
-        "duration_ms": 9.1
+        "duration_ms": 12.3
       },
       "tea": {
         "exit": 0,
@@ -5453,19 +5339,133 @@
       "error": null
     },
     {
+      "name": "unicodedata",
+      "layer": "extension",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 7.8
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.5,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "unittest",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 28.1
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 2.7,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "urllib",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.1
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 5.2,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "uuid",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 11.9
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 364.5,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
+      "name": "venv",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 35.3
+      },
+      "tea": {
+        "exit": 1,
+        "ok": false,
+        "timed_out": false,
+        "duration_ms": 106.4,
+        "error": "error[HYD0201]: type 'None' has no method '_generate_suggestions'"
+      },
+      "status": "compile_error:HYD0201",
+      "error": "error[HYD0201]: type 'None' has no method '_generate_suggestions'"
+    },
+    {
+      "name": "warnings",
+      "layer": "pure",
+      "cpython": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 8.8
+      },
+      "tea": {
+        "exit": 0,
+        "ok": true,
+        "timed_out": false,
+        "duration_ms": 3.4,
+        "error": null
+      },
+      "status": "ok",
+      "error": null
+    },
+    {
       "name": "wave",
       "layer": "pure",
       "cpython": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 10.7
+        "duration_ms": 11.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 74.2,
+        "duration_ms": 74.8,
         "error": null
       },
       "status": "ok",
@@ -5478,13 +5478,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 9.6
+        "duration_ms": 9.1
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 89.3,
+        "duration_ms": 93.9,
         "error": null
       },
       "status": "ok",
@@ -5497,13 +5497,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.3
+        "duration_ms": 18.9
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 16.9,
+        "duration_ms": 16.8,
         "error": "error[HYD0201]: module 'os' has no attribute 'startfile'"
       },
       "status": "compile_error:HYD0201",
@@ -5516,13 +5516,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 24.4
+        "duration_ms": 24.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 2.0,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module 'winreg' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -5535,13 +5535,13 @@
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 24.8
+        "duration_ms": 26.6
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 1.9,
+        "duration_ms": 2.7,
         "error": "error[HYD0002]: module 'winsound' not found: not supported on the import search path"
       },
       "status": "cpython_failed",
@@ -5554,13 +5554,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 8.3
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 6.4,
+        "duration_ms": 7.0,
         "error": null
       },
       "status": "ok",
@@ -5573,13 +5573,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.9
+        "duration_ms": 9.4
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 5.3,
+        "duration_ms": 7.2,
         "error": null
       },
       "status": "ok",
@@ -5592,13 +5592,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 7.6
+        "duration_ms": 8.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 3.6,
+        "duration_ms": 4.6,
         "error": null
       },
       "status": "ok",
@@ -5611,13 +5611,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 19.1
+        "duration_ms": 21.8
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 14.9,
+        "duration_ms": 22.5,
         "error": "error[HYD0201]: module 'sys' has no attribute 'pypy_version_info'"
       },
       "status": "compile_error:HYD0201",
@@ -5630,13 +5630,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 18.4
+        "duration_ms": 19.3
       },
       "tea": {
         "exit": 1,
         "ok": false,
         "timed_out": false,
-        "duration_ms": 14.1,
+        "duration_ms": 21.6,
         "error": "error[HYD0201]: module 'sys' has no attribute 'pypy_version_info'"
       },
       "status": "compile_error:HYD0201",
@@ -5649,13 +5649,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.5
+        "duration_ms": 7.7
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.9,
+        "duration_ms": 3.2,
         "error": null
       },
       "status": "ok",
@@ -5668,13 +5668,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 8.0
+        "duration_ms": 9.8
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.4,
+        "duration_ms": 3.4,
         "error": null
       },
       "status": "ok",
@@ -5687,13 +5687,13 @@
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 11.2
+        "duration_ms": 11.5
       },
       "tea": {
         "exit": 0,
         "ok": true,
         "timed_out": false,
-        "duration_ms": 2.3,
+        "duration_ms": 3.4,
         "error": null
       },
       "status": "ok",

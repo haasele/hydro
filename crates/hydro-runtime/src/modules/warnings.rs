@@ -1678,19 +1678,19 @@ pub(crate) fn filters() -> i64 {
     let mut entries = Vec::with_capacity(state.filters.len());
     for filter in &state.filters {
         let action = value::str_alloc(filter.action.as_str().to_string());
-        heap::add_thread_root(action);
+        heap::push_scoped_root(action);
         let message = if filter.message.is_empty() {
             NONE
         } else {
             let message = value::str_alloc(filter.message.clone());
-            heap::add_thread_root(message);
+            heap::push_scoped_root(message);
             message
         };
         let module = if filter.module.is_empty() {
             NONE
         } else {
             let module = value::str_alloc(filter.module.clone());
-            heap::add_thread_root(module);
+            heap::push_scoped_root(module);
             module
         };
         let category = exc::exception_class(filter.category_tag);
@@ -1701,7 +1701,7 @@ pub(crate) fn filters() -> i64 {
             module,
             ops::int_result(filter.lineno),
         ]);
-        heap::add_thread_root(merged);
+        heap::push_scoped_root(merged);
         entries.push(merged);
     }
     let result = value::list_new(entries);

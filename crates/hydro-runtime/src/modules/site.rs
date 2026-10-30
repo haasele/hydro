@@ -32,9 +32,9 @@ fn prefixes() -> i64 {
     let exec_prefix = crate::modules::base_prefix();
     let start = heap::root_values(&[]);
     let prefix = value::str_alloc(prefix);
-    heap::add_thread_root(prefix);
+    heap::push_scoped_root(prefix);
     let exec_prefix = value::str_alloc(exec_prefix);
-    heap::add_thread_root(exec_prefix);
+    heap::push_scoped_root(exec_prefix);
     let result = value::list_new(vec![prefix, exec_prefix]);
     heap::release_roots(start);
     result

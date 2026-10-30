@@ -532,6 +532,7 @@ const HASH_RANGE: u64 = FNV_OFFSET ^ 0x05;
 const HASH_NONE: u64 = FNV_OFFSET ^ 0x06;
 const HASH_IDENTITY: u64 = FNV_OFFSET ^ 0x07;
 const HASH_PATH: u64 = FNV_OFFSET ^ 0x08;
+const HASH_BUILTIN_TYPE: u64 = FNV_OFFSET ^ 0x09;
 
 #[inline]
 fn fnv_mix(hash: u64, word: u64) -> u64 {
@@ -579,6 +580,12 @@ pub(crate) fn key_hash(v: i64) -> u64 {
     }
     if v == NONE {
         return HASH_NONE;
+    }
+    // A builtin type has two runtime spellings (the cached native class
+    // `type(x)` returns and the builtin function value source code names).
+    // Both hash by the type name so dict lookup and [`equals`] agree.
+    if let Some(token) = value::builtin_type_token(v) {
+        return fnv_bytes(HASH_BUILTIN_TYPE, token.as_bytes());
     }
     identity_hash(v)
 }
@@ -643,6 +650,9 @@ pub(crate) fn unhashable_name(v: i64) -> Option<&'static str> {
         Some(view.kind.type_name())
     } else if let Some(items) = value::as_tuple(v) {
         items.iter().find_map(|item| unhashable_name(*item))
+    } else if value::dict_subclass_unhashable(v) {
+        // A `class D(dict)` instance inherits `dict`'s `__hash__ = None`.
+        Some("dict")
     } else {
         None
     }
@@ -2082,6 +2092,14 @@ fn equals_depth(a: i64, b: i64, depth: usize) -> bool {
         // Self-referential containers: treat unconverged comparison as unequal
         // instead of overflowing the stack.
         return false;
+    }
+    // A builtin type's two runtime spellings — the cached native class
+    // `type(x)` returns and the builtin function value source code names
+    // (`type(1) in (int, float)`) — denote the same Python type. `copy` and
+    // pydantic dispatch on exactly such membership tests.
+    if let (Some(left), Some(right)) = (value::builtin_type_token(a), value::builtin_type_token(b))
+    {
+        return left == right;
     }
     if let (Some(xs), Some(ys)) = (value::as_list(a), value::as_list(b)) {
         return xs.len() == ys.len()

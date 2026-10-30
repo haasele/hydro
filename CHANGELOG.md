@@ -8,6 +8,31 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-10-30 native stdlib and ecosystem continuation
+
+- Stdlib import matrix advanced to **233/297** (133 pure, 50 builtin/frozen,
+  50 extension, 1 CPython-failing; 64 failed). Added real `_sqlite3`/`sqlite3`
+  DB-API, `_ssl`/SSLContext factory surface, `_bz2`/`_lzma`, `pyexpat`,
+  readline, `_curses`, CJK/ISO-2022 codec accelerators, `_dbm`/`_gdbm`,
+  `_zstd`, SHA-3/SHAKE, and AST/importlib/OS surfaces.
+- Fixed a serious GC-rooting bug: permanent thread roots shared the scoped
+  root stack, so `release_roots` could reclaim cached native classes and
+  `types.FunctionType`/`type(f)` returned recycled strings/iterators. Scoped
+  and permanent roots are now separate; cache hits validate generation and
+  class identity. This also fixed `copy`/pydantic class introspection.
+- Runtime object model: native `object.__setattr__/__getattribute__/__delattr__`,
+  builtin type metadata and unbound methods, descriptor/staticmethod/
+  classmethod calls with keywords, bound `__func__`/`__self__`, `dict`
+  subclasses with real mapping storage/super slots, `functools.partial` as a
+  type, and string `removeprefix/removesuffix/count/maketrans`.
+- Native AOT now links `-lsqlite3 -lexpat -lbz2 -llzma -lgdbm
+  -lgdbm_compat -lzstd` (no `libpython`); the native-module AOT smoke passes.
+- Ecosystem: NumPy advances through `PyType_Ready` adapters, `Py_BuildValue`,
+  `PyErr_Format` and module init to a DType/ArrayMethod type check; pydantic
+  advances through enum/uuid/copy/model field machinery but package import is
+  still blocked by native-scalar `IntEnum` subclass allocation
+  (`AnnotationSource.ANY`). pandas remains unreached. No ecosystem pass is claimed.
+
 ### Compatibility — 2026-10-30 NB-1/NB-4 continuation
 
 - Stdlib import matrix advanced from 145/297 to **210/297** (124 pure, 50

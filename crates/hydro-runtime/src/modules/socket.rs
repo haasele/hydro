@@ -30,6 +30,17 @@
 //! scopeid)` 4-tuple; host strings in brackets (`[::1]`) are accepted
 //! everywhere a host is accepted.
 //!
+//! `ssl.SSLContext` follows CPython's rules: `verify_mode` and
+//! `check_hostname` stay consistent (`CERT_NONE` is rejected while host-name
+//! checking is enabled), `load_cert_chain`/`load_verify_locations` read real
+//! PEM/DER files, `set_alpn_protocols` feeds rustls' client hello and
+//! `post_handshake_auth` is stored for `http.client`. rustls clients never
+//! perform post-handshake authentication and server-side TLS is not
+//! implemented, so `SSLContext(PROTOCOL_TLS_SERVER).wrap_socket` reports that
+//! explicitly. `_create_stdlib_context`/`_create_unverified_context` and
+//! `_create_default_https_context` mirror the CPython factories the stdlib
+//! uses to build client contexts.
+//!
 //! Host lookup covers `gethostname`, `gethostbyname`, `getaddrinfo` and
 //! `getfqdn`; the last one reverse-resolves the name it is given (the local
 //! host name when the argument is empty), so it reports the resolver's
@@ -53,8 +64,10 @@ use rustls_pki_types::{
     ServerName, UnixTime,
 };
 
+use hydro_ir::MethodKind;
+
 use crate::core::globals;
-use crate::exc::{self, ATTRIBUTE_ERROR, OS_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::exc::{self, ATTRIBUTE_ERROR, OS_ERROR, TYPE_ERROR, UNICODE_ERROR, VALUE_ERROR};
 use crate::heap;
 use crate::value::{self, NONE};
 
@@ -81,7 +94,15 @@ const SHUT_RDWR: i64 = 2;
 
 /// TLS verification modes, mirroring `ssl.CERT_*`.
 const CERT_NONE: i64 = 0;
+const CERT_OPTIONAL: i64 = 1;
 const CERT_REQUIRED: i64 = 2;
+
+/// `ssl.OP_ALL`: the compatibility options `SSLContext` reports.
+const OP_ALL: i64 = 0x80000;
+
+/// ALPN protocol names are length-prefixed with one byte, so a name is
+/// 1..=255 bytes long.
+const ALPN_MAX_LENGTH: usize = 255;
 
 /// `SSLContext` protocol selectors.
 const PROTOCOL_TLS: i64 = 2;
@@ -3250,6 +3271,380 @@ fn set_context_attr(ctx: i64, name: &str, value: i64) {
     value::instance_setattr(ctx, name.to_string(), value);
 }
 
+/// Stored `verify_mode` (`CERT_*`) of a context instance.
+fn context_verify_mode(ctx: i64) -> i64 {
+    context_int(ctx, "_verify_mode", CERT_NONE)
+}
+
+/// Stored `check_hostname` flag of a context instance.
+fn context_check_hostname(ctx: i64) -> bool {
+    context_bool(ctx, "_check_hostname", false)
+}
+
+/// Stored `protocol` selector of a context instance.
+fn context_protocol(ctx: i64) -> i64 {
+    context_int(ctx, "_protocol", PROTOCOL_TLS)
+}
+
+/// ALPN protocol names configured through `set_alpn_protocols`.
+fn context_alpn(ctx: i64) -> Vec<Vec<u8>> {
+    let mut protocols = Vec::new();
+    if let Some(items) = context_attr(ctx, "_alpn").and_then(value::as_list) {
+        for &item in items {
+            if let Some(bytes) = value::as_bytes(item) {
+                protocols.push(bytes.to_vec());
+            }
+        }
+    }
+    protocols
+}
+
+/// Applies CPython's `verify_mode` rules: only `CERT_NONE`, `CERT_OPTIONAL`
+/// and `CERT_REQUIRED` are accepted, and `CERT_NONE` is rejected while
+/// host-name checking is enabled.
+fn set_context_verify_mode(ctx: i64, mode: i64) -> Result<(), i64> {
+    if !matches!(mode, CERT_NONE | CERT_OPTIONAL | CERT_REQUIRED) {
+        return Err(value_error("invalid verify_mode"));
+    }
+    if mode == CERT_NONE && context_check_hostname(ctx) {
+        return Err(value_error(
+            "Cannot set verify_mode to CERT_NONE when check_hostname is enabled.",
+        ));
+    }
+    set_context_attr(ctx, "_verify_mode", encode_int(mode));
+    Ok(())
+}
+
+/// Applies CPython's `check_hostname` rules: enabling it while `verify_mode`
+/// is `CERT_NONE` is rejected.
+fn set_context_check_hostname(ctx: i64, enabled: bool) -> Result<(), i64> {
+    if enabled && context_verify_mode(ctx) == CERT_NONE {
+        return Err(value_error(
+            "Cannot set check_hostname to True when verify_mode is CERT_NONE",
+        ));
+    }
+    set_context_attr(ctx, "_check_hostname", value::bool_value(enabled));
+    Ok(())
+}
+
+/// The purpose selector passed to `create_default_context()` /
+/// `_create_stdlib_context()`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PurposeKind {
+    ServerAuth,
+    ClientAuth,
+}
+
+/// `ssl.Purpose`: the X.509 extended-key-usage selectors the stdlib passes
+/// when it builds a context.
+fn purpose_class() -> i64 {
+    if let Some(class) = globals::registry_get("ssl.Purpose") {
+        return class;
+    }
+    let class = value::class_new("Purpose".to_string(), NONE, Vec::new());
+    globals::registry_set("ssl.Purpose", class);
+    let server = purpose_member(class, PurposeKind::ServerAuth);
+    let client = purpose_member(class, PurposeKind::ClientAuth);
+    value::class_set_attr(class, "SERVER_AUTH".to_string(), server);
+    value::class_set_attr(class, "CLIENT_AUTH".to_string(), client);
+    class
+}
+
+fn purpose_member(class: i64, kind: PurposeKind) -> i64 {
+    let key = match kind {
+        PurposeKind::ServerAuth => "ssl.Purpose.SERVER_AUTH",
+        PurposeKind::ClientAuth => "ssl.Purpose.CLIENT_AUTH",
+    };
+    if let Some(member) = globals::registry_get(key) {
+        return member;
+    }
+    let (shortname, longname, oid) = match kind {
+        PurposeKind::ServerAuth => (
+            "serverAuth",
+            "TLS Web Server Authentication",
+            "1.3.6.1.5.5.7.3.1",
+        ),
+        PurposeKind::ClientAuth => (
+            "clientAuth",
+            "TLS Web Client Authentication",
+            "1.3.6.1.5.5.7.3.2",
+        ),
+    };
+    let member = value::instance_new(class);
+    set_context_attr(member, "shortname", value::str_alloc(shortname.to_string()));
+    set_context_attr(member, "longname", value::str_alloc(longname.to_string()));
+    set_context_attr(member, "oid", value::str_alloc(oid.to_string()));
+    globals::registry_set(key, member);
+    member
+}
+
+/// Decodes a `purpose` argument: `None` means `Purpose.SERVER_AUTH`, and a
+/// value that is not one of the two `Purpose` members is rejected like
+/// CPython's `isinstance(purpose, _ASN1Object)` check.
+fn purpose_argument(purpose: i64) -> Result<PurposeKind, i64> {
+    if purpose == NONE {
+        return Ok(PurposeKind::ServerAuth);
+    }
+    let class = purpose_class();
+    if purpose == purpose_member(class, PurposeKind::ServerAuth) {
+        return Ok(PurposeKind::ServerAuth);
+    }
+    if purpose == purpose_member(class, PurposeKind::ClientAuth) {
+        return Ok(PurposeKind::ClientAuth);
+    }
+    Err(type_error(&format!(
+        "purpose must be a Purpose member, not {}",
+        value::type_name(purpose)
+    )))
+}
+
+/// Wraps a native entry point as a class-method value.
+fn ssl_method(entry: extern "C" fn(*const i64) -> i64, arity: usize, name: &str) -> i64 {
+    value::function_new(entry as *const () as usize, arity, name.to_string())
+}
+
+/// Wraps a native entry point whose argument count is dynamic (the first
+/// element of the argument buffer is the tagged count).
+fn ssl_varargs_method(entry: extern "C" fn(*const i64) -> i64, name: &str) -> i64 {
+    value::function_new_with_flags(
+        entry as *const () as usize,
+        1,
+        name.to_string(),
+        value::FUNCTION_FLAG_VARARGS,
+    )
+}
+
+extern "C" fn verify_mode_get(argv: *const i64) -> i64 {
+    // SAFETY: a bound method call passes `self` first.
+    let ctx = unsafe { *argv };
+    encode_int(context_verify_mode(ctx))
+}
+
+extern "C" fn verify_mode_set(argv: *const i64) -> i64 {
+    // SAFETY: an assignment through a property passes `self` and the value.
+    let ctx = unsafe { *argv };
+    let new_value = unsafe { *argv.add(1) };
+    let Some(mode) = value::as_integer(new_value) else {
+        return type_error("verify_mode must be an integer");
+    };
+    match set_context_verify_mode(ctx, mode) {
+        Ok(()) => NONE,
+        Err(err) => err,
+    }
+}
+
+extern "C" fn check_hostname_get(argv: *const i64) -> i64 {
+    // SAFETY: a bound method call passes `self` first.
+    let ctx = unsafe { *argv };
+    value::bool_value(context_check_hostname(ctx))
+}
+
+extern "C" fn check_hostname_set(argv: *const i64) -> i64 {
+    // SAFETY: an assignment through a property passes `self` and the value.
+    let ctx = unsafe { *argv };
+    let enabled = value::truthy(unsafe { *argv.add(1) });
+    match set_context_check_hostname(ctx, enabled) {
+        Ok(()) => NONE,
+        Err(err) => err,
+    }
+}
+
+extern "C" fn post_handshake_auth_get(argv: *const i64) -> i64 {
+    // SAFETY: a bound method call passes `self` first.
+    let ctx = unsafe { *argv };
+    value::bool_value(context_bool(ctx, "_post_handshake_auth", false))
+}
+
+extern "C" fn post_handshake_auth_set(argv: *const i64) -> i64 {
+    // SAFETY: an assignment through a property passes `self` and the value.
+    let ctx = unsafe { *argv };
+    let enabled = value::truthy(unsafe { *argv.add(1) });
+    set_context_attr(ctx, "_post_handshake_auth", value::bool_value(enabled));
+    NONE
+}
+
+extern "C" fn protocol_get(argv: *const i64) -> i64 {
+    // SAFETY: a bound method call passes `self` first.
+    let ctx = unsafe { *argv };
+    encode_int(context_protocol(ctx))
+}
+
+extern "C" fn options_get(argv: *const i64) -> i64 {
+    // SAFETY: a bound method call passes `self` first.
+    let ctx = unsafe { *argv };
+    encode_int(context_int(ctx, "_options", OP_ALL))
+}
+
+extern "C" fn options_set(argv: *const i64) -> i64 {
+    // SAFETY: an assignment through a property passes `self` and the value.
+    let ctx = unsafe { *argv };
+    let Some(options) = value::as_integer(unsafe { *argv.add(1) }) else {
+        return type_error("options must be an integer");
+    };
+    set_context_attr(ctx, "_options", encode_int(options));
+    NONE
+}
+
+/// `SSLContext.set_alpn_protocols(protocols)`: stores the names handed to
+/// rustls for the client hello. CPython's Python-level wrapper accepts
+/// ASCII strings, so both `str` and `bytes` items are accepted here.
+extern "C" fn set_alpn_protocols(argv: *const i64) -> i64 {
+    // SAFETY: a bound method call passes `self` then the sequence.
+    let ctx = unsafe { *argv };
+    let protocols = unsafe { *argv.add(1) };
+    let items = value::as_list(protocols)
+        .or_else(|| value::as_tuple(protocols))
+        .map(|items| items.to_vec());
+    let Some(items) = items else {
+        return type_error(&format!(
+            "set_alpn_protocols() argument must be a sequence, not {}",
+            value::type_name(protocols)
+        ));
+    };
+    let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+    for item in items {
+        let bytes = if let Some(text) = value::as_str(item) {
+            if !text.is_ascii() {
+                return exc::raise_with_message(
+                    UNICODE_ERROR,
+                    "'ascii' codec can't encode non-ASCII ALPN protocol name",
+                );
+            }
+            text.as_bytes().to_vec()
+        } else if let Some(bytes) = value::as_bytes(item) {
+            bytes.to_vec()
+        } else {
+            return type_error(&format!(
+                "protocol name must be str or bytes, not {}",
+                value::type_name(item)
+            ));
+        };
+        if bytes.is_empty() || bytes.len() > ALPN_MAX_LENGTH {
+            return ssl_error("ALPN protocols must be 1 to 255 in length");
+        }
+        encoded.push(bytes);
+    }
+    let stored: Vec<i64> = encoded.into_iter().map(value::bytes_new).collect();
+    set_context_attr(ctx, "_alpn", value::list_new(stored));
+    NONE
+}
+
+/// `SSLContext.load_default_certs(purpose=Purpose.SERVER_AUTH)`: marks the
+/// Mozilla (webpki) trust anchors as enabled. rustls ships one trust store,
+/// so the purpose only validates the selector.
+extern "C" fn load_default_certs(argv: *const i64) -> i64 {
+    // A dynamic (varargs) wrapper receives the tagged argument count first.
+    // SAFETY: the caller supplies the count followed by the arguments.
+    let count = value::as_integer(unsafe { *argv }).unwrap_or(1);
+    if count > 2 {
+        return type_error(&format!(
+            "load_default_certs() takes at most 2 arguments ({count} given)"
+        ));
+    }
+    let ctx = unsafe { *argv.add(1) };
+    let purpose = if count > 1 {
+        unsafe { *argv.add(2) }
+    } else {
+        NONE
+    };
+    match purpose_argument(purpose) {
+        Ok(_) => {
+            set_context_attr(ctx, "_default_roots", value::TRUE);
+            NONE
+        }
+        Err(err) => err,
+    }
+}
+
+/// The cached `ssl.SSLContext` class shared by every context instance.
+fn ssl_context_class() -> i64 {
+    if let Some(class) = globals::registry_get("ssl.SSLContext") {
+        return class;
+    }
+    let methods = vec![
+        (
+            "wrap_socket".to_string(),
+            value::native_function_new("ssl", "_ssl_context_wrap_socket", 3),
+            MethodKind::Normal,
+        ),
+        (
+            "load_verify_locations".to_string(),
+            value::native_function_new("ssl", "_ssl_context_load_verify_locations", 4),
+            MethodKind::Normal,
+        ),
+        (
+            "load_cert_chain".to_string(),
+            value::native_function_new("ssl", "_ssl_context_load_cert_chain", 4),
+            MethodKind::Normal,
+        ),
+        (
+            "load_default_certs".to_string(),
+            ssl_varargs_method(load_default_certs, "load_default_certs"),
+            MethodKind::Normal,
+        ),
+        (
+            "set_alpn_protocols".to_string(),
+            ssl_method(set_alpn_protocols, 2, "set_alpn_protocols"),
+            MethodKind::Normal,
+        ),
+    ];
+    let attrs = vec![
+        (
+            "verify_mode".to_string(),
+            value::property_new(
+                ssl_method(verify_mode_get, 1, "verify_mode"),
+                ssl_method(verify_mode_set, 2, "verify_mode"),
+                NONE,
+            ),
+        ),
+        (
+            "check_hostname".to_string(),
+            value::property_new(
+                ssl_method(check_hostname_get, 1, "check_hostname"),
+                ssl_method(check_hostname_set, 2, "check_hostname"),
+                NONE,
+            ),
+        ),
+        (
+            "post_handshake_auth".to_string(),
+            value::property_new(
+                ssl_method(post_handshake_auth_get, 1, "post_handshake_auth"),
+                ssl_method(post_handshake_auth_set, 2, "post_handshake_auth"),
+                NONE,
+            ),
+        ),
+        (
+            "protocol".to_string(),
+            value::property_new(ssl_method(protocol_get, 1, "protocol"), NONE, NONE),
+        ),
+        (
+            "options".to_string(),
+            value::property_new(
+                ssl_method(options_get, 1, "options"),
+                ssl_method(options_set, 2, "options"),
+                NONE,
+            ),
+        ),
+    ];
+    let class = value::class_new_full("SSLContext".to_string(), NONE, methods, attrs);
+    globals::registry_set("ssl.SSLContext", class);
+    class
+}
+
+/// The cached `ssl.SSLSocket` class. Hydro's TLS state lives inside the same
+/// `socket` object (`wrap_socket` returns its argument), so this value exists
+/// for the stdlib's `isinstance(conn, ssl.SSLSocket)` checks and as a
+/// subclass of `socket.socket`; wrapped objects keep their `socket.socket`
+/// class and never match it.
+fn ssl_socket_class() -> i64 {
+    if let Some(class) = globals::registry_get("ssl.SSLSocket") {
+        return class;
+    }
+    let class = value::class_new("SSLSocket".to_string(), value::socket_class(), Vec::new());
+    globals::registry_set("ssl.SSLSocket", class);
+    class
+}
+
 fn context_roots(ctx: i64) -> Vec<Vec<u8>> {
     let mut roots = Vec::new();
     if let Some(items) = context_attr(ctx, "_roots").and_then(value::as_list) {
@@ -3280,7 +3675,7 @@ fn context_cert_chain(ctx: i64) -> Vec<Vec<u8>> {
 }
 
 fn build_client_config(ctx: i64) -> Result<Arc<ClientConfig>, i64> {
-    let verify_mode = context_int(ctx, "verify_mode", CERT_REQUIRED);
+    let verify_mode = context_verify_mode(ctx);
     let default_roots = context_bool(ctx, "_default_roots", false);
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = ClientConfig::builder_with_provider(provider.clone())
@@ -3308,7 +3703,7 @@ fn build_client_config(ctx: i64) -> Result<Arc<ClientConfig>, i64> {
     };
     let chain = context_cert_chain(ctx);
     let key = context_attr(ctx, "_key").filter(|&key| key != NONE);
-    let config = match key {
+    let mut config = match key {
         Some(key) => {
             let Some(key_bytes) = value::as_bytes(key) else {
                 return Err(ssl_error("invalid private key"));
@@ -3327,6 +3722,7 @@ fn build_client_config(ctx: i64) -> Result<Arc<ClientConfig>, i64> {
         }
         None => builder.with_no_client_auth(),
     };
+    config.alpn_protocols = context_alpn(ctx);
     Ok(Arc::new(config))
 }
 
@@ -3336,40 +3732,36 @@ fn ssl_context(args: &[i64]) -> i64 {
             Ok(protocol) => protocol,
             Err(err) => return err,
         },
-        _ => PROTOCOL_TLS_CLIENT,
+        _ => PROTOCOL_TLS,
     };
-    if protocol != PROTOCOL_TLS
-        && protocol != PROTOCOL_TLS_CLIENT
-        && protocol != PROTOCOL_TLS_SERVER
-        && protocol != 5
-    {
-        return os_error("[Errno 22] Invalid argument");
+    if !matches!(
+        protocol,
+        PROTOCOL_TLS | PROTOCOL_TLS_CLIENT | PROTOCOL_TLS_SERVER | 5
+    ) {
+        return value_error(&format!("Unsupported protocol version 0x{protocol:x}"));
     }
-    let methods = vec![
-        (
-            "wrap_socket".to_string(),
-            value::native_function_new("ssl", "_ssl_context_wrap_socket", 3),
-        ),
-        (
-            "load_verify_locations".to_string(),
-            value::native_function_new("ssl", "_ssl_context_load_verify_locations", 4),
-        ),
-        (
-            "load_cert_chain".to_string(),
-            value::native_function_new("ssl", "_ssl_context_load_cert_chain", 4),
-        ),
-    ];
-    let class = value::class_new("SSLContext".to_string(), NONE, methods);
-    let context = value::instance_new(class);
-    set_context_attr(context, "verify_mode", encode_int(CERT_REQUIRED));
-    set_context_attr(context, "check_hostname", value::TRUE);
-    // Only `create_default_context()` pre-loads the Mozilla roots; a bare
-    // `SSLContext(...)` starts with an empty trust store, like CPython.
+    // `PROTOCOL_TLS_CLIENT` verifies the peer and its host name;
+    // `PROTOCOL_TLS_SERVER` and the generic `PROTOCOL_TLS` verify nothing,
+    // exactly like CPython's `_ssl._SSLContext`.
+    let client = protocol == PROTOCOL_TLS_CLIENT;
+    let context = value::instance_new(ssl_context_class());
+    set_context_attr(
+        context,
+        "_verify_mode",
+        encode_int(if client { CERT_REQUIRED } else { CERT_NONE }),
+    );
+    set_context_attr(context, "_check_hostname", value::bool_value(client));
+    // Only `create_default_context()`/`load_default_certs()` pre-load the
+    // Mozilla roots; a bare `SSLContext(...)` starts with an empty trust
+    // store, like CPython.
     set_context_attr(context, "_default_roots", value::FALSE);
+    set_context_attr(context, "_post_handshake_auth", value::FALSE);
     set_context_attr(context, "_roots", value::list_new(Vec::new()));
     set_context_attr(context, "_cert_chain", value::list_new(Vec::new()));
     set_context_attr(context, "_key", NONE);
     set_context_attr(context, "_key_kind", encode_int(2));
+    set_context_attr(context, "_alpn", value::list_new(Vec::new()));
+    set_context_attr(context, "_options", encode_int(OP_ALL));
     set_context_attr(
         context,
         "_server_side",
@@ -3380,11 +3772,18 @@ fn ssl_context(args: &[i64]) -> i64 {
 }
 
 fn create_default_context(args: &[i64]) -> i64 {
-    let context = ssl_context(&[encode_int(PROTOCOL_TLS_CLIENT)]);
+    let purpose = match purpose_argument(args.first().copied().unwrap_or(NONE)) {
+        Ok(purpose) => purpose,
+        Err(err) => return err,
+    };
+    let protocol = match purpose {
+        PurposeKind::ServerAuth => PROTOCOL_TLS_CLIENT,
+        PurposeKind::ClientAuth => PROTOCOL_TLS_SERVER,
+    };
+    let context = ssl_context(&[encode_int(protocol)]);
     if exc::pending() {
         return context;
     }
-    set_context_attr(context, "_default_roots", value::TRUE);
     let cafile = args.get(1).copied().unwrap_or(NONE);
     let capath = args.get(2).copied().unwrap_or(NONE);
     let cadata = args.get(3).copied().unwrap_or(NONE);
@@ -3393,6 +3792,90 @@ fn create_default_context(args: &[i64]) -> i64 {
         if exc::pending() {
             return result;
         }
+    } else if context_verify_mode(context) != CERT_NONE {
+        set_context_attr(context, "_default_roots", value::TRUE);
+    }
+    context
+}
+
+/// `ssl._create_stdlib_context(...)`/`_create_unverified_context(...)`:
+/// CPython's backward-compatible context factory used by `ftplib`,
+/// `imaplib`, `poplib` and `smtplib`.
+///
+/// The defaults are CPython 3.14's (`cert_reqs=CERT_NONE`,
+/// `check_hostname=False`, `purpose=Purpose.SERVER_AUTH`); an explicitly
+/// supplied `None` keeps the protocol default, which is how the stdlib
+/// modules build unverified contexts while still allowing callers to ask for
+/// verification.
+fn create_stdlib_context(args: &[i64]) -> i64 {
+    let purpose = match purpose_argument(args.get(3).copied().unwrap_or(NONE)) {
+        Ok(purpose) => purpose,
+        Err(err) => return err,
+    };
+    let protocol = match args.first().copied().unwrap_or(NONE) {
+        NONE => match purpose {
+            PurposeKind::ServerAuth => PROTOCOL_TLS_CLIENT,
+            PurposeKind::ClientAuth => PROTOCOL_TLS_SERVER,
+        },
+        v => match value::as_integer(v) {
+            Some(protocol) => protocol,
+            None => {
+                return type_error(&format!(
+                    "protocol must be an integer, not {}",
+                    value::type_name(v)
+                ))
+            }
+        },
+    };
+    let context = ssl_context(&[encode_int(protocol)]);
+    if exc::pending() {
+        return context;
+    }
+    // CPython assigns `check_hostname` first so a `CERT_NONE` context with
+    // host-name checking fails with the intended `ValueError`.
+    let check_hostname = args.get(2).copied().map(value::truthy).unwrap_or(false);
+    if let Err(err) = set_context_check_hostname(context, check_hostname) {
+        return err;
+    }
+    match args.get(1).copied() {
+        // The keyword-only default is `cert_reqs=CERT_NONE`.
+        None => {
+            if let Err(err) = set_context_verify_mode(context, CERT_NONE) {
+                return err;
+            }
+        }
+        // An explicit `None` keeps the protocol default, like CPython.
+        Some(NONE) => {}
+        Some(v) => {
+            let Some(mode) = value::as_integer(v) else {
+                return type_error("cert_reqs must be an integer");
+            };
+            if let Err(err) = set_context_verify_mode(context, mode) {
+                return err;
+            }
+        }
+    }
+    let certfile = args.get(4).copied().unwrap_or(NONE);
+    let keyfile = args.get(5).copied().unwrap_or(NONE);
+    if keyfile != NONE && certfile == NONE {
+        return value_error("certfile must be specified");
+    }
+    if certfile != NONE || keyfile != NONE {
+        let result = context_load_cert_chain(&[context, certfile, keyfile, NONE]);
+        if exc::pending() {
+            return result;
+        }
+    }
+    let cafile = args.get(6).copied().unwrap_or(NONE);
+    let capath = args.get(7).copied().unwrap_or(NONE);
+    let cadata = args.get(8).copied().unwrap_or(NONE);
+    if cafile != NONE || capath != NONE || cadata != NONE {
+        let result = context_load_verify_locations(&[context, cafile, capath, cadata]);
+        if exc::pending() {
+            return result;
+        }
+    } else if context_verify_mode(context) != CERT_NONE {
+        set_context_attr(context, "_default_roots", value::TRUE);
     }
     context
 }
@@ -3402,6 +3885,9 @@ fn context_load_verify_locations(args: &[i64]) -> i64 {
     let cafile = args.get(1).copied().unwrap_or(NONE);
     let capath = args.get(2).copied().unwrap_or(NONE);
     let cadata = args.get(3).copied().unwrap_or(NONE);
+    if cafile == NONE && capath == NONE && cadata == NONE {
+        return type_error("cafile, capath and cadata cannot be all omitted");
+    }
     let mut loaded: Vec<Vec<u8>> = Vec::new();
     if cadata != NONE {
         if let Some(text) = value::as_str(cadata) {
@@ -3487,6 +3973,16 @@ fn context_load_cert_chain(args: &[i64]) -> i64 {
     NONE
 }
 
+/// Host text of a connected stream's peer, used when a verifying context is
+/// wrapped without an explicit `server_hostname` (no SNI).
+fn peer_host(state: &SocketState) -> Option<String> {
+    let inner = state.lock();
+    match &inner.kind {
+        SocketKind::Stream(stream) => stream.peer_addr().ok().map(|addr| addr.ip().to_string()),
+        _ => None,
+    }
+}
+
 /// Wraps `sock` in a client TLS session, performing the handshake now.
 fn wrap_tls(context: i64, sock: i64, server_hostname: i64) -> i64 {
     let Some(state) = value::as_socket(sock) else {
@@ -3495,7 +3991,8 @@ fn wrap_tls(context: i64, sock: i64, server_hostname: i64) -> i64 {
     if context_bool(context, "_server_side", false) {
         return ssl_error("server-side TLS is not supported by this runtime");
     }
-    let verify_mode = context_int(context, "verify_mode", CERT_REQUIRED);
+    let verify_mode = context_verify_mode(context);
+    let check_hostname = context_check_hostname(context);
     let hostname = if server_hostname != NONE {
         match value::as_str(server_hostname) {
             Some(host) if !host.is_empty() => Some(host.to_string()),
@@ -3505,12 +4002,15 @@ fn wrap_tls(context: i64, sock: i64, server_hostname: i64) -> i64 {
     } else {
         None
     };
-    let hostname = match (verify_mode, hostname) {
-        (mode, None) if mode != CERT_NONE => {
-            return ssl_error("check_hostname requires server_hostname")
+    let hostname = match hostname {
+        Some(host) => strip_brackets(&host).to_string(),
+        None if check_hostname => return value_error("check_hostname requires server_hostname"),
+        // Without SNI CPython verifies against (and sends no name for) the
+        // connected peer, so an explicit name is only needed for SNI.
+        None if verify_mode != CERT_NONE => {
+            peer_host(state).unwrap_or_else(|| "localhost".to_string())
         }
-        (_, None) => "localhost".to_string(),
-        (_, Some(host)) => strip_brackets(&host).to_string(),
+        None => "localhost".to_string(),
     };
     let config = match build_client_config(context) {
         Ok(config) => config,
@@ -3586,8 +4086,8 @@ fn ssl_wrap_socket(args: &[i64]) -> i64 {
     if exc::pending() {
         return context;
     }
-    set_context_attr(context, "verify_mode", encode_int(CERT_NONE));
-    set_context_attr(context, "check_hostname", value::FALSE);
+    set_context_attr(context, "_verify_mode", encode_int(CERT_NONE));
+    set_context_attr(context, "_check_hostname", value::FALSE);
     wrap_tls(context, sock, hostname)
 }
 
@@ -3595,7 +4095,8 @@ fn ssl_wrap_socket(args: &[i64]) -> i64 {
 pub(crate) fn ssl_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "SSLContext" => ssl_context(args),
-        "create_default_context" => create_default_context(args),
+        "create_default_context" | "_create_default_https_context" => create_default_context(args),
+        "_create_stdlib_context" | "_create_unverified_context" => create_stdlib_context(args),
         "wrap_socket" => ssl_wrap_socket(args),
         "_ssl_context_wrap_socket" => {
             let hostname = args.get(2).copied().unwrap_or(NONE);
@@ -3616,10 +4117,19 @@ pub(crate) fn ssl_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i
     for (name, item) in keywords {
         let index = match (function, name.as_str()) {
             ("SSLContext", "protocol") => 0,
-            ("create_default_context", "purpose") => 0,
-            ("create_default_context", "cafile") => 1,
-            ("create_default_context", "capath") => 2,
-            ("create_default_context", "cadata") => 3,
+            ("create_default_context" | "_create_default_https_context", "purpose") => 0,
+            ("create_default_context" | "_create_default_https_context", "cafile") => 1,
+            ("create_default_context" | "_create_default_https_context", "capath") => 2,
+            ("create_default_context" | "_create_default_https_context", "cadata") => 3,
+            ("_create_stdlib_context" | "_create_unverified_context", "protocol") => 0,
+            ("_create_stdlib_context" | "_create_unverified_context", "cert_reqs") => 1,
+            ("_create_stdlib_context" | "_create_unverified_context", "check_hostname") => 2,
+            ("_create_stdlib_context" | "_create_unverified_context", "purpose") => 3,
+            ("_create_stdlib_context" | "_create_unverified_context", "certfile") => 4,
+            ("_create_stdlib_context" | "_create_unverified_context", "keyfile") => 5,
+            ("_create_stdlib_context" | "_create_unverified_context", "cafile") => 6,
+            ("_create_stdlib_context" | "_create_unverified_context", "capath") => 7,
+            ("_create_stdlib_context" | "_create_unverified_context", "cadata") => 8,
             ("wrap_socket", "sock") => 0,
             ("wrap_socket", "server_hostname") => 1,
             _ => {
@@ -3651,9 +4161,15 @@ pub(crate) fn ssl_constant(name: &str) -> i64 {
         "PROTOCOL_TLS_CLIENT" => encode_int(PROTOCOL_TLS_CLIENT),
         "PROTOCOL_TLS_SERVER" => encode_int(PROTOCOL_TLS_SERVER),
         "PROTOCOL_TLSv1_2" => encode_int(5),
-        "OP_ALL" => encode_int(0x80000),
+        "OP_ALL" => encode_int(OP_ALL),
         "HAS_SNI" => value::TRUE,
         "HAS_TLSv1_3" => value::TRUE,
+        "Purpose" => purpose_class(),
+        "SSLSocket" => ssl_socket_class(),
+        // The class value behind `SSLContext(...)`; module attribute lookup
+        // currently prefers the spec function, so `mod.rs` needs a
+        // class-value hook to expose this (see the hand-off notes).
+        "SSLContext" => ssl_context_class(),
         // No dedicated `SSLError` tag exists; the closest catchable class is
         // `OSError`, which is what every TLS failure in this runtime raises.
         "SSLError" => exc::exception_class(OS_ERROR),
@@ -3887,5 +4403,627 @@ mod tests {
             value::as_integer(method(sock, "getsockopt", &[level, nodelay])),
             Some(1)
         );
+    }
+
+    // --- ssl.SSLContext / stdlib context factories -----------------------
+
+    /// A certificate/key pair used by the file-backed `ssl` tests
+    /// (`CN=localhost`, self-signed, test data only).
+    const TEST_CA_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBkTCCATegAwIBAgIUPqDSi0O65gIvseWR4wdYILNxClIwCgYIKoZIzj0EAwIw
+FjEUMBIGA1UEAwwLUHlYIFRlc3QgQ0EwHhcNMjYxMDI1MjEwODQzWhcNMzYxMDIy
+MjEwODQzWjAWMRQwEgYDVQQDDAtQeVggVGVzdCBDQTBZMBMGByqGSM49AgEGCCqG
+SM49AwEHA0IABKdTR5KrBiJF8cUlL/EtVQmFRdm+SfG8tGiCb6zLzpj86JZhYUOI
+IH/3xL6jy0cMM9X98bDeQxezSGcLDIe0jZGjYzBhMB0GA1UdDgQWBBS8GSQ6Jzww
+MhXkMB3Bf1H82R1IpzAfBgNVHSMEGDAWgBS8GSQ6JzwwMhXkMB3Bf1H82R1IpzAP
+BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAgNIADBF
+AiAiNg1QVfYNPIMHV5DAhydW04m11vc/HQnlOi/UniwH/AIhAIFyOF0aRbQOiNRl
+qu1DRtUYcaAjRxO7epvoE/5g3rZf
+-----END CERTIFICATE-----
+";
+
+    const TEST_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBvjCCAWWgAwIBAgIUP9Qi57ffGs1l9SGvBbAg2yBHrLgwCgYIKoZIzj0EAwIw
+FjEUMBIGA1UEAwwLUHlYIFRlc3QgQ0EwHhcNMjYxMDI1MjEwODQzWhcNMzYxMDIy
+MjEwODQzWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAAQd3u7zRhk7+BASAbxK7WwLExCm5Dp+71j8tiiLp+I9mY09AZQ9a0zN
+J1s0W6b/JtOS+WMzlYxDm5x0bvGxQqbSo4GSMIGPMBoGA1UdEQQTMBGCCWxvY2Fs
+aG9zdIcEfwAAATAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUE
+DDAKBggrBgEFBQcDATAdBgNVHQ4EFgQUt4vz30/o5JQFkxcdLBzsuuZNl1YwHwYD
+VR0jBBgwFoAUvBkkOic8MDIV5DAdwX9R/NkdSKcwCgYIKoZIzj0EAwIDRwAwRAIg
+MMtdgSH5E4RTe+6ZN1LnDk14EXGy1HG3NEA/Q34mg5QCIBg6iDOH9QWMzwHnujWB
+3KtoWZ/dHdSIL9Nv+HV1m32P
+-----END CERTIFICATE-----
+";
+
+    const TEST_KEY_PEM: &str = "\
+-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIErV9AbQP8JYpvIVWvfAlYMHOI2fQi5HC+82OxiZ5QeEoAoGCCqGSM49
+AwEHoUQDQgAEHd7u80YZO/gQEgG8Su1sCxMQpuQ6fu9Y/LYoi6fiPZmNPQGUPWtM
+zSdbNFum/ybTkvljM5WMQ5ucdG7xsUKm0g==
+-----END EC PRIVATE KEY-----
+";
+
+    fn ssl_temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("hydro-ssl-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temporary directory");
+        dir
+    }
+
+    fn write_fixture(dir: &std::path::Path, name: &str, contents: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).expect("fixture file");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn ssl_text(text: &str) -> i64 {
+        value::str_alloc(text.to_string())
+    }
+
+    fn new_context(protocol: i64) -> i64 {
+        let context = ssl_call("SSLContext", &[encode_int(protocol)]);
+        assert!(
+            !exc::pending(),
+            "SSLContext({protocol}) raised: {}",
+            value::to_string(exc::pending_value())
+        );
+        context
+    }
+
+    fn context_get(context: i64, name: &str) -> i64 {
+        let result = crate::methods::getattr(context, name.as_ptr(), name.len());
+        assert!(
+            !exc::pending(),
+            "reading {name} raised: {}",
+            value::to_string(exc::pending_value())
+        );
+        result
+    }
+
+    fn context_set(context: i64, name: &str, new_value: i64) -> i64 {
+        crate::methods::setattr(context, name.as_ptr(), name.len(), new_value)
+    }
+
+    fn context_method(context: i64, name: &str, args: &[i64]) -> i64 {
+        crate::methods::call(
+            context,
+            name.as_ptr(),
+            name.len(),
+            args.len(),
+            args.as_ptr(),
+        )
+    }
+
+    fn context_error_message() -> String {
+        value::to_string(exc::pending_value())
+    }
+
+    #[test]
+    fn ssl_context_defaults_follow_the_protocol() {
+        exc::init();
+        let client = new_context(PROTOCOL_TLS_CLIENT);
+        assert_eq!(
+            value::as_integer(context_get(client, "verify_mode")),
+            Some(CERT_REQUIRED)
+        );
+        assert_eq!(context_get(client, "check_hostname"), value::TRUE);
+        assert_eq!(
+            value::as_integer(context_get(client, "protocol")),
+            Some(PROTOCOL_TLS_CLIENT)
+        );
+        assert_eq!(context_get(client, "post_handshake_auth"), value::FALSE);
+        assert_eq!(
+            value::as_integer(context_get(client, "options")),
+            Some(OP_ALL)
+        );
+        assert_eq!(
+            value::instance_class_value(client).and_then(value::class_display_name),
+            Some("SSLContext")
+        );
+
+        // `SSLContext()` without a protocol is CPython's generic
+        // `PROTOCOL_TLS`, which verifies nothing.
+        let generic = ssl_call("SSLContext", &[]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_integer(context_get(generic, "protocol")),
+            Some(PROTOCOL_TLS)
+        );
+        assert_eq!(
+            value::as_integer(context_get(generic, "verify_mode")),
+            Some(CERT_NONE)
+        );
+        assert_eq!(context_get(generic, "check_hostname"), value::FALSE);
+
+        let server = new_context(PROTOCOL_TLS_SERVER);
+        assert_eq!(
+            value::as_integer(context_get(server, "verify_mode")),
+            Some(CERT_NONE)
+        );
+        assert_eq!(context_get(server, "check_hostname"), value::FALSE);
+
+        exc::init();
+        let _ = ssl_call("SSLContext", &[encode_int(99)]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert!(context_error_message().contains("Unsupported protocol version"));
+        exc::clear();
+    }
+
+    #[test]
+    fn check_hostname_and_verify_mode_stay_consistent() {
+        exc::init();
+        let context = new_context(PROTOCOL_TLS_CLIENT);
+
+        // CERT_NONE is rejected while host-name checking is enabled.
+        assert_eq!(
+            context_set(context, "verify_mode", encode_int(CERT_NONE)),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert!(context_error_message()
+            .contains("Cannot set verify_mode to CERT_NONE when check_hostname is enabled."));
+        exc::clear();
+
+        // Out-of-range and non-integer modes are rejected.
+        assert_eq!(context_set(context, "verify_mode", encode_int(7)), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert!(context_error_message().contains("invalid verify_mode"));
+        exc::clear();
+
+        assert_eq!(
+            context_set(context, "verify_mode", ssl_text("unverified")),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(context_error_message().contains("verify_mode must be an integer"));
+        exc::clear();
+
+        // Disabling host-name checking frees CERT_NONE, and re-enabling it
+        // afterwards is then rejected.
+        assert_eq!(context_set(context, "check_hostname", value::FALSE), NONE);
+        assert!(!exc::pending());
+        assert_eq!(
+            context_set(context, "verify_mode", encode_int(CERT_NONE)),
+            NONE
+        );
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_integer(context_get(context, "verify_mode")),
+            Some(CERT_NONE)
+        );
+        assert_eq!(context_set(context, "check_hostname", value::TRUE), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert!(context_error_message()
+            .contains("Cannot set check_hostname to True when verify_mode is CERT_NONE"));
+        exc::clear();
+
+        // CERT_OPTIONAL keeps host-name checking available.
+        let optional = new_context(PROTOCOL_TLS_CLIENT);
+        assert_eq!(
+            context_set(optional, "verify_mode", encode_int(CERT_OPTIONAL)),
+            NONE
+        );
+        assert!(!exc::pending());
+        assert_eq!(context_get(optional, "check_hostname"), value::TRUE);
+        assert_eq!(
+            value::as_integer(context_get(optional, "verify_mode")),
+            Some(CERT_OPTIONAL)
+        );
+    }
+
+    #[test]
+    fn load_verify_locations_reads_real_ca_files() {
+        exc::init();
+        let dir = ssl_temp_dir("ca");
+        let ca_file = write_fixture(&dir, "ca.pem", TEST_CA_PEM);
+        let context = new_context(PROTOCOL_TLS_CLIENT);
+        assert_eq!(
+            ssl_call(
+                "_ssl_context_load_verify_locations",
+                &[context, ssl_text(&ca_file), NONE, NONE],
+            ),
+            NONE
+        );
+        assert!(!exc::pending());
+        assert_eq!(context_roots(context).len(), 1);
+
+        // `cadata` loads the same PEM text from memory.
+        let keyword_context = new_context(PROTOCOL_TLS_CLIENT);
+        let loaded = context_method(
+            keyword_context,
+            "load_verify_locations",
+            &[NONE, NONE, ssl_text(TEST_CA_PEM)],
+        );
+        assert_eq!(loaded, NONE);
+        assert!(!exc::pending());
+        assert_eq!(context_roots(keyword_context).len(), 1);
+
+        // All three sources omitted is CPython's TypeError.
+        exc::init();
+        let _ = ssl_call(
+            "_ssl_context_load_verify_locations",
+            &[context, NONE, NONE, NONE],
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(context_error_message().contains("cannot be all omitted"));
+        exc::clear();
+
+        // A missing file keeps the OS errno text, and a file without a
+        // certificate is an SSL-tagged OSError.
+        let missing = dir.join("missing.pem");
+        let _ = ssl_call(
+            "_ssl_context_load_verify_locations",
+            &[context, ssl_text(&missing.to_string_lossy()), NONE, NONE],
+        );
+        assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+        assert!(context_error_message().contains("No such file"));
+        exc::clear();
+
+        let garbage = write_fixture(&dir, "garbage.pem", "not a certificate\n");
+        let _ = ssl_call(
+            "_ssl_context_load_verify_locations",
+            &[context, ssl_text(&garbage), NONE, NONE],
+        );
+        assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+        assert!(context_error_message().contains("no certificates found"));
+        exc::clear();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_cert_chain_reads_real_certificate_and_key_files() {
+        exc::init();
+        let dir = ssl_temp_dir("chain");
+        let cert_file = write_fixture(&dir, "cert.pem", TEST_CERT_PEM);
+        let key_file = write_fixture(&dir, "key.pem", TEST_KEY_PEM);
+        let context = new_context(PROTOCOL_TLS_CLIENT);
+        assert_eq!(
+            ssl_call(
+                "_ssl_context_load_cert_chain",
+                &[context, ssl_text(&cert_file), ssl_text(&key_file), NONE],
+            ),
+            NONE
+        );
+        assert!(!exc::pending());
+        assert_eq!(context_cert_chain(context).len(), 1);
+        let key = context_attr(context, "_key").expect("private key stored");
+        assert!(value::as_bytes(key).is_some_and(|bytes| !bytes.is_empty()));
+
+        // The second argument is an unsupported encrypted-key password.
+        let password_context = new_context(PROTOCOL_TLS_CLIENT);
+        let _ = ssl_call(
+            "_ssl_context_load_cert_chain",
+            &[
+                password_context,
+                ssl_text(&cert_file),
+                ssl_text(&key_file),
+                ssl_text("secret"),
+            ],
+        );
+        assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+        assert!(context_error_message().contains("encrypted private keys"));
+        exc::clear();
+
+        // A missing certificate file and an unparsable key both fail.
+        let missing = dir.join("missing.pem");
+        let _ = ssl_call(
+            "_ssl_context_load_cert_chain",
+            &[context, ssl_text(&missing.to_string_lossy()), NONE, NONE],
+        );
+        assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+        exc::clear();
+
+        let bad_key = write_fixture(&dir, "bad-key.pem", "not a private key\n");
+        let _ = ssl_call(
+            "_ssl_context_load_cert_chain",
+            &[context, ssl_text(&cert_file), ssl_text(&bad_key), NONE],
+        );
+        assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+        assert!(context_error_message().contains("could not load the private key"));
+        exc::clear();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_alpn_protocols_validates_and_stores_names() {
+        exc::init();
+        let context = new_context(PROTOCOL_TLS_CLIENT);
+        let protocols =
+            value::list_new(vec![ssl_text("h2"), value::bytes_new(b"http/1.1".to_vec())]);
+        assert_eq!(
+            context_method(context, "set_alpn_protocols", &[protocols]),
+            NONE
+        );
+        assert!(!exc::pending());
+        let stored = context_alpn(context);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0], b"h2".to_vec());
+        assert_eq!(stored[1], b"http/1.1".to_vec());
+
+        // An empty and an over-long name are rejected with `SSLError`
+        // (`OSError` in this runtime).
+        for bad in [b"".to_vec(), vec![b'a'; 256]] {
+            let names = value::list_new(vec![value::bytes_new(bad)]);
+            assert_eq!(
+                context_method(context, "set_alpn_protocols", &[names]),
+                NONE
+            );
+            assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+            assert!(context_error_message().contains("ALPN protocols must be 1 to 255"));
+            exc::clear();
+        }
+
+        // A non-bytes item and a non-sequence argument are `TypeError`.
+        let mixed = value::list_new(vec![encode_int(1)]);
+        assert_eq!(
+            context_method(context, "set_alpn_protocols", &[mixed]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(context_error_message().contains("protocol name must be str or bytes"));
+        exc::clear();
+
+        assert_eq!(
+            context_method(context, "set_alpn_protocols", &[encode_int(1)]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(context_error_message().contains("must be a sequence"));
+        exc::clear();
+
+        // An empty sequence clears the list again.
+        let empty = value::list_new(Vec::new());
+        assert_eq!(
+            context_method(context, "set_alpn_protocols", &[empty]),
+            NONE
+        );
+        assert!(!exc::pending());
+        assert!(context_alpn(context).is_empty());
+    }
+
+    #[test]
+    fn post_handshake_auth_and_options_are_writable_flags() {
+        exc::init();
+        let context = new_context(PROTOCOL_TLS_CLIENT);
+        assert_eq!(context_get(context, "post_handshake_auth"), value::FALSE);
+        assert_eq!(
+            context_set(context, "post_handshake_auth", value::TRUE),
+            NONE
+        );
+        assert!(!exc::pending());
+        assert_eq!(context_get(context, "post_handshake_auth"), value::TRUE);
+        // Truthiness, not identity, decides the stored flag.
+        assert_eq!(
+            context_set(context, "post_handshake_auth", encode_int(0)),
+            NONE
+        );
+        assert_eq!(context_get(context, "post_handshake_auth"), value::FALSE);
+        // rustls has no post-handshake authentication for clients; the flag
+        // is stored (CPython reads it in `http.client`) but never used.
+
+        assert_eq!(context_set(context, "options", encode_int(3)), NONE);
+        assert!(!exc::pending());
+        assert_eq!(value::as_integer(context_get(context, "options")), Some(3));
+        assert_eq!(context_set(context, "options", ssl_text("opts")), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn stdlib_context_matches_cpython_defaults() {
+        exc::init();
+        // `ssl._create_stdlib_context()` is the unverified context the stdlib
+        // mail/FTP clients ask for by default.
+        let unverified = ssl_call_kw("_create_stdlib_context", &[], Vec::new());
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_integer(context_get(unverified, "protocol")),
+            Some(PROTOCOL_TLS_CLIENT)
+        );
+        assert_eq!(
+            value::as_integer(context_get(unverified, "verify_mode")),
+            Some(CERT_NONE)
+        );
+        assert_eq!(context_get(unverified, "check_hostname"), value::FALSE);
+        // No certificate store is touched without verification.
+        assert!(!context_bool(unverified, "_default_roots", false));
+
+        // `_create_unverified_context` is the same factory under its real
+        // CPython name.
+        let alias = ssl_call("_create_unverified_context", &[]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_integer(context_get(alias, "verify_mode")),
+            Some(CERT_NONE)
+        );
+
+        // Explicit verification loads the Mozilla roots.
+        let verified = ssl_call_kw(
+            "_create_stdlib_context",
+            &[],
+            vec![
+                ("cert_reqs".to_string(), encode_int(CERT_REQUIRED)),
+                ("check_hostname".to_string(), value::TRUE),
+            ],
+        );
+        assert!(
+            !exc::pending(),
+            "verified context raised: {}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(
+            value::as_integer(context_get(verified, "verify_mode")),
+            Some(CERT_REQUIRED)
+        );
+        assert_eq!(context_get(verified, "check_hostname"), value::TRUE);
+        assert!(context_bool(verified, "_default_roots", false));
+
+        // The CLIENT_AUTH purpose selects the server protocol, which this
+        // runtime reports as unsupported when wrapping.
+        let purposes = ssl_constant("Purpose");
+        let client_auth =
+            crate::methods::getattr(purposes, b"CLIENT_AUTH".as_ptr(), "CLIENT_AUTH".len());
+        assert!(!exc::pending());
+        let server_context = ssl_call_kw(
+            "_create_stdlib_context",
+            &[],
+            vec![("purpose".to_string(), client_auth)],
+        );
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_integer(context_get(server_context, "protocol")),
+            Some(PROTOCOL_TLS_SERVER)
+        );
+        let socket = call(
+            "socket",
+            "socket",
+            &[encode_int(AF_INET), encode_int(SOCK_STREAM)],
+        );
+        assert!(!exc::pending());
+        let wrapped = ssl_call("_ssl_context_wrap_socket", &[server_context, socket, NONE]);
+        assert_eq!(wrapped, NONE);
+        assert_eq!(exc::pending_tag(), OS_ERROR as i64);
+        assert!(context_error_message().contains("server-side TLS is not supported"));
+        exc::clear();
+        let _ = method(socket, "close", &[]);
+
+        // A bogus purpose is `TypeError`, and `keyfile` requires `certfile`.
+        exc::init();
+        let _ = ssl_call_kw(
+            "_create_stdlib_context",
+            &[],
+            vec![("purpose".to_string(), ssl_text("bogus"))],
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+
+        exc::init();
+        let _ = ssl_call_kw(
+            "_create_stdlib_context",
+            &[],
+            vec![("keyfile".to_string(), ssl_text("key.pem"))],
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert!(context_error_message().contains("certfile must be specified"));
+        exc::clear();
+
+        // Explicit CA files really load.
+        let dir = ssl_temp_dir("stdlib");
+        let ca_file = write_fixture(&dir, "ca.pem", TEST_CA_PEM);
+        let context = ssl_call_kw(
+            "_create_stdlib_context",
+            &[],
+            vec![("cafile".to_string(), ssl_text(&ca_file))],
+        );
+        assert!(!exc::pending());
+        assert_eq!(context_roots(context).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_https_context_is_create_default_context() {
+        exc::init();
+        let context = ssl_call("_create_default_https_context", &[]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_integer(context_get(context, "protocol")),
+            Some(PROTOCOL_TLS_CLIENT)
+        );
+        assert_eq!(
+            value::as_integer(context_get(context, "verify_mode")),
+            Some(CERT_REQUIRED)
+        );
+        assert_eq!(context_get(context, "check_hostname"), value::TRUE);
+        assert!(context_bool(context, "_default_roots", false));
+
+        let keyword = ssl_call_kw("_create_default_https_context", &[], Vec::new());
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_integer(context_get(keyword, "verify_mode")),
+            Some(CERT_REQUIRED)
+        );
+
+        // `create_default_context` validates its purpose selector too.
+        let purposes = ssl_constant("Purpose");
+        let client_auth =
+            crate::methods::getattr(purposes, b"CLIENT_AUTH".as_ptr(), "CLIENT_AUTH".len());
+        let server = ssl_call("create_default_context", &[client_auth]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_integer(context_get(server, "protocol")),
+            Some(PROTOCOL_TLS_SERVER)
+        );
+        assert_eq!(
+            value::as_integer(context_get(server, "verify_mode")),
+            Some(CERT_NONE)
+        );
+    }
+
+    #[test]
+    fn ssl_exports_ssl_socket_and_purpose_values() {
+        exc::init();
+        let ssl_socket = ssl_constant("SSLSocket");
+        assert!(!exc::pending());
+        assert!(value::as_class(ssl_socket).is_some());
+        assert!(value::is_subclass_of(ssl_socket, value::socket_class()));
+
+        let purposes = ssl_constant("Purpose");
+        assert!(!exc::pending());
+        assert!(value::as_class(purposes).is_some());
+        for name in ["SERVER_AUTH", "CLIENT_AUTH"] {
+            let member = crate::methods::getattr(purposes, name.as_ptr(), name.len());
+            assert!(!exc::pending(), "Purpose.{name} must resolve");
+            assert_eq!(
+                value::instance_class_value(member).and_then(value::class_display_name),
+                Some("Purpose")
+            );
+            let oid = crate::methods::getattr(member, b"oid".as_ptr(), 3);
+            assert!(!exc::pending());
+            assert!(value::as_str(oid).is_some_and(|oid| oid.starts_with("1.3.6.1.5.5.7.3.")));
+        }
+        let server_auth =
+            crate::methods::getattr(purposes, b"SERVER_AUTH".as_ptr(), "SERVER_AUTH".len());
+        let client_auth =
+            crate::methods::getattr(purposes, b"CLIENT_AUTH".as_ptr(), "CLIENT_AUTH".len());
+        assert_ne!(server_auth, client_auth);
+    }
+
+    #[test]
+    fn wrap_socket_reports_unsupported_and_missing_hostname() {
+        exc::init();
+        let context = new_context(PROTOCOL_TLS_CLIENT);
+        let socket = call(
+            "socket",
+            "socket",
+            &[encode_int(AF_INET), encode_int(SOCK_STREAM)],
+        );
+        assert!(!exc::pending());
+
+        // `check_hostname` is on for a client context, so a wrap without a
+        // server name is CPython's `ValueError`.
+        let _ = ssl_call("_ssl_context_wrap_socket", &[context, socket, NONE]);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert!(context_error_message().contains("check_hostname requires server_hostname"));
+        exc::clear();
+
+        // A non-socket argument is rejected before any TLS work.
+        let _ = ssl_call(
+            "_ssl_context_wrap_socket",
+            &[context, encode_int(1), ssl_text("localhost")],
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(context_error_message().contains("must be a socket"));
+        exc::clear();
+
+        let _ = method(socket, "close", &[]);
     }
 }

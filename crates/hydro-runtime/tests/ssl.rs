@@ -195,9 +195,28 @@ fn constants_and_context_exports() {
         &[module_get("ssl", "PROTOCOL_TLS_CLIENT")],
     );
     assert_no_error();
-    // `verify_mode` is an ordinary instance attribute (CERT_REQUIRED default)
-    // and can be replaced, exactly like CPython's SSLContext.
+    // `verify_mode`/`check_hostname` are properties: a client context starts
+    // verified with host-name checking on, and CPython refuses CERT_NONE
+    // until `check_hostname` is disabled.
     assert_eq!(hydro_getattr(context, b"verify_mode".as_ptr(), 11), int(2));
+    assert_eq!(
+        hydro_getattr(context, b"check_hostname".as_ptr(), 14),
+        hydro_true()
+    );
+    assert_eq!(
+        hydro_setattr(context, b"verify_mode".as_ptr(), 11, int(0)),
+        hydro_none()
+    );
+    assert_eq!(
+        hydro_exc_tag(),
+        0,
+        "CERT_NONE must be rejected while check_hostname is enabled"
+    );
+    clear_error();
+    assert_eq!(
+        hydro_setattr(context, b"check_hostname".as_ptr(), 14, hydro_false()),
+        hydro_none()
+    );
     assert_eq!(
         hydro_setattr(context, b"verify_mode".as_ptr(), 11, int(0)),
         hydro_none()
