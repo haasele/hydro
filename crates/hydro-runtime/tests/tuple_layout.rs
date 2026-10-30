@@ -76,6 +76,14 @@ fn build_fixture() -> Option<PathBuf> {
         return None;
     }
     let includes = String::from_utf8_lossy(&include_output.stdout);
+    // The fixture uses non-limited inline macros, so the header layout must
+    // match the targeted CPython minor. CI images often ship only the
+    // distro's Python headers (3.12 on Ubuntu 24.04); compiling against them
+    // produces a fixture with a different object layout. Skip rather than
+    // report a false runtime failure.
+    if !includes.contains("python3.14") {
+        return None;
+    }
     let mut command = Command::new("cc");
     // No `Py_LIMITED_API`: the inline macros are the point of this fixture.
     // `-DNDEBUG` disables the debug-only `index < allocated` assertion in
