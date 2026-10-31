@@ -1771,6 +1771,9 @@ pub(crate) fn unop(op: u32, a: i64) -> i64 {
             if let Some(f) = value::as_float(a) {
                 return value::float_new(-f);
             }
+            if let Some(result) = instance_dunder_unop(a, "__neg__") {
+                return result;
+            }
             unary_type_error("-", a)
         }
         OP_POS => {
@@ -1786,6 +1789,9 @@ pub(crate) fn unop(op: u32, a: i64) -> i64 {
             if let Some(f) = value::as_float(a) {
                 return value::float_new(f);
             }
+            if let Some(result) = instance_dunder_unop(a, "__pos__") {
+                return result;
+            }
             unary_type_error("+", a)
         }
         OP_NOT => value::bool_value(!value::truthy(a)),
@@ -1796,11 +1802,25 @@ pub(crate) fn unop(op: u32, a: i64) -> i64 {
             }
             match value::as_integer(a) {
                 Some(n) => int_result(!n),
-                None => unary_type_error("~", a),
+                None => match instance_dunder_unop(a, "__invert__") {
+                    Some(result) => result,
+                    None => unary_type_error("~", a),
+                },
             }
         }
         _ => exc::raise_with_message(TYPE_ERROR, "unknown unary operator"),
     }
+}
+
+/// Calls a user instance's unary dunder (`__neg__`, `__pos__`, `__invert__`).
+/// `NotImplemented` falls through to the operator's type error, as CPython
+/// does.
+fn instance_dunder_unop(a: i64, op: &str) -> Option<i64> {
+    let result = instance_method_call(a, op, &[a])?;
+    if !exc::pending() && result == value::NOT_IMPLEMENTED {
+        return None;
+    }
+    Some(result)
 }
 
 fn unary_type_error(op: &str, a: i64) -> i64 {

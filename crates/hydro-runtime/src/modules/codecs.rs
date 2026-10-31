@@ -114,6 +114,12 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "lookup" => lookup(args),
         "getdecoder" => codec_member(args, "decode"),
         "getencoder" => codec_member(args, "encode"),
+        // The native codecs are stateless for single-call encode/decode, so
+        // the incremental entry points hand back the same callables. That is
+        // enough for `_pyio`'s module-level imports; stateful streaming is
+        // still future work.
+        "getincrementaldecoder" => codec_member(args, "decode"),
+        "getincrementalencoder" => codec_member(args, "encode"),
         "register" => register(args),
         "unregister" => unregister(args),
         "register_error" => register_error(args),

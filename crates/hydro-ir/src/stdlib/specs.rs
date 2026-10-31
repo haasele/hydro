@@ -652,6 +652,13 @@ pub static OS: ModuleSpec = ModuleSpec {
         // `setsid()`: create a session and return its id.
         f("setsid", 0, 0, Type::Int),
         f("login_tty", 1, 1, Type::None),
+        // `get_blocking(fd)` / `readinto(fd, buffer[, n])`.
+        f("get_blocking", 1, 1, Type::Bool),
+        f("set_blocking", 2, 2, Type::None),
+        f("readinto", 2, 3, Type::Int),
+        f("ftruncate", 2, 2, Type::None),
+        // `execlp(file, arg0, *args)`: replaces the process image.
+        f("execlp", 2, usize::MAX, Type::Any),
         f("forkpty", 0, 0, Type::Tuple),
         // `walk(top)`: directory entries as a materialised list of
         // `(path, dirnames, filenames)` triples.
@@ -668,6 +675,8 @@ pub static OS: ModuleSpec = ModuleSpec {
         c("environ", Type::Dict),
         c("PathLike", Type::Any),
         c("devnull", Type::Str),
+        c("linesep", Type::Str),
+        c("O_BINARY", Type::Int),
         // `altsep` is `None` on POSIX; `defpath` is the default executable
         // search path.
         c("altsep", Type::Any),
@@ -678,6 +687,8 @@ pub static OS: ModuleSpec = ModuleSpec {
         c("SEEK_SET", Type::Int),
         c("SEEK_CUR", Type::Int),
         c("SEEK_END", Type::Int),
+        c("SEEK_DATA", Type::Int),
+        c("SEEK_HOLE", Type::Int),
         // `os.WNOHANG`: the non-blocking flag for the `waitpid` family.
         c("WNOHANG", Type::Int),
         c("F_OK", Type::Int),
@@ -1853,6 +1864,8 @@ pub static IO: ModuleSpec = ModuleSpec {
         c("SEEK_SET", Type::Int),
         c("SEEK_CUR", Type::Int),
         c("SEEK_END", Type::Int),
+        c("SEEK_DATA", Type::Int),
+        c("SEEK_HOLE", Type::Int),
         // The exported name list and the default `BufferedReader`/Writer
         // buffer size.
         c("__all__", Type::List),
@@ -4162,6 +4175,10 @@ pub static CODECS: ModuleSpec = ModuleSpec {
         // `CodecInfo` member, used by pandas' string accessors.
         f("getdecoder", 1, 1, Type::Function),
         f("getencoder", 1, 1, Type::Function),
+        // `getincrementaldecoder`/`getincrementalencoder`: the incremental
+        // codec classes used by `io.TextIOWrapper`.
+        f("getincrementaldecoder", 1, 1, Type::Any),
+        f("getincrementalencoder", 1, 1, Type::Any),
     ],
     constants: &[
         // `CodecInfo(encode, decode, streamreader=None, streamwriter=None,

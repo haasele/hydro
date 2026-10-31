@@ -422,8 +422,8 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`); `required`
       stays empty until a never-regress subset is pinned. It grows only from
       real `hydro_pass` results.
-      Stdlib import baseline 2026-10-30: **252/297 importable** (50
-      builtin/frozen, 150 pure, 52 extension; 9 CPython-failing; 45 failed). Batch A of
+      Stdlib import baseline 2026-10-30: **258/297 importable** (50
+      builtin/frozen, 156 pure, 52 extension; 9 CPython-failing; 39 failed). Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
       `_heapq`/`heapq`, `colorsys`, `keyword`, `_stat`/`stat`,
       `_operator`, `_functools`, `_io`), the Batch B native core
@@ -794,8 +794,11 @@ code, span, help and stable exit code; `--json` is documented and tested.
 Goal: the CPython 3.14.9 standard library works on the Hydro runtime —
 module by module, with evidence. `benchmarks/compat/latest.json` is the
 source of truth for the import matrix (`docs/COMPATIBILITY.md` is generated
-from it). Status 2026-10-30: **252/297 modules importable**, **45 failed**
+from it). Status 2026-10-30: **258/297 modules importable**, **39 failed**
 (including 9 modules where CPython 3.14.9 itself fails on this host).
+The latest batch closed `_pydatetime`, `_pyio`, `logging`, `venv` and
+`imaplib` by fixing sequential class-body lookup, property setters,
+unary dunders, subclass `__new__`, literal regex braces and `str.rfind`.
 
 The package/site-packages loader (P7-01) is in place: packages with
 `__init__.py`, dotted names, submodules and relative imports resolve through
@@ -1053,7 +1056,7 @@ marks a module CPython ships only for a
 platform Hydro does not target on this host (Windows/Apple), tracked as
 platform-unsupported rather than implemented.
 
-Current matrix: 252/297 importable, 45 failed (including 9 modules CPython
+Current matrix: 258/297 importable, 39 failed (including 9 modules CPython
 3.14.9 itself fails). The ledger is the work list for the failed entries;
 checked entries count as delivered slices, not as complete parity.
 
@@ -1410,7 +1413,7 @@ is implemented for the v1 slice, and Tier 4/NB-6 is a tested pilot.
       - [x] Full `tp_traverse`/`tp_clear`, GIL/thread integration and the
             threaded callback + GC stress gate (`PyGC_Collect` production
             pass; visitproc order fixed).
-- [ ] NB-7 Stdlib parity: 252/297 importable; 297/297 must be accounted for
+- [ ] NB-7 Stdlib parity: 258/297 importable; 297/297 must be accounted for
       (import + mapped `Lib/test` subset green, or documented unsupported).
       Tracked by P7 above; P7 is **not** complete.
 

@@ -1129,6 +1129,22 @@ fn metaclass_attribute(class: i64, attr: &str) -> Option<i64> {
 /// `AttributeError` here. A name missing from the class namespace is resolved
 /// on the metaclass, where the class itself is the receiver.
 fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
+    // `io.IOBase.register(Sub)` is a virtual-ABC registration. The cached
+    // `IOBase` has no `ABCMeta`, so accept the subclass directly; `_pyio` uses
+    // this only to declare its pure-Python class as the virtual base.
+    if method == "register"
+        && value::class_display_name(class).is_some_and(|name| name.ends_with("IOBase"))
+    {
+        if argc != 1 || argv.is_null() {
+            return type_error("register() takes exactly one argument".to_string());
+        }
+        // SAFETY: exactly one argument was checked above.
+        let subclass = unsafe { *argv };
+        if value::as_class(subclass).is_none() {
+            return type_error("register() argument must be a class".to_string());
+        }
+        return subclass;
+    }
     // `type(obj).__repr__(value)` resolves the type-level `repr` slot the
     // cached native classes expose, not the metaclass's own `__repr__`.
     if method == "__repr__" && cached_repr_type_name(class).is_some() {
@@ -1139,8 +1155,21 @@ fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) 
         && !metaclass_defines_new(class)
     {
         // `Cls.__new__(Cls)` allocates without running `__init__` when the
-        // class (and its metaclass) define no custom `__new__`.
-        return value::instance_new(class);
+        // class (and its metaclass) define no custom `__new__`. The first
+        // argument is the class to allocate, so `Base.__new__(Sub)` creates a
+        // `Sub` instance (CPython's `object.__new__` contract).
+        let target = if argc > 0 && !argv.is_null() {
+            // SAFETY: the caller guarantees `argc` initialized values at
+            // `argv` (checked before dispatch).
+            let candidate = unsafe { *argv };
+            if value::as_class(candidate).is_none() {
+                return type_error("__new__(): first argument must be a type".to_string());
+            }
+            candidate
+        } else {
+            class
+        };
+        return value::instance_new(target);
     }
     if argc > 0 && (argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>()) {
         return type_error(format!(
@@ -2894,6 +2923,16 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
             value::ClassEntry::Method(_, _) => value::bound_method_new(obj, attr.to_string()),
         };
     }
+    // `io`'s cached base classes are class objects even when `as_class`
+    // cannot describe them; `_pyio` registers each pure-Python base through
+    // this spelling.
+    if attr == "register"
+        && value::type_name(obj) == "type"
+        && value::class_display_name(obj).is_some_and(|name| name.ends_with("IOBase"))
+    {
+        let register = value::native_function_new("abc", "ABCMeta.register", 2);
+        return value::partial_new(register, vec![obj]);
+    }
     if let Some(class) = value::as_class(obj) {
         // `pprint` compares `type(object).__repr__` with `is dict.__repr__`,
         // so the cached native classes for the exposed builtin types return
@@ -3022,6 +3061,13 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
                 return value::bound_method_new(obj, attr.to_string());
             }
             None => {}
+        }
+        // `io.IOBase` is an ABC in CPython even though the cached native class
+        // carries no explicit `ABCMeta`; `_pyio` registers its pure-Python
+        // `IOBase` through this method.
+        if attr == "register" && value::as_class(obj).is_some_and(|class| class.name == "IOBase") {
+            let register = value::native_function_new("abc", "ABCMeta.register", 2);
+            return value::partial_new(register, vec![obj]);
         }
         // A name missing from the class namespace falls back to the
         // metaclass, as in CPython: this is how `ABCMeta.register`,
@@ -4924,6 +4970,52 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
             }
             let window: String = chars[start as usize..end as usize].iter().collect();
             let position = match window.find(pat.as_str()) {
+                Some(byte) => start + window[..byte].chars().count() as i64,
+                None => -1,
+            };
+            ops::int_result(position)
+        }
+        "rfind" => {
+            if let Some(err) = check_arity("str", method, args.len(), 1, 3) {
+                return err;
+            }
+            let pat = match str_arg(method, 1, args[0]) {
+                Ok(s) => s,
+                Err(err) => return err,
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let length = chars.len() as i64;
+            let start = match args.get(1).copied() {
+                Some(argument) => match value::as_integer(argument) {
+                    Some(index) => index,
+                    None => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            "rfind() index must be an integer",
+                        )
+                    }
+                },
+                None => 0,
+            };
+            let start = if start < 0 { start + length } else { start }.clamp(0, length);
+            let end = match args.get(2).copied() {
+                Some(argument) => match value::as_integer(argument) {
+                    Some(index) => index,
+                    None => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            "rfind() end must be an integer",
+                        )
+                    }
+                },
+                None => length,
+            };
+            let end = if end < 0 { end + length } else { end }.clamp(0, length);
+            if start > end {
+                return ops::int_result(-1);
+            }
+            let window: String = chars[start as usize..end as usize].iter().collect();
+            let position = match window.rfind(pat.as_str()) {
                 Some(byte) => start + window[..byte].chars().count() as i64,
                 None => -1,
             };

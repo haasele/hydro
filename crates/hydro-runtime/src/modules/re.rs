@@ -242,7 +242,7 @@ fn compile_source(source: &str, flags: i64) -> Result<Regex, i64> {
     // CPython accepts an unescaped `[` inside a character class (`[^[]` means
     // "not `[`"), while the Rust regex parser treats it as a nested class.
     // Escape that form before handing the pattern to the parser.
-    let mut normalized = escape_class_brackets(source);
+    let mut normalized = escape_literal_braces(&escape_class_brackets(source));
     if flags & VERBOSE != 0 {
         normalized = escape_verbose_class_chars(&normalized);
     }
@@ -266,6 +266,79 @@ fn compile_source(source: &str, flags: i64) -> Result<Regex, i64> {
     }
 }
 
+/// Escapes braces that CPython treats as literal text but the Rust parser
+/// reads as the start of a repetition quantifier.
+///
+/// Python only interprets `{n}`, `{n,}` and `{n,m}` as quantifiers; any other
+/// `{` is a literal brace (`{\w+}` is a common format-spec pattern). The Rust
+/// `regex` crate rejects those patterns, so escape the literal forms first.
+/// Escapes and character classes are left untouched.
+fn escape_literal_braces(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let mut index = 0;
+    let mut in_class = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            out.push(ch);
+            if let Some(next) = chars.get(index + 1) {
+                out.push(*next);
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '[' && !in_class {
+            in_class = true;
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == ']' && in_class {
+            in_class = false;
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '{' && !in_class {
+            let mut cursor = index + 1;
+            let mut digits = false;
+            while cursor < chars.len() && chars[cursor].is_ascii_digit() {
+                digits = true;
+                cursor += 1;
+            }
+            let mut valid = digits && cursor < chars.len() && chars[cursor] == '}';
+            if digits && !valid && cursor < chars.len() && chars[cursor] == ',' {
+                cursor += 1;
+                while cursor < chars.len() && chars[cursor].is_ascii_digit() {
+                    cursor += 1;
+                }
+                valid = cursor < chars.len() && chars[cursor] == '}';
+            }
+            if valid {
+                out.extend(chars[index..=cursor].iter());
+                index = cursor + 1;
+            } else {
+                out.push('\\');
+                out.push('{');
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '}' && !in_class {
+            out.push('\\');
+            out.push('}');
+            index += 1;
+            continue;
+        }
+        out.push(ch);
+        index += 1;
+    }
+    out
+}
+
 /// Renders a bytes pattern as the ASCII pattern text understood by the Rust
 /// bytes parser: ASCII bytes stay literal, while bytes at or above `0x80`
 /// become `\xNN` escapes. With Unicode mode disabled those escapes match the
@@ -285,7 +358,7 @@ fn bytes_pattern_text(source: &[u8]) -> String {
 /// Compiles bytes pattern text (see [`bytes_pattern_text`]) with the same
 /// normalisation and flag handling as [`compile_source`], in byte mode.
 fn compile_bytes_text(pattern: &str, flags: i64) -> Result<regex_bytes::Regex, i64> {
-    let mut normalized = escape_class_brackets(pattern);
+    let mut normalized = escape_literal_braces(&escape_class_brackets(pattern));
     if flags & VERBOSE != 0 {
         normalized = escape_verbose_class_chars(&normalized);
     }
@@ -2427,6 +2500,19 @@ mod tests {
             Some("a")
         );
         exc::init();
+    }
+
+    #[test]
+    fn literal_braces_are_escaped_but_quantifiers_survive() {
+        assert_eq!(escape_literal_braces(r"{\w+}"), r"\{\w+\}");
+        assert_eq!(
+            escape_literal_braces(r"a{2}b{2,}c{2,3}"),
+            r"a{2}b{2,}c{2,3}"
+        );
+        // Braces inside a character class are already literal; escaping them
+        // would change the class contents.
+        assert_eq!(escape_literal_braces(r"[{}]"), r"[{}]");
+        assert_eq!(escape_literal_braces(r"\{literal\}"), r"\{literal\}");
     }
 
     #[test]

@@ -5611,6 +5611,9 @@ fn importlib_bootstrap_external_module() -> i64 {
 /// the rest are the C library values this build links against, so a caller
 /// passing them to `os.open` gets the descriptor the kernel would create.
 fn os_flag_constant(name: &str) -> Option<i64> {
+    if name == "linesep" {
+        return Some(value::str_from_bytes(b"\n"));
+    }
     Some(encode_int(match name {
         "O_EXCL" => libc::O_EXCL as i64,
         "O_NOFOLLOW" => libc::O_NOFOLLOW as i64,
@@ -5620,6 +5623,11 @@ fn os_flag_constant(name: &str) -> Option<i64> {
         "O_ASYNC" => libc::O_ASYNC as i64,
         "O_NONBLOCK" | "O_NDELAY" => libc::O_NONBLOCK as i64,
         "O_ACCMODE" => (libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR) as i64,
+        // POSIX has no binary/text distinction; the constant exists so code
+        // that passes it unconditionally (CPython's `_pyio`) still compiles.
+        "O_BINARY" => 0,
+        "SEEK_DATA" => 3,
+        "SEEK_HOLE" => 4,
         _ => return None,
     }))
 }
@@ -15163,6 +15171,11 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "forkpty" => os_forkpty(),
         "setsid" => os_setsid(),
         "login_tty" => os_login_tty(args),
+        "get_blocking" => os_get_blocking(args),
+        "set_blocking" => os_set_blocking(args),
+        "readinto" => os_readinto(args),
+        "ftruncate" => os_ftruncate(args),
+        "execlp" => os_execlp(args),
         "walk" => os_walk(args),
         "access" => os_access(args),
         "urandom" => os_urandom(args),
@@ -16209,6 +16222,123 @@ fn os_openpty() -> i64 {
     {
         exc::raise_with_message(exc::NOT_IMPLEMENTED_ERROR, "openpty is unavailable")
     }
+}
+
+/// `os.get_blocking(fd)`: whether the descriptor is in blocking mode.
+fn os_get_blocking(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(raised) => return raised,
+    };
+    // SAFETY: `fcntl` validates the descriptor and command.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return os_error_from_io("get_blocking", std::io::Error::last_os_error(), None);
+    }
+    value::bool_value(flags & libc::O_NONBLOCK == 0)
+}
+
+/// `os.set_blocking(fd, blocking)`.
+fn os_set_blocking(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(raised) => return raised,
+    };
+    // SAFETY: `fcntl` validates the descriptor and command.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return os_error_from_io("set_blocking", std::io::Error::last_os_error(), None);
+    }
+    let updated = if value::truthy(args[1]) {
+        flags & !libc::O_NONBLOCK
+    } else {
+        flags | libc::O_NONBLOCK
+    };
+    // SAFETY: same descriptor and a flag set derived from `F_GETFL`.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, updated) } < 0 {
+        return os_error_from_io("set_blocking", std::io::Error::last_os_error(), None);
+    }
+    NONE
+}
+
+/// `os.execlp(file, arg0, *args)`: replaces the current process image with
+/// `execvp(3)`, searching `PATH`. On failure the pending `OSError` is set.
+fn os_execlp(args: &[i64]) -> i64 {
+    let Some(file) = value::as_str(args[0])
+        .or_else(|| value::as_bytes(args[0]).and_then(|bytes| std::str::from_utf8(bytes).ok()))
+    else {
+        return exc::raise_with_message(TYPE_ERROR, "execlp() file must be a str");
+    };
+    let Ok(file) = CString::new(file) else {
+        return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+    };
+    let mut owned: Vec<CString> = Vec::with_capacity(args.len());
+    for argument in &args[1..] {
+        let Some(text) = value::as_str(*argument).or_else(|| {
+            value::as_bytes(*argument).and_then(|bytes| std::str::from_utf8(bytes).ok())
+        }) else {
+            return exc::raise_with_message(TYPE_ERROR, "execlp() arguments must be str");
+        };
+        let Ok(text) = CString::new(text) else {
+            return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+        };
+        owned.push(text);
+    }
+    let mut pointers: Vec<*const libc::c_char> = owned.iter().map(|item| item.as_ptr()).collect();
+    pointers.push(std::ptr::null());
+    // SAFETY: `file` and every `pointers` entry are NUL-terminated and live
+    // until `execvp` either replaces the process or returns.
+    unsafe {
+        libc::execvp(file.as_ptr(), pointers.as_ptr());
+    }
+    os_error_from_io("execlp", std::io::Error::last_os_error(), None)
+}
+
+/// `os.ftruncate(fd, length)`.
+fn os_ftruncate(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(raised) => return raised,
+    };
+    let Some(length) = value::as_integer(args[1]) else {
+        return exc::raise_with_message(TYPE_ERROR, "ftruncate() length must be an integer");
+    };
+    // SAFETY: `ftruncate` validates the descriptor and length.
+    if unsafe { libc::ftruncate(fd, length) } < 0 {
+        return os_error_from_io("ftruncate", std::io::Error::last_os_error(), None);
+    }
+    NONE
+}
+
+/// `os.readinto(fd, buffer[, n])`: read up to `n` bytes into a bytearray.
+fn os_readinto(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(raised) => return raised,
+    };
+    let buffer = args.get(1).copied().unwrap_or(NONE);
+    let Some(bytes) = value::bytearray_bytes_mut(buffer) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "readinto() argument must be a writable bytes-like object, not '{}'",
+                value::type_name(buffer)
+            ),
+        );
+    };
+    let length = match args.get(2).copied() {
+        None | Some(NONE) => bytes.len(),
+        Some(argument) => match value::as_integer(argument) {
+            Some(n) => n.clamp(0, bytes.len() as i64) as usize,
+            None => return exc::raise_with_message(TYPE_ERROR, "readinto() n must be an integer"),
+        },
+    };
+    // SAFETY: the destination slice is valid for `length` bytes.
+    let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), length) };
+    if read < 0 {
+        return os_error_from_io("readinto", std::io::Error::last_os_error(), None);
+    }
+    encode_int(read as i64)
 }
 
 /// `os.login_tty(fd)`: make the descriptor the controlling terminal.

@@ -6954,22 +6954,21 @@ class C:
     let module = parse(source);
     let mut infer = Infer::new();
     let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
-    let hir = lowerer.lower_module(&module);
+    let _hir = lowerer.lower_module(&module);
     let diags = std::mem::take(&mut lowerer.diags);
     assert!(diags.is_empty(), "{diags:?}");
-    // A lone descriptor-factory decorator (and the known no-op markers) is
-    // fully described by the binding kind: the class keeps the static
-    // `ClassDef` shape instead of executing its body through a namespace.
+    // `@value.setter` is a real decorator call over the earlier property, so
+    // the class body executes through a namespace (the static plan cannot
+    // see the decorated value).
+    let plan = class_plan(&lowerer, &module, "C");
     assert!(
-        !class_plan(&lowerer, &module, "C").dynamic,
-        "binding-kind decorators keep the static class path"
+        plan.dynamic,
+        "property accessors force the runtime class path"
     );
-    let HStmtKind::ClassDef { methods, .. } = &hir.functions[0].body[0].kind else {
-        panic!("expected a class definition");
-    };
-    let kinds: Vec<(&str, MethodKind)> = methods
+    let kinds: Vec<(&str, MethodKind)> = plan
+        .methods
         .iter()
-        .map(|(name, _, kind)| (name.as_str(), *kind))
+        .map(|method| (method.name.as_str(), method.kind))
         .collect();
     assert_eq!(
         kinds,
@@ -6978,6 +6977,7 @@ class C:
             ("build", MethodKind::Classmethod),
             ("helper", MethodKind::Staticmethod),
             ("cached", MethodKind::Normal),
+            ("value", MethodKind::Normal),
         ]
     );
 }
@@ -14261,6 +14261,29 @@ class C(A, B, metaclass=type):
         })
         .expect("class D");
     assert!(class.iter().any(|(name, _)| name == "__slots__"));
+}
+
+#[test]
+fn class_body_reads_do_not_see_later_methods() {
+    // CPython's class body executes sequentially: a method defined after this
+    // statement is not yet bound in the class namespace, so `time` must
+    // resolve to the module-level `time` class, not `datetime.time`.
+    let source = "class time:\n    __slots__ = ('hour',)\n\
+                  class datetime:\n    __slots__ = time.__slots__\n    def time(self):\n        return 1\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let class = class_def_in(&hir.functions[0].body, "datetime").expect("class datetime");
+    let HStmtKind::ClassDef { attributes, .. } = class else {
+        unreachable!()
+    };
+    let slots = attributes
+        .iter()
+        .find_map(|(name, value)| (name == "__slots__").then_some(value))
+        .expect("datetime.__slots__");
+    assert!(
+        !matches!(slots.kind, HExprKind::FunctionRef(_)),
+        "class body saw later method as {slots:?}"
+    );
 }
 
 /// The `HStmtKind::ClassDef` for `name`, descending into module-level

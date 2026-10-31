@@ -35,8 +35,17 @@ initial state of the first runnable core.
   import reports.
 - The stdlib matrix now runs with `HYDRO_STDLIB` pointed at the pinned CPython
   `Lib` tree (the earlier 159 count used the toolchain's default subset); the
-  same code imports **252/297** modules, so the previous report undercounted
+  same code imports **258/297** modules, so the previous report undercounted
   the implementation by 87 modules.
+- Closed the next stdlib-import cluster: `_pydatetime`, `_pyio`, `logging`,
+  `venv` and `imaplib` now import. This required sequential class-body name
+  visibility, real `@property` setter/deleter decorators, unary `__neg__`/
+  `__pos__`/`__invert__`, `Base.__new__(Sub)` allocating the subclass,
+  CPython-compatible literal regex braces, `str.rfind`, and `io.IOBase`'s
+  virtual registration surface.
+- Added `os.ftruncate`, `os.readinto`, `os.get_blocking`/`set_blocking`,
+  `os.execlp`, `os.linesep`, `O_BINARY`, `SEEK_DATA`/`SEEK_HOLE`, plus
+  `codecs.getincrementalencoder`/`getincrementaldecoder`.
 
 ### Compatibility — 2026-10-30 native stdlib and ecosystem continuation
 

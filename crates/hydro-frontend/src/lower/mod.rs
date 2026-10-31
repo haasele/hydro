@@ -2222,6 +2222,11 @@ pub struct Lowerer<'a> {
     /// Class attributes visible while evaluating a class body's attribute
     /// values; the innermost scope is last.
     class_attr_scopes: Vec<HashMap<String, HExpr>>,
+    /// Definition offsets for class-body method names, parallel to
+    /// `class_attr_scopes`. A class body only sees a method after its `def`
+    /// statement runs, so a read before that offset must fall through to the
+    /// enclosing scope (CPython's sequential `LOAD_NAME`).
+    class_method_starts: Vec<HashMap<String, u32>>,
     /// Enclosing function locals visible to the methods of a class that is
     /// registered while lowering a nested `class` statement (name -> the local
     /// currently holds a closure cell). Such methods become closures over the
@@ -2332,6 +2337,7 @@ impl<'a> Lowerer<'a> {
             class_methods: HashMap::new(),
             current_class_method: None,
             class_attr_scopes: Vec::new(),
+            class_method_starts: Vec::new(),
             method_capture_scope: None,
             method_captures: HashMap::new(),
             in_default_expr: false,
@@ -6228,7 +6234,16 @@ impl<'a> Lowerer<'a> {
     ) -> Option<&'static ModuleSpec> {
         match expr {
             ast::Expr::Name(name) => {
-                if fs.lookup(name.id.as_str()).is_some() {
+                if fs.lookup(name.id.as_str()).is_some()
+                    || fs
+                        .class_ns
+                        .as_ref()
+                        .is_some_and(|state| state.bindings.contains(name.id.as_str()))
+                    || self
+                        .class_attr_scopes
+                        .last()
+                        .is_some_and(|scope| scope.contains_key(name.id.as_str()))
+                {
                     return None;
                 }
                 self.module_aliases.get(name.id.as_str()).copied()
@@ -6253,7 +6268,16 @@ impl<'a> Lowerer<'a> {
     fn resolve_user_module_name(&self, expr: &ast::Expr, fs: &FuncState) -> Option<String> {
         match expr {
             ast::Expr::Name(name) => {
-                if fs.lookup(name.id.as_str()).is_some() {
+                if fs.lookup(name.id.as_str()).is_some()
+                    || fs
+                        .class_ns
+                        .as_ref()
+                        .is_some_and(|state| state.bindings.contains(name.id.as_str()))
+                    || self
+                        .class_attr_scopes
+                        .last()
+                        .is_some_and(|scope| scope.contains_key(name.id.as_str()))
+                {
                     return None;
                 }
                 self.user_module_aliases.get(name.id.as_str()).cloned()
@@ -7316,14 +7340,10 @@ impl<'a> Lowerer<'a> {
             // likewise unnecessary: assignment stores an instance attribute,
             // which shadows the getter.
             let skipped_method = match stmt {
-                ast::Stmt::FunctionDef(f) => f
-                    .decorator_list
-                    .iter()
-                    .any(|d| is_overload_decorator(d) || is_property_accessor_decorator(d)),
-                ast::Stmt::AsyncFunctionDef(f) => f
-                    .decorator_list
-                    .iter()
-                    .any(|d| is_overload_decorator(d) || is_property_accessor_decorator(d)),
+                ast::Stmt::FunctionDef(f) => f.decorator_list.iter().any(is_overload_decorator),
+                ast::Stmt::AsyncFunctionDef(f) => {
+                    f.decorator_list.iter().any(is_overload_decorator)
+                }
                 _ => false,
             };
             if skipped_method {
@@ -7475,10 +7495,7 @@ impl<'a> Lowerer<'a> {
         for stmt in body {
             match stmt {
                 ast::Stmt::FunctionDef(f) => {
-                    if f.decorator_list
-                        .iter()
-                        .any(|d| is_overload_decorator(d) || is_property_accessor_decorator(d))
-                    {
+                    if f.decorator_list.iter().any(is_overload_decorator) {
                         continue;
                     }
                     if let Some((id, decoration)) = self.create_method_function(f, class) {
@@ -7500,10 +7517,7 @@ impl<'a> Lowerer<'a> {
                     }
                 }
                 ast::Stmt::AsyncFunctionDef(f) => {
-                    if f.decorator_list
-                        .iter()
-                        .any(|d| is_overload_decorator(d) || is_property_accessor_decorator(d))
-                    {
+                    if f.decorator_list.iter().any(is_overload_decorator) {
                         continue;
                     }
                     if let Some((id, decoration)) = self.create_async_method_function(f, class) {
@@ -11240,8 +11254,9 @@ impl<'a> Lowerer<'a> {
             .class_ns
             .as_ref()
             .map(|state| (state.ns, state.methods.get(&definition_start).cloned()))?;
-        // `@overload` stubs and property accessors are type-only markers and
-        // bind nothing (the static path skips them the same way).
+        // `@overload` stubs are type-only markers and bind nothing. Property
+        // accessors are real decorators and reach this path because
+        // `method_has_runtime_decorators` selects the namespace path.
         let entry = entry?;
         let mut statements = Vec::new();
         let value =
@@ -11849,10 +11864,18 @@ impl<'a> Lowerer<'a> {
                 col,
             };
             self.class_attr_scopes.push(HashMap::new());
+            self.class_method_starts.push(HashMap::new());
             // Class-body expressions can read methods and method aliases that
             // were created earlier in the body; the value is the function
             // object, exactly like a name read in CPython's class namespace.
             if let Some(scope) = self.class_attr_scopes.last_mut() {
+                if let Some(starts) = self.class_method_starts.last_mut() {
+                    for planned in &plan.methods {
+                        if let Some(start) = planned.start {
+                            starts.insert(planned.name.clone(), start);
+                        }
+                    }
+                }
                 for (method, function, _) in &methods {
                     scope.insert(
                         method.clone(),
@@ -11973,6 +11996,7 @@ impl<'a> Lowerer<'a> {
                 attributes.push(("__dataclass_fields__".to_string(), metadata));
             }
             self.class_attr_scopes.pop();
+            self.class_method_starts.pop();
             // CPython publishes the PEP 695 parameter list on the class after
             // the body has run, so a class-body binding of the same name never
             // wins.
@@ -16605,6 +16629,12 @@ impl<'a> Lowerer<'a> {
                     .last()
                     .and_then(|scope| scope.get(name))
                     .cloned()
+                    .filter(|_| {
+                        self.class_method_starts
+                            .last()
+                            .and_then(|starts| starts.get(name).copied())
+                            .is_none_or(|start| start <= u32::from(e.range().start()))
+                    })
                 {
                     attribute
                 } else if fs.is_module && self.infallible_import_functions.contains_key(name) {
@@ -22330,14 +22360,14 @@ fn class_body_has_runtime_method_decorators(body: &[ast::Stmt]) -> bool {
 }
 
 /// Whether a method's decorator list produces a runtime decorator expression.
-/// Stub/accessor definitions are skipped before registration, so they do not
-/// force the runtime path.
+/// `@overload` stubs are skipped before registration; property accessors are
+/// real decorator calls and therefore force the runtime namespace path.
 fn method_has_runtime_decorators(decorators: &[ast::Expr]) -> bool {
-    if decorators
-        .iter()
-        .any(|d| is_overload_decorator(d) || is_property_accessor_decorator(d))
-    {
+    if decorators.iter().any(is_overload_decorator) {
         return false;
+    }
+    if decorators.iter().any(is_property_accessor_decorator) {
+        return true;
     }
     let (_, applied) = classify_method_decorators(decorators);
     // A lone binding decorator (`@property`, `@classmethod`,
@@ -22424,8 +22454,8 @@ fn is_overload_decorator(expr: &ast::Expr) -> bool {
     decorator_final_name(expr).as_deref() == Some("overload")
 }
 
-/// `@name.setter` / `@name.deleter`: property writers are not needed because
-/// assigning an instance attribute shadows the getter.
+/// `@name.setter` / `@name.deleter`: these derive a new property from the
+/// getter, so they must execute in the class body like any other decorator.
 fn is_property_accessor_decorator(expr: &ast::Expr) -> bool {
     matches!(
         decorator_final_name(expr).as_deref(),

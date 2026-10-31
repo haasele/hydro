@@ -37,19 +37,19 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 50 | 2 |
-| pure | 174 | 150 | 24 |
+| pure | 174 | 156 | 18 |
 | extension | 63 | 52 | 11 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 252 | 45 |
+| **Total** | 297 | 258 | 39 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
 | compile_error:HYD0002 | 21 |
-| runtime_error | 10 |
 | cpython_failed | 9 |
-| compile_error:HYD0201 | 5 |
+| runtime_error | 6 |
+| compile_error:HYD0201 | 3 |
 
 ## Modules by layer
 
@@ -127,9 +127,9 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_osx_support` | ok | ok | ok | - |
 | `_py_abc` | ok | ok | ok | - |
 | `_py_warnings` | ok | ok | ok | - |
-| `_pydatetime` | ok | exit 1 | runtime_error | AttributeError: 'function' object has no attribute '__slots__' |
+| `_pydatetime` | ok | ok | ok | - |
 | `_pydecimal` | ok | ok | ok | - |
-| `_pyio` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'readinto' |
+| `_pyio` | ok | ok | ok | - |
 | `_pylong` | ok | ok | ok | - |
 | `_pyrepl` | ok | ok | ok | - |
 | `_strptime` | ok | ok | ok | - |
@@ -191,7 +191,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `html` | ok | ok | ok | - |
 | `http` | ok | ok | ok | - |
 | `idlelib` | ok | ok | ok | - |
-| `imaplib` | ok | exit 1 | runtime_error | error: repetition quantifier expects a valid decimal |
+| `imaplib` | ok | ok | ok | - |
 | `importlib` | ok | ok | ok | - |
 | `inspect` | ok | ok | ok | - |
 | `ipaddress` | ok | ok | ok | - |
@@ -199,7 +199,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `keyword` | ok | ok | ok | - |
 | `linecache` | ok | ok | ok | - |
 | `locale` | ok | ok | ok | - |
-| `logging` | ok | exit 1 | runtime_error | error: repetition operator missing expression |
+| `logging` | ok | ok | ok | - |
 | `lzma` | ok | ok | ok | - |
 | `mailbox` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: class-body import binding 'walk' is not supported: only native modules an… |
 | `mimetypes` | ok | ok | ok | - |
@@ -222,7 +222,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `pprint` | ok | ok | ok | - |
 | `profile` | ok | ok | ok | - |
 | `pstats` | ok | ok | ok | - |
-| `pty` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'os' has no attribute 'get_blocking' |
+| `pty` | ok | ok | ok | - |
 | `py_compile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'importlib._bootstrap_external' has no attribute '_code_to_timesta… |
 | `pyclbr` | ok | ok | ok | - |
 | `pydoc` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_frozen_importlib' has no attribute '_find_spec' |
@@ -277,7 +277,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `unittest` | ok | ok | ok | - |
 | `urllib` | ok | ok | ok | - |
 | `uuid` | ok | ok | ok | - |
-| `venv` | ok | exit 1 | runtime_error | error: repetition operator missing expression |
+| `venv` | ok | ok | ok | - |
 | `warnings` | ok | ok | ok | - |
 | `wave` | ok | ok | ok | - |
 | `weakref` | ok | ok | ok | - |
