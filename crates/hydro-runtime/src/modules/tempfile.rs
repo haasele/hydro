@@ -163,6 +163,63 @@ fn mkdtemp(args: &[i64]) -> i64 {
     }
 }
 
+/// `tempfile.mkstemp(suffix=None, prefix=None, dir=None, text=False)`: creates
+/// an exclusively-opened temporary file and returns `(fd, path)`.
+fn mkstemp(args: &[i64]) -> i64 {
+    let suffix = match optional_path(args, 0, "mkstemp", "suffix") {
+        Ok(value) => value.unwrap_or_default(),
+        Err(error) => return error,
+    };
+    let prefix = match optional_path(args, 1, "mkstemp", "prefix") {
+        Ok(value) => value.unwrap_or_else(|| "tmp".to_string()),
+        Err(error) => return error,
+    };
+    let dir = match optional_path(args, 2, "mkstemp", "dir") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let base = match dir.as_deref() {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(TEMP_DIR.as_str()),
+    };
+    for _ in 0..100 {
+        let candidate = base.join(format!("{prefix}{}{suffix}", unique_component()));
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::IntoRawFd;
+                    let fd = file.into_raw_fd();
+                    let path = value::str_alloc(candidate.to_string_lossy().into_owned());
+                    return value::tuple_new(vec![
+                        value::encode_int(i64::from(fd)).expect("fd fits"),
+                        path,
+                    ]);
+                }
+                #[cfg(not(unix))]
+                {
+                    drop(file);
+                    let path = value::str_alloc(candidate.to_string_lossy().into_owned());
+                    return value::tuple_new(vec![NONE, path]);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return io_error(error, &base),
+        }
+    }
+    io_error(
+        io::Error::new(io::ErrorKind::AlreadyExists, "too many temporary files"),
+        &base,
+    )
+}
+
 /// Removes `path` recursively, tolerating an already-missing path.
 fn remove_tree(path: &Path) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
@@ -626,6 +683,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         "gettempdir" => gettempdir(),
         "mkdtemp" => mkdtemp(args),
+        "mkstemp" => mkstemp(args),
         "TemporaryDirectory" => new_temporary_directory(args),
         "NamedTemporaryFile" => new_named_temporary_file(args),
         "_tempdir_enter" => match args.first() {

@@ -37,10 +37,10 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 50 | 2 |
-| pure | 174 | 156 | 18 |
+| pure | 174 | 159 | 15 |
 | extension | 63 | 52 | 11 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 258 | 39 |
+| **Total** | 297 | 261 | 36 |
 
 ## Failure classes
 
@@ -48,8 +48,8 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | --- | ---: |
 | compile_error:HYD0002 | 21 |
 | cpython_failed | 9 |
-| runtime_error | 6 |
-| compile_error:HYD0201 | 3 |
+| runtime_error | 5 |
+| compile_error:HYD0201 | 1 |
 
 ## Modules by layer
 
@@ -147,11 +147,11 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `cProfile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
 | `calendar` | ok | ok | ok | - |
 | `cmd` | ok | ok | ok | - |
-| `code` | ok | exit 2 | runtime_error | tea: internal codegen error: call to function traceback.format_exception expects 6 argume… |
+| `code` | ok | ok | ok | - |
 | `codeop` | ok | ok | ok | - |
 | `collections` | ok | ok | ok | - |
 | `colorsys` | ok | ok | ok | - |
-| `compileall` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'importlib._bootstrap_external' has no attribute '_code_to_timesta… |
+| `compileall` | ok | ok | ok | - |
 | `compression` | ok | ok | ok | - |
 | `concurrent` | ok | ok | ok | - |
 | `configparser` | ok | ok | ok | - |
@@ -223,9 +223,9 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `profile` | ok | ok | ok | - |
 | `pstats` | ok | ok | ok | - |
 | `pty` | ok | ok | ok | - |
-| `py_compile` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'importlib._bootstrap_external' has no attribute '_code_to_timesta… |
+| `py_compile` | ok | ok | ok | - |
 | `pyclbr` | ok | ok | ok | - |
-| `pydoc` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module '_frozen_importlib' has no attribute '_find_spec' |
+| `pydoc` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'inspect' has no attribute 'getcomments' |
 | `pydoc_data` | ok | ok | ok | - |
 | `queue` | ok | ok | ok | - |
 | `quopri` | ok | ok | ok | - |

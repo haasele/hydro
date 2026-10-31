@@ -6844,11 +6844,19 @@ impl<'a> Lowerer<'a> {
         // Signature order mirrors Python: positional, `*args`, keyword-only,
         // `**kwargs`. The slots are ordinary parameters in the generated
         // function; calls fill the list/dict or leave the literal defaults.
+        let (decl_line, decl_col) = self.span(decl.range);
         if let Some(vararg) = &args.vararg {
+            // Omitted `*args` binds an empty list; a direct call omitting the
+            // slot gets that value from the parameter default.
             self.add_param(
                 vararg,
                 None,
-                None,
+                Some(HExpr {
+                    kind: HExprKind::List(Vec::new()),
+                    ty: Ty::Concrete(Type::List),
+                    line: decl_line,
+                    col: decl_col,
+                }),
                 ParamKind::VarArg,
                 &mut params,
                 &mut locals,
@@ -6870,10 +6878,16 @@ impl<'a> Lowerer<'a> {
             );
         }
         if let Some(kwarg) = &args.kwarg {
+            // Omitted `**kwargs` binds an empty dict.
             self.add_param(
                 kwarg,
                 None,
-                None,
+                Some(HExpr {
+                    kind: HExprKind::Dict(Vec::new()),
+                    ty: Ty::Concrete(Type::Dict),
+                    line: decl_line,
+                    col: decl_col,
+                }),
                 ParamKind::KwArg,
                 &mut params,
                 &mut locals,

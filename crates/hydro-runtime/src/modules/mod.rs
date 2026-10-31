@@ -4282,6 +4282,12 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
             // `_frozen_importlib` aliases `importlib`, and both spellings
             // reach the bootstrap import primitive through this arm.
             "_gcd_import" => importlib_gcd_import(args),
+            "_find_spec" => importlib_util::call("find_spec", &args[..args.len().min(1)]),
+            "_exec" => exc::raise_with_message(
+                exc::NOT_IMPLEMENTED_ERROR,
+                "importlib._bootstrap._exec() is not implemented: Hydro links modules statically",
+            ),
+            "_setup" => NONE,
             _ => importlib::call(function, args),
         },
         // The native `runpy` surface (`run_module`) resolves modules through
@@ -5502,6 +5508,117 @@ fn sys_float_info() -> i64 {
 /// through the `importlib.machinery` alias. Only the pyc header validator is
 /// needed by the stdlib (`modulefinder`).
 fn importlib_bootstrap_external_call(function: &str, args: &[i64]) -> Option<i64> {
+    if function == "_set_bootstrap_module" {
+        let _ = args;
+        return Some(NONE);
+    }
+    if function == "_pack_uint32" {
+        return Some(match value::as_integer(args[0]) {
+            Some(value) => value::bytes_new((value as u32).to_le_bytes().to_vec()),
+            None => {
+                exc::raise_with_message(TYPE_ERROR, "_pack_uint32() argument must be an integer")
+            }
+        });
+    }
+    if function == "_unpack_uint32" {
+        let Some(bytes) = value::as_bytes(args[0]) else {
+            return Some(exc::raise_with_message(
+                TYPE_ERROR,
+                "_unpack_uint32() argument must be bytes",
+            ));
+        };
+        if bytes.len() != 4 {
+            return Some(exc::raise_with_message(
+                exc::VALUE_ERROR,
+                "_unpack_uint32() requires exactly 4 bytes",
+            ));
+        }
+        return Some(encode_int(i64::from(u32::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))));
+    }
+    if function == "_calc_mode" {
+        let Some(path) = path_argument(args[0]) else {
+            return Some(exc::raise_with_message(
+                TYPE_ERROR,
+                "_calc_mode() path must be str",
+            ));
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .map(|metadata| metadata.permissions().mode() & 0o777)
+                .unwrap_or(0o666);
+            return Some(encode_int(i64::from(mode | 0o200)));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return Some(encode_int(0o666 | 0o200));
+        }
+    }
+    if function == "_write_atomic" {
+        return Some(bootstrap_write_atomic(args));
+    }
+    if function == "_code_to_timestamp_pyc" {
+        let mut data = importlib_util::MAGIC_NUMBER_BYTES.to_vec();
+        // Timestamp-based pyc: flags 0, mtime and source size.
+        data.extend_from_slice(&0u32.to_le_bytes());
+        let mtime = args
+            .get(1)
+            .and_then(|value| value::as_integer(*value))
+            .unwrap_or(0);
+        let size = args
+            .get(2)
+            .and_then(|value| value::as_integer(*value))
+            .unwrap_or(0);
+        data.extend_from_slice(&(mtime as u32).to_le_bytes());
+        data.extend_from_slice(&(size as u32).to_le_bytes());
+        let payload = marshal::call("dumps", &[args[0]]);
+        if failed() {
+            return Some(NONE);
+        }
+        let Some(payload) = value::as_bytes(payload) else {
+            return Some(exc::raise_with_message(
+                TYPE_ERROR,
+                "_code_to_timestamp_pyc() marshal result must be bytes",
+            ));
+        };
+        data.extend_from_slice(payload);
+        return Some(value::bytes_new(data));
+    }
+    if function == "_code_to_hash_pyc" {
+        let Some(hash) = value::as_bytes(args[1]) else {
+            return Some(exc::raise_with_message(
+                TYPE_ERROR,
+                "_code_to_hash_pyc() source_hash must be bytes",
+            ));
+        };
+        if hash.len() != 8 {
+            return Some(exc::raise_with_message(
+                exc::VALUE_ERROR,
+                "_code_to_hash_pyc() source_hash must be 8 bytes",
+            ));
+        }
+        let checked = args.get(2).copied().map(value::truthy).unwrap_or(true);
+        let mut data = importlib_util::MAGIC_NUMBER_BYTES.to_vec();
+        let flags: u32 = 0b1 | (u32::from(checked) << 1);
+        data.extend_from_slice(&flags.to_le_bytes());
+        data.extend_from_slice(hash);
+        let payload = marshal::call("dumps", &[args[0]]);
+        if failed() {
+            return Some(NONE);
+        }
+        let Some(payload) = value::as_bytes(payload) else {
+            return Some(exc::raise_with_message(
+                TYPE_ERROR,
+                "_code_to_hash_pyc() marshal result must be bytes",
+            ));
+        };
+        data.extend_from_slice(payload);
+        return Some(value::bytes_new(data));
+    }
     if function != "_classify_pyc" {
         return None;
     }
@@ -5565,6 +5682,76 @@ fn importlib_bootstrap_external_call(function: &str, args: &[i64]) -> Option<i64
         ));
     }
     Some(encode_int(i64::from(flags)))
+}
+
+/// Converts a path argument (`str`, `bytes`, or path-like) for the
+/// `_bootstrap_external` helpers.
+fn path_argument(argument: i64) -> Option<std::path::PathBuf> {
+    let argument = os_fspath(argument);
+    if failed() {
+        return None;
+    }
+    if let Some(text) = value::as_str(argument) {
+        return Some(std::path::PathBuf::from(text));
+    }
+    value::as_bytes(argument).map(|bytes| {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    })
+}
+
+/// `_bootstrap_external._write_atomic(path, data, mode=0o666)`.
+fn bootstrap_write_atomic(args: &[i64]) -> i64 {
+    let Some(path) = path_argument(args[0]) else {
+        return exc::raise_with_message(TYPE_ERROR, "_write_atomic() path must be str");
+    };
+    let Some(data) = value::as_bytes(args[1])
+        .map(|bytes| bytes.to_vec())
+        .or_else(|| value::as_bytearray(args[1]).cloned())
+    else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "_write_atomic() data must be a bytes-like object",
+        );
+    };
+    let mode = args
+        .get(2)
+        .and_then(|value| value::as_integer(*value))
+        .unwrap_or(0o666) as u32
+        & 0o666;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("pyc");
+    let temp = path.with_extension(format!("{extension}.{}.tmp", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&temp)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, &path)
+    };
+    match write() {
+        Ok(()) => NONE,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            os_error_from_io("_write_atomic", error, path.to_str())
+        }
+    }
 }
 
 /// Cached `sys.path_hooks` list. Hydro has no filesystem path-hook entries,
@@ -11016,6 +11203,7 @@ fn multiprocessing_call(function: &str, args: &[i64]) -> i64 {
         }
         "cpu_count" => encode_int(cpu_count()),
         "get_start_method" => value::str_alloc(process::get_start_method()),
+        "get_context" => module_value_by_name("multiprocessing"),
         "set_start_method" => {
             let Some(method) = value::as_str(args[0]) else {
                 return exc::raise_with_message(
@@ -15175,6 +15363,7 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "set_blocking" => os_set_blocking(args),
         "readinto" => os_readinto(args),
         "ftruncate" => os_ftruncate(args),
+        "device_encoding" => os_device_encoding(args),
         "execlp" => os_execlp(args),
         "walk" => os_walk(args),
         "access" => os_access(args),
@@ -16292,6 +16481,22 @@ fn os_execlp(args: &[i64]) -> i64 {
         libc::execvp(file.as_ptr(), pointers.as_ptr());
     }
     os_error_from_io("execlp", std::io::Error::last_os_error(), None)
+}
+
+/// `os.device_encoding(fd)`: the locale encoding when the descriptor is a
+/// terminal, otherwise `None` (CPython's `nl_langinfo(CODESET)` behaviour is
+/// approximated with the UTF-8 locale this runtime exposes).
+fn os_device_encoding(args: &[i64]) -> i64 {
+    let fd = match os_fd_argument(args[0]) {
+        Ok(fd) => fd,
+        Err(raised) => return raised,
+    };
+    // SAFETY: `isatty` only inspects the descriptor.
+    if unsafe { libc::isatty(fd) } == 1 {
+        value::str_from_bytes(b"UTF-8")
+    } else {
+        NONE
+    }
 }
 
 /// `os.ftruncate(fd, length)`.

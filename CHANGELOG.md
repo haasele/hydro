@@ -35,8 +35,8 @@ initial state of the first runnable core.
   import reports.
 - The stdlib matrix now runs with `HYDRO_STDLIB` pointed at the pinned CPython
   `Lib` tree (the earlier 159 count used the toolchain's default subset); the
-  same code imports **258/297** modules, so the previous report undercounted
-  the implementation by 87 modules.
+  same code imports **261/297** modules, so the previous report undercounted
+  the implementation by 90 modules.
 - Closed the next stdlib-import cluster: `_pydatetime`, `_pyio`, `logging`,
   `venv` and `imaplib` now import. This required sequential class-body name
   visibility, real `@property` setter/deleter decorators, unary `__neg__`/
@@ -44,8 +44,14 @@ initial state of the first runnable core.
   CPython-compatible literal regex braces, `str.rfind`, and `io.IOBase`'s
   virtual registration surface.
 - Added `os.ftruncate`, `os.readinto`, `os.get_blocking`/`set_blocking`,
-  `os.execlp`, `os.linesep`, `O_BINARY`, `SEEK_DATA`/`SEEK_HOLE`, plus
-  `codecs.getincrementalencoder`/`getincrementaldecoder`.
+  `os.execlp`, `os.linesep`, `O_BINARY`, `SEEK_DATA`/`SEEK_HOLE`,
+  `os.device_encoding`, plus `codecs.getincrementalencoder`/
+  `getincrementaldecoder` and `tempfile.mkstemp`.
+- `compileall`, `py_compile` and `modulefinder` now import: implemented the
+  `importlib._bootstrap_external` pyc header helpers (`_pack_uint32`,
+  `_unpack_uint32`, `_calc_mode`, `_write_atomic`, timestamp/hash pyc
+  builders), the frozen-bootstrap hooks, and empty `*args`/`**kwargs`
+  defaults in direct calls.
 
 ### Compatibility — 2026-10-30 native stdlib and ecosystem continuation
 

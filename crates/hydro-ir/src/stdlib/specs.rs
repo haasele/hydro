@@ -657,6 +657,8 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("set_blocking", 2, 2, Type::None),
         f("readinto", 2, 3, Type::Int),
         f("ftruncate", 2, 2, Type::None),
+        // `device_encoding(fd)`: the locale encoding for a terminal, else None.
+        f("device_encoding", 1, 1, Type::Any),
         // `execlp(file, arg0, *args)`: replaces the process image.
         f("execlp", 2, usize::MAX, Type::Any),
         f("forkpty", 0, 0, Type::Tuple),
@@ -1317,6 +1319,9 @@ pub static MULTIPROCESSING: ModuleSpec = ModuleSpec {
         kw("Pool", 0, 1, Type::Any, &["processes"]),
         f("cpu_count", 0, 0, Type::Int),
         f("get_start_method", 0, 0, Type::Str),
+        // `get_context(method=None)`: the process-start context. Hydro's
+        // single-process runtime exposes the module's own factories.
+        kw("get_context", 0, 1, Type::Any, &["method"]),
         f("set_start_method", 1, 1, Type::None),
     ],
     constants: &[],
@@ -2861,6 +2866,15 @@ pub static TMPFILE: ModuleSpec = ModuleSpec {
     functions: &[
         f("gettempdir", 0, 0, Type::Str),
         kw("mkdtemp", 0, 3, Type::Str, &["suffix", "prefix", "dir"]),
+        // `mkstemp(suffix=None, prefix=None, dir=None, text=False)`: an open
+        // descriptor plus the path.
+        kw(
+            "mkstemp",
+            0,
+            4,
+            Type::Tuple,
+            &["suffix", "prefix", "dir", "text"],
+        ),
         kw(
             "TemporaryDirectory",
             0,
@@ -3835,6 +3849,11 @@ pub static IMPORTLIB: ModuleSpec = ModuleSpec {
         // behind `import_module` (also reachable as
         // `_frozen_importlib._gcd_import`).
         f("_gcd_import", 1, 3, Type::Any),
+        // Internal frozen-bootstrap hooks `importlib/__init__.py` and `pydoc`
+        // reach through `_frozen_importlib`.
+        f("_find_spec", 2, 3, Type::Any),
+        f("_exec", 2, 2, Type::None),
+        f("_setup", 2, 2, Type::None),
     ],
     constants: &[
         c("util", Type::Any),
@@ -3943,6 +3962,15 @@ pub static IMPORTLIB_MACHINERY: ModuleSpec = ModuleSpec {
         // `_bootstrap_external._classify_pyc(data, name, exc_details)`: the
         // pyc header validator `modulefinder` calls.
         f("_classify_pyc", 3, 3, Type::Any),
+        f("_set_bootstrap_module", 1, 1, Type::None),
+        // `_bootstrap_external`'s pyc helpers (`py_compile`/`compileall`):
+        // header packing and the atomic bytecode writer.
+        f("_pack_uint32", 1, 1, Type::Bytes),
+        f("_unpack_uint32", 1, 1, Type::Int),
+        f("_calc_mode", 1, 1, Type::Int),
+        f("_write_atomic", 2, 3, Type::None),
+        f("_code_to_timestamp_pyc", 1, 3, Type::Any),
+        f("_code_to_hash_pyc", 2, 3, Type::Any),
         // `PathFinder.find_spec(fullname, path=None, target=None)` and its
         // cache hook.
         f("_path_finder_find_spec", 2, 4, Type::Any),
