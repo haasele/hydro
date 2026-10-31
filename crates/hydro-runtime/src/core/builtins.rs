@@ -1918,7 +1918,29 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
             };
             crate::host::call_slots(*token, captures, args, func.flags, &func.name)
         }
-        FunctionBody::Native { module, name } => modules::call_native(module, name, argc, argv),
+        FunctionBody::Native { module, name } => {
+            // `object.__str__` and `object.__repr__` are universal defaults
+            // whose native bodies call the generic renderers. Invoked on an
+            // instance (directly, or through `x.__str__()`), dispatching them
+            // would re-enter the same class lookup forever. CPython's slots
+            // delegate `__str__` to `type(self).__repr__` and render
+            // `__repr__` as `<Name object>`, so apply those semantics here.
+            if *module == "builtins" && argc == 1 && !argv.is_null() {
+                // SAFETY: argc > 0 and a non-NULL buffer mean the first slot
+                // is readable (caller contract).
+                let receiver = unsafe { *argv };
+                if value::as_instance(receiver).is_some() {
+                    match *name {
+                        "__object_str__" => return value::str_alloc(value::repr(receiver)),
+                        "__object_repr__" => {
+                            return value::str_alloc(value::object_default_repr(receiver))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            modules::call_native(module, name, argc, argv)
+        }
         FunctionBody::Hna { module, index } => {
             crate::native::call_function(*module, *index, argc, argv)
         }
@@ -2431,6 +2453,13 @@ pub(crate) fn call_kw(
             };
             keywords.push((keyword.to_string(), pair[1]));
         }
+        // A TypedDict is a runtime dict factory (`ConfigDict(title=None, ...)`
+        // builds a dict; `typing_extensions` assigns `__call__ = dict` on
+        // `_TypedDictMeta`), so it keeps its construction path ahead of the
+        // metaclass hook.
+        if crate::modules::typing::is_typeddict_class(class) {
+            return typed_dict_construct(&args, &keywords);
+        }
         // CPython's call protocol dispatches `Class(...)` through
         // `type(Class).__call__` before any construction machinery, so a
         // metaclass that defines `__call__` (enum's `EnumType`, whose
@@ -2439,9 +2468,6 @@ pub(crate) fn call_kw(
         // path, so it leaves the fast path below in place.
         if let Some(result) = methods::metaclass_call(class, &args, &keywords) {
             return result;
-        }
-        if crate::modules::typing::is_typeddict_class(class) {
-            return typed_dict_construct(&args, &keywords);
         }
         if let Some(tag) = exc::exception_tag_of_class(class) {
             return instantiate_exception_kw(tag, &args, &keywords);
@@ -2546,6 +2572,55 @@ pub(crate) fn call_kw(
             return instance;
         };
         if value::function_signature(init).is_empty() || value::function_full_entry(init) == 0 {
+            // A native class constructor (for example `pickle.Unpickler`,
+            // whose class is a native value and whose inherited `__init__` is
+            // a native method value). The generated-method binder cannot see
+            // it, but the method spec may declare keyword parameters: bind
+            // them through the module keyword dispatcher with the receiver in
+            // the leading slot, exactly like an instance call.
+            if let Some(function) = value::as_function(init) {
+                if let FunctionBody::Native { module, name } = &function.body {
+                    if crate::modules::native_accepts_keywords(module, name) {
+                        let mut call_args = Vec::with_capacity(args.len() + 1);
+                        match kind {
+                            MethodKind::Staticmethod => {}
+                            MethodKind::Classmethod => call_args.push(class),
+                            _ => call_args.push(instance),
+                        }
+                        call_args.extend_from_slice(&args);
+                        // The instance, the positional values and the keyword
+                        // values are native memory the collector does not scan;
+                        // root them before the keyword-name allocations below.
+                        let mut roots_source = Vec::with_capacity(1 + args.len() + keywords.len());
+                        roots_source.push(instance);
+                        roots_source.extend_from_slice(&args);
+                        roots_source.extend(keywords.iter().map(|(_, item)| *item));
+                        let roots = crate::heap::root_values(&roots_source);
+                        let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+                        for (keyword, item) in &keywords {
+                            let name_value = value::str_alloc(keyword.clone());
+                            // Root the freshly allocated name immediately: the
+                            // next allocation must not collect it before the
+                            // dispatcher sees the pair. The single release below
+                            // covers these roots because they start after
+                            // `roots`.
+                            crate::heap::root_values(std::slice::from_ref(&name_value));
+                            pairs.push(name_value);
+                            pairs.push(*item);
+                        }
+                        let _ = crate::modules::call_native_kw(
+                            module,
+                            name,
+                            call_args.len(),
+                            call_args.as_ptr(),
+                            keywords.len(),
+                            pairs.as_ptr(),
+                        );
+                        crate::heap::release_roots(roots);
+                        return if exc::pending() { NONE } else { instance };
+                    }
+                }
+            }
             return exc::raise_with_message(
                 TYPE_ERROR,
                 "class constructor does not support keyword arguments",
@@ -3848,6 +3923,13 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
         // SAFETY: checked above for NULL; caller contract.
         unsafe { std::slice::from_raw_parts(argv, argc) }
     };
+    // A TypedDict is a runtime dict factory (`ConfigDict(title=None, ...)`
+    // builds a dict; `typing_extensions` assigns `__call__ = dict` on
+    // `_TypedDictMeta`), so it keeps its construction path ahead of the
+    // metaclass hook.
+    if crate::modules::typing::is_typeddict_class(class) {
+        return typed_dict_construct(args, &[]);
+    }
     // CPython's call protocol dispatches `Class(...)` through
     // `type(Class).__call__` before any construction machinery, so a metaclass
     // that defines `__call__` (enum's `EnumType`, whose functional API is
@@ -3856,9 +3938,6 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     // fast path below in place.
     if let Some(result) = methods::metaclass_call(class, args, &[]) {
         return result;
-    }
-    if crate::modules::typing::is_typeddict_class(class) {
-        return typed_dict_construct(args, &[]);
     }
     // The universal base class has CPython's zero-argument constructor.
     if value::is_object_class(class) {
@@ -7041,12 +7120,17 @@ fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
     let subclass = value::builtin_type_class(subclass).unwrap_or(subclass);
     let class = value::builtin_type_class(class).unwrap_or(class);
     if let Some(types) = value::as_tuple(class) {
-        if value::as_class(subclass).is_none() {
+        if value::as_class(subclass).is_none()
+            && !value::as_ext_object(subclass)
+                .is_some_and(|extension| crate::capi::object_is_type(extension.object))
+        {
             return Err(SubclassError::Subclass);
         }
         for &candidate in types {
             if value::as_class(candidate).is_none()
                 && value::builtin_type_class(candidate).is_none()
+                && !value::as_ext_object(candidate)
+                    .is_some_and(|extension| crate::capi::object_is_type(extension.object))
             {
                 return Err(SubclassError::Class);
             }
@@ -7055,6 +7139,32 @@ fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
             }
         }
         return Ok(false);
+    }
+    // An extension class handle (NumPy's scalar types such as `numpy.float64`
+    // and its abstract `numpy.signedinteger`, ...) answers through the
+    // extension's own type hierarchy, exactly as `isinstance` does: NumPy's
+    // `_type_aliases` runs `issubclass(np.float64, np.signedinteger)` while it
+    // imports.
+    if let Some(derived) = value::as_ext_object(subclass) {
+        if !crate::capi::object_is_type(derived.object) {
+            return Err(SubclassError::Subclass);
+        }
+        if let Some(base) = value::as_ext_object(class) {
+            if !crate::capi::object_is_type(base.object) {
+                return Err(SubclassError::Class);
+            }
+            return crate::capi::object_is_subclass(derived.object, base.object)
+                .map_err(|_| SubclassError::Class);
+        }
+        if value::is_object_class(class) {
+            // Every class, including a C class, derives from `object`.
+            return Ok(true);
+        }
+        if value::as_class(class).is_some() {
+            // A C type never derives from another Hydro class.
+            return Ok(false);
+        }
+        return Err(SubclassError::Class);
     }
     if value::as_class(subclass).is_none() {
         // Hydro spells native types (`bytes`, `memoryview`, …) as builtin
@@ -7071,6 +7181,17 @@ fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
     if value::is_object_class(class) {
         // Every class is a subclass of `object`.
         return Ok(true);
+    }
+    if let Some(base) = value::as_ext_object(class) {
+        if !crate::capi::object_is_type(base.object) {
+            return Err(SubclassError::Class);
+        }
+        // A Hydro class may name an extension type among its bases
+        // (`class C(SomeExtensionClass)`); it is a subclass when that type is
+        // in its linearization.
+        return Ok(value::class_mro(subclass).iter().any(|&ancestor| {
+            value::as_ext_object(ancestor).is_some_and(|extension| extension.object == base.object)
+        }));
     }
     if value::as_class(class).is_none() {
         return Err(SubclassError::Class);
@@ -7267,8 +7388,15 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
         | "frame" | "code" => value::type_name(value) == name,
         "object" => true,
         // A class, or the builtin type spelling source code names it by, is an
-        // instance of `type`.
-        "type" => value::as_class(value).is_some() || value::builtin_type_class(value).is_some(),
+        // instance of `type`. An extension class handle (`np.float64`) is a
+        // class too: `type(np.float64) is type` and `isinstance(np.float64,
+        // type)` hold.
+        "type" => {
+            value::as_class(value).is_some()
+                || value::builtin_type_class(value).is_some()
+                || value::as_ext_object(value)
+                    .is_some_and(|extension| crate::capi::object_is_type(extension.object))
+        }
         _ => return None,
     })
 }
@@ -7314,7 +7442,10 @@ fn instance_of(value: i64, class: i64) -> bool {
         }
     }
     if value::is_type_class(class) {
-        return value::as_class(value).is_some() || value::builtin_type_class(value).is_some();
+        return value::as_class(value).is_some()
+            || value::builtin_type_class(value).is_some()
+            || value::as_ext_object(value)
+                .is_some_and(|extension| crate::capi::object_is_type(extension.object));
     }
     // A `functools.partial` value is stored as a function object, but its
     // type is the cached `partial` class (see `value::type_class`).
@@ -11089,6 +11220,85 @@ mod tests {
 
     extern "C" fn int_probe_true(_argv: *const i64) -> i64 {
         TRUE
+    }
+
+    /// Stand-in metaclass `__call__`: returns a marker, so an intercepted
+    /// construction is observable instead of only raising.
+    extern "C" fn typed_dict_metaclass_call(_argv: *const i64) -> i64 {
+        value::str_alloc("metaclass __call__ ran".to_string())
+    }
+
+    #[test]
+    fn typed_dict_construction_wins_over_metaclass_call() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        // `typing_extensions` creates TypedDicts with `_TypedDictMeta`, whose
+        // `__call__` is the plain `dict` callable. Construction must keep
+        // building a dict (arbitrary keywords included) instead of being
+        // intercepted by the metaclass hook.
+        let metaclass_call = value::function_new(
+            typed_dict_metaclass_call as *const () as usize,
+            1,
+            "_TypedDictMeta.__call__".to_string(),
+        );
+        value::function_set_signature(
+            metaclass_call,
+            vec![value::ParamMeta {
+                name: "cls".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            }],
+        );
+        value::function_set_full_entry(
+            metaclass_call,
+            typed_dict_metaclass_call as *const () as usize,
+        );
+        let call_roots = crate::heap::root_values(&[metaclass_call]);
+        let metaclass = value::class_new(
+            "_TypedDictMeta".to_string(),
+            NONE,
+            vec![("__call__".to_string(), metaclass_call)],
+        );
+        let typed_dict = value::class_new("TypedDict".to_string(), NONE, Vec::new());
+        let class_roots = crate::heap::root_values(&[typed_dict, metaclass]);
+        let config_dict = value::class_new_multi(
+            "ConfigDict".to_string(),
+            vec![typed_dict],
+            metaclass,
+            Vec::new(),
+            Vec::new(),
+        );
+        crate::heap::release_roots(class_roots);
+        crate::heap::release_roots(call_roots);
+        assert!(!exc::pending(), "{}", pending_message());
+
+        let keywords = [string("title"), NONE, string("total"), FALSE];
+        let keyword_roots = crate::heap::root_values(&keywords);
+        let built = call_kw(config_dict, 0, std::ptr::null(), 2, keywords.as_ptr());
+        crate::heap::release_roots(keyword_roots);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            value::as_dict(built)
+                .expect("TypedDict call builds a dict")
+                .len(),
+            2
+        );
+        assert_eq!(value::repr(built), "{'title': None, 'total': False}");
+
+        // A regular class built by the same metaclass still dispatches
+        // through `__call__`.
+        let plain = value::class_new_multi(
+            "Plain".to_string(),
+            Vec::new(),
+            metaclass,
+            Vec::new(),
+            Vec::new(),
+        );
+        let plain_roots = crate::heap::root_values(&[plain]);
+        let result = call_kw(plain, 0, std::ptr::null(), 0, std::ptr::null());
+        crate::heap::release_roots(plain_roots);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::to_string(result), "metaclass __call__ ran");
     }
 
     fn int_method_class(name: &str, methods: &[(&str, extern "C" fn(*const i64) -> i64)]) -> i64 {

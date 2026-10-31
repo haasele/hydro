@@ -4022,6 +4022,14 @@ fn lower_modules(
             initializer_by_unit[index] = Some(base);
         }
         let mut user_modules = HashMap::new();
+        // Linked dependencies whose own unit the loader lowers *after* this
+        // one (an import cycle). Their export tables are not computed yet, so
+        // a member that is missing from the table is read late from the
+        // module's runtime global table instead of being rejected as a missing
+        // export (`pandas/core/frame.py` imports
+        // `pandas.core.computation.eval.eval` from inside a method while the
+        // top-level `pandas` initializer still owns that module's order).
+        let mut pending_modules: HashSet<String> = HashSet::new();
         // Package `__init__.py` files import their submodules, which become
         // attributes of the package. Make the whole transitive dependency set
         // visible so `pkg.sub` resolves after `import pkg`.
@@ -4036,6 +4044,9 @@ fn lower_modules(
         }
         for dep_index in visible {
             let dep = &units[dep_index];
+            if dep_index >= index {
+                pending_modules.insert(dep.name.clone());
+            }
             user_modules.insert(
                 dep.name.clone(),
                 UserModule {
@@ -4066,6 +4077,9 @@ fn lower_modules(
         // Modules this unit imports but cannot link (an initializing ancestor
         // package): their members are read late from the runtime global table.
         lowerer.set_late_modules(unit.late.iter().cloned().collect());
+        // Linked dependencies ordered after this unit by an import cycle:
+        // their export tables are not computed yet.
+        lowerer.set_pending_modules(pending_modules);
         // Modules imported only from nested blocks: the scan recorded them
         // without loading them, so their names bind to the runtime stub.
         lowerer.set_deferred_imports(

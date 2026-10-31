@@ -2387,11 +2387,9 @@ fn object_to_value_at(
     if types::is_type_pointer(object) {
         // Type objects cross the boundary as opaque handles: they are
         // callable, expose `__name__`/`__module__` and participate in
-        // `isinstance`.
-        return Ok(opaque_object(
-            object,
-            types::type_name(object as *mut TypeObject),
-        ));
+        // `isinstance`. `type(cls)` is the metatype, so the label is the
+        // metatype's name (`type`, or an extension's metaclass).
+        return Ok(opaque_object(object, types::metatype_name(object)));
     }
     let Some(kind) = kind_ref(object) else {
         // An extension-owned instance (including instances of types created by
@@ -2566,10 +2564,9 @@ fn object_to_hydro_at(
         return Ok(value);
     }
     if types::is_type_pointer(object) {
-        return Ok(opaque_hydro_object(
-            object,
-            types::type_name(object as *mut TypeObject),
-        ));
+        // A class object is an instance of its metatype; `type(cls)` in Hydro
+        // resolves the label to a class value.
+        return Ok(opaque_hydro_object(object, types::metatype_name(object)));
     }
     let Some(kind) = kind_ref(object) else {
         return Ok(opaque_hydro_object(object, object_type_name(object)));
@@ -4177,30 +4174,68 @@ fn dl_error() -> String {
 
 /// Looks up one attribute (value or callable) of a loaded module.
 pub(crate) fn get_attr(module: u64, name: &str) -> Result<ShimAttr, String> {
-    let registry = registry_lock();
-    let entry = registry
-        .modules
-        .get(&module)
-        .ok_or_else(|| format!("unknown extension module {module}"))?;
-    entry.attrs.get(name).cloned().ok_or_else(|| {
-        format!(
-            "extension module '{}' has no attribute '{name}'",
-            entry.name
+    let (attribute, dict, module_name) = {
+        let registry = registry_lock();
+        let entry = registry
+            .modules
+            .get(&module)
+            .ok_or_else(|| format!("unknown extension module {module}"))?;
+        (
+            entry.attrs.get(name).cloned(),
+            entry.dict,
+            entry.name.clone(),
         )
-    })
+    };
+    if let Some(attribute) = attribute {
+        return Ok(attribute);
+    }
+    // Extensions may write module attributes directly into `__dict__` instead
+    // of going through `PyModule_AddObject`. NumPy's `_multiarray_umath`
+    // publishes `_ArrayFunctionDispatcher` with `PyDict_SetItemString`, and
+    // `numpy._core.overrides` imports it; the module dictionary is the
+    // authoritative namespace CPython reads in that case.
+    if dict != 0 {
+        let key = new_str(name.to_string());
+        let value = PyDict_GetItem(dict as *mut ShimObject, key);
+        dec_ref(key);
+        if !value.is_null() {
+            if types::is_type_pointer(value) {
+                return Ok(ShimAttr::Type(value as usize));
+            }
+            // `object_to_value` borrows `value` and gives the converted value
+            // its own reference, so the dictionary keeps its entry.
+            return object_to_value(value).map(ShimAttr::Value);
+        }
+    }
+    Err(format!(
+        "extension module '{module_name}' has no attribute '{name}'"
+    ))
 }
 
 /// Every Python-visible attribute name of a loaded module.
 ///
-/// `dir(extension_module)` must agree with `getattr`/`hasattr`; the registry's
-/// attribute table is the authoritative export list (`PyModule_AddObject`,
-/// `PyModule_AddStringConstant` and module-dict writes all land there).
+/// `dir(extension_module)` must agree with `getattr`/`hasattr`. The registry's
+/// attribute table records `PyModule_AddObject`/`PyModule_AddStringConstant`
+/// exports, and the module `__dict__` records names the extension wrote
+/// directly (NumPy publishes `_ArrayFunctionDispatcher` with
+/// `PyDict_SetItemString`); both make up CPython's module namespace.
 pub(crate) fn module_attribute_names(module: u64) -> Vec<String> {
-    let registry = registry_lock();
-    let Some(entry) = registry.modules.get(&module) else {
-        return Vec::new();
+    let (mut names, dict) = {
+        let registry = registry_lock();
+        let Some(entry) = registry.modules.get(&module) else {
+            return Vec::new();
+        };
+        (entry.attrs.keys().cloned().collect::<Vec<_>>(), entry.dict)
     };
-    let mut names: Vec<String> = entry.attrs.keys().cloned().collect();
+    if dict != 0 {
+        if let Some(ShimKind::Dict(pairs)) = kind_ref(dict as *mut ShimObject) {
+            for &(key, _) in pairs {
+                if let Some(name) = as_string(key as *mut ShimObject) {
+                    names.push(name);
+                }
+            }
+        }
+    }
     names.extend(["__name__", "__doc__", "__dict__"].map(str::to_string));
     names.sort_unstable();
     names.dedup();
@@ -4387,11 +4422,14 @@ pub(crate) fn call_type_object_hydro(address: usize, args: &[ShimValue]) -> Resu
     value
 }
 
-/// Full name of a type handle, for diagnostics in the extension bridge.
-pub(crate) fn type_display_name(address: usize) -> String {
+/// Python-visible name of the metatype of an extension type handle: `type`,
+/// or the extension's metaclass (NumPy's `numpy._DTypeMeta`). This is what
+/// `type(cls)` reports for a class that crossed the C boundary.
+pub(crate) fn type_metatype_name(address: usize) -> String {
     ensure_builtin_types();
-    if types::is_type_pointer(address as *mut ShimObject) {
-        types::type_name(address as *mut TypeObject)
+    let pointer = address as *mut ShimObject;
+    if types::is_type_pointer(pointer) {
+        types::metatype_name(pointer)
     } else {
         "<unknown type>".to_string()
     }
@@ -4679,6 +4717,19 @@ pub(crate) fn object_isinstance(
     if result < 0 {
         return Err(take_error()
             .unwrap_or_else(|| "TypeError: isinstance() argument check failed".to_string()));
+    }
+    Ok(result != 0)
+}
+
+/// `issubclass(derived, class)` against extension type objects.
+pub(crate) fn object_is_subclass(
+    derived: *mut ShimObject,
+    class: *mut ShimObject,
+) -> Result<bool, String> {
+    let result = PyObject_IsSubclass(derived, class);
+    if result < 0 {
+        return Err(take_error()
+            .unwrap_or_else(|| "TypeError: issubclass() argument check failed".to_string()));
     }
     Ok(result != 0)
 }
@@ -6859,23 +6910,59 @@ pub extern "C" fn PyType_GetModuleState(type_object: *mut ShimObject) -> *mut c_
 }
 
 /// `PyType_FromMetaclass`.
+///
+/// Builds the heap type from `spec` and links it to `metaclass` the way
+/// CPython does: the metaclass becomes the new type's `Py_TYPE`, so
+/// `PyObject_TypeCheck(cls, metaclass)`, `type(cls)` and the metaclass's
+/// `tp_getset` descriptors all agree. A NULL metaclass means `&PyType_Type`,
+/// which is the plain `PyType_FromSpecWithBases` case.
 #[no_mangle]
 pub extern "C" fn PyType_FromMetaclass(
     metaclass: *mut ShimObject,
-    _module: *mut ShimObject,
+    module: *mut ShimObject,
     spec: *mut types::PyTypeSpecMirror,
     bases: *mut ShimObject,
 ) -> *mut ShimObject {
-    if !metaclass.is_null() && types::is_type_pointer(metaclass) {
-        let name = types::type_name(metaclass as *mut TypeObject);
-        if name != "type" {
+    let metaclass_type = metaclass as *mut types::TypeObject;
+    if !metaclass.is_null() {
+        // CPython rejects a metaclass that is not a subclass of `type`; this
+        // host additionally requires one it already readied, so the new
+        // type's `ob_type` is always a link `is_type_pointer` can identify.
+        if !types::is_type_pointer(metaclass) || !types::is_metatype_object(metaclass_type) {
+            let name = if types::is_type_pointer(metaclass) {
+                types::type_name(metaclass_type)
+            } else {
+                object_type_name(metaclass)
+            };
             set_error(format!(
-                "TypeError: PyType_FromMetaclass: metaclass '{name}' is not supported"
+                "TypeError: PyType_FromMetaclass: '{name}' is not a subclass of type"
             ));
             return ptr::null_mut();
         }
     }
-    PyType_FromSpecWithBases(spec, bases)
+    if !module.is_null() && module_entry_pointer(module, |_| ()).is_err() {
+        set_error("TypeError: PyType_FromMetaclass: module is not a module object");
+        return ptr::null_mut();
+    }
+    let type_object = PyType_FromSpecWithBases(spec, bases);
+    if type_object.is_null() || metaclass.is_null() {
+        return type_object;
+    }
+    // The created object is a heap type table; its CPython header starts with
+    // the same `ob_refcnt`/`ob_type` words a `ShimObject` does.
+    let heap_type = type_object as *mut types::TypeObject;
+    if metaclass_type != ptr::addr_of_mut!(types::TYPE_TYPE) {
+        // CPython's `PyType_FromMetaclass` owns a reference to the metaclass
+        // and `free_type_object` releases it when the heap type dies.
+        inc_ref(metaclass);
+        // SAFETY: `heap_type` is the heap type allocated by
+        // `PyType_FromSpecWithBases` above; `ob_type` is inside the prefix.
+        unsafe { (*heap_type).ob_type = metaclass_type };
+    }
+    if !module.is_null() {
+        types::associate_type_module(heap_type, module);
+    }
+    type_object
 }
 
 // ---------------------------------------------------------------------------
@@ -8667,23 +8754,74 @@ fn type_attribute(
             }
             // Static and class methods are reachable through the class, as in
             // CPython; a plain instance method still requires an instance.
-            _ => match types::find_method(type_object, name) {
-                Some(spec) if spec.flags & (METH_STATIC | METH_CLASS) != 0 => {
-                    let receiver = if spec.flags & METH_STATIC != 0 {
-                        ptr::null_mut()
-                    } else {
-                        type_pointer
-                    };
-                    let method = spec.definition as *mut PyMethodDefMirror;
-                    match PyCFunction_NewEx(method, receiver, ptr::null_mut()) {
-                        function if !function.is_null() => Ok(function),
-                        _ => Err(take_error().unwrap_or_else(|| {
-                            format!("AttributeError: cannot bind method '{name}'")
-                        })),
+            _ => {
+                if let Some(spec) = types::find_method(type_object, name) {
+                    if spec.flags & (METH_STATIC | METH_CLASS) != 0 {
+                        let receiver = if spec.flags & METH_STATIC != 0 {
+                            ptr::null_mut()
+                        } else {
+                            type_pointer
+                        };
+                        let method = spec.definition as *mut PyMethodDefMirror;
+                        return match PyCFunction_NewEx(method, receiver, ptr::null_mut()) {
+                            function if !function.is_null() => Some(Ok(function)),
+                            _ => Some(Err(take_error().unwrap_or_else(|| {
+                                format!("AttributeError: cannot bind method '{name}'")
+                            }))),
+                        };
                     }
                 }
-                _ => return None,
-            },
+                // CPython's `type.__getattribute__` also searches the
+                // metatype's MRO, which is how an extension metaclass exposes
+                // attributes on the classes it creates: NumPy's
+                // `PyArrayDTypeMeta_Type` provides `num`, `type` and `_legacy`
+                // on every dtype class this way. The shared `type` metatype
+                // has no descriptor tables here, so ordinary C classes are
+                // unaffected. This runs before the type's own tables because
+                // a metatype member such as `num` is a data descriptor and
+                // CPython binds it to the class, even when the class's base
+                // also declares a same-named instance member.
+                let metatype = (*type_object).ob_type;
+                if !metatype.is_null() && metatype != type_object {
+                    if let Some(definition) = types::find_member(metatype, name) {
+                        return Some(types::member_get(type_pointer, definition));
+                    }
+                    if let Some(definition) = types::find_getset(metatype, name) {
+                        return Some(types::getset_get(type_pointer, definition));
+                    }
+                }
+                // Plain methods, member descriptors and get-set descriptors
+                // found in the type's own MRO are attributes of the class
+                // itself: CPython returns the descriptor, which binds when it
+                // is later read from an instance. NumPy stores
+                // `ndarray.__array_finalize__`, `__array_ufunc__`,
+                // `__array_function__`, `_set_dtype` and `dtype` this way
+                // while `_multiarray_umath` initializes (it compares the
+                // class-level objects by identity), so a missing plain method
+                // here aborts the import.
+                let name_object = new_str(name.to_string());
+                if name_object.is_null() {
+                    return Some(Err(take_error().unwrap_or_else(|| {
+                        "MemoryError: cannot create attribute name".to_string()
+                    })));
+                }
+                // SAFETY: `type_pointer` is a live type object and
+                // `name_object` is an owned string; the lookup borrows both.
+                // The enclosing block is already `unsafe`.
+                let descriptor =
+                    object_api::_PyType_Lookup(type_pointer as *mut PyTypeObject, name_object);
+                dec_ref(name_object);
+                if !descriptor.is_null() {
+                    // `_PyType_Lookup` returns a borrowed reference (the type
+                    // dictionary or the descriptor cache owns it).
+                    inc_ref(descriptor);
+                    return Some(Ok(descriptor));
+                }
+                if let Some(error) = take_error() {
+                    return Some(Err(error));
+                }
+                return None;
+            }
         })
     }
 }
@@ -8805,6 +8943,26 @@ fn generic_attribute(object: *mut ShimObject, name: &str) -> Result<*mut ShimObj
     }
     if let Some(definition) = types::find_getset(type_object, name) {
         return types::getset_get(object, definition);
+    }
+    // An inline `tp_dictoffset` slot stores instance attributes. Data
+    // descriptors (members and getsets) were consulted first, so the
+    // dictionary wins over methods and other non-data class attributes,
+    // exactly as in CPython's `_PyObject_GenericGetAttrWithDict`.
+    if let Some(dict) = types::instance_dict(object) {
+        let key = new_str(name.to_string());
+        // SAFETY: `dict` is the live dictionary borrowed from the instance.
+        let value = PyDict_GetItem(dict, key);
+        dec_ref(key);
+        if value.is_null() {
+            if error_pending() {
+                return Err(take_error().unwrap_or_else(|| {
+                    format!("AttributeError: cannot read the instance dictionary of '{name}'")
+                }));
+            }
+        } else {
+            inc_ref(value);
+            return Ok(value);
+        }
     }
     if let Some(spec) = types::find_method(type_object, name) {
         // SAFETY: the definition belongs to the live extension.
@@ -9016,6 +9174,12 @@ fn generic_setattr(
     }
     if let Some(definition) = types::find_getset(type_object, name) {
         return types::getset_set(object, definition, value);
+    }
+    // With no data descriptor to receive the assignment, the inline
+    // `tp_dictoffset` dictionary stores it (or deletes it when `value` is
+    // NULL), matching CPython's generic setter.
+    if types::instance_dict_pointer(object).is_some() {
+        return types::instance_dict_store(object, name, value);
     }
     Err(format!(
         "AttributeError: '{}' object has no attribute '{name}'",
@@ -11645,8 +11809,20 @@ pub extern "C" fn PyObject_GenericGetDict(
         }
         return dict;
     }
-    set_error("AttributeError: __dict__");
-    ptr::null_mut()
+    // An extension type that declares `tp_dictoffset` stores its instance
+    // dictionary in the instance itself. CPython materialises it on first
+    // access, so a fresh instance reports an empty `__dict__` rather than
+    // None.
+    match types::instance_dict_ensure(object) {
+        Ok(dict) => {
+            inc_ref(dict);
+            dict
+        }
+        Err(error) => {
+            set_error(error);
+            ptr::null_mut()
+        }
+    }
 }
 
 /// `PyObject_GenericSetDict`.
@@ -11676,12 +11852,28 @@ pub extern "C" fn PyObject_GenericSetDict(
         ));
         return -1;
     }
-    if !matches!(kind_ref(object), Some(ShimKind::Module(_))) {
-        set_error("AttributeError: __dict__");
-        return -1;
+    if matches!(kind_ref(object), Some(ShimKind::Module(_))) {
+        PyDict_Clear(PyModule_GetDict(object));
+        return PyDict_Update(PyModule_GetDict(object), value);
     }
-    PyDict_Clear(PyModule_GetDict(object));
-    PyDict_Update(PyModule_GetDict(object), value)
+    // Replace the dictionary stored in the instance's `tp_dictoffset` slot.
+    // The old dictionary is released only after the new reference is
+    // installed, so `obj.__dict__ = obj.__dict__` stays safe.
+    let Some(slot) = types::instance_dict_pointer(object) else {
+        set_error("AttributeError: This object has no __dict__");
+        return -1;
+    };
+    // SAFETY: `slot` points inside a live instance; the instance owns the
+    // reference stored there.
+    unsafe {
+        let previous = *slot;
+        inc_ref(value);
+        *slot = value;
+        if !previous.is_null() {
+            dec_ref(previous);
+        }
+    }
+    0
 }
 
 /// `PyObject_HasAttrWithError`: 1 present, 0 absent, -1 error.
@@ -13043,7 +13235,10 @@ pub extern "C" fn PyDict_GetItemWithError(
 /// `PyDict_SetDefaultRef`: inserts `default` only when the key is absent.
 ///
 /// Returns 1 when the key already existed, 0 when it was inserted, and -1 on
-/// error. `*result` receives a new reference either way.
+/// error. `result` may be NULL, in which case only the return value is
+/// reported and no reference is handed out (CPython 3.14 writes `*result` only
+/// when it is non-NULL). Otherwise `*result` receives a new reference on
+/// success and NULL on error.
 #[no_mangle]
 pub extern "C" fn PyDict_SetDefaultRef(
     object: *mut ShimObject,
@@ -13051,12 +13246,10 @@ pub extern "C" fn PyDict_SetDefaultRef(
     default_value: *mut ShimObject,
     result: *mut *mut ShimObject,
 ) -> c_int {
-    if result.is_null() {
-        bad_internal_call();
-        return -1;
+    if !result.is_null() {
+        // SAFETY: caller-supplied writable slot.
+        unsafe { *result = ptr::null_mut() };
     }
-    // SAFETY: caller-supplied writable slot.
-    unsafe { *result = ptr::null_mut() };
     if key.is_null() || default_value.is_null() {
         bad_internal_call();
         return -1;
@@ -13077,18 +13270,22 @@ pub extern "C" fn PyDict_SetDefaultRef(
     };
     if let Some(index) = dict_position(pairs, key) {
         let value = pairs[index].1 as *mut ShimObject;
-        inc_ref(value);
-        // SAFETY: validated slot.
-        unsafe { *result = value };
+        if !result.is_null() {
+            inc_ref(value);
+            // SAFETY: validated slot.
+            unsafe { *result = value };
+        }
         return 1;
     }
     if let Err(error) = dict_set(object, key, default_value) {
         set_error(error);
         return -1;
     }
-    inc_ref(default_value);
-    // SAFETY: validated slot.
-    unsafe { *result = default_value };
+    if !result.is_null() {
+        inc_ref(default_value);
+        // SAFETY: validated slot.
+        unsafe { *result = default_value };
+    }
     0
 }
 
@@ -15254,17 +15451,25 @@ pub extern "C" fn Py_LeaveRecursiveCall() {
 }
 
 /// `PyTraceMalloc_Track`: this host does not implement the tracemalloc
-/// allocator hooks, so tracking reports "not tracing" (-1), which is the
-/// documented signal for callers to stop reporting allocations.
+/// allocator hooks, so tracking reports "disabled" (`-2`).
+///
+/// CPython's `cpython/tracemalloc.h` contract is explicit: `0` on success,
+/// `-1` on error, `-2` when tracemalloc is disabled. Reporting `-1` made
+/// allocators treat every allocation as a failed trace: NumPy's
+/// `PyDataMem_UserNEW` frees the block and returns NULL on `-1`, which turned
+/// every array allocation into a spurious `_ArrayMemoryError` during the
+/// `_multiarray_umath` import.
 #[no_mangle]
 pub extern "C" fn PyTraceMalloc_Track(_domain: c_uint, _pointer: usize, _size: usize) -> c_int {
-    -1
+    -2
 }
 
-/// `PyTraceMalloc_Untrack`: see [`PyTraceMalloc_Track`].
+/// `PyTraceMalloc_Untrack`: see [`PyTraceMalloc_Track`]; `-2` (disabled),
+/// which is also the value NumPy's `PyDataMem_UserRENEW` recognises as
+/// "tracemalloc not running".
 #[no_mangle]
 pub extern "C" fn PyTraceMalloc_Untrack(_domain: c_uint, _pointer: usize) -> c_int {
-    -1
+    -2
 }
 
 /// `ascii(obj)`: the repr with every non-ASCII character escaped.
@@ -15441,7 +15646,7 @@ pub(crate) fn anchor() {
     dynload_api::anchor();
     // Builtin type data symbols: staticlib linkers keep a definition only when
     // something references it, so take every address here.
-    let type_symbols: [*const TypeObject; 41] = {
+    let type_symbols: [*const TypeObject; 40] = {
         [
             ptr::addr_of!(types::TYPE_TYPE),
             ptr::addr_of!(types::OBJECT_TYPE),
@@ -15479,7 +15684,6 @@ pub(crate) fn anchor() {
             ptr::addr_of!(types::CLASSMETHOD_TYPE),
             ptr::addr_of!(types::DICT_PROXY_TYPE),
             ptr::addr_of!(types::TRACEBACK_TYPE),
-            ptr::addr_of!(types::OBJECT_ALIAS_TYPE),
             ptr::addr_of!(types::GENERIC_ALIAS_TYPE),
             ptr::addr_of!(types::SEQITER_TYPE),
             ptr::addr_of!(types::CONTEXT_VAR_TYPE),
@@ -15540,6 +15744,7 @@ pub(crate) fn anchor() {
         _Py_IncRef as *const (),
         _Py_DecRef as *const (),
         Py_TYPE as *const (),
+        types::PyObject_Type as *const (),
         Py_REFCNT as *const (),
         PyErr_Occurred as *const (),
         PyErr_SetString as *const (),
@@ -17312,13 +17517,24 @@ mod tests {
                 std::ptr::addr_of_mut!(types::TYPE_TYPE)
             );
             assert_ne!((*metaclass).tp_flags & types::PY_TPFLAGS_READY, 0);
+            assert_ne!(
+                (*metaclass).tp_flags & types::PY_TPFLAGS_TYPE_SUBCLASS,
+                0,
+                "a static metaclass inherits CPython's fast-subclass marker"
+            );
         }
+        assert!(
+            types::is_metatype_object(metaclass),
+            "a readied class deriving from type is a valid metatype"
+        );
 
         // A static type may name another static type as its metatype before
         // `PyType_Ready`, as NumPy does with `Py_SET_TYPE(&PyArrayDescr_Type,
-        // &PyArrayDTypeMeta_Type)`. The adopted metaclass is a known type
-        // object, so the type is adopted (and its link normalised to this
-        // host's metatype) instead of being rejected as an instance.
+        // &PyArrayDTypeMeta_Type)`. The adopted metaclass is a metatype this
+        // host recorded, so the type is adopted and its link is *preserved*:
+        // an extension's inline `PyObject_TypeCheck(dtype,
+        // &PyArrayDTypeMeta_Type)` compares `Py_TYPE(dtype)` with that very
+        // address.
         let custom = std::ptr::addr_of_mut!(STATIC_CUSTOM_METATYPE);
         unsafe {
             (*custom).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
@@ -17333,9 +17549,51 @@ mod tests {
         );
         unsafe {
             assert_eq!((*custom).role, types::TypeRole::Instance);
-            assert_eq!((*custom).ob_type, std::ptr::addr_of_mut!(types::TYPE_TYPE));
+            assert_eq!(
+                (*custom).ob_type,
+                metaclass,
+                "PyType_Ready preserves an extension's metatype link"
+            );
             assert_ne!((*custom).tp_flags & types::PY_TPFLAGS_READY, 0);
         }
+        assert!(
+            types::is_type_pointer(custom as *mut ShimObject),
+            "a class with a custom metatype is still a type object"
+        );
+        assert_eq!(
+            Py_TYPE(custom as *mut ShimObject),
+            metaclass,
+            "Py_TYPE names the extension metaclass"
+        );
+        assert_eq!(
+            types::PyType_IsSubtype(
+                Py_TYPE(custom as *mut ShimObject) as *mut ShimObject,
+                metaclass as *mut ShimObject,
+            ),
+            1,
+            "PyObject_TypeCheck(cls, metaclass) holds through Py_IS_TYPE"
+        );
+        assert_eq!(
+            types::PyType_IsSubtype(
+                metaclass as *mut ShimObject,
+                std::ptr::addr_of_mut!(types::TYPE_TYPE) as *mut ShimObject,
+            ),
+            1,
+            "the metaclass derives from type"
+        );
+        assert_eq!(
+            types::metatype_name(custom as *mut ShimObject),
+            "probe.StaticMetaclass",
+            "type(cls) reports the metaclass"
+        );
+
+        // Only a metatype link makes a class: an instance of the adopted type
+        // is not a type object.
+        let custom_instance = PyType_GenericAlloc(custom as *mut ShimObject, 0);
+        assert!(!custom_instance.is_null(), "{:?}", take_error());
+        assert!(!types::is_type_pointer(custom_instance));
+        assert!(!types::is_metatype_object(Py_TYPE(custom_instance)));
+        Py_DecRef(custom_instance);
 
         // CPython readies an unready `tp_base` on demand, and NumPy relies on
         // it: `numpy.dtypes.Int8DType.tp_base` names
@@ -19267,6 +19525,95 @@ PyMODINIT_FUNC PyInit_gc_probe(void) {
         Py_DecRef(associated);
     }
 
+    /// `PyType_FromMetaclass` links the new heap type to the supplied
+    /// metaclass, so an extension's inline `PyObject_TypeCheck(cls, meta)`
+    /// (`Py_IS_TYPE` on `ob_type`), `PyType_IsSubtype(Py_TYPE(cls), meta)` and
+    /// `type(cls)` all agree. A plain class is not a metaclass and is
+    /// rejected without leaking the freshly built type.
+    #[test]
+    fn py_type_from_metaclass_links_a_real_metatype() {
+        anchor();
+        clear_error();
+        // A static metaclass in the `PyArrayDTypeMeta_Type` shape: no explicit
+        // flag, `tp_base = &PyType_Type`, readied by `PyType_Ready`.
+        static mut STATIC_DTYPE_METACLASS: types::TypeObject =
+            types::TypeObject::builtin(c"probe.DTypeMeta".as_ptr(), types::TypeRole::Shim, 0);
+        let metaclass = std::ptr::addr_of_mut!(STATIC_DTYPE_METACLASS);
+        unsafe {
+            (*metaclass).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+            (*metaclass).tp_flags = 0;
+            (*metaclass).tp_base = std::ptr::addr_of_mut!(types::TYPE_TYPE);
+        }
+        assert_eq!(
+            PyType_Ready(metaclass as *mut ShimObject),
+            0,
+            "{:?}",
+            take_error()
+        );
+
+        let mut slots = empty_slots();
+        let mut spec = PyTypeSpecMirror {
+            name: c"probe.MetaOwned".as_ptr(),
+            basicsize: 0,
+            itemsize: 0,
+            flags: 0,
+            slots: slots.as_mut_ptr(),
+        };
+        let created = PyType_FromMetaclass(
+            metaclass as *mut ShimObject,
+            std::ptr::null_mut(),
+            &mut spec,
+            std::ptr::null_mut(),
+        );
+        assert!(!created.is_null(), "{:?}", take_error());
+        assert_eq!(Py_TYPE(created), metaclass, "Py_TYPE names the metaclass");
+        assert!(types::is_type_pointer(created));
+        assert_eq!(types::metatype_name(created), "probe.DTypeMeta");
+        assert_eq!(
+            types::PyType_IsSubtype(
+                Py_TYPE(created) as *mut ShimObject,
+                metaclass as *mut ShimObject,
+            ),
+            1,
+            "PyObject_TypeCheck(cls, metaclass) holds"
+        );
+        // The created type is still an instance-producing class, never a type.
+        let instance = PyType_GenericAlloc(created, 0);
+        assert!(!instance.is_null(), "{:?}", take_error());
+        assert_eq!(Py_TYPE(instance), created as *mut types::TypeObject);
+        assert!(!types::is_type_pointer(instance));
+        Py_DecRef(instance);
+
+        // The module argument is honoured (it used to be ignored).
+        let mut definition = empty_definition();
+        definition.m_name = c"probe_dtype_meta".as_ptr();
+        let module = PyModule_Create2(&mut definition, 3);
+        assert!(!module.is_null(), "{:?}", take_error());
+        let with_module = PyType_FromMetaclass(
+            metaclass as *mut ShimObject,
+            module,
+            &mut spec,
+            std::ptr::null_mut(),
+        );
+        assert!(!with_module.is_null(), "{:?}", take_error());
+        assert_eq!(PyType_GetModule(with_module), module);
+        assert_eq!(Py_TYPE(with_module), metaclass);
+        Py_DecRef(with_module);
+
+        // A class that does not derive from `type` is not a metaclass.
+        let plain = PyType_FromSpec(&mut spec);
+        assert!(!plain.is_null(), "{:?}", take_error());
+        clear_error();
+        let rejected =
+            PyType_FromMetaclass(plain, std::ptr::null_mut(), &mut spec, std::ptr::null_mut());
+        assert!(rejected.is_null());
+        let message = take_error().expect("non-metaclass");
+        assert!(message.contains("not a subclass of type"), "{message}");
+
+        Py_DecRef(plain);
+        Py_DecRef(created);
+    }
+
     // -- parser accessors and errors --------------------------------------
 
     #[test]
@@ -19310,6 +19657,447 @@ PyMODINIT_FUNC PyInit_gc_probe(void) {
 
         Py_DecRef(kwargs);
         Py_DecRef(positional);
+        Py_DecRef(args);
+    }
+
+    /// `O&` converter used by the parser tests: stores the object it receives.
+    unsafe extern "C" fn store_object_converter(
+        object: *mut ShimObject,
+        address: *mut c_void,
+    ) -> c_int {
+        if address.is_null() {
+            return 0;
+        }
+        *(address as *mut *mut ShimObject) = object;
+        1
+    }
+
+    /// A unit and its modifier count as one keyword name. NumPy 2.5 declares
+    /// `StringDType` as `"|$pO&:StringDType"` with the names
+    /// `{"coerce", "na_object", NULL}`; treating `&` as its own unit used to
+    /// raise `SystemError: StringDType: 2 keyword names for 3 format units`.
+    #[test]
+    fn keyword_parser_counts_units_not_format_characters() {
+        anchor();
+        clear_error();
+
+        let names = [c"coerce".as_ptr(), c"na_object".as_ptr(), std::ptr::null()];
+        let args = tuple_object(&[]);
+        let kwargs = PyDict_New();
+        let na = value_object(ShimValue::Int(7));
+        assert_eq!(PyDict_SetItemString(kwargs, c"na_object".as_ptr(), na), 0);
+
+        let mut coerce: c_int = 1;
+        let mut na_object: *mut ShimObject = std::ptr::null_mut();
+        let status = unsafe {
+            super::PyArg_ParseTupleAndKeywords(
+                args as *mut c_void,
+                kwargs as *mut c_void,
+                c"|$pO&:StringDType".as_ptr(),
+                names.as_ptr(),
+                &mut coerce as *mut c_int,
+                store_object_converter
+                    as unsafe extern "C" fn(*mut ShimObject, *mut c_void) -> c_int,
+                &mut na_object as *mut *mut ShimObject,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert_eq!(coerce, 1);
+        assert_eq!(na_object, na);
+
+        // Supplying `coerce` by name exercises the same two units.
+        assert_eq!(
+            PyDict_SetItemString(
+                kwargs,
+                c"coerce".as_ptr(),
+                value_object(ShimValue::Bool(false)),
+            ),
+            0
+        );
+        coerce = 1;
+        na_object = std::ptr::null_mut();
+        let status = unsafe {
+            super::PyArg_ParseTupleAndKeywords(
+                args as *mut c_void,
+                kwargs as *mut c_void,
+                c"|$pO&:StringDType".as_ptr(),
+                names.as_ptr(),
+                &mut coerce as *mut c_int,
+                store_object_converter
+                    as unsafe extern "C" fn(*mut ShimObject, *mut c_void) -> c_int,
+                &mut na_object as *mut *mut ShimObject,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert_eq!(coerce, 0);
+        assert_eq!(na_object, na);
+
+        Py_DecRef(kwargs);
+        Py_DecRef(args);
+        Py_DecRef(na);
+    }
+
+    /// Three units: an absent optional argument must still consume its
+    /// `va_arg` slot, otherwise the next keyword writes through the wrong
+    /// pointer.
+    #[test]
+    fn parser_skips_absent_optionals_without_misaligning_keywords() {
+        anchor();
+        clear_error();
+
+        let names = [
+            c"a".as_ptr(),
+            c"b".as_ptr(),
+            c"c".as_ptr(),
+            std::ptr::null(),
+        ];
+        let args = tuple_object(&[]);
+        let kwargs = PyDict_New();
+        assert_eq!(
+            PyDict_SetItemString(kwargs, c"a".as_ptr(), value_object(ShimValue::Int(1))),
+            0
+        );
+        assert_eq!(
+            PyDict_SetItemString(kwargs, c"c".as_ptr(), value_object(ShimValue::Int(3))),
+            0
+        );
+
+        let mut a: c_int = 0;
+        let mut b: c_int = 42;
+        let mut c: c_int = 0;
+        let status = unsafe {
+            super::PyArg_ParseTupleAndKeywords(
+                args as *mut c_void,
+                kwargs as *mut c_void,
+                c"|iii".as_ptr(),
+                names.as_ptr(),
+                &mut a as *mut c_int,
+                &mut b as *mut c_int,
+                &mut c as *mut c_int,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert_eq!((a, b, c), (1, 42, 3));
+
+        Py_DecRef(kwargs);
+        Py_DecRef(args);
+    }
+
+    /// Four units with `$`: `O&` positionally, then keyword-only integers.
+    #[test]
+    fn parser_supports_keyword_only_units_after_dollar() {
+        anchor();
+        clear_error();
+
+        let names = [
+            c"obj".as_ptr(),
+            c"a".as_ptr(),
+            c"b".as_ptr(),
+            c"c".as_ptr(),
+            std::ptr::null(),
+        ];
+        let args = tuple_object(&[ShimValue::Int(11)]);
+        let kwargs = PyDict_New();
+        assert_eq!(
+            PyDict_SetItemString(kwargs, c"b".as_ptr(), value_object(ShimValue::Int(20))),
+            0
+        );
+        assert_eq!(
+            PyDict_SetItemString(kwargs, c"c".as_ptr(), value_object(ShimValue::Int(30))),
+            0
+        );
+
+        let mut converted: *mut ShimObject = std::ptr::null_mut();
+        let mut a: c_int = 9;
+        let mut b: c_int = 0;
+        let mut c: c_int = 0;
+        let status = unsafe {
+            super::PyArg_ParseTupleAndKeywords(
+                args as *mut c_void,
+                kwargs as *mut c_void,
+                c"O&|$iii:probe".as_ptr(),
+                names.as_ptr(),
+                store_object_converter
+                    as unsafe extern "C" fn(*mut ShimObject, *mut c_void) -> c_int,
+                &mut converted as *mut *mut ShimObject,
+                &mut a as *mut c_int,
+                &mut b as *mut c_int,
+                &mut c as *mut c_int,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert_eq!(converted, PyTuple_GetItem(args, 0));
+        assert_eq!((a, b, c), (9, 20, 30));
+
+        Py_DecRef(kwargs);
+        Py_DecRef(args);
+    }
+
+    /// A real mismatch between names and units stays a `SystemError`.
+    #[test]
+    fn parser_reports_keyword_name_and_unit_mismatch() {
+        anchor();
+        clear_error();
+
+        let names = [
+            c"a".as_ptr(),
+            c"b".as_ptr(),
+            c"c".as_ptr(),
+            std::ptr::null(),
+        ];
+        let args = tuple_object(&[ShimValue::Int(1)]);
+        let kwargs = PyDict_New();
+        let mut a: c_int = 0;
+        let mut b: c_int = 0;
+        let status = unsafe {
+            super::PyArg_ParseTupleAndKeywords(
+                args as *mut c_void,
+                kwargs as *mut c_void,
+                c"ii:probe".as_ptr(),
+                names.as_ptr(),
+                &mut a as *mut c_int,
+                &mut b as *mut c_int,
+            )
+        };
+        assert_eq!(status, 0);
+        let message = take_error().expect("name/unit mismatch");
+        assert!(
+            message.contains("SystemError: probe: 3 keyword names for 2 format units"),
+            "{message}"
+        );
+
+        Py_DecRef(kwargs);
+        Py_DecRef(args);
+    }
+
+    /// Grouping counts as one unit, so `(ii)` matches a single keyword name.
+    #[test]
+    fn parser_counts_grouped_units_as_one() {
+        anchor();
+        clear_error();
+
+        let names = [c"pair".as_ptr(), std::ptr::null()];
+        let args = tuple_object(&[ShimValue::Tuple(vec![ShimValue::Int(1), ShimValue::Int(2)])]);
+        let kwargs = PyDict_New();
+        let status = unsafe {
+            super::PyArg_ParseTupleAndKeywords(
+                args as *mut c_void,
+                kwargs as *mut c_void,
+                c"(ii)".as_ptr(),
+                names.as_ptr(),
+            )
+        };
+        assert_eq!(status, 0);
+        let message = take_error().expect("group conversion is unsupported");
+        assert!(
+            message.contains("unsupported format character '('"),
+            "group must fail on conversion, not on the unit count: {message}"
+        );
+
+        Py_DecRef(kwargs);
+        Py_DecRef(args);
+    }
+
+    /// `s*`, `w*`, `y#`, `z` and `et` perform real conversions: the buffer
+    /// fields are filled, the release hook has run, and every error path keeps
+    /// its TypeError/ValueError shape.
+    #[test]
+    fn parser_supports_buffer_units() {
+        anchor();
+        clear_error();
+
+        // `s*` over str: UTF-8 bytes, read-only view, released (obj cleared).
+        let args = tuple_object(&[ShimValue::Str("hello".into())]);
+        let mut view: super::buffer::Py_buffer = unsafe { std::mem::zeroed() };
+        let status = unsafe {
+            super::PyArg_ParseTuple(
+                args as *mut c_void,
+                c"s*".as_ptr(),
+                &mut view as *mut super::buffer::Py_buffer,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert_eq!((view.len, view.readonly), (5, 1));
+        assert!(view.obj.is_null());
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(view.buf as *const u8, 5) },
+            b"hello"
+        );
+        Py_DecRef(args);
+
+        // `w*` asks for a writable exporter; bytes is read-only.
+        let args = tuple_object(&[ShimValue::Bytes(b"abc".to_vec())]);
+        let mut view: super::buffer::Py_buffer = unsafe { std::mem::zeroed() };
+        let status = unsafe {
+            super::PyArg_ParseTuple(
+                args as *mut c_void,
+                c"w*".as_ptr(),
+                &mut view as *mut super::buffer::Py_buffer,
+            )
+        };
+        assert_eq!(status, 0);
+        let message = take_error().expect("read-only bytes");
+        assert!(
+            message.contains("read-write bytes-like object"),
+            "{message}"
+        );
+        Py_DecRef(args);
+
+        // `y#` over bytes: pointer plus length.
+        let args = tuple_object(&[ShimValue::Bytes(b"abc".to_vec())]);
+        let mut out: *const c_char = std::ptr::null();
+        let mut length: isize = -1;
+        let status = unsafe {
+            super::PyArg_ParseTuple(
+                args as *mut c_void,
+                c"y#".as_ptr(),
+                &mut out as *mut *const c_char,
+                &mut length as *mut isize,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert_eq!(length, 3);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(out as *const u8, 3) },
+            b"abc"
+        );
+        Py_DecRef(args);
+
+        // `z` maps None to NULL.
+        let args = tuple_object(&[ShimValue::None]);
+        let mut out: *const c_char = std::ptr::null();
+        let status = unsafe {
+            super::PyArg_ParseTuple(
+                args as *mut c_void,
+                c"z".as_ptr(),
+                &mut out as *mut *const c_char,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert!(out.is_null());
+        Py_DecRef(args);
+
+        // `et` accepts bytes verbatim; the caller owns the PyMem buffer.
+        let args = tuple_object(&[ShimValue::Bytes(b"raw".to_vec())]);
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let status = unsafe {
+            super::PyArg_ParseTuple(
+                args as *mut c_void,
+                c"et".as_ptr(),
+                c"utf-8".as_ptr(),
+                &mut out as *mut *mut c_char,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert_eq!(unsafe { std::ffi::CStr::from_ptr(out) }.to_bytes(), b"raw");
+        super::PyMem_Free(out as *mut c_void);
+        Py_DecRef(args);
+
+        // Consecutive units keep their own slots: `s*` then `L`.
+        let args = tuple_object(&[ShimValue::Str("hi".into()), ShimValue::Int(12)]);
+        let mut view: super::buffer::Py_buffer = unsafe { std::mem::zeroed() };
+        let mut number: i64 = 0;
+        let status = unsafe {
+            super::PyArg_ParseTuple(
+                args as *mut c_void,
+                c"s*L".as_ptr(),
+                &mut view as *mut super::buffer::Py_buffer,
+                &mut number as *mut i64,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert_eq!((view.len, number), (2, 12));
+        Py_DecRef(args);
+    }
+
+    /// `L`, `k`, `I`, `es` and `es#` store through the caller's pointers.
+    #[test]
+    fn parser_supports_scalar_and_encoded_units() {
+        anchor();
+        clear_error();
+
+        // `L`, `k` and `I` consume three consecutive pointer slots; `k`/`I`
+        // apply CPython's unsigned masking rules to their own argument.
+        let args = tuple_object(&[ShimValue::Int(7), ShimValue::Int(-1), ShimValue::Int(-2)]);
+        let mut wide: i64 = 0;
+        let mut unsigned_long: c_ulong = 0;
+        let mut unsigned_int: c_uint = 0;
+        let status = unsafe {
+            super::PyArg_ParseTuple(
+                args as *mut c_void,
+                c"LkI".as_ptr(),
+                &mut wide as *mut i64,
+                &mut unsigned_long as *mut c_ulong,
+                &mut unsigned_int as *mut c_uint,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert_eq!(wide, 7);
+        assert_eq!(unsigned_long, c_ulong::MAX);
+        assert_eq!(unsigned_int, c_uint::MAX - 1);
+        Py_DecRef(args);
+
+        // `es` allocates a NUL-terminated PyMem buffer owned by the caller.
+        let args = tuple_object(&[ShimValue::Str("hello".into())]);
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let status = unsafe {
+            super::PyArg_ParseTuple(
+                args as *mut c_void,
+                c"es".as_ptr(),
+                c"utf-8".as_ptr(),
+                &mut out as *mut *mut c_char,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(out) }.to_bytes(),
+            b"hello"
+        );
+        super::PyMem_Free(out as *mut c_void);
+        Py_DecRef(args);
+
+        // `es#` additionally stores the encoded length.
+        let args = tuple_object(&[ShimValue::Str("hello".into())]);
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let mut length: isize = -1;
+        let status = unsafe {
+            super::PyArg_ParseTuple(
+                args as *mut c_void,
+                c"es#".as_ptr(),
+                c"utf-8".as_ptr(),
+                &mut out as *mut *mut c_char,
+                &mut length as *mut isize,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert_eq!(length, 5);
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(out) }.to_bytes(),
+            b"hello"
+        );
+        super::PyMem_Free(out as *mut c_void);
+        Py_DecRef(args);
+
+        // `es#` consumes encoding, buffer and length; the following `L` must
+        // still read its own slot.
+        let args = tuple_object(&[ShimValue::Str("hi".into()), ShimValue::Int(5)]);
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let mut length: isize = -1;
+        let mut number: i64 = 0;
+        let status = unsafe {
+            super::PyArg_ParseTuple(
+                args as *mut c_void,
+                c"es#L".as_ptr(),
+                c"utf-8".as_ptr(),
+                &mut out as *mut *mut c_char,
+                &mut length as *mut isize,
+                &mut number as *mut i64,
+            )
+        };
+        assert_eq!(status, 1, "{:?}", take_error());
+        assert_eq!((length, number), (2, 5));
+        assert_eq!(unsafe { std::ffi::CStr::from_ptr(out) }.to_bytes(), b"hi");
+        super::PyMem_Free(out as *mut c_void);
         Py_DecRef(args);
     }
 
@@ -21436,11 +22224,47 @@ long hydro_fixture_last_op(void) { return last_op; }
         dec_ref(fetched);
         assert_eq!(PyDict_SetDefaultRef(dict, key, fallback, &mut fetched), 1);
         dec_ref(fetched);
+
+        // CPython 3.14 allows a NULL `result`: only the 1/0 answer is
+        // reported and no reference may be handed out (or leaked). Use an
+        // object outside the interned small-int range so its refcount is
+        // observable.
+        let uncached = new_int(1000);
+        let held = Py_REFCNT(uncached);
+        assert_eq!(held, 1);
+        let absent_key = new_str("absent".to_string());
+        assert_eq!(
+            PyDict_SetDefaultRef(dict, absent_key, uncached, ptr::null_mut()),
+            0
+        );
+        // The dictionary took exactly one reference for the new key.
+        assert_eq!(Py_REFCNT(uncached), held + 1);
+        assert_eq!(
+            PyDict_SetDefaultRef(dict, absent_key, uncached, ptr::null_mut()),
+            1
+        );
+        assert_eq!(Py_REFCNT(uncached), held + 1);
+        dec_ref(uncached);
+        dec_ref(absent_key);
+
+        // On error the result slot is cleared when it is non-NULL.
+        let unhashable = value_object(ShimValue::List(Vec::new()));
+        let mut sentinel: *mut ShimObject = fallback;
+        assert_eq!(
+            PyDict_SetDefaultRef(dict, unhashable, fallback, &mut sentinel),
+            -1
+        );
+        assert!(sentinel.is_null());
+        assert!(take_error()
+            .unwrap_or_default()
+            .starts_with("TypeError: unhashable type"));
+        dec_ref(unhashable);
+
         dec_ref(key);
         dec_ref(fallback);
 
         let values = PyDict_Values(dict);
-        assert_eq!(PyList_Size(values), 2);
+        assert_eq!(PyList_Size(values), 3);
         dec_ref(values);
 
         let merge = PyDict_New();
@@ -22302,6 +23126,531 @@ long hydro_fixture_last_op(void) { return last_op; }
 
         dec_ref(instance);
         dec_ref(type_object);
+    }
+
+    /// `PyTraceMalloc_Track`/`Untrack` must report "tracemalloc disabled"
+    /// (`-2`), never an error.
+    ///
+    /// `-1` means "failed to record the trace"; allocators treat it as a fatal
+    /// condition. NumPy's `PyDataMem_UserNEW` frees the block and returns NULL
+    /// on `-1`, which turned every array allocation during `_multiarray_umath`
+    /// initialization into a spurious `_ArrayMemoryError`.
+    #[test]
+    fn trace_malloc_hooks_report_disabled_without_an_error() {
+        anchor();
+        clear_error();
+        assert_eq!(PyTraceMalloc_Track(0, 0x1000, 16), -2);
+        assert_eq!(PyTraceMalloc_Untrack(0, 0x1000), -2);
+        assert!(!error_pending());
+    }
+
+    /// `PyObject_Type` is a function returning a new reference to the type of
+    /// its argument, not the type data symbol CPython spells
+    /// `PyBaseObject_Type`.
+    ///
+    /// NumPy calls it in `install_logical_ufunc_promoter`; a data export made
+    /// that call jump into the type table and crash.
+    #[test]
+    fn py_object_type_returns_a_new_reference_to_the_type() {
+        anchor();
+        clear_error();
+        let integer = new_int(3);
+        let integer_type = types::PyObject_Type(integer);
+        assert_eq!(
+            integer_type,
+            ptr::addr_of_mut!(types::INT_TYPE) as *mut ShimObject
+        );
+        dec_ref(integer_type);
+        dec_ref(integer);
+
+        let type_object = make_type(
+            c"probe.ObjectType",
+            PY_OBJECT_HEAD_SIZE as c_int,
+            0,
+            0,
+            &mut empty_slots(),
+        );
+        let instance = PyType_GenericAlloc(type_object, 0);
+        assert!(!instance.is_null(), "{:?}", take_error());
+        let looked_up = types::PyObject_Type(instance);
+        assert_eq!(looked_up, type_object);
+        dec_ref(looked_up);
+        dec_ref(instance);
+        dec_ref(type_object);
+
+        assert!(types::PyObject_Type(ptr::null_mut()).is_null());
+        assert_eq!(
+            take_error().as_deref(),
+            Some("SystemError: null argument to internal routine")
+        );
+    }
+
+    /// Plain `tp_methods`, `tp_members` and `tp_getset` entries are attributes
+    /// of the class that declares them.
+    ///
+    /// CPython's `type.__getattribute__` returns their descriptors unchanged;
+    /// the descriptor binds when it is read from an instance. NumPy stores
+    /// `ndarray.__array_finalize__`, `__array_ufunc__`, `__array_function__`
+    /// and `_set_dtype` this way and compares `ndarray.dtype` by identity
+    /// while `_multiarray_umath` initializes.
+    #[test]
+    fn type_attribute_exposes_method_member_and_getset_descriptors() {
+        anchor();
+        clear_error();
+        static METHOD_SELF: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+        unsafe extern "C" fn probe_method(
+            self_object: *mut ShimObject,
+            _args: *mut ShimObject,
+        ) -> *mut ShimObject {
+            METHOD_SELF.store(self_object as usize, SEQ);
+            PyLong_FromLong(7)
+        }
+        extern "C" fn probe_getset(
+            _self_object: *mut ShimObject,
+            _closure: *mut c_void,
+        ) -> *mut ShimObject {
+            PyLong_FromLong(11)
+        }
+
+        let mut methods = [
+            PyMethodDefMirror {
+                ml_name: c"probe_method".as_ptr(),
+                ml_meth: probe_method as *const () as *mut c_void,
+                ml_flags: METH_VARARGS,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDefMirror {
+                ml_name: ptr::null(),
+                ml_meth: ptr::null_mut(),
+                ml_flags: 0,
+                ml_doc: ptr::null(),
+            },
+        ];
+        let mut members = [
+            types::PyMemberDefMirror {
+                name: c"probe_member".as_ptr(),
+                type_: types::T_LONG,
+                offset: 16,
+                flags: 0,
+                doc: ptr::null(),
+            },
+            types::PyMemberDefMirror {
+                name: ptr::null(),
+                type_: 0,
+                offset: 0,
+                flags: 0,
+                doc: ptr::null(),
+            },
+        ];
+        let mut getsets = [
+            types::PyGetSetDefMirror {
+                name: c"probe_getset".as_ptr(),
+                get: probe_getset as *const () as usize,
+                set: 0,
+                doc: ptr::null(),
+                closure: ptr::null_mut(),
+            },
+            types::PyGetSetDefMirror {
+                name: ptr::null(),
+                get: 0,
+                set: 0,
+                doc: ptr::null(),
+                closure: ptr::null_mut(),
+            },
+        ];
+        let mut slots = [
+            PyTypeSlotMirror {
+                slot: 64, // Py_tp_methods
+                pfunc: methods.as_mut_ptr() as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 72, // Py_tp_members
+                pfunc: members.as_mut_ptr() as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 73, // Py_tp_getset
+                pfunc: getsets.as_mut_ptr() as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 0,
+                pfunc: ptr::null_mut(),
+            },
+        ];
+        let type_object = make_type(c"probe.TypeAttributes", 48, 0, 0, &mut slots);
+        let instance = PyType_GenericAlloc(type_object, 0);
+        assert!(!instance.is_null(), "{:?}", take_error());
+
+        // The class returns a stable descriptor, not a missing attribute.
+        let method = PyObject_GetAttrString(type_object, c"probe_method".as_ptr());
+        assert!(!method.is_null(), "{:?}", take_error());
+        assert_eq!(types::type_name(Py_TYPE(method)), "method_descriptor");
+        let again = PyObject_GetAttrString(type_object, c"probe_method".as_ptr());
+        assert_eq!(again, method, "class lookups share the descriptor object");
+        dec_ref(again);
+
+        dec_ref(method);
+
+        let member = PyObject_GetAttrString(type_object, c"probe_member".as_ptr());
+        assert!(!member.is_null(), "{:?}", take_error());
+        assert_eq!(types::type_name(Py_TYPE(member)), "member_descriptor");
+        dec_ref(member);
+        let getset = PyObject_GetAttrString(type_object, c"probe_getset".as_ptr());
+        assert!(!getset.is_null(), "{:?}", take_error());
+        assert_eq!(types::type_name(Py_TYPE(getset)), "getset_descriptor");
+        dec_ref(getset);
+
+        // Reading the same names from an instance still binds the method.
+        let bound = PyObject_GetAttrString(instance, c"probe_method".as_ptr());
+        assert!(!bound.is_null(), "{:?}", take_error());
+        METHOD_SELF.store(usize::MAX, SEQ);
+        let result = PyObject_Vectorcall(bound, ptr::null(), 0, ptr::null_mut());
+        assert!(!result.is_null(), "{:?}", take_error());
+        assert_eq!(METHOD_SELF.load(SEQ), instance as usize);
+        dec_ref(result);
+        dec_ref(bound);
+
+        dec_ref(instance);
+        dec_ref(type_object);
+    }
+
+    /// A heap type can reserve an inline `__dict__` slot the way CPython's
+    /// `PyType_FromSpec` supports it: a `__dictoffset__` pseudo-member names
+    /// the offset. `PyObject_GenericGetDict`/`SetDict` and generic attribute
+    /// access must all operate on that slot, and the dictionary must be
+    /// released when the instance is deallocated.
+    #[test]
+    fn heap_type_dictoffset_backs_instance_dict() {
+        anchor();
+        clear_error();
+        let mut members = [
+            types::PyMemberDefMirror {
+                name: c"__dictoffset__".as_ptr(),
+                type_: types::T_PYSSIZET,
+                offset: 16,
+                flags: types::READONLY,
+                doc: ptr::null(),
+            },
+            types::PyMemberDefMirror {
+                name: ptr::null(),
+                type_: 0,
+                offset: 0,
+                flags: 0,
+                doc: ptr::null(),
+            },
+        ];
+        let mut getsets = [
+            types::PyGetSetDefMirror {
+                name: c"__dict__".as_ptr(),
+                get: PyObject_GenericGetDict as *const () as usize,
+                set: PyObject_GenericSetDict as *const () as usize,
+                doc: ptr::null(),
+                closure: ptr::null_mut(),
+            },
+            types::PyGetSetDefMirror {
+                name: ptr::null(),
+                get: 0,
+                set: 0,
+                doc: ptr::null(),
+                closure: ptr::null_mut(),
+            },
+        ];
+        let mut slots = [
+            PyTypeSlotMirror {
+                slot: 72, // Py_tp_members
+                pfunc: members.as_mut_ptr() as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 73, // Py_tp_getset
+                pfunc: getsets.as_mut_ptr() as *mut c_void,
+            },
+            PyTypeSlotMirror {
+                slot: 0,
+                pfunc: ptr::null_mut(),
+            },
+        ];
+        let type_object = make_type(c"probe.InstanceDict", 24, 0, 0, &mut slots);
+        // `Py_TYPE(type_object)` is the metatype; the declared instance offset
+        // lives on the type object itself.
+        let type_pointer = types::as_type(type_object).expect("heap type object");
+        // SAFETY: `make_type` returned a live type object.
+        assert_eq!(unsafe { (*type_pointer).tp_dictoffset }, 16);
+
+        let instance = PyType_GenericAlloc(type_object, 0);
+        assert!(!instance.is_null(), "{:?}", take_error());
+        assert!(
+            types::instance_dict(instance).is_none(),
+            "the dictionary is materialised lazily"
+        );
+
+        // `__dict__` creates the dictionary on first access and reuses it.
+        let dict = PyObject_GenericGetDict(instance, ptr::null_mut());
+        assert!(!dict.is_null(), "{:?}", take_error());
+        assert!(matches!(kind_ref(dict), Some(ShimKind::Dict(pairs)) if pairs.is_empty()));
+        assert_eq!(types::instance_dict(instance), Some(dict));
+        let again = PyObject_GetAttrString(instance, c"__dict__".as_ptr());
+        assert_eq!(again, dict, "the same dictionary is handed out");
+        dec_ref(again);
+
+        // Generic setattr stores new names in that dictionary; getattr finds
+        // them there before falling back to the class.
+        let name = new_str("marker".to_string());
+        let value = new_str("kept".to_string());
+        assert_eq!(
+            PyObject_GenericSetAttr(instance, name, value),
+            0,
+            "{:?}",
+            take_error()
+        );
+        let read = PyObject_GenericGetAttr(instance, name);
+        assert!(!read.is_null(), "{:?}", take_error());
+        assert_eq!(as_string(read).as_deref(), Some("kept"));
+        dec_ref(read);
+        dec_ref(value);
+
+        // Deletion removes the entry and reports AttributeError, not KeyError.
+        assert_eq!(PyObject_GenericSetAttr(instance, name, ptr::null_mut()), 0);
+        let missing = PyObject_GenericGetAttr(instance, name);
+        assert!(missing.is_null());
+        assert!(
+            take_error()
+                .unwrap_or_default()
+                .starts_with("AttributeError"),
+            "a deleted instance attribute is missing"
+        );
+        assert_eq!(
+            PyObject_GenericSetAttr(instance, name, ptr::null_mut()),
+            -1,
+            "deleting a missing attribute fails"
+        );
+        assert!(
+            take_error()
+                .unwrap_or_default()
+                .starts_with("AttributeError"),
+            "a missing deletion is an AttributeError"
+        );
+        dec_ref(name);
+
+        // Replacing `__dict__` swaps the reference stored in the slot and
+        // releases the old dictionary.
+        let replacement = PyDict_New();
+        assert!(!replacement.is_null(), "{:?}", take_error());
+        assert_eq!(
+            PyObject_GenericSetDict(instance, replacement, ptr::null_mut()),
+            0,
+            "{:?}",
+            take_error()
+        );
+        assert_eq!(types::instance_dict(instance), Some(replacement));
+        // SAFETY: live handles; the caller and the slot each own a reference.
+        unsafe {
+            assert_eq!((*replacement).head.ob_refcnt.load(SEQ), 2);
+            assert_eq!((*dict).head.ob_refcnt.load(SEQ), 1);
+        }
+        dec_ref(dict);
+
+        // Deallocation releases the dictionary even though the heap type has
+        // no custom `tp_dealloc`.
+        dec_ref(replacement);
+        // SAFETY: only the instance slot still owns the dictionary.
+        assert_eq!(unsafe { (*replacement).head.ob_refcnt.load(SEQ) }, 1);
+        dec_ref(instance);
+        dec_ref(type_object);
+    }
+
+    static mut STATIC_INSTANCE_DICT_TYPE: types::TypeObject = types::TypeObject::builtin(
+        c"probe.StaticInstanceDict".as_ptr(),
+        types::TypeRole::Instance,
+        types::PY_TPFLAGS_BASETYPE,
+    );
+
+    /// A statically declared C type (`PyVarObject_HEAD_INIT`) keeps the
+    /// `tp_dictoffset` its initialiser set; `PyType_Ready` must not clear it,
+    /// because NumPy's `_ArrayFunctionDispatcher` declares its dictionary that
+    /// way and `functools.update_wrapper` reads it.
+    #[test]
+    fn static_type_dictoffset_backs_instance_dict() {
+        anchor();
+        clear_error();
+        // SAFETY: this test owns the static type object; the fields set here
+        // are the ones a C initialiser would supply.
+        unsafe {
+            (*ptr::addr_of_mut!(STATIC_INSTANCE_DICT_TYPE)).tp_basicsize = 24;
+            (*ptr::addr_of_mut!(STATIC_INSTANCE_DICT_TYPE)).tp_dictoffset = 16;
+        }
+        let type_object = ptr::addr_of_mut!(STATIC_INSTANCE_DICT_TYPE) as *mut ShimObject;
+        assert_eq!(PyType_Ready(type_object), 0, "{:?}", take_error());
+
+        let instance = PyType_GenericAlloc(type_object, 0);
+        assert!(!instance.is_null(), "{:?}", take_error());
+        // SAFETY: the adopted static type kept the declared offset.
+        let type_pointer = types::as_type(type_object).expect("static type object");
+        assert_eq!(unsafe { (*type_pointer).tp_dictoffset }, 16);
+        let slot = types::instance_dict_pointer(instance).expect("inline dictionary slot");
+        // SAFETY: the slot belongs to the live instance.
+        assert!(unsafe { *slot }.is_null());
+
+        let dict = PyObject_GenericGetDict(instance, ptr::null_mut());
+        assert!(!dict.is_null(), "{:?}", take_error());
+        // SAFETY: as above.
+        assert_eq!(unsafe { *slot }, dict);
+        assert_eq!(types::instance_dict(instance), Some(dict));
+        dec_ref(dict);
+
+        dec_ref(instance);
+    }
+
+    /// Attributes written straight into a module's `__dict__` are visible to
+    /// the loader's attribute lookup, exactly as CPython reads the module
+    /// namespace.
+    ///
+    /// NumPy's `_multiarray_umath_exec` publishes `_ArrayFunctionDispatcher`
+    /// with `PyDict_SetItemString` rather than `PyModule_AddObject`, and
+    /// `numpy._core.overrides` imports it while NumPy initializes; looking
+    /// only at the host's attribute table reported the name as missing.
+    #[test]
+    fn module_dict_entries_are_visible_to_extension_lookup() {
+        anchor();
+        clear_error();
+        let mut definition = empty_definition();
+        definition.m_name = c"hydro_dict_probe".as_ptr();
+        let module = PyModule_Create2(&mut definition, 3);
+        assert!(!module.is_null(), "{:?}", take_error());
+        let id = module_id(module).expect("module id");
+        let dict = PyModule_GetDict(module);
+        assert!(!dict.is_null(), "{:?}", take_error());
+
+        let type_object = make_type(
+            c"probe.DictEntry",
+            PY_OBJECT_HEAD_SIZE as c_int,
+            0,
+            0,
+            &mut empty_slots(),
+        );
+        assert_eq!(
+            PyDict_SetItemString(dict, c"direct_type".as_ptr(), type_object),
+            0,
+            "{:?}",
+            take_error()
+        );
+        let value = new_str("direct value".to_string());
+        assert_eq!(
+            PyDict_SetItemString(dict, c"direct_value".as_ptr(), value),
+            0,
+            "{:?}",
+            take_error()
+        );
+        dec_ref(value);
+
+        match get_attr(id, "direct_type") {
+            Ok(ShimAttr::Type(address)) => assert_eq!(address, type_object as usize),
+            _ => panic!("a type written to __dict__ must be exported"),
+        }
+        match get_attr(id, "direct_value") {
+            Ok(ShimAttr::Value(ShimValue::Str(text))) => assert_eq!(text, "direct value"),
+            _ => panic!("a value written to __dict__ must be exported"),
+        }
+        let names = module_attribute_names(id);
+        for expected in ["direct_type", "direct_value"] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "module enumeration must include __dict__ entry '{expected}': {names:?}"
+            );
+        }
+        assert!(
+            get_attr(id, "missing").is_err(),
+            "an absent name stays absent"
+        );
+
+        dec_ref(type_object);
+        dec_ref(module);
+    }
+
+    /// A runtime extension star import copies every public namespace entry
+    /// into the importing module's global table, preferring `__all__` when the
+    /// extension defines it.
+    #[test]
+    fn extension_star_import_populates_the_module_globals() {
+        anchor();
+        clear_error();
+        let mut definition = empty_definition();
+        definition.m_name = c"hydro_star_probe".as_ptr();
+        let module = PyModule_Create2(&mut definition, 3);
+        assert!(!module.is_null(), "{:?}", take_error());
+        let id = module_id(module).expect("module id");
+        let dict = PyModule_GetDict(module);
+        assert!(!dict.is_null(), "{:?}", take_error());
+
+        // A public `__dict__` entry, a private one, and an attribute-table
+        // entry (registered through `PyModule_AddObject`).
+        for (name, number) in [("absolute", 7_i64), ("_hidden", 8_i64)] {
+            let key = new_str(name.to_string());
+            let value = new_int(number);
+            assert_eq!(PyDict_SetItem(dict, key, value), 0, "{:?}", take_error());
+            dec_ref(key);
+            dec_ref(value);
+        }
+        let added = new_int(9);
+        assert_eq!(
+            PyModule_AddObject(module, c"add".as_ptr(), added),
+            0,
+            "{:?}",
+            take_error()
+        );
+        // `PyModule_AddObject` steals `added`.
+
+        let target = "hydro.star.target";
+        let result = crate::modules::extension::populate_star_import(id, target);
+        assert!(!error_pending(), "{:?}", take_error());
+        assert_eq!(result, crate::value::NONE);
+        let read = |name: &str| {
+            crate::core::globals::try_get(target, name).and_then(crate::value::as_integer)
+        };
+        assert_eq!(read("absolute"), Some(7), "public __dict__ entry");
+        assert_eq!(read("add"), Some(9), "attribute-table entry");
+        assert_eq!(read("_hidden"), None, "underscore names are not imported");
+
+        // A module `__all__` selects exactly the names it lists.
+        let selected = PyTuple_New(2);
+        assert!(!selected.is_null(), "{:?}", take_error());
+        for (index, name) in ["absolute", "_hidden"].into_iter().enumerate() {
+            let item = new_str(name.to_string());
+            // `PyTuple_SetItem` steals the item reference.
+            assert_eq!(
+                PyTuple_SetItem(selected, index as isize, item),
+                0,
+                "{:?}",
+                take_error()
+            );
+        }
+        assert_eq!(
+            PyDict_SetItemString(dict, c"__all__".as_ptr(), selected),
+            0,
+            "{:?}",
+            take_error()
+        );
+        dec_ref(selected);
+        let target_all = "hydro.star.target.all";
+        let result = crate::modules::extension::populate_star_import(id, target_all);
+        assert!(!error_pending(), "{:?}", take_error());
+        assert_eq!(result, crate::value::NONE);
+        let read_all = |name: &str| {
+            crate::core::globals::try_get(target_all, name).and_then(crate::value::as_integer)
+        };
+        assert_eq!(read_all("absolute"), Some(7));
+        assert_eq!(
+            read_all("_hidden"),
+            Some(8),
+            "__all__ may name private attributes"
+        );
+        assert_eq!(
+            read_all("add"),
+            None,
+            "names outside __all__ are not imported"
+        );
+
+        dec_ref(module);
     }
 
     /// A returned container graph keeps CPython aliasing: the same C object

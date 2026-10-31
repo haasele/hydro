@@ -418,8 +418,9 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       **3.14.9** oracle, JSON + `docs/CPYTHON_TESTS.md`, release gate
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
       Manifest `tests/compat/cpython-3.14.9.json` records `minimum_passing=3`
-      for the 2026-10-29 full run's **3/398** genuine passes
-      (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`); `required`
+      for the 2026-10-31 full run's **6/398** genuine passes
+      (`test_colorsys.py`, `test_errno.py`, `test_int_literal.py`,
+      `test_longexp.py`, `test_openpty.py`, `test_unary.py`); `required`
       stays empty until a never-regress subset is pinned. It grows only from
       real `hydro_pass` results.
       Stdlib import baseline 2026-10-30: **288/297 importable** (52
@@ -433,7 +434,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       package/site-packages loader and the native
       `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/`importlib`/
       `__future__` modules are importable and API-tested.
-      Official-suite baseline 2026-10-29: **3/398 passing** (333
+      Official-suite baseline 2026-10-31: **6/398 passing** (330
       `hydro_fail`, 62 `expected_fail` where CPython also fails; 0 timeouts). No test is marked
       passing unless CPython 3.14.9 and Hydro both exit 0.
       The harness runs a defined subset of CPython 3.14 `Lib/test` against
@@ -1410,8 +1411,10 @@ is implemented for the v1 slice, and Tier 4/NB-6 is a tested pilot.
             `PyType_Ready` base adoption, `PyContextVar_New`, `Py_BuildValue`
             and `PyErr_Format`; it stops on a DType/ArrayMethod type check.
       - [ ] pandas 3.1 import/smoke: compilation now reaches
-            `pandas/io/common.py`; the remaining blocker is `except` with a
-            dynamic exception expression (`except tuple(...)`).
+            `pandas/io/common.py`; `except` with a dynamic exception
+            expression (`except tuple(...)`, an alias, any runtime
+            expression) is supported (evaluated at handler entry and matched
+            with `isinstance`).
       - [x] Full `tp_traverse`/`tp_clear`, GIL/thread integration and the
             threaded callback + GC stress gate (`PyGC_Collect` production
             pass; visitproc order fixed).

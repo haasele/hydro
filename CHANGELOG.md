@@ -8,6 +8,28 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-10-31 CPython compatibility program
+
+- Stdlib import matrix reached **288/297** with **288/288** modules CPython
+  3.14.9 can import on this host; the nine remaining are CPython-failing
+  platform modules. Added Hydro-native `turtle`, `symtable`/`_symtable` and
+  `tracemalloc`/`_tracemalloc`, plus native `http.server`, and loaded pinned
+  C extensions through derived `lib-dynload`/`HYDRO_EXTENSION_PATH` roots.
+- Official `Lib/test` differential baseline rose from 3/398 to **6/398**
+  (`test_colorsys`, `test_errno`, `test_int_literal`, `test_longexp`,
+  `test_openpty`, `test_unary`); 330 `hydro_fail`, 62 `expected_fail`.
+- Ecosystem gate remains **9/13**: pydantic import/smoke pass; NumPy now stops
+  on a class-registration path after DType/metatype, PARSE and instance-dict
+  fixes; pandas AOT stops on a static type-inference conflict after dynamic
+  `except` handlers, CSV dialects, pickle classes and export ordering were
+  added.
+- Added PEP 695 generic function parameters, function/class docstrings,
+  sequential class-body defaults, dynamic module globals, functional Enum
+  metaclass construction, octal regex escapes, `%` mapping formatting,
+  `time.strptime`, threading barriers, `sys.getrefcount`, unittest
+  expected-failure/skip/result infrastructure, and CPython C-API argument,
+  struct-sequence, audit, fork and instance-dict support.
+
 ### Compatibility — 2026-10-30 ecosystem follow-up and README progress
 
 - The ecosystem gate now passes **9/13** cases under JIT and AOT: pydantic

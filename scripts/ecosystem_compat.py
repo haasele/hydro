@@ -1211,6 +1211,7 @@ def main(argv: list[str] | None = None) -> int:
                 cpython,
                 tea,
                 sites,
+                stdlib,
                 args.timeout,
             )
         if upstream_rows:

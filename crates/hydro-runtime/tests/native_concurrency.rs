@@ -412,7 +412,9 @@ fn pickle_roundtrips_containers_and_functions() {
         assert_eq!(hydro_exc_tag(), 1); // TypeError
         hydro_exc_clear();
         assert_eq!(module("pickle", "loads", &[text("zz")]), hydro_none());
-        assert_eq!(hydro_exc_tag(), 0); // ValueError
+        // `pickle.UnpicklingError` is a real `Exception` subclass, so the
+        // pending tag is `Exception` (not the old `ValueError`).
+        assert_eq!(hydro_exc_tag(), hydro_ir::ExcKind::Exception.tag() as i64);
         hydro_exc_clear();
         assert_eq!(module("pickle", "loads", &[text("0000")]), hydro_none());
         hydro_exc_clear();

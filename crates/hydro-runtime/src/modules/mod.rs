@@ -9,13 +9,21 @@
 //!
 //! All fallible paths report a pending exception and return the `None` dummy
 //! value; no user input can panic.
+//!
+//! Reference counts are not part of the object model: the collector is a
+//! tracing garbage collector, so ownership is never tracked per object.
+//! `sys.getrefcount` reports two references (the value's stored reference plus
+//! the reference the call's argument slot holds) — CPython's count for a
+//! singly referenced object — rather than inventing a count; see
+//! `sys_getrefcount` for the exact contract and why CPython consumers such as
+//! pandas' copy-on-write guards stay on their safe path with it.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1323,11 +1331,50 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         native_member("_monitoring_restart_events", 0, 0),
     ),
     // `pickle.Pickler`'s instance methods. The class value lives in this
-    // module; the methods take `self` plus their declared argument.
+    // module; the methods take `self` plus their declared argument. The
+    // constructor and `persistent_id` declare their parameter names so a
+    // user subclass can bind keyword arguments the way CPython's pure-Python
+    // `_Pickler` does.
+    (
+        "pickle.Pickler.__init__",
+        native_dynamic_member("Pickler.__init__", 1, 3, &["self", "file", "protocol"]),
+    ),
     ("pickle.Pickler.dump", native_member("Pickler.dump", 2, 2)),
     (
         "pickle.Pickler.clear_memo",
         native_member("Pickler.clear_memo", 1, 1),
+    ),
+    (
+        "pickle.Pickler.persistent_id",
+        native_dynamic_member("Pickler.persistent_id", 2, 2, &["self", "obj"]),
+    ),
+    // `pickle.Unpickler`/`pickle._Unpickler`: the streaming reader's methods
+    // and the CPython-compatible constructor. `__init__` accepts the
+    // keyword-only options by name; `find_class` and `persistent_load` are the
+    // subclass hooks pandas overrides and calls through `super()`.
+    (
+        "pickle.Unpickler.__init__",
+        native_dynamic_member(
+            "Unpickler.__init__",
+            1,
+            6,
+            &[
+                "self",
+                "file",
+                "fix_imports",
+                "encoding",
+                "errors",
+                "buffers",
+            ],
+        ),
+    ),
+    (
+        "pickle.Unpickler.find_class",
+        native_dynamic_member("Unpickler.find_class", 3, 3, &["self", "module", "name"]),
+    ),
+    (
+        "pickle.Unpickler.persistent_load",
+        native_dynamic_member("Unpickler.persistent_load", 2, 2, &["self", "pid"]),
     ),
     // `collections.UserDict`'s native method bodies. The class table names
     // them `UserDict.<method>`; `collections::call` strips the prefix.
@@ -1736,6 +1783,13 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
     (
         "collections.UserString.zfill",
         native_member("UserString.zfill", 1, 4),
+    ),
+    // `csv.Sniffer.sniff(sample, delimiters=None)` is the class method value
+    // installed on the cached `Sniffer` class; `csv_call` dispatches it. The
+    // receiver is the first argument, like every native class method.
+    (
+        "csv.Sniffer.sniff",
+        native_dynamic_member("Sniffer.sniff", 2, 3, &["self", "sample", "delimiters"]),
     ),
     // `array.array`'s native method bodies. The class table names them
     // `array.<method>`; `array_mod::call` dispatches them.
@@ -2452,6 +2506,10 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         native_member("TestSuite.run", 2, 3),
     ),
     (
+        "unittest.TestSuite.__call__",
+        native_member("TestSuite.__call__", 1, 2),
+    ),
+    (
         "unittest.TestSuite.__iter__",
         native_member("TestSuite.__iter__", 1, 1),
     ),
@@ -2462,6 +2520,630 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
     (
         "unittest.TestSuite.__repr__",
         native_member_ret("TestSuite.__repr__", 1, 1, hydro_ir::Type::Str),
+    ),
+    // `unittest` module-level helpers and the native methods of the classes
+    // owned by `modules::unittest`. The class methods are qualified names so
+    // the module's function table stays free of them, matching TestSuite.
+    (
+        "unittest.main",
+        native_dynamic_member("main", 0, usize::MAX, &[]),
+    ),
+    (
+        "unittest.expectedFailure",
+        native_member("expectedFailure", 1, 1),
+    ),
+    ("unittest.skip", native_member("skip", 1, 1)),
+    ("unittest.skipIf", native_member("skipIf", 2, 2)),
+    ("unittest.skipUnless", native_member("skipUnless", 2, 2)),
+    ("unittest._skip_apply", native_member("_skip_apply", 3, 3)),
+    ("unittest._identity", native_member("_identity", 1, 1)),
+    (
+        "unittest._three_way_cmp",
+        native_member("_three_way_cmp", 2, 2),
+    ),
+    (
+        "unittest.TestCase.__init__",
+        native_keyword_member("TestCase.__init__", 1, 2, &["self", "methodName"]),
+    ),
+    (
+        "unittest.TestCase.run",
+        native_keyword_member("TestCase.run", 1, 2, &["self", "result"]),
+    ),
+    (
+        "unittest.TestCase.__call__",
+        native_member("TestCase.__call__", 1, 2),
+    ),
+    (
+        "unittest.TestCase.debug",
+        native_member("TestCase.debug", 1, 1),
+    ),
+    (
+        "unittest.TestCase.setUp",
+        native_member("TestCase.setUp", 1, 1),
+    ),
+    (
+        "unittest.TestCase.tearDown",
+        native_member("TestCase.tearDown", 1, 1),
+    ),
+    (
+        "unittest.TestCase.addCleanup",
+        native_dynamic_member("TestCase.addCleanup", 2, usize::MAX, &["self", "function"]),
+    ),
+    (
+        "unittest.TestCase.doCleanups",
+        native_member("TestCase.doCleanups", 1, 1),
+    ),
+    (
+        "unittest.TestCase.subTest",
+        native_dynamic_member("TestCase.subTest", 1, 2, &["self", "msg"]),
+    ),
+    ("unittest.TestCase.id", native_member("TestCase.id", 1, 1)),
+    (
+        "unittest.TestCase.shortDescription",
+        native_member("TestCase.shortDescription", 1, 1),
+    ),
+    (
+        "unittest.TestCase.__str__",
+        native_member("TestCase.__str__", 1, 1),
+    ),
+    (
+        "unittest.TestCase.__repr__",
+        native_member("TestCase.__repr__", 1, 1),
+    ),
+    (
+        "unittest.TestCase.countTestCases",
+        native_member("TestCase.countTestCases", 1, 1),
+    ),
+    (
+        "unittest.TestCase.defaultTestResult",
+        native_member("TestCase.defaultTestResult", 1, 1),
+    ),
+    (
+        "unittest.TestCase.assertEqual",
+        native_keyword_member(
+            "TestCase.assertEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertNotEqual",
+        native_keyword_member(
+            "TestCase.assertNotEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertTrue",
+        native_keyword_member("TestCase.assertTrue", 2, 3, &["self", "expr", "msg"]),
+    ),
+    (
+        "unittest.TestCase.assertFalse",
+        native_keyword_member("TestCase.assertFalse", 2, 3, &["self", "expr", "msg"]),
+    ),
+    (
+        "unittest.TestCase.assertIs",
+        native_keyword_member(
+            "TestCase.assertIs",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertIsNot",
+        native_keyword_member(
+            "TestCase.assertIsNot",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertIsNone",
+        native_keyword_member("TestCase.assertIsNone", 2, 3, &["self", "expr", "msg"]),
+    ),
+    (
+        "unittest.TestCase.assertIsNotNone",
+        native_keyword_member("TestCase.assertIsNotNone", 2, 3, &["self", "expr", "msg"]),
+    ),
+    (
+        "unittest.TestCase.assertIn",
+        native_keyword_member(
+            "TestCase.assertIn",
+            3,
+            4,
+            &["self", "member", "container", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertNotIn",
+        native_keyword_member(
+            "TestCase.assertNotIn",
+            3,
+            4,
+            &["self", "member", "container", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertIsInstance",
+        native_keyword_member(
+            "TestCase.assertIsInstance",
+            3,
+            4,
+            &["self", "obj", "cls", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertNotIsInstance",
+        native_keyword_member(
+            "TestCase.assertNotIsInstance",
+            3,
+            4,
+            &["self", "obj", "cls", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertGreater",
+        native_keyword_member(
+            "TestCase.assertGreater",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertGreaterEqual",
+        native_keyword_member(
+            "TestCase.assertGreaterEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertLess",
+        native_keyword_member(
+            "TestCase.assertLess",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertLessEqual",
+        native_keyword_member(
+            "TestCase.assertLessEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertAlmostEqual",
+        native_keyword_member(
+            "TestCase.assertAlmostEqual",
+            3,
+            6,
+            &["self", "first", "second", "places", "msg", "delta"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertNotAlmostEqual",
+        native_keyword_member(
+            "TestCase.assertNotAlmostEqual",
+            3,
+            6,
+            &["self", "first", "second", "places", "msg", "delta"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertRegex",
+        native_keyword_member(
+            "TestCase.assertRegex",
+            3,
+            4,
+            &["self", "text", "expected_regex", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertNotRegex",
+        native_keyword_member(
+            "TestCase.assertNotRegex",
+            3,
+            4,
+            &["self", "text", "expected_regex", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertCountEqual",
+        native_keyword_member(
+            "TestCase.assertCountEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertSequenceEqual",
+        native_keyword_member(
+            "TestCase.assertSequenceEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertListEqual",
+        native_keyword_member(
+            "TestCase.assertListEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertTupleEqual",
+        native_keyword_member(
+            "TestCase.assertTupleEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertSetEqual",
+        native_keyword_member(
+            "TestCase.assertSetEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertDictEqual",
+        native_keyword_member(
+            "TestCase.assertDictEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertMultiLineEqual",
+        native_keyword_member(
+            "TestCase.assertMultiLineEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertRaises",
+        native_dynamic_member(
+            "TestCase.assertRaises",
+            2,
+            usize::MAX,
+            &["self", "expected_exception"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertRaisesRegex",
+        native_dynamic_member(
+            "TestCase.assertRaisesRegex",
+            3,
+            usize::MAX,
+            &["self", "expected_exception", "expected_regex"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertHasAttr",
+        native_keyword_member(
+            "TestCase.assertHasAttr",
+            3,
+            4,
+            &["self", "obj", "name", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertNotHasAttr",
+        native_keyword_member(
+            "TestCase.assertNotHasAttr",
+            3,
+            4,
+            &["self", "obj", "name", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.fail",
+        native_keyword_member("TestCase.fail", 1, 2, &["self", "msg"]),
+    ),
+    (
+        "unittest.TestResult.__init__",
+        native_dynamic_member(
+            "TestResult.__init__",
+            1,
+            4,
+            &["self", "stream", "descriptions", "verbosity"],
+        ),
+    ),
+    (
+        "unittest.TestResult.startTest",
+        native_member("TestResult.startTest", 2, 2),
+    ),
+    (
+        "unittest.TestResult.stopTest",
+        native_member("TestResult.stopTest", 2, 2),
+    ),
+    (
+        "unittest.TestResult.startTestRun",
+        native_member("TestResult.startTestRun", 1, 1),
+    ),
+    (
+        "unittest.TestResult.stopTestRun",
+        native_member("TestResult.stopTestRun", 1, 1),
+    ),
+    (
+        "unittest.TestResult.addSuccess",
+        native_member("TestResult.addSuccess", 2, 2),
+    ),
+    (
+        "unittest.TestResult.addError",
+        native_member("TestResult.addError", 3, 3),
+    ),
+    (
+        "unittest.TestResult.addFailure",
+        native_member("TestResult.addFailure", 3, 3),
+    ),
+    (
+        "unittest.TestResult.addSubTest",
+        native_member("TestResult.addSubTest", 4, 4),
+    ),
+    (
+        "unittest.TestResult.addSkip",
+        native_member("TestResult.addSkip", 3, 3),
+    ),
+    (
+        "unittest.TestResult.addExpectedFailure",
+        native_member("TestResult.addExpectedFailure", 3, 3),
+    ),
+    (
+        "unittest.TestResult.addUnexpectedSuccess",
+        native_member("TestResult.addUnexpectedSuccess", 2, 2),
+    ),
+    (
+        "unittest.TestResult.addDuration",
+        native_member("TestResult.addDuration", 3, 3),
+    ),
+    (
+        "unittest.TestResult.wasSuccessful",
+        native_member("TestResult.wasSuccessful", 1, 1),
+    ),
+    (
+        "unittest.TestResult.stop",
+        native_member("TestResult.stop", 1, 1),
+    ),
+    (
+        "unittest.TestResult.printErrors",
+        native_member("TestResult.printErrors", 1, 1),
+    ),
+    (
+        "unittest.TestResult.__repr__",
+        native_member("TestResult.__repr__", 1, 1),
+    ),
+    (
+        "unittest.TestResult._exc_info_to_string",
+        native_member("TestResult._exc_info_to_string", 3, 3),
+    ),
+    (
+        "unittest.TextTestRunner.__init__",
+        native_dynamic_member(
+            "TextTestRunner.__init__",
+            1,
+            usize::MAX,
+            &[
+                "self",
+                "stream",
+                "descriptions",
+                "verbosity",
+                "failfast",
+                "buffer",
+                "resultclass",
+                "warnings",
+                "tb_locals",
+            ],
+        ),
+    ),
+    (
+        "unittest.TextTestRunner._makeResult",
+        native_member("TextTestRunner._makeResult", 1, 1),
+    ),
+    (
+        "unittest.TextTestRunner.run",
+        native_member("TextTestRunner.run", 2, 2),
+    ),
+    (
+        "unittest.TestLoader.__init__",
+        native_member("TestLoader.__init__", 1, 1),
+    ),
+    (
+        "unittest.TestLoader.getTestCaseNames",
+        native_member("TestLoader.getTestCaseNames", 2, 2),
+    ),
+    (
+        "unittest.TestLoader.loadTestsFromTestCase",
+        native_member("TestLoader.loadTestsFromTestCase", 2, 2),
+    ),
+    (
+        "unittest.TestLoader.loadTestsFromModule",
+        native_keyword_member(
+            "TestLoader.loadTestsFromModule",
+            2,
+            3,
+            &["self", "module", "pattern"],
+        ),
+    ),
+    (
+        "unittest.TestLoader.loadTestsFromNames",
+        native_member("TestLoader.loadTestsFromNames", 2, 3),
+    ),
+    (
+        "unittest.TestLoader.loadTestsFromName",
+        native_member("TestLoader.loadTestsFromName", 2, 3),
+    ),
+    (
+        "unittest.TestLoader.discover",
+        native_dynamic_member("TestLoader.discover", 2, usize::MAX, &[]),
+    ),
+    (
+        "unittest.TestLoader._makeSuite",
+        native_member("TestLoader._makeSuite", 2, 2),
+    ),
+    (
+        "unittest.TestProgram.__init__",
+        native_dynamic_member("TestProgram.__init__", 1, usize::MAX, &[]),
+    ),
+    (
+        "unittest.TestProgram.runTests",
+        native_member("TestProgram.runTests", 1, 1),
+    ),
+    (
+        "unittest.TestProgram.parseArgs",
+        native_member("TestProgram.parseArgs", 2, 2),
+    ),
+    (
+        "unittest._ErrorHolder.__init__",
+        native_member("_ErrorHolder.__init__", 2, 2),
+    ),
+    (
+        "unittest._ErrorHolder.id",
+        native_member("_ErrorHolder.id", 1, 1),
+    ),
+    (
+        "unittest._ErrorHolder.shortDescription",
+        native_member("_ErrorHolder.shortDescription", 1, 1),
+    ),
+    (
+        "unittest._ErrorHolder.__repr__",
+        native_member("_ErrorHolder.__repr__", 1, 1),
+    ),
+    (
+        "unittest._ErrorHolder.__str__",
+        native_member("_ErrorHolder.__str__", 1, 1),
+    ),
+    (
+        "unittest._ErrorHolder.run",
+        native_member("_ErrorHolder.run", 2, 2),
+    ),
+    (
+        "unittest._ErrorHolder.__call__",
+        native_member("_ErrorHolder.__call__", 2, 2),
+    ),
+    (
+        "unittest.TestList.__init__",
+        native_member("TestList.__init__", 1, 2),
+    ),
+    (
+        "unittest.TestList.__repr__",
+        native_member("TestList.__repr__", 1, 1),
+    ),
+    (
+        "unittest.TestList.__iter__",
+        native_member("TestList.__iter__", 1, 1),
+    ),
+    (
+        "unittest.TestList.__len__",
+        native_member("TestList.__len__", 1, 1),
+    ),
+    (
+        "unittest.TestList.__eq__",
+        native_member("TestList.__eq__", 2, 2),
+    ),
+    (
+        "unittest.TestList.__add__",
+        native_member("TestList.__add__", 2, 2),
+    ),
+    (
+        "unittest._SubTest.__init__",
+        native_member("_SubTest.__init__", 3, 3),
+    ),
+    (
+        "unittest._SubTest.__enter__",
+        native_member("_SubTest.__enter__", 1, 1),
+    ),
+    (
+        "unittest._SubTest.__exit__",
+        native_member("_SubTest.__exit__", 4, 4),
+    ),
+    (
+        "unittest._SubTest.__str__",
+        native_member("_SubTest.__str__", 1, 1),
+    ),
+    (
+        "unittest._AssertRaisesContext.__init__",
+        native_member("_AssertRaisesContext.__init__", 3, 4),
+    ),
+    (
+        "unittest._AssertRaisesContext.__enter__",
+        native_member("_AssertRaisesContext.__enter__", 1, 1),
+    ),
+    (
+        "unittest._AssertRaisesContext.__exit__",
+        native_member("_AssertRaisesContext.__exit__", 4, 4),
+    ),
+    ("unittest.util.strclass", native_member("strclass", 1, 1)),
+    ("unittest.util.safe_repr", native_member("safe_repr", 1, 2)),
+    (
+        "unittest.util.sorted_list_difference",
+        native_member("sorted_list_difference", 2, 2),
+    ),
+    (
+        "unittest.util.unorderable_list_difference",
+        native_member("unorderable_list_difference", 2, 2),
+    ),
+    (
+        "unittest.util.three_way_cmp",
+        native_member("three_way_cmp", 2, 2),
+    ),
+    (
+        "unittest.util._common_shorten_repr",
+        native_member("_common_shorten_repr", 0, usize::MAX),
+    ),
+    // `http.HTTPStatus`: the native `IntEnum`-shaped class's methods.
+    (
+        "http.HTTPStatus.__init__",
+        native_member("HTTPStatus.__init__", 2, 2),
+    ),
+    (
+        "http.HTTPStatus.__repr__",
+        native_member("HTTPStatus.__repr__", 1, 1),
+    ),
+    (
+        "http.HTTPStatus.__str__",
+        native_member("HTTPStatus.__str__", 1, 1),
+    ),
+    (
+        "http.HTTPStatus.is_informational",
+        native_member("HTTPStatus.is_informational", 1, 1),
+    ),
+    (
+        "http.HTTPStatus.is_success",
+        native_member("HTTPStatus.is_success", 1, 1),
+    ),
+    (
+        "http.HTTPStatus.is_redirection",
+        native_member("HTTPStatus.is_redirection", 1, 1),
+    ),
+    (
+        "http.HTTPStatus.is_client_error",
+        native_member("HTTPStatus.is_client_error", 1, 1),
+    ),
+    (
+        "http.HTTPStatus.is_server_error",
+        native_member("HTTPStatus.is_server_error", 1, 1),
     ),
     // The `random.Random` proxy exposes the generator's methods on the class
     // value. Constructing through it runs the real generator factory.
@@ -2955,7 +3637,50 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if module == "unittest" {
         match name {
             "TestCase" => return unittest::test_case(),
-            "TestSuite" => return unittest_test_suite_class(),
+            "TestSuite" | "BaseTestSuite" => return unittest_test_suite_class(),
+            "TestResult" => return unittest::test_result_class(),
+            "TextTestResult" => return unittest::text_test_result_class(),
+            "TextTestRunner" => return unittest::text_test_runner_class(),
+            "TestLoader" => return unittest::test_loader_class(),
+            "TestProgram" => return unittest::test_program_class(),
+            "defaultTestLoader" => return unittest::default_test_loader(),
+            // CPython's `SkipTest` is an ordinary `Exception` subclass; the
+            // runtime's `Skipped` tag is what the runner recognises, and the
+            // cached class keeps `except unittest.SkipTest` working for user
+            // subclasses such as `test.support.ResourceDenied`.
+            "SkipTest" => return exc::exception_class(exc::SKIPPED),
+            _ => {}
+        }
+    }
+    if module == "http" && name == "HTTPStatus" {
+        return http_status_class();
+    }
+    // `__future__.CO_FUTURE_BARRY_AS_BDFL`: the compiler flag `compile()`
+    // callers pass; CPython's value is 0x400000.
+    if module == "__future__" && name == "CO_FUTURE_BARRY_AS_BDFL" {
+        return encode_int(0x400000);
+    }
+    // `socket.herror`: a real `OSError` subclass so `raise socket.herror(...)`
+    // is catchable and the class identity is stable.
+    if matches!(module, "socket" | "_socket") && name == "herror" {
+        return socket_error_class("herror");
+    }
+    if module == "unittest.util" {
+        match name {
+            "_ErrorHolder" => return unittest::error_holder_class(),
+            "TestList" => return unittest::test_list_class(),
+            _ => {}
+        }
+    }
+    // `csv.Dialect`, `csv.Sniffer` and `csv.Error` are real classes: pandas
+    // subclasses `Dialect`, calls `Sniffer().sniff(...)` and catches
+    // `csv.Error`, so the module value must be the class, not a constructor
+    // function. `_csv` reaches this branch through the alias resolution.
+    if matches!(module, "csv" | "_csv") {
+        match name {
+            "Dialect" => return csv_dialect_class(),
+            "Sniffer" => return csv_sniffer_class(),
+            "Error" => return csv_error_class(),
             _ => {}
         }
     }
@@ -3134,15 +3859,24 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if module == "pickle" && name == "Pickler" {
         return pickle_pickler_class();
     }
-    // `pickle._Pickler` is CPython's pure-Python implementation of the same
-    // class; HYD1 has one writer, so both spellings share the cached class.
+    // `pickle._Pickler` is CPython's pure-Python writer class: pandas and
+    // other libraries subclass it and read its class-level `dispatch`/
+    // `dispatch_table` mappings. It is the base class of `Pickler`, so
+    // subclassing either spelling inherits the constructor and methods.
     if module == "pickle" && name == "_Pickler" {
-        return pickle_pickler_class();
+        return pickle_pickler_base_class();
     }
     // `pickle.Unpickler` is the streaming reader counterpart; same cached
     // class treatment so `type()` and `isinstance` observe a class.
     if module == "pickle" && name == "Unpickler" {
         return pickle_unpickler_class();
+    }
+    // `pickle._Unpickler` is CPython's pure-Python reader. pandas defines
+    // `class Unpickler(pickle._Unpickler)` and copies
+    // `pickle._Unpickler.dispatch`, so the value must be a real, subclassable
+    // class with that class attribute (not a constructor function).
+    if module == "pickle" && name == "_Unpickler" {
+        return pickle_unpickler_base_class();
     }
     // `random.Random` is a class in CPython: callers read its methods from the
     // class value (`Random.getrandbits`) and only then instantiate it. The
@@ -3158,6 +3892,13 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     // OS-backed generator.
     if module == "random" && name == "SystemRandom" {
         return random_system_proxy();
+    }
+    // `threading.Barrier` is a class in CPython. The spec declares `Barrier`
+    // as a constructor so module calls lower there, but the value itself must
+    // be the cached class: `type(b)`, `isinstance(b, threading.Barrier)` and
+    // class-level attribute access need a type, not a function.
+    if module == "threading" && name == "Barrier" {
+        return barrier_class();
     }
     // `pickle`'s three exception classes are part of its `__all__` and are
     // raised by CPython's implementation; expose the real subclass chain
@@ -3409,10 +4150,9 @@ pub(crate) fn module_dict(module: &str) -> i64 {
             names.push("exec");
         }
         "types" => names.push("CellType"),
-        // The opcode constants live outside the static spec (their values are
-        // one-byte strings generated by the runtime), so `vars(pickle)` and
-        // `dir(pickle)` need them listed explicitly, like CPython's module.
-        "pickle" => names.extend(PICKLE_OPCODE_CONSTANTS.iter().map(|(name, _)| *name)),
+        // The `pickle` opcode constants are spec constants; their `bytes`
+        // values come from the runtime opcode table, so they need no extra
+        // listing here.
         _ => {}
     }
     for name in names {
@@ -3719,6 +4459,18 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
     let module = alias_target(module).unwrap_or(module);
     match module {
         "math" => math_call_kw(function, args, keywords),
+        // The `json` options are declared by the spec, so the generic binder
+        // already moved the supplied names into their positional slots. A name
+        // left here belongs to no JSON signature.
+        "json" => {
+            if let Some((name, _)) = keywords.first() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("{function}() got an unexpected keyword argument '{name}'"),
+                );
+            }
+            json_call(function, args)
+        }
         "cmath" => cmath::call_kw(function, args, &keywords),
         "builtins" => builtins_dispatch_kw(function, args, &keywords),
         "datetime" => datetime::call_kw(function, args, &keywords),
@@ -3730,6 +4482,7 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         "ssl" => socket::ssl_call_kw(function, args, keywords),
         "select" => select::call_kw(function, args, keywords),
         "pytest" => pytest::call_kw(function, args, keywords),
+        "unittest" => unittest::call_kw(function, args, keywords),
         "warnings" | "_warnings" => warnings::call_kw(function, args, &keywords),
         "typing" => typing::call_kw(function, args, &keywords),
         "inspect" => inspect::call_kw(function, args, &keywords),
@@ -3752,6 +4505,11 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         // `textwrap`'s `wrap`/`fill`/`shorten`/`TextWrapper` take the
         // `TextWrapper` keyword set (`width`, `initial_indent`, ...).
         "textwrap" => textwrap::call_kw(function, args, &keywords),
+        // `csv.reader(file, dialect=..., **fmtparams)` and
+        // `csv.register_dialect(name, dialect='excel', **fmtparams)`: the
+        // generic binder fills the declared slots and the csv handler applies
+        // the remaining format parameters.
+        "csv" => csv_call_kw(function, args, &keywords),
         "bz2" | "_bz2" | "lzma" | "_lzma" => {
             compression_native::call_kw(module, function, args, &keywords)
         }
@@ -3783,6 +4541,20 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         // semantics (base64's `padded`) binds them into the positional
         // layout before this point.
         "base64" => base64::call(function, args),
+        // `pickle.dump(obj, file, protocol=..., fix_imports=...)`,
+        // `pickle.Unpickler(file, fix_imports=..., ...)` and the
+        // `pickle.Pickler`/`pickle.Unpickler` constructor methods declare
+        // their parameter names, so the binder already moved them into slots.
+        // Any name left over belongs to no pickle signature.
+        "pickle" => {
+            if let Some((name, _)) = keywords.first() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("{function}() got an unexpected keyword argument '{name}'"),
+                );
+            }
+            pickle_call(function, args)
+        }
         // `platform.platform(aliased=..., terse=...)`: the binder has already
         // moved the two documented names into their positional slots.
         "platform" => platform_call(function, args),
@@ -4462,7 +5234,10 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "multiprocessing" => multiprocessing_call(function, args),
         "pickle" => pickle_call(function, args),
         "html" => html_call(function, args),
-        "http" => http::call(function, args),
+        "http" => match http_status_call(function, args) {
+            Some(result) => result,
+            None => http::call(function, args),
+        },
         "postgres" => postgres::call(function, args),
         "memcached" => memcached::call(function, args),
         "json" => json_call(function, args),
@@ -4500,6 +5275,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
             Some(result) => result,
             None => unittest::call(function, args),
         },
+        "unittest.util" => unittest::util_call(function, args),
         "pytest" => pytest::call(function, args),
         "binascii" => binascii::call(function, args),
         "base64" => base64::call(function, args),
@@ -4560,18 +5336,19 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
 // keep no Rust-side state.
 
 /// Cached native `unittest.TestSuite` class.
-fn unittest_test_suite_class() -> i64 {
+pub(crate) fn unittest_test_suite_class() -> i64 {
     const KEY: &str = "unittest.TestSuite.class";
     if let Some(cached) = globals::registry_get(KEY) {
         return cached;
     }
     // (Python name, dispatch name, minimum argc including `self`).
-    const METHODS: [(&str, &str, usize); 8] = [
+    const METHODS: [(&str, &str, usize); 9] = [
         ("__init__", "TestSuite.__init__", 1),
         ("addTest", "TestSuite.addTest", 2),
         ("addTests", "TestSuite.addTests", 2),
         ("countTestCases", "TestSuite.countTestCases", 1),
         ("run", "TestSuite.run", 2),
+        ("__call__", "TestSuite.__call__", 2),
         ("__iter__", "TestSuite.__iter__", 1),
         ("__len__", "TestSuite.__len__", 1),
         ("__repr__", "TestSuite.__repr__", 1),
@@ -4605,7 +5382,7 @@ fn unittest_suite_call(function: &str, args: &[i64]) -> Option<i64> {
         "TestSuite.addTest" => unittest_suite_add_test(args),
         "TestSuite.addTests" => unittest_suite_add_tests(args),
         "TestSuite.countTestCases" => unittest_suite_count(args),
-        "TestSuite.run" => unittest_suite_run(args),
+        "TestSuite.run" | "TestSuite.__call__" => unittest_suite_run(args),
         "TestSuite.__iter__" => unittest_suite_iter(args),
         "TestSuite.__len__" => unittest_suite_len(args),
         "TestSuite.__repr__" => unittest_suite_repr(args),
@@ -4923,6 +5700,606 @@ fn unittest_suite_repr(args: &[i64]) -> i64 {
     );
     heap::release_roots(roots);
     value::str_alloc(text)
+}
+
+/// `socket.herror`/`socket.gaierror`-style exception classes: real `OSError`
+/// subclasses so `raise`/`except` see the class hierarchy.
+fn socket_error_class(name: &str) -> i64 {
+    let key = format!("socket.{name}.class");
+    if let Some(class) = globals::registry_get(&key) {
+        return class;
+    }
+    let class = value::class_new(name.to_string(), exc::exception_class(OS_ERROR), Vec::new());
+    let roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(&key, class);
+    heap::release_roots(roots);
+    class
+}
+
+// `http.HTTPStatus`
+//
+// `http/__init__.py` defines an `IntEnum`; the native `http` module has no
+// Python source, so the status class is built here as a real `int` subclass
+// whose members carry CPython's names, phrases and descriptions. Enum-style
+// lookups (`HTTPStatus(404)`) and attributes keep working through the class
+// and member state.
+
+const HTTP_STATUSES: [(&str, i64, &str, &str); 66] = [
+    (
+        "CONTINUE",
+        100,
+        "Continue",
+        "Request received, please continue",
+    ),
+    (
+        "SWITCHING_PROTOCOLS",
+        101,
+        "Switching Protocols",
+        "Switching to new protocol; obey Upgrade header",
+    ),
+    (
+        "PROCESSING",
+        102,
+        "Processing",
+        "Server is processing the request",
+    ),
+    (
+        "EARLY_HINTS",
+        103,
+        "Early Hints",
+        "Headers sent to prepare for the response",
+    ),
+    ("OK", 200, "OK", "Request fulfilled, document follows"),
+    ("CREATED", 201, "Created", "Document created, URL follows"),
+    (
+        "ACCEPTED",
+        202,
+        "Accepted",
+        "Request accepted, processing continues off-line",
+    ),
+    (
+        "NON_AUTHORITATIVE_INFORMATION",
+        203,
+        "Non-Authoritative Information",
+        "Request fulfilled from cache",
+    ),
+    (
+        "NO_CONTENT",
+        204,
+        "No Content",
+        "Request fulfilled, nothing follows",
+    ),
+    (
+        "RESET_CONTENT",
+        205,
+        "Reset Content",
+        "Clear input form for further input",
+    ),
+    (
+        "PARTIAL_CONTENT",
+        206,
+        "Partial Content",
+        "Partial content follows",
+    ),
+    (
+        "MULTI_STATUS",
+        207,
+        "Multi-Status",
+        "Response contains multiple statuses in the body",
+    ),
+    (
+        "ALREADY_REPORTED",
+        208,
+        "Already Reported",
+        "Operation has already been reported",
+    ),
+    (
+        "IM_USED",
+        226,
+        "IM Used",
+        "Request completed using instance manipulations",
+    ),
+    (
+        "MULTIPLE_CHOICES",
+        300,
+        "Multiple Choices",
+        "Object has several resources -- see URI list",
+    ),
+    (
+        "MOVED_PERMANENTLY",
+        301,
+        "Moved Permanently",
+        "Object moved permanently -- see URI list",
+    ),
+    (
+        "FOUND",
+        302,
+        "Found",
+        "Object moved temporarily -- see URI list",
+    ),
+    (
+        "SEE_OTHER",
+        303,
+        "See Other",
+        "Object moved -- see Method and URL list",
+    ),
+    (
+        "NOT_MODIFIED",
+        304,
+        "Not Modified",
+        "Document has not changed since given time",
+    ),
+    (
+        "USE_PROXY",
+        305,
+        "Use Proxy",
+        "You must use proxy specified in Location to access this resource",
+    ),
+    (
+        "TEMPORARY_REDIRECT",
+        307,
+        "Temporary Redirect",
+        "Object moved temporarily -- see URI list",
+    ),
+    (
+        "PERMANENT_REDIRECT",
+        308,
+        "Permanent Redirect",
+        "Object moved permanently -- see URI list",
+    ),
+    (
+        "BAD_REQUEST",
+        400,
+        "Bad Request",
+        "Bad request syntax or unsupported method",
+    ),
+    (
+        "UNAUTHORIZED",
+        401,
+        "Unauthorized",
+        "No permission -- see authorization schemes",
+    ),
+    (
+        "PAYMENT_REQUIRED",
+        402,
+        "Payment Required",
+        "No payment -- see charging schemes",
+    ),
+    (
+        "FORBIDDEN",
+        403,
+        "Forbidden",
+        "Request forbidden -- authorization will not help",
+    ),
+    (
+        "NOT_FOUND",
+        404,
+        "Not Found",
+        "Nothing matches the given URI",
+    ),
+    (
+        "METHOD_NOT_ALLOWED",
+        405,
+        "Method Not Allowed",
+        "Specified method is invalid for this resource",
+    ),
+    (
+        "NOT_ACCEPTABLE",
+        406,
+        "Not Acceptable",
+        "URI not available in preferred format",
+    ),
+    (
+        "PROXY_AUTHENTICATION_REQUIRED",
+        407,
+        "Proxy Authentication Required",
+        "You must authenticate with this proxy before proceeding",
+    ),
+    (
+        "REQUEST_TIMEOUT",
+        408,
+        "Request Timeout",
+        "Request timed out; try again later",
+    ),
+    ("CONFLICT", 409, "Conflict", "Request conflict"),
+    (
+        "GONE",
+        410,
+        "Gone",
+        "URI no longer exists and has been permanently removed",
+    ),
+    (
+        "LENGTH_REQUIRED",
+        411,
+        "Length Required",
+        "Client must specify Content-Length",
+    ),
+    (
+        "PRECONDITION_FAILED",
+        412,
+        "Precondition Failed",
+        "Precondition in headers is false",
+    ),
+    (
+        "CONTENT_TOO_LARGE",
+        413,
+        "Content Too Large",
+        "Content is too large",
+    ),
+    (
+        "REQUEST_ENTITY_TOO_LARGE",
+        413,
+        "Content Too Large",
+        "Content is too large",
+    ),
+    ("URI_TOO_LONG", 414, "URI Too Long", "URI is too long"),
+    (
+        "REQUEST_URI_TOO_LONG",
+        414,
+        "URI Too Long",
+        "URI is too long",
+    ),
+    (
+        "UNSUPPORTED_MEDIA_TYPE",
+        415,
+        "Unsupported Media Type",
+        "Entity body in unsupported format",
+    ),
+    (
+        "RANGE_NOT_SATISFIABLE",
+        416,
+        "Range Not Satisfiable",
+        "Cannot satisfy request range",
+    ),
+    (
+        "REQUESTED_RANGE_NOT_SATISFIABLE",
+        416,
+        "Range Not Satisfiable",
+        "Cannot satisfy request range",
+    ),
+    (
+        "EXPECTATION_FAILED",
+        417,
+        "Expectation Failed",
+        "Expect condition could not be satisfied",
+    ),
+    (
+        "IM_A_TEAPOT",
+        418,
+        "I'm a Teapot",
+        "Server refuses to brew coffee because it is a teapot",
+    ),
+    (
+        "MISDIRECTED_REQUEST",
+        421,
+        "Misdirected Request",
+        "Server is not able to produce a response",
+    ),
+    (
+        "UNPROCESSABLE_CONTENT",
+        422,
+        "Unprocessable Content",
+        "Server is not able to process the contained instructions",
+    ),
+    (
+        "UNPROCESSABLE_ENTITY",
+        422,
+        "Unprocessable Content",
+        "Server is not able to process the contained instructions",
+    ),
+    ("LOCKED", 423, "Locked", "Resource of a method is locked"),
+    (
+        "FAILED_DEPENDENCY",
+        424,
+        "Failed Dependency",
+        "Dependent action of the request failed",
+    ),
+    (
+        "TOO_EARLY",
+        425,
+        "Too Early",
+        "Server refuses to process a request that might be replayed",
+    ),
+    (
+        "UPGRADE_REQUIRED",
+        426,
+        "Upgrade Required",
+        "Server refuses to perform the request using the current protocol",
+    ),
+    (
+        "PRECONDITION_REQUIRED",
+        428,
+        "Precondition Required",
+        "The origin server requires the request to be conditional",
+    ),
+    (
+        "TOO_MANY_REQUESTS",
+        429,
+        "Too Many Requests",
+        "The user has sent too many requests in a given amount of time (\"rate limiting\")",
+    ),
+    (
+        "REQUEST_HEADER_FIELDS_TOO_LARGE",
+        431,
+        "Request Header Fields Too Large",
+        "The server is unwilling to process the request because its header fields are too large",
+    ),
+    (
+        "UNAVAILABLE_FOR_LEGAL_REASONS",
+        451,
+        "Unavailable For Legal Reasons",
+        "The server is denying access to the resource as a consequence of a legal demand",
+    ),
+    (
+        "INTERNAL_SERVER_ERROR",
+        500,
+        "Internal Server Error",
+        "Server got itself in trouble",
+    ),
+    (
+        "NOT_IMPLEMENTED",
+        501,
+        "Not Implemented",
+        "Server does not support this operation",
+    ),
+    (
+        "BAD_GATEWAY",
+        502,
+        "Bad Gateway",
+        "Invalid responses from another server/proxy",
+    ),
+    (
+        "SERVICE_UNAVAILABLE",
+        503,
+        "Service Unavailable",
+        "The server cannot process the request due to a high load",
+    ),
+    (
+        "GATEWAY_TIMEOUT",
+        504,
+        "Gateway Timeout",
+        "The gateway server did not receive a timely response",
+    ),
+    (
+        "HTTP_VERSION_NOT_SUPPORTED",
+        505,
+        "HTTP Version Not Supported",
+        "Cannot fulfill request",
+    ),
+    (
+        "VARIANT_ALSO_NEGOTIATES",
+        506,
+        "Variant Also Negotiates",
+        "Server has an internal configuration error",
+    ),
+    (
+        "INSUFFICIENT_STORAGE",
+        507,
+        "Insufficient Storage",
+        "Server is not able to store the representation",
+    ),
+    (
+        "LOOP_DETECTED",
+        508,
+        "Loop Detected",
+        "Server encountered an infinite loop while processing a request",
+    ),
+    (
+        "NOT_EXTENDED",
+        510,
+        "Not Extended",
+        "Request does not meet the resource access policy",
+    ),
+    (
+        "NETWORK_AUTHENTICATION_REQUIRED",
+        511,
+        "Network Authentication Required",
+        "The client needs to authenticate to gain network access",
+    ),
+];
+
+fn http_status_class() -> i64 {
+    const KEY: &str = "http.HTTPStatus.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    // `__init__` fills the member metadata; the range predicates are
+    // properties, like CPython's `@property` accessors.
+    let mut methods: Vec<(String, i64, hydro_ir::MethodKind)> = vec![
+        (
+            "__init__".to_string(),
+            value::native_function_new("http", "HTTPStatus.__init__", 2),
+            hydro_ir::MethodKind::Normal,
+        ),
+        (
+            "__repr__".to_string(),
+            value::native_function_new("http", "HTTPStatus.__repr__", 1),
+            hydro_ir::MethodKind::Normal,
+        ),
+        (
+            "__str__".to_string(),
+            value::native_function_new("http", "HTTPStatus.__str__", 1),
+            hydro_ir::MethodKind::Normal,
+        ),
+    ];
+    for (name, native) in [
+        ("is_informational", "HTTPStatus.is_informational"),
+        ("is_success", "HTTPStatus.is_success"),
+        ("is_redirection", "HTTPStatus.is_redirection"),
+        ("is_client_error", "HTTPStatus.is_client_error"),
+        ("is_server_error", "HTTPStatus.is_server_error"),
+    ] {
+        methods.push((
+            name.to_string(),
+            value::native_function_new("http", native, 1),
+            hydro_ir::MethodKind::Property,
+        ));
+    }
+    let class = value::class_new_full(
+        "HTTPStatus".to_string(),
+        value::native_class("int"),
+        methods,
+        Vec::new(),
+    );
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    let members = value::dict_new(Vec::new());
+    let value_map = value::dict_new(Vec::new());
+    let member_names = value::list_new(Vec::new());
+    let roots = heap::root_values(&[members, value_map, member_names]);
+    for (name, code, phrase, description) in HTTP_STATUSES {
+        let number = encode_int(code);
+        let number_roots = heap::root_values(&[number]);
+        let member = crate::core::builtins::scalar_instance_new(
+            class,
+            1,
+            std::slice::from_ref(&number).as_ptr(),
+        )
+        .unwrap_or(NONE);
+        let member_roots = heap::root_values(&[member]);
+        value::instance_setattr(
+            member,
+            "name".to_string(),
+            value::str_alloc(name.to_string()),
+        );
+        value::instance_setattr(
+            member,
+            "_name_".to_string(),
+            value::str_alloc(name.to_string()),
+        );
+        value::instance_setattr(member, "value".to_string(), number);
+        value::instance_setattr(member, "_value_".to_string(), number);
+        value::instance_setattr(
+            member,
+            "phrase".to_string(),
+            value::str_alloc(phrase.to_string()),
+        );
+        value::instance_setattr(
+            member,
+            "description".to_string(),
+            value::str_alloc(description.to_string()),
+        );
+        value::class_set_attr(class, name.to_string(), member);
+        let key = value::str_alloc(name.to_string());
+        let key_roots = heap::root_values(&[key]);
+        container::dict_set(members, key, member);
+        heap::release_roots(key_roots);
+        let present = value::as_dict(value_map)
+            .is_some_and(|pairs| pairs.iter().any(|(existing, _)| *existing == number));
+        if !present {
+            let value_key = encode_int(code);
+            let key_roots = heap::root_values(&[value_key]);
+            container::dict_set(value_map, value_key, member);
+            heap::release_roots(key_roots);
+        }
+        let name_value = value::str_alloc(name.to_string());
+        let name_roots = heap::root_values(&[name_value]);
+        container::list_append(member_names, name_value);
+        heap::release_roots(name_roots);
+        heap::release_roots(member_roots);
+        heap::release_roots(number_roots);
+    }
+    value::class_set_attr(class, "__members__".to_string(), members);
+    value::class_set_attr(class, "_member_map_".to_string(), members);
+    value::class_set_attr(class, "_value2member_map_".to_string(), value_map);
+    value::class_set_attr(class, "_member_names_".to_string(), member_names);
+    value::class_set_attr(
+        class,
+        "__module__".to_string(),
+        value::str_alloc("http".to_string()),
+    );
+    value::class_set_attr(
+        class,
+        "__qualname__".to_string(),
+        value::str_alloc("HTTPStatus".to_string()),
+    );
+    globals::registry_set(KEY, class);
+    heap::release_roots(roots);
+    heap::release_roots(class_roots);
+    class
+}
+
+fn http_status_call(function: &str, args: &[i64]) -> Option<i64> {
+    let member_value = args.first().copied().unwrap_or(NONE);
+    // `scalar_payload` returns the *tagged* immediate of an int subclass;
+    // formatting it directly would print `200 << 3`. `as_integer` unwraps the
+    // scalar payload to the Python integer, which is what IntEnum renders.
+    let code = value::as_integer(member_value)
+        .or_else(|| value::instance_attr(member_value, "_value_").and_then(value::as_integer))
+        .or_else(|| value::scalar_payload(member_value).and_then(value::as_integer));
+    Some(match function {
+        "HTTPStatus.__init__" => {
+            let given = args.get(1).copied().unwrap_or(NONE);
+            let code = value::as_integer(given)
+                .unwrap_or_else(|| value::scalar_payload(member_value).unwrap_or_default());
+            http_status_populate(member_value, code);
+            NONE
+        }
+        "HTTPStatus.__repr__" => {
+            // Aliases share the canonical member's repr in CPython, so the
+            // first table entry with this code supplies the display name.
+            let name = code
+                .and_then(|code| {
+                    HTTP_STATUSES
+                        .iter()
+                        .find(|(_, status, _, _)| *status == code)
+                        .map(|(name, _, _, _)| *name)
+                })
+                .map(str::to_string)
+                .or_else(|| {
+                    value::instance_attr(member_value, "name")
+                        .and_then(value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "HTTPStatus".to_string());
+            value::str_alloc(format!("<HTTPStatus.{name}: {}>", code.unwrap_or_default()))
+        }
+        "HTTPStatus.__str__" => value::str_alloc(format!("{}", code.unwrap_or_default())),
+        "HTTPStatus.is_informational" => value::bool_value(range(code, 100, 199)),
+        "HTTPStatus.is_success" => value::bool_value(range(code, 200, 299)),
+        "HTTPStatus.is_redirection" => value::bool_value(range(code, 300, 399)),
+        "HTTPStatus.is_client_error" => value::bool_value(range(code, 400, 499)),
+        "HTTPStatus.is_server_error" => value::bool_value(range(code, 500, 599)),
+        _ => return None,
+    })
+}
+
+fn http_status_populate(member: i64, code: i64) {
+    let Some((name, _, phrase, description)) = HTTP_STATUSES
+        .iter()
+        .find(|(_, status, _, _)| *status == code)
+        .copied()
+    else {
+        return;
+    };
+    let number = encode_int(code);
+    let roots = heap::root_values(&[member, number]);
+    value::instance_setattr(
+        member,
+        "name".to_string(),
+        value::str_alloc(name.to_string()),
+    );
+    value::instance_setattr(
+        member,
+        "_name_".to_string(),
+        value::str_alloc(name.to_string()),
+    );
+    value::instance_setattr(member, "value".to_string(), number);
+    value::instance_setattr(member, "_value_".to_string(), number);
+    value::instance_setattr(
+        member,
+        "phrase".to_string(),
+        value::str_alloc(phrase.to_string()),
+    );
+    value::instance_setattr(
+        member,
+        "description".to_string(),
+        value::str_alloc(description.to_string()),
+    );
+    heap::release_roots(roots);
+}
+
+fn range(code: Option<i64>, low: i64, high: i64) -> bool {
+    code.is_some_and(|code| code >= low && code <= high)
 }
 
 // Runtime module registry
@@ -6540,6 +7917,12 @@ fn constant_value(module: &str, name: &str) -> i64 {
     match (module, name) {
         ("__future__", "_Feature") => future_feature_class(),
         ("__future__", name) => future::constant(name),
+        // `csv`'s classes are real class values; resolve them here as well as
+        // in `module_get_default_named`, so every constant lookup path (module
+        // reads, `from csv import Dialect`, `vars(csv)`) observes the class.
+        ("csv" | "_csv", "Dialect") => csv_dialect_class(),
+        ("csv" | "_csv", "Sniffer") => csv_sniffer_class(),
+        ("csv" | "_csv", "Error") => csv_error_class(),
         // `http.server` is a nested native module; its members are the server
         // and request-handler classes `pydoc.serve` instantiates.
         ("http.server", name) => http_server::constant(name),
@@ -6769,6 +8152,9 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // limitation is that concurrent instances share nothing, which is the
         // usual pattern for console/render state.
         ("threading", "local") => value::class_new("local".to_string(), NONE, Vec::new()),
+        // `threading.BrokenBarrierError` subclasses `RuntimeError` and is
+        // raised by `Barrier.wait` when the barrier breaks.
+        ("threading", "BrokenBarrierError") => broken_barrier_class(),
         // Help formatters are marker classes; `ArgumentParser` reads the
         // class name to select layout details. `SUPPRESS` is CPython's
         // sentinel string.
@@ -7045,6 +8431,8 @@ pub(crate) fn contextlib_class_value(module: &str, name: &str) -> Option<i64> {
     match name {
         "AbstractContextManager" => Some(abstract_manager_class(false)),
         "AbstractAsyncContextManager" => Some(abstract_manager_class(true)),
+        // Real class returned by `contextmanager(func)`.
+        "_GeneratorContextManager" => Some(context_manager_class()),
         _ => None,
     }
 }
@@ -10293,6 +11681,7 @@ fn operator_call(function: &str, args: &[i64]) -> i64 {
         }
         "index" => return operator_index(args[0]),
         "_compare_digest" => return operator_compare_digest(args[0], args[1]),
+        "length_hint" => return operator_length_hint(args),
         // The subscript protocols, exactly as the `[]` syntax performs them.
         "getitem" => return container::subscript(args[0], args[1]),
         "setitem" => return container::subscript_set(args[0], args[1], args[2]),
@@ -10329,6 +11718,47 @@ fn operator_call(function: &str, args: &[i64]) -> i64 {
         "abs" => crate::builtins::abs(args[0]),
         "truth" => value::bool_value(value::truthy(args[0])),
         _ => missing_attribute("operator", function),
+    }
+}
+
+/// `operator.length_hint(obj, default=0)`: `len(obj)` when available, then
+/// `obj.__length_hint__()`, and finally the caller's default.
+fn operator_length_hint(args: &[i64]) -> i64 {
+    let object = args[0];
+    let default = args
+        .get(1)
+        .copied()
+        .filter(|value| *value != NONE)
+        .unwrap_or_else(|| encode_int(0));
+    let length = crate::core::builtins::len(object);
+    if !exc::pending() {
+        return length;
+    }
+    if exc::pending_tag() != i64::from(TYPE_ERROR) {
+        return NONE;
+    }
+    exc::clear();
+    let hint =
+        crate::core::methods::getattr(object, b"__length_hint__".as_ptr(), "__length_hint__".len());
+    if exc::pending() {
+        exc::clear();
+        return default;
+    }
+    let result = crate::core::builtins::call(hint, 0, std::ptr::null());
+    if exc::pending() {
+        exc::clear();
+        return default;
+    }
+    match value::as_integer(result) {
+        Some(hint) if hint >= 0 => result,
+        Some(_) => exc::raise_with_message(VALUE_ERROR, "__length_hint__() should return >= 0"),
+        None => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "__length_hint__ must be an integer, not '{}'",
+                value::type_name(result)
+            ),
+        ),
     }
 }
 
@@ -12402,6 +13832,16 @@ fn threading_call(function: &str, args: &[i64]) -> i64 {
         "Lock" => value::lock_new(),
         "RLock" => value::lock_new_reentrant(),
         "Event" | "Condition" => value::event_new(),
+        // `Barrier` is a class value (see `barrier_class`), so a module call
+        // constructs through the class and runs the native `__init__`.
+        "Barrier" => crate::builtins::call(barrier_class(), args.len(), args.as_ptr()),
+        "_barrier_init" => barrier_init(args),
+        "_barrier_wait" => barrier_wait(args),
+        "_barrier_reset" => barrier_reset(args),
+        "_barrier_abort" => barrier_abort(args),
+        "_barrier_parties" => barrier_parties(args),
+        "_barrier_n_waiting" => barrier_n_waiting(args),
+        "_barrier_broken" => barrier_broken(args),
         "get_ident" => encode_int(heap::current_thread_id()),
         "current_thread" => threading_current_thread(),
         "main_thread" => threading_thread_for_ident(1),
@@ -12461,6 +13901,532 @@ fn current_thread_daemon() -> bool {
 /// `threading.current_thread()`: the `Thread` object for the running thread.
 fn threading_current_thread() -> i64 {
     threading_thread_for_ident(heap::current_thread_id())
+}
+
+// threading.Barrier
+
+/// Mutable part of a barrier, protected by its mutex.
+///
+/// `state` mirrors CPython's `Barrier._state`: `0` filling, `1` draining,
+/// `-1` resetting and `-2` broken. Hydro adds `2` for "the release action is
+/// running": CPython holds the condition lock across the action, which a
+/// callback could not use to inspect the barrier, so the action runs outside
+/// the mutex while every waiter stays parked. `count` is the number of threads
+/// that have entered the current generation.
+struct BarrierInner {
+    state: i8,
+    count: usize,
+}
+
+/// Shared state of a `threading.Barrier`.
+///
+/// The state lives for as long as any thread can reach the barrier: methods
+/// clone the `Arc` out of the table before blocking, so a concurrent `reset`
+/// or `abort` never invalidates a waiter's state. Like `EventState`, the
+/// condition variable is independent of the heap, and waiters park for the
+/// collector through `blocking_enter`/`blocking_leave`.
+struct BarrierState {
+    parties: usize,
+    timeout: Option<Duration>,
+    inner: Mutex<BarrierInner>,
+    changed: Condvar,
+}
+
+impl BarrierState {
+    fn new(parties: usize, timeout: Option<Duration>) -> BarrierState {
+        BarrierState {
+            parties,
+            timeout,
+            inner: Mutex::new(BarrierInner { state: 0, count: 0 }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BarrierInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// CPython's `_exit`: the last leaver of a draining/resetting generation
+    /// returns the barrier to the filling state and wakes threads waiting in
+    /// `_enter`.
+    fn exit(&self, inner: &mut BarrierInner) {
+        if inner.count == 0 && (inner.state == -1 || inner.state == 1) {
+            inner.state = 0;
+            self.changed.notify_all();
+        }
+    }
+}
+
+/// Identifier source for entries of [`barrier_table`]. Identifiers are never
+/// reused, so a table lookup can never observe the state of a dead barrier.
+fn barrier_ids() -> &'static AtomicU64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    &NEXT
+}
+
+/// Rust-side state of every live barrier, keyed by the id stored on the
+/// instance. Only plain data is held here (no Hydro values), so the map never
+/// needs collector tracing.
+///
+/// The collector has no finalizer hook for native state, so an entry outlives
+/// its Python instance; each is a few dozen bytes, and re-initialising an
+/// instance replaces its entry instead of adding another.
+fn barrier_table() -> &'static Mutex<HashMap<u64, Arc<BarrierState>>> {
+    static TABLE: LazyLock<Mutex<HashMap<u64, Arc<BarrierState>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    &TABLE
+}
+
+/// Registers a fresh barrier state and returns its tagged id.
+fn barrier_register(state: BarrierState) -> i64 {
+    let id = barrier_ids().fetch_add(1, Ordering::Relaxed);
+    barrier_table()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(id, Arc::new(state));
+    encode_int(id as i64)
+}
+
+/// Looks up the state of `instance` from the id `__init__` stored on it.
+fn barrier_state(instance: i64) -> Option<Arc<BarrierState>> {
+    let id = value::as_integer(value::instance_attr(instance, "_hydro_barrier_id")?)?;
+    let id = u64::try_from(id).ok()?;
+    barrier_table()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&id)
+        .cloned()
+}
+
+/// Converts a Python timeout argument. `None` means "wait forever"; negative
+/// values are clamped to zero (CPython's `Condition.wait` treats them as an
+/// immediate expiration), and finite values are clamped so `Instant +
+/// Duration` cannot overflow.
+fn barrier_timeout(arg: i64) -> Result<Option<Duration>, i64> {
+    if arg == NONE {
+        return Ok(None);
+    }
+    let seconds =
+        value::as_float(arg).or_else(|| value::as_integer(arg).map(|number| number as f64));
+    let Some(seconds) = seconds else {
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "timeout must be a float or int, not {}",
+                value::type_name(arg)
+            ),
+        ));
+    };
+    let seconds = if seconds.is_nan() {
+        0.0
+    } else {
+        seconds.clamp(0.0, 10.0 * 365.0 * 86_400.0)
+    };
+    Ok(Some(Duration::from_secs_f64(seconds)))
+}
+
+/// The cached `threading.BrokenBarrierError` class.
+///
+/// It derives from the native `RuntimeError` class, so the frontend's
+/// `RuntimeError` approximation of user-class handlers matches, while
+/// `except threading.BrokenBarrierError` and `type()` observe the real class.
+fn broken_barrier_class() -> i64 {
+    const KEY: &str = "threading.BrokenBarrierError.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    // `exc::exception_class` keeps the base class rooted in its own cache.
+    let class = value::class_new(
+        "BrokenBarrierError".to_string(),
+        exc::exception_class(RUNTIME_ERROR),
+        Vec::new(),
+    );
+    let roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(roots);
+    class
+}
+
+/// Raises `threading.BrokenBarrierError`, preserving the Python class on the
+/// exception payload.
+fn raise_broken_barrier() -> i64 {
+    let instance = crate::builtins::call(broken_barrier_class(), 0, std::ptr::null());
+    if exc::pending() {
+        return instance;
+    }
+    exc::raise_value(instance)
+}
+
+fn barrier_native(name: &'static str, arity: usize) -> i64 {
+    value::native_function_new("threading", name, arity)
+}
+
+/// The cached `threading.Barrier` class.
+///
+/// The class carries the native methods plus the `parties`/`n_waiting`/
+/// `broken` properties, so `type(b)`, `isinstance(b, threading.Barrier)` and
+/// attribute reads behave like CPython. Construction runs the native
+/// `__init__`, which registers the barrier state.
+fn barrier_class() -> i64 {
+    const KEY: &str = "threading.Barrier.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let methods = vec![
+        (
+            "__init__".to_string(),
+            barrier_native("_barrier_init", 4),
+            hydro_ir::MethodKind::Normal,
+        ),
+        (
+            "wait".to_string(),
+            barrier_native("_barrier_wait", 2),
+            hydro_ir::MethodKind::Normal,
+        ),
+        (
+            "reset".to_string(),
+            barrier_native("_barrier_reset", 1),
+            hydro_ir::MethodKind::Normal,
+        ),
+        (
+            "abort".to_string(),
+            barrier_native("_barrier_abort", 1),
+            hydro_ir::MethodKind::Normal,
+        ),
+    ];
+    let parties_getter = barrier_native("_barrier_parties", 1);
+    let waiting_getter = barrier_native("_barrier_n_waiting", 1);
+    let broken_getter = barrier_native("_barrier_broken", 1);
+    // Every value created here lives on the Rust stack until the class is
+    // built, which the collector does not scan; root them across the
+    // allocations below.
+    let mut roots = Vec::with_capacity(methods.len() + 6);
+    roots.extend(methods.iter().map(|(_, function, _)| *function));
+    roots.extend_from_slice(&[parties_getter, waiting_getter, broken_getter]);
+    let function_roots = heap::root_values(&roots);
+    let attrs = vec![
+        (
+            "parties".to_string(),
+            value::property_new(parties_getter, NONE, NONE),
+        ),
+        (
+            "n_waiting".to_string(),
+            value::property_new(waiting_getter, NONE, NONE),
+        ),
+        (
+            "broken".to_string(),
+            value::property_new(broken_getter, NONE, NONE),
+        ),
+    ];
+    let descriptors: Vec<i64> = attrs.iter().map(|(_, descriptor)| *descriptor).collect();
+    let descriptor_roots = heap::root_values(&descriptors);
+    let class = value::class_new_full("Barrier".to_string(), NONE, methods, attrs);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(descriptor_roots);
+    heap::release_roots(function_roots);
+    class
+}
+
+/// `Barrier.__init__(parties, action=None, timeout=None)`.
+fn barrier_init(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Barrier.__init__() missing self");
+    };
+    let parties = match args.get(1).copied().and_then(value::as_integer) {
+        Some(parties) if parties >= 1 => usize::try_from(parties).unwrap_or(usize::MAX),
+        Some(_) => {
+            return exc::raise_with_message(VALUE_ERROR, "parties must be >= 1");
+        }
+        None => {
+            return exc::raise_with_message(TYPE_ERROR, "Barrier() argument 1 must be an integer");
+        }
+    };
+    let action = optional(args, 2);
+    let timeout_arg = optional(args, 3);
+    let timeout = match barrier_timeout(timeout_arg) {
+        Ok(timeout) => timeout,
+        Err(err) => return err,
+    };
+    // Re-initialising an existing barrier discards its old state.
+    if let Some(old) = value::instance_attr(instance, "_hydro_barrier_id")
+        .and_then(value::as_integer)
+        .and_then(|old| u64::try_from(old).ok())
+    {
+        barrier_table()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&old);
+    }
+    let id = barrier_register(BarrierState::new(parties, timeout));
+    value::instance_setattr(instance, "_hydro_barrier_id".to_string(), id);
+    value::instance_setattr(instance, "_action".to_string(), action);
+    NONE
+}
+
+/// `Barrier.wait(timeout=None)`: blocks until `parties` threads arrive or the
+/// wait expires, returning this thread's arrival index (`0..parties-1`).
+fn barrier_wait(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Barrier.wait() missing self");
+    };
+    let Some(state) = barrier_state(instance) else {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "Barrier is not initialised: call Barrier(parties) first",
+        );
+    };
+    let timeout = match args.get(1).copied() {
+        None | Some(NONE) => state.timeout,
+        Some(arg) => match barrier_timeout(arg) {
+            Ok(timeout) => timeout,
+            Err(err) => return err,
+        },
+    };
+    // The state mutex/condition are outside the heap, and the thread parks for
+    // the collector while it may block. That bracket must not allocate, so the
+    // release action and the exception construction run after it ends.
+    heap::blocking_enter();
+    let step = barrier_wait_step(&state, timeout);
+    heap::blocking_leave();
+    match step {
+        BarrierStep::Released(index) => encode_int(index),
+        BarrierStep::Broken => raise_broken_barrier(),
+        BarrierStep::Trip(index) => {
+            let failure = barrier_run_action(instance);
+            heap::blocking_enter();
+            barrier_finish_release(&state, failure.is_some());
+            heap::blocking_leave();
+            match failure {
+                Some(result) => result,
+                None => encode_int(index),
+            }
+        }
+    }
+}
+
+/// Outcome of one non-allocating step of `Barrier.wait`.
+enum BarrierStep {
+    /// The generation released this thread; the value is its arrival index.
+    Released(i64),
+    /// The barrier is broken (or broke while this thread waited).
+    Broken,
+    /// This thread is the last arrival and must run the release action.
+    Trip(i64),
+}
+
+/// Waits for the generation while parked for the collector.
+///
+/// Every outcome is allocation-free: the caller leaves the parking bracket
+/// before running the action or raising `BrokenBarrierError`.
+fn barrier_wait_step(state: &BarrierState, timeout: Option<Duration>) -> BarrierStep {
+    let parties = state.parties;
+    let mut inner = state.lock();
+    // CPython's `_enter`: an in-flight generation drains (or resets) before a
+    // new arrival may join it. State `2` is Hydro's private "action running"
+    // marker (CPython instead holds the condition lock while it runs).
+    while inner.state == -1 || inner.state == 1 || inner.state == 2 {
+        inner = state
+            .changed
+            .wait(inner)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    if inner.state < 0 {
+        drop(inner);
+        return BarrierStep::Broken;
+    }
+    let index = inner.count;
+    inner.count += 1;
+    if index + 1 == parties {
+        // `_release`: the last arrival trips the generation. The action runs
+        // outside the barrier mutex (so a callback that inspects the barrier
+        // cannot deadlock) in the "action running" state, which keeps every
+        // waiter asleep until it finishes; an action that raises breaks the
+        // generation, exactly like CPython.
+        inner.state = 2;
+        drop(inner);
+        return BarrierStep::Trip(index as i64);
+    }
+    // `_wait`: sleep until the generation drains, breaks, or the timeout
+    // expires.
+    let mut timed_out = false;
+    match timeout {
+        None => {
+            while inner.state == 0 || inner.state == 2 {
+                inner = state
+                    .changed
+                    .wait(inner)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+        Some(timeout) => {
+            // CPython applies the timeout to the wait phase, after `_enter`.
+            let deadline = Instant::now() + timeout;
+            while inner.state == 0 || inner.state == 2 {
+                // A release action that is still running is about to wake
+                // this waiter; CPython cannot time out while it holds the
+                // condition lock, so wait for it without the deadline.
+                if inner.state == 2 {
+                    inner = state
+                        .changed
+                        .wait(inner)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    continue;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    timed_out = true;
+                    break;
+                }
+                let (next, _) = state
+                    .changed
+                    .wait_timeout(inner, deadline - now)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                inner = next;
+            }
+        }
+    }
+    if timed_out {
+        // A waiter that gives up breaks the generation, exactly like CPython.
+        inner.state = -2;
+        inner.count = inner.count.saturating_sub(1);
+        state.changed.notify_all();
+        state.exit(&mut inner);
+        drop(inner);
+        return BarrierStep::Broken;
+    }
+    inner.count = inner.count.saturating_sub(1);
+    let broken = inner.state < 0;
+    state.exit(&mut inner);
+    drop(inner);
+    if broken {
+        BarrierStep::Broken
+    } else {
+        BarrierStep::Released(index as i64)
+    }
+}
+
+/// Runs the barrier's release action, returning the pending exception on
+/// failure.
+fn barrier_run_action(instance: i64) -> Option<i64> {
+    let action = value::instance_attr(instance, "_action").unwrap_or(NONE);
+    if action == NONE || !value::truthy(action) {
+        return None;
+    }
+    // The attribute read above is the only reference held on the Rust stack;
+    // root it across the call so a collection cannot drop it.
+    let action_roots = heap::root_values(&[action]);
+    let result = crate::builtins::call(action, 0, std::ptr::null());
+    heap::release_roots(action_roots);
+    if exc::pending() {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+/// Completes the trip of a generation after its action ran: drains (or
+/// breaks) the generation and decrements the releaser's arrival count.
+fn barrier_finish_release(state: &BarrierState, failed: bool) {
+    let mut inner = state.lock();
+    inner.count = inner.count.saturating_sub(1);
+    if inner.state == 2 {
+        // A concurrent `abort` may already have broken the generation; keep
+        // its verdict.
+        inner.state = if failed { -2 } else { 1 };
+    }
+    state.changed.notify_all();
+    state.exit(&mut inner);
+}
+
+/// `Barrier.reset()`: return the barrier to its initial state, breaking any
+/// threads currently waiting on it.
+fn barrier_reset(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Barrier.reset() missing self");
+    };
+    let Some(state) = barrier_state(instance) else {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "Barrier is not initialised: call Barrier(parties) first",
+        );
+    };
+    let mut inner = state.lock();
+    if inner.count > 0 {
+        if inner.state == 0 || inner.state == -2 {
+            inner.state = -1;
+        }
+    } else {
+        inner.state = 0;
+    }
+    state.changed.notify_all();
+    NONE
+}
+
+/// `Barrier.abort()`: put the barrier into the broken state.
+fn barrier_abort(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Barrier.abort() missing self");
+    };
+    let Some(state) = barrier_state(instance) else {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "Barrier is not initialised: call Barrier(parties) first",
+        );
+    };
+    let mut inner = state.lock();
+    inner.state = -2;
+    state.changed.notify_all();
+    NONE
+}
+
+/// `Barrier.parties` property.
+fn barrier_parties(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Barrier.parties missing self");
+    };
+    match barrier_state(instance) {
+        Some(state) => encode_int(state.parties as i64),
+        None => exc::raise_with_message(ATTRIBUTE_ERROR, "Barrier has no state"),
+    }
+}
+
+/// `Barrier.n_waiting` property.
+fn barrier_n_waiting(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Barrier.n_waiting missing self");
+    };
+    match barrier_state(instance) {
+        Some(state) => {
+            let waiting = {
+                let inner = state.lock();
+                if inner.state == 0 || inner.state == 2 {
+                    inner.count
+                } else {
+                    0
+                }
+            };
+            encode_int(waiting as i64)
+        }
+        None => exc::raise_with_message(ATTRIBUTE_ERROR, "Barrier has no state"),
+    }
+}
+
+/// `Barrier.broken` property.
+fn barrier_broken(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Barrier.broken missing self");
+    };
+    match barrier_state(instance) {
+        Some(state) => {
+            let broken = { state.lock().state == -2 };
+            value::bool_value(broken)
+        }
+        None => exc::raise_with_message(ATTRIBUTE_ERROR, "Barrier has no state"),
+    }
 }
 
 fn queue_call(function: &str, args: &[i64]) -> i64 {
@@ -12568,11 +14534,112 @@ fn pickle_error(error: serialize::PickleError, loading: bool) -> i64 {
     } else {
         error.dumps_message()
     };
+    // A stream the HYD1 decoder cannot read is CPython's `UnpicklingError`,
+    // not a `ValueError`; pandas and the stdlib's own tests catch that class.
+    if loading && matches!(&error, serialize::PickleError::Corrupt) {
+        return pickle_unpickling_error(&message);
+    }
     let tag = match error {
         serialize::PickleError::Unsupported(_) => TYPE_ERROR,
         serialize::PickleError::TooDeep | serialize::PickleError::Corrupt => VALUE_ERROR,
     };
     exc::raise_with_message(tag, &message)
+}
+
+/// Raises `pickle.UnpicklingError(message)` and returns the `None` dummy.
+///
+/// The exception is a real instance of the module's cached class, so
+/// `except pickle.UnpicklingError:` and `type(e) is pickle.UnpicklingError`
+/// observe the class CPython raises (a plain `ValueError` would not be
+/// catchable through the pickle hierarchy).
+fn pickle_unpickling_error(message: &str) -> i64 {
+    let class = pickle_exception_class("UnpicklingError");
+    let text = value::str_alloc(message.to_string());
+    let roots = heap::root_values(&[text, class]);
+    // Raising replaces the pending exception, so an exception left pending by
+    // an earlier operation must not suppress this raise. Only a failure of the
+    // construction itself aborts (and propagates its own error).
+    exc::clear();
+    let instance = crate::builtins::call(class, 1, &text as *const i64);
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    // A class whose native `Exception` ancestor was discarded by an
+    // `exc::init()` epoch change instantiates as a plain object rather than a
+    // tagged exception. Wrap the payload explicitly so the raised value is
+    // always a `pickle.UnpicklingError` instance (and therefore visible to
+    // `as_exc_instance` and to class-based `except` clauses).
+    let instance = if value::as_exc_instance(instance).is_some() {
+        instance
+    } else {
+        let data = match value::exception_data(instance) {
+            Some(data) => data.clone(),
+            None => {
+                let plain =
+                    exc::exception_value(crate::exc::EXCEPTION, message, vec![message.to_string()]);
+                match value::exception_clone(plain) {
+                    Some(data) => data,
+                    None => {
+                        heap::release_roots(roots);
+                        return NONE;
+                    }
+                }
+            }
+        };
+        value::exc_instance_new(class, data)
+    };
+    // The wrapper lives only in Rust memory until `raise_value`, so root it.
+    let instance_roots = heap::root_values(&[instance]);
+    let result = exc::raise_value(instance);
+    heap::release_roots(instance_roots);
+    heap::release_roots(roots);
+    result
+}
+
+/// Whether undecodable bytes look like a CPython binary pickle rather than
+/// malformed HYD1 text.
+///
+/// CPython's protocol 2+ streams start with the `PROTO` opcode (`0x80`) and
+/// otherwise mix opcode bytes with raw binary payloads; HYD1 is hexadecimal
+/// ASCII. This only chooses the error message — both cases raise
+/// `UnpicklingError`, so a caller can never mistake a foreign payload for a
+/// successful decode.
+fn pickle_looks_like_cpython_binary(data: &[u8]) -> bool {
+    data.iter().any(|byte| {
+        !(byte.is_ascii_graphic()
+            || matches!(*byte, b' ' | b'\n' | b'\r' | b'\t' | b'\x0b' | b'\x0c'))
+    })
+}
+
+/// Decodes a HYD1 payload held in `data`.
+///
+/// HYD1 is the module's own hexadecimal text format. A byte string that is
+/// valid UTF-8 hexadecimal is decoded; anything else raises
+/// `UnpicklingError` naming the format mismatch (CPython binary pickles are
+/// explicitly unsupported, never silently accepted).
+fn pickle_decode_bytes(data: &[u8]) -> i64 {
+    let Ok(text) = std::str::from_utf8(data) else {
+        return pickle_undecodable(data);
+    };
+    let Some(bytes) = serialize::from_hex(text) else {
+        return pickle_undecodable(data);
+    };
+    match serialize::decode(&bytes, false) {
+        Ok(decoded) => decoded,
+        Err(error) => pickle_error(error, true),
+    }
+}
+
+fn pickle_undecodable(data: &[u8]) -> i64 {
+    if pickle_looks_like_cpython_binary(data) {
+        pickle_unpickling_error(
+            "cannot unpickle CPython binary pickle data: Hydro's pickle module uses the \
+             HYD1 format; re-save the object in HYD1 or decode it with CPython",
+        )
+    } else {
+        pickle_unpickling_error("invalid pickle data")
+    }
 }
 
 /// Highest protocol version CPython defines. HYD1 output is the same for
@@ -12680,16 +14747,7 @@ fn pickle_load(args: &[i64]) -> i64 {
         Ok(data) => data,
         Err(raised) => return raised,
     };
-    let Ok(text) = std::str::from_utf8(&data) else {
-        return exc::raise_with_message(VALUE_ERROR, "invalid pickle data");
-    };
-    let Some(bytes) = serialize::from_hex(text) else {
-        return exc::raise_with_message(VALUE_ERROR, "invalid pickle data");
-    };
-    match serialize::decode(&bytes, false) {
-        Ok(decoded) => decoded,
-        Err(error) => pickle_error(error, true),
-    }
+    pickle_decode_bytes(&data)
 }
 
 /// `pickle.dumps(obj, protocol=None)` / `pickle.dump(obj, file, protocol=None,
@@ -12740,58 +14798,117 @@ fn pickle_call(function: &str, args: &[i64]) -> i64 {
                 Err(error) => value::raise_file_error(error),
             }
         }
+        // `loads(data)`: CPython accepts any bytes-like object. HYD1 payloads
+        // are hexadecimal text, so both `str` (the `dumps` result) and its
+        // UTF-8 `bytes` form decode; a CPython binary stream raises
+        // `UnpicklingError` with the format mismatch instead of a silent
+        // success or a bare `TypeError`.
         "loads" => {
-            let Some(text) = value::as_str(args[0]) else {
+            let data: Vec<u8> = if let Some(text) = value::as_str(args[0]) {
+                text.as_bytes().to_vec()
+            } else if let Some(bytes) = value::as_bytes(args[0]) {
+                bytes.to_vec()
+            } else if let Some(bytes) = value::as_bytearray(args[0]) {
+                bytes.clone()
+            } else {
                 return exc::raise_with_message(
                     TYPE_ERROR,
                     &format!(
-                        "loads() argument must be str, not {}",
+                        "loads() argument must be a bytes-like object, not {}",
                         value::type_name(args[0])
                     ),
                 );
             };
-            let Some(bytes) = serialize::from_hex(text) else {
-                return exc::raise_with_message(VALUE_ERROR, "invalid pickle data");
-            };
-            match serialize::decode(&bytes, false) {
-                Ok(decoded) => decoded,
-                Err(error) => pickle_error(error, true),
-            }
+            pickle_decode_bytes(&data)
         }
         "load" => pickle_load(args),
         "decode_long" => pickle_decode_long(args),
-        "Pickler" | "_Pickler" => pickle_pickler_new(args),
+        "Pickler" => pickle_pickler_new(args),
+        "_Pickler" => pickle_pickler_new_for(pickle_pickler_base_class(), args),
+        "Pickler.__init__" => pickle_pickler_init(args),
         "Pickler.dump" => pickle_pickler_dump(args),
         "Pickler.clear_memo" => pickle_pickler_clear_memo(args),
+        "Pickler.persistent_id" => NONE,
         "Unpickler" => pickle_unpickler_new(args),
+        "_Unpickler" => pickle_unpickler_new_for(pickle_unpickler_base_class(), args),
+        "Unpickler.__init__" => pickle_unpickler_init(args),
         "Unpickler.load" => pickle_unpickler_load(args),
+        "Unpickler.find_class" => pickle_unpickler_find_class(args),
+        "Unpickler.persistent_load" => pickle_unpickler_persistent_load(args),
         _ => missing_attribute("pickle", function),
     }
 }
 
-/// Cached `pickle.Pickler` class.
+/// An empty `dict` for the class-level `dispatch`/`dispatch_table` mappings.
+fn pickle_empty_mapping() -> i64 {
+    value::dict_new(Vec::new())
+}
+
+/// Cached `pickle._Pickler` class: CPython's pure-Python writer.
 ///
-/// The streaming writer is an instance-backed class: `Pickler(file, protocol)`
-/// stores both operands and `dump` delegates to the module-level `dump`
-/// implementation, so the payload bytes match `pickle.dump` exactly.
+/// HYD1 has a single writer implementation, so this class is the base of
+/// `pickle.Pickler` and the subclass hook surface (`__init__`, `dump`,
+/// `clear_memo`, `persistent_id`, `dispatch`, `dispatch_table`) lives here.
+/// `dispatch` is keyed by type like CPython's table but starts empty because
+/// HYD1 has no opcode stream; it exists so subclasses such as pandas can copy
+/// and extend it without a second class hierarchy.
+fn pickle_pickler_base_class() -> i64 {
+    const KEY: &str = "pickle._Pickler";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let dispatch = pickle_empty_mapping();
+    let dispatch_table = pickle_empty_mapping();
+    let mapping_roots = heap::root_values(&[dispatch, dispatch_table]);
+    let init = value::native_function_new("pickle", "Pickler.__init__", 3);
+    let dump = value::native_function_new("pickle", "Pickler.dump", 2);
+    let clear_memo = value::native_function_new("pickle", "Pickler.clear_memo", 1);
+    let persistent_id = value::native_function_new("pickle", "Pickler.persistent_id", 2);
+    let method_roots = heap::root_values(&[init, dump, clear_memo, persistent_id]);
+    let class = value::class_new_full(
+        "_Pickler".to_string(),
+        NONE,
+        vec![
+            ("__init__".to_string(), init, hydro_ir::MethodKind::Normal),
+            ("dump".to_string(), dump, hydro_ir::MethodKind::Normal),
+            (
+                "clear_memo".to_string(),
+                clear_memo,
+                hydro_ir::MethodKind::Normal,
+            ),
+            (
+                "persistent_id".to_string(),
+                persistent_id,
+                hydro_ir::MethodKind::Normal,
+            ),
+        ],
+        vec![
+            ("dispatch".to_string(), dispatch),
+            ("dispatch_table".to_string(), dispatch_table),
+        ],
+    );
+    let class_roots = heap::root_values(&[class]);
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    heap::release_roots(mapping_roots);
+    class
+}
+
+/// Cached `pickle.Pickler` class: the public writer, derived from `_Pickler`.
+///
+/// The streaming writer stores its operands on the instance and `dump`
+/// delegates to the module-level `dump` implementation, so the payload bytes
+/// match `pickle.dump` exactly. Deriving from `_Pickler` means a subclass of
+/// either spelling inherits the same constructor and method set.
 fn pickle_pickler_class() -> i64 {
     const KEY: &str = "pickle.Pickler";
     if let Some(cached) = globals::registry_get(KEY) {
         return cached;
     }
-    let methods = vec![
-        (
-            "dump".to_string(),
-            value::native_function_new("pickle", "Pickler.dump", 2),
-        ),
-        (
-            "clear_memo".to_string(),
-            value::native_function_new("pickle", "Pickler.clear_memo", 1),
-        ),
-    ];
-    let method_values: Vec<i64> = methods.iter().map(|(_, method)| *method).collect();
-    let roots = heap::root_values(&method_values);
-    let class = value::class_new("Pickler".to_string(), NONE, methods);
+    let base = pickle_pickler_base_class();
+    let roots = heap::root_values(&[base]);
+    let class = value::class_new("Pickler".to_string(), base, Vec::new());
     let class_roots = heap::root_values(&[class]);
     globals::registry_set(KEY, class);
     heap::release_roots(class_roots);
@@ -12799,9 +14916,57 @@ fn pickle_pickler_class() -> i64 {
     class
 }
 
-/// `pickle.Pickler(file, protocol=None)`: builds a writer over `file`.
+/// Allocates `class`, runs its `__init__` and returns the instance (or `None`
+/// when the initializer raised).
+fn pickle_new_instance(class: i64, args: &[i64], init: fn(&[i64]) -> i64) -> i64 {
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance]);
+    let mut full = Vec::with_capacity(args.len() + 1);
+    full.push(instance);
+    full.extend_from_slice(args);
+    let _ = init(&full);
+    heap::release_roots(roots);
+    if exc::pending() {
+        NONE
+    } else {
+        instance
+    }
+}
+
+/// `pickle.Pickler(file, protocol=None)` / `pickle._Pickler(...)`.
+fn pickle_pickler_new_for(class: i64, args: &[i64]) -> i64 {
+    pickle_new_instance(class, args, pickle_pickler_init)
+}
+
+/// Convenience wrapper matching the previous internal API (`pickle.Pickler`).
 fn pickle_pickler_new(args: &[i64]) -> i64 {
-    let file = args.first().copied().unwrap_or(NONE);
+    pickle_pickler_new_for(pickle_pickler_class(), args)
+}
+
+/// `Pickler.__init__(self, file, protocol=None)`: initialises the writer.
+///
+/// This is a real method (not only the module-level constructor) so a user
+/// subclass of `pickle._Pickler`/`pickle.Pickler` inherits a working
+/// constructor through the normal class-call path.
+fn pickle_pickler_init(args: &[i64]) -> i64 {
+    let Some(instance) = args.first().copied() else {
+        return exc::raise_with_message(TYPE_ERROR, "Pickler.__init__() missing self");
+    };
+    if value::as_instance(instance).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "descriptor '__init__' requires a 'Pickler' object but received a '{}'",
+                value::type_name(instance)
+            ),
+        );
+    }
+    let Some(file) = args.get(1).copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "Pickler.__init__() missing required argument 'file' (pos 1)",
+        );
+    };
     if value::as_file(file).is_none() {
         let ty = value::type_name(file);
         return exc::raise_with_message(
@@ -12809,7 +14974,7 @@ fn pickle_pickler_new(args: &[i64]) -> i64 {
             &format!("file must be a writable file object, not {ty}"),
         );
     }
-    let protocol = args.get(1).copied().unwrap_or(NONE);
+    let protocol = args.get(2).copied().unwrap_or(NONE);
     if let Err(raised) = pickle_check_protocol(protocol) {
         return raised;
     }
@@ -12818,17 +14983,14 @@ fn pickle_pickler_new(args: &[i64]) -> i64 {
     } else {
         protocol
     };
-    let instance = value::instance_new(pickle_pickler_class());
     let memo = value::dict_new(Vec::new());
     let roots = heap::root_values(&[instance, file, protocol, memo]);
     value::instance_setattr(instance, "file".to_string(), file);
     value::instance_setattr(instance, "protocol".to_string(), protocol);
     value::instance_setattr(instance, "memo".to_string(), memo);
     value::instance_setattr(instance, "fast".to_string(), FALSE);
-    value::instance_setattr(instance, "dispatch_table".to_string(), NONE);
-    value::instance_setattr(instance, "persistent_id".to_string(), NONE);
     heap::release_roots(roots);
-    instance
+    NONE
 }
 
 /// `Pickler.dump(obj)`: writes the HYD1 payload through the module `dump`.
@@ -12859,30 +15021,6 @@ fn pickle_pickler_clear_memo(args: &[i64]) -> i64 {
     NONE
 }
 
-/// Cached `pickle.Unpickler` class.
-///
-/// The streaming reader mirrors `Pickler`: the instance stores its source file
-/// and `load` delegates to the module-level `pickle.load`, so the accepted
-/// payload and the errors are exactly those of the function form.
-fn pickle_unpickler_class() -> i64 {
-    const KEY: &str = "pickle.Unpickler";
-    if let Some(cached) = globals::registry_get(KEY) {
-        return cached;
-    }
-    let load = value::native_function_new("pickle", "Unpickler.load", 1);
-    let roots = heap::root_values(&[load]);
-    let class = value::class_new(
-        "Unpickler".to_string(),
-        NONE,
-        vec![("load".to_string(), load)],
-    );
-    let class_roots = heap::root_values(&[class]);
-    globals::registry_set(KEY, class);
-    heap::release_roots(class_roots);
-    heap::release_roots(roots);
-    class
-}
-
 /// Whether `source` is one of the readable streams [`pickle_read_source`]
 /// understands: a native file, an `io.TextIOWrapper` around one, or an
 /// in-memory `StringIO`/`BytesIO`.
@@ -12892,43 +15030,183 @@ fn pickle_source_readable(source: i64) -> bool {
         || value::instance_attr(source, IO_DATA).is_some()
 }
 
-/// `pickle.Unpickler(file, *, fix_imports=True, encoding='ASCII',
-/// errors='strict', buffers=())`: builds a reader over `file`.
+/// Cached `pickle._Unpickler` class: CPython's pure-Python reader.
+///
+/// This carries the subclass hook surface pandas relies on:
+/// `__init__(file, *, fix_imports, encoding, errors, buffers)`, `load()`,
+/// `find_class(module, name)` (callable through `super()`), the
+/// `persistent_load(pid)` hook, the `dispatch` mapping
+/// (`pickle._Unpickler.dispatch.copy()`), and a static `loads(data)` helper.
+/// `dispatch` starts empty: HYD1 is a hexadecimal text format with no opcode
+/// stream, so there are no per-opcode hooks to install. The mapping exists so
+/// subclasses can copy and extend it exactly as they do in CPython; `load`
+/// never consults it.
+fn pickle_unpickler_base_class() -> i64 {
+    const KEY: &str = "pickle._Unpickler";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let dispatch = pickle_empty_mapping();
+    let dispatch_table = pickle_empty_mapping();
+    let mapping_roots = heap::root_values(&[dispatch, dispatch_table]);
+    let init = value::native_function_new("pickle", "Unpickler.__init__", 6);
+    let load = value::native_function_new("pickle", "Unpickler.load", 1);
+    let find_class = value::native_function_new("pickle", "Unpickler.find_class", 3);
+    let persistent_load = value::native_function_new("pickle", "Unpickler.persistent_load", 2);
+    // `loads` is the module-level decoder; as a static method it takes only
+    // the payload, so `_Unpickler.loads(data)` mirrors `pickle.loads(data)`.
+    let loads = value::native_function_new("pickle", "loads", 1);
+    let method_roots = heap::root_values(&[init, load, find_class, persistent_load, loads]);
+    let class = value::class_new_full(
+        "_Unpickler".to_string(),
+        NONE,
+        vec![
+            ("__init__".to_string(), init, hydro_ir::MethodKind::Normal),
+            ("load".to_string(), load, hydro_ir::MethodKind::Normal),
+            (
+                "find_class".to_string(),
+                find_class,
+                hydro_ir::MethodKind::Normal,
+            ),
+            (
+                "persistent_load".to_string(),
+                persistent_load,
+                hydro_ir::MethodKind::Normal,
+            ),
+            (
+                "loads".to_string(),
+                loads,
+                hydro_ir::MethodKind::Staticmethod,
+            ),
+        ],
+        vec![
+            ("dispatch".to_string(), dispatch),
+            ("dispatch_table".to_string(), dispatch_table),
+        ],
+    );
+    let class_roots = heap::root_values(&[class]);
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    heap::release_roots(mapping_roots);
+    class
+}
+
+/// Cached `pickle.Unpickler` class: the public reader, derived from
+/// `_Unpickler` so both spellings share one method surface.
+///
+/// The streaming reader stores its source file and `load` delegates to the
+/// module-level `pickle.load`, so the accepted payload and the errors are
+/// exactly those of the function form.
+fn pickle_unpickler_class() -> i64 {
+    const KEY: &str = "pickle.Unpickler";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let base = pickle_unpickler_base_class();
+    let roots = heap::root_values(&[base]);
+    let class = value::class_new("Unpickler".to_string(), base, Vec::new());
+    let class_roots = heap::root_values(&[class]);
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    class
+}
+
+/// `pickle.Unpickler(file, ...)` / `pickle._Unpickler(...)`.
+fn pickle_unpickler_new_for(class: i64, args: &[i64]) -> i64 {
+    pickle_new_instance(class, args, pickle_unpickler_init)
+}
+
+/// Convenience wrapper matching the previous internal API.
+fn pickle_unpickler_new(args: &[i64]) -> i64 {
+    pickle_unpickler_new_for(pickle_unpickler_class(), args)
+}
+
+/// `Unpickler.__init__(self, file, *, fix_imports=True, encoding='ASCII',
+/// errors='strict', buffers=None)`: initialises the reader.
 ///
 /// The keyword-only options are stored for attribute parity; HYD1 carries its
 /// own encoding and has no import table or out-of-band buffers, so `load`
-/// ignores them, exactly like the module-level `pickle.load`.
-fn pickle_unpickler_new(args: &[i64]) -> i64 {
-    let file = args.first().copied().unwrap_or(NONE);
+/// ignores them, exactly like the module-level `pickle.load`. `stack` and
+/// `metastack` are initialised empty so a subclass hook that inspects them
+/// observes the CPython attribute shape.
+fn pickle_unpickler_init(args: &[i64]) -> i64 {
+    let Some(instance) = args.first().copied() else {
+        return exc::raise_with_message(TYPE_ERROR, "Unpickler.__init__() missing self");
+    };
+    if value::as_instance(instance).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "descriptor '__init__' requires an 'Unpickler' object but received a '{}'",
+                value::type_name(instance)
+            ),
+        );
+    }
+    let Some(file) = args.get(1).copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "Unpickler.__init__() missing required argument 'file' (pos 1)",
+        );
+    };
     if !pickle_source_readable(file) {
         return exc::raise_with_message(
             TYPE_ERROR,
             "file must have 'read' and 'readline' attributes",
         );
     }
-    let instance = value::instance_new(pickle_unpickler_class());
+    let fix_imports = args.get(2).copied().unwrap_or(TRUE);
+    let encoding = args
+        .get(3)
+        .copied()
+        .unwrap_or_else(|| value::str_from_bytes(b"ASCII"));
+    let errors = args
+        .get(4)
+        .copied()
+        .unwrap_or_else(|| value::str_from_bytes(b"strict"));
+    let buffers = args
+        .get(5)
+        .copied()
+        .unwrap_or_else(|| value::tuple_new(Vec::new()));
     let memo = value::dict_new(Vec::new());
-    let encoding = value::str_from_bytes(b"ASCII");
-    let errors = value::str_from_bytes(b"strict");
-    let buffers = value::tuple_new(Vec::new());
-    let roots = heap::root_values(&[instance, file, memo, encoding, errors, buffers]);
+    let stack = value::list_new(Vec::new());
+    let metastack = value::list_new(Vec::new());
+    let proto = encode_int(0);
+    let roots = heap::root_values(&[
+        instance,
+        file,
+        fix_imports,
+        encoding,
+        errors,
+        buffers,
+        memo,
+        stack,
+        metastack,
+        proto,
+    ]);
     value::instance_setattr(instance, "file".to_string(), file);
-    value::instance_setattr(instance, "fix_imports".to_string(), TRUE);
+    value::instance_setattr(instance, "fix_imports".to_string(), fix_imports);
     value::instance_setattr(instance, "encoding".to_string(), encoding);
     value::instance_setattr(instance, "errors".to_string(), errors);
     value::instance_setattr(instance, "buffers".to_string(), buffers);
     value::instance_setattr(instance, "memo".to_string(), memo);
-    value::instance_setattr(instance, "persistent_load".to_string(), NONE);
+    value::instance_setattr(instance, "stack".to_string(), stack);
+    value::instance_setattr(instance, "metastack".to_string(), metastack);
+    value::instance_setattr(instance, "proto".to_string(), proto);
     heap::release_roots(roots);
-    instance
+    NONE
 }
 
 /// `Unpickler.load()`: decodes the next HYD1 payload from the stored file.
+///
+/// A subclass that forgot to call `__init__` raises `UnpicklingError` (as in
+/// CPython), not an `AttributeError` on a missing instance slot.
 fn pickle_unpickler_load(args: &[i64]) -> i64 {
     let Some(instance) = args.first().copied() else {
         return exc::raise_with_message(TYPE_ERROR, "Unpickler.load() missing self");
     };
-    if value::as_instance(instance).is_none() {
+    let Some(state) = value::as_instance(instance) else {
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
@@ -12936,26 +15214,155 @@ fn pickle_unpickler_load(args: &[i64]) -> i64 {
                 value::type_name(instance)
             ),
         );
-    }
-    let file = value::instance_attr(instance, "file").unwrap_or(NONE);
+    };
+    let class_name = value::class_display_name(state.class).unwrap_or("Unpickler");
+    let Some(file) = value::instance_attr(instance, "file") else {
+        return pickle_unpickling_error(&format!(
+            "Unpickler.__init__() was not called by {class_name}.__init__()"
+        ));
+    };
     pickle_load(&[file])
+}
+
+/// `Unpickler.persistent_load(pid)`: the default hook.
+///
+/// CPython's pure-Python reader raises `UnpicklingError` here; a subclass
+/// overrides it to resolve persistent IDs. HYD1 payloads never contain
+/// persistent IDs, so reaching this method always means the caller decoded a
+/// foreign stream.
+fn pickle_unpickler_persistent_load(_args: &[i64]) -> i64 {
+    pickle_unpickling_error("unsupported persistent id encountered")
+}
+
+/// `Unpickler.find_class(module, name)`: imports `module` and resolves `name`
+/// (walking dotted paths for protocol-4 globals).
+///
+/// pandas subclasses `pickle._Unpickler` and routes every legacy global
+/// through `super().find_class(module, name)`, so this must resolve the
+/// runtime module registry rather than a static table. Unknown modules raise
+/// `ModuleNotFoundError` and missing attributes raise `AttributeError`, the
+/// same classes CPython's implementation produces.
+fn pickle_unpickler_find_class(args: &[i64]) -> i64 {
+    let Some(instance) = args.first().copied() else {
+        return exc::raise_with_message(TYPE_ERROR, "Unpickler.find_class() missing self");
+    };
+    if value::as_instance(instance).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "descriptor 'find_class' requires an 'Unpickler' object but received a '{}'",
+                value::type_name(instance)
+            ),
+        );
+    }
+    let Some(module_arg) = args.get(1).copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "find_class() missing required argument 'module' (pos 1)",
+        );
+    };
+    let Some(name_arg) = args.get(2).copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "find_class() missing required argument 'name' (pos 2)",
+        );
+    };
+    let Some(module_name) = value::as_str(module_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "find_class() argument 'module' must be str, not {}",
+                value::type_name(module_arg)
+            ),
+        );
+    };
+    let Some(name) = value::as_str(name_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "find_class() argument 'name' must be str, not {}",
+                value::type_name(name_arg)
+            ),
+        );
+    };
+    let module_value = match registry_lookup(module_name) {
+        Some(module) => module,
+        // A native module that has not been inserted into `sys.modules` yet
+        // still has a spec; materialise it so `find_class` works without an
+        // explicit `import` in the caller.
+        None if stdlib::module(module_name).is_some() => module_value_by_name(module_name),
+        // Everything else goes through the runtime import machinery, which
+        // resolves already-loaded compiled modules and raises the same
+        // `ModuleNotFoundError` CPython does.
+        None => {
+            let imported =
+                crate::modules::builtins::import_from_core(std::slice::from_ref(&module_arg));
+            if exc::pending() {
+                return NONE;
+            }
+            imported
+        }
+    };
+    let mut current = module_value;
+    for part in name.split('.') {
+        if part.is_empty() {
+            return exc::raise_with_message(
+                ATTRIBUTE_ERROR,
+                &format!("can't resolve {name:?} on module {module_name:?}"),
+            );
+        }
+        current = crate::core::methods::getattr(current, part.as_ptr(), part.len());
+        if exc::pending() {
+            return NONE;
+        }
+    }
+    current
+}
+
+thread_local! {
+    /// `pickle`'s exception classes, cached per heap generation and native
+    /// `Exception` base.
+    ///
+    /// `exc::init()` clears the native exception-class cache between program
+    /// runs (and a heap reset frees the classes themselves). A class built on
+    /// the previous `Exception` value no longer resolves its exception tag, so
+    /// derived-class instantiation would silently stop producing exception
+    /// objects. The tuple records `(generation, native_exception_base, class)`
+    /// and is rebuilt whenever either epoch marker changes; the recorded
+    /// pointers are only compared, never dereferenced, so a stale entry from a
+    /// freed heap is safe to discard.
+    static PICKLE_EXCEPTION_CLASSES: RefCell<HashMap<String, (u64, i64, i64)>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Cached `pickle` exception class (`PickleError` and its two subclasses).
 fn pickle_exception_class(name: &str) -> i64 {
-    let key = format!("pickle.{name}");
-    if let Some(cached) = globals::registry_get(&key) {
-        return cached;
-    }
     let base = if name == "PickleError" {
         exc::exception_class(crate::exc::EXCEPTION)
     } else {
         pickle_exception_class("PickleError")
     };
+    let generation = heap::generation();
+    let cached = PICKLE_EXCEPTION_CLASSES.with(|cache| {
+        cache
+            .borrow()
+            .get(name)
+            .copied()
+            .filter(|(cached_generation, cached_base, _)| {
+                *cached_generation == generation && *cached_base == base
+            })
+    });
+    if let Some((_, _, class)) = cached {
+        return class;
+    }
     let class = value::class_new(name.to_string(), base, Vec::new());
-    let roots = heap::root_values(std::slice::from_ref(&class));
-    globals::registry_set(&key, class);
-    heap::release_roots(roots);
+    // The thread-local map is Rust state the collector cannot scan.
+    heap::add_thread_root(class);
+    PICKLE_EXCEPTION_CLASSES.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert(name.to_string(), (generation, base, class));
+    });
     class
 }
 
@@ -13137,14 +15544,825 @@ fn pickle_decode_long(args: &[i64]) -> i64 {
 
 // csv
 
+/// The values of the six `csv.QUOTE_*` constants (CPython's numbers).
+const CSV_QUOTE_MINIMAL: i64 = 0;
+const CSV_QUOTE_ALL: i64 = 1;
+
+/// One resolved CSV dialect: the eight attributes `_csv.Dialect` stores.
+///
+/// `delimiter` and the two optional characters mirror CPython's one-character
+/// string attributes; `lineterminator` stays a `String` because the writer is
+/// free to use any terminator.
+#[derive(Clone)]
+struct CsvDialect {
+    delimiter: char,
+    quotechar: Option<char>,
+    escapechar: Option<char>,
+    doublequote: bool,
+    skipinitialspace: bool,
+    lineterminator: String,
+    quoting: i64,
+    strict: bool,
+}
+
+impl CsvDialect {
+    /// CPython's `excel` dialect (the base of every other one).
+    fn excel() -> CsvDialect {
+        CsvDialect {
+            delimiter: ',',
+            quotechar: Some('"'),
+            escapechar: None,
+            doublequote: true,
+            skipinitialspace: false,
+            lineterminator: "\r\n".to_string(),
+            quoting: CSV_QUOTE_MINIMAL,
+            strict: false,
+        }
+    }
+
+    /// `excel-tab`: `excel` with a TAB delimiter.
+    fn excel_tab() -> CsvDialect {
+        CsvDialect {
+            delimiter: '\t',
+            ..CsvDialect::excel()
+        }
+    }
+
+    /// `unix`: `excel` with `\n` records and every field quoted.
+    fn unix() -> CsvDialect {
+        CsvDialect {
+            lineterminator: "\n".to_string(),
+            quoting: CSV_QUOTE_ALL,
+            ..CsvDialect::excel()
+        }
+    }
+}
+
+/// The process-global, case-sensitive dialect registry, in registration
+/// order. Built-in dialects are installed on first use; `register_dialect`
+/// replaces an existing entry in place and `unregister_dialect` removes it.
+static CSV_DIALECTS: LazyLock<Mutex<Vec<(String, CsvDialect)>>> = LazyLock::new(|| {
+    Mutex::new(vec![
+        ("excel".to_string(), CsvDialect::excel()),
+        ("excel-tab".to_string(), CsvDialect::excel_tab()),
+        ("unix".to_string(), CsvDialect::unix()),
+    ])
+});
+
+fn csv_registry() -> &'static Mutex<Vec<(String, CsvDialect)>> {
+    &CSV_DIALECTS
+}
+
+/// Locks the registry, recovering the guard if a previous panic poisoned it.
+fn csv_registry_guard() -> MutexGuard<'static, Vec<(String, CsvDialect)>> {
+    csv_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn csv_dialect_lookup(name: &str) -> Option<CsvDialect> {
+    csv_registry_guard()
+        .iter()
+        .find(|(key, _)| key.as_str() == name)
+        .map(|(_, dialect)| dialect.clone())
+}
+
+/// `csv.field_size_limit` state: CPython's initial 128 KiB, process-global.
+static CSV_FIELD_SIZE_LIMIT: AtomicI64 = AtomicI64::new(131_072);
+
+// -------------------------------------------------------------------------
+// csv classes
+// -------------------------------------------------------------------------
+
+/// Cached `csv.Error` class: a plain `Exception` subclass.
+fn csv_error_class() -> i64 {
+    let key = "csv.Error.class";
+    if let Some(class) = globals::registry_get(key) {
+        return class;
+    }
+    let class = value::class_new(
+        "Error".to_string(),
+        exc::exception_class(exc::EXCEPTION),
+        Vec::new(),
+    );
+    let roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(key, class);
+    heap::release_roots(roots);
+    class
+}
+
+/// Raises `csv.Error(message)` and returns the pending dummy value.
+fn csv_error(message: &str) -> i64 {
+    let class = csv_error_class();
+    let text = value::str_alloc(message.to_string());
+    let roots = heap::root_values(&[class, text]);
+    let instance = crate::builtins::call(class, 1, [text].as_ptr());
+    heap::release_roots(roots);
+    if exc::pending() {
+        return NONE;
+    }
+    exc::raise_value(instance)
+}
+
+/// Cached `csv.Dialect` class.
+///
+/// The class attributes are the eight dialect slots with CPython's `None`
+/// placeholder values; `get_dialect` returns an instance of this class with
+/// every attribute resolved. Subclasses defined by user code (`class
+/// MyDialect(csv.Dialect): ...`) freeze their own values on the derived class,
+/// which is what pandas passes to `csv.reader`.
+fn csv_dialect_class() -> i64 {
+    let key = "csv.Dialect.class";
+    if let Some(class) = globals::registry_get(key) {
+        return class;
+    }
+    let attrs: Vec<(String, i64)> = [
+        "delimiter",
+        "quotechar",
+        "escapechar",
+        "doublequote",
+        "skipinitialspace",
+        "lineterminator",
+        "quoting",
+        "strict",
+    ]
+    .iter()
+    .map(|name| (name.to_string(), NONE))
+    .collect();
+    let class = value::class_new_full(
+        "Dialect".to_string(),
+        value::object_class(),
+        Vec::new(),
+        attrs,
+    );
+    let roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(key, class);
+    heap::release_roots(roots);
+    class
+}
+
+/// Cached `csv.Sniffer` class, whose `sniff` method is a native function value.
+fn csv_sniffer_class() -> i64 {
+    let key = "csv.Sniffer.class";
+    if let Some(class) = globals::registry_get(key) {
+        return class;
+    }
+    let sniff = value::native_function_new("csv", "Sniffer.sniff", 3);
+    let method_roots = heap::root_values(std::slice::from_ref(&sniff));
+    let class = value::class_new_full(
+        "Sniffer".to_string(),
+        value::object_class(),
+        vec![("sniff".to_string(), sniff, hydro_ir::MethodKind::Normal)],
+        Vec::new(),
+    );
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(key, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// Builds a `csv.Dialect` instance carrying one dialect's eight attributes.
+fn csv_dialect_instance(dialect: &CsvDialect) -> i64 {
+    let class = csv_dialect_class();
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance]);
+    let set = |name: &str, item: i64| {
+        let item_roots = heap::root_values(&[item]);
+        value::instance_setattr(instance, name.to_string(), item);
+        heap::release_roots(item_roots);
+    };
+    set("delimiter", value::str_alloc(dialect.delimiter.to_string()));
+    set(
+        "quotechar",
+        dialect
+            .quotechar
+            .map(|ch| value::str_alloc(ch.to_string()))
+            .unwrap_or(NONE),
+    );
+    set(
+        "escapechar",
+        dialect
+            .escapechar
+            .map(|ch| value::str_alloc(ch.to_string()))
+            .unwrap_or(NONE),
+    );
+    set(
+        "doublequote",
+        if dialect.doublequote { TRUE } else { FALSE },
+    );
+    set(
+        "skipinitialspace",
+        if dialect.skipinitialspace {
+            TRUE
+        } else {
+            FALSE
+        },
+    );
+    set(
+        "lineterminator",
+        value::str_alloc(dialect.lineterminator.clone()),
+    );
+    set("quoting", encode_int(dialect.quoting));
+    set("strict", if dialect.strict { TRUE } else { FALSE });
+    heap::release_roots(roots);
+    instance
+}
+
+// -------------------------------------------------------------------------
+// Dialect attribute conversion
+// -------------------------------------------------------------------------
+
+fn csv_type_error(message: String) -> i64 {
+    exc::raise_with_message(TYPE_ERROR, &message)
+}
+
+/// Reads one attribute from a dialect class or instance without running user
+/// attribute hooks: instance values first, then the class linearization.
+fn csv_dialect_attr(target: i64, name: &str) -> Option<i64> {
+    if let Some(item) = value::instance_attr(target, name) {
+        return Some(item);
+    }
+    let class = value::instance_class_value(target).or_else(|| {
+        if value::as_class(target).is_some() {
+            Some(target)
+        } else {
+            None
+        }
+    })?;
+    match value::class_lookup(class, name)? {
+        value::ClassEntry::Attr(item) => Some(item),
+        value::ClassEntry::Method(_, function) => Some(function),
+    }
+}
+
+/// `None` or a one-character string, CPython's character-attribute rule.
+fn csv_char_attr(item: i64, name: &str, allow_none: bool) -> Result<Option<char>, i64> {
+    if item == NONE {
+        if allow_none {
+            return Ok(None);
+        }
+        return Err(csv_type_error(format!(
+            "{name} must be a 1-character string"
+        )));
+    }
+    let Some(text) = value::as_str(item) else {
+        return Err(csv_type_error(format!(
+            "{name} must be a 1-character string, not {}",
+            value::type_name(item)
+        )));
+    };
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => Ok(Some(ch)),
+        _ => Err(csv_type_error(format!(
+            "{name} must be a 1-character string"
+        ))),
+    }
+}
+
+/// Applies one dialect format parameter (the `**fmtparams` of CPython's
+/// reader/register_dialect) to `dialect`.
+fn csv_apply_fmtparam(dialect: &mut CsvDialect, name: &str, item: i64) -> Result<(), i64> {
+    match name {
+        "delimiter" => {
+            // A delimiter may never be a newline; CPython rejects that.
+            let ch = csv_char_attr(item, "delimiter", false)?.unwrap_or(',');
+            if matches!(ch, '\r' | '\n') {
+                return Err(csv_error("\"delimiter\" must be a 1-character string"));
+            }
+            dialect.delimiter = ch;
+        }
+        "quotechar" => dialect.quotechar = csv_char_attr(item, "quotechar", true)?,
+        "escapechar" => dialect.escapechar = csv_char_attr(item, "escapechar", true)?,
+        "doublequote" => dialect.doublequote = value::truthy(item),
+        "skipinitialspace" => dialect.skipinitialspace = value::truthy(item),
+        "lineterminator" => {
+            let Some(text) = value::as_str(item) else {
+                return Err(csv_type_error(format!(
+                    "lineterminator must be a string, not {}",
+                    value::type_name(item)
+                )));
+            };
+            dialect.lineterminator = text.to_string();
+        }
+        "quoting" => {
+            let Some(quoting) = value::as_integer(item) else {
+                return Err(csv_type_error(format!(
+                    "quoting must be an integer, not {}",
+                    value::type_name(item)
+                )));
+            };
+            if !(0..=5).contains(&quoting) {
+                return Err(csv_error("bad quoting value"));
+            }
+            dialect.quoting = quoting;
+        }
+        "strict" => dialect.strict = value::truthy(item),
+        _ => {
+            return Err(csv_type_error(format!(
+                "'{name}' is an invalid keyword argument for this function"
+            )))
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the base dialect argument of `reader`/`register_dialect`.
+///
+/// A string names a registered dialect (unknown names raise `csv.Error`), a
+/// class or instance contributes whichever of the eight attributes it defines
+/// (missing ones keep the `excel` default, matching CPython's attribute
+/// fallback for dialect classes), and `None` means `excel`.
+fn csv_dialect_from(target: i64) -> Result<CsvDialect, i64> {
+    if target == NONE {
+        return Ok(CsvDialect::excel());
+    }
+    if let Some(name) = value::as_str(target) {
+        return match csv_dialect_lookup(name) {
+            Some(dialect) => Ok(dialect),
+            None => Err(csv_error("unknown dialect")),
+        };
+    }
+    if value::as_class(target).is_some() || value::as_instance(target).is_some() {
+        let mut dialect = CsvDialect::excel();
+        for name in [
+            "delimiter",
+            "quotechar",
+            "escapechar",
+            "doublequote",
+            "skipinitialspace",
+            "lineterminator",
+            "quoting",
+            "strict",
+        ] {
+            if let Some(item) = csv_dialect_attr(target, name) {
+                // `csv.Dialect`'s placeholder attributes are `None`; an
+                // undefined slot keeps the `excel` default instead of failing
+                // the whole dialect, which is how a subclass that only
+                // overrides some fields behaves in practice.
+                if item == NONE {
+                    continue;
+                }
+                csv_apply_fmtparam(&mut dialect, name, item)?;
+            }
+        }
+        return Ok(dialect);
+    }
+    Err(csv_type_error(format!(
+        "\"{}\" is not a valid dialect",
+        value::type_name(target)
+    )))
+}
+
+// -------------------------------------------------------------------------
+// Entry points
+// -------------------------------------------------------------------------
+
 fn csv_call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "reader" => crate::csv::reader_new(args[0]),
+        "reader" => match args.get(1) {
+            Some(&dialect) => csv_reader_with(args[0], Some(dialect), &[], false, "csv.reader"),
+            None => crate::csv::reader_new(args[0]),
+        },
         "writer" => crate::csv::writer_new(args[0]),
-        "DictReader" => crate::csv::dict_reader_new(args[0]),
+        "DictReader" => match args.get(1) {
+            Some(&dialect) => csv_reader_with(args[0], Some(dialect), &[], true, "csv.DictReader"),
+            None => crate::csv::dict_reader_new(args[0]),
+        },
         "DictWriter" => crate::csv::dict_writer_new(args[0], args[1]),
+        "register_dialect" => {
+            let Some(&name) = args.first() else {
+                return csv_type_error(
+                    "register_dialect() missing required argument 'name'".to_string(),
+                );
+            };
+            csv_register(name, args.get(1).copied(), &[])
+        }
+        "unregister_dialect" => csv_unregister(args[0]),
+        "get_dialect" => csv_get_dialect(args[0]),
+        "list_dialects" => csv_list_dialects(),
+        "field_size_limit" => csv_field_size_limit(args),
+        "Sniffer.sniff" => csv_sniff(args),
         _ => missing_attribute("csv", function),
     }
+}
+
+/// Keyword-aware csv dispatch: `reader`/`DictReader` receive `dialect` and the
+/// format parameters, `register_dialect` the base dialect and `**fmtparams`.
+fn csv_call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    match function {
+        "reader" | "DictReader" => {
+            let dict_mode = function == "DictReader";
+            let function_name = if dict_mode {
+                "csv.DictReader"
+            } else {
+                "csv.reader"
+            };
+            let Some(&file) = args.first() else {
+                return csv_type_error(format!(
+                    "{function_name}() missing required argument 'file'"
+                ));
+            };
+            let mut dialect = args.get(1).copied();
+            let mut fmtparams = Vec::new();
+            for (name, item) in keywords {
+                if name == "dialect" {
+                    if dialect.is_some() {
+                        return csv_type_error(format!(
+                            "{function_name}() got multiple values for argument 'dialect'"
+                        ));
+                    }
+                    dialect = Some(*item);
+                } else {
+                    fmtparams.push((name.clone(), *item));
+                }
+            }
+            csv_reader_with(file, dialect, &fmtparams, dict_mode, function_name)
+        }
+        "register_dialect" => {
+            let Some(&name) = args.first() else {
+                return csv_type_error(
+                    "register_dialect() missing required argument 'name'".to_string(),
+                );
+            };
+            let mut dialect = args.get(1).copied();
+            let mut fmtparams = Vec::new();
+            for (name, item) in keywords {
+                if name == "dialect" {
+                    if dialect.is_some() {
+                        return csv_type_error(
+                            "register_dialect() got multiple values for argument 'dialect'"
+                                .to_string(),
+                        );
+                    }
+                    dialect = Some(*item);
+                } else {
+                    fmtparams.push((name.clone(), *item));
+                }
+            }
+            csv_register(name, dialect, &fmtparams)
+        }
+        // `csv.Sniffer().sniff(sample, delimiters=...)`: the binder moved a
+        // named `delimiters` argument into its slot, so the positional shape
+        // is already correct.
+        "Sniffer.sniff" => {
+            if let Some((name, _)) = keywords.first() {
+                return csv_type_error(format!(
+                    "sniff() got an unexpected keyword argument '{name}'"
+                ));
+            }
+            csv_sniff(args)
+        }
+        _ if keywords.is_empty() => csv_call(function, args),
+        _ => csv_type_error(format!(
+            "csv.{function}() does not accept keyword arguments"
+        )),
+    }
+}
+
+/// `csv.reader`/`csv.DictReader` with a resolved dialect and format
+/// parameters. The whole remaining file content is parsed with the dialect's
+/// delimiter, quote and escape rules; the row storage and yielding stay the
+/// shared [`crate::csv`] representation.
+fn csv_reader_with(
+    file: i64,
+    dialect: Option<i64>,
+    fmtparams: &[(String, i64)],
+    dict_mode: bool,
+    function: &str,
+) -> i64 {
+    let Some(state) = value::as_file(file) else {
+        return csv_type_error(format!(
+            "{function}() argument 1 must be a file object, not {}",
+            value::type_name(file)
+        ));
+    };
+    let mut dialect = match dialect {
+        Some(target) => match csv_dialect_from(target) {
+            Ok(dialect) => dialect,
+            Err(error) => return error,
+        },
+        None => CsvDialect::excel(),
+    };
+    for (name, item) in fmtparams {
+        if let Err(error) = csv_apply_fmtparam(&mut dialect, name, *item) {
+            return error;
+        }
+    }
+    let content = match state.read(None) {
+        Ok(content) => content,
+        Err(error) => return value::raise_file_error(error),
+    };
+    let mut rows = match csv_parse_rows(&content, &dialect) {
+        Ok(rows) => rows,
+        Err(message) => return csv_error(&message),
+    };
+    let header = if dict_mode {
+        if rows.is_empty() {
+            None
+        } else {
+            Some(rows.remove(0))
+        }
+    } else {
+        None
+    };
+    value::csv_reader_new(rows, header)
+}
+
+/// Parses one document with `dialect`. This is the generalised form of
+/// [`crate::csv::parse_rows`]: the same record/quote/escape state machine, but
+/// every delimiter, quote character, escape character, whitespace and quoting
+/// rule comes from the dialect. Record terminators stay `\r\n`, `\n` and lone
+/// `\r`, like CPython's reader.
+fn csv_parse_rows(text: &str, dialect: &CsvDialect) -> Result<Vec<Vec<String>>, String> {
+    let chars: Vec<char> = text.chars().collect();
+    let quoting_enabled = dialect.quoting != 3;
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if quoted {
+            if let Some(escape) = dialect.escapechar {
+                if ch == escape {
+                    if index + 1 < chars.len() {
+                        field.push(chars[index + 1]);
+                        index += 2;
+                    } else {
+                        field.push(ch);
+                        index += 1;
+                    }
+                    continue;
+                }
+            }
+            if quoting_enabled && Some(ch) == dialect.quotechar {
+                if dialect.doublequote
+                    && index + 1 < chars.len()
+                    && Some(chars[index + 1]) == dialect.quotechar
+                {
+                    field.push(ch);
+                    index += 2;
+                } else {
+                    quoted = false;
+                    index += 1;
+                }
+            } else {
+                field.push(ch);
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(escape) = dialect.escapechar {
+            if ch == escape {
+                if index + 1 < chars.len() {
+                    field.push(chars[index + 1]);
+                    index += 2;
+                } else {
+                    field.push(ch);
+                    index += 1;
+                }
+                started = true;
+                continue;
+            }
+        }
+        if quoting_enabled && Some(ch) == dialect.quotechar {
+            if started {
+                if dialect.doublequote
+                    && index + 1 < chars.len()
+                    && Some(chars[index + 1]) == dialect.quotechar
+                {
+                    field.push(ch);
+                    index += 2;
+                    continue;
+                }
+                // Non-strict keeps a quote inside an unquoted field literally,
+                // CPython's default reading rule.
+                field.push(ch);
+            } else {
+                quoted = true;
+                started = true;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == dialect.delimiter {
+            row.push(std::mem::take(&mut field));
+            started = false;
+            index += 1;
+            if dialect.skipinitialspace {
+                while index < chars.len() && chars[index] == ' ' {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        if ch == '\r' || ch == '\n' {
+            if started || !row.is_empty() {
+                row.push(std::mem::take(&mut field));
+            }
+            rows.push(std::mem::take(&mut row));
+            started = false;
+            if ch == '\r' && index + 1 < chars.len() && chars[index + 1] == '\n' {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        field.push(ch);
+        started = true;
+        index += 1;
+    }
+    if quoted {
+        return Err("unexpected end of data".to_string());
+    }
+    if started || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// `csv.register_dialect(name, dialect='excel', **fmtparams)`.
+fn csv_register(name: i64, dialect: Option<i64>, fmtparams: &[(String, i64)]) -> i64 {
+    let Some(name) = value::as_str(name) else {
+        return csv_type_error(format!(
+            "dialect name must be a string, not {}",
+            value::type_name(name)
+        ));
+    };
+    let name = name.to_string();
+    let mut resolved = match dialect {
+        Some(target) => match csv_dialect_from(target) {
+            Ok(dialect) => dialect,
+            Err(error) => return error,
+        },
+        None => CsvDialect::excel(),
+    };
+    for (param, item) in fmtparams {
+        if let Err(error) = csv_apply_fmtparam(&mut resolved, param, *item) {
+            return error;
+        }
+    }
+    let mut registry = csv_registry_guard();
+    match registry
+        .iter_mut()
+        .find(|(key, _)| key.as_str() == name.as_str())
+    {
+        Some((_, existing)) => *existing = resolved,
+        None => registry.push((name, resolved)),
+    }
+    NONE
+}
+
+/// `csv.unregister_dialect(name)`.
+fn csv_unregister(name: i64) -> i64 {
+    let Some(name) = value::as_str(name) else {
+        return csv_type_error(format!(
+            "dialect name must be a string, not {}",
+            value::type_name(name)
+        ));
+    };
+    let mut registry = csv_registry_guard();
+    let Some(position) = registry.iter().position(|(key, _)| key.as_str() == name) else {
+        return csv_error("unknown dialect");
+    };
+    registry.remove(position);
+    NONE
+}
+
+/// `csv.get_dialect(name)`: a fresh `csv.Dialect` instance.
+fn csv_get_dialect(name: i64) -> i64 {
+    let Some(name) = value::as_str(name) else {
+        return csv_type_error(format!(
+            "dialect name must be a string, not {}",
+            value::type_name(name)
+        ));
+    };
+    match csv_dialect_lookup(name) {
+        Some(dialect) => csv_dialect_instance(&dialect),
+        None => csv_error("unknown dialect"),
+    }
+}
+
+/// `csv.list_dialects()`: every registered name in registration order.
+fn csv_list_dialects() -> i64 {
+    let names: Vec<String> = csv_registry_guard()
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    let list = value::list_new(Vec::new());
+    let roots = heap::root_values(std::slice::from_ref(&list));
+    for name in names {
+        let item = value::str_alloc(name);
+        let item_roots = heap::root_values(std::slice::from_ref(&item));
+        container::list_append(list, item);
+        heap::release_roots(item_roots);
+    }
+    heap::release_roots(roots);
+    list
+}
+
+/// `csv.field_size_limit([new_limit])`: returns the previous (or current)
+/// limit.
+fn csv_field_size_limit(args: &[i64]) -> i64 {
+    if args.is_empty() {
+        return encode_int(CSV_FIELD_SIZE_LIMIT.load(Ordering::Relaxed));
+    }
+    let Some(limit) = value::as_integer(args[0]) else {
+        return csv_type_error(format!(
+            "limit must be an integer, not {}",
+            value::type_name(args[0])
+        ));
+    };
+    encode_int(CSV_FIELD_SIZE_LIMIT.swap(limit, Ordering::Relaxed))
+}
+
+/// `csv.Sniffer().sniff(sample, delimiters=None)`.
+///
+/// Counts each candidate delimiter outside quoted regions of the sample and
+/// returns a `csv.Dialect` instance whose `delimiter` is the most frequent
+/// candidate. `delimiters` may be a string or a sequence of one-character
+/// strings; `None` uses CPython's default candidate list.
+fn csv_sniff(args: &[i64]) -> i64 {
+    // `args[0]` is the receiver.
+    let Some(sample) = args.get(1).and_then(|item| value::as_str(*item)) else {
+        return csv_type_error(format!(
+            "sniff() argument must be a string, not {}",
+            args.get(1)
+                .map(|item| value::type_name(*item))
+                .unwrap_or("None")
+        ));
+    };
+    let mut candidates: Vec<char> = match args.get(2).copied() {
+        None | Some(NONE) => vec![',', '\t', ';', ' ', ':'],
+        Some(target) => {
+            if let Some(text) = value::as_str(target) {
+                text.chars().collect()
+            } else if let Some(items) = value::as_list(target).or_else(|| value::as_tuple(target)) {
+                let mut chars = Vec::new();
+                for item in items {
+                    let Some(text) = value::as_str(*item) else {
+                        return csv_type_error(format!(
+                            "delimiters must be a string or a sequence of strings, not {}",
+                            value::type_name(*item)
+                        ));
+                    };
+                    chars.extend(text.chars());
+                }
+                chars
+            } else {
+                return csv_type_error(format!(
+                    "delimiters must be a string or a sequence of strings, not {}",
+                    value::type_name(target)
+                ));
+            }
+        }
+    };
+    candidates.retain(|candidate| !matches!(*candidate, '\r' | '\n'));
+    if candidates.is_empty() {
+        return csv_error("Could not determine delimiter");
+    }
+    // Count candidates outside the sample's quote regions. The sniffer's
+    // quote default is `"`, matching CPython's `Sniffer.sniff`.
+    let quote = '"';
+    let mut counts = vec![0usize; candidates.len()];
+    let mut quoted = false;
+    let mut chars = sample.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == quote {
+            if quoted && chars.peek() == Some(&quote) {
+                chars.next();
+            } else {
+                quoted = !quoted;
+            }
+            continue;
+        }
+        if quoted {
+            continue;
+        }
+        if let Some(position) = candidates.iter().position(|candidate| *candidate == ch) {
+            counts[position] += 1;
+        }
+    }
+    let Some(best) = counts
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count > 0)
+        .max_by_key(|(position, count)| (**count, std::cmp::Reverse(*position)))
+        .map(|(position, _)| position)
+    else {
+        return csv_error("Could not determine delimiter");
+    };
+    let dialect = CsvDialect {
+        delimiter: candidates[best],
+        ..CsvDialect::excel()
+    };
+    csv_dialect_instance(&dialect)
 }
 
 // html
@@ -13212,10 +16430,115 @@ fn json_parse_error(message: &str) -> i64 {
 pub(crate) fn json_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "dumps" => json_dumps(args),
-        "loads" => json_loads(args[0]),
+        "loads" => json_loads(args),
         "dump" => json_dump(args),
         "load" => json_load(args[0]),
         _ => missing_attribute("json", function),
+    }
+}
+
+/// Keyword-only decoder options of `json.loads`.
+///
+/// The frontend reorders keyword arguments into the positional layout
+/// declared by the `json` module spec:
+/// `loads(s, *, object_hook=None, parse_float=None, parse_int=None,
+/// parse_constant=None, object_pairs_hook=None, cls=None)`. Omitted slots
+/// arrive as `None`, which selects the built-in decoder behaviour.
+#[derive(Clone, Copy)]
+struct JsonDecoderOptions {
+    object_hook: i64,
+    parse_float: i64,
+    parse_int: i64,
+    parse_constant: i64,
+    object_pairs_hook: i64,
+    cls: i64,
+}
+
+impl JsonDecoderOptions {
+    /// The CPython defaults: no custom hooks and the native decoder.
+    fn defaults() -> JsonDecoderOptions {
+        JsonDecoderOptions {
+            object_hook: NONE,
+            parse_float: NONE,
+            parse_int: NONE,
+            parse_constant: NONE,
+            object_pairs_hook: NONE,
+            cls: NONE,
+        }
+    }
+
+    /// Reads the option slots from a `loads` argument list. The slot order is
+    /// the `loads` parameter order after `s`, as declared in the spec.
+    fn from_args(args: &[i64]) -> JsonDecoderOptions {
+        let slot = |index: usize| args.get(index + 1).copied().unwrap_or(NONE);
+        JsonDecoderOptions {
+            object_hook: slot(0),
+            parse_float: slot(1),
+            parse_int: slot(2),
+            parse_constant: slot(3),
+            object_pairs_hook: slot(4),
+            cls: slot(5),
+        }
+    }
+}
+
+/// Calls a decoder hook with one argument, propagating a raised exception.
+fn json_hook(hook: i64, argument: i64) -> Result<i64, i64> {
+    let mark = heap::root_values(&[argument]);
+    let result = crate::core::builtins::call(hook, 1, &argument);
+    heap::release_roots(mark);
+    if exc::pending() {
+        Err(NONE)
+    } else {
+        Ok(result)
+    }
+}
+
+/// `loads(s, ..., cls=...)`: CPython constructs `cls(**options)` and delegates
+/// to its `decode` method, because a custom decoder class owns the whole
+/// parse. The hooks are forwarded only when supplied, exactly like
+/// `json.loads`.
+fn json_decode_with_class(class: i64, text: &str, options: JsonDecoderOptions) -> i64 {
+    let mark = heap::root_values(&[]);
+    let mut pairs: Vec<i64> = Vec::with_capacity(10);
+    for (name, hook) in [
+        ("object_hook", options.object_hook),
+        ("object_pairs_hook", options.object_pairs_hook),
+        ("parse_float", options.parse_float),
+        ("parse_int", options.parse_int),
+        ("parse_constant", options.parse_constant),
+    ] {
+        if hook == NONE {
+            continue;
+        }
+        let name = value::str_alloc(name.to_string());
+        heap::push_scoped_root(name);
+        heap::push_scoped_root(hook);
+        pairs.push(name);
+        pairs.push(hook);
+    }
+    let instance =
+        crate::core::builtins::call_kw(class, 0, std::ptr::null(), pairs.len() / 2, pairs.as_ptr());
+    heap::release_roots(mark);
+    if exc::pending() {
+        return NONE;
+    }
+    let argument = value::str_alloc(text.to_string());
+    let mark = heap::root_values(&[instance, argument]);
+    let result = crate::core::methods::call_kw(
+        instance,
+        b"decode".as_ptr(),
+        "decode".len(),
+        1,
+        &argument,
+        0,
+        std::ptr::null(),
+    );
+    heap::release_roots(mark);
+    if exc::pending() {
+        NONE
+    } else {
+        result
     }
 }
 
@@ -13356,7 +16679,7 @@ fn json_load(file: i64) -> i64 {
         Err(err) => return err,
     };
     match state.read(None) {
-        Ok(source) => parse_json(source),
+        Ok(source) => parse_json(source, JsonDecoderOptions::defaults()),
         Err(error) => value::raise_file_error(error),
     }
 }
@@ -13590,27 +16913,38 @@ fn write_unicode_escape(code: u32, out: &mut String) {
     let _ = write!(out, "\\u{high:04x}\\u{low:04x}");
 }
 
-/// `json.loads(text)`: parses a `str` into runtime values. Containers are
-/// allocated empty first and held in tagged locals, then filled incrementally,
-/// so a collection between two elements still traces the partial container.
-fn json_loads(v: i64) -> i64 {
-    let Some(text) = value::as_str(v) else {
+/// `json.loads(s, *, object_hook=None, parse_float=None, parse_int=None,
+/// parse_constant=None, object_pairs_hook=None, cls=None)`: parses a `str`
+/// into runtime values, applying the keyword-only decoder hooks.
+fn json_loads(args: &[i64]) -> i64 {
+    let options = JsonDecoderOptions::from_args(args);
+    let Some(&input) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "loads() missing required argument 's'");
+    };
+    let Some(text) = value::as_str(input) else {
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
                 "the JSON object must be str, bytes or bytearray, not {}",
-                value::type_name(v)
+                value::type_name(input)
             ),
         );
     };
+    if options.cls != NONE {
+        return json_decode_with_class(options.cls, text, options);
+    }
     // Copy the input before the first allocation: the parser must not depend
     // on a reference into a heap object while new objects are being created.
-    parse_json(text.to_string())
+    parse_json(text.to_string(), options)
 }
 
 /// Parses a complete JSON document (shared by `loads` and file `load`).
-fn parse_json(source: String) -> i64 {
-    let mut parser = JsonParser { source, pos: 0 };
+fn parse_json(source: String, options: JsonDecoderOptions) -> i64 {
+    let mut parser = JsonParser {
+        source,
+        pos: 0,
+        options,
+    };
     match parser.parse_document() {
         Ok(result) => result,
         Err(err) => err,
@@ -13620,6 +16954,7 @@ fn parse_json(source: String) -> i64 {
 struct JsonParser {
     source: String,
     pos: usize,
+    options: JsonDecoderOptions,
 }
 
 impl JsonParser {
@@ -13692,19 +17027,31 @@ impl JsonParser {
             }
             Some(b'N') => {
                 self.literal("NaN")?;
-                Ok(value::float_new(f64::NAN))
+                self.constant("NaN", f64::NAN)
             }
             Some(b'I') => {
                 self.literal("Infinity")?;
-                Ok(value::float_new(f64::INFINITY))
+                self.constant("Infinity", f64::INFINITY)
             }
             Some(b'-') if self.source[self.pos..].starts_with("-Infinity") => {
                 self.pos += "-Infinity".len();
-                Ok(value::float_new(f64::NEG_INFINITY))
+                self.constant("-Infinity", f64::NEG_INFINITY)
             }
             Some(b'-' | b'0'..=b'9') => self.parse_number(),
             _ => Err(json_parse_error("Expecting value")),
         }
+    }
+
+    /// Builds `NaN`/`Infinity`/`-Infinity`, applying `parse_constant` when the
+    /// caller supplied one. CPython passes the token text to the hook.
+    fn constant(&mut self, text: &str, fallback: f64) -> Result<i64, i64> {
+        if self.options.parse_constant != NONE {
+            return json_hook(
+                self.options.parse_constant,
+                value::str_alloc(text.to_string()),
+            );
+        }
+        Ok(value::float_new(fallback))
     }
 
     fn parse_array(&mut self, depth: usize) -> Result<i64, i64> {
@@ -13744,10 +17091,15 @@ impl JsonParser {
         }
         self.pos += 1; // '{'
         let object = value::dict_new(Vec::new());
+        // `object_pairs_hook` sees the raw pairs in source order, including
+        // duplicate keys, and replaces the dict. The tuples are appended to a
+        // list as they are parsed, so the collector reaches them through the
+        // tagged local instead of an unscanned Rust vector.
+        let pairs = (self.options.object_pairs_hook != NONE).then(|| value::list_new(Vec::new()));
         self.skip_whitespace();
         if self.byte() == Some(b'}') {
             self.pos += 1;
-            return Ok(object);
+            return self.finish_object(object, pairs);
         }
         loop {
             self.skip_whitespace();
@@ -13768,6 +17120,10 @@ impl JsonParser {
             if let Some(mut pairs) = value::dict_pairs_mut(object) {
                 crate::container::dict_insert_barrier(object, &mut pairs, key, item);
             }
+            if let Some(pairs) = pairs {
+                let pair = value::tuple_new(vec![key, item]);
+                crate::container::list_append(pairs, pair);
+            }
             self.skip_whitespace();
             match self.byte() {
                 Some(b',') => {
@@ -13775,11 +17131,27 @@ impl JsonParser {
                 }
                 Some(b'}') => {
                     self.pos += 1;
-                    return Ok(object);
+                    return self.finish_object(object, pairs);
                 }
                 _ => return Err(json_parse_error("Expecting ',' delimiter")),
             }
         }
+    }
+
+    /// Applies the object hooks to a finished object.
+    ///
+    /// `object_pairs_hook` receives the raw `(key, value)` list (duplicates
+    /// included) and replaces the result; `object_hook` receives the dict the
+    /// parser built and is ignored when `object_pairs_hook` is set, matching
+    /// CPython's decoder.
+    fn finish_object(&self, object: i64, pairs: Option<i64>) -> Result<i64, i64> {
+        if self.options.object_pairs_hook != NONE {
+            return json_hook(self.options.object_pairs_hook, pairs.unwrap_or(NONE));
+        }
+        if self.options.object_hook != NONE {
+            return json_hook(self.options.object_hook, object);
+        }
+        Ok(object)
     }
 
     fn parse_number(&mut self) -> Result<i64, i64> {
@@ -13822,13 +17194,20 @@ impl JsonParser {
                 return Err(json_parse_error("Expecting value"));
             }
         }
-        let text = &self.source[start..self.pos];
+        // Copy the token before any allocation: `text` borrows `self.source`.
+        let text = self.source[start..self.pos].to_string();
         if is_float {
+            if self.options.parse_float != NONE {
+                return json_hook(self.options.parse_float, value::str_alloc(text));
+            }
             match text.parse::<f64>() {
                 Ok(f) => Ok(value::float_new(f)),
                 Err(_) => Err(json_parse_error("Expecting value")),
             }
         } else {
+            if self.options.parse_int != NONE {
+                return json_hook(self.options.parse_int, value::str_alloc(text));
+            }
             match text.parse::<num_bigint::BigInt>() {
                 // `bigint_new` normalizes values inside the tagged range to
                 // immediates, so small integers keep the fast path.
@@ -16529,6 +19908,8 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "getpid" => encode_int(i64::from(std::process::id())),
         "getppid" => encode_int(parent_pid()),
         "cpu_count" => encode_int(cpu_count()),
+        "process_cpu_count" => encode_int(process_cpu_count()),
+        "umask" => os_umask(args),
         "getcwd" => match std::env::current_dir() {
             Ok(path) => value::str_alloc(path.to_string_lossy().into_owned()),
             Err(err) => {
@@ -18439,6 +21820,44 @@ fn sys_getsizeof(args: &[i64]) -> i64 {
     })
 }
 
+/// `sys.getrefcount(obj)`: the number of references to `obj`.
+///
+/// Hydro does not reference-count objects. The collector is a tracing
+/// mark-and-sweep GC, so no per-object ownership count exists and none can be
+/// observed from the runtime's Rust frames; inventing one would be a lie about
+/// memory management this runtime does not perform.
+///
+/// The emulation reports `2`: the value's stored reference plus the reference
+/// held by the call's argument slot. That is CPython's value for a singly
+/// referenced object (a local or attribute read), which is the case every
+/// documented consumer compares against. A trace-GC runtime cannot tell a
+/// stored reference from a temporary expression (CPython reports 1) or count
+/// the other references a program holds, so the answer is deliberately the
+/// single-stored-reference count rather than a fabricated ownership total.
+///
+/// CPython's consumers only compare the result against small thresholds:
+/// pandas' chained-assignment guards test `sys.getrefcount(self) <=
+/// REF_COUNT` / `REF_COUNT_IDX` / `REF_COUNT_METHOD` (2 / 2 / 1 on Python
+/// 3.14). Reporting 2 keeps the two-reference checks true and the
+/// one-reference method check false, exactly the decisions a plain CPython
+/// 3.14 local/method receiver produces.
+///
+/// Singletons and interned scalars report an immortality-marker count in
+/// CPython; this emulation stays at the single-reference value instead of
+/// fabricating reference ownership.
+fn sys_getrefcount(args: &[i64]) -> i64 {
+    if args.len() != 1 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "sys.getrefcount() takes exactly one argument ({} given)",
+                args.len()
+            ),
+        );
+    }
+    encode_int(2)
+}
+
 fn sys_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "exit" => sys_exit(args),
@@ -18465,6 +21884,7 @@ fn sys_call(function: &str, args: &[i64]) -> i64 {
         "gettrace" | "getprofile" => NONE,
         "getrecursionlimit" => sys_getrecursionlimit(),
         "getsizeof" => sys_getsizeof(args),
+        "getrefcount" => sys_getrefcount(args),
         "setrecursionlimit" => sys_setrecursionlimit(args),
         "_getframemodulename" => sys::getframemodulename(args),
         "_getframe" => sys::getframe(args),
@@ -21500,6 +24920,30 @@ fn cpu_count() -> i64 {
     std::thread::available_parallelism()
         .map(|count| count.get() as i64)
         .unwrap_or(1)
+}
+
+/// `os.process_cpu_count()`: the CPUs available to this process. The standard
+/// library exposes the affinity-aware count (when it can), which is what CPython
+/// reports; `available_parallelism` is the portable approximation.
+fn process_cpu_count() -> i64 {
+    cpu_count()
+}
+
+/// `os.umask(mask)`: set the process umask and return the previous value.
+fn os_umask(args: &[i64]) -> i64 {
+    let Some(mask) = args.first().copied().and_then(value::as_integer) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "umask() argument must be an integer, not {}",
+                args.first()
+                    .map_or("nothing", |value| value::type_name(*value))
+            ),
+        );
+    };
+    // SAFETY: `umask(2)` has no memory-safety preconditions.
+    let previous = unsafe { libc::umask(mask as libc::mode_t) };
+    encode_int(i64::from(previous))
 }
 
 #[cfg(unix)]
@@ -25767,6 +29211,53 @@ mod tests {
     }
 
     #[test]
+    fn json_loads_applies_decoder_hooks() {
+        // `parse_constant` receives the token text, not the parsed float.
+        exc::init();
+        let parse_constant = value::builtin_function_new(hydro_ir::Builtin::Str);
+        let parsed = call(
+            "json",
+            "loads",
+            &[string("NaN"), NONE, NONE, NONE, parse_constant],
+        );
+        assert!(!exc::pending(), "loads raised: {}", message());
+        assert_eq!(value::as_str(parsed), Some("NaN"));
+
+        // `parse_float` receives the source token.
+        exc::init();
+        let parse_float = value::builtin_function_new(hydro_ir::Builtin::Str);
+        let parsed = call("json", "loads", &[string("1e2"), NONE, parse_float]);
+        assert!(!exc::pending(), "loads raised: {}", message());
+        assert_eq!(value::as_str(parsed), Some("1e2"));
+
+        // `object_hook` receives the built dict.
+        exc::init();
+        let object_hook = value::builtin_function_new(hydro_ir::Builtin::Str);
+        let parsed = call("json", "loads", &[string("{\"a\": 1}"), object_hook]);
+        assert!(!exc::pending(), "loads raised: {}", message());
+        assert_eq!(value::as_str(parsed), Some("{'a': 1}"));
+
+        // `object_pairs_hook` receives every raw pair (duplicates included),
+        // so `len` sees two pairs where the dict deduplicates to one.
+        exc::init();
+        let object_pairs_hook = value::builtin_function_new(hydro_ir::Builtin::Len);
+        let parsed = call(
+            "json",
+            "loads",
+            &[
+                string("{\"a\": 1, \"a\": 2}"),
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                object_pairs_hook,
+            ],
+        );
+        assert!(!exc::pending(), "loads raised: {}", message());
+        assert_eq!(as_int(parsed), 2);
+    }
+
+    #[test]
     fn json_loads_string_escapes() {
         exc::init();
         assert_eq!(value::as_str(loads("\"a\\\\b\"")), Some("a\\b"));
@@ -28466,13 +31957,18 @@ mod tests {
         assert_eq!(message(), "errors must be str or None, not int");
         method(reader, "close", &[]);
 
-        // Malformed HYD1 text is a ValueError, like `loads`.
+        // Malformed HYD1 text raises the module's `UnpicklingError` class,
+        // like CPython's reader (not a bare `ValueError`).
+        exc::init();
         let invalid_path = dir.join("invalid.pkl");
         std::fs::write(&invalid_path, b"zz").unwrap();
         let invalid_name = invalid_path.to_string_lossy().into_owned();
         let reader = call("io", "open", &[string(&invalid_name), string("r")]);
         assert_eq!(call("pickle", "load", &[reader]), NONE);
-        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(
+            value::as_exc_instance(exc::pending_value()).map(|state| state.class),
+            Some(pickle_exception_class("UnpicklingError"))
+        );
         assert_eq!(message(), "invalid pickle data");
         method(reader, "close", &[]);
 
@@ -28484,6 +31980,184 @@ mod tests {
         );
         assert_eq!((load.min_args, load.max_args), (1, 5));
         assert_eq!(load.ret, hydro_ir::Type::Any);
+    }
+
+    #[test]
+    fn pickle_private_classes_are_subclassable_and_dispatch_tables_copy() {
+        exc::init();
+        let unpickler_base = pickle_unpickler_base_class();
+        let pickler_base = pickle_pickler_base_class();
+        // The private spellings are real classes, distinct from the public
+        // classes that derive from them (CPython's `pickle.Unpickler` is the
+        // C accelerator, `pickle._Unpickler` the pure-Python base).
+        assert_eq!(get("pickle", "_Unpickler"), unpickler_base);
+        assert_eq!(get("pickle", "_Pickler"), pickler_base);
+        assert_ne!(get("pickle", "Unpickler"), unpickler_base);
+        assert_ne!(get("pickle", "Pickler"), pickler_base);
+        assert!(value::is_subclass_of(
+            get("pickle", "Unpickler"),
+            unpickler_base
+        ));
+        assert!(value::is_subclass_of(
+            get("pickle", "Pickler"),
+            pickler_base
+        ));
+
+        // `dispatch`/`dispatch_table` are real dicts; `dispatch.copy()` is a
+        // fresh mapping so pandas can add its REDUCE/NEWOBJ hooks without
+        // mutating the class table.
+        for class in [unpickler_base, pickler_base] {
+            let dispatch = crate::core::methods::getattr(class, b"dispatch".as_ptr(), 8);
+            assert!(!exc::pending(), "dispatch lookup: {}", message());
+            assert!(value::as_dict(dispatch).is_some());
+            let copy = method(dispatch, "copy", &[]);
+            assert!(!exc::pending(), "dispatch.copy(): {}", message());
+            assert_ne!(copy, dispatch);
+            let key = int(82); // `pickle.REDUCE[0]`
+            container::dict_set(copy, key, string("hook"));
+            assert_eq!(value::as_dict(copy).map(|entries| entries.len()), Some(1));
+            assert_eq!(
+                value::as_dict(dispatch).map(|entries| entries.len()),
+                Some(0),
+                "copy must not alias the class table"
+            );
+        }
+        let table = crate::core::methods::getattr(pickler_base, b"dispatch_table".as_ptr(), 14);
+        assert!(value::as_dict(table).is_some());
+
+        // A runtime subclass (the shape `class U(pickle._Unpickler)` builds)
+        // inherits the constructor and hooks and shares the class table.
+        let derived = value::class_new_multi(
+            "CompatUnpickler".to_string(),
+            vec![unpickler_base],
+            NONE,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(!exc::pending(), "subclass creation: {}", message());
+        // The subclass is not registered anywhere, so keep it rooted while
+        // the rest of the test allocates.
+        let derived_roots = heap::root_values(&[derived]);
+        for name in ["__init__", "load", "find_class", "persistent_load", "loads"] {
+            assert!(value::class_member(derived, name).is_some(), "{name}");
+        }
+        assert_eq!(
+            crate::core::methods::getattr(derived, b"dispatch".as_ptr(), 8),
+            crate::core::methods::getattr(unpickler_base, b"dispatch".as_ptr(), 8)
+        );
+
+        // The inherited `__init__`/`load` work on a subclass instance with a
+        // real HYD1 stream.
+        let payload = value::list_new(vec![int(5), string("six")]);
+        let text = value::as_str(call("pickle", "dumps", &[payload]))
+            .expect("HYD1 text")
+            .to_string();
+        let stream = call(
+            "io",
+            "BytesIO",
+            &[value::bytes_new(text.as_bytes().to_vec())],
+        );
+        assert!(!exc::pending(), "BytesIO: {}", message());
+        let instance = value::instance_new(derived);
+        assert_eq!(method(instance, "__init__", &[stream]), NONE);
+        assert!(!exc::pending(), "inherited __init__: {}", message());
+        let decoded = method(instance, "load", &[]);
+        assert!(!exc::pending(), "inherited load: {}", message());
+        assert_eq!(value::repr(decoded), value::repr(payload));
+
+        // `find_class` resolves modules and attributes through the runtime
+        // registry (the hook pandas calls through `super()`).
+        let resolved = method(instance, "find_class", &[string("json"), string("dumps")]);
+        assert!(!exc::pending(), "find_class: {}", message());
+        assert_ne!(resolved, NONE);
+
+        // The static `loads` helper decodes the same HYD1 text.
+        let decoded = method(instance, "loads", &[string(&text)]);
+        assert!(!exc::pending(), "inherited loads: {}", message());
+        assert_eq!(value::repr(decoded), value::repr(payload));
+
+        // Keyword construction through the module call path binds the
+        // declared constructor options (`Unpickler(fd, fix_imports=...)`).
+        let keyword_stream = call(
+            "io",
+            "BytesIO",
+            &[value::bytes_new(text.as_bytes().to_vec())],
+        );
+        let keyword_reader = call_kw(
+            "pickle",
+            "Unpickler",
+            &[keyword_stream],
+            &[
+                ("fix_imports", TRUE),
+                ("encoding", string("UTF-8")),
+                ("errors", string("strict")),
+            ],
+        );
+        assert!(!exc::pending(), "Unpickler kwargs: {}", message());
+        assert_eq!(
+            value::repr(method(keyword_reader, "load", &[])),
+            value::repr(payload)
+        );
+
+        // A user subclass of the native class also binds constructor keywords
+        // through the inherited native `__init__` (the class-call keyword
+        // path); pandas' compat reader constructs itself this way.
+        let subclass_stream = call(
+            "io",
+            "BytesIO",
+            &[value::bytes_new(text.as_bytes().to_vec())],
+        );
+        let values = [subclass_stream];
+        let names = [string("fix_imports"), string("encoding"), string("errors")];
+        let words = [
+            names[0],
+            TRUE,
+            names[1],
+            string("UTF-8"),
+            names[2],
+            string("strict"),
+        ];
+        let subclass_reader =
+            crate::builtins::call_kw(derived, values.len(), values.as_ptr(), 3, words.as_ptr());
+        assert!(!exc::pending(), "subclass kwargs: {}", message());
+        assert_eq!(
+            value::repr(method(subclass_reader, "load", &[])),
+            value::repr(payload)
+        );
+
+        // `persistent_load` is a real hook whose default raises the module's
+        // `UnpicklingError`.
+        exc::init();
+        assert_eq!(method(instance, "persistent_load", &[int(1)]), NONE);
+        assert_eq!(
+            value::as_exc_instance(exc::pending_value()).map(|state| state.class),
+            Some(pickle_exception_class("UnpicklingError"))
+        );
+        assert_eq!(message(), "unsupported persistent id encountered");
+
+        // CPython binary pickles are rejected with `UnpicklingError` naming
+        // the HYD1 mismatch; they are never silently accepted.
+        exc::init();
+        let binary = value::bytes_new(vec![0x80, 0x05, b'.']);
+        assert_eq!(call("pickle", "loads", &[binary]), NONE);
+        assert_eq!(
+            value::as_exc_instance(exc::pending_value()).map(|state| state.class),
+            Some(pickle_exception_class("UnpicklingError"))
+        );
+        assert!(message().contains("HYD1"), "{}", message());
+
+        // HYD1 payloads also decode from their UTF-8 `bytes` spelling.
+        // (Reset the pending error from the rejection case above: a
+        // successful decode does not clear it.)
+        exc::init();
+        let from_bytes = call(
+            "pickle",
+            "loads",
+            &[value::bytes_new(text.as_bytes().to_vec())],
+        );
+        assert!(!exc::pending(), "bytes loads: {}", message());
+        assert_eq!(value::repr(from_bytes), value::repr(payload));
+        heap::release_roots(derived_roots);
     }
 
     #[test]
@@ -29725,6 +33399,100 @@ mod tests {
     }
 
     #[test]
+    fn threading_barrier_trips_times_out_resets_and_aborts() {
+        fn invoke(obj: i64, method: &str, args: &[i64]) -> i64 {
+            let argv = if args.is_empty() {
+                std::ptr::null()
+            } else {
+                args.as_ptr()
+            };
+            crate::core::methods::call(obj, method.as_ptr(), method.len(), args.len(), argv)
+        }
+
+        fn attribute(obj: i64, name: &str) -> i64 {
+            crate::core::methods::getattr(obj, name.as_ptr(), name.len())
+        }
+
+        static ACTION_CALLS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn action(_argv: *const i64) -> i64 {
+            ACTION_CALLS.fetch_add(1, Ordering::SeqCst);
+            NONE
+        }
+
+        exc::init();
+        // `threading.Barrier` is the cached class; a module call constructs an
+        // instance through the class and runs the native `__init__`.
+        let class = get("threading", "Barrier");
+        assert!(value::as_class(class).is_some(), "Barrier must be a class");
+        let action = value::function_new(action as *const () as usize, 0, "action".to_string());
+        let barrier = call("threading", "Barrier", &[int(1), action]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(value::type_class(barrier), class);
+        assert_eq!(as_int(attribute(barrier, "parties")), 1);
+        assert_eq!(as_int(attribute(barrier, "n_waiting")), 0);
+        assert_eq!(attribute(barrier, "broken"), FALSE);
+
+        // A one-party barrier trips immediately: index 0, action first.
+        assert_eq!(as_int(invoke(barrier, "wait", &[])), 0);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(ACTION_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(as_int(attribute(barrier, "n_waiting")), 0);
+        assert_eq!(attribute(barrier, "broken"), FALSE);
+
+        // A lone waiter of a two-party barrier times out, breaks the barrier
+        // and raises `BrokenBarrierError` (a `RuntimeError` subclass).
+        let barrier = call("threading", "Barrier", &[int(2), NONE, NONE]);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(as_int(attribute(barrier, "parties")), 2);
+        invoke(barrier, "wait", &[value::float_new(0.02)]);
+        assert!(exc::pending());
+        assert_eq!(exc::pending_tag(), RUNTIME_ERROR as i64);
+        assert_eq!(
+            value::type_class(exc::pending_value()),
+            get("threading", "BrokenBarrierError")
+        );
+        exc::clear();
+        assert_eq!(as_int(attribute(barrier, "n_waiting")), 0);
+        assert_eq!(attribute(barrier, "broken"), TRUE);
+
+        // `reset` returns the broken barrier to the initial state.
+        assert_eq!(invoke(barrier, "reset", &[]), NONE);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(attribute(barrier, "broken"), FALSE);
+
+        // `abort` breaks it and every later wait fails immediately.
+        assert_eq!(invoke(barrier, "abort", &[]), NONE);
+        assert_eq!(attribute(barrier, "broken"), TRUE);
+        invoke(barrier, "wait", &[]);
+        assert!(exc::pending());
+        assert_eq!(
+            value::type_class(exc::pending_value()),
+            get("threading", "BrokenBarrierError")
+        );
+        exc::clear();
+
+        // The spec exposes every native member the class binds.
+        for name in [
+            "Barrier",
+            "BrokenBarrierError",
+            "_barrier_init",
+            "_barrier_wait",
+            "_barrier_reset",
+            "_barrier_abort",
+            "_barrier_parties",
+            "_barrier_n_waiting",
+            "_barrier_broken",
+        ] {
+            let exposed = if stdlib::function("threading", name).is_some() {
+                true
+            } else {
+                stdlib::constant("threading", name).is_some()
+            };
+            assert!(exposed, "{name} missing from the threading spec");
+        }
+    }
+
+    #[test]
     fn sidecar_spec_and_runtime_dispatch_agree() {
         exc::init();
         let spec = stdlib::module("_hydro_sidecar").expect("_hydro_sidecar spec");
@@ -30149,6 +33917,35 @@ mod tests {
     }
 
     #[test]
+    fn sys_getrefcount_reports_the_single_reference_count() {
+        exc::init();
+        // A live heap object referenced from this frame: CPython 3.14 reports
+        // 2 here (the frame slot plus the argument slot).
+        let marker = value::list_new(Vec::new());
+        assert_eq!(as_int(call("sys", "getrefcount", &[marker])), 2);
+        assert!(!exc::pending(), "{}", message());
+        // The answer is the single-stored-reference count, not a fabricated
+        // ownership total: repeated observations are stable and never raise.
+        assert_eq!(as_int(call("sys", "getrefcount", &[marker])), 2);
+        // Any value is accepted, including untagged singletons and ints.
+        assert_eq!(as_int(call("sys", "getrefcount", &[NONE])), 2);
+        assert_eq!(as_int(call("sys", "getrefcount", &[int(1)])), 2);
+        assert!(!exc::pending(), "{}", message());
+        // Arity errors keep CPython's message and never fabricate a count.
+        call("sys", "getrefcount", &[]);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+        call("sys", "getrefcount", &[marker, marker]);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+        // The spec and the runtime dispatch agree on the exported name.
+        let spec = stdlib::function("sys", "getrefcount").expect("sys.getrefcount spec");
+        assert_eq!((spec.min_args, spec.max_args), (1, 1));
+        assert_eq!(spec.ret, hydro_ir::Type::Int);
+        assert_ne!(get("sys", "getrefcount"), NONE);
+    }
+
+    #[test]
     fn pickle_opcode_constants_are_the_published_surface() {
         exc::init();
         let all = pickle_all_list();
@@ -30174,6 +33971,25 @@ mod tests {
         // `pickletools.assure_pickle_consistency` validates the one-byte
         // values; `FALSE`/`TRUE` are the multi-byte legacy aliases it skips.
         assert_eq!(codes.len(), 68);
+        // pandas builds its compat dispatch table as
+        // `dispatch[pickle.REDUCE[0]] = load_reduce`; indexing the `bytes`
+        // constant must yield the opcode number (82 for `b'R'`).
+        let reduce = module_get_by_name("pickle", "REDUCE");
+        assert_eq!(
+            value::as_bytes(reduce).map(|bytes| bytes.to_vec()),
+            Some(b"R".to_vec())
+        );
+        assert_eq!(as_int(container::subscript(reduce, int(0))), 82);
+        let newobj = module_get_by_name("pickle", "NEWOBJ");
+        assert_eq!(as_int(container::subscript(newobj, int(0))), 0x81);
+        // The opcode names are part of the central spec so AOT attribute
+        // lookups (`pickle.REDUCE`) resolve statically.
+        for name in ["REDUCE", "NEWOBJ", "BUILD", "APPEND", "SETITEMS"] {
+            assert!(
+                hydro_ir::stdlib::constant("pickle", name).is_some(),
+                "{name} missing from the spec"
+            );
+        }
         assert!(!exc::pending());
     }
 
@@ -30369,8 +34185,14 @@ mod tests {
         assert_eq!(exc::pending_tag(), exc::IMPORT_ERROR as i64);
         exc::clear();
 
-        // `pickle._Pickler` is the cached `Pickler` class.
-        assert_eq!(get("pickle", "_Pickler"), get("pickle", "Pickler"));
+        // `pickle._Pickler` is the subclassable base class; `pickle.Pickler`
+        // derives from it (CPython's pure-Python `_Pickler` is likewise the
+        // base of the accelerated reader/writer hierarchy).
+        assert_ne!(get("pickle", "_Pickler"), get("pickle", "Pickler"));
+        assert!(value::is_subclass_of(
+            get("pickle", "Pickler"),
+            get("pickle", "_Pickler")
+        ));
 
         // `fnmatch._translate` returns (fragments, star_indices).
         let translated = call(
@@ -31035,6 +34857,37 @@ mod tests {
     }
 
     #[test]
+    fn http_status_members_str_repr_and_int_semantics() {
+        exc::init();
+        let class = get("http", "HTTPStatus");
+        assert!(value::as_class(class).is_some());
+        let ok = match value::class_lookup(class, "OK") {
+            Some(value::ClassEntry::Attr(member)) => member,
+            _ => panic!("HTTPStatus.OK missing"),
+        };
+        // Numeric semantics stay those of the wrapped int.
+        assert_eq!(value::as_integer(ok), Some(200));
+        // `str()`/`repr()` must not leak the tagged immediate (`200 << 3`).
+        assert_eq!(value::to_string(ok), "200");
+        assert_eq!(value::repr(ok), "<HTTPStatus.OK: 200>");
+        // `format()` follows int formatting, with and without a presentation
+        // type.
+        let formatted = crate::core::builtins::format_builtin(ok, string(""), 0);
+        assert_eq!(value::to_string(formatted), "200");
+        let decimal = crate::core::builtins::format_builtin(ok, string("d"), 0);
+        assert_eq!(value::to_string(decimal), "200");
+        // Aliases display the canonical member name, like CPython's IntEnum.
+        let alias = match value::class_lookup(class, "REQUEST_ENTITY_TOO_LARGE") {
+            Some(value::ClassEntry::Attr(member)) => member,
+            _ => panic!("HTTPStatus.REQUEST_ENTITY_TOO_LARGE missing"),
+        };
+        assert_eq!(value::as_integer(alias), Some(413));
+        assert_eq!(value::to_string(alias), "413");
+        assert_eq!(value::repr(alias), "<HTTPStatus.CONTENT_TOO_LARGE: 413>");
+        assert!(!exc::pending());
+    }
+
+    #[test]
     fn unittest_test_suite_container_and_run() {
         exc::init();
         let suite_class = get("unittest", "TestSuite");
@@ -31085,10 +34938,15 @@ mod tests {
         let derived = value::class_new("DerivedSuite".to_string(), suite_class, Vec::new());
         let derived_roots = heap::root_values(&[derived]);
         let instance = call_value(derived, &[]);
+        // The instance lives only in this Rust local; without an explicit
+        // root a collection triggered by the `addTest` call can reclaim it
+        // (the `derived` class is rooted, but the instance is not).
+        let instance_roots = heap::root_values(std::slice::from_ref(&instance));
         heap::release_roots(derived_roots);
         assert_eq!(as_int(crate::builtins::len(instance)), 0);
         assert_eq!(method(instance, "addTest", &[first]), NONE);
         assert_eq!(as_int(crate::builtins::len(instance)), 1);
+        heap::release_roots(instance_roots);
 
         // Counts aggregate recursively through nested suites.
         let nested_list = value::list_new(vec![first, second]);
@@ -31114,8 +34972,10 @@ mod tests {
         heap::release_roots(run_roots);
         assert!(!exc::pending());
 
-        // A native `TestCase` has no `run(result)`, so running one raises
-        // `TypeError` instead of pretending the test ran.
+        // A native `TestCase` now implements `run(result)`, so running one
+        // with a non-result object reports the same error CPython does:
+        // `TestCase.run` asks the result object for `startTest`, which a
+        // string does not have.
         let cases_list = value::list_new(vec![first]);
         let roots = heap::root_values(&[cases_list]);
         let cases = call_value(suite_class, &[cases_list]);
@@ -31123,6 +34983,215 @@ mod tests {
         let run_roots = heap::root_values(&[cases, result]);
         assert_eq!(method(cases, "run", &[result]), NONE);
         heap::release_roots(run_roots);
-        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+    }
+
+    #[test]
+    fn csv_dialect_registry_round_trips() {
+        // The built-in dialects always exist.
+        let listed = call("csv", "list_dialects", &[]);
+        let names: Vec<String> = value::as_list(listed)
+            .expect("list_dialects returns a list")
+            .iter()
+            .filter_map(|item| value::as_str(*item).map(str::to_string))
+            .collect();
+        for builtin in ["excel", "excel-tab", "unix"] {
+            assert!(
+                names.iter().any(|name| name.as_str() == builtin),
+                "missing built-in dialect {builtin}"
+            );
+        }
+
+        // Registering with format parameters stores a real dialect.
+        let name = string("hydro-dialect-test");
+        assert_eq!(
+            call_kw(
+                "csv",
+                "register_dialect",
+                &[name],
+                &[("delimiter", string(";")), ("skipinitialspace", TRUE)]
+            ),
+            NONE
+        );
+        assert!(!exc::pending(), "register_dialect failed: {}", message());
+        let dialect = call("csv", "get_dialect", &[name]);
+        assert!(!exc::pending(), "get_dialect failed: {}", message());
+        assert_eq!(value::as_str(attribute(dialect, "delimiter")), Some(";"));
+        assert_eq!(value::as_integer(attribute(dialect, "quoting")), Some(0));
+        assert_eq!(attribute(dialect, "skipinitialspace"), TRUE);
+
+        let listed = call("csv", "list_dialects", &[]);
+        let names: Vec<String> = value::as_list(listed)
+            .expect("list_dialects returns a list")
+            .iter()
+            .filter_map(|item| value::as_str(*item).map(str::to_string))
+            .collect();
+        assert!(names
+            .iter()
+            .any(|registered| registered.as_str() == "hydro-dialect-test"));
+
+        // A registered string base contributes its values; format parameters
+        // override them.
+        let unix_base = string("unix");
+        let custom = string("hydro-unix-test");
+        assert_eq!(
+            call_kw(
+                "csv",
+                "register_dialect",
+                &[custom, unix_base],
+                &[("quoting", int(0))]
+            ),
+            NONE
+        );
+        let dialect = call("csv", "get_dialect", &[custom]);
+        assert_eq!(
+            value::as_str(attribute(dialect, "lineterminator")),
+            Some("\n")
+        );
+        assert_eq!(value::as_integer(attribute(dialect, "quoting")), Some(0));
+
+        // A dialect class contributes every attribute it defines.
+        let base = get("csv", "Dialect");
+        let class_name = string("hydro-class-dialect");
+        let pipe = string("|");
+        let all_quoting = int(1);
+        let attr_roots = heap::root_values(&[pipe, all_quoting]);
+        let derived = value::class_new_full(
+            "HydroDialect".to_string(),
+            base,
+            Vec::new(),
+            vec![
+                ("delimiter".to_string(), pipe),
+                ("quoting".to_string(), all_quoting),
+            ],
+        );
+        let derived_roots = heap::root_values(std::slice::from_ref(&derived));
+        assert_eq!(
+            call("csv", "register_dialect", &[class_name, derived]),
+            NONE
+        );
+        assert!(!exc::pending(), "class registration failed: {}", message());
+        let dialect = call("csv", "get_dialect", &[class_name]);
+        assert_eq!(value::as_str(attribute(dialect, "delimiter")), Some("|"));
+        assert_eq!(value::as_integer(attribute(dialect, "quoting")), Some(1));
+        // Attributes the class leaves undefined fall back to `excel`.
+        assert_eq!(
+            value::as_str(attribute(dialect, "lineterminator")),
+            Some("\r\n")
+        );
+        heap::release_roots(derived_roots);
+        heap::release_roots(attr_roots);
+
+        // Unregister removes the entry; an unknown name raises csv.Error.
+        for registered in [name, custom, class_name] {
+            assert_eq!(call("csv", "unregister_dialect", &[registered]), NONE);
+        }
+        assert!(!exc::pending());
+        assert_eq!(call("csv", "get_dialect", &[name]), NONE);
+        assert!(exc::pending());
+        assert_eq!(message(), "unknown dialect");
+        exc::clear();
+        assert_eq!(call("csv", "unregister_dialect", &[name]), NONE);
+        assert!(exc::pending());
+        assert_eq!(message(), "unknown dialect");
+        exc::clear();
+    }
+
+    #[test]
+    fn csv_field_size_limit_round_trips() {
+        let current = as_int(call("csv", "field_size_limit", &[]));
+        assert_eq!(current, 131_072);
+        let previous = call("csv", "field_size_limit", &[int(4096)]);
+        assert!(!exc::pending());
+        assert_eq!(as_int(previous), 131_072);
+        assert_eq!(as_int(call("csv", "field_size_limit", &[])), 4096);
+        assert_eq!(
+            as_int(call("csv", "field_size_limit", &[int(current)])),
+            4096
+        );
+    }
+
+    #[test]
+    fn csv_sniffer_detects_a_delimiter() {
+        let sniffer = call_value(get("csv", "Sniffer"), &[]);
+        assert!(!exc::pending(), "Sniffer() failed: {}", message());
+        let sample = string("a;b;c\n1;2;3\n");
+        let dialect = method(sniffer, "sniff", &[sample]);
+        assert!(!exc::pending(), "sniff failed: {}", message());
+        assert_eq!(value::as_str(attribute(dialect, "delimiter")), Some(";"));
+        // No candidate occurs: a real csv.Error.
+        let sample = string("abc\n");
+        assert_eq!(method(sniffer, "sniff", &[sample]), NONE);
+        assert!(exc::pending());
+        assert_eq!(message(), "Could not determine delimiter");
+        exc::clear();
+    }
+
+    #[test]
+    fn csv_dialect_parser_supports_delimiter_escape_and_space() {
+        let mut dialect = CsvDialect::excel();
+        dialect.delimiter = ';';
+        dialect.skipinitialspace = true;
+        dialect.escapechar = Some('\\');
+        dialect.quoting = 3; // QUOTE_NONE
+        assert_eq!(
+            csv_parse_rows("a; b;c\\;d\n", &dialect),
+            Ok(vec![vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c;d".to_string(),
+            ]])
+        );
+
+        // Quoted fields keep embedded delimiters and newlines.
+        let mut quoted = CsvDialect::excel();
+        quoted.delimiter = ';';
+        assert_eq!(
+            csv_parse_rows("\"a;b\";\"c\nd\"\n", &quoted),
+            Ok(vec![vec!["a;b".to_string(), "c\nd".to_string()]])
+        );
+
+        // An unbalanced quote is a parse error (reported as `csv.Error` by
+        // the reader entry point).
+        assert!(csv_parse_rows("\"a", &quoted).is_err());
+    }
+
+    #[test]
+    fn csv_reader_honours_dialect_keywords() {
+        let dir = temp_root("csv-dialect-reader");
+        let separated = dir.join("separated.csv");
+        std::fs::write(&separated, "a;b\n1;2\n").expect("write csv fixture");
+        let path = string(separated.to_str().expect("UTF-8 temp path"));
+        let file = call("io", "open", &[path, string("r")]);
+        assert!(!exc::pending(), "open failed: {}", message());
+        let reader = call_kw("csv", "reader", &[file], &[("delimiter", string(";"))]);
+        assert!(!exc::pending(), "reader failed: {}", message());
+        let row = crate::csv::reader_item(reader).expect("first record");
+        let fields = value::as_list(row).expect("reader row is a list");
+        assert_eq!(value::as_str(fields[0]), Some("a"));
+        assert_eq!(value::as_str(fields[1]), Some("b"));
+
+        // A dialect class is accepted: the class attributes seed the parser.
+        let piped = dir.join("piped.csv");
+        std::fs::write(&piped, "x|y\n").expect("write piped fixture");
+        let piped_path = string(piped.to_str().expect("UTF-8 temp path"));
+        let pipe = string("|");
+        let attr_roots = heap::root_values(std::slice::from_ref(&pipe));
+        let derived = value::class_new_full(
+            "PipeDialect".to_string(),
+            get("csv", "Dialect"),
+            Vec::new(),
+            vec![("delimiter".to_string(), pipe)],
+        );
+        let derived_roots = heap::root_values(std::slice::from_ref(&derived));
+        let file = call("io", "open", &[piped_path, string("r")]);
+        let reader = call_kw("csv", "reader", &[file], &[("dialect", derived)]);
+        assert!(!exc::pending(), "class dialect failed: {}", message());
+        let row = crate::csv::reader_item(reader).expect("first record");
+        let fields = value::as_list(row).expect("reader row is a list");
+        assert_eq!(value::as_str(fields[0]), Some("x"));
+        assert_eq!(value::as_str(fields[1]), Some("y"));
+        heap::release_roots(derived_roots);
+        heap::release_roots(attr_roots);
     }
 }

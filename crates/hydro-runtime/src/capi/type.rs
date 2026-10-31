@@ -767,12 +767,23 @@ pub(crate) static mut TRACEBACK_TYPE: TypeObject = TypeObject::builtin(
     TypeRole::Shim,
     PY_TPFLAGS_IMMUTABLETYPE,
 );
-/// `PyObject_Type` is referenced by some vendored extension code even though
-/// CPython itself only exports `PyBaseObject_Type`. Export a real type object
-/// so such code links; this host never stores it in an `ob_type`.
-#[export_name = "PyObject_Type"]
-pub(crate) static mut OBJECT_ALIAS_TYPE: TypeObject =
-    TypeObject::builtin(c"object".as_ptr(), TypeRole::Shim, PY_TPFLAGS_IMMUTABLETYPE);
+/// `PyObject_Type`: a new reference to `object`'s type, as CPython exports it.
+///
+/// CPython exports `PyObject_Type` as a *function* (`PyBaseObject_Type` is the
+/// data symbol naming `object`); extensions such as NumPy call it through the
+/// host's dynamic symbol table, so exporting a type object under this name
+/// made those calls jump into data and crash. `NULL` matches CPython's
+/// `null_error`: `SystemError` and no result.
+#[no_mangle]
+pub extern "C" fn PyObject_Type(object: *mut ShimObject) -> *mut ShimObject {
+    if object.is_null() {
+        set_error("SystemError: null argument to internal routine");
+        return ptr::null_mut();
+    }
+    let type_object = type_of(object);
+    inc_ref(type_object as *mut ShimObject);
+    type_object as *mut ShimObject
+}
 
 /// `types.GenericAlias`, the type of the objects `Py_GenericAlias` returns.
 /// Its `tp_repr`, `tp_str`, `__origin__` and `__args__` are provided by
@@ -881,7 +892,7 @@ pub(crate) fn datetime_capi_type_for(value: i64) -> Option<*mut TypeObject> {
 }
 
 /// Every static builtin type, used to patch the metatype link.
-fn builtin_type_pointers() -> [*mut TypeObject; 48] {
+fn builtin_type_pointers() -> [*mut TypeObject; 47] {
     [
         ptr::addr_of_mut!(TYPE_TYPE),
         ptr::addr_of_mut!(OBJECT_TYPE),
@@ -919,7 +930,6 @@ fn builtin_type_pointers() -> [*mut TypeObject; 48] {
         ptr::addr_of_mut!(CLASSMETHOD_TYPE),
         ptr::addr_of_mut!(DICT_PROXY_TYPE),
         ptr::addr_of_mut!(TRACEBACK_TYPE),
-        ptr::addr_of_mut!(OBJECT_ALIAS_TYPE),
         ptr::addr_of_mut!(GENERIC_ALIAS_TYPE),
         ptr::addr_of_mut!(SEQITER_TYPE),
         ptr::addr_of_mut!(CONTEXT_VAR_TYPE),
@@ -963,6 +973,72 @@ fn is_internal_type(type_object: *mut TypeObject) -> bool {
         .contains(&(type_object as usize))
 }
 
+/// Addresses of type objects that may serve as a metatype: `type` itself and
+/// every ready class that derives from it.
+///
+/// CPython's `PyType_Check` accepts a class whose `ob_type` is a subclass of
+/// `type` (`Py_TYPE(op)->tp_flags & Py_TPFLAGS_TYPE_SUBCLASS`), and extensions
+/// rely on it: `Py_SET_TYPE(&PyArrayDescr_Type, &PyArrayDTypeMeta_Type)` makes
+/// every NumPy dtype class an instance of `PyArrayDTypeMeta_Type`. Only
+/// classes that derive from `type` enter this registry, so an ordinary
+/// instance's class (a plain type) and a Hydro class handle's synthetic
+/// metatype never make the handle look like a C type object.
+static METATYPE_ADDRESSES: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn remember_metatype(type_object: *mut TypeObject) {
+    if !type_object.is_null() {
+        METATYPE_ADDRESSES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(type_object as usize);
+    }
+}
+
+fn is_remembered_metatype(type_object: *mut TypeObject) -> bool {
+    !type_object.is_null()
+        && METATYPE_ADDRESSES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&(type_object as usize))
+}
+
+/// Drops a heap metatype from the registry when its type is freed, so a later
+/// allocation that reuses the address starts unregistered.
+fn forget_metatype(type_object: *mut TypeObject) {
+    if !type_object.is_null() {
+        METATYPE_ADDRESSES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(type_object as usize));
+    }
+}
+
+/// True when `candidate` may be the `ob_type` of a type object: `type` itself
+/// or a class this host readied that derives from it (an extension metaclass
+/// such as `PyArrayDTypeMeta_Type`).
+pub(crate) fn is_metatype_object(candidate: *mut TypeObject) -> bool {
+    candidate == ptr::addr_of_mut!(TYPE_TYPE) || is_remembered_metatype(candidate)
+}
+
+/// Records `type_object` as a usable metatype when it derives from `type`.
+///
+/// A Shim-role table is excluded: the synthetic metatype of a Hydro class
+/// handle carries `Py_TPFLAGS_TYPE_SUBCLASS` so extensions accept the handle
+/// through `PyType_Check`, but it is not a C type table and must not turn the
+/// handle into one.
+fn publish_metatype(type_object: *mut TypeObject) {
+    // SAFETY: callers pass live type objects.
+    unsafe {
+        if (*type_object).role == TypeRole::Shim
+            || (*type_object).tp_flags & PY_TPFLAGS_TYPE_SUBCLASS == 0
+        {
+            return;
+        }
+    }
+    remember_metatype(type_object);
+}
+
 /// `object.__init__`: accepts any arguments and does nothing.
 extern "C" fn object_init(
     _self: *mut ShimObject,
@@ -981,6 +1057,9 @@ pub(crate) fn ensure_builtin_types() {
             (*pointer).ob_type = metatype;
         }
         (*metatype).ob_type = metatype;
+        // Every builtin type names `type` as its metatype, and `type` names
+        // itself; extensions may name it again on their own static types.
+        remember_metatype(metatype);
         let object = ptr::addr_of_mut!(OBJECT_TYPE);
         (*metatype).tp_base = object;
         for pointer in builtin_type_pointers() {
@@ -1029,7 +1108,19 @@ pub(crate) fn ensure_builtin_types() {
     });
 }
 
-/// True when `object` is a type object (its `ob_type` is the shared metatype).
+/// True when `object` is a type object.
+///
+/// A type object is either an instance of this host's shared metatype
+/// (`ob_type == &PyType_Type`) or a class whose metatype is a metaclass this
+/// host readied, exactly as CPython's `PyType_Check` accepts any `ob_type`
+/// carrying `Py_TPFLAGS_TYPE_SUBCLASS`. NumPy readies
+/// `PyArrayDTypeMeta_Type` and points its dtype classes at it, so the second
+/// branch is what keeps `PyObject_TypeCheck(Float16DType,
+/// &PyArrayDTypeMeta_Type)` and `PyType_Check(dtype class)` true here.
+///
+/// The metatype must be registered by `ensure_ready`, so an ordinary instance
+/// (whose class is not a metaclass) and a Hydro class handle (whose synthetic
+/// metatype is never registered) are still rejected.
 pub(crate) fn is_type_pointer(object: *mut ShimObject) -> bool {
     if object.is_null()
         || (object as usize) < std::mem::align_of::<ShimObject>()
@@ -1042,7 +1133,8 @@ pub(crate) fn is_type_pointer(object: *mut ShimObject) -> bool {
     // SAFETY: every object this host hands out starts with `PyObject_HEAD`, so
     // `ob_type` is readable. A random pointer is as unsupported here as it is
     // in CPython.
-    unsafe { (*candidate).ob_type == ptr::addr_of_mut!(TYPE_TYPE) }
+    let metatype = unsafe { (*candidate).ob_type };
+    metatype == ptr::addr_of_mut!(TYPE_TYPE) || is_metatype_object(metatype)
 }
 
 /// Validates that `object` is a type object and returns it.
@@ -1064,6 +1156,20 @@ pub(crate) fn type_of(object: *mut ShimObject) -> *mut TypeObject {
     }
     // SAFETY: see `is_type_pointer`.
     unsafe { (*object).head.ob_type }
+}
+
+/// Python-visible name of the metatype of a class object (`type`, or an
+/// extension's metaclass such as NumPy's `numpy._DTypeMeta`).
+///
+/// `type(cls)` reports the metatype, so a class crossing the C boundary must
+/// be labelled with that name rather than with its own.
+pub(crate) fn metatype_name(object: *mut ShimObject) -> String {
+    let metatype = type_of(object);
+    if metatype.is_null() {
+        "type".to_string()
+    } else {
+        type_name(metatype)
+    }
 }
 
 /// Reads a type's `tp_name` as a Rust string.
@@ -1800,11 +1906,48 @@ pub(crate) fn type_from_spec(
             &format!("type '{name}'"),
         )?;
     }
+    let mut declared_dictoffset: isize = 0;
     if slots.members != 0 {
-        read_member_table(
+        let entries = read_member_table(
             slots.members as *mut PyMemberDefMirror,
             &format!("type '{name}'"),
         )?;
+        for &entry in &entries {
+            // SAFETY: entries point into the validated, terminated table.
+            let (member_name, member_type, member_flags, member_offset) = unsafe {
+                (
+                    read_c_string((*entry).name),
+                    (*entry).type_,
+                    (*entry).flags,
+                    (*entry).offset,
+                )
+            };
+            if member_name != "__dictoffset__" {
+                continue;
+            }
+            // CPython reads the declared dict offset from this pseudo-member
+            // (`special_offset_from_member`); it is the only way a heap type
+            // created by `PyType_FromSpec` can reserve an inline `__dict__`.
+            if member_type != T_PYSSIZET {
+                return Err(format!(
+                    "SystemError: type '{name}' member '__dictoffset__' must be Py_T_PYSSIZET"
+                ));
+            }
+            if member_flags == READONLY {
+                declared_dictoffset = member_offset;
+            } else if member_flags == READONLY | RELATIVE_OFFSET {
+                return Err(format!(
+                    "SystemError: type '{name}' member '__dictoffset__' uses Py_RELATIVE_OFFSET, \
+                     which requires a negative basicsize; this host does not support negative \
+                     basicsizes"
+                ));
+            } else {
+                return Err(format!(
+                    "SystemError: type '{name}' member '__dictoffset__' flags must be \
+                     Py_READONLY or (Py_READONLY | Py_RELATIVE_OFFSET)"
+                ));
+            }
+        }
     }
 
     // C3 linearisation of the bases. The new type is prepended later when the
@@ -1816,6 +1959,16 @@ pub(crate) fn type_from_spec(
         // SAFETY: every base was validated as a live type pointer above.
         flags | (unsafe { (*base).tp_flags } & PY_TPFLAGS_BUILTIN_SUBCLASSES)
     });
+
+    if declared_dictoffset != 0 {
+        let slot = std::mem::size_of::<*mut c_void>() as isize;
+        if declared_dictoffset < 0 || declared_dictoffset.saturating_add(slot) > basicsize {
+            return Err(format!(
+                "TypeError: PyType_FromSpec: type '{name}' declares __dictoffset__ \
+                 {declared_dictoffset}, which does not fit in its {basicsize}-byte instance"
+            ));
+        }
+    }
 
     let name_c = CString::new(name.as_str())
         .map_err(|_| "TypeError: PyType_FromSpec: type name contains a NUL".to_string())?;
@@ -1840,6 +1993,7 @@ pub(crate) fn type_from_spec(
     type_object.tp_itemsize = itemsize;
     type_object.tp_doc = doc_c.map_or(ptr::null(), |doc| doc.into_raw() as *const c_char);
     type_object.owns_name = true;
+    type_object.tp_dictoffset = declared_dictoffset;
     type_object.tp_flags |= inherited_subclass_flags;
     type_object.tp_methods = slots.methods as *mut PyMethodDefMirror;
     type_object.tp_members = slots.members as *mut c_void;
@@ -2154,6 +2308,12 @@ pub(crate) fn free_type_object(type_object: *mut TypeObject) {
         let bases = (*type_object).tp_bases;
         let base = (*type_object).tp_base;
         let mro = (*type_object).tp_mro;
+        // `PyType_FromMetaclass` takes a reference to the metaclass it links,
+        // exactly as CPython's `type_dealloc` releases `Py_TYPE(type)`; a
+        // heap type created by `PyType_FromSpec` keeps the immortal shared
+        // metatype instead.
+        let metatype = (*type_object).ob_type;
+        let owns_metatype = !metatype.is_null() && metatype != ptr::addr_of_mut!(TYPE_TYPE);
         let owns_name = (*type_object).owns_name;
         let owns_buffer = (*type_object).owns_buffer;
         let name = (*type_object).tp_name;
@@ -2180,6 +2340,7 @@ pub(crate) fn free_type_object(type_object: *mut TypeObject) {
                 drop(Box::from_raw(suites as *mut MethodSuites));
             }
         }
+        forget_metatype(type_object);
         let _ = Box::from_raw(type_object);
         // Release the type's strong references after its own memory is gone;
         // `dec_ref` may recursively free types and must not see a dropped box.
@@ -2194,6 +2355,9 @@ pub(crate) fn free_type_object(type_object: *mut TypeObject) {
         }
         if let Some(module) = associated_module {
             dec_ref(module as *mut ShimObject);
+        }
+        if owns_metatype {
+            dec_ref(metatype as *mut ShimObject);
         }
     }
 }
@@ -2271,6 +2435,38 @@ fn static_ancestors(type_object: *mut TypeObject) -> Result<Vec<*mut TypeObject>
         current = unsafe { (*current).tp_base };
     }
     Ok(chain)
+}
+
+/// Copies CPython's `inherit_special` fast-subclass marker from the base
+/// chain into an adopted static type.
+///
+/// `PyType_Check` and the other `Py*_Check` macros read these bits straight
+/// out of a type's `tp_flags`, so a static C subclass of `type` (NumPy's
+/// `PyArrayDTypeMeta_Type`) or of an exception must publish the same marker
+/// CPython would set in `inherit_special`. Exactly one marker is inherited,
+/// tried in CPython's order; ancestors are already ready and therefore carry
+/// the marker they inherited themselves.
+fn inherit_static_subclass_flags(type_object: *mut TypeObject, ancestors: &[*mut TypeObject]) {
+    for marker in [
+        PY_TPFLAGS_BASE_EXC_SUBCLASS,
+        PY_TPFLAGS_TYPE_SUBCLASS,
+        PY_TPFLAGS_LONG_SUBCLASS,
+        PY_TPFLAGS_BYTES_SUBCLASS,
+        PY_TPFLAGS_UNICODE_SUBCLASS,
+        PY_TPFLAGS_TUPLE_SUBCLASS,
+        PY_TPFLAGS_LIST_SUBCLASS,
+        PY_TPFLAGS_DICT_SUBCLASS,
+    ] {
+        // SAFETY: every entry was validated by `static_ancestors`.
+        let inherited = ancestors
+            .iter()
+            .any(|&ancestor| unsafe { (*ancestor).tp_flags } & marker != 0);
+        if inherited {
+            // SAFETY: live type object.
+            unsafe { (*type_object).tp_flags |= marker };
+            return;
+        }
+    }
 }
 
 /// Copies the slots CPython inherits from the base chain into an unset static
@@ -2391,6 +2587,9 @@ pub(crate) fn ensure_ready(type_object: *mut TypeObject) -> Result<(), String> {
     // pointer this module allocated.
     unsafe {
         if (*type_object).tp_flags & PY_TPFLAGS_READY != 0 {
+            // A type an extension pre-marked ready may still name itself as
+            // another type's metatype; publishing is idempotent.
+            publish_metatype(type_object);
             return Ok(());
         }
         if (*type_object).role == TypeRole::Instance {
@@ -2435,6 +2634,7 @@ pub(crate) fn ensure_ready(type_object: *mut TypeObject) -> Result<(), String> {
             // pass in `type_from_spec`.
             if (*type_object).tp_bases.is_null() {
                 let ancestors = static_ancestors(type_object)?;
+                inherit_static_subclass_flags(type_object, &ancestors);
                 inherit_static_slots(type_object, &ancestors);
                 if !(*type_object).tp_base.is_null() {
                     fill_static_type_metadata(type_object, &ancestors)?;
@@ -2472,6 +2672,11 @@ pub(crate) fn ensure_ready(type_object: *mut TypeObject) -> Result<(), String> {
             }
         }
         (*type_object).tp_flags |= PY_TPFLAGS_READY;
+        // Every class that derives from `type` may be named as the metatype of
+        // another type object (`Py_SET_TYPE(&Cls, &Meta)`, or NumPy pointing
+        // its dtype classes at `PyArrayDTypeMeta_Type`). Record it now that
+        // the inherited `Py_TPFLAGS_TYPE_SUBCLASS` marker is in place.
+        publish_metatype(type_object);
     }
     Ok(())
 }
@@ -2538,6 +2743,10 @@ pub(crate) fn free_instance(object: *mut ShimObject) {
                 std::mem::transmute((*type_object).tp_clear as *const c_void);
             clear(object);
         }
+        // The instance may still own a `__dict__` that its `tp_clear` did not
+        // release (a non-GC type, or a clear that only breaks other edges).
+        // Dropping the slot here keeps instance attributes from leaking.
+        release_instance_dict(object);
         if (*type_object).tp_free != 0 {
             let free: unsafe extern "C" fn(*mut c_void) =
                 std::mem::transmute((*type_object).tp_free as *const c_void);
@@ -2547,6 +2756,177 @@ pub(crate) fn free_instance(object: *mut ShimObject) {
         }
         if flags & PY_TPFLAGS_HEAPTYPE != 0 {
             dec_ref(type_object as *mut ShimObject);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Instance dictionaries
+// ---------------------------------------------------------------------------
+//
+// CPython types may reserve one pointer-sized slot for an instance
+// `__dict__` and publish its offset in `tp_dictoffset`. The slot is part of the
+// extension's own instance layout (NumPy's `_ArrayFunctionDispatcher` stores
+// its `dict` member there), so the host must not keep the dictionary anywhere
+// else: extension code reads and writes the slot directly, and the default
+// `__dict__` getset (`PyObject_GenericGetDict`/`PyObject_GenericSetDict`)
+// hands out the dictionary stored in it.
+//
+// The slot stores an owned `PyObject *` (NULL until the dictionary is first
+// materialised). It is released by the default deallocator; a type that
+// installs its own `tp_dealloc` owns that duty, exactly as in CPython.
+
+/// Returns the address of the instance `__dict__` slot declared by
+/// `tp_dictoffset`, if this object's type has one.
+///
+/// A positive offset is measured from the start of the object; a negative
+/// offset is relative to the end of the (variable-sized) payload, matching
+/// CPython's `_PyObject_ComputedDictPointer`. Types using
+/// `Py_TPFLAGS_MANAGED_DICT` keep the dictionary outside the instance and have
+/// no inline slot, so they report `None` here.
+///
+/// A slot that is out of bounds or misaligned is rejected: writing through it
+/// would corrupt unrelated memory, and a C type with such a declaration is
+/// broken just as it would be under CPython.
+pub(crate) fn instance_dict_pointer(object: *mut ShimObject) -> Option<*mut *mut ShimObject> {
+    if object.is_null() {
+        return None;
+    }
+    let type_object = type_of(object);
+    if type_object.is_null() {
+        return None;
+    }
+    // SAFETY: the caller owns a live handle; the type is a live type object.
+    let (role, flags, basicsize, itemsize, raw_offset) = unsafe {
+        (
+            (*type_object).role,
+            (*type_object).tp_flags,
+            (*type_object).tp_basicsize,
+            (*type_object).tp_itemsize,
+            (*type_object).tp_dictoffset,
+        )
+    };
+    if role != TypeRole::Instance
+        || flags & PY_TPFLAGS_MANAGED_DICT != 0
+        || raw_offset == 0
+        || basicsize < PY_OBJECT_HEAD_SIZE as isize
+    {
+        return None;
+    }
+    let base = usize::try_from(basicsize).ok()?;
+    let payload = if itemsize > 0 {
+        // SAFETY: `ob_size` is inside the PyVarObject header of every handle.
+        let nitems = unsafe { (*object).ob_size.load(Ordering::Relaxed) };
+        (itemsize as usize).checked_mul(nitems.unsigned_abs())?
+    } else {
+        0
+    };
+    let size = base.checked_add(payload)?;
+    let pointer_size = std::mem::size_of::<usize>();
+    let offset = if raw_offset > 0 {
+        usize::try_from(raw_offset).ok()?
+    } else {
+        // CPython measures a negative offset from the end of the variable
+        // part, rounded up to a pointer boundary.
+        let rounded = size.checked_add(pointer_size - 1)? & !(pointer_size - 1);
+        let from_end = isize::try_from(rounded).ok()?.checked_add(raw_offset)?;
+        usize::try_from(from_end).ok()?
+    };
+    if offset < PY_OBJECT_HEAD_SIZE
+        || offset % std::mem::align_of::<*mut ShimObject>() != 0
+        || offset.checked_add(std::mem::size_of::<*mut ShimObject>())? > size
+    {
+        return None;
+    }
+    // SAFETY: the slot lies inside the instance allocation, which is at least
+    // `basicsize + itemsize * |ob_size|` bytes.
+    Some(unsafe { (object as *mut u8).add(offset) as *mut *mut ShimObject })
+}
+
+/// Borrows an instance's materialised `__dict__`, if the type has a slot and
+/// the dictionary already exists.
+pub(crate) fn instance_dict(object: *mut ShimObject) -> Option<*mut ShimObject> {
+    let slot = instance_dict_pointer(object)?;
+    // SAFETY: `slot` points inside a live instance and stores an owned
+    // reference (NULL until first use).
+    let dict = unsafe { *slot };
+    (!dict.is_null()).then_some(dict)
+}
+
+/// Returns the instance `__dict__`, creating an empty dictionary on first
+/// use and returning a borrowed reference, exactly like CPython's
+/// `ensure_nonmanaged_dict`.
+pub(crate) fn instance_dict_ensure(object: *mut ShimObject) -> Result<*mut ShimObject, String> {
+    let Some(slot) = instance_dict_pointer(object) else {
+        return Err("AttributeError: This object has no __dict__".to_string());
+    };
+    // SAFETY: `slot` points inside a live instance.
+    let existing = unsafe { *slot };
+    if !existing.is_null() {
+        return Ok(existing);
+    }
+    let dict = super::PyDict_New();
+    if dict.is_null() {
+        return Err(super::take_error()
+            .unwrap_or_else(|| "MemoryError: cannot allocate an instance dictionary".to_string()));
+    }
+    // SAFETY: the slot still belongs to this instance (no Python code ran in
+    // between), so publishing the new reference transfers its ownership.
+    unsafe { *slot = dict };
+    Ok(dict)
+}
+
+/// Stores `value` under `name` in the instance dictionary, or deletes the
+/// entry when `value` is NULL.
+///
+/// This is the generic `tp_setattro` tail: a data descriptor (member/getset)
+/// is consulted first, so reaching this point means the attribute belongs to
+/// the instance dictionary. A deletion of a missing name reports the same
+/// `AttributeError` CPython's `_PyObject_GenericSetAttrWithDict` produces.
+pub(crate) fn instance_dict_store(
+    object: *mut ShimObject,
+    name: &str,
+    value: *mut ShimObject,
+) -> Result<(), String> {
+    let dict = instance_dict_ensure(object)?;
+    let key = super::new_str(name.to_string());
+    let status = if value.is_null() {
+        super::PyDict_DelItem(dict, key)
+    } else {
+        super::PyDict_SetItem(dict, key, value)
+    };
+    super::dec_ref(key);
+    if status == 0 {
+        return Ok(());
+    }
+    let error = super::take_error()
+        .unwrap_or_else(|| "AttributeError: cannot update the instance dictionary".to_string());
+    if value.is_null() && error.starts_with("KeyError:") {
+        let type_object = type_of(object);
+        let object_type = if type_object.is_null() {
+            "<unknown>".to_string()
+        } else {
+            type_name(type_object)
+        };
+        return Err(format!(
+            "AttributeError: '{object_type}' object has no attribute '{name}'"
+        ));
+    }
+    Err(error)
+}
+
+/// Releases the instance `__dict__` slot during default deallocation.
+fn release_instance_dict(object: *mut ShimObject) {
+    let Some(slot) = instance_dict_pointer(object) else {
+        return;
+    };
+    // SAFETY: the slot belongs to the instance being deallocated, and no other
+    // reference to this instance can exist at this point.
+    unsafe {
+        let dict = *slot;
+        if !dict.is_null() {
+            *slot = ptr::null_mut();
+            dec_ref(dict);
         }
     }
 }
@@ -2696,11 +3076,11 @@ pub extern "C" fn PyType_FromSpecWithBases(
 /// Such an object starts with a NULL (or extension-chosen) `ob_type`;
 /// CPython's `PyType_Ready` makes it immortal, links the metatype and treats
 /// it as a normal static type. An aligned object whose metatype is NULL, this
-/// host's `type`, an allocated heap type, or a static type already adopted
-/// here, with a readable name and non-negative sizes, is adopted. Every other
-/// layout is rejected with a diagnostic instead of being written to, so a
-/// builtin instance handle or a corrupt pointer cannot be turned into a type
-/// by accident.
+/// host's `type`, or a metatype it already readied (`PyArrayDTypeMeta_Type`),
+/// with a readable name and non-negative sizes, is adopted. Every other layout
+/// is rejected with a diagnostic instead of being written to, so a builtin
+/// instance handle or a corrupt pointer cannot be turned into a type by
+/// accident.
 fn adopt_static_type(pointer: *mut TypeObject) -> Result<*mut TypeObject, String> {
     if pointer.is_null() {
         return Err("TypeError: PyType_Ready: type is NULL".to_string());
@@ -2716,15 +3096,15 @@ fn adopt_static_type(pointer: *mut TypeObject) -> Result<*mut TypeObject, String
     // every read below is inside the CPython prefix.
     let metatype = unsafe { (*pointer).ob_type };
     // CPython accepts any metatype; this host additionally requires the link
-    // to be one it can identify: NULL, its own metatype, an allocated heap
-    // type, or a static type an earlier `PyType_Ready` adopted (NumPy points
-    // `PyArrayDescr_Type` at its own `PyArrayDTypeMeta_Type` this way). An
-    // instance handle's class is a builtin value type, which is not in the
-    // registry, so `PyType_Ready(instance)` is still rejected.
-    let known_metatype = metatype.is_null()
-        || metatype == ptr::addr_of_mut!(TYPE_TYPE)
-        || is_internal_type(metatype);
-    if !known_metatype {
+    // to be one it can identify: NULL or its own metatype (both mean "link to
+    // `type`"), or a metatype an earlier `PyType_Ready` readied. NumPy relies
+    // on the last case: it readies `PyArrayDTypeMeta_Type`, then points
+    // `PyArrayDescr_Type` and every dtype class at it, and its inline
+    // `PyObject_TypeCheck(dtype, &PyArrayDTypeMeta_Type)` compares the class's
+    // own `ob_type` against that address. An instance handle's class is not a
+    // metatype, so `PyType_Ready(instance)` is still rejected.
+    let shared_metatype = metatype.is_null() || metatype == ptr::addr_of_mut!(TYPE_TYPE);
+    if !shared_metatype && !is_metatype_object(metatype) {
         return Err(format!(
             "TypeError: PyType_Ready: object at {address:#x} is not a static type object \
              (ob_type {metatype:p} is not a known type object)"
@@ -2748,7 +3128,12 @@ fn adopt_static_type(pointer: *mut TypeObject) -> Result<*mut TypeObject, String
     // internal tail lives in the struct's trailing padding, which the
     // extension's declaration also contains (sizeof(PyTypeObject) == 416).
     unsafe {
-        (*pointer).ob_type = ptr::addr_of_mut!(TYPE_TYPE);
+        if shared_metatype {
+            (*pointer).ob_type = ptr::addr_of_mut!(TYPE_TYPE);
+        }
+        // A custom metatype link is kept: `Py_TYPE(dtype class)` must stay
+        // `&PyArrayDTypeMeta_Type`, or `PyObject_TypeCheck` and `type()` stop
+        // agreeing with CPython.
         (*pointer).role = TypeRole::Instance;
         (*pointer).owns_name = false;
         (*pointer).owns_buffer = false;

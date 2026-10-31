@@ -325,6 +325,129 @@ except RuntimeError:
 }
 
 #[test]
+fn dynamic_exception_matchers() {
+    run_source(
+        "\
+def value_error():
+    return ValueError
+
+def type_or_value():
+    return tuple([TypeError, ValueError])
+
+errors_alias = KeyError
+alias_tuple = (ValueError, TypeError)
+
+def matcher_call():
+    try:
+        raise ValueError(\"boom\")
+    except (KeyError, AttributeError):
+        return \"static-miss\"
+    except value_error():
+        return \"call\"
+
+assert matcher_call() == \"call\"
+
+def matcher_tuple():
+    try:
+        raise ValueError(\"boom\")
+    except tuple([]):
+        return \"empty\"
+    except type_or_value():
+        return \"tuple\"
+
+assert matcher_tuple() == \"tuple\"
+
+def matcher_alias():
+    try:
+        raise KeyError(\"boom\")
+    except errors_alias:
+        return \"alias\"
+    except alias_tuple:
+        return \"tuple-alias\"
+
+assert matcher_alias() == \"alias\"
+
+def matcher_alias_tuple():
+    try:
+        raise TypeError(\"boom\")
+    except errors_alias:
+        return \"wrong\"
+    except alias_tuple:
+        return \"tuple-alias\"
+
+assert matcher_alias_tuple() == \"tuple-alias\"
+
+def matcher_binding():
+    try:
+        raise ValueError(\"bound\")
+    except value_error() as e:
+        return str(e)
+
+assert matcher_binding() == \"bound\"
+
+def static_hierarchy():
+    try:
+        raise ZeroDivisionError(\"zero\")
+    except ArithmeticError:
+        return \"arithmetic\"
+
+assert static_hierarchy() == \"arithmetic\"
+
+def nested_propagation():
+    try:
+        try:
+            raise RuntimeError(\"inner\")
+        except value_error():
+            return \"wrong\"
+        except alias_tuple:
+            return \"wrong\"
+    except RuntimeError:
+        return \"outer\"
+
+assert nested_propagation() == \"outer\"
+
+def raising_matcher():
+    try:
+        raise ValueError(\"original\")
+    except (1 / 0):
+        return \"unreachable\"
+
+try:
+    raising_matcher()
+except ZeroDivisionError:
+    pass
+else:
+    assert False
+
+def else_finally_parts():
+    log = []
+    try:
+        log.append(\"body\")
+    except value_error():
+        log.append(\"handler\")
+    else:
+        log.append(\"else\")
+    finally:
+        log.append(\"finally\")
+    return log
+
+assert else_finally_parts() == [\"body\", \"else\", \"finally\"]
+
+def chained_raise():
+    try:
+        raise ValueError(\"inner\")
+    except value_error() as e:
+        raise RuntimeError(\"outer\") from e
+
+try:
+    chained_raise()
+except RuntimeError:
+    pass
+",
+    );
+}
+
+#[test]
 fn classes_methods_and_attributes() {
     run_source(
         "\

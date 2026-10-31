@@ -338,13 +338,26 @@ pub enum HStmtKind {
 
 #[derive(Clone, Debug)]
 pub struct HHandler {
-    /// `None` for a bare `except:`; tuple handlers are expanded into one
-    /// handler per type by the lowering pass.
+    /// Statically-known tag. `None` for a bare `except:` and for a dynamic
+    /// handler (`exc_expr`); tuple handlers of static names are expanded into
+    /// one handler per type by the lowering pass.
     pub exc: Option<ExcKind>,
+    /// `except <expression>:` whose matched class (or tuple of classes) is a
+    /// runtime value; evaluated by codegen/interp when the arm is reached.
+    /// `None` for static handlers and for a bare `except:`.
+    pub exc_expr: Option<HExpr>,
     pub binding: Option<LocalId>,
     /// The binding local holds a closure cell; store the exception through it.
     pub binding_cell: bool,
     pub body: Vec<HStmt>,
+}
+
+/// How one `except <type>` clause matches the pending exception.
+enum HandlerMatcher {
+    /// Static tags; a tuple of names expands into one tag per element.
+    Kinds(Vec<ExcKind>),
+    /// The clause is an arbitrary expression evaluated at handler entry.
+    Dynamic(HExpr),
 }
 
 /// Target binding inside a comprehension clause. Plain names always bind
@@ -590,6 +603,11 @@ pub enum HExprKind {
     /// `path` is the compiled shared object resolved by the frontend and
     /// `member` is the Python attribute name. The value type is dynamic:
     /// a limited-API extension exposes no static type information.
+    ///
+    /// A member beginning with [`EXTENSION_STAR_IMPORT_PREFIX`] is the
+    /// internal form of `from <extension> import *`: evaluating it copies the
+    /// extension's public namespace into the importing module's globals and
+    /// yields `None`.
     ExtensionAttr {
         path: String,
         member: String,
@@ -644,6 +662,13 @@ pub enum HExprKind {
         args: Vec<HExpr>,
         /// `**mapping` that must be routed to named keyword-only/positional
         /// slots at runtime (its keys are not known statically).
+        ///
+        /// Always `None` from this frontend: a `**mapping` operand lowers to
+        /// [`HExprKind::CallFull`] through the runtime class-call binder,
+        /// which expands the keys (including the required slots the call site
+        /// cannot name) and reports duplicate or unknown names like CPython.
+        /// The slot stays so the node mirrors
+        /// [`hydro_ir::ExprKind::ClassCall`].
         dynamic_kwargs: Option<Box<HExpr>>,
         /// Bindable parameter names after `self`, in `args` order. Variadic
         /// `*args`/`**kwargs` slots carry their names but never receive a
@@ -687,8 +712,6 @@ pub enum HExprKind {
 struct ClassCallBind {
     /// Values for every `__init__` parameter after `self`.
     args: Vec<HExpr>,
-    /// Routing mapping for a `**mapping` operand whose keys are dynamic.
-    dynamic_kwargs: Option<HExpr>,
     /// Bindable parameter names in `args` order (variadic slots are empty).
     param_names: Vec<String>,
     /// Index in `args` of the `**kwargs` slot.
@@ -1886,6 +1909,16 @@ pub struct UserModule {
     pub module_getattr: bool,
 }
 
+/// Hidden extension member name that asks the runtime to perform the
+/// `import *` side effect (copy the extension's namespace into the importing
+/// module's globals).
+///
+/// Must stay in sync with
+/// `hydro_runtime::modules::extension::STAR_IMPORT_MEMBER_PREFIX`. Real
+/// attribute names cannot contain NUL, so the runtime never confuses it with a
+/// genuine attribute read.
+pub(crate) const EXTENSION_STAR_IMPORT_PREFIX: &str = "\0hydro.star.import\0";
+
 /// Returns the literal `__all__` of a module body, if there is one.
 ///
 /// Only a tuple or list of string constants is honoured; an `__all__` built at
@@ -2084,6 +2117,11 @@ pub struct Lowerer<'a> {
     /// Their values are stored into the runtime global table by the import
     /// statement, which is what makes them real module globals for importers.
     extension_star_bindings: Vec<(String, String)>,
+    /// `(statement start, extension path)` for module-level
+    /// `from <extension> import *` statements. The statement asks the runtime
+    /// to copy the extension's whole public namespace into the module globals,
+    /// because a compiled extension cannot be enumerated at compile time.
+    extension_star_imports: Vec<(usize, String)>,
     /// Names bound by imports nested inside functions, classes or compound
     /// bodies that could not be linked statically. Reading one resolves the
     /// name at runtime and raises the interpreter's import error.
@@ -2133,6 +2171,13 @@ pub struct Lowerer<'a> {
     /// itself through the registry; see
     /// [`Lowerer::is_initializing_ancestor`].
     late_modules: HashSet<String>,
+    /// Linked user modules whose own unit the loader lowers *after* this one
+    /// (an import cycle). Their static export tables are not computed yet, so
+    /// a `from <module> import <member>` binding reads the member from the
+    /// module's runtime global table at use time instead of being rejected as
+    /// a missing export. A module that *has* been lowered keeps the static
+    /// diagnostic for a name its export table does not list.
+    pending_modules: HashSet<String>,
     /// Base id for this unit's functions. Multi-module programs reserve a
     /// contiguous id range per module; single-source checks use `0`.
     fid_base: FunctionId,
@@ -2338,6 +2383,7 @@ impl<'a> Lowerer<'a> {
             module_def_names: HashSet::new(),
             extension_stars: Vec::new(),
             extension_star_bindings: Vec::new(),
+            extension_star_imports: Vec::new(),
             deferred_imports: HashMap::new(),
             optional_imports: HashMap::new(),
             pending_extension_loads: Vec::new(),
@@ -2349,6 +2395,7 @@ impl<'a> Lowerer<'a> {
             collect_initializer_segment: false,
             module_segments: Vec::new(),
             late_modules: HashSet::new(),
+            pending_modules: HashSet::new(),
             fid_base: 0,
             dunder_name: "__main__".to_string(),
             package: String::new(),
@@ -2518,6 +2565,15 @@ impl<'a> Lowerer<'a> {
     /// binding is the module value, not a package attribute.
     pub fn set_late_modules(&mut self, modules: HashSet<String>) {
         self.late_modules = modules;
+    }
+
+    /// Names linked user modules whose own unit the loader lowers *after* this
+    /// one (an import cycle). Their export tables do not exist yet when this
+    /// unit is lowered, so a member they do not list cannot be called a
+    /// missing export: the binding reads the module's runtime global table
+    /// when the import statement executes.
+    pub fn set_pending_modules(&mut self, modules: HashSet<String>) {
+        self.pending_modules = modules;
     }
 
     /// Names the modules the loader recorded as imported only from nested
@@ -2961,7 +3017,23 @@ impl<'a> Lowerer<'a> {
                 ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_)
                     if !self.session_mode && !self.mirror_all_globals =>
                 {
-                    continue
+                    // A linked import normally runs at compile time and emits
+                    // no IR. An extension star import is the exception: the
+                    // statement must run where CPython executes it to copy the
+                    // extension's public namespace into the module globals
+                    // (`globals()` observes those names).
+                    let extension_star = match stmt {
+                        ast::Stmt::ImportFrom(import) => {
+                            let statement = u32::from(import.range.start()) as usize;
+                            self.extension_star_imports
+                                .iter()
+                                .any(|(offset, _)| *offset == statement)
+                        }
+                        _ => false,
+                    };
+                    if !extension_star {
+                        continue;
+                    }
                 }
                 _ => {}
             }
@@ -3763,6 +3835,7 @@ impl<'a> Lowerer<'a> {
                         body: vec![Self::pytest_stmt(HStmtKind::Expr(call), line, col)],
                         handlers: vec![HHandler {
                             exc: None,
+                            exc_expr: None,
                             binding: None,
                             binding_cell: false,
                             body: vec![Self::pytest_stmt(
@@ -3893,7 +3966,7 @@ impl<'a> Lowerer<'a> {
         let mut names: Vec<String> = Vec::new();
         let mut cases: Vec<Vec<(String, HExpr, String)>> = vec![Vec::new()];
         for decorator in decorators {
-            if decorator_final_name(decorator).as_deref() != Some("parametrize") {
+            if pytest_decorator_name(decorator).as_deref() != Some("parametrize") {
                 continue;
             }
             let ast::Expr::Call(call) = decorator else {
@@ -5349,6 +5422,19 @@ impl<'a> Lowerer<'a> {
                     None if self.may_defer_from(imported, member, nested) => {
                         self.record_deferred_from(binding, imported, member);
                     }
+                    // The module is linked, but the loader lowers its unit
+                    // *after* this one (an import cycle). Its export table is
+                    // therefore empty here, which says nothing about the names
+                    // it will define: a nested import reads the member from the
+                    // module's runtime global table when the statement
+                    // executes, exactly like a module that is still
+                    // initializing. A module whose unit *has* been lowered —
+                    // and every module-level import, which the initializer
+                    // order already places — keeps the static export check
+                    // below.
+                    None if nested && self.pending_modules.contains(imported) => {
+                        self.bind_user_global(binding, imported, member);
+                    }
                     // The package is still initializing, so its exports are
                     // not known yet: read the attribute from its module table
                     // when the code runs, exactly like the branch below. This
@@ -5937,7 +6023,9 @@ impl<'a> Lowerer<'a> {
     ///
     /// A star import cannot be enumerated statically: the importing unit's
     /// literal `__all__` names the attributes it re-exports, everything else
-    /// stays a lazy member read.
+    /// stays a lazy member read. The statement also teaches the runtime to
+    /// copy the extension's real public namespace into the module globals, so
+    /// `globals()` observes the same names CPython's `import *` binds.
     fn collect_extension_members(&mut self, s: &ast::StmtImportFrom, path: &str, nested: bool) {
         for alias in &s.names {
             let member = alias.name.as_str();
@@ -5954,18 +6042,44 @@ impl<'a> Lowerer<'a> {
                 if !self.extension_stars.iter().any(|existing| existing == path) {
                     self.extension_stars.push(path.to_string());
                 }
+                // The import statement itself must copy the extension's whole
+                // public namespace into the module globals at runtime:
+                // `__all__` above is this unit's re-export list, not a filter
+                // on what `import *` binds (`numpy/_core/multiarray.py` reads
+                // ufuncs such as `absolute` through `globals()` even though
+                // they are absent from its own `__all__`).
+                let statement = u32::from(s.range.start()) as usize;
+                if !self
+                    .extension_star_imports
+                    .iter()
+                    .any(|(offset, existing)| *offset == statement && existing == path)
+                {
+                    self.extension_star_imports
+                        .push((statement, path.to_string()));
+                }
                 let Some(all) = self.module_all.clone() else {
                     continue;
                 };
                 for name in all {
-                    if self.global_names.contains(&name) || self.module_def_names.contains(&name) {
-                        continue;
+                    // A name this unit itself binds resolves through its own
+                    // definition, not through the extension member; only names
+                    // with no static binding become lazy member reads.
+                    let unit_binds =
+                        self.global_names.contains(&name) || self.module_def_names.contains(&name);
+                    if !unit_binds {
+                        if !self.claim_import_binding(&name, nested) {
+                            continue;
+                        }
+                        self.imported_extension_members
+                            .insert(name.clone(), (path.to_string(), name.clone()));
                     }
-                    if !self.claim_import_binding(&name, nested) {
-                        continue;
-                    }
-                    self.imported_extension_members
-                        .insert(name.clone(), (path.to_string(), name.clone()));
+                    // The import statement must store the member at the point
+                    // it runs even when the unit defines the same name: a read
+                    // between the import and a later definition observes the
+                    // extension value, exactly as in CPython. NumPy's
+                    // `may_share_memory.__module__ = 'numpy'` runs before
+                    // `def may_share_memory`, so skipping the store left the
+                    // module slot `None`.
                     if !self
                         .extension_star_bindings
                         .iter()
@@ -6108,22 +6222,64 @@ impl<'a> Lowerer<'a> {
                         stores.push(self.session_global_store(&name, value, line, col));
                     }
                 }
+                // `from <extension> import *`: the runtime copies the
+                // extension's whole public namespace into this module's global
+                // table, exactly where CPython executes the import. The
+                // statically known `__all__` names are also stored below, but
+                // they are only this unit's re-export list: names such as
+                // NumPy's ufuncs must reach `globals()` too.
+                let star_paths: Vec<String> = self
+                    .extension_star_imports
+                    .iter()
+                    .filter(|(offset, _)| *offset == statement)
+                    .map(|(_, path)| path.clone())
+                    .collect();
+                for path in star_paths {
+                    stores.push(HStmt {
+                        kind: HStmtKind::Expr(HExpr {
+                            kind: HExprKind::ExtensionAttr {
+                                path,
+                                member: format!(
+                                    "{}{}",
+                                    EXTENSION_STAR_IMPORT_PREFIX, self.dunder_name
+                                ),
+                            },
+                            ty: Ty::Concrete(Type::Any),
+                            line,
+                            col,
+                        }),
+                        line,
+                        col,
+                    });
+                }
                 // `from <extension> import *`: the statically known names (the
                 // unit's literal `__all__`) are stored into the runtime global
                 // table here, exactly like `from ... import name` bindings.
                 // Reading the extension attribute loads the shared object
                 // through the normal ABI.
-                for (binding, path) in &self.extension_star_bindings {
+                let star_bindings = self.extension_star_bindings.clone();
+                for (binding, path) in star_bindings {
                     let value = HExpr {
                         kind: HExprKind::ExtensionAttr {
-                            path: path.clone(),
+                            path,
                             member: binding.clone(),
                         },
                         ty: Ty::Concrete(Type::Any),
                         line,
                         col,
                     };
-                    stores.push(self.session_global_store(binding, value, line, col));
+                    if fs.lookup(&binding).is_some() {
+                        // The unit has a module-local slot for this name (it
+                        // defines it later, or a function reads it as a
+                        // global). The import assigns here, in source order,
+                        // and a later definition overwrites it. NumPy reads
+                        // `may_share_memory` between the star import and its
+                        // `def may_share_memory`, so the slot must hold the
+                        // extension member until then.
+                        self.import_binding_store(&mut stores, fs, &binding, value, line, col);
+                    } else {
+                        stores.push(self.session_global_store(&binding, value, line, col));
+                    }
                 }
                 continue;
             }
@@ -11220,6 +11376,7 @@ impl<'a> Lowerer<'a> {
                 body,
                 handlers: vec![HHandler {
                     exc: None,
+                    exc_expr: None,
                     binding: None,
                     binding_cell: false,
                     body: vec![raise],
@@ -15303,6 +15460,7 @@ impl<'a> Lowerer<'a> {
                 body: vec![fetch],
                 handlers: vec![HHandler {
                     exc: Some(ExcKind::StopAsyncIteration),
+                    exc_expr: None,
                     binding: None,
                     binding_cell: false,
                     body: stop_body,
@@ -16321,22 +16479,37 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Resolves the tags an `except` handler matches. Builtin names keep
-    /// their tag; user/imported classes fall back to [`ExcKind::RuntimeError`]
-    /// (like `raise`), so their handlers also catch other user-class raises.
+    /// Resolves how an `except` handler matches the pending exception.
+    ///
+    /// Builtin names keep their tag, and user/imported classes keep the
+    /// documented [`ExcKind::RuntimeError`] approximation (like `raise`), so
+    /// their handlers also catch other user-class raises. A tuple of such
+    /// static elements expands into one tag per element. Every other shape —
+    /// a call (`except tuple(types):`), a subscript, an alias name bound to a
+    /// class, a mixed tuple — is left as a runtime expression: codegen and the
+    /// interpreter evaluate it when the arm is reached and match the value
+    /// with `isinstance`, which walks the same CPython hierarchy.
+    ///
     /// Returns `None` after reporting an unsupported handler expression.
-    fn handler_exception_kinds(&mut self, type_expr: &ast::Expr) -> Option<Vec<ExcKind>> {
+    fn handler_matcher(
+        &mut self,
+        type_expr: &ast::Expr,
+        fs: &mut FuncState,
+    ) -> Option<HandlerMatcher> {
         match type_expr {
-            ast::Expr::Name(n) => Some(vec![Self::approximate_exception_kind(n.id.as_str())]),
+            ast::Expr::Name(n) => match self.static_handler_kind(n.id.as_str()) {
+                Some(kind) => Some(HandlerMatcher::Kinds(vec![kind])),
+                None => Some(HandlerMatcher::Dynamic(
+                    self.dynamic_handler_expr(type_expr, fs),
+                )),
+            },
             ast::Expr::Attribute(_) => {
                 if dotted_expr_name(type_expr).is_some() {
-                    Some(vec![ExcKind::RuntimeError])
+                    Some(HandlerMatcher::Kinds(vec![ExcKind::RuntimeError]))
                 } else {
-                    self.error_at(
-                        type_expr.range(),
-                        "only simple exception names are supported",
-                    );
-                    None
+                    Some(HandlerMatcher::Dynamic(
+                        self.dynamic_handler_expr(type_expr, fs),
+                    ))
                 }
             }
             ast::Expr::Tuple(tuple) => {
@@ -16351,33 +16524,56 @@ impl<'a> Lowerer<'a> {
                 let mut kinds = Vec::with_capacity(tuple.elts.len());
                 for elt in &tuple.elts {
                     match elt {
-                        ast::Expr::Name(n) => {
-                            kinds.push(Self::approximate_exception_kind(n.id.as_str()))
-                        }
+                        ast::Expr::Name(n) => match self.static_handler_kind(n.id.as_str()) {
+                            Some(kind) => kinds.push(kind),
+                            None => {
+                                return Some(HandlerMatcher::Dynamic(
+                                    self.dynamic_handler_expr(type_expr, fs),
+                                ))
+                            }
+                        },
                         ast::Expr::Attribute(_) if dotted_expr_name(elt).is_some() => {
                             kinds.push(ExcKind::RuntimeError);
                         }
                         _ => {
-                            self.error_at(
-                                elt.range(),
-                                "only simple exception names are supported in exception tuples",
-                            );
-                            return None;
+                            return Some(HandlerMatcher::Dynamic(
+                                self.dynamic_handler_expr(type_expr, fs),
+                            ))
                         }
                     }
                 }
-                Some(kinds)
+                Some(HandlerMatcher::Kinds(kinds))
             }
-            other => {
-                self.error_at(other.range(), "only simple exception names are supported");
-                None
-            }
+            other => Some(HandlerMatcher::Dynamic(
+                self.dynamic_handler_expr(other, fs),
+            )),
         }
     }
 
-    /// Tag matched by a bare exception name in a handler.
-    fn approximate_exception_kind(name: &str) -> ExcKind {
-        ExcKind::from_name(name).unwrap_or(ExcKind::RuntimeError)
+    /// Lowers the expression of a dynamic `except <expr>:` handler.
+    ///
+    /// CPython evaluates the matcher only when an exception reaches the arm,
+    /// so an unbound name inside it is a runtime `NameError` (or the
+    /// expression is never evaluated at all) rather than a compile error.
+    /// Unresolved names therefore fall back to a runtime global read, exactly
+    /// like the `NameError` probe of a `try` body (`except (WindowsError,
+    /// ...)` in `dateutil`). Other diagnostics still apply.
+    fn dynamic_handler_expr(&mut self, type_expr: &ast::Expr, fs: &mut FuncState) -> HExpr {
+        self.name_fallback_depth += 1;
+        let expr = self.expr(type_expr, fs);
+        self.name_fallback_depth -= 1;
+        expr
+    }
+
+    /// Tag matched by a bare exception name in a handler, or `None` when the
+    /// name is a runtime value (an alias, a parameter, an imported class from
+    /// a non-user module, ...) that only `isinstance` can resolve.
+    fn static_handler_kind(&self, name: &str) -> Option<ExcKind> {
+        match ExcKind::from_name(name) {
+            Some(kind) => Some(kind),
+            None if self.is_user_exception_name(name) => Some(ExcKind::RuntimeError),
+            None => None,
+        }
     }
 
     /// Whether one `except` clause names `NameError` (alone or as one element
@@ -16396,8 +16592,9 @@ impl<'a> Lowerer<'a> {
         handler.type_.as_deref().is_some_and(names_name_error)
     }
 
-    /// Lowers `try` with tag-based handlers; see
-    /// [`Self::handler_exception_kinds`] for the user-class approximation.
+    /// Lowers `try` with static tag handlers and runtime (`exc_expr`)
+    /// handlers; see [`Self::handler_matcher`] for the user-class
+    /// approximation and the dynamic fallback.
     fn lower_try(
         &mut self,
         s: &ast::StmtTry,
@@ -16443,6 +16640,7 @@ impl<'a> Lowerer<'a> {
             let ast::ExceptHandler::ExceptHandler(h) = handler;
             let is_bare = h.type_.is_none();
             let mut kinds: Vec<ExcKind> = Vec::new();
+            let mut exc_expr: Option<HExpr> = None;
             match &h.type_ {
                 None => {
                     if idx + 1 != s.handlers.len() {
@@ -16453,12 +16651,11 @@ impl<'a> Lowerer<'a> {
                         );
                     }
                 }
-                Some(type_expr) => {
-                    let Some(parsed) = self.handler_exception_kinds(type_expr) else {
-                        continue;
-                    };
-                    kinds = parsed;
-                }
+                Some(type_expr) => match self.handler_matcher(type_expr, fs) {
+                    None => continue,
+                    Some(HandlerMatcher::Kinds(parsed)) => kinds = parsed,
+                    Some(HandlerMatcher::Dynamic(expr)) => exc_expr = Some(expr),
+                },
             };
             let binding = match &h.name {
                 Some(name) => match fs.lookup(name.as_str()) {
@@ -16481,6 +16678,16 @@ impl<'a> Lowerer<'a> {
             if is_bare {
                 handlers.push(HHandler {
                     exc: None,
+                    exc_expr: None,
+                    binding,
+                    binding_cell,
+                    body: handler_body,
+                });
+            } else if let Some(exc_expr) = exc_expr {
+                // Dynamic matcher: one arm, evaluated when reached.
+                handlers.push(HHandler {
+                    exc: None,
+                    exc_expr: Some(exc_expr),
                     binding,
                     binding_cell,
                     body: handler_body,
@@ -16489,6 +16696,7 @@ impl<'a> Lowerer<'a> {
                 for kind in kinds {
                     handlers.push(HHandler {
                         exc: Some(kind),
+                        exc_expr: None,
                         binding,
                         binding_cell,
                         body: handler_body.clone(),
@@ -16692,6 +16900,7 @@ impl<'a> Lowerer<'a> {
                     body,
                     handlers: vec![HHandler {
                         exc: Some(ExcKind::BaseException),
+                        exc_expr: None,
                         binding: Some(exc),
                         binding_cell: false,
                         body: vec![suppress_check],
@@ -17086,6 +17295,7 @@ impl<'a> Lowerer<'a> {
                     body,
                     handlers: vec![HHandler {
                         exc: Some(ExcKind::BaseException),
+                        exc_expr: None,
                         binding: Some(exc),
                         binding_cell: false,
                         body: vec![suppress_check],
@@ -19828,6 +20038,10 @@ impl<'a> Lowerer<'a> {
         // the general starred-call ABI, which preserves every keyword name
         // (`CallFull` with the callee evaluated first).
         if call_has_dynamic_arguments(call) {
+            // A `**mapping` operand carries runtime keys: only the runtime
+            // binder can expand them, validate duplicates and unknown names,
+            // and fill required parameters the call site did not spell out.
+            let has_mapping = call.keywords.iter().any(|keyword| keyword.arg.is_none());
             // `cls(*args, ...)` inside a classmethod: the runtime class is
             // fixed, so the dynamic constructor binder can still expand the
             // starred operand at compile time.
@@ -19840,6 +20054,21 @@ impl<'a> Lowerer<'a> {
                         && !fs.is_module
                     {
                         if let Some((init, signature)) = self.resolve_class(&class) {
+                            if has_mapping {
+                                self.used_globals.insert(class.clone());
+                                let (callee_line, callee_col) = self.span(name_expr.range);
+                                let class_expr = HExpr {
+                                    kind: HExprKind::GlobalGet {
+                                        module: self.dunder_name.clone(),
+                                        name: class,
+                                    },
+                                    ty: Ty::Concrete(Type::Any),
+                                    line: callee_line,
+                                    col: callee_col,
+                                };
+                                return self
+                                    .lower_dynamic_callee_call(class_expr, call, fs, line, col);
+                            }
                             if signature.has_dynamic_signature() {
                                 let Some(bind) = self.class_constructor_dynamic_arguments(
                                     &class, &signature, call, fs, line, col,
@@ -19862,7 +20091,7 @@ impl<'a> Lowerer<'a> {
                                         class: Box::new(class_expr),
                                         init,
                                         args: bind.args,
-                                        dynamic_kwargs: bind.dynamic_kwargs.map(Box::new),
+                                        dynamic_kwargs: None,
                                         param_names: bind.param_names,
                                         kwarg_index: bind.kwarg_index,
                                         class_name: class,
@@ -19883,6 +20112,14 @@ impl<'a> Lowerer<'a> {
                 let name = name_expr.id.as_str();
                 if self.class_callee_resolvable(name, fs) {
                     if let Some((init, signature)) = self.resolve_class(name) {
+                        if has_mapping {
+                            let Some(class) =
+                                self.class_callee_expr(name, name_expr, fs, line, col)
+                            else {
+                                return self.error_expr(call.range);
+                            };
+                            return self.lower_dynamic_callee_call(class, call, fs, line, col);
+                        }
                         if signature.has_dynamic_signature() {
                             let Some(bind) = self.class_constructor_dynamic_arguments(
                                 name, &signature, call, fs, line, col,
@@ -19899,7 +20136,7 @@ impl<'a> Lowerer<'a> {
                                     class: Box::new(class),
                                     init,
                                     args: bind.args,
-                                    dynamic_kwargs: bind.dynamic_kwargs.map(Box::new),
+                                    dynamic_kwargs: None,
                                     param_names: bind.param_names,
                                     kwarg_index: bind.kwarg_index,
                                     class_name: name.to_string(),
@@ -20073,7 +20310,7 @@ impl<'a> Lowerer<'a> {
                                 class: Box::new(class_expr),
                                 init,
                                 args: bind.args,
-                                dynamic_kwargs: bind.dynamic_kwargs.map(Box::new),
+                                dynamic_kwargs: None,
                                 param_names: bind.param_names,
                                 kwarg_index: bind.kwarg_index,
                                 class_name: class.clone(),
@@ -20130,7 +20367,7 @@ impl<'a> Lowerer<'a> {
                                 class: Box::new(class),
                                 init,
                                 args: bind.args,
-                                dynamic_kwargs: bind.dynamic_kwargs.map(Box::new),
+                                dynamic_kwargs: None,
                                 param_names: bind.param_names,
                                 kwarg_index: bind.kwarg_index,
                                 class_name: name.to_string(),
@@ -20721,7 +20958,7 @@ impl<'a> Lowerer<'a> {
                             class: Box::new(class),
                             init,
                             args: bind.args,
-                            dynamic_kwargs: bind.dynamic_kwargs.map(Box::new),
+                            dynamic_kwargs: None,
                             param_names: bind.param_names,
                             kwarg_index: bind.kwarg_index,
                             class_name: name.to_string(),
@@ -21692,11 +21929,14 @@ impl<'a> Lowerer<'a> {
     /// Bind a class constructor whose `__init__` has a dynamic signature
     /// (`*args`, keyword-only parameters or `**kwargs`).
     ///
-    /// Fixed positional slots and keyword-only slots are still bound at
-    /// compile time; a single starred operand becomes the `*args` list and a
-    /// `**mapping` operand is merged into the `**kwargs` dict at runtime.
-    /// Shapes that would need an unknown number of positional slots (a
-    /// starred operand without a `*args` parameter) stay deferred.
+    /// Fixed positional slots and keyword-only slots are bound at compile
+    /// time and a single starred operand becomes the `*args` list. A
+    /// `**mapping` operand never reaches this binder: `call_expr` lowers it
+    /// through the runtime class-call protocol, which expands the mapping
+    /// keys (including required slots this binder cannot name) and reports
+    /// duplicate or unknown names exactly like CPython. Shapes that would
+    /// need an unknown number of positional slots (a starred operand without
+    /// a `*args` parameter) stay deferred.
     #[allow(clippy::question_mark)]
     fn class_constructor_dynamic_arguments(
         &mut self,
@@ -21800,24 +22040,16 @@ impl<'a> Lowerer<'a> {
         }
 
         let mut explicit_kwargs: Vec<(String, HExpr)> = Vec::new();
-        let mut dstar: Option<HExpr> = None;
         for keyword in &call.keywords {
             let Some(name) = keyword.arg.as_ref() else {
-                let (line, col) = self.span(keyword.value.range());
-                let next = self.expr(&keyword.value, fs);
-                dstar = Some(match dstar.take() {
-                    Some(previous) => HExpr {
-                        kind: HExprKind::Call {
-                            callee: Callee::Builtin(Builtin::DictMerge),
-                            args: vec![previous, next],
-                        },
-                        ty: Ty::Concrete(Type::Dict),
-                        line,
-                        col,
-                    },
-                    None => next,
-                });
-                continue;
+                // `**mapping` operands are lowered through the runtime class
+                // call protocol before any constructor binder runs.
+                self.error_at_code(
+                    keyword.range,
+                    codes::CALL,
+                    "**kwargs arguments are bound by the runtime call protocol",
+                );
+                return None;
             };
             let matched = params
                 .iter()
@@ -21884,89 +22116,28 @@ impl<'a> Lowerer<'a> {
             });
         }
 
-        let mut dynamic_kwargs = None;
-        match (kwarg_index, dstar) {
-            (Some(index), Some(mapping)) => {
-                // `dict(mapping)` copies the mapping so merging explicit names
-                // never mutates the caller's dict. The copy is also the
-                // `**kwargs` slot; the runtime router removes keys that bind a
-                // named parameter.
-                let mut value = HExpr {
-                    kind: HExprKind::Call {
-                        callee: Callee::Builtin(Builtin::Dict),
-                        args: vec![mapping.clone()],
-                    },
-                    ty: Ty::Concrete(Type::Dict),
-                    line,
-                    col,
-                };
-                if !explicit_kwargs.is_empty() {
-                    let pairs = explicit_kwargs
-                        .into_iter()
-                        .map(|(name, value)| {
-                            let key = HExpr {
-                                kind: HExprKind::Const(Const::Str(name)),
-                                ty: Ty::Concrete(Type::Str),
-                                line,
-                                col,
-                            };
-                            (key, value)
-                        })
-                        .collect();
-                    value = HExpr {
-                        kind: HExprKind::MethodCall {
-                            object: Box::new(value),
-                            method: "update".to_string(),
-                            args: vec![HExpr {
-                                kind: HExprKind::Dict(pairs),
-                                ty: Ty::Concrete(Type::Dict),
-                                line,
-                                col,
-                            }],
-                            star: None,
-                            keywords: Vec::new(),
-                            double_star: None,
-                        },
-                        ty: Ty::Concrete(Type::Dict),
+        // Explicit keyword names that bind no parameter belong to the
+        // generated `**kwargs` slot. A call without that slot rejected them
+        // while scanning above.
+        if let Some(index) = kwarg_index {
+            let pairs = explicit_kwargs
+                .into_iter()
+                .map(|(name, value)| {
+                    let key = HExpr {
+                        kind: HExprKind::Const(Const::Str(name)),
+                        ty: Ty::Concrete(Type::Str),
                         line,
                         col,
                     };
-                }
-                slots[index] = Some(value);
-                dynamic_kwargs = Some(mapping);
-            }
-            (Some(index), None) => {
-                let pairs = explicit_kwargs
-                    .into_iter()
-                    .map(|(name, value)| {
-                        let key = HExpr {
-                            kind: HExprKind::Const(Const::Str(name)),
-                            ty: Ty::Concrete(Type::Str),
-                            line,
-                            col,
-                        };
-                        (key, value)
-                    })
-                    .collect();
-                slots[index] = Some(HExpr {
-                    kind: HExprKind::Dict(pairs),
-                    ty: Ty::Concrete(Type::Dict),
-                    line,
-                    col,
-                });
-            }
-            (None, Some(mapping)) => {
-                if !explicit_kwargs.is_empty() {
-                    self.error_at_code(
-                        call.range,
-                        codes::CALL,
-                        format!("{class}() got an unexpected keyword argument"),
-                    );
-                    return None;
-                }
-                dynamic_kwargs = Some(mapping);
-            }
-            (None, None) => {}
+                    (key, value)
+                })
+                .collect();
+            slots[index] = Some(HExpr {
+                kind: HExprKind::Dict(pairs),
+                ty: Ty::Concrete(Type::Dict),
+                line,
+                col,
+            });
         }
 
         let mut args = Vec::with_capacity(params.len());
@@ -21981,8 +22152,10 @@ impl<'a> Lowerer<'a> {
             };
             args.push(value);
         }
-        // Positional-only slots carry no bindable name: a `**mapping` key with
-        // that name must be routed to `**kwargs`, never into the slot.
+        // Bindable parameter names in `args` order; positional-only and
+        // variadic slots carry an empty name. A `**mapping` never reaches
+        // this binder (it binds at runtime), so the list mirrors the IR
+        // node's contract rather than routing keys here.
         let param_names = params
             .iter()
             .map(|(name, _, kind)| {
@@ -21996,7 +22169,6 @@ impl<'a> Lowerer<'a> {
             .collect();
         Some(ClassCallBind {
             args,
-            dynamic_kwargs,
             param_names,
             kwarg_index,
         })
@@ -23192,7 +23364,7 @@ fn decorator_string(expr: &ast::Expr) -> Option<String> {
 /// `@pytest.fixture` scope: `function` unless `scope="module"`/`"session"`.
 fn pytest_fixture_scope(decorators: &[ast::Expr]) -> Option<&'static str> {
     for decorator in decorators {
-        if decorator_final_name(decorator).as_deref() != Some("fixture") {
+        if pytest_decorator_name(decorator).as_deref() != Some("fixture") {
             continue;
         }
         if let ast::Expr::Call(call) = decorator {
@@ -23253,7 +23425,7 @@ fn pytest_sequence(expr: &ast::Expr) -> Option<&[ast::Expr]> {
 /// `@pytest.mark.skip(reason="why")`).
 fn pytest_decorator_reason(decorators: &[ast::Expr], name: &str, fallback: &str) -> Option<String> {
     for decorator in decorators {
-        if decorator_final_name(decorator).as_deref() != Some(name) {
+        if pytest_decorator_name(decorator).as_deref() != Some(name) {
             continue;
         }
         if let ast::Expr::Call(call) = decorator {
@@ -23284,7 +23456,7 @@ fn pytest_xfail(decorators: &[ast::Expr]) -> Option<String> {
 /// Condition expression of `@pytest.mark.skipif(condition, reason=...)`.
 fn pytest_skipif(decorators: &[ast::Expr]) -> Option<ast::Expr> {
     for decorator in decorators {
-        if decorator_final_name(decorator).as_deref() != Some("skipif") {
+        if pytest_decorator_name(decorator).as_deref() != Some("skipif") {
             continue;
         }
         if let ast::Expr::Call(call) = decorator {
@@ -23298,7 +23470,7 @@ fn pytest_skipif(decorators: &[ast::Expr]) -> Option<ast::Expr> {
 fn pytest_usefixtures(decorators: &[ast::Expr]) -> Vec<String> {
     let mut names = Vec::new();
     for decorator in decorators {
-        if decorator_final_name(decorator).as_deref() != Some("usefixtures") {
+        if pytest_decorator_name(decorator).as_deref() != Some("usefixtures") {
             continue;
         }
         let ast::Expr::Call(call) = decorator else {
@@ -23416,11 +23588,18 @@ fn decorator_path(expr: &ast::Expr) -> Vec<String> {
 /// Decorators provided by `pytest`: `@pytest.fixture`, `@pytest.mark.*` and
 /// the marker helpers imported unqualified. Lowering never evaluates them;
 /// they are recognised so pytest test modules compile unchanged.
+///
+/// `unittest`'s helpers share names with pytest marks (`@unittest.skip`), but
+/// they are real decorators whose effect belongs to the runtime
+/// `unittest.TestCase`, so a `unittest.*` path is never a pytest decorator.
 fn is_pytest_decorator(expr: &ast::Expr) -> bool {
     let path = decorator_path(expr);
     let Some(last) = path.last() else {
         return false;
     };
+    if path.first().is_some_and(|segment| segment == "unittest") {
+        return false;
+    }
     if path.iter().any(|segment| segment == "pytest") {
         return path
             .iter()
@@ -23436,6 +23615,17 @@ fn is_pytest_decorator(expr: &ast::Expr) -> bool {
         last.as_str(),
         "fixture" | "parametrize" | "skip" | "skipif" | "xfail" | "usefixtures"
     )
+}
+
+/// Final name of a decorator when it is a pytest directive.
+///
+/// `decorator_final_name` alone would also match `@unittest.skip` and friends,
+/// which must stay real runtime decorators.
+fn pytest_decorator_name(expr: &ast::Expr) -> Option<String> {
+    if !is_pytest_decorator(expr) {
+        return None;
+    }
+    decorator_final_name(expr)
 }
 
 /// Class decorators accepted and ignored by lowering.
@@ -25622,6 +25812,26 @@ fn collect_free_name_loads(stmts: &[ast::Stmt], out: &mut Vec<String>) {
     walk_free_stmts(stmts, &HashSet::new(), out, &mut seen);
 }
 
+/// Loads made by the `except <expression>:` matchers of one `try` statement.
+///
+/// The matcher is an ordinary expression evaluated in the frame that owns the
+/// `try`, so its names are free names of that frame exactly like the body's.
+/// A function reading a module-level alias only from a handler still needs the
+/// module body to mirror that binding into the runtime global table.
+fn walk_free_handler_types(
+    handlers: &[ast::ExceptHandler],
+    shadowed: &HashSet<String>,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    for handler in handlers {
+        let ast::ExceptHandler::ExceptHandler(h) = handler;
+        if let Some(type_) = &h.type_ {
+            walk_free_expr(type_, shadowed, out, seen);
+        }
+    }
+}
+
 fn walk_free_stmts(
     stmts: &[ast::Stmt],
     shadowed: &HashSet<String>,
@@ -25711,6 +25921,7 @@ fn walk_free_stmts(
             }
             ast::Stmt::Try(s) => {
                 walk_free_stmts(&s.body, shadowed, out, seen);
+                walk_free_handler_types(&s.handlers, shadowed, out, seen);
                 for handler in &s.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
                     walk_free_stmts(&h.body, shadowed, out, seen);
@@ -25720,6 +25931,7 @@ fn walk_free_stmts(
             }
             ast::Stmt::TryStar(s) => {
                 walk_free_stmts(&s.body, shadowed, out, seen);
+                walk_free_handler_types(&s.handlers, shadowed, out, seen);
                 for handler in &s.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
                     walk_free_stmts(&h.body, shadowed, out, seen);

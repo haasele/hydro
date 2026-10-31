@@ -78,18 +78,18 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-10-30: **3025 tests run
-(3025 passed, 1 skipped)**; the per-crate breakdown below sums to 3025
+`cargo nextest run --workspace` on 2026-10-31: **3073 tests run
+(3073 passed, 1 skipped)**; the per-crate breakdown below sums to 3073
 (the skipped test is not included in the listed binaries):
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 1932 |
-| frontend | 860 |
-| codegen | 78 |
-| IR | 67 |
+| runtime (unit + integration) | 1964 |
+| frontend | 873 |
+| codegen | 79 |
+| IR | 68 |
 | bindgen | 42 |
-| interpreter | 27 |
+| interpreter | 28 |
 | parser | 19 |
 | hna | 0 |
 | hna-fixture | 0 |
@@ -106,17 +106,16 @@ Other docs must link here instead of repeating the total.
   harness now sets `HYDRO_STDLIB` to the pinned CPython `Lib` tree; the earlier
   159 count used the toolchain's default subset. Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
-- **Official suite:** **3/398 passing** (`test_errno.py`,
-  `test_int_literal.py`, `test_longexp.py`), 333 `hydro_fail`, 62
-  `expected_fail` (CPython also fails), 0 timeouts; full differential run took
-  733.8 s. Manifest `tests/compat/cpython-3.14.9.json` grows only from real
-  `hydro_pass` runs.
+- **Official suite:** **6/398 passing** (`test_colorsys.py`, `test_errno.py`,
+  `test_int_literal.py`, `test_longexp.py`, `test_openpty.py`, `test_unary.py`),
+  330 `hydro_fail`, 62 `expected_fail` (CPython also fails), 0 timeouts; full
+  differential run took 894.3 s. Manifest `tests/compat/cpython-3.14.9.json`
+  records the six observed passes.
 - **Ecosystem:** **9/13 cases pass** under JIT and AOT. Pydantic 2.14.1,
   pydantic-core, python-dateutil, six, typing-extensions,
   typing-inspection, annotated-types and tzdata pass. NumPy 2.5 stops on the
-  `_multiarray_umath` DType/ArrayMethod check; pandas AOT compilation now
-  stops on the dynamic `except tuple(...)` handler in
-  `pandas/io/common.py`. The
+  `_multiarray_umath` class-registration path; pandas AOT compilation now
+  stops on a type-inference conflict in `frame.py`. The
   ABI inventory reports **0 missing required symbols** across 68 pinned
   extension modules. Pinned ecosystem report:
   `docs/ECOSYSTEM.md`.

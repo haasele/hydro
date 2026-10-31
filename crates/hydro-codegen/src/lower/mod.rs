@@ -1853,7 +1853,10 @@ fn count_stmt(stmt: &Stmt) -> usize {
             count_body(body)
                 + handlers
                     .iter()
-                    .map(|handler| 1 + count_body(&handler.body))
+                    .map(|handler| {
+                        1 + handler.exc_expr.as_ref().map_or(0, count_expr)
+                            + count_body(&handler.body)
+                    })
                     .sum::<usize>()
                 + count_body(else_body)
                 + count_body(finally_body)
@@ -4279,13 +4282,13 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 } else {
                     self.builder.create_block()
                 };
-                match handler.exc {
-                    None => {
+                match (handler.exc, handler.exc_expr.as_ref()) {
+                    (None, None) => {
                         // Bare `except:` catches everything; the frontend
                         // guarantees it is the last arm.
                         self.jump(handler_block);
                     }
-                    Some(kind) => {
+                    (Some(kind), _) => {
                         // The runtime owns the complete CPython parent
                         // chain (`ArithmeticError` catches `ZeroDivisionError`,
                         // `ImportError` catches `ModuleNotFoundError`,
@@ -4298,6 +4301,38 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         let id = self.runtime.exc_matches;
                         let caught = self.call_rt(id, &[tag])?;
                         let matches = self.builder.ins().icmp_imm(IntCC::NotEqual, caught, 0);
+                        self.builder
+                            .ins()
+                            .brif(matches, handler_block, &[], next_handler, &[]);
+                    }
+                    // `except <expr>:` — the matched class (or tuple of
+                    // classes) is a runtime value. CPython evaluates the arm's
+                    // expression only when an exception reaches it, so the
+                    // matcher runs here, in source order. The pending flag
+                    // marks the exception being dispatched, so it is cleared
+                    // while the matcher and `isinstance` run (otherwise their
+                    // own runtime checks would mistake it for a fresh
+                    // failure); the parked value is restored before branching
+                    // so the remaining arms and the handler entry still see
+                    // it. Matching goes through the runtime `isinstance`
+                    // builtin, which walks the same CPython hierarchy as
+                    // `hydro_exc_matches` (including user-defined exception
+                    // classes and tuples); codegen keeps no second tag table.
+                    (None, Some(expr)) => {
+                        let value_id = self.runtime.exc_value;
+                        let exception = self.call_rt(value_id, &[])?;
+                        let parked = self.temp_var()?;
+                        self.define_var(parked, exception)?;
+                        let clear_id = self.runtime.exc_clear;
+                        self.call_rt(clear_id, &[])?;
+                        let matcher = self.lower_expr(expr)?;
+                        let exception = self.builder.use_var(parked);
+                        let caught =
+                            self.lower_builtins_direct("isinstance", &[exception, matcher])?;
+                        let matches = self.truthy_cond(caught)?;
+                        let exception = self.builder.use_var(parked);
+                        let raise_id = self.runtime.raise_value;
+                        self.call_rt(raise_id, &[exception])?;
                         self.builder
                             .ins()
                             .brif(matches, handler_block, &[], next_handler, &[]);
@@ -10579,12 +10614,14 @@ mod tests {
                             handlers: vec![
                                 Handler {
                                     exc: Some(ExcKind::Exception),
+                                    exc_expr: None,
                                     binding: None,
                                     binding_cell: false,
                                     body: vec![pass()],
                                 },
                                 Handler {
                                     exc: Some(ExcKind::BaseException),
+                                    exc_expr: None,
                                     binding: None,
                                     binding_cell: false,
                                     body: vec![pass()],
@@ -10624,6 +10661,155 @@ mod tests {
                 "the generated code must reference {symbol}"
             );
         }
+    }
+
+    #[test]
+    fn dynamic_except_matchers_lower_through_isinstance() {
+        // `except (ValueError, TypeError):` as an expression and
+        // `except <runtime value>:`: the matcher is evaluated when the arm is
+        // reached and matched with the runtime `isinstance` builtin, so the
+        // generated code calls `hydro_module_call` instead of the tag matcher.
+        let matcher = Expr::new(ExprKind::ExceptionClass(ExcKind::ValueError), Type::Any, 2);
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: Vec::new(),
+                body: vec![Stmt::new(
+                    StmtKind::Try {
+                        body: vec![Stmt::new(
+                            StmtKind::Raise {
+                                exc: Some(ExcKind::ValueError),
+                                msg: None,
+                                cause: None,
+                            },
+                            1,
+                        )],
+                        handlers: vec![Handler {
+                            exc: None,
+                            exc_expr: Some(matcher),
+                            binding: None,
+                            binding_cell: false,
+                            body: vec![Stmt::new(StmtKind::Pass, 2)],
+                        }],
+                        else_body: Vec::new(),
+                        finally_body: Vec::new(),
+                    },
+                    1,
+                )],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object = crate::compile_object(&program).expect("a dynamic handler must lower");
+        assert_eq!(
+            runtime_call_sites(&object, "hydro_exc_matches"),
+            0,
+            "a dynamic matcher must not fall back to the static tag table"
+        );
+        assert!(
+            runtime_call_sites(&object, "hydro_module_call") > 0,
+            "the matcher must dispatch the runtime isinstance builtin"
+        );
+        for symbol in ["hydro_exc_value", "hydro_exc_clear", "hydro_raise_value"] {
+            assert!(
+                runtime_call_sites(&object, symbol) > 0,
+                "the matcher must park and restore the pending exception ({symbol})"
+            );
+        }
+
+        // The pandas shape: static arms followed by a call matcher
+        // (`except tuple(types):`) whose arm body contains a nested `try`.
+        let call_matcher = Expr::new(
+            ExprKind::Call {
+                callee: Callee::Builtin(Builtin::Tuple),
+                args: Vec::new(),
+            },
+            Type::Any,
+            3,
+        );
+        let nested = Stmt::new(
+            StmtKind::Try {
+                body: vec![Stmt::new(StmtKind::Pass, 4)],
+                handlers: vec![Handler {
+                    exc: Some(ExcKind::TypeError),
+                    exc_expr: None,
+                    binding: None,
+                    binding_cell: false,
+                    body: vec![Stmt::new(StmtKind::Pass, 5)],
+                }],
+                else_body: Vec::new(),
+                finally_body: Vec::new(),
+            },
+            4,
+        );
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![Function {
+                name: "<module>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Type::None,
+                locals: Vec::new(),
+                body: vec![Stmt::new(
+                    StmtKind::Try {
+                        body: vec![Stmt::new(
+                            StmtKind::Raise {
+                                exc: Some(ExcKind::ValueError),
+                                msg: None,
+                                cause: None,
+                            },
+                            1,
+                        )],
+                        handlers: vec![
+                            Handler {
+                                exc: Some(ExcKind::ValueError),
+                                exc_expr: None,
+                                binding: None,
+                                binding_cell: false,
+                                body: vec![Stmt::new(StmtKind::Pass, 2)],
+                            },
+                            Handler {
+                                exc: Some(ExcKind::TypeError),
+                                exc_expr: None,
+                                binding: None,
+                                binding_cell: false,
+                                body: vec![Stmt::new(StmtKind::Pass, 2)],
+                            },
+                            Handler {
+                                exc: None,
+                                exc_expr: Some(call_matcher),
+                                binding: None,
+                                binding_cell: false,
+                                body: vec![nested],
+                            },
+                        ],
+                        else_body: Vec::new(),
+                        finally_body: Vec::new(),
+                    },
+                    1,
+                )],
+                is_async: false,
+                is_generator: false,
+            }],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object =
+            crate::compile_object(&program).expect("static and dynamic arms must lower together");
+        assert!(
+            runtime_call_sites(&object, "hydro_exc_matches") > 0,
+            "the static arms keep the tag matcher"
+        );
+        assert!(
+            runtime_call_sites(&object, "hydro_module_call") > 0,
+            "the call matcher still dispatches isinstance"
+        );
     }
 
     #[test]

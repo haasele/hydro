@@ -18,6 +18,7 @@ fn checker<'a>(prog: &'a LHir, inf: &'a mut Infer) -> Checker<'a> {
         ops: Vec::new(),
         checks: Vec::new(),
         spans: HashMap::new(),
+        narrow: HashMap::new(),
     }
 }
 
@@ -1469,6 +1470,42 @@ fn range_arguments_must_be_ints() {
         vec!["range() argument 'step' has type float, expected int"]
     );
     assert!(check_errors("x = range(True)\n").is_empty());
+}
+
+#[test]
+fn deferred_checks_use_the_type_at_the_call_site() {
+    // numpy/ma/mrecords.py: `ndescr = len(descr)` is an int where it feeds
+    // `range(ndescr)`; only later is the same local rebound to a list. The
+    // deferred range check must see the call-site type, not the final slot.
+    assert!(check_errors(
+        "def f(descr):\n\
+         \x20   ndescr = len(descr)\n\
+         \x20   names = [i for i in range(ndescr)]\n\
+         \x20   ndescr = []\n\
+         \x20   return names\n"
+    )
+    .is_empty());
+
+    // Numeric widening of the slot (`int` then `float`) must not retroactively
+    // turn the recorded read into a float either.
+    assert!(check_errors(
+        "def f(descr):\n\
+         \x20   n = len(descr)\n\
+         \x20   r = range(n)\n\
+         \x20   n = 1.5\n\
+         \x20   return r\n"
+    )
+    .is_empty());
+
+    // A genuinely non-int operand is still rejected at the call site.
+    assert_eq!(
+        check_errors(
+            "def f(descr):\n\
+             \x20   ndescr = list(descr)\n\
+             \x20   return range(ndescr)\n"
+        ),
+        vec!["range() argument 'stop' has type list, expected int"]
+    );
 }
 
 #[test]

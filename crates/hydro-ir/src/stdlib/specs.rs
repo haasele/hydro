@@ -206,6 +206,8 @@ const OPERATOR_FUNCTIONS: &[FunctionSpec] = &[
     // `_compare_digest(a, b)`: the timing-safe comparison `hmac`/`secrets`
     // import from `_operator`.
     f("_compare_digest", 2, 2, Type::Bool),
+    // `length_hint(obj, default=0)`: the object's declared length hint.
+    f("length_hint", 1, 2, Type::Int),
 ];
 
 pub static OPERATOR: ModuleSpec = ModuleSpec {
@@ -385,7 +387,26 @@ pub static JSON: ModuleSpec = ModuleSpec {
                 "cls",
             ],
         ),
-        f("loads", 1, 1, Type::Any),
+        // `loads(s, *, object_hook=None, parse_float=None, parse_int=None,
+        // parse_constant=None, object_pairs_hook=None, cls=None)`: every
+        // decoder hook is keyword-only in CPython. The slots keep the order
+        // the runtime dispatcher reads, and `None` selects the built-in
+        // decoder behaviour for that hook.
+        kw(
+            "loads",
+            1,
+            7,
+            Type::Any,
+            &[
+                "s",
+                "object_hook",
+                "parse_float",
+                "parse_int",
+                "parse_constant",
+                "object_pairs_hook",
+                "cls",
+            ],
+        ),
         kw(
             "dump",
             2,
@@ -408,10 +429,29 @@ pub static JSON: ModuleSpec = ModuleSpec {
 pub static CSV: ModuleSpec = ModuleSpec {
     name: "csv",
     functions: &[
-        kw("reader", 1, 1, Type::Any, &["file"]),
+        // `reader(file, dialect='excel', **fmtparams)`: the reader entry also
+        // accepts `dialect` positionally and every dialect format parameter by
+        // keyword, exactly like CPython's `_csv.reader`.
+        kw_dynamic("reader", 1, 2, Type::Any, &["file", "dialect"]),
+        // `writer(file, dialect='excel', **fmtparams)` is declared without the
+        // dialect plumbed through the writer object; the keyword surface stays
+        // closed so a dialect call fails loudly instead of being ignored.
         kw("writer", 1, 1, Type::Any, &["file"]),
-        kw("DictReader", 1, 1, Type::Any, &["file"]),
+        // `DictReader(f, fieldnames=None, restkey=None, restval=None,
+        // dialect='excel', *args, **kwds)`: `dialect` and the format
+        // parameters are keyword-only here.
+        kw_dynamic("DictReader", 1, 1, Type::Any, &["file"]),
         kw("DictWriter", 2, 2, Type::Any, &["file", "fieldnames"]),
+        // The process-global dialect registry. `register_dialect` takes the
+        // base dialect as its second positional/keyword argument and any
+        // remaining `**fmtparams`.
+        kw_dynamic("register_dialect", 1, 2, Type::None, &["name", "dialect"]),
+        f("unregister_dialect", 1, 1, Type::None),
+        // `get_dialect(name)`: a concrete `csv.Dialect`-like instance.
+        f("get_dialect", 1, 1, Type::Any),
+        f("list_dialects", 0, 0, Type::List),
+        // `field_size_limit([new_limit])`: the old (or current) limit.
+        f("field_size_limit", 0, 1, Type::Int),
     ],
     constants: &[
         c("QUOTE_MINIMAL", Type::Int),
@@ -420,6 +460,12 @@ pub static CSV: ModuleSpec = ModuleSpec {
         c("QUOTE_NONE", Type::Int),
         c("QUOTE_STRINGS", Type::Int),
         c("QUOTE_NOTNULL", Type::Int),
+        // The real classes: `Dialect` is the base pandas subclasses,
+        // `Sniffer` detects a dialect from a sample and `Error` is the
+        // exception every csv failure raises.
+        c("Dialect", Type::Any),
+        c("Sniffer", Type::Any),
+        c("Error", Type::Any),
     ],
 };
 
@@ -496,6 +542,10 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("getpid", 0, 0, Type::Int),
         f("getppid", 0, 0, Type::Int),
         f("cpu_count", 0, 0, Type::Int),
+        // `process_cpu_count()`: CPUs available to this process (affinity).
+        f("process_cpu_count", 0, 0, Type::Int),
+        // `umask(mask)`: set the process umask and return the previous one.
+        f("umask", 1, 1, Type::Int),
         f("getcwd", 0, 0, Type::Str),
         // `getcwdb()`: the current directory as bytes.
         f("getcwdb", 0, 0, Type::Bytes),
@@ -1276,6 +1326,24 @@ pub static THREADING: ModuleSpec = ModuleSpec {
         f("Lock", 0, 0, Type::Any),
         f("RLock", 0, 0, Type::Any),
         f("Event", 0, 0, Type::Any),
+        // `Barrier(parties, action=None, timeout=None)`: the value is the
+        // cached class, while module calls lower here and construct through
+        // it. The `_barrier_*` entries are the class's native method bodies
+        // and property getters; native calls are validated against this table.
+        kw(
+            "Barrier",
+            1,
+            3,
+            Type::Any,
+            &["parties", "action", "timeout"],
+        ),
+        f("_barrier_init", 1, 4, Type::None),
+        f("_barrier_wait", 1, 2, Type::Int),
+        f("_barrier_reset", 1, 1, Type::None),
+        f("_barrier_abort", 1, 1, Type::None),
+        f("_barrier_parties", 1, 1, Type::Int),
+        f("_barrier_n_waiting", 1, 1, Type::Int),
+        f("_barrier_broken", 1, 1, Type::Bool),
         // `Condition(lock=None)`: lock/notify surface used by
         // `concurrent.futures`; the runtime backs it with the Event object.
         f("Condition", 0, 1, Type::Any),
@@ -1297,6 +1365,8 @@ pub static THREADING: ModuleSpec = ModuleSpec {
     constants: &[
         // Empty base class; Hydro has no per-thread attribute storage.
         c("local", Type::Any),
+        // `Barrier.wait` raises this when the barrier times out or is aborted.
+        c("BrokenBarrierError", Type::Any),
     ],
 };
 
@@ -1399,9 +1469,26 @@ pub static PICKLE: ModuleSpec = ModuleSpec {
         // module function so `pickle.Pickler(...)` lowers as a module call;
         // the runtime value is the class.
         kw("Pickler", 1, 2, Type::Any, &["file", "protocol"]),
-        // `pickle._Pickler`: CPython's pure-Python writer; HYD1 has one
-        // writer, so both spellings are the same class.
+        // `pickle._Pickler`: CPython's pure-Python writer. HYD1 has one
+        // writer implementation, exposed as the base class of `Pickler`;
+        // subclasses inherit the constructor, `dump`, `clear_memo`,
+        // `persistent_id` and the class-level `dispatch`/`dispatch_table`
+        // mappings.
         kw("_Pickler", 1, 2, Type::Any, &["file", "protocol"]),
+        // `pickle._Unpickler(file, *, fix_imports=True, encoding="ASCII",
+        // errors="strict", buffers=None)`: CPython's pure-Python reader.
+        // pandas defines `class Unpickler(pickle._Unpickler)` and evaluates
+        // `pickle._Unpickler.dispatch.copy()` at import time, so the runtime
+        // value is a real, subclassable class carrying `dispatch`,
+        // `dispatch_table`, `load`, `loads`, `find_class` and
+        // `persistent_load`.
+        kw(
+            "_Unpickler",
+            1,
+            5,
+            Type::Any,
+            &["file", "fix_imports", "encoding", "errors", "buffers"],
+        ),
         // `Unpickler(file, *, fix_imports=True, encoding="ASCII",
         // errors="strict", buffers=None)`: the streaming reader. Declared as
         // a module function so `pickle.Unpickler(...)` lowers as a module
@@ -1434,6 +1521,83 @@ pub static PICKLE: ModuleSpec = ModuleSpec {
         // `pickle.bytes_types`: the byte-like types `loads` accepts
         // (`(bytes, bytearray)` in CPython).
         c("bytes_types", Type::Any),
+        // CPython 3.14's one-byte opcode constants (`REDUCE = b'R'`, ...).
+        // `pickle.__all__` extends with every uppercase name, and consumers
+        // such as pandas' `compat/pickle_compat.py` build their dispatch table
+        // with `pickle.REDUCE[0]` / `pickle.NEWOBJ[0]`, so the names must be
+        // part of the module surface. The values are `bytes`; the runtime
+        // serves them from its opcode table (HYD1 itself has no opcode
+        // stream).
+        c("ADDITEMS", Type::Any),
+        c("APPEND", Type::Any),
+        c("APPENDS", Type::Any),
+        c("BINBYTES", Type::Any),
+        c("BINBYTES8", Type::Any),
+        c("BINFLOAT", Type::Any),
+        c("BINGET", Type::Any),
+        c("BININT", Type::Any),
+        c("BININT1", Type::Any),
+        c("BININT2", Type::Any),
+        c("BINPERSID", Type::Any),
+        c("BINPUT", Type::Any),
+        c("BINSTRING", Type::Any),
+        c("BINUNICODE", Type::Any),
+        c("BINUNICODE8", Type::Any),
+        c("BUILD", Type::Any),
+        c("BYTEARRAY8", Type::Any),
+        c("DICT", Type::Any),
+        c("DUP", Type::Any),
+        c("EMPTY_DICT", Type::Any),
+        c("EMPTY_LIST", Type::Any),
+        c("EMPTY_SET", Type::Any),
+        c("EMPTY_TUPLE", Type::Any),
+        c("EXT1", Type::Any),
+        c("EXT2", Type::Any),
+        c("EXT4", Type::Any),
+        c("FALSE", Type::Any),
+        c("FLOAT", Type::Any),
+        c("FRAME", Type::Any),
+        c("FROZENSET", Type::Any),
+        c("GET", Type::Any),
+        c("GLOBAL", Type::Any),
+        c("INST", Type::Any),
+        c("INT", Type::Any),
+        c("LIST", Type::Any),
+        c("LONG", Type::Any),
+        c("LONG1", Type::Any),
+        c("LONG4", Type::Any),
+        c("LONG_BINGET", Type::Any),
+        c("LONG_BINPUT", Type::Any),
+        c("MARK", Type::Any),
+        c("MEMOIZE", Type::Any),
+        c("NEWFALSE", Type::Any),
+        c("NEWOBJ", Type::Any),
+        c("NEWOBJ_EX", Type::Any),
+        c("NEWTRUE", Type::Any),
+        c("NEXT_BUFFER", Type::Any),
+        c("NONE", Type::Any),
+        c("OBJ", Type::Any),
+        c("PERSID", Type::Any),
+        c("POP", Type::Any),
+        c("POP_MARK", Type::Any),
+        c("PROTO", Type::Any),
+        c("PUT", Type::Any),
+        c("READONLY_BUFFER", Type::Any),
+        c("REDUCE", Type::Any),
+        c("SETITEM", Type::Any),
+        c("SETITEMS", Type::Any),
+        c("SHORT_BINBYTES", Type::Any),
+        c("SHORT_BINSTRING", Type::Any),
+        c("SHORT_BINUNICODE", Type::Any),
+        c("STACK_GLOBAL", Type::Any),
+        c("STOP", Type::Any),
+        c("STRING", Type::Any),
+        c("TRUE", Type::Any),
+        c("TUPLE", Type::Any),
+        c("TUPLE1", Type::Any),
+        c("TUPLE2", Type::Any),
+        c("TUPLE3", Type::Any),
+        c("UNICODE", Type::Any),
     ],
 };
 
@@ -1456,6 +1620,12 @@ pub static SYS: ModuleSpec = ModuleSpec {
         // `getsizeof(obj, default=None)`: the object's shallow size. Hydro
         // reports its own representation sizes, not CPython's.
         f("getsizeof", 1, 2, Type::Int),
+        // `getrefcount(obj)`: the number of references to `obj`. Hydro has a
+        // tracing collector and no per-object reference count, so the runtime
+        // reports two references (the value's stored reference plus the
+        // argument slot) — CPython's count for a singly referenced object —
+        // instead of a fabricated ownership total.
+        f("getrefcount", 1, 1, Type::Int),
         f("setrecursionlimit", 1, 1, Type::None),
         // `sys._getframemodulename(depth=0)` reports the module name of a
         // caller frame, and `sys._getframe(depth=0)` returns that frame.
@@ -2134,6 +2304,7 @@ const SOCKET_CONSTANTS: &[ConstantSpec] = &[
     c("_GLOBAL_DEFAULT_TIMEOUT", Type::Any),
     c("error", Type::Any),
     c("gaierror", Type::Any),
+    c("herror", Type::Any),
     c("timeout", Type::Any),
 ];
 
@@ -2452,7 +2623,18 @@ pub static ERRNO: ModuleSpec = ModuleSpec {
 pub static UNITTEST: ModuleSpec = ModuleSpec {
     name: "unittest",
     functions: &[
-        f("main", 0, 0, Type::None),
+        // `main(*args, **kwargs)` runs the registered tests; the arguments are
+        // accepted for CPython compatibility (`verbosity`, `argv`, ...).
+        kw_dynamic("main", 0, usize::MAX, Type::Any, &[]),
+        // Skip / expected-failure decorators. `skip` is callable both as
+        // `@skip(reason)` and as the bare `@skip` decorator.
+        f("expectedFailure", 1, 1, Type::Any),
+        f("skip", 1, 1, Type::Any),
+        f("skipIf", 2, 2, Type::Any),
+        f("skipUnless", 2, 2, Type::Any),
+        f("_skip_apply", 3, 3, Type::Any),
+        f("_identity", 1, 1, Type::Any),
+        f("_three_way_cmp", 2, 2, Type::Int),
         f("_case_marker", 1, 1, Type::None),
         f("_assert_has_attr", 3, 4, Type::None),
         f("_assert_in", 3, 4, Type::None),
@@ -2462,10 +2644,38 @@ pub static UNITTEST: ModuleSpec = ModuleSpec {
         f("_assert_is", 3, 3, Type::None),
         f("_fail", 1, 2, Type::None),
     ],
-    // `TestCase` and `TestSuite` are classes (not constructors declared as
-    // functions), so reads resolve them directly; `Type::Any` keeps
-    // subclassing and construction lowering to the runtime values.
-    constants: &[c("TestCase", Type::Any), c("TestSuite", Type::Any)],
+    // The framework classes are native class values (their methods are
+    // runtime-only qualified names), so reads resolve them directly;
+    // `Type::Any` keeps subclassing and construction lowering to the runtime.
+    constants: &[
+        c("TestCase", Type::Any),
+        c("TestSuite", Type::Any),
+        c("BaseTestSuite", Type::Any),
+        c("TestResult", Type::Any),
+        c("TextTestResult", Type::Any),
+        c("TextTestRunner", Type::Any),
+        c("TestLoader", Type::Any),
+        c("TestProgram", Type::Any),
+        c("defaultTestLoader", Type::Any),
+        c("SkipTest", Type::Any),
+        // The nested native module.
+        c("util", Type::Any),
+    ],
+};
+
+/// `unittest.util`: helpers used by `TestCase` and the CPython test runner.
+pub static UNITTEST_UTIL: ModuleSpec = ModuleSpec {
+    name: "unittest.util",
+    functions: &[
+        f("strclass", 1, 1, Type::Str),
+        f("safe_repr", 1, 2, Type::Str),
+        f("sorted_list_difference", 2, 2, Type::Tuple),
+        f("unorderable_list_difference", 2, 2, Type::Tuple),
+        f("three_way_cmp", 2, 2, Type::Int),
+        f("_common_shorten_repr", 0, usize::MAX, Type::Tuple),
+    ],
+    // The two test-like container classes are real class values.
+    constants: &[c("_ErrorHolder", Type::Any), c("TestList", Type::Any)],
 };
 
 /// `pytest`: the Hydro test runner's native support module.
@@ -3581,6 +3791,8 @@ pub static FUTURE: ModuleSpec = ModuleSpec {
         c("nested_scopes", Type::Bool),
         c("generators", Type::Bool),
         c("with_statement", Type::Bool),
+        // The compiler flag constant `compile(..., flags=...)` reads.
+        c("CO_FUTURE_BARRY_AS_BDFL", Type::Int),
         // The release-record class `pydoc` uses as an `isinstance` target.
         c("_Feature", Type::Any),
     ],
@@ -4215,6 +4427,8 @@ pub static CONTEXTLIB: ModuleSpec = ModuleSpec {
         // Real class values at runtime; see `contextlib_class_value`.
         c("AbstractContextManager", Type::Any),
         c("AbstractAsyncContextManager", Type::Any),
+        // The concrete manager `contextmanager` wraps generators in.
+        c("_GeneratorContextManager", Type::Any),
     ],
 };
 
@@ -5352,6 +5566,22 @@ pub static HTTP: ModuleSpec = ModuleSpec {
         Type::None,
         &["port", "routes", "handler", "max_connections"],
     )],
+    constants: &[
+        c("HTTPStatus", Type::Any),
+        // Nested native submodules exposed as module values.
+        c("client", Type::Any),
+        c("server", Type::Any),
+    ],
+};
+
+/// `http.client`: the submodule `from http import client` names.
+///
+/// Hydro's `http` is the native server, so the CPython package sources cannot
+/// be linked underneath it. The submodule exists as a module value so imports
+/// succeed; its `HTTPConnection` family is not part of the native surface.
+pub static HTTP_CLIENT: ModuleSpec = ModuleSpec {
+    name: "http.client",
+    functions: &[],
     constants: &[],
 };
 
@@ -6698,6 +6928,73 @@ mod tests {
         let dump = function("json", "dump").expect("json.dump");
         assert_eq!(dump.max_args, 6);
         assert_eq!(dump.params.last().copied(), Some("sort_keys"));
+        // `loads` exposes the keyword-only decoder hooks; the slot order is
+        // the positional layout the runtime dispatcher decodes.
+        let loads = function("json", "loads").expect("json.loads");
+        assert_eq!((loads.min_args, loads.max_args), (1, 7));
+        assert_eq!(
+            loads.params,
+            &[
+                "s",
+                "object_hook",
+                "parse_float",
+                "parse_int",
+                "parse_constant",
+                "object_pairs_hook",
+                "cls",
+            ][..]
+        );
+    }
+
+    #[test]
+    fn csv_dialect_registry_surface_is_declared() {
+        // The dialect registry entry points are real module functions.
+        for name in [
+            "register_dialect",
+            "unregister_dialect",
+            "get_dialect",
+            "list_dialects",
+            "field_size_limit",
+        ] {
+            assert!(function("csv", name).is_some(), "csv.{name}");
+        }
+        let register = function("csv", "register_dialect").expect("csv.register_dialect");
+        assert_eq!((register.min_args, register.max_args), (1, 2));
+        assert_eq!(register.params, &["name", "dialect"][..]);
+        assert!(
+            register.dynamic_keywords,
+            "register_dialect(name, dialect='excel', **fmtparams)"
+        );
+        let limit = function("csv", "field_size_limit").expect("csv.field_size_limit");
+        assert_eq!((limit.min_args, limit.max_args), (0, 1));
+        assert_eq!(limit.ret, Type::Int);
+        assert_eq!(function("csv", "list_dialects").unwrap().ret, Type::List);
+        assert_eq!(function("csv", "get_dialect").unwrap().ret, Type::Any);
+
+        // `reader` accepts dialect and format parameters; `DictReader` the
+        // same keyword surface.
+        let reader = function("csv", "reader").expect("csv.reader");
+        assert_eq!((reader.min_args, reader.max_args), (1, 2));
+        assert_eq!(reader.params, &["file", "dialect"][..]);
+        assert!(reader.dynamic_keywords);
+        assert!(function("csv", "DictReader").unwrap().dynamic_keywords);
+
+        // The classes are module constants resolved by the runtime.
+        for name in ["Dialect", "Sniffer", "Error"] {
+            assert_eq!(
+                constant("csv", name)
+                    .unwrap_or_else(|| panic!("csv.{name}"))
+                    .ty,
+                Type::Any
+            );
+        }
+        // `_csv` shares the csv surface.
+        for name in ["register_dialect", "Dialect", "Sniffer", "Error"] {
+            assert!(
+                function("_csv", name).is_some() || constant("_csv", name).is_some(),
+                "_csv.{name}"
+            );
+        }
     }
 
     #[test]
@@ -7856,6 +8153,13 @@ mod tests {
         let set_limit = function("sys", "setrecursionlimit").expect("setrecursionlimit");
         assert_eq!((set_limit.min_args, set_limit.max_args), (1, 1));
         assert_eq!(set_limit.ret, Type::None);
+        // `sys.getrefcount(obj)`: Hydro reports the single-stored-reference
+        // count, but the arity/return contract matches CPython's query.
+        let getref = function("sys", "getrefcount").expect("sys.getrefcount");
+        assert_eq!(
+            (getref.min_args, getref.max_args, getref.ret),
+            (1, 1, Type::Int)
+        );
         let frame_module = function("sys", "_getframemodulename").expect("_getframemodulename");
         assert_eq!(
             (
@@ -7949,7 +8253,19 @@ mod tests {
         // `TestCase` and `TestSuite` are classes, not module functions: reads
         // resolve them directly and the runtime hands back native class
         // values (methods are dispatched under qualified names).
-        for name in ["TestCase", "TestSuite"] {
+        for name in [
+            "TestCase",
+            "TestSuite",
+            "BaseTestSuite",
+            "TestResult",
+            "TextTestResult",
+            "TextTestRunner",
+            "TestLoader",
+            "TestProgram",
+            "defaultTestLoader",
+            "SkipTest",
+            "util",
+        ] {
             assert_eq!(
                 constant("unittest", name)
                     .unwrap_or_else(|| panic!("unittest.{name}"))
@@ -7963,6 +8279,33 @@ mod tests {
         // must not advertise them as module functions.
         assert!(function("unittest", "TestSuite.addTest").is_none());
         assert!(function("unittest", "TestSuite.run").is_none());
+        // The decorators and the runner entry point are real module functions.
+        for name in ["main", "expectedFailure", "skip", "skipIf", "skipUnless"] {
+            assert!(function("unittest", name).is_some(), "{name}");
+        }
+        // `unittest.util` is a nested native module with the CPython helpers.
+        assert_eq!(
+            module("unittest.util").expect("unittest.util").name,
+            "unittest.util"
+        );
+        for name in [
+            "strclass",
+            "safe_repr",
+            "sorted_list_difference",
+            "unorderable_list_difference",
+            "three_way_cmp",
+        ] {
+            assert!(function("unittest.util", name).is_some(), "{name}");
+        }
+        for name in ["_ErrorHolder", "TestList"] {
+            assert_eq!(
+                constant("unittest.util", name)
+                    .unwrap_or_else(|| panic!("unittest.util.{name}"))
+                    .ty,
+                Type::Any,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -8638,6 +8981,11 @@ mod tests {
         let pickler = function("pickle", "Pickler").expect("pickle.Pickler");
         assert_eq!((pickler.min_args, pickler.max_args), (1, 2));
         assert_eq!(pickler.params, &["file", "protocol"][..]);
+        // `pickle._Pickler` is the subclassable base class spelling; it keeps
+        // the same constructor signature as `Pickler`.
+        let private_pickler = function("pickle", "_Pickler").expect("pickle._Pickler");
+        assert_eq!((private_pickler.min_args, private_pickler.max_args), (1, 2));
+        assert_eq!(private_pickler.params, &["file", "protocol"][..]);
         // `zlib._ZlibDecompressor` is the class value `gzip` instantiates.
         assert_eq!(
             constant("zlib", "_ZlibDecompressor")
@@ -8668,6 +9016,13 @@ mod tests {
             ("pickle", "PickleError", Type::Any),
             ("pickle", "PicklingError", Type::Any),
             ("pickle", "UnpicklingError", Type::Any),
+            // CPython 3.14 opcode constants used to build dispatch tables
+            // (`pickle.REDUCE[0]`, `pickle.NEWOBJ[0]`).
+            ("pickle", "REDUCE", Type::Any),
+            ("pickle", "NEWOBJ", Type::Any),
+            ("pickle", "BUILD", Type::Any),
+            ("pickle", "APPEND", Type::Any),
+            ("pickle", "SETITEMS", Type::Any),
             ("importlib", "_bootstrap_external", Type::Any),
             ("sys", "stdlib_module_names", Type::Set),
             ("pickle", "bytes_types", Type::Any),
@@ -8708,6 +9063,17 @@ mod tests {
         assert_eq!((unpickler.min_args, unpickler.max_args), (1, 5));
         assert_eq!(
             unpickler.params,
+            &["file", "fix_imports", "encoding", "errors", "buffers"][..]
+        );
+        // `pickle._Unpickler` is the pure-Python spelling pandas subclasses;
+        // it shares `Unpickler`'s constructor signature.
+        let private_unpickler = function("pickle", "_Unpickler").expect("pickle._Unpickler");
+        assert_eq!(
+            (private_unpickler.min_args, private_unpickler.max_args),
+            (1, 5)
+        );
+        assert_eq!(
+            private_unpickler.params,
             &["file", "fix_imports", "encoding", "errors", "buffers"][..]
         );
         assert!(function("pickle", "Pickler").is_some());

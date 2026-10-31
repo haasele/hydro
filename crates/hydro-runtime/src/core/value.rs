@@ -8716,6 +8716,21 @@ fn instance_default_repr(state: &InstanceState) -> String {
     format!("<{name} object>")
 }
 
+/// `object.__repr__(v)`: the universal default rendering.
+///
+/// Instances render as `<ClassName object>`; every other value keeps its normal
+/// repr, so an explicit `object.__repr__(1)` still yields `1`.
+///
+/// The `__object_repr__` dispatch guard uses this instead of `repr()`: on an
+/// instance with `object` in its MRO, `repr()` would resolve the same
+/// `__object_repr__` slot again and recurse.
+pub(crate) fn object_default_repr(v: i64) -> String {
+    match as_instance(v) {
+        Some(state) => instance_default_repr(state),
+        None => repr(v),
+    }
+}
+
 /// `repr(bytearray)`: the bytes literal wrapped in `bytearray(...)`.
 pub(crate) fn bytearray_repr(bytes: &[u8]) -> String {
     format!("bytearray({})", quote_bytes(bytes))
@@ -8983,6 +8998,15 @@ pub(crate) fn to_string(v: i64) -> String {
                     if let Some(ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
                         class_lookup(class, "__str__")
                     {
+                        // `object.__str__` is `type(self).__repr__(self)`, but
+                        // its native body calls `str(self)` and would re-enter
+                        // this renderer. A class that inherits `object` (a
+                        // namedtuple does, through `tuple`) and defines only
+                        // `__repr__` used to recurse until the stack overflowed
+                        // here. Apply CPython's slot behaviour instead.
+                        if function_native_name(function) == Some("__object_str__") {
+                            return repr_depth(v, 0);
+                        }
                         let result = call_instance_dunder(v, function);
                         if !crate::exc::pending() {
                             if let Some(text) = as_str(result) {
@@ -8993,6 +9017,9 @@ pub(crate) fn to_string(v: i64) -> String {
                         // A dunder assigned after class creation (`C.__str__ =
                         // f`, how `enum.py` installs the mixed-in type's slot).
                         if as_function(item).is_some() {
+                            if function_native_name(item) == Some("__object_str__") {
+                                return repr_depth(v, 0);
+                            }
                             let result = crate::core::methods::call(
                                 v,
                                 b"__str__".as_ptr(),
@@ -9200,6 +9227,12 @@ fn repr_depth(v: i64, depth: usize) -> String {
         if let Some(ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
             class_lookup(class, "__repr__")
         {
+            // `object.__repr__`'s native body calls `repr(self)` and would
+            // re-enter this renderer; its documented output is exactly the
+            // default `<Name object>` rendering.
+            if function_native_name(function) == Some("__object_repr__") {
+                return instance_default_repr(state);
+            }
             let result = call_instance_dunder(v, function);
             if !crate::exc::pending() {
                 if let Some(text) = as_str(result) {
@@ -9214,6 +9247,9 @@ fn repr_depth(v: i64, depth: usize) -> String {
             // A dunder assigned after class creation (`C.__repr__ = f`, how
             // `enum.py` installs the mixed-in type's slot on `IntEnum`).
             if as_function(item).is_some() {
+                if function_native_name(item) == Some("__object_repr__") {
+                    return instance_default_repr(state);
+                }
                 let result =
                     crate::core::methods::call(v, b"__repr__".as_ptr(), 8, 0, std::ptr::null());
                 if !crate::exc::pending() {
@@ -9816,6 +9852,76 @@ mod tests {
         assert_eq!(repr(bare), "<Bare object>");
         assert_eq!(to_string(bare), "<Bare object>");
         assert!(!crate::exc::pending());
+    }
+
+    /// Regression for the `namedtuple` stack overflow: a class with `object`
+    /// in its MRO inherits `object.__str__`/`object.__repr__`, whose native
+    /// bodies call `str(self)`/`repr(self)`. Dispatching them from the
+    /// renderers re-entered the same class lookup forever. The renderers now
+    /// apply CPython's slot behaviour (str delegates to repr; repr is the
+    /// default `<Name object>`), while a user-defined dunder still wins.
+    #[test]
+    fn object_default_dunders_render_without_recursing() {
+        crate::exc::init();
+        let self_parameter = || ParamMeta {
+            name: "self".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        };
+
+        // An object whose `__str__` returns a str keeps that rendering.
+        let str_method = native_function_new("value_tests", "_tagged_str", usize::MAX);
+        function_set_signature(str_method, vec![self_parameter()]);
+        function_set_full_entry(str_method, tagged_str_entry as *const () as usize);
+        let str_class = class_new(
+            "StrOnly".to_string(),
+            object_class(),
+            vec![("__str__".to_string(), str_method)],
+        );
+        let str_instance = instance_new(str_class);
+        assert_eq!(to_string(str_instance), "tagged");
+        assert_eq!(repr(str_instance), "<StrOnly object>");
+        assert!(!crate::exc::pending(), "custom __str__ dispatch raised");
+
+        // A class that only overrides `__repr__` gets it from `str()`: the
+        // inherited `object.__str__` delegates to `type(self).__repr__`.
+        // This is exactly the namedtuple slot arrangement.
+        let repr_method = native_function_new("value_tests", "_tagged_repr", usize::MAX);
+        function_set_signature(repr_method, vec![self_parameter()]);
+        function_set_full_entry(repr_method, tagged_repr_entry as *const () as usize);
+        let repr_class = class_new(
+            "ReprOnly".to_string(),
+            object_class(),
+            vec![("__repr__".to_string(), repr_method)],
+        );
+        let repr_instance = instance_new(repr_class);
+        assert_eq!(to_string(repr_instance), "Tagged()");
+        assert_eq!(repr(repr_instance), "Tagged()");
+        assert!(!crate::exc::pending(), "repr delegation raised");
+
+        // A direct `object.__str__(x)` / `object.__repr__(x)` goes through the
+        // native dispatch and must terminate with the same slot behaviour.
+        let object_str = match class_lookup(object_class(), "__str__") {
+            Some(ClassEntry::Method(_, function)) => function,
+            _ => panic!("object.__str__ is not a class method"),
+        };
+        let direct = crate::core::builtins::call(object_str, 1, [repr_instance].as_ptr());
+        assert_eq!(as_str(direct), Some("Tagged()"));
+        assert!(!crate::exc::pending(), "object.__str__ raised");
+
+        let object_repr = match class_lookup(object_class(), "__repr__") {
+            Some(ClassEntry::Method(_, function)) => function,
+            _ => panic!("object.__repr__ is not a class method"),
+        };
+        let direct = crate::core::builtins::call(object_repr, 1, [repr_instance].as_ptr());
+        assert_eq!(as_str(direct), Some("<ReprOnly object>"));
+        assert!(!crate::exc::pending(), "object.__repr__ raised");
+
+        // Neither dunder: the universal default, not a recursion.
+        let plain = instance_new(class_new("Plain".to_string(), object_class(), Vec::new()));
+        assert_eq!(to_string(plain), "<Plain object>");
+        assert_eq!(repr(plain), "<Plain object>");
+        assert!(!crate::exc::pending(), "default rendering raised");
     }
 
     extern "C" fn raising_repr_entry(_argv: *const i64) -> i64 {

@@ -6,10 +6,27 @@
  * here, and every conversion is forwarded to a Rust accessor exported by
  * `crates/hydro-runtime/src/capi/mod.rs`.
  *
- * Supported format characters (matching the subset implemented in Rust):
+ * Supported format characters (conversions are forwarded to the Rust
+ * accessors unless noted):
  *   i  int *            l  long *            n  Py_ssize_t *
  *   d  double *         s  const char **     O  PyObject **
- *   p  int * (truth)
+ *   p  int * (truth)    s# const char ** + Py_ssize_t *
+ *   O& converter + void *                   O! type + PyObject **
+ *   L  long long *      k  unsigned long *   K  unsigned long long *
+ *   I  unsigned int *   f  float *
+ *   z  str-or-None       y  bytes-like C string
+ *   s*, z*, y*, w*  Py_buffer *  (acquired through the exported buffer API)
+ *   s#, z#, y#      pointer + Py_ssize_t *      (length-aware string units)
+ *   es/et/es#/et# encoded buffer owned by the caller
+ *
+ * `Z`, `u` and `u#` are not supported, matching CPython 3.14, which removed
+ * those units (`skipitem`/`convertsimple` reject them as impossible format
+ * characters).
+ *
+ * Format units are scanned, not counted character by character: a unit plus
+ * its modifier (`O&`, `O!`, `s#`, `es#`, `s*`, `[ ... ]`) is one argument,
+ * even though `O&` consumes two pointers from the `va_list`. Units that nest
+ * other units (`(...)`, `[...]`) count as a single top-level unit.
  *
  * `|` starts the optional arguments; parsing stops successfully once an
  * optional argument is missing. `$` (keyword variant only) starts the
@@ -68,11 +85,57 @@ extern int hydro_capi_parse_d(PyObject *object, double *out);
 extern int hydro_capi_parse_s(PyObject *object, const char **out);
 extern int hydro_capi_parse_o(PyObject *object, PyObject **out);
 extern int hydro_capi_parse_p(PyObject *object, int *out);
+extern int PyObject_IsInstance(PyObject *instance, PyObject *type);
 extern void hydro_capi_set_error(const char *message);
 extern void hydro_capi_set_type_error(const char *message);
 extern void hydro_capi_set_exception_message(PyObject *exception, const char *message);
 extern void *hydro_capi_vectorcall(void *callable, void *const *args,
                                    size_t nargs);
+
+/*
+ * `Py_buffer` as CPython 3.14 and this host's `buffer.rs` define it (both
+ * assert this exact 80-byte x86_64 layout). Only the address is handed to the
+ * host; the field mirror lets the parser fill in and read back a view.
+ */
+typedef struct hydro_capi_buffer {
+    void *buf;
+    PyObject *obj;
+    Py_ssize_t len;
+    Py_ssize_t itemsize;
+    int readonly;
+    int ndim;
+    char *format;
+    Py_ssize_t *shape;
+    Py_ssize_t *strides;
+    Py_ssize_t *suboffsets;
+    void *internal;
+} hydro_capi_buffer;
+
+#define HYDRO_CAPI_PYBUF_SIMPLE 0
+#define HYDRO_CAPI_PYBUF_WRITABLE 1
+
+extern int PyObject_GetBuffer(PyObject *object, hydro_capi_buffer *view,
+                              int flags);
+extern void PyBuffer_Release(hydro_capi_buffer *view);
+extern int PyBuffer_FillInfo(hydro_capi_buffer *view, PyObject *object, void *buf,
+                             Py_ssize_t len, int readonly, int flags);
+extern char _Py_NoneStruct;
+extern long long PyLong_AsLongLong(PyObject *object);
+extern unsigned long long PyLong_AsUnsignedLongLongMask(PyObject *object);
+extern double PyFloat_AsDouble(PyObject *object);
+extern PyObject *PyErr_Occurred(void);
+extern void PyErr_Clear(void);
+extern PyObject *PyErr_NoMemory(void);
+extern void *PyMem_Malloc(size_t size);
+extern const char *PyUnicode_AsUTF8AndSize(PyObject *object, Py_ssize_t *size);
+extern PyObject *PyUnicode_AsEncodedString(PyObject *object,
+                                           const char *encoding,
+                                           const char *errors);
+extern int PyBytes_AsStringAndSize(PyObject *object, char **string,
+                                   Py_ssize_t *length);
+extern Py_ssize_t PyByteArray_Size(PyObject *object);
+extern char *PyByteArray_AsString(PyObject *object);
+extern void Py_DecRef(PyObject *object);
 
 static int hydro_capi_is_space(char code)
 {
@@ -108,13 +171,571 @@ static void hydro_capi_unsupported_character(const char *api_name, char code)
     hydro_capi_set_type_error(message);
 }
 
+/* Function-pointer argument of an `O&` format unit. */
+typedef int (*hydro_capi_converter)(PyObject *object, void *address);
+
 /*
- * Converts one argument for `code`, storing through the pointer the caller
+ * One top-level format unit, as scanned from the format string.
+ *
+ * `code` is the conversion character; `modifier` is the suffix that extends
+ * it (`&`/`!` after `O`, `#` after `s`, `*`/`+` after string or buffer codes,
+ * `s`/`t` after `e`). `varargs` is the number of pointer-sized `va_arg` slots
+ * the unit consumes, which is *not* the same as the unit count: `O&` is one
+ * keyword argument but takes a converter and an address, and `s#` is one
+ * keyword argument but takes a string pointer and a length pointer. `group`
+ * marks a `(...)` or `[...]` group, which is one top-level unit regardless of
+ * how many units it nests.
+ */
+typedef struct hydro_capi_unit {
+    char code;
+    char modifier;
+    int group;
+    int varargs;
+} hydro_capi_unit;
+
+/*
+ * Advances `*pcursor` past exactly one format unit.
+ *
+ * Returns 1 when a unit was scanned, 0 at the end of the format (`'\0'`,
+ * `':'` or `';'`), and -1 for a malformed format with the error already
+ * recorded. Markers (`'|'`, `'$'`), whitespace and the trailing function name
+ * are not units; callers handle them before calling this function, the same
+ * way CPython's `vgetargskeywords` checks for the markers before advancing
+ * the format pointer.
+ *
+ * Every optional or trailing part of a unit stays attached to that unit, so
+ * "one keyword name per unit" is decided by this scanner and not by counting
+ * format characters.
+ */
+static int hydro_capi_scan_unit(const char **pcursor, hydro_capi_unit *unit)
+{
+    const char *cursor = *pcursor;
+    char code = *cursor;
+
+    unit->code = code;
+    unit->modifier = '\0';
+    unit->group = 0;
+    unit->varargs = 1;
+
+    if (code == '\0' || code == ':' || code == ';') {
+        return 0;
+    }
+    if (code == '(' || code == '[') {
+        char close = code == '(' ? ')' : ']';
+        int nested = 0;
+
+        cursor += 1;
+        for (;;) {
+            hydro_capi_unit inner;
+            int scanned;
+
+            while (hydro_capi_is_space(*cursor)) {
+                cursor += 1;
+            }
+            if (*cursor == '\0' || *cursor == ':' || *cursor == ';') {
+                hydro_capi_set_error(
+                    "SystemError: Unmatched left paren in format string");
+                return -1;
+            }
+            if (*cursor == ')') {
+                if (close != ')') {
+                    hydro_capi_set_error(
+                        "SystemError: Unmatched right paren in format string");
+                    return -1;
+                }
+                cursor += 1;
+                break;
+            }
+            if (*cursor == ']') {
+                if (close != ']') {
+                    hydro_capi_set_error(
+                        "SystemError: Unmatched right bracket in format string");
+                    return -1;
+                }
+                cursor += 1;
+                break;
+            }
+            scanned = hydro_capi_scan_unit(&cursor, &inner);
+            if (scanned <= 0) {
+                return scanned;
+            }
+            nested += inner.varargs;
+        }
+        unit->group = 1;
+        unit->varargs = nested;
+        *pcursor = cursor;
+        return 1;
+    }
+    if (code == ')' || code == ']') {
+        hydro_capi_set_error("SystemError: Unmatched right paren in format string");
+        return -1;
+    }
+
+    cursor += 1;
+    switch (code) {
+    case 'O':
+        /* `O&` takes a converter and an address, `O!` a type and an address. */
+        if (*cursor == '&' || *cursor == '!') {
+            unit->modifier = *cursor;
+            unit->varargs = 2;
+            cursor += 1;
+        }
+        break;
+    case 'e':
+        /* `es`, `et`, `es#`, `et#`: encoding, output pointer, maybe length. */
+        if (*cursor == 's' || *cursor == 't') {
+            unit->modifier = *cursor;
+            cursor += 1;
+            unit->varargs = 2;
+            if (*cursor == '#') {
+                unit->varargs = 3;
+                cursor += 1;
+            }
+        }
+        break;
+    case 's':
+    case 'z':
+    case 'y':
+    case 'w':
+        /* `s#`/`z#`/`y#` add a length pointer; `s*`/`w*` take a buffer. */
+        if (*cursor == '#') {
+            unit->modifier = '#';
+            unit->varargs = 2;
+            cursor += 1;
+        }
+        else if (*cursor == '*') {
+            unit->modifier = '*';
+            cursor += 1;
+        }
+        else if (code == 's' && *cursor == '+') {
+            unit->modifier = '+';
+            cursor += 1;
+        }
+        break;
+    default:
+        /* Every remaining supported unit takes a single pointer. */
+        break;
+    }
+    *pcursor = cursor;
+    return 1;
+}
+
+/* True when `object` is the None singleton. */
+static int hydro_capi_is_none(PyObject *object)
+{
+    return object == (PyObject *)(void *)&_Py_NoneStruct;
+}
+
+/*
+ * Releases a buffer view the way CPython leaves it after `PyArg_Parse*`
+ * returns: the exporter's release hook has run and the object reference has
+ * been dropped, but `buf`, `len` and the other fields stay readable by the
+ * extension. This host's `PyBuffer_Release` zeroes the whole structure, so the
+ * fields are restored with only `obj` cleared.
+ */
+static void hydro_capi_release_buffer(hydro_capi_buffer *view)
+{
+    hydro_capi_buffer saved = *view;
+
+    PyBuffer_Release(view);
+    saved.obj = NULL;
+    *view = saved;
+}
+
+static void hydro_capi_argument_type_error(const char *api_name,
+                                           const char *expected)
+{
+    char message[HYDRO_CAPI_MESSAGE_SIZE];
+
+    snprintf(message, sizeof message, "%s: argument must be %s", api_name,
+             expected);
+    hydro_capi_set_type_error(message);
+}
+
+/* `s*` / `z*` / `y*` / `w*`: acquire a view over the argument. */
+static int hydro_capi_convert_view(const hydro_capi_unit *unit, PyObject *item,
+                                   va_list *arguments, const char *api_name)
+{
+    hydro_capi_buffer *view = va_arg(*arguments, hydro_capi_buffer *);
+
+    if (view == NULL) {
+        hydro_capi_null_pointer(api_name, unit->code);
+        return 0;
+    }
+    if (unit->code == 'w') {
+        if (unit->modifier != '*') {
+            /* `w` is only valid as `w*`. */
+            hydro_capi_unsupported_character(api_name, 'w');
+            return 0;
+        }
+        if (PyObject_GetBuffer(item, view, HYDRO_CAPI_PYBUF_WRITABLE) != 0) {
+            /* CPython discards the exporter's error and reports the format
+             * requirement instead. */
+            PyErr_Clear();
+            hydro_capi_argument_type_error(api_name,
+                                           "a read-write bytes-like object");
+            return 0;
+        }
+        hydro_capi_release_buffer(view);
+        return 1;
+    }
+    if (unit->code == 'z' && hydro_capi_is_none(item)) {
+        if (PyBuffer_FillInfo(view, NULL, NULL, 0, 1,
+                              HYDRO_CAPI_PYBUF_SIMPLE) != 0) {
+            return 0;
+        }
+        return 1;
+    }
+    if (unit->code == 's' || unit->code == 'z') {
+        Py_ssize_t length = 0;
+        const char *text = PyUnicode_AsUTF8AndSize(item, &length);
+
+        if (text != NULL) {
+            if (PyBuffer_FillInfo(view, item, (void *)text, length, 1,
+                                  HYDRO_CAPI_PYBUF_SIMPLE) != 0) {
+                return 0;
+            }
+            hydro_capi_release_buffer(view);
+            return 1;
+        }
+        /* Not `str`: fall through to the bytes-like path. */
+        PyErr_Clear();
+    }
+    if (PyObject_GetBuffer(item, view, HYDRO_CAPI_PYBUF_SIMPLE) != 0) {
+        hydro_capi_argument_type_error(
+            api_name, unit->code == 'y' ? "a bytes-like object"
+                                        : "str or a bytes-like object");
+        return 0;
+    }
+    hydro_capi_release_buffer(view);
+    return 1;
+}
+
+/* `s#` / `z#` / `y#`: pointer plus explicit length. */
+static int hydro_capi_convert_string_length(const hydro_capi_unit *unit,
+                                            PyObject *item, va_list *arguments,
+                                            const char *api_name)
+{
+    const char **out = va_arg(*arguments, const char **);
+    Py_ssize_t *length = va_arg(*arguments, Py_ssize_t *);
+
+    if (out == NULL || length == NULL) {
+        hydro_capi_null_pointer(api_name, unit->code);
+        return 0;
+    }
+    if (unit->code == 'z' && hydro_capi_is_none(item)) {
+        *out = NULL;
+        *length = 0;
+        return 1;
+    }
+    if (unit->code == 'y') {
+        char *data = NULL;
+        Py_ssize_t size = 0;
+
+        if (PyBytes_AsStringAndSize(item, &data, &size) != 0) {
+            PyErr_Clear();
+            hydro_capi_argument_type_error(api_name, "a bytes-like object");
+            return 0;
+        }
+        *out = data;
+        *length = size;
+        return 1;
+    }
+    {
+        Py_ssize_t size = 0;
+        const char *text = PyUnicode_AsUTF8AndSize(item, &size);
+
+        if (text != NULL) {
+            *out = text;
+            *length = size;
+            return 1;
+        }
+        PyErr_Clear();
+    }
+    {
+        char *data = NULL;
+        Py_ssize_t size = 0;
+
+        if (PyBytes_AsStringAndSize(item, &data, &size) == 0) {
+            *out = data;
+            *length = size;
+            return 1;
+        }
+        PyErr_Clear();
+    }
+    hydro_capi_argument_type_error(api_name, "str or a bytes-like object");
+    return 0;
+}
+
+/* `y`: a bytes-like object as a NUL-terminated C string. */
+static int hydro_capi_convert_bytes_string(PyObject *item, const char **out,
+                                           const char *api_name)
+{
+    char *data = NULL;
+    Py_ssize_t size = 0;
+
+    if (PyBytes_AsStringAndSize(item, &data, &size) != 0) {
+        PyErr_Clear();
+        hydro_capi_argument_type_error(api_name, "a bytes-like object");
+        return 0;
+    }
+    if ((Py_ssize_t)strlen(data) != size) {
+        hydro_capi_set_error("ValueError: embedded null byte");
+        return 0;
+    }
+    *out = data;
+    return 1;
+}
+
+/* `z`: a string or None as a NUL-terminated C string. */
+static int hydro_capi_convert_optional_string(PyObject *item, const char **out,
+                                              const char *api_name)
+{
+    Py_ssize_t length = 0;
+    const char *text;
+
+    if (hydro_capi_is_none(item)) {
+        *out = NULL;
+        return 1;
+    }
+    text = PyUnicode_AsUTF8AndSize(item, &length);
+    if (text == NULL) {
+        PyErr_Clear();
+        hydro_capi_argument_type_error(api_name, "str or None");
+        return 0;
+    }
+    if ((Py_ssize_t)strlen(text) != length) {
+        hydro_capi_set_error("ValueError: embedded null character");
+        return 0;
+    }
+    *out = text;
+    return 1;
+}
+
+/*
+ * `es` / `et` / `es#` / `et#`: encode the argument and store a buffer the
+ * caller owns (and releases with `PyMem_Free`). The `#` variants honour a
+ * caller-supplied buffer and its capacity, exactly like CPython.
+ */
+static int hydro_capi_convert_encoded(const hydro_capi_unit *unit,
+                                      PyObject *item, va_list *arguments,
+                                      const char *api_name)
+{
+    const char *encoding = va_arg(*arguments, const char *);
+    char **buffer = va_arg(*arguments, char **);
+    Py_ssize_t *length = NULL;
+    int with_length = unit->varargs == 3;
+    int recode = unit->modifier == 's';
+    PyObject *owned = NULL;
+    const char *data = NULL;
+    Py_ssize_t size = 0;
+
+    if (with_length) {
+        length = va_arg(*arguments, Py_ssize_t *);
+    }
+    if (buffer == NULL || (with_length && length == NULL)) {
+        hydro_capi_null_pointer(api_name, unit->code);
+        return 0;
+    }
+    if (!recode) {
+        char *bytes = NULL;
+        Py_ssize_t bytes_size = 0;
+
+        if (PyBytes_AsStringAndSize(item, &bytes, &bytes_size) == 0) {
+            data = bytes;
+            size = bytes_size;
+        }
+        else {
+            Py_ssize_t array_size;
+
+            PyErr_Clear();
+            array_size = PyByteArray_Size(item);
+            if (array_size >= 0) {
+                char *array = PyByteArray_AsString(item);
+                if (array != NULL) {
+                    data = array;
+                    size = array_size;
+                }
+            }
+            if (data == NULL) {
+                PyErr_Clear();
+            }
+        }
+    }
+    if (data == NULL) {
+        char *bytes = NULL;
+        Py_ssize_t bytes_size = 0;
+
+        owned = PyUnicode_AsEncodedString(item, encoding, NULL);
+        if (owned == NULL) {
+            return 0;
+        }
+        if (PyBytes_AsStringAndSize(owned, &bytes, &bytes_size) != 0) {
+            Py_DecRef(owned);
+            return 0;
+        }
+        data = bytes;
+        size = bytes_size;
+    }
+    if (!with_length && (Py_ssize_t)strlen(data) != size) {
+        if (owned != NULL) {
+            Py_DecRef(owned);
+        }
+        hydro_capi_set_error("ValueError: encoded string without null bytes");
+        return 0;
+    }
+    if (with_length) {
+        if (*buffer == NULL) {
+            char *fresh = PyMem_Malloc((size_t)size + 1);
+
+            if (fresh == NULL) {
+                if (owned != NULL) {
+                    Py_DecRef(owned);
+                }
+                PyErr_NoMemory();
+                return 0;
+            }
+            *buffer = fresh;
+        }
+        else if (size + 1 > *length) {
+            char message[HYDRO_CAPI_MESSAGE_SIZE];
+
+            if (owned != NULL) {
+                Py_DecRef(owned);
+            }
+            snprintf(message, sizeof message,
+                     "ValueError: encoded string too long (%zd, maximum length %zd)",
+                     size, *length - 1);
+            hydro_capi_set_error(message);
+            return 0;
+        }
+        memcpy(*buffer, data, (size_t)size + 1);
+        *length = size;
+    }
+    else {
+        char *fresh = PyMem_Malloc((size_t)size + 1);
+
+        if (fresh == NULL) {
+            if (owned != NULL) {
+                Py_DecRef(owned);
+            }
+            PyErr_NoMemory();
+            return 0;
+        }
+        memcpy(fresh, data, (size_t)size + 1);
+        *buffer = fresh;
+    }
+    if (owned != NULL) {
+        Py_DecRef(owned);
+    }
+    return 1;
+}
+
+/* `L` / `k` / `K` / `I` / `f`: scalar integer or float. */
+static int hydro_capi_convert_scalar(const hydro_capi_unit *unit,
+                                     PyObject *item, va_list *arguments,
+                                     const char *api_name)
+{
+    switch (unit->code) {
+    case 'L': {
+        long long *out = va_arg(*arguments, long long *);
+        long long value;
+
+        if (out == NULL) {
+            hydro_capi_null_pointer(api_name, unit->code);
+            return 0;
+        }
+        value = PyLong_AsLongLong(item);
+        if (value == -1 && PyErr_Occurred() != NULL) {
+            return 0;
+        }
+        *out = value;
+        return 1;
+    }
+    case 'k': {
+        unsigned long *out = va_arg(*arguments, unsigned long *);
+        unsigned long long value;
+
+        if (out == NULL) {
+            hydro_capi_null_pointer(api_name, unit->code);
+            return 0;
+        }
+        value = PyLong_AsUnsignedLongLongMask(item);
+        if (value == (unsigned long long)-1 && PyErr_Occurred() != NULL) {
+            return 0;
+        }
+        *out = (unsigned long)value;
+        return 1;
+    }
+    case 'K': {
+        unsigned long long *out = va_arg(*arguments, unsigned long long *);
+        unsigned long long value;
+
+        if (out == NULL) {
+            hydro_capi_null_pointer(api_name, unit->code);
+            return 0;
+        }
+        value = PyLong_AsUnsignedLongLongMask(item);
+        if (value == (unsigned long long)-1 && PyErr_Occurred() != NULL) {
+            return 0;
+        }
+        *out = value;
+        return 1;
+    }
+    case 'I': {
+        unsigned int *out = va_arg(*arguments, unsigned int *);
+        unsigned long long value;
+
+        if (out == NULL) {
+            hydro_capi_null_pointer(api_name, unit->code);
+            return 0;
+        }
+        value = PyLong_AsUnsignedLongLongMask(item);
+        if (value == (unsigned long long)-1 && PyErr_Occurred() != NULL) {
+            return 0;
+        }
+        *out = (unsigned int)value;
+        return 1;
+    }
+    case 'f': {
+        float *out = va_arg(*arguments, float *);
+        double value;
+
+        if (out == NULL) {
+            hydro_capi_null_pointer(api_name, unit->code);
+            return 0;
+        }
+        value = PyFloat_AsDouble(item);
+        if (value == -1.0 && PyErr_Occurred() != NULL) {
+            return 0;
+        }
+        *out = (float)value;
+        return 1;
+    }
+    default:
+        hydro_capi_unsupported_character(api_name, unit->code);
+        return 0;
+    }
+}
+
+/*
+ * Converts one argument for `unit`, storing through the pointer(s) the caller
  * supplied for that format unit. Returns 1 on success, 0 with an error set.
  */
-static int hydro_capi_convert(char code, PyObject *item, va_list *arguments,
-                              const char *api_name)
+static int hydro_capi_convert_unit(const hydro_capi_unit *unit, PyObject *item,
+                                   va_list *arguments, const char *api_name)
 {
+    char code = unit->code;
+
+    if (unit->group) {
+        /*
+         * Groups are scanned (and therefore counted and skipped) as one unit,
+         * but recursively converting a nested tuple is not implemented here.
+         */
+        hydro_capi_unsupported_character(api_name, code);
+        return 0;
+    }
+
     switch (code) {
     case 'i': {
         int *out = va_arg(*arguments, int *);
@@ -148,16 +769,111 @@ static int hydro_capi_convert(char code, PyObject *item, va_list *arguments,
         }
         return hydro_capi_parse_d(item, out);
     }
-    case 's': {
-        const char **out = va_arg(*arguments, const char **);
+    case 'L':
+    case 'k':
+    case 'K':
+    case 'I':
+    case 'f':
+        return hydro_capi_convert_scalar(unit, item, arguments, api_name);
+    case 'e':
+        if (unit->modifier != 's' && unit->modifier != 't') {
+            hydro_capi_unsupported_character(api_name, code);
+            return 0;
+        }
+        return hydro_capi_convert_encoded(unit, item, arguments, api_name);
+    case 's':
+    case 'z':
+    case 'y':
+    case 'w': {
+        const char **out;
+
+        if (unit->modifier == '*' || unit->modifier == '#') {
+            if (unit->modifier == '*') {
+                return hydro_capi_convert_view(unit, item, arguments,
+                                               api_name);
+            }
+            return hydro_capi_convert_string_length(unit, item, arguments,
+                                                    api_name);
+        }
+        if (unit->modifier != '\0') {
+            /* `s+` needs a writable `Py_buffer`, which is not modelled. */
+            hydro_capi_unsupported_character(api_name, unit->modifier);
+            return 0;
+        }
+        if (code == 'y') {
+            out = va_arg(*arguments, const char **);
+            if (out == NULL) {
+                hydro_capi_null_pointer(api_name, code);
+                return 0;
+            }
+            return hydro_capi_convert_bytes_string(item, out, api_name);
+        }
+        if (code == 'w') {
+            /* `w` is only valid as `w*`. */
+            hydro_capi_unsupported_character(api_name, code);
+            return 0;
+        }
+        out = va_arg(*arguments, const char **);
         if (out == NULL) {
             hydro_capi_null_pointer(api_name, code);
             return 0;
         }
+        if (code == 'z') {
+            return hydro_capi_convert_optional_string(item, out, api_name);
+        }
         return hydro_capi_parse_s(item, out);
     }
     case 'O': {
-        PyObject **out = va_arg(*arguments, PyObject **);
+        PyObject **out;
+
+        if (unit->modifier == '&') {
+            hydro_capi_converter converter =
+                va_arg(*arguments, hydro_capi_converter);
+            void *address = va_arg(*arguments, void *);
+
+            if (converter == NULL) {
+                hydro_capi_set_type_error(
+                    "PyArg_ParseTupleAndKeywords: NULL converter for 'O&'");
+                return 0;
+            }
+            if (!converter(item, address)) {
+                /* The converter is responsible for setting the exception. */
+                return 0;
+            }
+            return 1;
+        }
+        if (unit->modifier == '!') {
+            PyObject *type = va_arg(*arguments, PyObject *);
+            int matches;
+
+            out = va_arg(*arguments, PyObject **);
+            if (out == NULL) {
+                hydro_capi_null_pointer(api_name, code);
+                return 0;
+            }
+            if (type == NULL) {
+                hydro_capi_set_type_error(
+                    "PyArg_ParseTupleAndKeywords: NULL type for 'O!'");
+                return 0;
+            }
+            matches = PyObject_IsInstance(item, type);
+            if (matches < 0) {
+                return 0;
+            }
+            if (matches == 0) {
+                hydro_capi_set_type_error(
+                    "PyArg_ParseTupleAndKeywords: argument does not match the "
+                    "type required by 'O!'");
+                return 0;
+            }
+            *out = item;
+            return 1;
+        }
+        if (unit->modifier != '\0') {
+            hydro_capi_unsupported_character(api_name, unit->modifier);
+            return 0;
+        }
+        out = va_arg(*arguments, PyObject **);
         if (out == NULL) {
             hydro_capi_null_pointer(api_name, code);
             return 0;
@@ -175,6 +891,30 @@ static int hydro_capi_convert(char code, PyObject *item, va_list *arguments,
     default:
         hydro_capi_unsupported_character(api_name, code);
         return 0;
+    }
+}
+
+/*
+ * Advances the argument list over one unit without converting it. This is
+ * what keeps `va_arg` aligned when an optional argument was not supplied:
+ * CPython's `skipitem` consumes the same pointer slots that the conversion
+ * would have consumed, so later keyword arguments still read their own
+ * pointers. Every slot is a pointer, so one `void *` read per slot suffices.
+ */
+static void hydro_capi_skip_varargs(const hydro_capi_unit *unit,
+                                    va_list *arguments)
+{
+    int slot;
+
+    for (slot = 0; slot < unit->varargs; slot++) {
+        if (slot == 0 && unit->code == 'O' && unit->modifier == '&') {
+            /* `O&` stores a function pointer, which is not an object pointer
+             * on every ABI; read it through its own type, as CPython does. */
+            (void) va_arg(*arguments, hydro_capi_converter);
+        }
+        else {
+            (void) va_arg(*arguments, void *);
+        }
     }
 }
 
@@ -199,18 +939,22 @@ int PyArg_ParseTuple(PyObject *args, const char *format, ...)
     count = hydro_capi_arg_count(args);
 
     va_start(arguments, format);
-    for (cursor = format; *cursor != '\0'; cursor++) {
-        char code = *cursor;
+    cursor = format;
+    while (*cursor != '\0') {
+        hydro_capi_unit unit;
         PyObject *item;
+        int scanned;
 
-        if (hydro_capi_is_space(code)) {
+        if (hydro_capi_is_space(*cursor)) {
+            cursor += 1;
             continue;
         }
-        if (code == '|') {
+        if (*cursor == '|') {
             optional = 1;
+            cursor += 1;
             continue;
         }
-        if (code == ':' || code == ';') {
+        if (*cursor == ':' || *cursor == ';') {
             break;
         }
 
@@ -222,10 +966,16 @@ int PyArg_ParseTuple(PyObject *args, const char *format, ...)
             status = 0;
             break;
         }
+        scanned = hydro_capi_scan_unit(&cursor, &unit);
+        if (scanned <= 0) {
+            status = 0;
+            break;
+        }
         item = hydro_capi_arg(args, index);
         index += 1;
 
-        if (!hydro_capi_convert(code, item, &arguments, "PyArg_ParseTuple")) {
+        if (!hydro_capi_convert_unit(&unit, item, &arguments,
+                                     "PyArg_ParseTuple")) {
             status = 0;
             break;
         }
@@ -239,17 +989,33 @@ int PyArg_ParseTuple(PyObject *args, const char *format, ...)
     return status;
 }
 
-/* Number of value-consuming format units, stopping at ':' or ';'. */
-static size_t hydro_capi_format_units(const char *format)
+/*
+ * Number of value-consuming format units, stopping at ':' or ';'. Markers and
+ * whitespace do not count; `O&`, `O!`, `s#`, `es#` and a whole `(...)` or
+ * `[...]` group each count as one unit. Returns -1 when the format is
+ * malformed (an error is already recorded).
+ */
+static long hydro_capi_format_units(const char *format)
 {
-    const char *cursor;
-    size_t units = 0;
+    const char *cursor = format;
+    long units = 0;
 
-    for (cursor = format; *cursor != '\0'; cursor++) {
+    while (*cursor != '\0') {
+        hydro_capi_unit unit;
+        int scanned;
+
         if (hydro_capi_is_space(*cursor) || *cursor == '|' || *cursor == '$') {
+            cursor += 1;
             continue;
         }
         if (*cursor == ':' || *cursor == ';') {
+            break;
+        }
+        scanned = hydro_capi_scan_unit(&cursor, &unit);
+        if (scanned < 0) {
+            return -1;
+        }
+        if (scanned == 0) {
             break;
         }
         units += 1;
@@ -318,7 +1084,7 @@ static int hydro_capi_parse_keywords(PyObject *args, PyObject *keywords,
     const char *cursor;
     const char *function = "PyArg_ParseTupleAndKeywords";
     char detail[HYDRO_CAPI_MESSAGE_SIZE];
-    size_t units;
+    long units;
     size_t len = 0;
     size_t positionals_only = 0;
     size_t minimum = (size_t)-1; /* index where '|' appeared */
@@ -366,8 +1132,11 @@ static int hydro_capi_parse_keywords(PyObject *args, PyObject *keywords,
         }
     }
     units = hydro_capi_format_units(format);
-    if (len != units) {
-        snprintf(detail, sizeof detail, "%zu keyword names for %zu format units",
+    if (units < 0) {
+        return 0;
+    }
+    if ((size_t)units != len) {
+        snprintf(detail, sizeof detail, "%zu keyword names for %ld format units",
                  len, units);
         hydro_capi_keyword_system_error(function, detail);
         return 0;
@@ -396,10 +1165,14 @@ static int hydro_capi_parse_keywords(PyObject *args, PyObject *keywords,
 
     cursor = format;
     for (index = 0; index < len; index++) {
-        char code;
+        hydro_capi_unit unit;
         const char *name;
         PyObject *item;
+        int scanned;
 
+        while (hydro_capi_is_space(*cursor)) {
+            cursor += 1;
+        }
         if (*cursor == '|') {
             if (minimum != (size_t)-1) {
                 hydro_capi_keyword_system_error(
@@ -443,15 +1216,18 @@ static int hydro_capi_parse_keywords(PyObject *args, PyObject *keywords,
         while (hydro_capi_is_space(*cursor)) {
             cursor += 1;
         }
-        if (*cursor == '\0' || *cursor == ':' || *cursor == ';') {
+        scanned = hydro_capi_scan_unit(&cursor, &unit);
+        if (scanned == 0) {
             snprintf(detail, sizeof detail,
                      "format string is shorter than the %zu keyword names", len);
             hydro_capi_keyword_system_error(function, detail);
             status = 0;
             break;
         }
-        code = *cursor;
-        cursor += 1;
+        if (scanned < 0) {
+            status = 0;
+            break;
+        }
         name = names[index];
 
         if (index < nargs) {
@@ -473,7 +1249,10 @@ static int hydro_capi_parse_keywords(PyObject *args, PyObject *keywords,
             }
             if (item == NULL) {
                 if (index >= minimum) {
-                    /* Optional argument: leave the caller's variable alone. */
+                    /* Optional argument: leave the caller's variable alone but
+                     * still consume its `va_arg` slots so later units stay
+                     * aligned. */
+                    hydro_capi_skip_varargs(&unit, arguments);
                     continue;
                 }
                 if (index < positionals_only) {
@@ -492,7 +1271,7 @@ static int hydro_capi_parse_keywords(PyObject *args, PyObject *keywords,
             }
         }
 
-        if (!hydro_capi_convert(code, item, arguments, function)) {
+        if (!hydro_capi_convert_unit(&unit, item, arguments, function)) {
             status = 0;
             break;
         }

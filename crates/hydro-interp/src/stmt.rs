@@ -699,13 +699,25 @@ impl Interp {
                 if abi::hydro_exc_pending() == 0 {
                     break;
                 }
-                let catches = match handler.exc {
-                    None => true,
+                let catches = match (handler.exc, handler.exc_expr.as_ref()) {
+                    (None, None) => true,
                     // The runtime owns the complete CPython parent chain, so
                     // every handler tag (not a hand-picked subset) is resolved
                     // there. This keeps the interpreter free of a second,
                     // partial hierarchy table.
-                    Some(kind) => abi::hydro_exc_matches(kind.tag()) != 0,
+                    (Some(kind), _) => abi::hydro_exc_matches(kind.tag()) != 0,
+                    // `except <expr>:`: evaluate the matcher now, in source
+                    // order. The helper parks the original exception, clears
+                    // the pending flag for the evaluation, then restores it.
+                    (None, Some(expr)) => match self.matches_exc_expr(expr) {
+                        Ok(catches) => catches,
+                        // A raising matcher replaces the exception being
+                        // dispatched; it must still reach `finally`/callers.
+                        Err(signal) => {
+                            result = Err(signal);
+                            break;
+                        }
+                    },
                 };
                 if catches {
                     matched = Some(handler);
@@ -773,5 +785,59 @@ impl Interp {
             // A signal from `finally` replaces the in-flight transfer.
             other => other,
         }
+    }
+
+    /// Evaluates one dynamic `except <expr>:` matcher with the original
+    /// exception parked and reports whether it catches that exception.
+    ///
+    /// The pending flag marks the exception being dispatched, so it is cleared
+    /// while the matcher and `isinstance` run (their own runtime checks would
+    /// otherwise mistake it for a fresh failure). The parked value is restored
+    /// before returning so the remaining arms and the handler entry still see
+    /// it. The value is checked with the runtime `isinstance` builtin, so the
+    /// CPython hierarchy, user-defined exception classes and tuples of classes
+    /// resolve exactly like a source-level `isinstance(exc, <expr>)`; the
+    /// interpreter keeps no exception table of its own. A matcher that raises
+    /// propagates that exception (it replaces the one being dispatched, as in
+    /// CPython) and the original is not restored.
+    fn matches_exc_expr(&mut self, expr: &Expr) -> Result<bool, Signal> {
+        let mark = self.scratch_mark();
+        let exception = abi::hydro_exc_value();
+        self.scratch_push(exception);
+        abi::hydro_exc_clear();
+        let handler_type = match self.eval(expr) {
+            Ok(value) => value,
+            Err(signal) => {
+                self.scratch_release(mark);
+                return Err(signal);
+            }
+        };
+        self.scratch_push(handler_type);
+        let (ptr, len) = bytes(hydro_ir::Builtin::Isinstance.name());
+        let function = abi::hydro_builtin_function(ptr, len);
+        let function = match self.check(function) {
+            Ok(value) => value,
+            Err(signal) => {
+                self.scratch_release(mark);
+                return Err(signal);
+            }
+        };
+        self.scratch_push(function);
+        let args = [exception, handler_type];
+        let token = abi::hydro_gc_scope_push(args.as_ptr(), args.len());
+        let result = abi::hydro_call(function, args.len(), args.as_ptr());
+        abi::hydro_gc_scope_pop(token);
+        let result = self.check(result);
+        let matched = match result {
+            Ok(value) => Ok(self.truthy(value)),
+            Err(signal) => Err(signal),
+        };
+        if matched.is_ok() {
+            // Restore the pending exception for the remaining arms and the
+            // handler entry; it is still rooted by the scratch region.
+            abi::hydro_raise_value(exception);
+        }
+        self.scratch_release(mark);
+        matched
     }
 }

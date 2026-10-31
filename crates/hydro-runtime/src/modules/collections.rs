@@ -3380,6 +3380,9 @@ fn build_namedtuple(args: &[i64], live: &mut Vec<i64>) -> i64 {
             keep(live, native_method(namedtuple_getitem, 2, "__getitem__")),
             MethodKind::Normal,
         ),
+        // No `__str__` entry, like CPython's namedtuple: `str()` resolves the
+        // inherited `object.__str__`, which delegates to this `__repr__`
+        // (see `value::to_string`'s object-slot handling).
         (
             "__repr__".to_string(),
             keep(live, native_method(namedtuple_repr, 1, "__repr__")),
@@ -4587,6 +4590,106 @@ mod pprint_dispatch_tests {
             // The generic fallback renders through the same member.
             assert!(!value::repr(instance).is_empty());
         }
+        assert!(!exc::pending());
+    }
+}
+
+#[cfg(test)]
+mod namedtuple_tests {
+    use super::*;
+
+    fn int(n: i64) -> i64 {
+        value::encode_int(n).expect("representable")
+    }
+
+    fn text(s: &str) -> i64 {
+        value::str_alloc(s.to_string())
+    }
+
+    fn namedtuple_class() -> i64 {
+        call("namedtuple", &[text("T"), text("a b")])
+    }
+
+    fn point(class: i64) -> i64 {
+        crate::core::builtins::call(class, 2, [int(1), int(2)].as_ptr())
+    }
+
+    fn invoke(instance: i64, name: &str, args: &[i64]) -> i64 {
+        crate::core::methods::call(
+            instance,
+            name.as_ptr(),
+            name.len(),
+            args.len(),
+            args.as_ptr(),
+        )
+    }
+
+    #[test]
+    fn namedtuple_str_and_repr_use_the_generated_repr() {
+        exc::init();
+        let class = namedtuple_class();
+        assert!(!exc::pending(), "namedtuple() raised");
+        let tuple = point(class);
+        assert!(!exc::pending(), "T(1, 2) raised");
+
+        // `print(T(1, 2))` / `str(T(1, 2))`: the class inherits
+        // `object.__str__` through the native `tuple` base. Calling that slot
+        // re-entered `to_string` and overflowed the stack; CPython's slot
+        // delegates to the generated `__repr__` instead.
+        assert_eq!(value::to_string(tuple), "T(a=1, b=2)");
+        assert!(!exc::pending(), "str() raised");
+        assert_eq!(value::repr(tuple), "T(a=1, b=2)");
+        assert!(!exc::pending(), "repr() raised");
+
+        // Field values are rendered with `repr`, so strings stay quoted.
+        let labeled =
+            crate::core::builtins::call(namedtuple_class(), 2, [text("x"), text("y")].as_ptr());
+        assert_eq!(value::to_string(labeled), "T(a='x', b='y')");
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn namedtuple_sequence_surface_survives() {
+        exc::init();
+        let class = namedtuple_class();
+        let tuple = point(class);
+
+        assert_eq!(
+            value::as_integer(invoke(tuple, "__getitem__", &[int(0)])),
+            Some(1)
+        );
+        assert_eq!(value::as_integer(invoke(tuple, "__len__", &[])), Some(2));
+
+        let fields = crate::core::methods::getattr(class, b"_fields".as_ptr(), 7);
+        let fields: Vec<String> = value::as_tuple(fields)
+            .expect("_fields tuple")
+            .iter()
+            .map(|&name| value::as_str(name).expect("field name").to_string())
+            .collect();
+        assert_eq!(fields, vec!["a".to_string(), "b".to_string()]);
+
+        // `_asdict` keeps declaration order.
+        let mapping = invoke(tuple, "_asdict", &[]);
+        let pairs = value::as_dict(mapping).expect("_asdict dict");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(value::as_str(pairs[0].0), Some("a"));
+        assert_eq!(value::as_integer(pairs[0].1), Some(1));
+
+        // `_replace(a=9)` builds a copy with the named field changed.
+        let Some(value::ClassEntry::Method(_, replace)) = value::class_lookup(class, "_replace")
+        else {
+            panic!("_replace is not a class method");
+        };
+        let keyword = [text("a"), int(9)];
+        let replaced =
+            crate::core::builtins::call_kw(replace, 1, [tuple].as_ptr(), 1, keyword.as_ptr());
+        assert!(!exc::pending(), "_replace raised");
+        assert_eq!(value::to_string(replaced), "T(a=9, b=2)");
+
+        // Equality against another instance of the same shape.
+        let same = point(class);
+        assert_eq!(invoke(tuple, "__eq__", &[same]), value::TRUE);
+        assert_eq!(invoke(tuple, "__eq__", &[replaced]), value::FALSE);
         assert!(!exc::pending());
     }
 }

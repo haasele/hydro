@@ -329,7 +329,13 @@ fn handler_use(handler: &Handler, local: LocalId) -> Use {
         Some(id) => local_use(id, local),
         None => Use::none(),
     };
-    binding.merge(stmts_use(&handler.body, local))
+    let matcher = handler
+        .exc_expr
+        .as_ref()
+        .map_or_else(Use::none, |expr| expr_use(expr, local));
+    binding
+        .merge(matcher)
+        .merge(stmts_use(&handler.body, local))
 }
 
 fn stmts_use(stmts: &[Stmt], local: LocalId) -> Use {

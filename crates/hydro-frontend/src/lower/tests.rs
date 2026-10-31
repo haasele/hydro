@@ -34,6 +34,19 @@ fn assigned<'a>(hir: &'a LHir, name: &str) -> &'a HExpr {
     panic!("no assignment to '{name}'");
 }
 
+/// The handlers of the first `try` statement in any function of `hir`, with
+/// the module body checked first.
+fn try_handlers(hir: &LHir) -> &[HHandler] {
+    hir.functions
+        .iter()
+        .flat_map(|function| function.body.iter())
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::Try { handlers, .. } => Some(handlers.as_slice()),
+            _ => None,
+        })
+        .expect("expected a try statement")
+}
+
 /// True when `stmts` or any nested block emits a `GlobalSet`.
 fn has_global_set(stmts: &[HStmt]) -> bool {
     stmts.iter().any(|stmt| match &stmt.kind {
@@ -2204,15 +2217,20 @@ fn single_element_exception_tuple_expands() {
 }
 
 #[test]
-fn tuple_handler_approximates_user_classes_and_rejects_non_names() {
-    // Non-builtin names and dotted names approximate RuntimeError; builtin
-    // tags stay exact.
-    let source = "try:\n    pass\nexcept (ValueError, NopeError, ex.Error):\n    pass\n";
+fn tuple_handler_approximates_user_classes_and_evaluates_runtime_elements() {
+    // A name that names a user class and a dotted name approximate
+    // RuntimeError; builtin tags stay exact.
+    let source = "\
+class ColorParseError(Exception):
+    pass
+try:
+    pass
+except (ValueError, ColorParseError, ex.Error):
+    pass
+";
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
-    let HStmtKind::Try { handlers, .. } = &hir.functions[0].body[0].kind else {
-        panic!("expected a try statement");
-    };
+    let handlers = try_handlers(&hir);
     let kinds: Vec<_> = handlers.iter().map(|handler| handler.exc).collect();
     assert_eq!(
         kinds,
@@ -2222,15 +2240,67 @@ fn tuple_handler_approximates_user_classes_and_rejects_non_names() {
             Some(ExcKind::RuntimeError)
         ]
     );
+    assert!(handlers.iter().all(|handler| handler.exc_expr.is_none()));
 
+    // A tuple with a non-name element is not rejected: the whole tuple is
+    // evaluated at handler entry and matched at runtime.
     let source = "try:\n    pass\nexcept (ValueError, 1):\n    pass\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let handlers = try_handlers(&hir);
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].exc, None);
     assert!(
-        diags
-            .iter()
-            .any(|d| d.message == "only simple exception names are supported in exception tuples"),
-        "{diags:?}"
+        matches!(
+            &handlers[0].exc_expr.as_ref().expect("runtime matcher").kind,
+            HExprKind::Tuple(_)
+        ),
+        "{handlers:?}"
     );
+}
+
+#[test]
+fn call_handlers_evaluate_their_expression_at_handler_entry() {
+    // `except tuple(types):` (pandas' `except tuple(err_types_to_retry...)`)
+    // is an arbitrary runtime expression, not a simple exception name.
+    let source = "\
+def types():
+    return [ValueError, TypeError]
+try:
+    pass
+except tuple(types()):
+    pass
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let handlers = try_handlers(&hir);
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].exc, None);
+    let matcher = handlers[0].exc_expr.as_ref().expect("runtime matcher");
+    assert!(
+        matches!(&matcher.kind, HExprKind::Call { .. }),
+        "{matcher:?}"
+    );
+}
+
+#[test]
+fn alias_handlers_are_evaluated_at_handler_entry() {
+    // A name bound to a class value has no static tag; it is read when the
+    // handler is reached instead of being approximated as `RuntimeError`.
+    let source = "\
+errors_alias = ValueError
+try:
+    pass
+except errors_alias:
+    pass
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let handlers = try_handlers(&hir);
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].exc, None);
+    let matcher = handlers[0].exc_expr.as_ref().expect("runtime matcher");
+    assert!(matches!(&matcher.kind, HExprKind::Local(_)), "{matcher:?}");
 }
 
 #[test]
@@ -5777,6 +5847,102 @@ fn ordinary_module_member_typos_still_fail_at_compile_time() {
             .contains("does not export a function named 'missing'"),
         "{diags:?}"
     );
+}
+
+#[test]
+fn builtin_named_and_decorated_definitions_stay_in_the_export_table() {
+    // `pandas/core/computation/eval.py` defines `def eval` with
+    // `@set_module("pandas")`. Shadowing a builtin is not special: every
+    // top-level definition is an export. A decorated definition exports the
+    // *public name* bound to the decorator's result (a runtime global), while
+    // an undecorated one exports the linked function handle.
+    let source = "\
+def _passthrough(module):
+    def decorate(function):
+        return function
+    return decorate
+
+
+@_passthrough(\"pandas\")
+def eval(expr):
+    return expr
+
+
+def print(value):
+    return value
+
+
+def open(path):
+    return path
+";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "pandas/core/computation/eval.py", &mut infer);
+    let _ = lowerer.lower_module(&parse(source));
+    let exports = lowerer.exported_names();
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(exports.get("eval"), Some(UserExport::Global)),
+        "a decorated definition exports its public name: {exports:?}"
+    );
+    for name in ["print", "open"] {
+        assert!(
+            matches!(exports.get(name), Some(UserExport::Function(_))),
+            "a function named after a builtin is exported like any other: {name}: {exports:?}"
+        );
+    }
+    // A leading underscore only affects star imports: the name stays in the
+    // export table (a module attribute), exactly like CPython.
+    assert!(
+        matches!(exports.get("_passthrough"), Some(UserExport::Function(_))),
+        "a private definition is still a module attribute: {exports:?}"
+    );
+}
+
+#[test]
+fn member_of_a_module_ordered_after_this_unit_binds_at_runtime() {
+    // An import cycle can leave a linked dependency lowered *after* the unit
+    // that imports it: its export table does not exist yet, so a name missing
+    // from it is not a missing export. `pandas/core/frame.py` imports
+    // `pandas.core.computation.eval.eval` from inside a method while the
+    // top-level `pandas` initializer still owns that module's order; the
+    // import must read the member from the module's runtime global table.
+    let source = "def call():\n    from pkg.eval import eval\n    return eval(1)\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "pkg/user.py", &mut infer);
+    lowerer.set_dunder_name("pkg.user");
+    lowerer.set_package("pkg");
+    lowerer.set_user_modules(HashMap::from([(
+        "pkg.eval".to_string(),
+        user_module("pkg.eval", &[]),
+    )]));
+    // The loader recorded other deferred imports, so this nested import is
+    // linked rather than deferred; the module itself has not been lowered yet.
+    lowerer.set_deferred_imports(std::collections::HashSet::from(["pkg.other".to_string()]));
+    lowerer.set_pending_modules(std::collections::HashSet::from(["pkg.eval".to_string()]));
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = function_body(&hir, "call");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return statement: {:?}", body[0].kind);
+    };
+    match &value.kind {
+        HExprKind::CallKw { callee, .. } | HExprKind::IndirectCall { callee, .. } => {
+            assert!(
+                matches!(
+                    &callee.kind,
+                    HExprKind::GlobalGet { module, name }
+                        if module == "pkg.eval" && name == "eval"
+                ),
+                "the member is read from the module table: {:?}",
+                callee.kind
+            );
+        }
+        other => panic!("expected a call through the module global, got {other:?}"),
+    }
 }
 
 #[test]
@@ -10144,6 +10310,99 @@ z = helper
 }
 
 #[test]
+fn extension_star_binds_a_name_the_unit_defines_later() {
+    // NumPy's `_core/multiarray.py` does `from ._multiarray_umath import *`,
+    // then reads `may_share_memory.__module__ = 'numpy'`, and only afterwards
+    // defines `def may_share_memory(...)`. The import must store the extension
+    // member into the module slot at that point; skipping the store because a
+    // later definition shadows the name left the slot `None`.
+    let dir = ExtensionDir::new("star-later-def");
+    let so = dir.add_extension("mod_ext.abi3.so");
+    let expected = fs::canonicalize(&so).expect("canonical extension path");
+    let expected_path = expected.to_string_lossy().into_owned();
+    let source = r#"__all__ = ['may_share_memory']
+from mod_ext import *
+
+def passthrough(fn):
+    return fn
+
+may_share_memory.__module__ = 'probe'
+
+@passthrough
+def may_share_memory(a, b):
+    return (a, b)
+"#;
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    // The import statement stores the extension member into the module-local
+    // slot the later `def` also owns, in source order.
+    fn find_star_stores(stmts: &[HStmt], members: &mut Vec<String>) {
+        for stmt in stmts {
+            match &stmt.kind {
+                HStmtKind::Assign { value, .. } | HStmtKind::GlobalSet { value, .. } => {
+                    if let HExprKind::ExtensionAttr { path: _, member } = &value.kind {
+                        members.push(member.clone());
+                    }
+                }
+                HStmtKind::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    find_star_stores(then_body, members);
+                    find_star_stores(else_body, members);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut members = Vec::new();
+    find_star_stores(&hir.functions[0].body, &mut members);
+    assert!(
+        members.iter().any(|member| member == "may_share_memory"),
+        "the star import must store the extension member, got {members:?} (extension {expected_path})"
+    );
+}
+
+#[test]
+fn extension_star_import_populates_the_runtime_namespace() {
+    // `from <extension> import *` must copy the extension's whole public
+    // namespace into the module globals at the import statement, not only the
+    // importing unit's literal `__all__` names: `globals()` sees every name
+    // CPython would bind. NumPy's ufuncs (`absolute`, ...) are absent from
+    // `numpy/_core/multiarray.py`'s `__all__` but present in the extension's
+    // namespace.
+    let dir = ExtensionDir::new("star-namespace");
+    dir.add_extension("mod_ext.abi3.so");
+    let source = "__all__ = ['array']\nfrom mod_ext import *\n";
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    fn find_import_hook(stmts: &[HStmt]) -> bool {
+        for stmt in stmts {
+            match &stmt.kind {
+                HStmtKind::Expr(HExpr {
+                    kind: HExprKind::ExtensionAttr { member, .. },
+                    ..
+                }) if member.starts_with(EXTENSION_STAR_IMPORT_PREFIX) => return true,
+                HStmtKind::If {
+                    then_body,
+                    else_body,
+                    ..
+                } if find_import_hook(then_body) || find_import_hook(else_body) => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+    assert!(
+        find_import_hook(&hir.functions[0].body),
+        "the star import must ask the runtime to populate the module namespace"
+    );
+}
+
+#[test]
 fn module_level_try_extension_star_import_is_legal() {
     // A module-level `try` body still runs at module level, so the wildcard
     // form is allowed there; unresolvable names keep the lazy extension
@@ -13366,7 +13625,12 @@ fn bare_dotted_raise_uses_the_runtime_error_fallback() {
 
 #[test]
 fn user_and_dotted_handlers_approximate_runtime_error() {
+    // A user exception class declared in the unit and a dotted class name
+    // keep the documented RuntimeError approximation (their `raise` forms use
+    // that tag too); a builtin keeps its exact tag.
     let source = "\
+class ColorParseError(Exception):
+    pass
 try:
     pass
 except errors.StyleSyntaxError:
@@ -13378,9 +13642,7 @@ except ValueError:
 ";
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
-    let HStmtKind::Try { handlers, .. } = &hir.functions[0].body[0].kind else {
-        panic!("expected a try statement");
-    };
+    let handlers = try_handlers(&hir);
     let kinds: Vec<_> = handlers.iter().map(|handler| handler.exc).collect();
     assert_eq!(
         kinds,
@@ -15310,6 +15572,136 @@ fn entry_module_test_functions_keep_pytest_fixture_binding() {
             .message
             .contains("pytest fixture 'left' is not defined")),
         "{diags:?}"
+    );
+}
+
+#[test]
+fn unittest_skip_decorators_are_kept_as_runtime_decorators() {
+    // `unittest` shares decorator names with pytest (`@unittest.skip`), but
+    // its helpers are real decorators whose effect belongs to the runtime
+    // `unittest.TestCase`; they must not be dropped as pytest markers.
+    let source = "\
+import unittest
+
+class T(unittest.TestCase):
+    @unittest.skip('nope')
+    def test_skip(self):
+        pass
+
+    @unittest.skipIf(True, 'conditional')
+    def test_skip_if(self):
+        pass
+
+    @unittest.skipUnless(False, 'conditional')
+    def test_skip_unless(self):
+        pass
+
+    @unittest.expectedFailure
+    def test_expected_failure(self):
+        pass
+";
+    let module = parse(source);
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
+    let _hir = lowerer.lower_module(&module);
+    let diags = std::mem::take(&mut lowerer.diags);
+    assert!(diags.is_empty(), "{diags:?}");
+    let plan = class_plan(&lowerer, &module, "T");
+    let method = |name: &str| {
+        plan.methods
+            .iter()
+            .find(|method| method.name == name)
+            .unwrap_or_else(|| panic!("no method '{name}'"))
+    };
+    assert_eq!(planned_decorator_names(method("test_skip")), vec!["skip"]);
+    assert_eq!(
+        planned_decorator_names(method("test_skip_if")),
+        vec!["skipIf"]
+    );
+    assert_eq!(
+        planned_decorator_names(method("test_skip_unless")),
+        vec!["skipUnless"]
+    );
+    assert_eq!(
+        planned_decorator_names(method("test_expected_failure")),
+        vec!["expectedFailure"]
+    );
+}
+
+#[test]
+fn unittest_skip_functions_are_not_rewritten_as_pytest_tests() {
+    // A module-level function decorated with `@unittest.skip*` is not a pytest
+    // marker: no skip wrapper is synthesized and the decorator is applied at
+    // runtime instead.
+    let source = "\
+import unittest
+
+@unittest.skip('nope')
+def test_skipped():
+    pass
+
+@unittest.skipUnless(False, 'conditional')
+def test_conditional():
+    pass
+";
+    let hir = lower_ok(source);
+    let names: Vec<&str> = hir.functions.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"test_skipped"), "{names:?}");
+    assert!(names.contains(&"test_conditional"), "{names:?}");
+    assert!(
+        !names.iter().any(|name| name.ends_with("__hydro_impl")),
+        "unittest skip decorators must not synthesize pytest wrappers: {names:?}"
+    );
+    let decorator_calls = hir.functions[0]
+        .body
+        .iter()
+        .filter(|stmt| {
+            matches!(
+                &stmt.kind,
+                HStmtKind::Assign { value, .. }
+                    if matches!(&value.kind, HExprKind::IndirectCall { .. })
+            )
+        })
+        .count();
+    assert!(
+        decorator_calls >= 2,
+        "both unittest decorators must be applied at runtime: {:?}",
+        hir.functions[0].body
+    );
+}
+
+#[test]
+fn module_level_pytest_detection_is_unchanged() {
+    // `@pytest.fixture` still becomes a fixture wrapper and `@pytest.mark.skip`
+    // still skips its test through a generated wrapper.
+    let source = "\
+import pytest
+
+@pytest.fixture
+def value():
+    return 41
+
+def test_value(value):
+    return value
+
+@pytest.mark.skip(reason='later')
+def test_skipped():
+    pass
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let names: Vec<&str> = hir.functions.iter().map(|f| f.name.as_str()).collect();
+    assert!(
+        names.contains(&"__hydro_fixture_value"),
+        "the pytest fixture wrapper must still be synthesized: {names:?}"
+    );
+    assert!(
+        names.contains(&"test_value__hydro_impl") && names.contains(&"test_value"),
+        "the fixture-consuming test must still get its wrapper: {names:?}"
+    );
+    assert!(
+        names.contains(&"test_skipped__hydro_impl") && names.contains(&"test_skipped"),
+        "the pytest skip marker must still synthesize a wrapper: {names:?}"
     );
 }
 
@@ -18607,5 +18999,98 @@ fn deferred_import_binding_runs_in_a_later_initializer_segment() {
         ),
         "segment must publish _path.Path: {:?}",
         segment.body
+    );
+}
+
+#[test]
+fn class_constructor_mapping_binds_required_slots_at_runtime() {
+    // `Flags(self, **flags)` in pandas: the mapping keys are only known at
+    // runtime, so the constructor binds through the runtime class-call
+    // protocol instead of rejecting the keyword-only parameter the call site
+    // cannot name.
+    let source = "\
+class Flags:
+    def __init__(self, obj, *, allows_duplicate_labels):
+        self.obj = obj
+        self.allows_duplicate_labels = allows_duplicate_labels
+flags = {'allows_duplicate_labels': True}
+value = Flags(1, **flags)
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::CallFull {
+        double_star: Some(mapping),
+        keywords,
+        ..
+    } = &assigned(&hir, "value").kind
+    else {
+        panic!(
+            "a **mapping constructor call must bind at runtime: {:?}",
+            assigned(&hir, "value").kind
+        );
+    };
+    assert!(keywords.is_empty(), "no named keywords here: {keywords:?}");
+    assert!(
+        matches!(&mapping.kind, HExprKind::Local(_)),
+        "the mapping operand is kept: {:?}",
+        mapping.kind
+    );
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn guarded_none_local_is_non_optional_inside_the_guard() {
+    // pandas' `merge.py` builds `mask_left = None if ... else indexer == -1`
+    // (a mixed conditional whose deferred comparison infers `None`) and then
+    // negates it under `if mask_left is not None:`. The guard must make the
+    // guarded read a non-None value instead of rejecting `~mask_left`.
+    let source = "\
+def f(left_indexer):
+    mask_left = None if left_indexer is None else left_indexer == -1
+    if mask_left is not None and mask_left.all():
+        return 0
+    if mask_left is not None:
+        return ~mask_left
+    return 1
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        crate::sema::check(&hir, &mut infer, "test.py").is_ok(),
+        "the is-not-None branch must narrow the local"
+    );
+
+    // The complementary branch of `is None` also proves the value non-None.
+    let source = "\
+def f(left_indexer):
+    mask_left = None if left_indexer is None else left_indexer == -1
+    if mask_left is None:
+        return 0
+    else:
+        return ~mask_left
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn unguarded_none_local_keeps_the_invalid_operand_diagnostic() {
+    // Narrowing must stay scoped to the guarded branch: without the guard the
+    // local keeps its inferred `None` type and `~` is still rejected.
+    let source = "\
+def f(left_indexer):
+    mask_left = None if left_indexer is None else left_indexer == -1
+    return ~mask_left
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let errors = crate::sema::check(&hir, &mut infer, "test.py")
+        .expect_err("an unguarded None operand must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unary ~: 'None'")),
+        "{errors:?}"
     );
 }

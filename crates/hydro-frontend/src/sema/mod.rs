@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use hydro_ir::stdlib;
 use hydro_ir::{
     BinOp, Builtin, Callee, ClassAttr, ClassMethod, CompClause, CompTarget, Const, DeleteTarget,
-    Expr as IrExpr, ExprKind, Function as IrFunction, Handler as IrHandler, LocalInfo, Param,
-    ParamKind, Program, Stmt as IrStmt, StmtKind, Type, UnOp, UnpackTarget,
+    Expr as IrExpr, ExprKind, Function as IrFunction, Handler as IrHandler, LocalId, LocalInfo,
+    Param, ParamKind, Program, Stmt as IrStmt, StmtKind, Type, UnOp, UnpackTarget,
 };
 
 use crate::diag::{self, codes, Diagnostic};
@@ -108,6 +108,31 @@ impl Infer {
         self.parent.push(id);
         self.binding.push(None);
         Ty::Var(id)
+    }
+
+    /// Snapshot a resolved type so later constraints on the source slot cannot
+    /// retroactively change it.
+    ///
+    /// The operator queue and the builtin-call checks are applied after the
+    /// whole function body has been walked, so a read that was concrete when
+    /// it was recorded must not observe a later reassignment of the same
+    /// local (including numeric widening and dynamic widening). The snapshot
+    /// is a fresh variable bound to the current type; gradual provenance is
+    /// copied so the dynamic-argument rule still applies to it. An unresolved
+    /// variable is returned unchanged: it still has to receive constraints.
+    pub fn freeze(&mut self, t: Ty) -> Ty {
+        let Ty::Concrete(ty) = self.resolve(t) else {
+            return t;
+        };
+        let gradual = self.is_gradual(t);
+        let fresh = self.fresh();
+        if let Ty::Var(v) = fresh {
+            self.binding[v as usize] = Some(ty);
+            if gradual {
+                self.gradual.insert(v);
+            }
+        }
+        fresh
     }
 
     fn root(&mut self, mut v: u32) -> u32 {
@@ -775,6 +800,28 @@ fn is_generic_builtin(builtin: Builtin) -> bool {
     )
 }
 
+/// Concrete result of a builtin that does not depend on its argument types.
+///
+/// Such a call types its result at the call site instead of waiting for the
+/// deferred argument checks. The timing matters: numpy's
+/// `ndescr = len(descr)` feeds `range(ndescr)` and only later rebinds
+/// `ndescr`, so an earlier read must keep the result type it had. Builtins
+/// whose result follows their arguments (`max`, `abs`, `sum`, `int(x, base)`)
+/// or is dynamic stay deferred (`None`).
+fn builtin_fixed_result(builtin: Builtin) -> Option<Type> {
+    Some(match builtin {
+        Builtin::Len => Type::Int,
+        Builtin::Str | Builtin::Repr | Builtin::Ascii | Builtin::Format => Type::Str,
+        Builtin::Bool => Type::Bool,
+        Builtin::Range => Type::Range,
+        Builtin::List | Builtin::Reversed | Builtin::Sorted => Type::List,
+        Builtin::Tuple => Type::Tuple,
+        Builtin::Dict => Type::Dict,
+        Builtin::Set | Builtin::Frozenset => Type::Set,
+        _ => return None,
+    })
+}
+
 /// Result type of the class-level methods Hydro models on builtin class
 /// values. Every other class-level method is dispatched at runtime, so a
 /// missing entry only means "dynamic result", not "unknown attribute".
@@ -1215,6 +1262,11 @@ struct Checker<'a> {
     checks: Vec<Check>,
     /// Known end columns keyed by expression start.
     spans: HashMap<(u32, u32), u32>,
+    /// Locals narrowed by the guard that dominates the branch being checked
+    /// (`if x is not None:`). A read of a narrowed local takes the narrowed
+    /// type instead of the function-wide slot; an assignment to the local
+    /// removes the entry so later reads see the value it stores.
+    narrow: HashMap<LocalId, Ty>,
 }
 
 impl<'a> Checker<'a> {
@@ -1274,6 +1326,9 @@ impl<'a> Checker<'a> {
     }
 
     fn check_function(&mut self, f: &HFunction) {
+        // Narrowing facts are scoped to the branch that established them;
+        // no fact survives into another function body.
+        self.narrow.clear();
         // An unannotated return type starts as a fresh inference variable and
         // an annotation starts concrete; only the inferred slot may be
         // widened by the body, so record its shape before the walk binds it.
@@ -1422,6 +1477,98 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Check `stmts` with `facts` narrowed for the branch guarded by them.
+    ///
+    /// The facts are scoped to the branch: the caller's narrowing is restored
+    /// afterwards, and an assignment to a narrowed local inside the body
+    /// removes its fact for the statements that follow it.
+    fn check_stmts_narrowed(
+        &mut self,
+        stmts: &[HStmt],
+        f: &HFunction,
+        facts: &[(LocalId, Ty)],
+        has_value: &mut bool,
+        has_bare: &mut bool,
+    ) {
+        if facts.is_empty() {
+            self.check_stmts(stmts, f, has_value, has_bare);
+            return;
+        }
+        let mut previous: Vec<(LocalId, Option<Ty>)> = Vec::with_capacity(facts.len());
+        for (id, ty) in facts {
+            previous.push((*id, self.narrow.insert(*id, *ty)));
+        }
+        self.check_stmts(stmts, f, has_value, has_bare);
+        // Undo in reverse: a condition may mention the same local twice, and
+        // the earliest save is the state to restore.
+        for (id, previous) in previous.into_iter().rev() {
+            match previous {
+                Some(ty) => {
+                    self.narrow.insert(id, ty);
+                }
+                None => {
+                    self.narrow.remove(&id);
+                }
+            }
+        }
+    }
+
+    /// Collect the narrowing a condition establishes for one outcome.
+    ///
+    /// Only `x is None` / `x is not None` guards on a local are modelled; a
+    /// conjunction narrows all of its operands when it is true, and a
+    /// disjunction narrows all of them when it is false, because only then is
+    /// every operand known to hold. `not` swaps the outcome. The type model
+    /// has no union, so the only representable optional shape is a local
+    /// inferred as `None`: the non-None side of the guard turns that into a
+    /// dynamic (non-None) value, while every other inferred type is already
+    /// non-optional and is kept unchanged.
+    fn narrow_facts(
+        &mut self,
+        expr: &HExpr,
+        f: &HFunction,
+        truthy: bool,
+        out: &mut Vec<(LocalId, Ty)>,
+    ) {
+        match &expr.kind {
+            HExprKind::Un {
+                op: UnOp::Not,
+                operand,
+            } => self.narrow_facts(operand, f, !truthy, out),
+            HExprKind::BoolOp { op, lhs, rhs } => {
+                let both_hold = matches!(
+                    (*op, truthy),
+                    (hydro_ir::BoolOp::And, true) | (hydro_ir::BoolOp::Or, false)
+                );
+                if both_hold {
+                    self.narrow_facts(lhs, f, truthy, out);
+                    self.narrow_facts(rhs, f, truthy, out);
+                }
+            }
+            HExprKind::Bin { op, lhs, rhs } => {
+                if !matches!(*op, BinOp::Is | BinOp::IsNot) {
+                    return;
+                }
+                let local = match (&lhs.kind, &rhs.kind) {
+                    (HExprKind::Local(id), HExprKind::Const(Const::None))
+                    | (HExprKind::Const(Const::None), HExprKind::Local(id)) => *id,
+                    _ => return,
+                };
+                let asserts_none = (*op == BinOp::Is) == truthy;
+                if asserts_none {
+                    // The local is either already `None` or a concrete type the
+                    // model cannot intersect with `None`; keeping the inferred
+                    // type stays conservative.
+                    return;
+                }
+                if self.inf.resolve(f.locals[local as usize].ty) == Ty::Concrete(Type::None) {
+                    out.push((local, Ty::Concrete(Type::Any)));
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Bind a value to a function-local slot.
     ///
     /// An inferred slot is a type variable: Python locals may hold a value of
@@ -1518,6 +1665,9 @@ impl<'a> Checker<'a> {
             HStmtKind::Expr(e) => self.check_expr(e, f),
             HStmtKind::Assign { target, value } => {
                 self.check_expr(value, f);
+                // A store replaces the guarded value: later reads must see the
+                // slot again rather than the narrowed type.
+                self.narrow.remove(target);
                 let local = &f.locals[*target as usize];
                 self.assign_local(local.ty, value.ty, &local.name, stmt.line, stmt.col);
             }
@@ -1528,6 +1678,7 @@ impl<'a> Checker<'a> {
             }
             HStmtKind::CellAssign { target, value } => {
                 self.check_expr(value, f);
+                self.narrow.remove(target);
                 let local = &f.locals[*target as usize];
                 self.assign_local(local.ty, value.ty, &local.name, stmt.line, stmt.col);
             }
@@ -1571,10 +1722,15 @@ impl<'a> Checker<'a> {
             HStmtKind::AugAssign { target, op, value } => {
                 self.check_expr(value, f);
                 let local_ty = f.locals[*target as usize].ty;
+                // The read side sees the guard's type; the store updates the
+                // slot, so the fact ends after this statement.
+                let read_ty = self.narrow.remove(target).unwrap_or(local_ty);
+                let a = self.inf.freeze(read_ty);
+                let b = self.inf.freeze(value.ty);
                 self.ops.push(Op {
                     kind: OpKind::Bin(*op),
-                    a: local_ty,
-                    b: value.ty,
+                    a,
+                    b,
                     out: local_ty,
                     line: stmt.line,
                     col: stmt.col,
@@ -1643,8 +1799,12 @@ impl<'a> Checker<'a> {
                 else_body,
             } => {
                 self.check_expr(cond, f);
-                self.check_stmts(then_body, f, has_value, has_bare);
-                self.check_stmts(else_body, f, has_value, has_bare);
+                let mut then_facts = Vec::new();
+                self.narrow_facts(cond, f, true, &mut then_facts);
+                let mut else_facts = Vec::new();
+                self.narrow_facts(cond, f, false, &mut else_facts);
+                self.check_stmts_narrowed(then_body, f, &then_facts, has_value, has_bare);
+                self.check_stmts_narrowed(else_body, f, &else_facts, has_value, has_bare);
             }
             HStmtKind::While {
                 cond,
@@ -1652,8 +1812,12 @@ impl<'a> Checker<'a> {
                 else_body,
             } => {
                 self.check_expr(cond, f);
-                self.check_stmts(body, f, has_value, has_bare);
-                self.check_stmts(else_body, f, has_value, has_bare);
+                let mut body_facts = Vec::new();
+                self.narrow_facts(cond, f, true, &mut body_facts);
+                let mut else_facts = Vec::new();
+                self.narrow_facts(cond, f, false, &mut else_facts);
+                self.check_stmts_narrowed(body, f, &body_facts, has_value, has_bare);
+                self.check_stmts_narrowed(else_body, f, &else_facts, has_value, has_bare);
             }
             HStmtKind::ForRange {
                 var,
@@ -1664,6 +1828,8 @@ impl<'a> Checker<'a> {
                 else_body,
             } => {
                 let var_ty = f.locals[*var as usize].ty;
+                // The loop target is assigned on every iteration.
+                self.narrow.remove(var);
                 match self.inf.resolve(var_ty) {
                     Ty::Concrete(Type::Int) | Ty::Concrete(Type::Any) => {}
                     Ty::Var(_) => {
@@ -1721,6 +1887,8 @@ impl<'a> Checker<'a> {
                     }
                 }
                 let var_ty = f.locals[*var as usize].ty;
+                // The loop target is assigned on every iteration.
+                self.narrow.remove(var);
                 // `bytes` yields integer byte values; every other iterable
                 // keeps its elements dynamically typed.
                 let element = if iterable_ty == Ty::Concrete(Type::Bytes) {
@@ -1799,8 +1967,9 @@ impl<'a> Checker<'a> {
             HStmtKind::Raise { msg, cause, .. } => {
                 if let Some(msg) = msg {
                     self.check_expr(msg, f);
+                    let ty = self.inf.freeze(msg.ty);
                     self.checks.push(Check::RaiseMsg {
-                        ty: msg.ty,
+                        ty,
                         line: msg.line,
                         col: msg.col,
                     });
@@ -1857,6 +2026,11 @@ impl<'a> Checker<'a> {
             } => {
                 self.check_stmts(body, f, has_value, has_bare);
                 for handler in handlers {
+                    if let Some(exc_expr) = &handler.exc_expr {
+                        // The matcher is a runtime expression evaluated when
+                        // the arm is reached; check it like any other value.
+                        self.check_expr(exc_expr, f);
+                    }
                     if let Some(binding) = handler.binding {
                         let ty = f.locals[binding as usize].ty;
                         // Exception bindings are runtime objects; keep them
@@ -1940,6 +2114,7 @@ impl<'a> Checker<'a> {
     fn check_unpack_target(&mut self, target: &HUnpackTarget, f: &HFunction) {
         match target {
             HUnpackTarget::Name(id) | HUnpackTarget::Cell(id) => {
+                self.narrow.remove(id);
                 let ty = f.locals[*id as usize].ty;
                 let _ = self.inf.unify(ty, Ty::Concrete(Type::Any));
             }
@@ -2160,8 +2335,15 @@ impl<'a> Checker<'a> {
         match &expr.kind {
             HExprKind::Const(_) => {}
             HExprKind::Local(id) => {
-                let local_ty = f.locals[*id as usize].ty;
-                let _ = self.inf.unify(local_ty, expr.ty);
+                if let Some(narrowed) = self.narrow.get(id).copied() {
+                    // The guard established this type for the branch; do not
+                    // unify with the function-wide slot, whose optional shape
+                    // stays visible outside the guard.
+                    let _ = self.inf.unify(expr.ty, narrowed);
+                } else {
+                    let local_ty = f.locals[*id as usize].ty;
+                    let _ = self.inf.unify(local_ty, expr.ty);
+                }
             }
             HExprKind::CellGet(id) => {
                 let local_ty = f.locals[*id as usize].ty;
@@ -2177,6 +2359,7 @@ impl<'a> Checker<'a> {
             }
             HExprKind::NamedExpr { target, value } => {
                 self.check_expr(value, f);
+                self.narrow.remove(target);
                 // The slot may receive any value; only a still-open slot is
                 // widened to `Any`, so an annotated local keeps its type.
                 let slot = f.locals[*target as usize].ty;
@@ -2207,10 +2390,14 @@ impl<'a> Checker<'a> {
                 {
                     self.check_hashable(lhs);
                 }
+                // The queue is solved after the whole body is walked, so
+                // snapshot the operand types recorded at this point.
+                let a = self.inf.freeze(lhs.ty);
+                let b = self.inf.freeze(rhs.ty);
                 self.ops.push(Op {
                     kind: OpKind::Bin(*op),
-                    a: lhs.ty,
-                    b: rhs.ty,
+                    a,
+                    b,
                     out: expr.ty,
                     line: expr.line,
                     col: expr.col,
@@ -2219,9 +2406,10 @@ impl<'a> Checker<'a> {
             }
             HExprKind::Un { op, operand } => {
                 self.check_expr(operand, f);
+                let a = self.inf.freeze(operand.ty);
                 self.ops.push(Op {
                     kind: OpKind::Un(*op),
-                    a: operand.ty,
+                    a,
                     b: Ty::Concrete(Type::None),
                     out: expr.ty,
                     line: expr.line,
@@ -2842,15 +3030,20 @@ impl<'a> Checker<'a> {
             }
             Callee::Builtin(builtin) => {
                 let builtin = *builtin;
-                // `range(...)` has a concrete result type, so callers can
-                // type-check against it eagerly; argument validation stays
-                // deferred.
-                if builtin == Builtin::Range {
-                    let _ = self.inf.unify(expr.ty, Ty::Concrete(Type::Range));
+                // A builtin whose result does not depend on its arguments
+                // types its result at the call site; callers can type-check
+                // against it in source order and argument validation stays
+                // deferred. The rest stay fully deferred.
+                if let Some(result) = builtin_fixed_result(builtin) {
+                    let _ = self.inf.unify(expr.ty, Ty::Concrete(result));
                 }
+                let arg_types: Vec<(Ty, u32, u32)> = args
+                    .iter()
+                    .map(|arg| (self.inf.freeze(arg.ty), arg.line, arg.col))
+                    .collect();
                 self.checks.push(Check::Builtin {
                     builtin,
-                    args: args.iter().map(|a| (a.ty, a.line, a.col)).collect(),
+                    args: arg_types,
                     literal: args
                         .iter()
                         .map(|a| matches!(a.kind, HExprKind::Const(_)))
@@ -4852,6 +5045,7 @@ pub fn check(prog: &LHir, inf: &mut Infer, filename: &str) -> Result<(), Vec<Dia
         ops: Vec::new(),
         checks: Vec::new(),
         spans: HashMap::new(),
+        narrow: HashMap::new(),
     };
 
     let functions = prog.functions.clone();
@@ -5161,6 +5355,7 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
                 .iter()
                 .map(|h| IrHandler {
                     exc: h.exc,
+                    exc_expr: h.exc_expr.as_ref().map(|e| emit_expr(e, inf)),
                     binding: h.binding,
                     binding_cell: h.binding_cell,
                     body: emit_stmts(&h.body, inf),

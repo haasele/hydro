@@ -591,6 +591,15 @@ pub(crate) fn call(
     }
 }
 
+/// Member-name prefix that asks [`get`] to perform a runtime `import *`.
+///
+/// The frontend cannot enumerate a compiled extension at compile time, so a
+/// `from <extension> import *` statement lowers to a hidden member whose name
+/// is this prefix plus the importing module. Real attribute names cannot
+/// contain NUL, so no extension can define it. See
+/// `lower::EXTENSION_STAR_IMPORT_PREFIX` for the frontend half.
+pub(crate) const STAR_IMPORT_MEMBER_PREFIX: &str = "\0hydro.star.import\0";
+
 /// `extension.get(path, member)`: materialises a module attribute as a Hydro
 /// value or a callable function object.
 pub(crate) fn get(
@@ -605,6 +614,9 @@ pub(crate) fn get(
     let Some(member) = name_str(member_ptr, member_len) else {
         return exc::raise_with_message(RUNTIME_ERROR, "invalid extension attribute buffer");
     };
+    if let Some(module_name) = member.strip_prefix(STAR_IMPORT_MEMBER_PREFIX) {
+        return star_import(path, module_name);
+    }
     if crate::native::is_hna_path(path) {
         return crate::native::get(path, member);
     }
@@ -635,11 +647,77 @@ pub(crate) fn module_attribute_names(path: &str) -> Result<Vec<String>, String> 
 
 /// Materialises a module-owned type handle as an opaque Hydro value.
 ///
-/// The registry keeps its own reference; the returned value owns one more.
+/// The registry keeps its own reference; the returned value owns one more. The
+/// handle is labelled with its metatype (`type`, or an extension metaclass), so
+/// `type(cls)` and `isinstance(x, type)` see a class rather than an instance of
+/// the class it names.
 fn type_object_value(address: usize) -> i64 {
     let object = address as *mut capi::ShimObject;
     capi::inc_ref(object);
-    value::ext_object_new(object, capi::type_display_name(address))
+    value::ext_object_new(object, capi::type_metatype_name(address))
+}
+
+/// Runtime half of `from <extension> import *`.
+fn star_import(path: &str, importing_module: &str) -> i64 {
+    if crate::native::is_hna_path(path) {
+        // Hydro-native modules expose their namespace through the static
+        // module specs; there is nothing to copy into the global table.
+        return NONE;
+    }
+    match capi::load_extension(path, &init_name(path)) {
+        Ok(module) => populate_star_import(module, importing_module),
+        // A star import is an import statement: an unavailable shared object
+        // raises `ImportError`, which a surrounding handler can catch.
+        Err(message) => raised_import_error(&message),
+    }
+}
+
+/// Copies every name a star import exports into `target_module`'s runtime
+/// global table.
+///
+/// `__all__` selects the names when the extension defines it; otherwise every
+/// public (non-underscore) module attribute is copied, matching CPython's
+/// `import *`. The importing unit's literal `__all__` is only its own export
+/// list, not a restriction on what the star import binds: `globals()` must see
+/// names such as NumPy's ufuncs even though `numpy/_core/multiarray.py` does
+/// not re-export them.
+pub(crate) fn populate_star_import(module: u64, target_module: &str) -> i64 {
+    for name in star_import_names(module) {
+        let value = match capi::get_attr(module, &name) {
+            Ok(ShimAttr::Value(shim)) => match shim_to_value(shim) {
+                Ok(value) => value,
+                Err(message) => return exc::raise_with_message(RUNTIME_ERROR, &message),
+            },
+            Ok(ShimAttr::Callable(callable)) => {
+                value::ext_function_new(callable.module, callable.method, name.clone())
+            }
+            Ok(ShimAttr::Type(address)) => type_object_value(address),
+            Err(message) => return raised_error(&message),
+        };
+        crate::core::globals::set(target_module, &name, value);
+    }
+    NONE
+}
+
+/// Names copied by a star import from `module`.
+fn star_import_names(module: u64) -> Vec<String> {
+    match capi::get_attr(module, "__all__") {
+        Ok(ShimAttr::Value(ShimValue::List(items)))
+        | Ok(ShimAttr::Value(ShimValue::Tuple(items))) => {
+            return items
+                .into_iter()
+                .filter_map(|item| match item {
+                    ShimValue::Str(name) => Some(name),
+                    _ => None,
+                })
+                .collect();
+        }
+        _ => {}
+    }
+    capi::module_attribute_names(module)
+        .into_iter()
+        .filter(|name| !name.starts_with('_'))
+        .collect()
 }
 
 /// `from <extension> import member`: a module attribute read for an import

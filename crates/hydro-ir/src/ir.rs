@@ -481,15 +481,26 @@ pub enum DeleteTarget {
     },
 }
 
-/// One `except [exc] [as <local>]:` arm. `exc == None` is a bare `except:`.
+/// One `except [exc] [as <local>]:` arm. Both `exc` and `exc_expr` `None` is a
+/// bare `except:`.
 ///
-/// `exc` is always a runtime tag. The frontend approximates handlers that name
+/// `exc` is a static runtime tag. The frontend approximates handlers that name
 /// a user exception class (declared in the unit, imported, or dotted such as
 /// `errors.StyleSyntaxError`) with [`ExcKind::RuntimeError`], because user
 /// classes have no runtime tag; builtin names keep their exact tag.
+///
+/// `exc_expr` is the general form: `except <expression>:` where the matched
+/// exception class — or tuple of classes — is only known at runtime (a call
+/// such as `except tuple(errors):`, a subscript, an alias bound to a class,
+/// ...). The expression is evaluated when the pending exception reaches this
+/// arm, in source order after the earlier arms failed to match, and the value
+/// is matched through the runtime `isinstance`/exception-hierarchy logic. A
+/// matcher that raises replaces the pending exception, exactly like CPython.
 #[derive(Clone, Debug)]
 pub struct Handler {
     pub exc: Option<ExcKind>,
+    /// Dynamic matcher evaluated at handler entry; `None` for static handlers.
+    pub exc_expr: Option<Expr>,
     pub binding: Option<LocalId>,
     /// The binding local holds a closure cell; store the exception through it.
     pub binding_cell: bool,

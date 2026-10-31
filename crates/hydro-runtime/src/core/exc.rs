@@ -2162,6 +2162,45 @@ mod tests {
     }
 
     #[test]
+    fn pending_exception_values_match_classes_and_tuples() {
+        // Dynamic `except <expr>:` arms match the pending exception value with
+        // the runtime `isinstance` builtin. A class, a tuple of classes and an
+        // empty tuple (`except tuple([])`) must all resolve without consuming
+        // or disturbing the pending exception.
+        init();
+        raise_with_message(VALUE_ERROR, "boom");
+        let exc = pending_value();
+        let value_error = exception_class(VALUE_ERROR);
+        let type_error = exception_class(TYPE_ERROR);
+
+        assert_eq!(crate::builtins::isinstance(exc, value_error), value::TRUE);
+        assert_eq!(
+            crate::builtins::isinstance(exc, exception_class(EXCEPTION)),
+            value::TRUE
+        );
+        assert_eq!(
+            crate::builtins::isinstance(exc, exception_class(BASE_EXCEPTION)),
+            value::TRUE
+        );
+        assert_eq!(crate::builtins::isinstance(exc, type_error), value::FALSE);
+
+        // Tuple matchers follow the same hierarchy, including an empty tuple,
+        // which matches nothing.
+        let candidates = value::tuple_new(vec![type_error, value_error]);
+        assert_eq!(crate::builtins::isinstance(exc, candidates), value::TRUE);
+        assert_eq!(
+            crate::builtins::isinstance(exc, value::tuple_new(Vec::new())),
+            value::FALSE
+        );
+
+        // Matching leaves the exception installed for the handler entry.
+        assert!(pending());
+        assert_eq!(pending_value(), exc);
+        assert_eq!(pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(clear(), 0);
+    }
+
+    #[test]
     fn unknown_tags_use_the_safe_fallback() {
         init();
         // An unknown pending tag matches only the two documented roots and

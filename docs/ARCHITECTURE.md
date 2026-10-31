@@ -373,9 +373,15 @@ Exception): ...` creates an ordinary class (its instances are class
 instances, not native exception objects). `raise ReprError("msg")` is not
 dropped: the frontend lowers it to `RuntimeError` whose message is
 `"ReprError: msg"` (the message is rendered with `str()`), keeping an
-explicit `from` cause; a bare `raise ReprError` uses `"ReprError"`. A later
-`except ReprError:` is rejected at compile time (handlers only accept
-built-in kinds), so the fallback never matches a user handler.
+explicit `from` cause; a bare `raise ReprError` uses `"ReprError"`. A handler
+that *names* the user class (`except ReprError:`, `except (ReprError, ...):`,
+or a dotted imported spelling) uses the same `RuntimeError` tag, so the two
+sides stay consistent. A handler whose matched type is an arbitrary runtime
+expression (`except tuple(types):`, `except alias:`, a subscript, a mixed
+tuple) is evaluated when the exception reaches the arm and matched with the
+runtime `isinstance` builtin, i.e. by real class identity and the CPython
+hierarchy; an alias of a user class therefore only matches exceptions whose
+class identity survived (value-form raises).
 
 ### 3.3 Semantics
 
@@ -1035,12 +1041,18 @@ it. The cache is not a shared artifact store.
   `ClassDef { target, name, base, methods }`, `SetAttr`, `Delete { targets }`,
   `Return`, `Break`, `Continue`, `Pass`, `Raise`,
   `Try { body, handlers, else_body, finally_body }`.
-- `Handler.exc == None` is a bare `except:` (catches every tag). `else` runs
+- `Handler.exc == None` and `Handler.exc_expr == None` is a bare `except:`
+  (catches every tag). `else` runs
   only after an error-free body; `finally` runs on every path (normal, `return`,
   `break`, `continue`, exception) and can override the previous action
   (return/break/continue suppress a pending exception; a new exception
-  in finally replaces the old one). Tuple handlers are expanded by the
-  frontend into ordered handlers. `raise ... from ...` stores an explicit
+  in finally replaces the old one). Tuple handlers of static names are
+  expanded by the frontend into ordered handlers; `Handler.exc_expr` holds
+  `except <expression>:` (`except tuple(types):`, an alias name, a subscript,
+  a tuple with a runtime element) and is evaluated by codegen/interp when the
+  arm is reached, with the pending exception parked and then restored, and
+  matched through the runtime `isinstance` builtin. `raise ... from ...`
+  stores an explicit
   cause, rendered deepest-first; `from None` suppresses it. A raise inside an
   active handler stores the caught exception as `__context__` and renders
   "During handling of the above exception ...", suppressed by
