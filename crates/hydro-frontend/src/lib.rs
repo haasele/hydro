@@ -7075,8 +7075,15 @@ def __getattr__(name):
         // `from _socket import NOPE` names no native member. Inside a `try`
         // whose handler catches `ImportError` the statement is deferred
         // through the extension shared object, so the handler binds the
-        // fallback instead of the compiler rejecting the program.
+        // fallback instead of the compiler rejecting the program. The fixture
+        // makes the resolved shared object independent of the host's Python
+        // installation.
         let dir = TestDir::new("optional-native-member");
+        let so = dir.add_extension("_socket.so");
+        let expected = fs::canonicalize(&so)
+            .expect("canonical extension path")
+            .to_string_lossy()
+            .into_owned();
         let main = dir.write(
             "main.py",
             "try:\n    from _socket import NOPE\nexcept ImportError:\n    NOPE = 42\n\nprint(NOPE)\n",
@@ -7092,7 +7099,7 @@ def __getattr__(name):
                 ExprKind::DeferredImport { module, member, path }
                     if module == "_socket"
                         && member.as_deref() == Some("NOPE")
-                        && path.as_deref().is_some_and(|path| path.ends_with(".so"))
+                        && path.as_deref() == Some(expected.as_str())
             ),
             "expected a deferred extension import, got {:?}",
             imported.kind

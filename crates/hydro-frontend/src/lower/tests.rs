@@ -683,10 +683,17 @@ fn optional_native_import_binds_a_missing_member_at_runtime() {
     // compiler rejects it, but an `except ImportError` fallback makes the
     // import a deferred one through the `_socket` extension shared object, so
     // the handler binds the fallback and every later read sees it through the
-    // module local/global table.
+    // module local/global table. The fixture makes the resolved shared object
+    // independent of the host's Python installation.
+    let dir = ExtensionDir::new("optional-native-member");
+    let so = dir.add_extension("_socket.so");
+    let expected = fs::canonicalize(&so)
+        .expect("canonical extension path")
+        .to_string_lossy()
+        .into_owned();
     let source =
         "try:\n    from _socket import NOPE\nexcept ImportError:\n    NOPE = 42\n\nvalue = NOPE\n";
-    let (hir, _, diags) = lower_source(source, &parse(source));
+    let (hir, _, diags) = lower_source_in(&dir.path, source);
     assert!(diags.is_empty(), "{diags:?}");
 
     let imported = global_set_value(&hir.functions[0].body, "NOPE")
@@ -697,7 +704,7 @@ fn optional_native_import_binds_a_missing_member_at_runtime() {
             HExprKind::DeferredImport { module, member, path }
                 if module == "_socket"
                     && member.as_deref() == Some("NOPE")
-                    && path.as_deref().is_some_and(|path| path.ends_with(".so"))
+                    && path.as_deref() == Some(expected.as_str())
         ),
         "expected a deferred extension import, got {:?}",
         imported.kind
