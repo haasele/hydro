@@ -302,7 +302,22 @@ impl SessionCompiler {
         self.getattr_units.resize(unit_count, false);
         self.extension_star_units.resize(unit_count, Vec::new());
         let first_new_unit = self.lowered_units;
-        let mut initializers: Vec<FunctionId> = Vec::new();
+        // Reversed package/submodule cycles and the initializer order they
+        // imply. `tea -c` runs through this session pipeline (the IR
+        // interpreter), so it must use the same ordering and deferred binding
+        // segments as a whole-file check.
+        let reversed = crate::reversed_cycle_imports(&self.loader.units);
+        let initializer_order =
+            crate::unit_initializer_order(&self.loader.units, entry_index, &reversed);
+        let unit_by_name: HashMap<String, usize> = self
+            .loader
+            .units
+            .iter()
+            .enumerate()
+            .map(|(index, unit)| (unit.name.clone(), index))
+            .collect();
+        let mut initializer_by_unit: Vec<Option<FunctionId>> = vec![None; unit_count];
+        let mut segments_by_unit: Vec<Vec<(FunctionId, Vec<usize>)>> = vec![Vec::new(); unit_count];
         let mut entry_main: Option<FunctionId> = None;
 
         let parsed = &self.loader.units[entry_index];
@@ -330,7 +345,7 @@ impl SessionCompiler {
             } else {
                 lowerer.set_dunder_name(&unit.name);
                 lowerer.set_package(&unit.package);
-                initializers.push(base);
+                initializer_by_unit[index] = Some(base);
             }
 
             let mut user_modules = HashMap::new();
@@ -377,8 +392,22 @@ impl SessionCompiler {
                     .map(|(module, _)| module.clone())
                     .collect(),
             );
+            // Modules whose body the loader ordered after this unit (a
+            // reversed package/submodule cycle): their import bindings move to
+            // an extra initializer segment.
+            let deferred_initializer_modules: HashSet<String> = reversed
+                .get(&index)
+                .map(|submodules| {
+                    submodules
+                        .iter()
+                        .map(|&dep| self.loader.units[dep].name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            lowerer.set_initializer_deferred_modules(deferred_initializer_modules);
 
             let mut hir = lowerer.lower_module(&unit.module);
+            let segments = lowerer.take_module_segments();
             let exported = lowerer.exported_names();
             let dynamic_globals = lowerer.exports_dynamic_globals();
             let module_getattr = lowerer.exports_module_getattr();
@@ -390,6 +419,13 @@ impl SessionCompiler {
             if !lower_diags.is_empty() {
                 return Err(lower_diags);
             }
+            segments_by_unit[index] = segments
+                .into_iter()
+                .map(|(id, module)| {
+                    let deps = unit_by_name.get(&module).copied().into_iter().collect();
+                    (id, deps)
+                })
+                .collect();
 
             for (class, init, mut signature) in exported_classes {
                 signature.default_exprs = vec![None; signature.default_exprs.len()];
@@ -438,6 +474,16 @@ impl SessionCompiler {
                 entry_main = Some(base);
             }
         }
+
+        let initializers = crate::build_initializers(
+            &self.loader.units,
+            entry_index,
+            &initializer_order,
+            &initializer_by_unit,
+            &segments_by_unit,
+            &reversed,
+            first_new_unit,
+        );
 
         self.lowered_units = unit_count;
         for name in &bound_names {

@@ -11,7 +11,13 @@
 //! * `Signature`/`Parameter`/`BoundArguments` objects with real argument
 //!   binding, formatting and `functools.partial`/`partialmethod` support;
 //! * `getfullargspec`, `getcallargs`, `getmembers`, `getattr_static` and
-//!   `unwrap`.
+//!   `unwrap`;
+//! * `getmro` and `getclasstree` over the recorded class MRO, and
+//!   `classify_class_attrs` over the recorded class namespaces (methods keep
+//!   their declared `staticmethod`/`classmethod`/`property` kind);
+//! * `getabsfile` (through the native `os.path` helpers);
+//! * `istraceback`/`ismethodwrapper`, which report `False` because Hydro
+//!   reifies neither value kind.
 //!
 //! ## Precise unsupported areas (reported, not fabricated)
 //!
@@ -21,6 +27,10 @@
 //!   empty list because there are no representable frame contexts.
 //!   `getclosurevars` raises `NotImplementedError`: free/global/builtin name
 //!   references live in a code object the runtime does not reify.
+//! * **`getcomments` has no first line number for functions and classes.**
+//!   A Python module is read from its `__file__` and gets CPython's
+//!   top-of-file comment scan; every other object reports `None` instead of
+//!   guessing where its definition starts.
 //! * **Annotations are not stored on function values.** Every
 //!   `Parameter.annotation` (and `FullArgSpec.annotations`) is
 //!   `Parameter.empty`; `signature`'s `globals`/`locals`/`eval_str`/
@@ -49,7 +59,7 @@
 
 use std::cell::Cell;
 
-use hydro_ir::{MethodKind, ParamKind};
+use hydro_ir::{Builtin, MethodKind, ParamKind};
 
 use crate::container;
 use crate::core::globals;
@@ -290,6 +300,7 @@ pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
         "FullArgSpec" => full_arg_spec_class(),
         "FrameInfo" => frame_info_class(),
         "ClosureVars" => closure_vars_class(),
+        "Attribute" => attribute_class(),
         "ParameterKind" | "_ParameterKind" => parameter_kind_class(),
         _ => return None,
     })
@@ -1696,6 +1707,9 @@ const FRAME_INFO_FIELDS: [&str; 6] = [
 
 const CLOSURE_VARS_FIELDS: [&str; 4] = ["nonlocals", "globals", "builtins", "unbound"];
 
+/// `inspect.Attribute`: the namedtuple `classify_class_attrs` returns.
+const ATTRIBUTE_FIELDS: [&str; 4] = ["name", "kind", "defining_class", "object"];
+
 fn namedtuple_methods(class_name: &'static str) -> Vec<(String, i64, MethodKind)> {
     let qualified = |suffix: &'static str| -> &'static str {
         match (class_name, suffix) {
@@ -1710,6 +1724,11 @@ fn namedtuple_methods(class_name: &'static str) -> Vec<(String, i64, MethodKind)
             ("ClosureVars", "__iter__") => "ClosureVars.__iter__",
             ("ClosureVars", "__len__") => "ClosureVars.__len__",
             ("ClosureVars", "__getitem__") => "ClosureVars.__getitem__",
+            ("ClosureVars", "__repr__") => "ClosureVars.__repr__",
+            ("Attribute", "__iter__") => "Attribute.__iter__",
+            ("Attribute", "__len__") => "Attribute.__len__",
+            ("Attribute", "__getitem__") => "Attribute.__getitem__",
+            ("Attribute", "__repr__") => "Attribute.__repr__",
             _ => "ClosureVars.__repr__",
         }
     };
@@ -1753,6 +1772,10 @@ fn closure_vars_class() -> i64 {
     namedtuple_helper_class("ClosureVars", &CLOSURE_VARS_FIELDS)
 }
 
+fn attribute_class() -> i64 {
+    namedtuple_helper_class("Attribute", &ATTRIBUTE_FIELDS)
+}
+
 fn namedtuple_helper_class(name: &'static str, fields: &[&'static str]) -> i64 {
     let key = format!("inspect.{name}.class");
     if let Some(class) = cached(&key) {
@@ -1776,8 +1799,10 @@ fn namedtuple_fields(obj: i64) -> &'static [&'static str] {
         &FULL_ARG_SPEC_FIELDS
     } else if class == frame_info_class() {
         &FRAME_INFO_FIELDS
-    } else {
+    } else if class == closure_vars_class() {
         &CLOSURE_VARS_FIELDS
+    } else {
+        &ATTRIBUTE_FIELDS
     }
 }
 
@@ -3237,6 +3262,328 @@ fn getcallargs_impl(args: &[i64], keywords: &[(String, i64)]) -> i64 {
 }
 
 // -------------------------------------------------------------------------
+// Class, attribute and source helpers
+// -------------------------------------------------------------------------
+
+/// `inspect.getmro(cls)`: `cls.__mro__`, the class itself first.
+fn getmro_impl(class: i64) -> i64 {
+    if value::as_class(class).is_none() {
+        // CPython reads `cls.__mro__`, so a non-class raises the same
+        // `AttributeError` an attribute access would.
+        return attribute_error(class, "__mro__");
+    }
+    value::tuple_new(value::class_mro(class))
+}
+
+/// `isinstance(object, types.<class_name>)` for the `types` placeholder
+/// classes (`TracebackType`, `MethodWrapperType`). Hydro reifies neither kind,
+/// so the predicate reports `False` for every value, exactly like CPython
+/// reports `False` for values of another type.
+fn is_types_instance(obj: i64, class_name: &str) -> i64 {
+    let roots = heap::root_values(&[obj]);
+    let class = crate::modules::types::constant(class_name);
+    let result = value::bool_value(is_instance_of(obj, class));
+    heap::release_roots(roots);
+    result
+}
+
+fn istraceback_impl(obj: i64) -> i64 {
+    is_types_instance(obj, "TracebackType")
+}
+
+fn ismethodwrapper_impl(obj: i64) -> i64 {
+    is_types_instance(obj, "MethodWrapperType")
+}
+
+/// `inspect.getabsfile(object)`: `os.path.normcase(os.path.abspath(filename))`
+/// where `filename` comes from `getsourcefile` (falling back to `getfile`).
+fn getabsfile_impl(obj: i64) -> i64 {
+    let mut guard = Roots::new();
+    guard.keep(&[obj]);
+    let source = getsourcefile_impl(obj);
+    if exc::pending() {
+        return NONE;
+    }
+    let filename = if source != NONE {
+        source
+    } else {
+        let file = getfile_impl(obj);
+        if exc::pending() {
+            return NONE;
+        }
+        file
+    };
+    guard.keep(&[filename]);
+    let abspath = super::module_get_by_name("os.path", "abspath");
+    if exc::pending() {
+        return NONE;
+    }
+    guard.keep(&[abspath]);
+    let absolute = crate::builtins::call(abspath, 1, &filename as *const i64);
+    if exc::pending() {
+        return NONE;
+    }
+    guard.keep(&[absolute]);
+    let normcase = super::module_get_by_name("os.path", "normcase");
+    if exc::pending() {
+        return NONE;
+    }
+    guard.keep(&[normcase]);
+    crate::builtins::call(normcase, 1, &absolute as *const i64)
+}
+
+/// `inspect.getcomments(object)`.
+///
+/// Hydro records no code objects or first line numbers, so the preceding
+/// comment block of a function or class cannot be located; those objects
+/// report `None`, like CPython when source is unavailable. A Python module is
+/// read from its `__file__` and gets CPython's top-of-file comment scan
+/// (`None` when the file has none, the expanded comment block otherwise).
+fn getcomments_impl(obj: i64) -> i64 {
+    if value::as_module(obj).is_none() {
+        return NONE;
+    }
+    let roots = heap::root_values(&[obj]);
+    let file = getfile_impl(obj);
+    // `getcomments` catches the `findsource` `TypeError` for built-in modules.
+    if exc::pending() {
+        let _ = exc::clear();
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let Some(path) = value::as_str(file).map(str::to_string) else {
+        heap::release_roots(roots);
+        return NONE;
+    };
+    heap::release_roots(roots);
+    if !path.ends_with(".py") {
+        return NONE;
+    }
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        return NONE;
+    };
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    // CPython's `getcomments` module branch.
+    let mut start = 0;
+    if lines.first().is_some_and(|line| line.starts_with("#!")) {
+        start = 1;
+    }
+    while start < lines.len() {
+        let stripped = lines[start].trim();
+        if stripped.is_empty() || stripped == "#" {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    if start < lines.len() && lines[start].starts_with('#') {
+        let mut comments = String::new();
+        let mut end = start;
+        while end < lines.len() && lines[end].starts_with('#') {
+            comments.push_str(&expand_tabs(lines[end]));
+            end += 1;
+        }
+        return text(&comments);
+    }
+    NONE
+}
+
+/// Whether a class attribute value is a routine for CPython's `isroutine`
+/// classification.
+fn is_routine_value(obj: i64) -> bool {
+    is_method(obj) || is_user_function(obj) || is_builtin(obj) || object_is_method_descriptor(obj)
+}
+
+/// `inspect.classify_class_attrs(cls)`: one `Attribute` namedtuple
+/// `(name, kind, defining_class, object)` per `dir(cls)` name.
+fn classify_class_attrs_impl(class: i64) -> i64 {
+    if value::as_class(class).is_none() {
+        return type_error(&format!(
+            "classify_class_attrs() argument must be a class, not {}",
+            value::type_name(class)
+        ));
+    }
+    let mut guard = Roots::new();
+    guard.keep(&[class]);
+    let attribute = attribute_class();
+    guard.keep(&[attribute]);
+    let result = value::list_new(Vec::new());
+    guard.keep(&[result]);
+
+    let mro = value::class_mro(class);
+    let mut class_bases = Vec::with_capacity(mro.len() + 1);
+    class_bases.push(class);
+    class_bases.extend(mro.iter().copied());
+    let metaclass = value::type_class(class);
+    let metamro: Vec<i64> = if value::as_class(metaclass).is_some() {
+        value::class_mro(metaclass)
+            .into_iter()
+            .filter(|&ancestor| {
+                ancestor != value::native_class("type") && ancestor != value::object_class()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let names_value = crate::builtins::call_builtin(Builtin::Dir, 1, &class as *const i64);
+    if exc::pending() {
+        return NONE;
+    }
+    guard.keep(&[names_value]);
+    let names: Vec<String> = value::as_list(names_value)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| value::as_str(*item).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for name in names {
+        let Some(entry) = value::class_lookup(class, &name) else {
+            continue;
+        };
+        let Some(homecls) = value::class_lookup_owner(class, &name) else {
+            continue;
+        };
+        // An object-owned protocol slot belongs to the implicit `object`
+        // ancestor Hydro does not record for base-less classes; every other
+        // owner must appear in the class' bases or the metaclass chain.
+        if homecls != value::object_class()
+            && !class_bases.contains(&homecls)
+            && !metamro.contains(&homecls)
+        {
+            continue;
+        }
+        let (kind, obj) = match entry {
+            ClassEntry::Method(MethodKind::Staticmethod, function) => ("static method", function),
+            ClassEntry::Method(MethodKind::Classmethod, function) => ("class method", function),
+            ClassEntry::Method(MethodKind::Property, function) => ("property", function),
+            ClassEntry::Method(_, function) => ("method", function),
+            ClassEntry::Attr(item) => {
+                if is_routine_value(item) {
+                    ("method", item)
+                } else {
+                    ("data", item)
+                }
+            }
+        };
+        let name_value = text(&name);
+        let kind_value = text(kind);
+        guard.keep(&[name_value, kind_value, obj, homecls]);
+        let attribute_value = namedtuple_instance(
+            attribute,
+            &[
+                ("name", name_value),
+                ("kind", kind_value),
+                ("defining_class", homecls),
+                ("object", obj),
+            ],
+        );
+        container::list_append(result, attribute_value);
+        guard.keep(&[attribute_value]);
+    }
+    result
+}
+
+/// `__module__`/`__name__` sort key of a class for `getclasstree`'s walktree.
+fn class_sort_key(class: i64) -> (String, String) {
+    let module = static_attribute(class, "__module__")
+        .and_then(|value_in| value::as_str(value_in).map(str::to_string))
+        .unwrap_or_default();
+    let name = value::class_display_name(class).unwrap_or("").to_string();
+    (module, name)
+}
+
+/// `walktree` for `getclasstree`: `[(class, bases), nested...]` per class,
+/// sorted by `(__module__, __name__)`.
+fn walktree(classes: &mut [i64], children: &[(i64, Vec<i64>)], guard: &mut Roots) -> i64 {
+    let result = value::list_new(Vec::new());
+    guard.keep(&[result]);
+    classes.sort_by_key(|&class| class_sort_key(class));
+    for class in classes.iter().copied() {
+        let bases = value::tuple_new(class_bases(class));
+        guard.keep(&[bases]);
+        let entry = value::tuple_new(vec![class, bases]);
+        guard.keep(&[entry]);
+        container::list_append(result, entry);
+        if let Some((_, descendants)) = children.iter().find(|(parent, _)| *parent == class) {
+            let mut nested = descendants.clone();
+            let subtree = walktree(&mut nested, children, guard);
+            container::list_append(result, subtree);
+        }
+    }
+    result
+}
+
+/// `inspect.getclasstree(classes, unique=False)`: nest the given classes by
+/// their `__bases__`, CPython's `walktree` result shape.
+fn getclasstree_impl(args: &[i64]) -> i64 {
+    let Some(&classes_arg) = args.first() else {
+        return type_error("getclasstree() missing required argument 'classes'");
+    };
+    let unique = args.get(1).copied().map(value::truthy).unwrap_or(false);
+    let mut guard = Roots::new();
+    guard.keep(&[classes_arg]);
+    let iterator = iter::iter_of(classes_arg);
+    if exc::pending() {
+        return NONE;
+    }
+    guard.keep(&[iterator]);
+    let mut classes: Vec<i64> = Vec::new();
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        if value::as_class(item).is_none() {
+            return type_error(&format!(
+                "getclasstree() argument must be an iterable of classes, not {}",
+                value::type_name(item)
+            ));
+        }
+        guard.keep(&[item]);
+        classes.push(item);
+    }
+
+    let mut children: Vec<(i64, Vec<i64>)> = Vec::new();
+    let mut roots: Vec<i64> = Vec::new();
+    for &class in &classes {
+        let bases = class_bases(class);
+        if !bases.is_empty() {
+            for parent in bases {
+                let slot = match children.iter().position(|(known, _)| *known == parent) {
+                    Some(index) => index,
+                    None => {
+                        children.push((parent, Vec::new()));
+                        children.len() - 1
+                    }
+                };
+                if !children[slot].1.contains(&class) {
+                    children[slot].1.push(class);
+                }
+                if unique && classes.contains(&parent) {
+                    break;
+                }
+            }
+        } else if !roots.contains(&class) {
+            roots.push(class);
+        }
+    }
+    for (parent, _) in &children {
+        if !classes.contains(parent) && !roots.contains(parent) {
+            roots.push(*parent);
+        }
+    }
+    walktree(&mut roots, &children, &mut guard)
+}
+
+// -------------------------------------------------------------------------
 // Public dispatch
 // -------------------------------------------------------------------------
 
@@ -3307,6 +3654,9 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             fiber_kind_of(args[0]) == Some(crate::fiber::FiberKind::AsyncGenerator),
         ),
         "isawaitable" => value::bool_value(is_awaitable(args[0])),
+        "istraceback" => istraceback_impl(args[0]),
+        "ismethodwrapper" => ismethodwrapper_impl(args[0]),
+        "getmro" => getmro_impl(args[0]),
         // Hydro has no frame, code or traceback objects.
         "isframe" | "iscode" => FALSE,
         "ismethoddescriptor" => value::bool_value(object_is_method_descriptor(args[0])),
@@ -3316,6 +3666,10 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "cleandoc" => cleandoc_impl(args[0]),
         "getdoc" => getdoc_impl(args[0]),
         "getmodule" => getmodule_impl(args[0]),
+        "getabsfile" => getabsfile_impl(args[0]),
+        "getcomments" => getcomments_impl(args[0]),
+        "classify_class_attrs" => classify_class_attrs_impl(args[0]),
+        "getclasstree" => getclasstree_impl(args),
         "getmodulename" => getmodulename_impl(args.first().copied().unwrap_or(NONE)),
         "getfile" => getfile_impl(args[0]),
         "getsourcefile" => getsourcefile_impl(args[0]),
@@ -3396,18 +3750,22 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "BoundArguments.signature" => bound_signature(args[0]),
         "BoundArguments.args" => bound_arguments_args(args[0]),
         "BoundArguments.kwargs" => bound_arguments_kwargs(args[0]),
-        "FullArgSpec.__iter__" | "FrameInfo.__iter__" | "ClosureVars.__iter__" => {
-            namedtuple_iter_raw(args[0])
-        }
-        "FullArgSpec.__len__" | "FrameInfo.__len__" | "ClosureVars.__len__" => {
-            integer(namedtuple_values_of(args[0]).len() as i64)
-        }
-        "FullArgSpec.__getitem__" | "FrameInfo.__getitem__" | "ClosureVars.__getitem__" => {
-            namedtuple_getitem(args[0], args[1])
-        }
-        "FullArgSpec.__repr__" | "FrameInfo.__repr__" | "ClosureVars.__repr__" => {
-            namedtuple_repr_raw(args[0])
-        }
+        "FullArgSpec.__iter__"
+        | "FrameInfo.__iter__"
+        | "ClosureVars.__iter__"
+        | "Attribute.__iter__" => namedtuple_iter_raw(args[0]),
+        "FullArgSpec.__len__"
+        | "FrameInfo.__len__"
+        | "ClosureVars.__len__"
+        | "Attribute.__len__" => integer(namedtuple_values_of(args[0]).len() as i64),
+        "FullArgSpec.__getitem__"
+        | "FrameInfo.__getitem__"
+        | "ClosureVars.__getitem__"
+        | "Attribute.__getitem__" => namedtuple_getitem(args[0], args[1]),
+        "FullArgSpec.__repr__"
+        | "FrameInfo.__repr__"
+        | "ClosureVars.__repr__"
+        | "Attribute.__repr__" => namedtuple_repr_raw(args[0]),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'inspect' has no attribute '{function}'"),
@@ -3423,6 +3781,11 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
     }
     if function == "getcallargs" {
         return getcallargs_impl(args, keywords);
+    }
+    // Every declared parameter has been bound into its positional slot by the
+    // generic binder, so nothing is left that needs keyword handling.
+    if keywords.is_empty() {
+        return call(function, args);
     }
     type_error(&format!(
         "inspect.{function}() does not accept keyword arguments"
@@ -3487,6 +3850,10 @@ static METHOD_SPECS: &[hydro_ir::stdlib::FunctionSpec] = &[
     method_spec("ClosureVars.__len__", 1, 1),
     method_spec("ClosureVars.__getitem__", 2, 2),
     method_spec("ClosureVars.__repr__", 1, 1),
+    method_spec("Attribute.__iter__", 1, 1),
+    method_spec("Attribute.__len__", 1, 1),
+    method_spec("Attribute.__getitem__", 2, 2),
+    method_spec("Attribute.__repr__", 1, 1),
 ];
 
 pub(crate) fn function_spec(name: &str) -> Option<&'static hydro_ir::stdlib::FunctionSpec> {

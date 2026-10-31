@@ -904,6 +904,11 @@ class EnumType(type):
         * A mapping of member name -> value pairs.
         """
         metacls = cls.__class__
+        if getattr(type, '__name__', None) in ('int', 'str', 'float', 'bytes', 'complex'):
+            # Hydro: a native scalar data type (`int`, `str`, ...) is a builtin
+            # function value rather than a class object; the mixin search and
+            # `type.__new__` both need the class itself.
+            type = bltns.type(type(0))
         bases = (cls, ) if type is None else (type, cls)
         _, first_enum = cls._get_mixins_(class_name, bases)
         classdict = metacls.__prepare__(class_name, bases)
@@ -988,7 +993,10 @@ class EnumType(type):
     @classmethod
     def _check_for_existing_members_(mcls, class_name, bases):
         for chain in bases:
-            for base in chain.__mro__:
+            # Hydro: a native scalar data-type base (`int`, `str`, ...) is a
+            # builtin function value without an inspectable `__mro__`; it has
+            # no Enum ancestry to check.
+            for base in getattr(chain, '__mro__', ()):
                 if isinstance(base, EnumType) and base._member_names_:
                     # Hydro: class layout differs from CPython; allow the
                     # subclass and let member creation reject real duplicates.
@@ -1016,7 +1024,7 @@ class EnumType(type):
     @classmethod
     def _find_data_repr_(mcls, class_name, bases):
         for chain in bases:
-            for base in chain.__mro__:
+            for base in getattr(chain, '__mro__', ()):
                 if base is object:
                     continue
                 elif isinstance(base, EnumType):
@@ -1048,7 +1056,7 @@ class EnumType(type):
         base_chain = set()
         for chain in bases:
             candidate = None
-            for base in chain.__mro__:
+            for base in getattr(chain, '__mro__', ()):
                 base_chain.add(base)
                 if base is object:
                     continue
@@ -1394,16 +1402,25 @@ class Enum(metaclass=EnumType):
     # instance of enum.property saves its companion member, which it returns
     # on class lookup; on instance lookup it either executes a provided function
     # or raises an AttributeError.
+    #
+    # Hydro: the compiler classifies a class-body decorator by name, so an
+    # `@property` here would install the builtin `property`, not `enum.property`
+    # (whose class lookup returns the companion member and whose instance
+    # lookup keeps supporting members and attributes named `name`/`value`).
+    # Install the enum descriptor as a class value so both spellings agree.
+    name = property(
+            lambda self: self._name_,
+            None,
+            None,
+            "The name of the Enum member.",
+            )
 
-    @property
-    def name(self):
-        """The name of the Enum member."""
-        return self._name_
-
-    @property
-    def value(self):
-        """The value of the Enum member."""
-        return self._value_
+    value = property(
+            lambda self: self._value_,
+            None,
+            None,
+            "The value of the Enum member.",
+            )
 
 
 class ReprEnum(Enum):

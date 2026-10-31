@@ -206,6 +206,7 @@ pub static MODULES: &[&ModuleSpec] = &[
     &ZLIB,
     &MMAP,
     &HTTP,
+    &HTTP_SERVER,
     &POSTGRES,
     &MEMCACHED,
     // Accelerator / alternative spellings of modules above. Each shares the

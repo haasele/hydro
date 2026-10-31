@@ -37,19 +37,17 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 50 | 2 |
-| pure | 174 | 160 | 14 |
+| pure | 174 | 167 | 7 |
 | extension | 63 | 52 | 11 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 262 | 35 |
+| **Total** | 297 | 269 | 28 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:HYD0002 | 21 |
+| compile_error:HYD0002 | 19 |
 | cpython_failed | 9 |
-| runtime_error | 4 |
-| compile_error:HYD0201 | 1 |
 
 ## Modules by layer
 
@@ -201,12 +199,12 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `locale` | ok | ok | ok | - |
 | `logging` | ok | ok | ok | - |
 | `lzma` | ok | ok | ok | - |
-| `mailbox` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: class-body import binding 'walk' is not supported: only native modules an… |
+| `mailbox` | ok | ok | ok | - |
 | `mimetypes` | ok | ok | ok | - |
 | `modulefinder` | ok | ok | ok | - |
 | `multiprocessing` | ok | ok | ok | - |
 | `netrc` | ok | ok | ok | - |
-| `nturl2path` | ok | exit 1 | runtime_error | TypeError: _deprecated() got an unexpected keyword argument 'message' |
+| `nturl2path` | ok | ok | ok | - |
 | `numbers` | ok | ok | ok | - |
 | `opcode` | ok | ok | ok | - |
 | `operator` | ok | ok | ok | - |
@@ -217,7 +215,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `pickletools` | ok | ok | ok | - |
 | `pkgutil` | ok | ok | ok | - |
 | `platform` | ok | ok | ok | - |
-| `plistlib` | ok | exit 1 | runtime_error | TypeError: Enum.__new__() takes at most 1 positional argument(s) (2 given) |
+| `plistlib` | ok | ok | ok | - |
 | `poplib` | ok | ok | ok | - |
 | `pprint` | ok | ok | ok | - |
 | `profile` | ok | ok | ok | - |
@@ -225,7 +223,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `pty` | ok | ok | ok | - |
 | `py_compile` | ok | ok | ok | - |
 | `pyclbr` | ok | ok | ok | - |
-| `pydoc` | ok | exit 1 | compile_error:HYD0201 | error[HYD0201]: module 'inspect' has no attribute 'getcomments' |
+| `pydoc` | ok | ok | ok | - |
 | `pydoc_data` | ok | ok | ok | - |
 | `queue` | ok | ok | ok | - |
 | `quopri` | ok | ok | ok | - |
@@ -240,7 +238,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `shlex` | ok | ok | ok | - |
 | `shutil` | ok | ok | ok | - |
 | `signal` | ok | ok | ok | - |
-| `smtplib` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: class-body import binding 'walk' is not supported: only native modules an… |
+| `smtplib` | ok | ok | ok | - |
 | `socket` | ok | ok | ok | - |
 | `socketserver` | ok | ok | ok | - |
 | `sqlite3` | ok | ok | ok | - |
@@ -285,8 +283,8 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `wsgiref` | ok | ok | ok | - |
 | `xml` | ok | ok | ok | - |
 | `xmlrpc` | ok | ok | ok | - |
-| `zipapp` | ok | exit 1 | runtime_error | AttributeError: module 'zipfile' has no attribute 'ZipFile' |
-| `zipfile` | ok | exit 1 | runtime_error | AttributeError: module 'zipfile' has no attribute 'ZipFile' |
+| `zipapp` | ok | ok | ok | - |
+| `zipfile` | ok | ok | ok | - |
 | `zoneinfo` | ok | ok | ok | - |
 
 ### extension (63)

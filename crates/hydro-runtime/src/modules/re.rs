@@ -242,7 +242,8 @@ fn compile_source(source: &str, flags: i64) -> Result<Regex, i64> {
     // CPython accepts an unescaped `[` inside a character class (`[^[]` means
     // "not `[`"), while the Rust regex parser treats it as a nested class.
     // Escape that form before handing the pattern to the parser.
-    let mut normalized = escape_literal_braces(&escape_class_brackets(source));
+    let mut normalized =
+        escape_literal_braces(&escape_class_brackets(&translate_octal_escapes(source)));
     if flags & VERBOSE != 0 {
         normalized = escape_verbose_class_chars(&normalized);
     }
@@ -264,6 +265,82 @@ fn compile_source(source: &str, flags: i64) -> Result<Regex, i64> {
         }
         Err(error) => Err(regex_error(error)),
     }
+}
+
+/// Translates CPython numeric escapes to Rust regex `\xNN` escapes.
+///
+/// CPython parses `\0` (with up to two more octal digits) and any exactly
+/// three-digit octal escape (`\041`, `\176`) as a character, while
+/// one/two-digit escapes outside a character class are group
+/// backreferences (`\1`, `\12`). Inside a character class every numeric
+/// escape is octal. Backreferences are copied unchanged.
+fn translate_octal_escapes(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let mut index = 0usize;
+    let mut in_class = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            let next = chars.get(index + 1).copied();
+            if next.is_some_and(|digit| digit.is_ascii_digit()) {
+                let mut digits = 0usize;
+                let mut value = 0u32;
+                while digits < 3 {
+                    let Some(&digit) = chars.get(index + 1 + digits) else {
+                        break;
+                    };
+                    if !matches!(digit, '0'..='7') {
+                        break;
+                    }
+                    value = value * 8 + (digit as u32 - '0' as u32);
+                    digits += 1;
+                }
+                let octal = digits >= 1 && (in_class || next == Some('0') || digits == 3);
+                if octal {
+                    if value <= 0xFF {
+                        out.push_str(&format!("\\x{value:02X}"));
+                    } else {
+                        out.push_str(&format!("\\x{{{value:X}}}"));
+                    }
+                    index += 1 + digits;
+                    continue;
+                }
+                // `\1`..`\99`: a group backreference, left untouched.
+                out.push('\\');
+                index += 1;
+                let mut taken = 0usize;
+                while taken < 2 {
+                    let Some(&digit) = chars.get(index) else {
+                        break;
+                    };
+                    if !digit.is_ascii_digit() {
+                        break;
+                    }
+                    out.push(digit);
+                    index += 1;
+                    taken += 1;
+                }
+                continue;
+            }
+            out.push(ch);
+            if let Some(escaped) = next {
+                out.push(escaped);
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+        } else if ch == ']' {
+            in_class = false;
+        }
+        out.push(ch);
+        index += 1;
+    }
+    out
 }
 
 /// Escapes braces that CPython treats as literal text but the Rust parser
@@ -358,7 +435,8 @@ fn bytes_pattern_text(source: &[u8]) -> String {
 /// Compiles bytes pattern text (see [`bytes_pattern_text`]) with the same
 /// normalisation and flag handling as [`compile_source`], in byte mode.
 fn compile_bytes_text(pattern: &str, flags: i64) -> Result<regex_bytes::Regex, i64> {
-    let mut normalized = escape_literal_braces(&escape_class_brackets(pattern));
+    let mut normalized =
+        escape_literal_braces(&escape_class_brackets(&translate_octal_escapes(pattern)));
     if flags & VERBOSE != 0 {
         normalized = escape_verbose_class_chars(&normalized);
     }
@@ -2500,6 +2578,29 @@ mod tests {
             Some("a")
         );
         exc::init();
+    }
+
+    #[test]
+    fn octal_escapes_compile_and_match() {
+        // Python's `\041`/`\176` are octal (`!`/`~`); the Rust parser rejects
+        // them, so they are translated to `\x21`/`\x7E` first.
+        exc::init();
+        let compiled = call("compile", &[text(r"[\041-\176]+:$")]);
+        assert!(!exc::pending(), "octal class failed to compile");
+        let matched = pattern_method(compiled, "search", &[text("hello:")]);
+        assert!(!exc::pending());
+        assert_ne!(matched, NONE);
+        assert_eq!(
+            translate_octal_escapes(r"[\041-\176]+:$"),
+            r"[\x21-\x7E]+:$"
+        );
+        assert_eq!(translate_octal_escapes(r"\0"), r"\x00");
+        assert_eq!(translate_octal_escapes(r"\052"), r"\x2A");
+        // Inside a character class one/two-digit escapes are octal too.
+        assert_eq!(translate_octal_escapes(r"[\1]"), r"[\x01]");
+        // Outside a class, `\1` and `\12` stay group backreferences.
+        assert_eq!(translate_octal_escapes(r"(a)\1"), r"(a)\1");
+        assert_eq!(translate_octal_escapes(r"(a)\12"), r"(a)\12");
     }
 
     #[test]

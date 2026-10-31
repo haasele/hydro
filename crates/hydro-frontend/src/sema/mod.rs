@@ -347,10 +347,11 @@ impl ArgKind {
             // A mapping and a pair iterable are both accepted, so an
             // unresolved argument cannot be narrowed to either shape.
             ArgKind::MappingOrPairs => None,
-            // Lists are the common `join` operand; keep the previous
-            // narrowing so later list operations on the same unresolved
-            // variable are still checked.
-            ArgKind::Iterable => Some(Type::List),
+            // An unresolved argument is not narrowed to a list: container
+            // expressions (e.g. `set(a) - set(b)` passed to `str.join`) are
+            // typed by their own expression, and pinning this slot first made
+            // the set/iterator result fail with a spurious list mismatch.
+            ArgKind::Iterable => None,
         }
     }
 }

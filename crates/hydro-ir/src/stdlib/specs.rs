@@ -231,6 +231,9 @@ pub static TIME: ModuleSpec = ModuleSpec {
         // `strftime(format[, t])`: formats either the given `struct_time` or
         // the current local time. Both parameters may be passed by name.
         kw("strftime", 1, 2, Type::Str, &["format", "t"]),
+        // `strptime(string[, format])`: CPython's default format is
+        // `%a %b %d %H:%M:%S %Y`; both parameters may be passed by name.
+        kw("strptime", 1, 2, Type::Any, &["string", "format"]),
         // `ctime([secs])`: the `asctime(localtime(secs))` spelling with an
         // optional epoch-seconds argument.
         f("ctime", 0, 1, Type::Str),
@@ -313,6 +316,10 @@ pub static PATHLIB: ModuleSpec = ModuleSpec {
     ],
 };
 
+/// `platform`: build and uname facts. `platform(aliased=False, terse=False)`
+/// takes CPython's two documented keyword arguments; `python_build()` and
+/// `python_compiler()` read the same `sys.version` provenance as the CPython
+/// pure-Python implementation.
 pub static PLATFORM: ModuleSpec = ModuleSpec {
     name: "platform",
     functions: &[
@@ -321,9 +328,13 @@ pub static PLATFORM: ModuleSpec = ModuleSpec {
         f("release", 0, 0, Type::Str),
         f("version", 0, 0, Type::Str),
         f("node", 0, 0, Type::Str),
-        f("platform", 0, 0, Type::Str),
+        kw("platform", 0, 2, Type::Str, &["aliased", "terse"]),
         f("python_version", 0, 0, Type::Str),
         f("python_implementation", 0, 0, Type::Str),
+        // `python_build()` -> `(buildno, builddate)` and
+        // `python_compiler()` -> the compiler identification.
+        f("python_build", 0, 0, Type::Tuple),
+        f("python_compiler", 0, 0, Type::Str),
         f("processor", 0, 0, Type::Str),
         // `platform.uname()`: CPython's `uname_result` namedtuple with
         // `system`/`node`/`release`/`version`/`machine`/`processor`.
@@ -553,6 +564,10 @@ pub static OS: ModuleSpec = ModuleSpec {
         // `os.mkdir(path, mode=0o777, *, dir_fd=None)`: a single directory
         // level, created through `mkdir(2)` so `mode` is honoured.
         kw("mkdir", 1, 3, Type::None, &["path", "mode", "dir_fd"]),
+        // `os.rmdir(path, *, dir_fd=None)`: remove one empty directory.
+        // `dir_fd` binds into the second positional slot; only `None` is
+        // accepted (Hydro has no descriptor-relative path lookup).
+        kw("rmdir", 1, 2, Type::None, &["path", "dir_fd"]),
         // `chmod(path, mode, *, dir_fd=None, follow_symlinks=True)` and
         // `mknod(path, mode=0o600, device=0, *, dir_fd=None)`: the keyword-only
         // options keep positional slots for the frontend binder; the runtime
@@ -1987,7 +2002,13 @@ const SOCKET_FUNCTIONS: &[FunctionSpec] = &[
     // The runtime binds these keyword names itself, so the spec keeps the
     // parameter list empty (the frontend still validates the arity).
     kw_dynamic("socket", 0, 3, Type::Any, &[]),
-    kw_dynamic("create_connection", 0, 2, Type::Any, &[]),
+    kw_dynamic(
+        "create_connection",
+        1,
+        3,
+        Type::Any,
+        &["address", "timeout", "source_address"],
+    ),
     // `create_server(address, *, family=AF_INET, backlog=None,
     // reuse_port=False, dualstack_ipv6=False)`: a listening socket. The
     // runtime binds the keyword-only options itself, like
@@ -2181,7 +2202,11 @@ pub static RE: ModuleSpec = ModuleSpec {
         f("match", 2, 3, Type::Any),
         f("fullmatch", 2, 3, Type::Any),
         f("findall", 2, 3, Type::List),
-        f("sub", 3, 4, Type::Str),
+        // `sub(pattern, repl, string, count=0, flags=0)`: the result is the
+        // same kind as the input string, so a bytes pattern/subject returns
+        // bytes. The static table has no overload channel, so the return is
+        // dynamic (the runtime returns `bytes` for bytes patterns).
+        f("sub", 3, 5, Type::Any),
         f("split", 2, 3, Type::List),
         f("escape", 1, 1, Type::Str),
         // `compile(pattern, flags=0)`; the runtime forwards the flags to the
@@ -2346,6 +2371,7 @@ pub static ERRNO: ModuleSpec = ModuleSpec {
         c("ENOTDIR", Type::Int),
         c("EISDIR", Type::Int),
         c("ENOSPC", Type::Int),
+        c("EROFS", Type::Int),
         c("EPIPE", Type::Int),
         c("ESPIPE", Type::Int),
         c("ECONNREFUSED", Type::Int),
@@ -3496,6 +3522,8 @@ pub static FUTURE: ModuleSpec = ModuleSpec {
         c("nested_scopes", Type::Bool),
         c("generators", Type::Bool),
         c("with_statement", Type::Bool),
+        // The release-record class `pydoc` uses as an `isinstance` target.
+        c("_Feature", Type::Any),
     ],
 };
 
@@ -5268,6 +5296,25 @@ pub static HTTP: ModuleSpec = ModuleSpec {
     constants: &[],
 };
 
+/// `http.server`: the classes `pydoc.serve` builds on.
+///
+/// Hydro's `http` module is the native server, so the standard-library
+/// `http/server.py` package cannot be linked underneath it. The nested native
+/// module exposes real class values with the protocol methods the standard
+/// library uses: `BaseHTTPRequestHandler` (request parsing, `do_<METHOD>`
+/// dispatch, status/header emission through `wfile`) and `HTTPServer`
+/// (`socket.create_server` binding, accept loop, close), plus
+/// `ThreadingHTTPServer` with CPython's `daemon_threads = True`.
+pub static HTTP_SERVER: ModuleSpec = ModuleSpec {
+    name: "http.server",
+    functions: &[],
+    constants: &[
+        c("BaseHTTPRequestHandler", Type::Any),
+        c("HTTPServer", Type::Any),
+        c("ThreadingHTTPServer", Type::Any),
+    ],
+};
+
 /// `postgres`: native PostgreSQL v3 client used by the benchmark app.
 ///
 /// Connections are capsule-backed and reconnect lazily. `insert` returns the
@@ -5348,6 +5395,8 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
         f("iscoroutine", 1, 1, Type::Bool),
         f("isasyncgen", 1, 1, Type::Bool),
         f("isawaitable", 1, 1, Type::Bool),
+        f("istraceback", 1, 1, Type::Bool),
+        f("ismethodwrapper", 1, 1, Type::Bool),
         f("isframe", 1, 1, Type::Bool),
         f("iscode", 1, 1, Type::Bool),
         f("ismethoddescriptor", 1, 1, Type::Bool),
@@ -5359,6 +5408,12 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
         f("cleandoc", 1, 1, Type::Str),
         f("getdoc", 1, 1, Type::Any),
         f("getmodule", 1, 1, Type::Any),
+        f("getabsfile", 1, 1, Type::Str),
+        f("getcomments", 1, 1, Type::Any),
+        f("getmro", 1, 1, Type::Tuple),
+        f("classify_class_attrs", 1, 1, Type::List),
+        // `getclasstree(classes, unique=False)`.
+        kw("getclasstree", 1, 2, Type::List, &["classes", "unique"]),
         f("getfile", 1, 1, Type::Str),
         f("getsourcefile", 1, 1, Type::Any),
         f("findsource", 1, 1, Type::Tuple),
@@ -5411,6 +5466,7 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
         c("FullArgSpec", Type::Any),
         c("FrameInfo", Type::Any),
         c("ClosureVars", Type::Any),
+        c("Attribute", Type::Any),
         // `Parameter.kind` members are re-exported by CPython's inspect module
         // for backwards compatibility.
         c("_POSITIONAL_ONLY", Type::Any),

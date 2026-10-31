@@ -1045,6 +1045,7 @@ fn restore_filters(snapshot: i64) {
 /// defaulted into a misleading deprecation.
 fn deprecated(args: &[i64], keywords: &[(String, i64)]) -> i64 {
     let mut name_keyword: Option<i64> = None;
+    let mut message_keyword: Option<i64> = None;
     let mut since: Option<i64> = None;
     let mut alternative = NONE;
     let mut pending = false;
@@ -1055,6 +1056,11 @@ fn deprecated(args: &[i64], keywords: &[(String, i64)]) -> i64 {
         let value = *value;
         match keyword.as_str() {
             "name" => name_keyword = Some(value),
+            // 3.14's signature is `_deprecated(name, message=_DEPRECATED_MSG,
+            // *, remove, _version)`: `message` is positional-or-keyword, so
+            // `warnings._deprecated(__name__, message=..., remove=...)` must
+            // reach [`deprecated_removal`] instead of being rejected.
+            "message" => message_keyword = Some(value),
             "since" => since = Some(value),
             "alternative" => alternative = value,
             "pending" => match bool_arg(value) {
@@ -1075,7 +1081,7 @@ fn deprecated(args: &[i64], keywords: &[(String, i64)]) -> i64 {
         }
     }
     if let Some(remove) = remove {
-        return deprecated_removal(args, remove, version, stacklevel);
+        return deprecated_removal(args, message_keyword, remove, version, stacklevel);
     }
     let Some(message_value) = args.first().copied() else {
         return type_error("_deprecated() missing required argument 'message'");
@@ -1124,11 +1130,26 @@ fn deprecated(args: &[i64], keywords: &[(String, i64)]) -> i64 {
 }
 
 /// 3.14 `_deprecated(name, message, *, remove=...)` semantics.
-fn deprecated_removal(args: &[i64], remove: i64, version: Option<i64>, _stacklevel: i64) -> i64 {
+fn deprecated_removal(
+    args: &[i64],
+    message_keyword: Option<i64>,
+    remove: i64,
+    version: Option<i64>,
+    _stacklevel: i64,
+) -> i64 {
     let Some(name) = args.first().copied().and_then(string_arg) else {
         return type_error("_deprecated() missing required argument 'name'");
     };
-    let message = match args.get(1).copied() {
+    let message_value = match message_keyword {
+        Some(value) => {
+            if args.len() > 1 {
+                return type_error("_deprecated() got multiple values for argument 'message'");
+            }
+            Some(value)
+        }
+        None => args.get(1).copied(),
+    };
+    let message = match message_value {
         None | Some(NONE) => {
             "{name!r} is deprecated and slated for removal in Python {remove}".to_string()
         }

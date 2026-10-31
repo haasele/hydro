@@ -796,6 +796,173 @@ fn connect_stream(
     }
 }
 
+/// Creates a socket, binds it to `source`, then connects to `addr`, preserving
+/// the timeout semantics of [`connect_stream`] (`None` blocks, zero parks the
+/// connection in the returned [`NonblockingConnect::Pending`], a finite limit
+/// polls until the deadline).
+#[cfg(unix)]
+fn connect_bound(
+    addr: SocketAddr,
+    source: SocketAddr,
+    timeout: Option<Duration>,
+) -> io::Result<NonblockingConnect> {
+    use std::os::unix::io::FromRawFd;
+    let domain = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    // SAFETY: `socket` returns an owned descriptor or -1.
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh owned stream descriptor.
+    let stream = unsafe { TcpStream::from_raw_fd(fd) };
+    let (storage, length) = raw_sockaddr(source);
+    // SAFETY: `storage` holds an initialized sockaddr of `length` bytes.
+    if unsafe { libc::bind(fd, &storage as *const _ as *const libc::sockaddr, length) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (storage, length) = raw_sockaddr(addr);
+    // SAFETY: `storage` is initialized for this call.
+    let connect =
+        || unsafe { libc::connect(fd, &storage as *const _ as *const libc::sockaddr, length) };
+    match timeout {
+        None => {
+            heap::blocking_enter();
+            let result = connect();
+            heap::blocking_leave();
+            if result == 0 {
+                Ok(NonblockingConnect::Connected(stream))
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        Some(limit) if limit.is_zero() => {
+            stream.set_nonblocking(true)?;
+            if connect() == 0 {
+                Ok(NonblockingConnect::Connected(stream))
+            } else {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINPROGRESS) {
+                    Ok(NonblockingConnect::Pending(stream))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+        Some(limit) => {
+            stream.set_nonblocking(true)?;
+            if connect() != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINPROGRESS) {
+                    return Err(error);
+                }
+                wait_connected(fd, limit)?;
+            }
+            // `TcpStream::connect_timeout` (the unbound path) leaves the
+            // stream blocking; match it after the poll completes.
+            stream.set_nonblocking(false)?;
+            Ok(NonblockingConnect::Connected(stream))
+        }
+    }
+}
+
+/// Waits for a non-blocking `connect` to finish and reports its `SO_ERROR`.
+#[cfg(unix)]
+fn wait_connected(fd: libc::c_int, limit: Duration) -> io::Result<()> {
+    let deadline = Instant::now().checked_add(limit);
+    loop {
+        let remaining = match deadline {
+            Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+            None => limit,
+        };
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
+        }
+        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` is one writable element for the duration of `poll`.
+        let ready = parked(Some(remaining), || unsafe {
+            libc::poll(&mut pollfd, 1, millis.max(1))
+        });
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ready == 0 {
+            continue;
+        }
+        let mut error: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: the option buffer is one `c_int`; `length` is its size.
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut error as *mut _ as *mut libc::c_void,
+                &mut length,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        return Ok(());
+    }
+}
+
+/// Like [`connect_stream`], but binds every candidate socket to `source`
+/// first (CPython's `create_connection(..., source_address=...)`).
+#[cfg(unix)]
+fn connect_stream_from(
+    host: &str,
+    port: u16,
+    family: i64,
+    timeout: Option<Duration>,
+    source: &Address,
+) -> io::Result<NonblockingConnect> {
+    let addrs = resolve(host, port, family)?;
+    let mut last = io::Error::new(io::ErrorKind::NotFound, "no address to connect to");
+    for addr in &addrs {
+        let source_family = if addr.is_ipv4() { AF_INET } else { AF_INET6 };
+        let sources = match resolve(&source.host, source.port, source_family) {
+            Ok(sources) => sources,
+            Err(error) => {
+                last = error;
+                continue;
+            }
+        };
+        let local = scope_address(sources[0], source.scope_id);
+        match connect_bound(*addr, local, timeout) {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
+#[cfg(not(unix))]
+fn connect_stream_from(
+    _host: &str,
+    _port: u16,
+    _family: i64,
+    _timeout: Option<Duration>,
+    _source: &Address,
+) -> io::Result<NonblockingConnect> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "binding source_address is not supported on this platform",
+    ))
+}
+
 /// Progress view of `socket()` validation.
 fn construct_kind(family: i64, sock_type: i64, proto: i64, timeout: Option<Duration>) -> i64 {
     let base_type = sock_type & 0xF;
@@ -849,7 +1016,9 @@ fn construct(args: &[i64]) -> i64 {
     construct_kind(family, raw_type, proto, timeout)
 }
 
-/// `socket.create_connection(address, timeout=None)`.
+/// `socket.create_connection(address, timeout=_GLOBAL_DEFAULT_TIMEOUT,
+/// source_address=None)`. A non-`None` `source_address` binds the local
+/// endpoint before connecting, exactly like CPython's implementation.
 fn create_connection(args: &[i64]) -> i64 {
     let Some(&address_value) = args.first() else {
         return type_error("create_connection() missing required argument 'address'");
@@ -865,12 +1034,23 @@ fn create_connection(args: &[i64]) -> i64 {
         },
         None => None,
     };
+    let source = match args.get(2).copied() {
+        None | Some(NONE) => None,
+        Some(value_in) => match address_argument(value_in) {
+            Ok(address) => Some(address),
+            Err(err) => return err,
+        },
+    };
     let family = if address.host.contains(':') || address.host.starts_with('[') {
         AF_INET6
     } else {
         AF_UNSPEC
     };
-    match connect_stream(&address.host, address.port, family, timeout) {
+    let outcome = match &source {
+        Some(source) => connect_stream_from(&address.host, address.port, family, timeout, source),
+        None => connect_stream(&address.host, address.port, family, timeout),
+    };
+    match outcome {
         Ok(NonblockingConnect::Connected(stream)) => {
             let family = family_of(
                 &stream

@@ -31,7 +31,7 @@
 //! `byteorder`, sign-extension and overflow rules; `from_bytes` keeps arbitrary
 //! precision through the heap `BigInt` path.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{BufRead as _, IsTerminal, Read as _, Write as _};
 use std::sync::atomic::Ordering;
@@ -1121,6 +1121,115 @@ fn metaclass_attribute(class: i64, attr: &str) -> Option<i64> {
     }
 }
 
+thread_local! {
+    /// Class whose construction an explicit `type.__call__(...)` is running.
+    ///
+    /// CPython's `type.__call__` *is* `type_call`: it builds `C` through
+    /// `C.__new__`/`C.__init__` and never re-enters an overridden metaclass
+    /// `__call__`. `dateutil`'s `_TzFactory.instance` relies on that when it
+    /// calls `type.__call__(cls, ...)` from inside the override itself, so the
+    /// dispatch in [`metaclass_call`] steps aside for that one class.
+    static TYPE_CALL_CLASS: Cell<i64> = const { Cell::new(NONE) };
+}
+
+/// Restores the previous `type.__call__` target when dropped.
+struct TypeCallBypass {
+    previous: i64,
+}
+
+impl TypeCallBypass {
+    fn enter(class: i64) -> Self {
+        let previous = TYPE_CALL_CLASS.with(|slot| slot.replace(class));
+        TypeCallBypass { previous }
+    }
+}
+
+impl Drop for TypeCallBypass {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        TYPE_CALL_CLASS.with(|slot| slot.set(previous));
+    }
+}
+
+/// Calls the metaclass `__call__` that overrides the native constructor.
+///
+/// CPython's call protocol dispatches `Class(args...)` through
+/// `type(Class).__call__`, so a metaclass that defines its own `__call__`
+/// intercepts every construction call. `enum`'s `EnumType.__call__` is the
+/// motivating case: it serves both the functional API
+/// (`Enum('Name', 'A B', module=...)`) and member lookups (`Color(1)`). The
+/// native `type.__call__` entry is the default allocator rather than a hook,
+/// so it leaves the ordinary constructor fast path in place.
+///
+/// Returns `None` when no metaclass `__call__` overrides the default.
+pub(crate) fn metaclass_call(class: i64, args: &[i64], keywords: &[(String, i64)]) -> Option<i64> {
+    // An explicit `type.__call__(class, ...)` constructs the class directly.
+    if TYPE_CALL_CLASS.with(|slot| slot.get()) == class {
+        return None;
+    }
+    let metaclass = value::class_metaclass(class);
+    if metaclass == NONE {
+        return None;
+    }
+    let owner = value::class_lookup_owner(metaclass, "__call__")?;
+    if value::is_type_class(owner) {
+        return None;
+    }
+    let entry = value::class_lookup(metaclass, "__call__")?;
+    Some(match entry {
+        // A descriptor stored in the metaclass namespace resolves through
+        // `__get__` with the class as the instance; a plain function binds the
+        // class as its first argument, like any other method.
+        value::ClassEntry::Attr(item) => {
+            if let Some(resolved) = descriptor_get(item, class, metaclass) {
+                call_with_keywords(resolved, args, keywords)
+            } else if value::as_function(item).is_some() {
+                let method_entry = value::ClassEntry::Method(MethodKind::Normal, item);
+                call_bound_entry(class, metaclass, method_entry, "__call__", args, keywords)
+            } else {
+                call_with_keywords(item, args, keywords)
+            }
+        }
+        // A property runs `__get__(class, metaclass)`; the value it returns is
+        // the callable handling the construction.
+        value::ClassEntry::Method(MethodKind::Property, function) => {
+            let receiver = [class];
+            let resolved = builtins::call(function, 1, receiver.as_ptr());
+            if exc::pending() {
+                return Some(NONE);
+            }
+            call_with_keywords(resolved, args, keywords)
+        }
+        entry => call_bound_entry(class, metaclass, entry, "__call__", args, keywords),
+    })
+}
+
+/// Calls a resolved callable, forwarding keywords when the call site had any.
+fn call_with_keywords(target: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if keywords.is_empty() {
+        return builtins::call(target, args.len(), args.as_ptr());
+    }
+    // The positional and keyword vectors live in native memory the collector
+    // cannot scan; root them while the keyword names are allocated.
+    let mut roots_source: Vec<i64> = args.to_vec();
+    roots_source.extend(keywords.iter().map(|(_, item)| *item));
+    let roots = crate::heap::root_values(&roots_source);
+    let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+    for (name, item) in keywords {
+        pairs.push(value::str_alloc(name.clone()));
+        pairs.push(*item);
+    }
+    let result = builtins::call_kw(
+        target,
+        args.len(),
+        args.as_ptr(),
+        keywords.len(),
+        pairs.as_ptr(),
+    );
+    crate::heap::release_roots(roots);
+    result
+}
+
 /// Calls `Class.method(...)` and `Class.attr`-style methods on a class value.
 ///
 /// Ordinary methods are unbound (the caller supplies `self`), classmethods
@@ -1705,6 +1814,37 @@ pub(crate) fn call_kw(
             Some(value::ClassEntry::Attr(item)) => {
                 if let Some(resolved) = descriptor_get(item, NONE, obj) {
                     return builtins::call_kw(resolved, args.len(), args.as_ptr(), kwargc, kw_argv);
+                }
+            }
+            // An ordinary method stays unbound when reached through the class,
+            // exactly like the positional path: the caller supplies the
+            // receiver itself. `enum.py` builds a class with
+            // `metacls.__new__(metacls, cls, bases, classdict, boundary=...)`,
+            // which binds the metaclass constructor's keyword-only slots.
+            Some(value::ClassEntry::Method(MethodKind::Normal, function))
+                if !value::function_signature(function).is_empty()
+                    && value::function_full_entry(function) != 0 =>
+            {
+                return builtins::call_kw(function, args.len(), args.as_ptr(), kwargc, kw_argv);
+            }
+            None => {
+                // A name missing from the class namespace resolves on the
+                // metaclass with the class itself as receiver, exactly like the
+                // positional path. `enum.py` reaches `Enum._create_(
+                // class_name=..., module=...)` this way, and a classmethod of
+                // the metaclass (`Meta.cm(x=1)`) binds its owner.
+                let metaclass = lookup_metaclass(obj);
+                if let Some(entry) = value::class_lookup(metaclass, &method) {
+                    if !matches!(&entry, value::ClassEntry::Method(MethodKind::Property, _)) {
+                        return call_bound_entry(
+                            obj,
+                            metaclass,
+                            entry,
+                            &method,
+                            &args,
+                            &keywords.items,
+                        );
+                    }
                 }
             }
             _ => {}
@@ -2513,6 +2653,20 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
     }
     if let Some(module) = value::as_module(obj) {
         return crate::modules::module_attr(module, attr);
+    }
+    // Builtin scalar instances inherit their type's docstring: `'x'.__doc__`,
+    // `True.__doc__`, `1.__doc__` and `None.__doc__`. User instances, classes,
+    // functions and modules keep their own attribute lookup below, and any
+    // other missing name still reports `AttributeError`.
+    if attr == "__doc__"
+        && value::as_class(obj).is_none()
+        && value::as_function(obj).is_none()
+        && value::as_instance(obj).is_none()
+    {
+        let class = value::type_class(obj);
+        if value::as_class(class).is_some() {
+            return getattr_named(class, "__doc__");
+        }
     }
     // Function metadata: the generated code stores the bare definition name,
     // so `f.__name__`/`f.__qualname__` report it and `__doc__` stays `None`
@@ -3829,6 +3983,10 @@ fn type_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, 
                     value::type_name(callable)
                 ));
             }
+            // `type.__call__` is `type_call`: it constructs the class through
+            // `__new__`/`__init__` and never re-enters a metaclass `__call__`
+            // override. `super().__call__()` resolves to this entry too.
+            let _bypass = TypeCallBypass::enter(callable);
             let rest = &args[1..];
             if keywords.is_empty() {
                 builtins::call(callable, rest.len(), rest.as_ptr())
@@ -10359,6 +10517,105 @@ mod tests {
         value::tuple_new(vec![first, second, third])
     }
 
+    /// Returns all four slots of a metaclass `__call__` probe.
+    extern "C" fn metaclass_call_slots(args: *const i64) -> i64 {
+        // SAFETY: signature-declared trampolines receive one slot per parameter.
+        let (first, second) = unsafe { (*args, *args.add(1)) };
+        let (third, fourth) = unsafe { (*args.add(2), *args.add(3)) };
+        value::tuple_new(vec![first, second, third, fourth])
+    }
+
+    #[test]
+    fn metaclass_call_intercepts_class_construction() {
+        reset();
+        // `enum.EnumType.__call__`'s shape: the class itself is `cls`, the
+        // first argument names the new class, and the remaining arguments bind
+        // from the call site (positionally or by name).
+        let call_fn = value::function_new(
+            metaclass_call_slots as *const () as usize,
+            4,
+            "Meta.__call__".to_string(),
+        );
+        value::function_set_signature(
+            call_fn,
+            vec![
+                value::ParamMeta {
+                    name: "cls".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "value".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "names".to_string(),
+                    kind: ParamKind::Positional,
+                    default: Some(NONE),
+                },
+                value::ParamMeta {
+                    name: "module".to_string(),
+                    kind: ParamKind::KwOnly,
+                    default: Some(NONE),
+                },
+            ],
+        );
+        value::function_set_full_entry(call_fn, metaclass_call_slots as *const () as usize);
+        let metaclass = value::class_new(
+            "Meta".to_string(),
+            NONE,
+            vec![("__call__".to_string(), call_fn)],
+        );
+        let class = value::class_new_multi(
+            "E".to_string(),
+            Vec::new(),
+            metaclass,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // `E('Name')`: construction dispatches through the metaclass
+        // `__call__` with the class bound as `cls`, instead of running the
+        // class's own `__new__`/`__init__` directly.
+        let result = crate::builtins::call(class, 1, [string("Name")].as_ptr());
+        let slots = value::as_tuple(result).expect("metaclass __call__ result");
+        assert_eq!(slots.len(), 4);
+        assert_eq!(slots[0], class);
+        assert_eq!(text(slots[1]), "Name");
+        assert_eq!(slots[2], NONE);
+        assert_eq!(slots[3], NONE);
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // `E('Name', names='A B', module='m')`: the call-site keywords reach
+        // the metaclass method, which is how the functional Enum API binds
+        // `names`/`module`/`qualname`/`type`/`start`/`boundary`.
+        let keywords = [
+            string("names"),
+            string("A B"),
+            string("module"),
+            string("m"),
+        ];
+        let result =
+            crate::builtins::call_kw(class, 1, [string("Name")].as_ptr(), 2, keywords.as_ptr());
+        let slots = value::as_tuple(result).expect("metaclass __call__ result");
+        assert_eq!(slots[0], class);
+        assert_eq!(text(slots[1]), "Name");
+        assert_eq!(text(slots[2]), "A B");
+        assert_eq!(text(slots[3]), "m");
+        assert!(!crate::exc::pending(), "{}", message());
+
+        // `type.__call__(E)` is `type_call`: it constructs `E` directly and
+        // must not re-enter the override, or a metaclass that calls
+        // `type.__call__` from its own `__call__` (dateutil's factories,
+        // `super().__call__()`) would recurse forever.
+        let type_builtin = value::builtin_function_new(hydro_ir::Builtin::Type);
+        let result = invoke(type_builtin, "__call__", &[class]);
+        assert!(!crate::exc::pending(), "{}", message());
+        assert_eq!(value::instance_class_value(result), Some(class));
+    }
+
     fn method(name: &str, arity: usize, kind: MethodKind) -> (String, i64, MethodKind) {
         (
             name.to_string(),
@@ -11661,6 +11918,31 @@ mod tests {
         let plain = value::class_new("Plain".to_string(), NONE, Vec::new());
         assert_eq!(getattr(plain, b"__doc__".as_ptr(), 7), NONE);
         assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn builtin_instances_inherit_type_doc() {
+        reset();
+        // CPython resolves `instance.__doc__` through the type. Builtin
+        // scalars have no instance dictionary, so the lookup must fall back
+        // to the cached type's doc instead of raising `AttributeError`.
+        for probe in [string("x"), int(1), TRUE, NONE, list(&[]), dict(&[])] {
+            let doc = getattr(probe, b"__doc__".as_ptr(), 7);
+            assert!(
+                value::as_str(doc).is_some_and(|text| !text.is_empty()),
+                "__doc__ missing for {}",
+                value::type_name(probe)
+            );
+            assert!(!crate::exc::pending());
+        }
+        // Arbitrary missing attributes still raise.
+        let missing = getattr(string("x"), b"nope".as_ptr(), 4);
+        assert_eq!(missing, NONE);
+        assert_eq!(
+            crate::exc::pending_tag(),
+            i64::from(crate::exc::ATTRIBUTE_ERROR)
+        );
+        let _ = crate::exc::clear();
     }
 
     #[test]

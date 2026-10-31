@@ -35,8 +35,8 @@ initial state of the first runnable core.
   import reports.
 - The stdlib matrix now runs with `HYDRO_STDLIB` pointed at the pinned CPython
   `Lib` tree (the earlier 159 count used the toolchain's default subset); the
-  same code imports **262/297** modules, so the previous report undercounted
-  the implementation by 91 modules.
+  same code imports **269/297** modules, so the previous report undercounted
+  the implementation by 98 modules.
 - Closed the next stdlib-import cluster: `_pydatetime`, `_pyio`, `logging`,
   `venv` and `imaplib` now import. This required sequential class-body name
   visibility, real `@property` setter/deleter decorators, unary `__neg__`/
@@ -47,6 +47,14 @@ initial state of the first runnable core.
   `os.execlp`, `os.linesep`, `O_BINARY`, `SEEK_DATA`/`SEEK_HOLE`,
   `os.device_encoding`, plus `codecs.getincrementalencoder`/
   `getincrementaldecoder` and `tempfile.mkstemp`.
+- `pydoc`, `zipfile`, `zipapp`, `mailbox`, `smtplib`, `plistlib` and
+  `nturl2path` now import. This batch added real `inspect` MRO/tree/doc
+  helpers, `__future__._Feature`, `platform.python_build`/`python_compiler`
+  and keywords, a native `http.server` surface, package-cycle initializer
+  ordering for `zipfile._path`, class-body loop/import semantics, functional
+  `Enum` construction, CPython octal regex escapes, `time.strptime`,
+  `os.rmdir`, `struct` bytes formats, `socket.create_connection`
+  `source_address`, and inherited `__doc__` on builtin instances.
 - `optparse` now imports: `OSError` and its built-in subclasses accept
   CPython's `(errno, strerror[, filename])` constructor form and render the
   `[Errno N] ...: 'file'` message.

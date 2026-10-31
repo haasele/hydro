@@ -264,14 +264,25 @@ fn parsed_format(format: &str) -> Result<Rc<Parsed>, String> {
     Ok(parsed)
 }
 
-fn string_argument(value_arg: i64, name: &str) -> Result<&'static str, i64> {
-    match value::as_str(value_arg) {
-        Some(text) => Ok(text),
-        None => Err(type_error(&format!(
-            "argument '{name}' must be str, not {}",
-            value::type_name(value_arg)
-        ))),
+/// Format argument: CPython accepts `str` or ASCII `bytes` for
+/// `struct.calcsize`/`pack`/`unpack` and their `Struct` methods. Arbitrary
+/// objects are rejected with the same `TypeError` CPython raises.
+fn string_argument(value_arg: i64, name: &str) -> Result<String, i64> {
+    if let Some(text) = value::as_str(value_arg) {
+        return Ok(text.to_string());
     }
+    if let Some(bytes) = value::as_bytes(value_arg) {
+        return match std::str::from_utf8(bytes) {
+            Ok(text) => Ok(text.to_string()),
+            Err(_) => Err(type_error(&format!(
+                "argument '{name}' must be an ASCII string, not bytes with non-ASCII data"
+            ))),
+        };
+    }
+    Err(type_error(&format!(
+        "argument '{name}' must be str or bytes, not {}",
+        value::type_name(value_arg)
+    )))
 }
 
 /// Exact integer argument as `i128` so every struct range can be checked.
@@ -585,15 +596,11 @@ fn init_struct(instance: i64, format_arg: i64) -> i64 {
     if exc::pending() {
         return NONE;
     }
-    let parsed = match parsed_format(format) {
+    let parsed = match parsed_format(&format) {
         Ok(parsed) => parsed,
         Err(message) => return struct_error(&message),
     };
-    value::instance_setattr(
-        instance,
-        "format".to_string(),
-        value::str_alloc(format.to_string()),
-    );
+    value::instance_setattr(instance, "format".to_string(), value::str_alloc(format));
     value::instance_setattr(instance, "size".to_string(), int_result(parsed.size as i64));
     instance
 }
@@ -632,7 +639,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             let Ok(format) = string_argument(format_arg, "format") else {
                 return NONE;
             };
-            let parsed = match parsed_format(format) {
+            let parsed = match parsed_format(&format) {
                 Ok(parsed) => parsed,
                 Err(message) => return struct_error(&message),
             };
@@ -660,7 +667,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             let Ok(format) = string_argument(format_arg, "format") else {
                 return NONE;
             };
-            let parsed = match parsed_format(format) {
+            let parsed = match parsed_format(&format) {
                 Ok(parsed) => parsed,
                 Err(message) => return struct_error(&message),
             };
@@ -696,7 +703,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             let Ok(format) = string_argument(format_arg, "format") else {
                 return NONE;
             };
-            let parsed = match parsed_format(format) {
+            let parsed = match parsed_format(&format) {
                 Ok(parsed) => parsed,
                 Err(message) => return struct_error(&message),
             };
@@ -734,7 +741,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             let Ok(format) = string_argument(format_arg, "format") else {
                 return NONE;
             };
-            let parsed = match parsed_format(format) {
+            let parsed = match parsed_format(&format) {
                 Ok(parsed) => parsed,
                 Err(message) => return struct_error(&message),
             };
@@ -785,7 +792,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             let Ok(format) = string_argument(format_arg, "format") else {
                 return NONE;
             };
-            let parsed = match parsed_format(format) {
+            let parsed = match parsed_format(&format) {
                 Ok(parsed) => parsed,
                 Err(message) => return struct_error(&message),
             };
@@ -833,7 +840,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             let Ok(format) = string_argument(format_arg, "format") else {
                 return NONE;
             };
-            match parsed_format(format) {
+            match parsed_format(&format) {
                 Ok(parsed) => int_result(parsed.size as i64),
                 Err(message) => struct_error(&message),
             }

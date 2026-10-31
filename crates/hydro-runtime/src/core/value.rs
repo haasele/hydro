@@ -5974,6 +5974,10 @@ fn create_class(
         }
         if as_class(result).is_some() {
             created = result;
+            // The metaclass rebuilt the class from the namespace mapping,
+            // which cannot carry a method's binding kind. Put the class plan's
+            // `@property`/`@classmethod`/`@staticmethod` bindings back.
+            restore_method_kinds(created, &methods);
         } else if result != NONE {
             crate::heap::release_roots(namespace_root);
             return result;
@@ -6017,6 +6021,56 @@ fn create_class(
     }
     crate::heap::release_roots(namespace_root);
     created
+}
+
+/// Restores a class plan's method binding kinds on a class a metaclass built.
+///
+/// CPython hands a metaclass `__new__` the class-body namespace, whose entries
+/// for decorated methods are the descriptors the decorators produced. Hydro
+/// records the binding kind on the class plan instead, so that namespace holds
+/// the bare function; a metaclass that rebuilds the class with
+/// `type.__new__(mcls, name, bases, namespace)` therefore gets an ordinary
+/// method back. Re-apply the plan's kind for every name the metaclass kept as
+/// the same function value: `enum.EnumType.__new__` does exactly that, and
+/// without this `enum.Enum`'s `name`/`value`/`_missing_` and every user enum's
+/// own accessors lose their binding.
+///
+/// A name the metaclass replaced, renamed or removed is left untouched.
+fn restore_method_kinds(class: i64, methods: &[(String, i64, MethodKind)]) {
+    if methods
+        .iter()
+        .all(|(_, _, kind)| *kind == MethodKind::Normal)
+    {
+        return;
+    }
+    if !is_heap(class) || (class & !TAG_MASK) == 0 {
+        return;
+    }
+    // SAFETY: `class` is a live runtime class reachable from the executing
+    // program, and the runtime thread is the only mutator of a class payload.
+    let obj = unsafe { &mut *((class & !TAG_MASK) as *mut HydroObj) };
+    if obj.kind != KIND_CLASS {
+        return;
+    }
+    let ObjDataMut::Class(state) = obj.data_mut() else {
+        return;
+    };
+    for (name, function, kind) in methods {
+        if *kind == MethodKind::Normal {
+            continue;
+        }
+        if let Some(entry) = state
+            .methods
+            .iter_mut()
+            .find(|entry| entry.0.as_str() == name.as_str())
+        {
+            // Only entries the metaclass kept unchanged: a function it
+            // installed itself decides its own binding.
+            if entry.1 == *function {
+                entry.2 = *kind;
+            }
+        }
+    }
 }
 
 /// Calls `value.__set_name__(owner, name)` when the value defines it.

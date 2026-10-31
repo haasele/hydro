@@ -377,6 +377,11 @@ struct LoopTarget {
     /// Plain-name target declared `global`: the loop binds a hidden local and
     /// stores it into the runtime global table on every iteration.
     global: Option<String>,
+    /// Plain-name target in a dynamic class body: CPython runs the loop with
+    /// `STORE_NAME`, so the loop binds a hidden local and stores it into the
+    /// class namespace on every iteration. Reads resolve through the same
+    /// namespace, and a later `del` deletes the class attribute.
+    class: Option<String>,
     /// Sequence target, unpacked from the item the loop binds.
     unpack: Option<Vec<HUnpackTarget>>,
 }
@@ -2081,6 +2086,25 @@ pub struct Lowerer<'a> {
     /// when lowering a single source file without the loader, where every
     /// nested import is treated as deferred.
     deferred_modules: HashSet<String>,
+    /// User modules whose module body initializes *after* this unit. The
+    /// loader reverses a package/submodule cycle only when the package's
+    /// module-level import of the submodule binds values it does not read
+    /// while initializing (`zipfile` imports `._path` at its end). Their
+    /// import binding stores are moved out of the module body into extra
+    /// initializer segments that run after the imported module.
+    initializer_deferred_modules: HashSet<String>,
+    /// `GlobalSet` statements collected for those deferred segments. Each
+    /// deferred `from ... import ...` statement contributes a contiguous
+    /// range; [`Lowerer::module_segments`] records where each range runs.
+    deferred_initializer_stores: Vec<HStmt>,
+    /// True while lowering the top-level `from ... import ...` statement that
+    /// owns the next deferred segment. Nested imports never defer: the loader
+    /// only reverses a cycle when every import of the module is top level.
+    collect_initializer_segment: bool,
+    /// Extra initializer segments created by [`Lowerer::lower_module`], with
+    /// the fully qualified module each segment must run after. Ids are
+    /// program-wide (`fid_base + local id`).
+    module_segments: Vec<(FunctionId, String)>,
     /// User modules this unit imports but cannot link because they are still
     /// initializing. Their members are read late from the runtime global
     /// table, and a name imported by `from pkg import name` binds the module
@@ -2298,6 +2322,10 @@ impl<'a> Lowerer<'a> {
             collecting_optional_try: false,
             top_level_imports: HashSet::new(),
             deferred_modules: HashSet::new(),
+            initializer_deferred_modules: HashSet::new(),
+            deferred_initializer_stores: Vec::new(),
+            collect_initializer_segment: false,
+            module_segments: Vec::new(),
             late_modules: HashSet::new(),
             fid_base: 0,
             dunder_name: "__main__".to_string(),
@@ -2479,6 +2507,21 @@ impl<'a> Lowerer<'a> {
     /// source checks), where every nested import may be deferred.
     pub fn set_deferred_imports(&mut self, modules: HashSet<String>) {
         self.deferred_modules = modules;
+    }
+
+    /// Names the modules whose initializer the loader orders *after* this
+    /// unit (a reversed package/submodule cycle). Module-level
+    /// `from module import name` bindings are published by an extra
+    /// initializer segment that runs once the module initialized.
+    pub fn set_initializer_deferred_modules(&mut self, modules: HashSet<String>) {
+        self.initializer_deferred_modules = modules;
+    }
+
+    /// Extra initializer segments created by [`Self::lower_module`]:
+    /// `(program-wide function id, module that must initialize first)`, in
+    /// source order. Empty when the unit has no reversed-cycle imports.
+    pub fn take_module_segments(&mut self) -> Vec<(FunctionId, String)> {
+        std::mem::take(&mut self.module_segments)
     }
 
     /// Whether a nested import of `module` may be bound as deferred.
@@ -2817,6 +2860,11 @@ impl<'a> Lowerer<'a> {
             class_ns: None,
         };
         let mut body = Vec::new();
+        // `(body index, store start, store end, module)` for every module-level
+        // `from <module> import ...` whose module initializes after this unit.
+        // The body is split there so the binding stores run in an extra
+        // initializer segment after that module's body.
+        let mut deferred_segments: Vec<(usize, usize, usize, String)> = Vec::new();
         for stmt in &module.body {
             let start = u32::from(stmt.range().start()) as usize;
             match stmt {
@@ -2898,10 +2946,35 @@ impl<'a> Lowerer<'a> {
                 }
                 _ => {}
             }
-            if let Some(s) = self.lower_stmt(stmt, &mut fs) {
+            let deferred_module = match stmt {
+                ast::Stmt::ImportFrom(import) => self.deferred_import_module(import),
+                _ => None,
+            };
+            let deferred_start = deferred_module.as_ref().map(|module| {
+                (
+                    body.len(),
+                    self.deferred_initializer_stores.len(),
+                    module.clone(),
+                )
+            });
+            self.collect_initializer_segment = deferred_start.is_some();
+            let lowered = self.lower_stmt(stmt, &mut fs);
+            self.collect_initializer_segment = false;
+            if let Some(s) = lowered {
                 self.push_lowered_stmt(stmt, s, &fs, &mut body);
             }
+            if let Some((boundary, store_start, module)) = deferred_start {
+                let store_end = self.deferred_initializer_stores.len();
+                deferred_segments.push((boundary, store_start, store_end, module));
+            }
         }
+        // A reversed-cycle import is published by a segment that runs after
+        // the imported module. Split the body before module annotations,
+        // dunders and cell initializers are added: those belong to the first
+        // segment, the imported bindings (and everything after the import in
+        // source order) to the trailing ones.
+        let (mut body, mut trailing_segments) =
+            self.split_deferred_segments(body, &deferred_segments);
         // `__annotations__` of the module body: one entry per simple-name
         // annotated assignment directly in the module body. The dictionary is
         // published in the runtime global table (so importers and
@@ -2940,10 +3013,14 @@ impl<'a> Lowerer<'a> {
                 line: 0,
                 col: 0,
             };
-            body.push(HStmt {
+            let target = match trailing_segments.last_mut() {
+                Some(segment) => segment,
+                None => &mut body,
+            };
+            target.push(HStmt {
                 kind: HStmtKind::GlobalSet {
                     module: self.dunder_name.clone(),
-                    name: format!("\0hydro.extload.{}", body.len()),
+                    name: format!("\0hydro.extload.{}", target.len()),
                     value,
                 },
                 line: 0,
@@ -2969,6 +3046,32 @@ impl<'a> Lowerer<'a> {
         }
         body.splice(0..0, module_cell_inits);
         self.functions[0].body = body;
+        // Every deferred import segment is a separate initializer function.
+        // The loader places it right after the imported module's initializer;
+        // its body publishes the bindings through the runtime global table.
+        for (segment, (_, _, _, module)) in
+            trailing_segments.into_iter().zip(deferred_segments.iter())
+        {
+            if segment.is_empty() {
+                continue;
+            }
+            let local = self.functions.len() as FunctionId;
+            self.functions.push(HFunction {
+                name: "<imports>".to_string(),
+                params: Vec::new(),
+                capture_count: 0,
+                ret_ty: Ty::Concrete(Type::None),
+                locals: Vec::new(),
+                body: segment,
+                is_async: false,
+                is_generator: false,
+                is_module: true,
+                line: 0,
+                col: 0,
+            });
+            self.module_segments
+                .push((self.fid_base + local, module.clone()));
+        }
 
         self.synthesize_pytest(&module.body, &mut fs);
 
@@ -2976,6 +3079,66 @@ impl<'a> Lowerer<'a> {
             source_name: self.filename.to_string(),
             functions: std::mem::take(&mut self.functions),
         }
+    }
+
+    /// The resolved module of a module-level `from ... import ...` statement
+    /// when the loader ordered that module's body *after* this unit.
+    fn deferred_import_module(&self, import: &ast::StmtImportFrom) -> Option<String> {
+        if self.initializer_deferred_modules.is_empty() {
+            return None;
+        }
+        let level = import
+            .level
+            .as_ref()
+            .map(|level| level.to_u32())
+            .unwrap_or(0);
+        let module = resolve_import_name(
+            level,
+            import.module.as_ref().map(|module| module.as_str()),
+            &self.package,
+        )
+        .ok()?;
+        self.initializer_deferred_modules
+            .contains(&module)
+            .then_some(module)
+    }
+
+    /// Split the lowered module body at the deferred import boundaries.
+    ///
+    /// `segments` holds `(body index, store start, store end, module)` in
+    /// source order. The returned first segment is the module body proper;
+    /// every trailing segment starts with its import's binding stores and
+    /// continues with the source statements after that import, so the whole
+    /// unit still executes in CPython order once the loader runs the segments
+    /// at the right positions.
+    fn split_deferred_segments(
+        &mut self,
+        body: Vec<HStmt>,
+        segments: &[(usize, usize, usize, String)],
+    ) -> (Vec<HStmt>, Vec<Vec<HStmt>>) {
+        if segments.is_empty() {
+            return (body, Vec::new());
+        }
+        let stores = std::mem::take(&mut self.deferred_initializer_stores);
+        let mut parts: Vec<Vec<HStmt>> = Vec::with_capacity(segments.len() + 1);
+        let mut start = 0;
+        for &(boundary, _, _, _) in segments {
+            let boundary = boundary.clamp(start, body.len());
+            parts.push(body[start..boundary].to_vec());
+            start = boundary;
+        }
+        parts.push(body[start..].to_vec());
+        for (index, &(_, store_start, store_end, _)) in segments.iter().enumerate().rev() {
+            let store_start = store_start.min(stores.len());
+            let store_end = store_end.min(stores.len());
+            if store_start >= store_end {
+                continue;
+            }
+            let mut segment = stores[store_start..store_end].to_vec();
+            segment.append(&mut parts[index + 1]);
+            parts[index + 1] = segment;
+        }
+        (parts.remove(0), parts)
     }
 
     /// The blocks of a module-level compound statement whose definitions can
@@ -5941,8 +6104,23 @@ impl<'a> Lowerer<'a> {
                 if self.is_initializing_ancestor(&module) || self.late_modules.contains(&module) {
                     continue;
                 }
-                self.imported_user_global_expr(&binding, line, col)
-                    .expect("checked imported user global")
+                let value = self
+                    .imported_user_global_expr(&binding, line, col)
+                    .expect("checked imported user global");
+                if self.collect_initializer_segment
+                    && self.initializer_deferred_modules.contains(&module)
+                {
+                    // The loader reversed the package/submodule cycle
+                    // (`zipfile` defines everything before importing
+                    // `._path`): this unit initializes first, so the value is
+                    // published by an extra initializer segment after the
+                    // imported module's body ran. `zipfile.Path` therefore
+                    // reaches the module global table once `_path` exists.
+                    let store = self.session_global_store(&binding, value, line, col);
+                    self.deferred_initializer_stores.push(store);
+                    continue;
+                }
+                value
             } else if let Some(module) = self.user_module_aliases.get(&binding).cloned() {
                 self.module_ref_expr(&module, line, col)
             } else if let Some((module, function)) = self.imported_functions.get(&binding).copied()
@@ -11522,6 +11700,17 @@ impl<'a> Lowerer<'a> {
                 col,
             });
         }
+        // `import pkg.helper [as h]` in a class body stores the linked user
+        // module value itself. The module registry materializes it once that
+        // unit initialized, exactly like the module-level import statement.
+        if let Some(module) = self.user_module_aliases.get(binding).cloned() {
+            return Some(HExpr {
+                kind: HExprKind::ModuleRef { module },
+                ty: Ty::Concrete(Type::Any),
+                line,
+                col,
+            });
+        }
         // A function imported from a compiled user module (`email.message`
         // does `from email.iterators import walk` in its class body) is a
         // direct function reference; a module-level value is read from the
@@ -11544,6 +11733,22 @@ impl<'a> Lowerer<'a> {
                     name: constant.name.to_string(),
                 },
                 ty: Ty::Concrete(constant.ty),
+                line,
+                col,
+            });
+        }
+        // An import the loader could not link (a class-body import of a module
+        // absent on this platform, kept deferred by the scan) still binds a
+        // class attribute; evaluating it raises the runtime `ImportError`
+        // exactly where CPython executes the import.
+        if let Some(deferred) = self.deferred_imports.get(binding) {
+            return Some(HExpr {
+                kind: HExprKind::DeferredImport {
+                    module: deferred.module.clone(),
+                    member: deferred.member.clone(),
+                    path: deferred.path.clone(),
+                },
+                ty: Ty::Concrete(Type::Any),
                 line,
                 col,
             });
@@ -15044,6 +15249,7 @@ impl<'a> Lowerer<'a> {
     ) -> Option<LoopTarget> {
         let unpack = matches!(target, ast::Expr::Tuple(_) | ast::Expr::List(_));
         let mut global = None;
+        let mut class = None;
         let name = match target {
             ast::Expr::Name(n) => {
                 if fs.is_global(n.id.as_str()) {
@@ -15052,6 +15258,18 @@ impl<'a> Lowerer<'a> {
                     self.used_globals.insert(n.id.to_string());
                     global = Some(n.id.to_string());
                     None
+                } else if fs.class_ns.is_some() {
+                    // CPython's class body binds a loop target with
+                    // `STORE_NAME`: the item lands in the class namespace, not
+                    // in an enclosing local. The loop therefore binds a hidden
+                    // local and publishes it into the namespace on every
+                    // iteration (like a `global` target does for the runtime
+                    // global table). The name is already known to
+                    // `ClassNs::bindings`, so reads and a later `del` resolve
+                    // through the same namespace.
+                    let (local, _) = self.for_temp(fs, n.range);
+                    class = Some(n.id.to_string());
+                    Some(local)
                 } else {
                     match fs.lookup(n.id.as_str()) {
                         Some(var) => Some(var),
@@ -15069,7 +15287,7 @@ impl<'a> Lowerer<'a> {
             }
             _ => None,
         };
-        if !unpack && name.is_none() && global.is_none() {
+        if !unpack && name.is_none() && global.is_none() && class.is_none() {
             self.error_at(
                 target.range(),
                 "for loop target must be a single name in Phase 2.0",
@@ -15084,6 +15302,7 @@ impl<'a> Lowerer<'a> {
         Some(LoopTarget {
             name,
             global,
+            class,
             unpack,
         })
     }
@@ -15105,7 +15324,10 @@ impl<'a> Lowerer<'a> {
         global: Option<&str>,
         unpack: Option<&[HUnpackTarget]>,
     ) -> Vec<(String, LocalId)> {
-        if !fs.is_module || global.is_some() {
+        // A dynamic class body is a separate namespace: `STORE_NAME` never
+        // touches the module globals, so a class-body loop target must not be
+        // mirrored even when the class statement itself sits at module level.
+        if !fs.is_module || global.is_some() || fs.class_ns.is_some() {
             return Vec::new();
         }
         if let Some(local) = var {
@@ -15161,6 +15383,33 @@ impl<'a> Lowerer<'a> {
             .collect()
     }
 
+    /// `STORE_NAME` of one class-body loop iteration: publish the item the
+    /// loop bound into the runtime class namespace.
+    fn class_loop_store(
+        &self,
+        fs: &FuncState,
+        name: &str,
+        local: LocalId,
+        line: u32,
+        col: u32,
+    ) -> HStmt {
+        let ty = match self
+            .functions
+            .get(fs.fid as usize)
+            .and_then(|function| function.locals.get(local as usize))
+        {
+            Some(local) => local.ty,
+            None => Ty::Concrete(Type::Any),
+        };
+        let value = self.local_read(fs, local, ty, line, col);
+        let ns = fs
+            .class_ns
+            .as_ref()
+            .map(|state| state.ns)
+            .expect("class-body loop target has a class namespace");
+        class_namespace_store(ns, name, value, line, col)
+    }
+
     /// Lower `for target in iterable:` (and its optional `else:`) to
     /// [`HStmtKind::ForRange`] or [`HStmtKind::ForEach`].
     #[allow(clippy::too_many_arguments)]
@@ -15178,6 +15427,7 @@ impl<'a> Lowerer<'a> {
         let LoopTarget {
             name: var,
             global: global_var,
+            class: class_var,
             unpack: unpack_targets,
         } = self.resolve_loop_target(target, fs)?;
         // Computed before the target locals move into the IR node below.
@@ -15201,9 +15451,9 @@ impl<'a> Lowerer<'a> {
 
         let Some(call) = range_call else {
             let iterable = self.expr(iter, fs);
-            let (var, cell_target, global_target, mut lowered_body) =
-                match (var, global_var, unpack_targets) {
-                    (Some(user_var), _, _) => {
+            let (var, cell_target, global_target, class_target, mut lowered_body) =
+                match (var, global_var, class_var, unpack_targets) {
+                    (Some(user_var), _, class_target, _) => {
                         // A cell target is bound through a hidden slot: the cell
                         // itself must stay in the user local.
                         let (var, cell_assign) = if fs.is_cell(user_var) {
@@ -15215,9 +15465,9 @@ impl<'a> Lowerer<'a> {
                         fs.loop_depth += 1;
                         let body = self.lower_block(loop_body, fs);
                         fs.loop_depth -= 1;
-                        (var, cell_assign, None, body)
+                        (var, cell_assign, None, class_target, body)
                     }
-                    (None, Some(name), None) => {
+                    (None, Some(name), _, None) => {
                         // `global name`: the loop binds a hidden local and
                         // stores it into the runtime global table on every
                         // iteration, so the loop never allocates a local slot
@@ -15226,9 +15476,9 @@ impl<'a> Lowerer<'a> {
                         fs.loop_depth += 1;
                         let body = self.lower_block(loop_body, fs);
                         fs.loop_depth -= 1;
-                        (var, None, Some((name, value)), body)
+                        (var, None, Some((name, value)), None, body)
                     }
-                    (None, None, Some(targets)) => {
+                    (None, None, None, Some(targets)) => {
                         // `for a, b in xs` desugars to a loop over a hidden local
                         // followed by a straight unpack of that local.
                         let (var, value) = self.unpack_temp(fs, target_expr);
@@ -15242,7 +15492,7 @@ impl<'a> Lowerer<'a> {
                         });
                         body.extend(self.lower_block(loop_body, fs));
                         fs.loop_depth -= 1;
-                        (var, None, None, body)
+                        (var, None, None, None, body)
                     }
                     _ => return None,
                 };
@@ -15264,6 +15514,9 @@ impl<'a> Lowerer<'a> {
                     line,
                     col,
                 });
+            }
+            if let Some(name) = class_target {
+                body.push(self.class_loop_store(fs, &name, var, line, col));
             }
             // A module-level target is a module global: publish the value the
             // loop assigned before the body observes it.
@@ -15291,22 +15544,23 @@ impl<'a> Lowerer<'a> {
             );
             return None;
         }
-        let (var, cell_target, global_target) = match (var, global_var) {
-            (Some(user_var), _) => {
+        let (var, cell_target, global_target, class_target) = match (var, global_var, class_var) {
+            (Some(user_var), _, class_target) => {
                 if fs.is_cell(user_var) {
                     let (temp, temp_expr) = self.for_temp(fs, target_expr.range());
-                    (temp, Some((user_var, temp_expr)), None)
+                    (temp, Some((user_var, temp_expr)), None, class_target)
                 } else {
-                    (user_var, None, None)
+                    (user_var, None, None, class_target)
                 }
             }
-            (None, Some(name)) => {
+            (None, Some(name), _) => {
                 // `global name`: the range loops over a hidden local and the
                 // body stores each value into the runtime global table.
                 let (temp, temp_expr) = self.for_temp(fs, target_expr.range());
-                (temp, None, Some((name, temp_expr)))
+                (temp, None, Some((name, temp_expr)), None)
             }
-            (None, None) => return None,
+            (None, None, None) => return None,
+            _ => return None,
         };
 
         if fs.lookup("range").is_some() {
@@ -15382,6 +15636,9 @@ impl<'a> Lowerer<'a> {
                 line,
                 col,
             });
+        }
+        if let Some(name) = class_target {
+            body.push(self.class_loop_store(fs, &name, var, line, col));
         }
         // A module-level target is a module global: publish the value the
         // range assigned before the body observes it.
@@ -16197,6 +16454,7 @@ impl<'a> Lowerer<'a> {
         let LoopTarget {
             name,
             global: global_name,
+            class: class_name,
             unpack: unpack_targets,
         } = self.resolve_loop_target(&s.target, fs)?;
         let iterable = self.expr(&s.iter, fs);
@@ -16238,7 +16496,13 @@ impl<'a> Lowerer<'a> {
                         col,
                     });
                 }
-                Some(_) => {}
+                Some(local) => {
+                    if let Some(name) = &class_name {
+                        // `STORE_NAME` for the class namespace: the awaited
+                        // item is published there on every iteration.
+                        after_item.push(self.class_loop_store(fs, name, local, line, col));
+                    }
+                }
                 None => {
                     // `global name`: every iteration stores the awaited item
                     // into the runtime global table.
@@ -23260,7 +23524,7 @@ fn expr_has_yield(expr: &ast::Expr) -> bool {
 /// functions; class bodies are separate scopes, so their method bodies are
 /// scanned explicitly. The module-level `def`/`class` names themselves are
 /// bindings, not loads, and never match.
-fn module_references_name(stmts: &[ast::Stmt], name: &str) -> bool {
+pub(crate) fn module_references_name(stmts: &[ast::Stmt], name: &str) -> bool {
     let mut names = Vec::new();
     collect_free_name_loads(stmts, &mut names);
     if names.iter().any(|loaded| loaded.as_str() == name) {

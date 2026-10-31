@@ -146,6 +146,91 @@ fn global_set_value<'a>(stmts: &'a [HStmt], name: &str) -> Option<&'a HExpr> {
     None
 }
 
+/// Collects every class-namespace key written by `SetSubscript` stores,
+/// unpacking subscript targets and namespace deletions, including nested
+/// blocks. Used to check `STORE_NAME`/`DELETE_NAME` lowering of class bodies.
+fn collect_namespace_store_keys(stmts: &[HStmt], out: &mut Vec<String>) {
+    fn target_key(index: &HExpr) -> Option<String> {
+        match &index.kind {
+            HExprKind::Const(Const::Str(name)) => Some(name.clone()),
+            _ => None,
+        }
+    }
+    fn collect_target(target: &HUnpackTarget, out: &mut Vec<String>) {
+        match target {
+            HUnpackTarget::Subscript { index, .. } => {
+                if let Some(name) = target_key(index) {
+                    out.push(name);
+                }
+            }
+            HUnpackTarget::Nested(nested) => {
+                for target in nested {
+                    collect_target(target, out);
+                }
+            }
+            HUnpackTarget::Star(inner) => collect_target(inner, out),
+            _ => {}
+        }
+    }
+    for stmt in stmts {
+        match &stmt.kind {
+            HStmtKind::SetSubscript { index, .. } => {
+                if let Some(name) = target_key(index) {
+                    out.push(name);
+                }
+            }
+            HStmtKind::Unpack { targets, .. } => {
+                for target in targets {
+                    collect_target(target, out);
+                }
+            }
+            HStmtKind::Delete { targets } => {
+                for target in targets {
+                    if let HDeleteTarget::Subscript { index, .. } = target {
+                        if let Some(name) = target_key(index) {
+                            out.push(name);
+                        }
+                    }
+                }
+            }
+            HStmtKind::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_namespace_store_keys(then_body, out);
+                collect_namespace_store_keys(else_body, out);
+            }
+            HStmtKind::While {
+                body, else_body, ..
+            }
+            | HStmtKind::ForRange {
+                body, else_body, ..
+            }
+            | HStmtKind::ForEach {
+                body, else_body, ..
+            } => {
+                collect_namespace_store_keys(body, out);
+                collect_namespace_store_keys(else_body, out);
+            }
+            HStmtKind::Try {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => {
+                collect_namespace_store_keys(body, out);
+                for handler in handlers {
+                    collect_namespace_store_keys(&handler.body, out);
+                }
+                collect_namespace_store_keys(else_body, out);
+                collect_namespace_store_keys(finally_body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[test]
 fn import_forms_resolve_to_module_nodes() {
     let source = "import math, sys as system\n\
@@ -422,10 +507,23 @@ fn class_body_import_binds_a_user_module_function() {
             module_getattr: false,
         },
     )]));
-    let _hir = lowerer.lower_module(&parse(source));
+    let hir = lowerer.lower_module(&parse(source));
     let diags = std::mem::take(&mut lowerer.diags);
     drop(lowerer);
     assert!(diags.is_empty(), "{diags:?}");
+    // The class body stores the imported function handle in its namespace,
+    // exactly like CPython's `STORE_NAME` of the `walk` function.
+    let mut keys = Vec::new();
+    collect_namespace_store_keys(&hir.functions[0].body, &mut keys);
+    assert!(
+        keys.contains(&"walk".to_string()),
+        "class namespace stores: {keys:?}"
+    );
+    let value = global_set_value(&hir.functions[0].body, "walk");
+    assert!(
+        value.is_none(),
+        "a class-body import must not bind a module global"
+    );
 }
 
 #[test]
@@ -17973,5 +18071,104 @@ fn multiple_mapping_arguments_fold_into_one_call_operand() {
         ),
         "mappings must merge left to right: {:?}",
         merged.kind
+    );
+}
+
+#[test]
+fn class_body_loop_target_binds_the_class_namespace() {
+    // CPython compiles a class-body loop target with `STORE_NAME`, so the item
+    // lands in the class namespace and never in an enclosing local; a later
+    // `del` removes the class attribute. `pydoc.Helper` runs two nested loops
+    // in its class body and deletes the targets afterwards.
+    let source = "\
+class C:
+    for topic, symbols in [('a', ['x'])]:
+        for symbol in symbols:
+            pass
+    del topic, symbols, symbol
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let mut keys = Vec::new();
+    collect_namespace_store_keys(&hir.functions[0].body, &mut keys);
+    for key in ["topic", "symbols", "symbol"] {
+        assert!(
+            keys.contains(&key.to_string()),
+            "missing namespace store for {key}: {keys:?}"
+        );
+    }
+    // The class body is a separate namespace: nothing is mirrored into the
+    // module global table.
+    assert!(
+        !has_global_set(&hir.functions[0].body),
+        "class-body loop targets must not mirror module globals"
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("valid program");
+}
+
+#[test]
+fn class_body_simple_loop_target_does_not_reuse_an_enclosing_local() {
+    // An enclosing module local of the same name must not capture the loop
+    // target: `x = 0` then a class-body `for x in ...` binds only `C.x`.
+    let source = "\
+x = 0
+class C:
+    for x in [1, 2]:
+        pass
+    value = x
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let mut keys = Vec::new();
+    collect_namespace_store_keys(&hir.functions[0].body, &mut keys);
+    assert!(keys.contains(&"x".to_string()), "{keys:?}");
+    crate::sema::check(&hir, &mut infer, "test.py").expect("valid program");
+}
+
+#[test]
+fn deferred_import_binding_runs_in_a_later_initializer_segment() {
+    // `zipfile/__init__.py` defines `ZipFile` and only then imports
+    // `._path`; the loader orders the package body first and moves the import
+    // bindings to a segment that runs after `_path` initialized.
+    let source = "class ZipFile:\n    pass\n\nfrom ._path import Path\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "pkg/__init__.py", &mut infer);
+    lowerer.set_mirror_all_globals(true);
+    lowerer.set_package("pkg");
+    lowerer.set_user_modules(HashMap::from([(
+        "pkg._path".to_string(),
+        user_module("pkg._path", &[("Path", UserExport::Global)]),
+    )]));
+    lowerer.set_initializer_deferred_modules(std::collections::HashSet::from([
+        "pkg._path".to_string()
+    ]));
+    let hir = lowerer.lower_module(&parse(source));
+    let segments = lowerer.take_module_segments();
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    assert_eq!(segments.len(), 1, "one deferred segment: {segments:?}");
+    let (segment_id, module) = &segments[0];
+    assert_eq!(module, "pkg._path");
+    // The module body itself no longer reads `_path.Path`.
+    assert!(
+        global_set_value(&hir.functions[0].body, "Path").is_none(),
+        "the deferred binding must not be published by the module body"
+    );
+    // The extra segment publishes it into the package global table.
+    let segment = hir
+        .functions
+        .get(*segment_id as usize)
+        .expect("segment function is lowered");
+    assert_eq!(segment.name, "<imports>");
+    assert!(
+        matches!(
+            global_set_value(&segment.body, "Path").map(|value| &value.kind),
+            Some(HExprKind::GlobalGet { module, name })
+                if module.as_str() == "pkg._path" && name.as_str() == "Path"
+        ),
+        "segment must publish _path.Path: {:?}",
+        segment.body
     );
 }

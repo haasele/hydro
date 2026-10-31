@@ -63,6 +63,7 @@ pub(crate) mod grp;
 pub(crate) mod hashlib;
 pub(crate) mod heapq;
 pub(crate) mod http;
+pub(crate) mod http_server;
 pub(crate) mod imp;
 pub(crate) mod importlib;
 pub(crate) mod importlib_machinery;
@@ -3664,6 +3665,9 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         // semantics (base64's `padded`) binds them into the positional
         // layout before this point.
         "base64" => base64::call(function, args),
+        // `platform.platform(aliased=..., terse=...)`: the binder has already
+        // moved the two documented names into their positional slots.
+        "platform" => platform_call(function, args),
         _ => exc::raise_with_message(
             TYPE_ERROR,
             &format!("{module}.{function}() does not accept keyword arguments"),
@@ -4347,7 +4351,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "os.path" => os_path_call(function, args),
         "random" => random_call(function, args),
         "pathlib" => pathlib_call(function, args),
-        "platform" => platform_call(function),
+        "platform" => platform_call(function, args),
         "statistics" => statistics_call(function, args),
         "argparse" => argparse::call(function, args),
         "_collections" | "collections" => match collections_repr_call(function, args) {
@@ -5866,9 +5870,126 @@ fn os_path_allow_missing() -> i64 {
     sentinel
 }
 
+// __future__
+
+/// `__future__._Feature.__init__(optionalRelease, mandatoryRelease,
+/// compiler_flag)`: CPython's release-record class carries the three
+/// attributes the standard library reads (`codeop`/`doctest` use
+/// `compiler_flag`).
+extern "C" fn future_feature_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: four declared parameter slots.
+    let args = unsafe { std::slice::from_raw_parts(argv, 4) };
+    let instance = args[0];
+    value::instance_setattr(instance, "optional".to_string(), args[1]);
+    value::instance_setattr(instance, "mandatory".to_string(), args[2]);
+    value::instance_setattr(instance, "compiler_flag".to_string(), args[3]);
+    NONE
+}
+
+/// `_Feature.getOptionalRelease()`.
+extern "C" fn future_feature_optional_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter.
+    value::instance_attr(unsafe { *argv }, "optional").unwrap_or(NONE)
+}
+
+/// `_Feature.getMandatoryRelease()`.
+extern "C" fn future_feature_mandatory_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter.
+    value::instance_attr(unsafe { *argv }, "mandatory").unwrap_or(NONE)
+}
+
+/// `_Feature.__repr__`: `_Feature(optional, mandatory, compiler_flag)`.
+extern "C" fn future_feature_repr_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter.
+    let instance = unsafe { *argv };
+    let optional = value::instance_attr(instance, "optional").unwrap_or(NONE);
+    let mandatory = value::instance_attr(instance, "mandatory").unwrap_or(NONE);
+    let compiler_flag = value::instance_attr(instance, "compiler_flag").unwrap_or(NONE);
+    value::str_alloc(format!(
+        "_Feature({}, {}, {})",
+        value::repr(optional),
+        value::repr(mandatory),
+        value::repr(compiler_flag)
+    ))
+}
+
+/// Cached `__future__._Feature` class value.
+///
+/// `pydoc` uses it as an `isinstance` target; the real class also constructs
+/// instances with the three documented attributes and their getters.
+fn future_feature_class() -> i64 {
+    const KEY: &str = "__future__._Feature";
+    if let Some(class) = globals::registry_get(KEY) {
+        return class;
+    }
+    let self_param = || value::ParamMeta {
+        name: "self".to_string(),
+        kind: hydro_ir::ParamKind::Positional,
+        default: None,
+    };
+    let positional = |name: &str| value::ParamMeta {
+        name: name.to_string(),
+        kind: hydro_ir::ParamKind::Positional,
+        default: None,
+    };
+    let init = value::native_function_new("__future__", "_Feature.__init__", usize::MAX);
+    value::function_set_signature(
+        init,
+        vec![
+            self_param(),
+            positional("optionalRelease"),
+            positional("mandatoryRelease"),
+            positional("compiler_flag"),
+        ],
+    );
+    value::function_set_full_entry(init, future_feature_init_entry as *const () as usize);
+    let optional = value::native_function_new("__future__", "_Feature.getOptionalRelease", 1);
+    value::function_set_signature(optional, vec![self_param()]);
+    value::function_set_full_entry(
+        optional,
+        future_feature_optional_entry as *const () as usize,
+    );
+    let mandatory = value::native_function_new("__future__", "_Feature.getMandatoryRelease", 1);
+    value::function_set_signature(mandatory, vec![self_param()]);
+    value::function_set_full_entry(
+        mandatory,
+        future_feature_mandatory_entry as *const () as usize,
+    );
+    let repr = value::native_function_new("__future__", "_Feature.__repr__", 1);
+    value::function_set_signature(repr, vec![self_param()]);
+    value::function_set_full_entry(repr, future_feature_repr_entry as *const () as usize);
+    let roots = heap::root_values(&[init, optional, mandatory, repr]);
+    let class = value::class_new_full(
+        "_Feature".to_string(),
+        NONE,
+        vec![
+            ("__init__".to_string(), init, hydro_ir::MethodKind::Normal),
+            (
+                "getOptionalRelease".to_string(),
+                optional,
+                hydro_ir::MethodKind::Normal,
+            ),
+            (
+                "getMandatoryRelease".to_string(),
+                mandatory,
+                hydro_ir::MethodKind::Normal,
+            ),
+            ("__repr__".to_string(), repr, hydro_ir::MethodKind::Normal),
+        ],
+        Vec::new(),
+    );
+    heap::release_roots(roots);
+    globals::registry_set(KEY, class);
+    class
+}
+
 fn constant_value(module: &str, name: &str) -> i64 {
     match (module, name) {
+        ("__future__", "_Feature") => future_feature_class(),
         ("__future__", name) => future::constant(name),
+        // `http.server` is a nested native module; its members are the server
+        // and request-handler classes `pydoc.serve` instantiates.
+        ("http.server", name) => http_server::constant(name),
         ("token", name) => match tokenize::token_constant(name) {
             Some(constant) => constant,
             None => missing_attribute("token", name),
@@ -8546,6 +8667,46 @@ fn platform_processor() -> &'static str {
     platform_machine()
 }
 
+/// CPython's `system_alias`: the marketing names for the systems whose kernel
+/// name differs. `platform()` only applies it when `aliased=True`.
+fn platform_system_alias(system: &'static str) -> &'static str {
+    match system {
+        "SunOS" => "Solaris",
+        "win32" | "win16" => "Windows",
+        other => other,
+    }
+}
+
+/// `platform.python_build()`: CPython's `_sys_version()[4:6]`.
+///
+/// The build number is the text between `(` (and an optional `#`) and the
+/// first comma, and the build date is the date and time fields inside the
+/// parentheses joined by a space. Hydro's `sys.version` is
+/// `<version> (Hydro <crate version>)`, so the build number is
+/// `Hydro <crate version>` and the build date is empty.
+fn platform_python_build() -> (String, String) {
+    let version = format!(
+        "{PYTHON_VERSION_STRING} (Hydro {})",
+        env!("CARGO_PKG_VERSION")
+    );
+    let Some(open) = version.find('(') else {
+        return (String::new(), String::new());
+    };
+    let rest = &version[open + 1..];
+    let rest = rest.strip_prefix('#').unwrap_or(rest);
+    let Some(close) = rest.find(')') else {
+        return (String::new(), String::new());
+    };
+    let mut fields = rest[..close].splitn(3, ',');
+    let buildno = fields.next().unwrap_or("").trim().to_string();
+    let builddate = match (fields.next(), fields.next()) {
+        (Some(date), Some(time)) => format!("{} {}", date.trim(), time.trim()),
+        (Some(date), None) => date.trim().to_string(),
+        _ => String::new(),
+    };
+    (buildno, builddate)
+}
+
 /// `platform.uname()`: the six-field `uname_result` namedtuple.
 ///
 /// The identity fields mirror the individual `platform` helpers, so
@@ -8562,21 +8723,44 @@ fn platform_uname() -> i64 {
     ])
 }
 
-fn platform_call(function: &str) -> i64 {
+fn platform_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "system" => value::str_from_bytes(platform_system().as_bytes()),
         "machine" => value::str_from_bytes(platform_machine().as_bytes()),
         "release" => value::str_alloc(platform_release()),
         "version" => value::str_alloc(platform_version()),
         "node" => value::str_alloc(platform_node()),
-        "platform" => value::str_alloc(format!(
-            "{}-{}-{}",
-            platform_system(),
-            platform_release(),
-            platform_machine()
-        )),
+        "platform" => {
+            // `platform(aliased=False, terse=False)`; the declared parameter
+            // names were bound into these slots by the generic keyword binder.
+            let aliased = args.first().is_some_and(|flag| value::truthy(*flag));
+            let terse = args.get(1).is_some_and(|flag| value::truthy(*flag));
+            let system = if aliased {
+                platform_system_alias(platform_system())
+            } else {
+                platform_system()
+            };
+            // CPython's Windows branch drops the extra fields for `terse`;
+            // its Unix branches (including Linux) produce one string either
+            // way. Alias renames only apply to the SunOS/win32 spellings.
+            if terse && system == "Windows" {
+                value::str_alloc(format!("{}-{}", system, platform_release()))
+            } else {
+                value::str_alloc(format!(
+                    "{}-{}-{}",
+                    system,
+                    platform_release(),
+                    platform_machine()
+                ))
+            }
+        }
         "python_version" => value::str_from_bytes(PYTHON_VERSION_STRING.as_bytes()),
         "python_implementation" => value::str_from_bytes(b"Hydro"),
+        "python_build" => {
+            let (buildno, builddate) = platform_python_build();
+            value::tuple_new(vec![value::str_alloc(buildno), value::str_alloc(builddate)])
+        }
+        "python_compiler" => value::str_from_bytes(b"rustc"),
         "processor" => value::str_from_bytes(platform_processor().as_bytes()),
         "uname" => platform_uname(),
         _ => missing_attribute("platform", function),
@@ -10488,8 +10672,535 @@ fn time_struct_tm_items() -> i64 {
     list
 }
 
+/// Month names for `%b`/`%B` (`_strptime` uses the C locale names).
+const STRPTIME_MONTHS: [(&str, &str, i64); 12] = [
+    ("January", "Jan", 1),
+    ("February", "Feb", 2),
+    ("March", "Mar", 3),
+    ("April", "Apr", 4),
+    ("May", "May", 5),
+    ("June", "Jun", 6),
+    ("July", "Jul", 7),
+    ("August", "Aug", 8),
+    ("September", "Sep", 9),
+    ("October", "Oct", 10),
+    ("November", "Nov", 11),
+    ("December", "Dec", 12),
+];
+
+/// Weekday names for `%a`/`%A`, Monday first (Python's `tm_wday` order).
+const STRPTIME_WEEKDAYS: [(&str, &str); 7] = [
+    ("Monday", "Mon"),
+    ("Tuesday", "Tue"),
+    ("Wednesday", "Wed"),
+    ("Thursday", "Thu"),
+    ("Friday", "Fri"),
+    ("Saturday", "Sat"),
+    ("Sunday", "Sun"),
+];
+
+struct StrptimeFields {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    month_set: bool,
+    day_set: bool,
+    hour12: Option<i64>,
+    pm: Option<bool>,
+    wday: Option<i64>,
+    yday: Option<i64>,
+    zone: i64,
+    gmtoff: i64,
+}
+
+impl StrptimeFields {
+    fn new() -> StrptimeFields {
+        StrptimeFields {
+            year: 1900,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            month_set: false,
+            day_set: false,
+            hour12: None,
+            pm: None,
+            wday: None,
+            yday: None,
+            zone: NONE,
+            gmtoff: NONE,
+        }
+    }
+}
+
+fn strptime_mismatch(data: &str, format: &str) -> i64 {
+    exc::raise_with_message(
+        VALUE_ERROR,
+        &format!("time data {data:?} does not match format {format:?}"),
+    )
+}
+
+fn strptime_range(directive: char, value: i64, low: i64, high: i64) -> i64 {
+    exc::raise_with_message(
+        VALUE_ERROR,
+        &format!("{directive} must be in {low}..{high}, not {value}"),
+    )
+}
+
+fn strptime_digits(input: &[u8], index: &mut usize, min: usize, max: usize) -> Option<i64> {
+    let mut value = 0i64;
+    let mut count = 0usize;
+    while count < max && *index < input.len() && input[*index].is_ascii_digit() {
+        value = value * 10 + i64::from(input[*index] - b'0');
+        *index += 1;
+        count += 1;
+    }
+    (count >= min).then_some(value)
+}
+
+fn strptime_starts_with(input: &[u8], word: &str) -> bool {
+    let word = word.as_bytes();
+    input.len() >= word.len() && input[..word.len()].eq_ignore_ascii_case(word)
+}
+
+/// Matches a month or weekday name. `full` selects the `%B`/`%A` spelling;
+/// the abbreviated form is tried first for `%b`/`%a`, like `_strptime`'s
+/// regex alternation.
+fn strptime_name(input: &[u8], index: &mut usize, full: bool, month: bool) -> Option<usize> {
+    let rest = &input[*index..];
+    if month {
+        let mut order: Vec<usize> = (0..STRPTIME_MONTHS.len()).collect();
+        if !full {
+            order.sort_by_key(|&slot| STRPTIME_MONTHS[slot].1.len());
+        } else {
+            order.sort_by_key(|&slot| std::cmp::Reverse(STRPTIME_MONTHS[slot].0.len()));
+        }
+        for slot in order {
+            let (full_name, abbrev, _) = STRPTIME_MONTHS[slot];
+            let candidate = if full { full_name } else { abbrev };
+            if strptime_starts_with(rest, candidate) {
+                *index += candidate.len();
+                return Some(slot);
+            }
+        }
+        return None;
+    }
+    let mut order: Vec<usize> = (0..STRPTIME_WEEKDAYS.len()).collect();
+    if full {
+        order.sort_by_key(|&slot| std::cmp::Reverse(STRPTIME_WEEKDAYS[slot].0.len()));
+    } else {
+        order.sort_by_key(|&slot| STRPTIME_WEEKDAYS[slot].1.len());
+    }
+    for slot in order {
+        let (full_name, abbrev) = STRPTIME_WEEKDAYS[slot];
+        let candidate = if full { full_name } else { abbrev };
+        if strptime_starts_with(rest, candidate) {
+            *index += candidate.len();
+            return Some(slot);
+        }
+    }
+    None
+}
+
+/// Parses `%z`: `±HHMM`, `±HH:MM`, optional `SS` and `.ffffff`.
+fn strptime_offset(input: &[u8], index: &mut usize) -> Option<i64> {
+    let sign = match input.get(*index) {
+        Some(b'+') => 1i64,
+        Some(b'-') => -1i64,
+        _ => return None,
+    };
+    *index += 1;
+    let hours = strptime_digits(input, index, 2, 2)?;
+    if input.get(*index) == Some(&b':') {
+        *index += 1;
+    }
+    let minutes = strptime_digits(input, index, 2, 2)?;
+    let mut seconds = 0i64;
+    if input.get(*index) == Some(&b':') {
+        *index += 1;
+        seconds = strptime_digits(input, index, 2, 2)?;
+    } else if input.get(*index).is_some_and(u8::is_ascii_digit) {
+        seconds = strptime_digits(input, index, 2, 2)?;
+    }
+    if input.get(*index) == Some(&b'.') {
+        *index += 1;
+        let start = *index;
+        while input.get(*index).is_some_and(u8::is_ascii_digit) {
+            *index += 1;
+        }
+        if *index == start {
+            return None;
+        }
+    }
+    Some(sign * (hours * 3600 + minutes * 60 + seconds))
+}
+
+/// Expands the C-locale composite directives `%c`, `%x` and `%X`.
+fn strptime_expand(format: &str) -> String {
+    let bytes = format.as_bytes();
+    let mut expanded = String::with_capacity(format.len() + 16);
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'%' || index + 1 >= bytes.len() {
+            expanded.push(bytes[index] as char);
+            index += 1;
+            continue;
+        }
+        let directive = bytes[index + 1];
+        match directive {
+            b'c' => expanded.push_str("%a %b %d %H:%M:%S %Y"),
+            b'x' => expanded.push_str("%m/%d/%y"),
+            b'X' => expanded.push_str("%H:%M:%S"),
+            other => {
+                expanded.push('%');
+                expanded.push(other as char);
+            }
+        }
+        index += 2;
+    }
+    expanded
+}
+
+fn is_leap_year(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    const DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if month == 2 && is_leap_year(year) {
+        29
+    } else {
+        DAYS[usize::try_from(month - 1).unwrap_or(0)]
+    }
+}
+
+/// Days from 1970-01-01 (Howard Hinnant's civil-date algorithm).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = (month + 9) % 12;
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// `time.strptime(string[, format])`: C-locale directive parsing returning a
+/// `time.struct_time` with CPython's defaults (`tm_year=1900`, month/day 1,
+/// `tm_isdst=-1`).
+fn time_strptime(args: &[i64]) -> i64 {
+    let Some(data) = args.first().copied().and_then(value::as_str) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "strptime() argument 1 must be str, not {}",
+                args.first()
+                    .map_or("nothing", |item| value::type_name(*item))
+            ),
+        );
+    };
+    let format = match args.get(1).copied() {
+        None | Some(NONE) => "%a %b %d %H:%M:%S %Y",
+        Some(item) => match value::as_str(item) {
+            Some(format) => format,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "strptime() argument 2 must be str, not {}",
+                        value::type_name(item)
+                    ),
+                )
+            }
+        },
+    };
+    let expanded = strptime_expand(format);
+    let pattern = expanded.as_bytes();
+    let input = data.as_bytes();
+    let mut fields = StrptimeFields::new();
+    let mut index = 0usize;
+    let mut pattern_index = 0usize;
+    while pattern_index < pattern.len() {
+        let literal = pattern[pattern_index];
+        if literal.is_ascii_whitespace() {
+            while pattern_index < pattern.len() && pattern[pattern_index].is_ascii_whitespace() {
+                pattern_index += 1;
+            }
+            if index >= input.len() || !input[index].is_ascii_whitespace() {
+                return strptime_mismatch(data, format);
+            }
+            while index < input.len() && input[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            continue;
+        }
+        if literal != b'%' {
+            if index >= input.len() || input[index] != literal {
+                return strptime_mismatch(data, format);
+            }
+            index += 1;
+            pattern_index += 1;
+            continue;
+        }
+        pattern_index += 1;
+        let Some(&directive) = pattern.get(pattern_index) else {
+            return strptime_mismatch(data, format);
+        };
+        pattern_index += 1;
+        match directive {
+            b'%' => {
+                if index >= input.len() || input[index] != b'%' {
+                    return strptime_mismatch(data, format);
+                }
+                index += 1;
+            }
+            b'Y' => {
+                let Some(year) = strptime_digits(input, &mut index, 1, 4) else {
+                    return strptime_mismatch(data, format);
+                };
+                fields.year = year;
+            }
+            b'y' => {
+                let Some(year) = strptime_digits(input, &mut index, 2, 2) else {
+                    return strptime_mismatch(data, format);
+                };
+                fields.year = if year >= 69 { 1900 + year } else { 2000 + year };
+            }
+            b'm' => {
+                let Some(month) = strptime_digits(input, &mut index, 1, 2) else {
+                    return strptime_mismatch(data, format);
+                };
+                if !(1..=12).contains(&month) {
+                    return strptime_range('m', month, 1, 12);
+                }
+                fields.month = month;
+                fields.month_set = true;
+            }
+            b'd' => {
+                let Some(day) = strptime_digits(input, &mut index, 1, 2) else {
+                    return strptime_mismatch(data, format);
+                };
+                if !(1..=31).contains(&day) {
+                    return strptime_range('d', day, 1, 31);
+                }
+                fields.day = day;
+                fields.day_set = true;
+            }
+            b'H' => {
+                let Some(hour) = strptime_digits(input, &mut index, 1, 2) else {
+                    return strptime_mismatch(data, format);
+                };
+                if !(0..=23).contains(&hour) {
+                    return strptime_range('H', hour, 0, 23);
+                }
+                fields.hour = hour;
+            }
+            b'I' => {
+                let Some(hour) = strptime_digits(input, &mut index, 1, 2) else {
+                    return strptime_mismatch(data, format);
+                };
+                if !(1..=12).contains(&hour) {
+                    return strptime_range('I', hour, 1, 12);
+                }
+                fields.hour12 = Some(hour);
+            }
+            b'M' => {
+                let Some(minute) = strptime_digits(input, &mut index, 1, 2) else {
+                    return strptime_mismatch(data, format);
+                };
+                if !(0..=59).contains(&minute) {
+                    return strptime_range('M', minute, 0, 59);
+                }
+                fields.minute = minute;
+            }
+            b'S' => {
+                let Some(second) = strptime_digits(input, &mut index, 1, 2) else {
+                    return strptime_mismatch(data, format);
+                };
+                if !(0..=61).contains(&second) {
+                    return strptime_range('S', second, 0, 61);
+                }
+                fields.second = second;
+            }
+            // `%f`: 1..6 fractional-second digits; `struct_time` has no
+            // microsecond field, so the value is validated and discarded.
+            b'f' => {
+                if strptime_digits(input, &mut index, 1, 6).is_none() {
+                    return strptime_mismatch(data, format);
+                }
+            }
+            b'j' => {
+                let Some(day) = strptime_digits(input, &mut index, 1, 3) else {
+                    return strptime_mismatch(data, format);
+                };
+                if !(1..=366).contains(&day) {
+                    return strptime_range('j', day, 1, 366);
+                }
+                fields.yday = Some(day);
+            }
+            b'p' => {
+                let rest = &input[index..];
+                if strptime_starts_with(rest, "AM") {
+                    fields.pm = Some(false);
+                    index += 2;
+                } else if strptime_starts_with(rest, "PM") {
+                    fields.pm = Some(true);
+                    index += 2;
+                } else {
+                    return strptime_mismatch(data, format);
+                }
+            }
+            b'a' | b'A' => {
+                let Some(slot) = strptime_name(input, &mut index, directive == b'A', false) else {
+                    return strptime_mismatch(data, format);
+                };
+                fields.wday = Some(slot as i64);
+            }
+            b'b' | b'B' => {
+                let Some(slot) = strptime_name(input, &mut index, directive == b'B', true) else {
+                    return strptime_mismatch(data, format);
+                };
+                fields.month = STRPTIME_MONTHS[slot].2;
+                fields.month_set = true;
+            }
+            b'w' => {
+                let Some(day) = strptime_digits(input, &mut index, 1, 1) else {
+                    return strptime_mismatch(data, format);
+                };
+                if !(0..=6).contains(&day) {
+                    return strptime_range('w', day, 0, 6);
+                }
+                // `%w` numbers Sunday as 0; Python's `tm_wday` is Monday 0.
+                fields.wday = Some((day + 6) % 7);
+            }
+            // Week numbers: validated, but the calendar day they imply is not
+            // reconstructible without the year's first-weekday, which the
+            // parsed fields do not retain. Formats that also name the day
+            // (all practical uses) parse exactly.
+            b'U' | b'W' => {
+                let Some(week) = strptime_digits(input, &mut index, 1, 2) else {
+                    return strptime_mismatch(data, format);
+                };
+                if !(0..=53).contains(&week) {
+                    return strptime_range(directive as char, week, 0, 53);
+                }
+            }
+            b'z' => {
+                let Some(offset) = strptime_offset(input, &mut index) else {
+                    return strptime_mismatch(data, format);
+                };
+                fields.gmtoff = encode_int(offset);
+            }
+            b'Z' => {
+                let start = index;
+                while index < input.len()
+                    && (input[index].is_ascii_alphabetic()
+                        || matches!(input[index], b'_' | b'/' | b'-' | b'+'))
+                {
+                    index += 1;
+                }
+                if index == start {
+                    return strptime_mismatch(data, format);
+                }
+                fields.zone =
+                    value::str_alloc(String::from_utf8_lossy(&input[start..index]).into_owned());
+            }
+            other => {
+                return exc::raise_with_message(
+                    VALUE_ERROR,
+                    &format!(
+                        "'{}' is a bad directive in format {format:?}",
+                        other as char
+                    ),
+                );
+            }
+        }
+    }
+    if index != input.len() {
+        return strptime_mismatch(data, format);
+    }
+    if let Some(hour12) = fields.hour12 {
+        match fields.pm {
+            Some(true) => fields.hour = (hour12 % 12) + 12,
+            Some(false) => fields.hour = hour12 % 12,
+            None => {
+                return exc::raise_with_message(
+                    VALUE_ERROR,
+                    "'%I' directive requires '%p' in format",
+                )
+            }
+        }
+    }
+    if let Some(yday) = fields.yday {
+        let limit = if is_leap_year(fields.year) { 366 } else { 365 };
+        if yday > limit {
+            return strptime_range('j', yday, 1, limit);
+        }
+        let mut remaining = yday;
+        let mut month = 1i64;
+        loop {
+            let days = days_in_month(fields.year, month);
+            if remaining <= days {
+                break;
+            }
+            remaining -= days;
+            month += 1;
+        }
+        fields.month = month;
+        fields.day = remaining;
+        fields.month_set = true;
+        fields.day_set = true;
+    }
+    if !(1..=12).contains(&fields.month) {
+        return strptime_range('m', fields.month, 1, 12);
+    }
+    let limit = days_in_month(fields.year, fields.month);
+    if !(1..=limit).contains(&fields.day) {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            &format!(
+                "day {} must be in range 1..{} for month {} in year {}",
+                fields.day, limit, fields.month, fields.year
+            ),
+        );
+    }
+    let days = days_from_civil(fields.year, fields.month, fields.day);
+    let wday = fields.wday.unwrap_or_else(|| (days.rem_euclid(7) + 3) % 7);
+    let yday = fields
+        .yday
+        .unwrap_or_else(|| days - days_from_civil(fields.year, 1, 1) + 1);
+    let _ = (fields.month_set, fields.day_set);
+    let items = [
+        encode_int(fields.year),
+        encode_int(fields.month),
+        encode_int(fields.day),
+        encode_int(fields.hour),
+        encode_int(fields.minute),
+        encode_int(fields.second),
+        encode_int(wday),
+        encode_int(yday),
+        encode_int(-1),
+    ];
+    struct_time_new(&items, fields.zone, fields.gmtoff)
+}
+
 /// Keyword-aware `time` dispatch: `strftime` binds `format` and `t`.
 fn time_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    if function == "strptime" {
+        // The generic binder already moved `string`/`format` into their
+        // positional slots; any remaining name is unknown.
+        if let Some((name, _)) = keywords.first() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("strptime() got an unexpected keyword argument '{name}'"),
+            );
+        }
+        return time_strptime(args);
+    }
     if function != "strftime" {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -10541,6 +11252,7 @@ fn time_call(function: &str, args: &[i64]) -> i64 {
         "ctime" => time_ctime(args),
         "asctime" => time_asctime(args),
         "strftime" => time_strftime(args[0], args.get(1).copied().unwrap_or(NONE)),
+        "strptime" => time_strptime(args),
         "tzset" => time_tzset(),
         "_struct_time_init" => struct_time_init(args),
         "_struct_time_len" => struct_time_len(args),
@@ -15163,6 +15875,28 @@ fn os_remove_path(function: &str, args: &[i64]) -> i64 {
     }
 }
 
+/// `os.rmdir(path, *, dir_fd=None)`: remove one empty directory. `dir_fd` is
+/// accepted only as `None`; descriptor-relative lookup has no runtime
+/// representation, matching `os.remove`/`os.unlink`.
+fn os_rmdir(args: &[i64]) -> i64 {
+    if args.get(1).copied().is_some_and(|dir_fd| dir_fd != NONE) {
+        return exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "os.rmdir: dir_fd is not supported");
+    }
+    let Some(path) = value::as_path_like(args[0]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "rmdir() argument must be a path string, not {}",
+                value::type_name(args[0])
+            ),
+        );
+    };
+    match std::fs::remove_dir(path) {
+        Ok(()) => NONE,
+        Err(error) => exc::raise_with_message(OS_ERROR, &format!("rmdir: {error}: '{path}'")),
+    }
+}
+
 fn os_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "getpid" => encode_int(i64::from(std::process::id())),
@@ -15286,6 +16020,7 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         // reported error keeps the spelling the caller used.
         "remove" => os_remove_path("remove", args),
         "unlink" => os_remove_path("unlink", args),
+        "rmdir" => os_rmdir(args),
         "rename" => {
             let (Some(from), Some(to)) =
                 (value::as_path_like(args[0]), value::as_path_like(args[1]))

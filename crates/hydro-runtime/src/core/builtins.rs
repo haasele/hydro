@@ -2417,23 +2417,6 @@ pub(crate) fn call_kw(
         if let Some(base) = value::extension_class_base(class) {
             return modules::extension::ext_object_call_kw(base, argc, argv, kwargc, kw_argv);
         }
-        if crate::modules::typing::is_typeddict_class(class) {
-            let args = if argc == 0 {
-                Vec::new()
-            } else {
-                // SAFETY: checked above; caller contract.
-                unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
-            };
-            let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
-            let mut keywords = Vec::with_capacity(kwargc);
-            for pair in pairs.as_chunks::<2>().0 {
-                let Some(keyword) = value::as_str(pair[0]) else {
-                    return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
-                };
-                keywords.push((keyword.to_string(), pair[1]));
-            }
-            return typed_dict_construct(&args, &keywords);
-        }
         let args = if argc == 0 {
             Vec::new()
         } else {
@@ -2447,6 +2430,18 @@ pub(crate) fn call_kw(
                 return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
             };
             keywords.push((keyword.to_string(), pair[1]));
+        }
+        // CPython's call protocol dispatches `Class(...)` through
+        // `type(Class).__call__` before any construction machinery, so a
+        // metaclass that defines `__call__` (enum's `EnumType`, whose
+        // functional API is `Enum('Name', 'A B', module=...)`) intercepts the
+        // call. The native `type.__call__` slot is the default constructor
+        // path, so it leaves the fast path below in place.
+        if let Some(result) = methods::metaclass_call(class, &args, &keywords) {
+            return result;
+        }
+        if crate::modules::typing::is_typeddict_class(class) {
+            return typed_dict_construct(&args, &keywords);
         }
         if let Some(tag) = exc::exception_tag_of_class(class) {
             return instantiate_exception_kw(tag, &args, &keywords);
@@ -3837,13 +3832,22 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     if argc > isize::MAX as usize / std::mem::size_of::<i64>() {
         return exc::raise_with_message(TYPE_ERROR, "class instantiation has too many arguments");
     }
+    let args: &[i64] = if argc == 0 {
+        &[]
+    } else {
+        // SAFETY: checked above for NULL; caller contract.
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    };
+    // CPython's call protocol dispatches `Class(...)` through
+    // `type(Class).__call__` before any construction machinery, so a metaclass
+    // that defines `__call__` (enum's `EnumType`, whose functional API is
+    // `Enum('Name', 'A B', module=...)`) intercepts the call. The native
+    // `type.__call__` slot is the default constructor path, so it leaves the
+    // fast path below in place.
+    if let Some(result) = methods::metaclass_call(class, args, &[]) {
+        return result;
+    }
     if crate::modules::typing::is_typeddict_class(class) {
-        let args: &[i64] = if argc == 0 {
-            &[]
-        } else {
-            // SAFETY: checked above for NULL; caller contract.
-            unsafe { std::slice::from_raw_parts(argv, argc) }
-        };
         return typed_dict_construct(args, &[]);
     }
     // The universal base class has CPython's zero-argument constructor.

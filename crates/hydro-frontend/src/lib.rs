@@ -273,7 +273,7 @@ pub fn check_pytest_file(path: &Path) -> Result<Program, Vec<Diagnostic>> {
 }
 
 /// A parsed module in dependency order (dependencies before importers).
-struct LoadedModule {
+pub(crate) struct LoadedModule {
     /// Full dotted module name; `__main__` for the entry file.
     name: String,
     /// `__package__`: the package relative imports resolve against.
@@ -1892,9 +1892,15 @@ impl ModuleLoader {
                     false,
                     false,
                 ),
-                // A class body executes when the class statement runs, but it
-                // can also sit inside a deferred function: keep its imports
-                // deferred like every other nested block.
+                // A class body executes when the class statement runs. At
+                // module level that is during module initialization, so its
+                // imports are ordinary dependencies ordered like every other
+                // module-level import (CPython's `email.message` imports
+                // `email.iterators` from its `Message` class body). A class
+                // inside a deferred function keeps its imports deferred. The
+                // conditional flag keeps a module that is absent on this
+                // platform a runtime error instead of a compile diagnostic,
+                // matching the previous deferred behaviour for such branches.
                 ast::Stmt::ClassDef(s) => self.scan_stmts(
                     &s.body,
                     source,
@@ -1904,9 +1910,9 @@ impl ModuleLoader {
                     current,
                     package,
                     scan,
-                    true,
+                    deferred,
                     false,
-                    false,
+                    conditional || !deferred,
                 ),
                 ast::Stmt::If(s) => {
                     // Module-level branches execute while the module
@@ -3259,6 +3265,305 @@ fn initializer_reachable(
     seen
 }
 
+/// Imports of `module` in `stmts` that execute while the owning module body
+/// initializes.
+///
+/// Direct imports, module-level control flow and class bodies run during
+/// module initialization; function bodies do not and are skipped. Used to
+/// decide whether a reversed package/submodule cycle is safe: every import of
+/// the delayed submodule must be a top-level `from ... import ...` so its
+/// binding stores can move to an initializer segment.
+fn imports_module_during_init(stmts: &[ast::Stmt], package: &str, module: &str) -> bool {
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::Import(s) => {
+                if s.names.iter().any(|alias| alias.name.as_str() == module) {
+                    return true;
+                }
+            }
+            ast::Stmt::ImportFrom(s) => {
+                let level = s.level.as_ref().map(|level| level.to_u32()).unwrap_or(0);
+                if let Ok(resolved) = lower::resolve_import_name(
+                    level,
+                    s.module.as_ref().map(|module| module.as_str()),
+                    package,
+                ) {
+                    if resolved == module {
+                        return true;
+                    }
+                }
+            }
+            ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => {}
+            ast::Stmt::ClassDef(s) => {
+                if imports_module_during_init(&s.body, package, module) {
+                    return true;
+                }
+            }
+            ast::Stmt::If(s) => {
+                if imports_module_during_init(&s.body, package, module)
+                    || imports_module_during_init(&s.orelse, package, module)
+                {
+                    return true;
+                }
+            }
+            ast::Stmt::For(s) => {
+                if imports_module_during_init(&s.body, package, module)
+                    || imports_module_during_init(&s.orelse, package, module)
+                {
+                    return true;
+                }
+            }
+            ast::Stmt::AsyncFor(s) => {
+                if imports_module_during_init(&s.body, package, module)
+                    || imports_module_during_init(&s.orelse, package, module)
+                {
+                    return true;
+                }
+            }
+            ast::Stmt::While(s) => {
+                if imports_module_during_init(&s.body, package, module)
+                    || imports_module_during_init(&s.orelse, package, module)
+                {
+                    return true;
+                }
+            }
+            ast::Stmt::With(s) => {
+                if imports_module_during_init(&s.body, package, module) {
+                    return true;
+                }
+            }
+            ast::Stmt::AsyncWith(s) => {
+                if imports_module_during_init(&s.body, package, module) {
+                    return true;
+                }
+            }
+            ast::Stmt::Try(s) => {
+                if imports_module_during_init(&s.body, package, module)
+                    || imports_module_during_init(&s.orelse, package, module)
+                    || imports_module_during_init(&s.finalbody, package, module)
+                {
+                    return true;
+                }
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    if imports_module_during_init(&handler.body, package, module) {
+                        return true;
+                    }
+                }
+            }
+            ast::Stmt::TryStar(s) => {
+                if imports_module_during_init(&s.body, package, module)
+                    || imports_module_during_init(&s.orelse, package, module)
+                    || imports_module_during_init(&s.finalbody, package, module)
+                {
+                    return true;
+                }
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    if imports_module_during_init(&handler.body, package, module) {
+                        return true;
+                    }
+                }
+            }
+            ast::Stmt::Match(s) => {
+                for case in &s.cases {
+                    if imports_module_during_init(&case.body, package, module) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a top-level compound statement imports `module` from a block that
+/// executes during module initialization.
+fn compound_imports_module(stmt: &ast::Stmt, package: &str, module: &str) -> bool {
+    match stmt {
+        ast::Stmt::ClassDef(s) => imports_module_during_init(&s.body, package, module),
+        ast::Stmt::If(s) => {
+            imports_module_during_init(&s.body, package, module)
+                || imports_module_during_init(&s.orelse, package, module)
+        }
+        ast::Stmt::For(s) => {
+            imports_module_during_init(&s.body, package, module)
+                || imports_module_during_init(&s.orelse, package, module)
+        }
+        ast::Stmt::AsyncFor(s) => {
+            imports_module_during_init(&s.body, package, module)
+                || imports_module_during_init(&s.orelse, package, module)
+        }
+        ast::Stmt::While(s) => {
+            imports_module_during_init(&s.body, package, module)
+                || imports_module_during_init(&s.orelse, package, module)
+        }
+        ast::Stmt::With(s) => imports_module_during_init(&s.body, package, module),
+        ast::Stmt::AsyncWith(s) => imports_module_during_init(&s.body, package, module),
+        ast::Stmt::Try(s) => {
+            imports_module_during_init(&s.body, package, module)
+                || imports_module_during_init(&s.orelse, package, module)
+                || imports_module_during_init(&s.finalbody, package, module)
+                || s.handlers.iter().any(|handler| {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    imports_module_during_init(&handler.body, package, module)
+                })
+        }
+        ast::Stmt::TryStar(s) => {
+            imports_module_during_init(&s.body, package, module)
+                || imports_module_during_init(&s.orelse, package, module)
+                || imports_module_during_init(&s.finalbody, package, module)
+                || s.handlers.iter().any(|handler| {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    imports_module_during_init(&handler.body, package, module)
+                })
+        }
+        ast::Stmt::Match(s) => s
+            .cases
+            .iter()
+            .any(|case| imports_module_during_init(&case.body, package, module)),
+        _ => false,
+    }
+}
+
+/// Whether `package` may initialize before the submodule `unit` it imports,
+/// even though `unit` names `package` as a late (cycle) import.
+///
+/// `zipfile/__init__.py` defines everything and only then does
+/// `from ._path import Path, CompleteDirs`; `zipfile/_path/__init__.py`
+/// subclasses `zipfile.ZipFile` while initializing. CPython therefore runs the
+/// package body's prefix first, then the submodule, then the package's last
+/// import statement. Hydro runs a whole module body as one initializer, so the
+/// order is package first, and the package's import bindings are published by
+/// an extra initializer segment.
+///
+/// The reversal is only safe when every import of the submodule is a direct
+/// top-level `from <submodule> import ...`, the package body never reads the
+/// imported names while it initializes, and those imports are the *tail* of
+/// the module body (the `zipfile` shape). A package that defines more names
+/// after the import keeps the established submodule-first order: its later
+/// definitions must stay in the package body, not move to the deferred
+/// segment (`pkg/__init__.py` imports `run` first and defines `greeting`
+/// afterwards, and `pkg.child` resolves `greeting` late from a function).
+fn deferrable_cycle_import(units: &[LoadedModule], package: usize, unit: usize) -> bool {
+    let p = &units[package];
+    let dep = units[unit].name.as_str();
+    let mut saw = false;
+    let mut first_import: Option<usize> = None;
+    for (position, stmt) in p.module.body.iter().enumerate() {
+        match stmt {
+            ast::Stmt::Import(s) => {
+                if s.names.iter().any(|alias| alias.name.as_str() == dep) {
+                    return false;
+                }
+            }
+            ast::Stmt::ImportFrom(s) => {
+                let level = s.level.as_ref().map(|level| level.to_u32()).unwrap_or(0);
+                let Ok(module) = lower::resolve_import_name(
+                    level,
+                    s.module.as_ref().map(|module| module.as_str()),
+                    &p.package,
+                ) else {
+                    continue;
+                };
+                if module != dep {
+                    continue;
+                }
+                if s.names.iter().any(|alias| alias.name.as_str() == "*") {
+                    return false;
+                }
+                for alias in &s.names {
+                    let binding = alias
+                        .asname
+                        .as_ref()
+                        .map(|name| name.as_str())
+                        .unwrap_or(alias.name.as_str());
+                    if lower::module_references_name(&p.module.body, binding) {
+                        return false;
+                    }
+                }
+                first_import.get_or_insert(position);
+                saw = true;
+            }
+            ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => {}
+            other => {
+                if compound_imports_module(other, &p.package, dep) {
+                    return false;
+                }
+            }
+        }
+    }
+    if !saw {
+        return false;
+    }
+    // The package must run all of its own definitions before the submodule:
+    // every statement after the first import of the submodule must itself be
+    // such an import (the `zipfile` tail). A package that defines more names
+    // after the import keeps the established submodule-first order, and those
+    // definitions must not move into the deferred segment (`pkg/__init__.py`:
+    // `from .child import run` followed by `def greeting`).
+    let Some(first) = first_import else {
+        return false;
+    };
+    for stmt in &p.module.body[first..] {
+        let ast::Stmt::ImportFrom(s) = stmt else {
+            return false;
+        };
+        let level = s.level.as_ref().map(|level| level.to_u32()).unwrap_or(0);
+        let Ok(module) = lower::resolve_import_name(
+            level,
+            s.module.as_ref().map(|module| module.as_str()),
+            &p.package,
+        ) else {
+            return false;
+        };
+        if module != dep {
+            return false;
+        }
+    }
+    true
+}
+
+/// Package/submodule cycles whose package must initialize before the
+/// submodule: `(package index, submodules)`. See
+/// [`deferrable_cycle_import`].
+pub(crate) fn reversed_cycle_imports(units: &[LoadedModule]) -> HashMap<usize, Vec<usize>> {
+    let by_name: HashMap<&str, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(index, unit)| (unit.name.as_str(), index))
+        .collect();
+    let mut reversed: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (index, unit) in units.iter().enumerate() {
+        for late in &unit.late {
+            let Some(&package) = by_name.get(late.as_str()) else {
+                continue;
+            };
+            if package == index {
+                continue;
+            }
+            let ancestor = unit.name.len() > late.len()
+                && unit.name.starts_with(late.as_str())
+                && unit.name.as_bytes().get(late.len()) == Some(&b'.');
+            if !ancestor {
+                continue;
+            }
+            if !units[package].deps.contains(&index) {
+                continue;
+            }
+            if !deferrable_cycle_import(units, package, index) {
+                continue;
+            }
+            let entries = reversed.entry(package).or_default();
+            if !entries.contains(&index) {
+                entries.push(index);
+            }
+        }
+    }
+    reversed
+}
+
 /// Orders the module bodies so a unit that reads a partially initialized
 /// ancestor package initializes after that package.
 ///
@@ -3277,7 +3582,18 @@ fn initializer_reachable(
 /// subtree still binds them directly, so it can initialize before the subtree
 /// body; a value/alias/module-alias import keeps the edge and the cycle falls
 /// back to the previous order. The entry unit always stays last.
-fn unit_initializer_order(units: &[LoadedModule], entry: usize) -> Vec<usize> {
+///
+/// A package that imports the submodule only at its end, after its own
+/// definitions (`zipfile`), is the mirror image: the submodule's class bases
+/// need the package's already-executed prefix, so the package is constrained
+/// first and its import edge is soft. `reversed` holds those pairs; the
+/// lowerer moves the package's binding stores to an extra initializer segment
+/// that runs after the submodule.
+pub(crate) fn unit_initializer_order(
+    units: &[LoadedModule],
+    entry: usize,
+    reversed: &HashMap<usize, Vec<usize>>,
+) -> Vec<usize> {
     let count = units.len();
     let debug = std::env::var_os("HYDRO_DEBUG_INIT_ORDER").is_some();
     if debug {
@@ -3322,6 +3638,19 @@ fn unit_initializer_order(units: &[LoadedModule], entry: usize) -> Vec<usize> {
             }
         }
     }
+    // Deferred-cycle packages: the package body runs first, its import of the
+    // submodule is published by a later segment, so the dependency edge is
+    // relaxed instead of forcing the submodule first.
+    for (&package, submodules) in reversed {
+        if package == entry {
+            continue;
+        }
+        for &unit in submodules {
+            if unit != package && !constraints.contains(&(package, unit)) {
+                constraints.push((package, unit));
+            }
+        }
+    }
     if constraints.is_empty() {
         if debug {
             eprintln!("init-constraints: none");
@@ -3342,7 +3671,10 @@ fn unit_initializer_order(units: &[LoadedModule], entry: usize) -> Vec<usize> {
             edges.push(InitializerEdge {
                 dep,
                 importer,
-                soft: initializer_edge_is_soft(units, &by_name, &callable, importer, dep),
+                soft: initializer_edge_is_soft(units, &by_name, &callable, importer, dep)
+                    || reversed
+                        .get(&importer)
+                        .is_some_and(|submodules| submodules.contains(&dep)),
                 dropped: false,
             });
         }
@@ -3535,6 +3867,16 @@ fn lower_modules(
     namespaces: &[String],
 ) -> Result<Program, Vec<Diagnostic>> {
     let entry_index = units.len() - 1;
+    // Reversed package/submodule cycles and the initializer order they imply.
+    // Both are derived from the scan (deps/late/AST), so they are known before
+    // any unit is lowered; the lowerer needs the deferred module names.
+    let reversed = reversed_cycle_imports(units);
+    let initializer_order = unit_initializer_order(units, entry_index, &reversed);
+    let unit_by_name: HashMap<String, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(index, unit)| (unit.name.clone(), index))
+        .collect();
     let mut all_functions: Vec<hydro_ir::Function> = Vec::new();
     let mut exports: Vec<HashMap<String, lower::UserExport>> = vec![HashMap::new(); units.len()];
     // Whether each unit installs names into its own namespace at runtime;
@@ -3552,6 +3894,9 @@ fn lower_modules(
     // is derived separately because a package body can need a module that must
     // itself run after the package (see `unit_initializer_order`).
     let mut initializer_by_unit: Vec<Option<FunctionId>> = vec![None; units.len()];
+    // Extra deferred-import initializer segments of each unit, in source
+    // order, with the unit indices each must run after.
+    let mut segments_by_unit: Vec<Vec<(FunctionId, Vec<usize>)>> = vec![Vec::new(); units.len()];
     let mut entry_main = 0;
     let mut class_registry: HashMap<(String, String), (FunctionId, lower::CallSignature)> =
         HashMap::new();
@@ -3629,8 +3974,22 @@ fn lower_modules(
                 .map(|(module, _)| module.clone())
                 .collect(),
         );
+        // Modules whose body the loader ordered after this unit (a reversed
+        // package/submodule cycle): their module-level import bindings move to
+        // extra initializer segments.
+        let deferred_initializer_modules: HashSet<String> = reversed
+            .get(&index)
+            .map(|submodules| {
+                submodules
+                    .iter()
+                    .map(|&dep| units[dep].name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        lowerer.set_initializer_deferred_modules(deferred_initializer_modules);
 
         let mut hir = lowerer.lower_module(&unit.module);
+        let segments = lowerer.take_module_segments();
         let exported = lowerer.exported_names();
         let dynamic_globals = lowerer.exports_dynamic_globals();
         let module_getattr = lowerer.exports_module_getattr();
@@ -3650,6 +4009,13 @@ fn lower_modules(
         if !lower_diags.is_empty() {
             return Err(lower_diags);
         }
+        segments_by_unit[index] = segments
+            .into_iter()
+            .map(|(id, module)| {
+                let deps = unit_by_name.get(&module).copied().into_iter().collect();
+                (id, deps)
+            })
+            .collect();
 
         exports[index] = exported;
         dynamic_units[index] = dynamic_globals;
@@ -3690,10 +4056,15 @@ fn lower_modules(
         }
     }
 
-    let initializers: Vec<FunctionId> = unit_initializer_order(units, entry_index)
-        .into_iter()
-        .filter_map(|index| initializer_by_unit.get(index).copied().flatten())
-        .collect();
+    let initializers = build_initializers(
+        units,
+        entry_index,
+        &initializer_order,
+        &initializer_by_unit,
+        &segments_by_unit,
+        &reversed,
+        0,
+    );
 
     Ok(Program {
         source_name: units[entry_index].display.clone(),
@@ -3701,6 +4072,174 @@ fn lower_modules(
         main: entry_main,
         initializers,
     })
+}
+
+/// Whether `index` may initialize now: every dependency body and every
+/// deferred import segment of its dependencies already ran.
+///
+/// A reversed-cycle dependency is exempt from the body check (it is ordered
+/// later on purpose), but its own segments are not: the importer must wait
+/// until the dependency's binding segments completed.
+fn initializer_unit_ready(
+    units: &[LoadedModule],
+    reversed: &HashMap<usize, Vec<usize>>,
+    placed: &[bool],
+    pushed: &[Vec<bool>],
+    index: usize,
+) -> bool {
+    for &dep in &units[index].deps {
+        if dep == index || dep >= units.len() {
+            continue;
+        }
+        let relaxed = reversed
+            .get(&index)
+            .is_some_and(|submodules| submodules.contains(&dep));
+        if !relaxed && !placed[dep] {
+            return false;
+        }
+        if pushed
+            .get(dep)
+            .is_some_and(|segments| segments.iter().any(|&done| !done))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Pushes every deferred import segment whose unit and dependencies already
+/// initialized, in source order per unit.
+fn push_initializer_segments(
+    segments: &[Vec<(FunctionId, Vec<usize>)>],
+    placed: &[bool],
+    pushed: &mut [Vec<bool>],
+    initializers: &mut Vec<FunctionId>,
+) {
+    loop {
+        let mut progress = false;
+        for unit in 0..segments.len() {
+            for segment in 0..segments[unit].len() {
+                if pushed[unit][segment] {
+                    continue;
+                }
+                if !placed[unit] {
+                    break;
+                }
+                if segment > 0 && !pushed[unit][segment - 1] {
+                    break;
+                }
+                let (id, deps) = &segments[unit][segment];
+                let ready = deps.iter().all(|&dep| {
+                    placed.get(dep).copied().unwrap_or(false)
+                        && pushed
+                            .get(dep)
+                            .is_none_or(|done| done.iter().all(|&done| done))
+                });
+                if !ready {
+                    break;
+                }
+                initializers.push(*id);
+                pushed[unit][segment] = true;
+                progress = true;
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+}
+
+/// Interleaves module bodies and deferred import segments.
+///
+/// Without a reversed cycle the list is exactly the units in
+/// [`unit_initializer_order`] order, which keeps the established behaviour.
+/// Otherwise a unit's extra segments run as soon as every module they import
+/// initialized; an importer of a reversed-cycle package waits for those
+/// segments, exactly like CPython waits for the package body to finish its
+/// last import statement before another module sees it.
+pub(crate) fn build_initializers(
+    units: &[LoadedModule],
+    entry: usize,
+    order: &[usize],
+    mains: &[Option<FunctionId>],
+    segments: &[Vec<(FunctionId, Vec<usize>)>],
+    reversed: &HashMap<usize, Vec<usize>>,
+    initialized: usize,
+) -> Vec<FunctionId> {
+    if reversed.is_empty() {
+        return order
+            .iter()
+            .copied()
+            .filter(|&index| index >= initialized)
+            .filter_map(|index| mains.get(index).copied().flatten())
+            .collect();
+    }
+    let count = units.len();
+    let initialized = initialized.min(count);
+    let mut placed = vec![false; count];
+    let mut emitted = vec![false; count];
+    // A session fragment reuses the units of earlier fragments: they already
+    // ran and must not be emitted again.
+    for index in 0..initialized {
+        placed[index] = true;
+        emitted[index] = true;
+    }
+    let mut pushed: Vec<Vec<bool>> = segments
+        .iter()
+        .map(|list| vec![false; list.len()])
+        .collect();
+    let mut initializers = Vec::new();
+    let mut pending: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|&index| index != entry && index >= initialized)
+        .collect();
+    loop {
+        let mut progress = false;
+        let mut next = Vec::new();
+        for index in pending {
+            if emitted[index] {
+                continue;
+            }
+            if !initializer_unit_ready(units, reversed, &placed, &pushed, index) {
+                next.push(index);
+                continue;
+            }
+            if let Some(id) = mains.get(index).copied().flatten() {
+                initializers.push(id);
+            }
+            placed[index] = true;
+            emitted[index] = true;
+            push_initializer_segments(segments, &placed, &mut pushed, &mut initializers);
+            progress = true;
+        }
+        pending = next;
+        if pending.is_empty() || !progress {
+            break;
+        }
+    }
+    // A cycle that the constraints could not satisfy keeps the loader order;
+    // emit whatever is left, then any remaining segment.
+    for index in pending {
+        if !emitted[index] {
+            if let Some(id) = mains.get(index).copied().flatten() {
+                initializers.push(id);
+            }
+            placed[index] = true;
+            emitted[index] = true;
+        }
+    }
+    push_initializer_segments(segments, &placed, &mut pushed, &mut initializers);
+    // Defensive: a segment whose unit was skipped above still runs at the end.
+    for unit in 0..segments.len() {
+        for segment in 0..segments[unit].len() {
+            if !pushed[unit][segment] {
+                initializers.push(segments[unit][segment].0);
+                pushed[unit][segment] = true;
+            }
+        }
+    }
+    initializers
 }
 
 /// Placeholder HIR for an already emitted dependency function: signature only,
@@ -7342,6 +7881,103 @@ def __getattr__(name):
             initializer_names(&program),
             vec!["pkg.sub.<module>", "pkg.<module>"],
             "a directly imported submodule stays before its package body"
+        );
+    }
+
+    #[test]
+    fn package_initializes_before_a_late_submodule_cycle() {
+        // `pkg/__init__.py` defines `ZipFile` and only then imports `._path`;
+        // `pkg/_path.py` subclasses `pkg.ZipFile` while initializing. CPython
+        // runs the package prefix, then the submodule, then the package's last
+        // import statement. Hydro runs the package body first and publishes the
+        // import binding from an extra initializer segment.
+        let dir = TestDir::new("deferred-cycle-order");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            "class ZipFile:\n    pass\n\nfrom ._path import Path\n",
+        )
+        .expect("write package init");
+        fs::write(
+            pkg.join("_path.py"),
+            "import pkg\n\nclass CompleteDirs(pkg.ZipFile):\n    pass\n\nPath = CompleteDirs\n",
+        )
+        .expect("write submodule");
+        let main = dir.write("main.py", "import pkg\nprint(pkg.Path)\n");
+        let program = program(&main);
+
+        let names = initializer_names(&program);
+        let package = names
+            .iter()
+            .position(|name| *name == "pkg.<module>")
+            .unwrap_or_else(|| panic!("package initializer missing: {names:?}"));
+        let submodule = names
+            .iter()
+            .position(|name| *name == "pkg._path.<module>")
+            .unwrap_or_else(|| panic!("submodule initializer missing: {names:?}"));
+        let imports = names
+            .iter()
+            .position(|name| *name == "pkg.<imports>")
+            .unwrap_or_else(|| panic!("deferred binding segment missing: {names:?}"));
+        assert!(
+            package < submodule,
+            "the package prefix runs first: {names:?}"
+        );
+        assert!(
+            submodule < imports,
+            "the deferred binding runs after _path initialized: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_package_reading_the_imported_value_keeps_the_submodule_first() {
+        // `Path` is read while the package initializes, so its binding cannot
+        // move after the submodule: keep the established dependency order.
+        let dir = TestDir::new("deferred-cycle-read");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            "from ._path import Path\nVALUE = Path\n\nclass ZipFile:\n    pass\n",
+        )
+        .expect("write package init");
+        fs::write(
+            pkg.join("_path.py"),
+            "import pkg\n\nclass CompleteDirs(pkg.ZipFile):\n    pass\n\nPath = CompleteDirs\n",
+        )
+        .expect("write submodule");
+        let main = dir.write("main.py", "import pkg\nprint(pkg.VALUE)\n");
+        let program = program(&main);
+
+        assert_eq!(
+            initializer_names(&program),
+            vec!["pkg._path.<module>", "pkg.<module>"],
+            "a module-body read of the binding keeps the dependency order"
+        );
+    }
+
+    #[test]
+    fn class_body_import_links_a_user_module() {
+        // A class body executes during module initialization, so its import is
+        // an ordinary dependency (`email.message` imports `email.iterators` in
+        // its `Message` class body).
+        let dir = TestDir::new("class-body-import-link");
+        let pkg = dir.path.join("pkg");
+        fs::create_dir_all(&pkg).expect("create package");
+        fs::write(
+            pkg.join("__init__.py"),
+            "class Message:\n    from .helper import walk\n",
+        )
+        .expect("write package init");
+        fs::write(pkg.join("helper.py"), "def walk(self):\n    return 1\n").expect("write helper");
+        let main = dir.write("main.py", "import pkg\nprint(pkg.Message.walk)\n");
+        let program = program(&main);
+
+        assert!(
+            initializer_names(&program).contains(&"pkg.helper.<module>"),
+            "a class-body import must link its module: {:?}",
+            initializer_names(&program)
         );
     }
 }
