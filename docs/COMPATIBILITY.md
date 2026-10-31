@@ -36,19 +36,17 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
-| builtin/frozen | 52 | 50 | 2 |
-| pure | 174 | 171 | 3 |
+| builtin/frozen | 52 | 52 | 0 |
+| pure | 174 | 174 | 0 |
 | extension | 63 | 62 | 1 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 283 | 14 |
+| **Total** | 297 | 288 | 9 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
 | cpython_failed | 9 |
-| compile_error:HYD0002 | 4 |
-| runtime_error | 1 |
 
 ## Modules by layer
 
@@ -77,11 +75,11 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_stat` | ok | ok | ok | - |
 | `_string` | ok | ok | ok | - |
 | `_suggestions` | ok | ok | ok | - |
-| `_symtable` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_symtable' not found: not supported on the import search path |
+| `_symtable` | ok | ok | ok | - |
 | `_sysconfig` | ok | ok | ok | - |
 | `_thread` | ok | ok | ok | - |
 | `_tokenize` | ok | ok | ok | - |
-| `_tracemalloc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path |
+| `_tracemalloc` | ok | ok | ok | - |
 | `_types` | ok | ok | ok | - |
 | `_typing` | ok | ok | ok | - |
 | `_warnings` | ok | ok | ok | - |
@@ -252,7 +250,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `stringprep` | ok | ok | ok | - |
 | `struct` | ok | ok | ok | - |
 | `subprocess` | ok | ok | ok | - |
-| `symtable` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_symtable' not found: not supported on the import search path |
+| `symtable` | ok | ok | ok | - |
 | `sysconfig` | ok | ok | ok | - |
 | `tabnanny` | ok | ok | ok | - |
 | `tarfile` | ok | ok | ok | - |
@@ -267,9 +265,9 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `tomllib` | ok | ok | ok | - |
 | `trace` | ok | ok | ok | - |
 | `traceback` | ok | ok | ok | - |
-| `tracemalloc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path |
+| `tracemalloc` | ok | ok | ok | - |
 | `tty` | ok | ok | ok | - |
-| `turtle` | ok | exit 1 | runtime_error | NotImplementedError: exec() cannot compile Python source at runtime in Hydro: a parameter… |
+| `turtle` | ok | ok | ok | - |
 | `turtledemo` | ok | ok | ok | - |
 | `types` | ok | ok | ok | - |
 | `typing` | ok | ok | ok | - |

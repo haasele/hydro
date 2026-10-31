@@ -35,8 +35,9 @@ initial state of the first runnable core.
   import reports.
 - The stdlib matrix now runs with `HYDRO_STDLIB` pointed at the pinned CPython
   `Lib` tree (the earlier 159 count used the toolchain's default subset); the
-  same code imports **283/297** modules, so the previous report undercounted
-  the implementation by 112 modules.
+  same code imports **288/297** modules, so the previous report undercounted
+  the implementation by 117 modules; the remaining nine are CPython-failing
+  Windows-only modules (and `_gdbm` absent from the uv oracle).
 - Closed the next stdlib-import cluster: `_pydatetime`, `_pyio`, `logging`,
   `venv` and `imaplib` now import. This required sequential class-body name
   visibility, real `@property` setter/deleter decorators, unary `__neg__`/
@@ -47,6 +48,11 @@ initial state of the first runnable core.
   `os.execlp`, `os.linesep`, `O_BINARY`, `SEEK_DATA`/`SEEK_HOLE`,
   `os.device_encoding`, plus `codecs.getincrementalencoder`/
   `getincrementaldecoder` and `tempfile.mkstemp`.
+- Added Hydro-native `turtle`, `symtable`/`_symtable` and
+  `tracemalloc`/`_tracemalloc` emulations in `stdlib/`, so those modules no
+  longer depend on CPython's runtime compiler, builtin symbol table or
+  allocator-tracing internals. This closes every module CPython 3.14.9 can
+  import on this host.
 - Closed the native-extension and compiler-surface cluster: `HYDRO_STDLIB`
   now derives `lib-dynload` roots (or `HYDRO_EXTENSION_PATH`), the CPython
   C-API gained the argument/struct-sequence/audit/thread/fork helpers needed
