@@ -779,6 +779,19 @@ impl<'a> FnDecl<'a> {
     }
 }
 
+/// The PEP 695 definition-time pieces of one `def` signature.
+///
+/// `setup` holds the statements that evaluate the type-parameter list in
+/// source order, `type_params` the runtime `__type_params__` tuple (present
+/// only when the definition is generic) and `annotations` the signature's
+/// `__annotations__` mapping, already evaluated in the annotation scope.
+#[derive(Debug)]
+struct FunctionSignatureExtras {
+    setup: Vec<HStmt>,
+    type_params: Option<HExpr>,
+    annotations: Option<HExpr>,
+}
+
 /// How a dataclass/NamedTuple field produces its value when a constructor
 /// call omits the argument.
 #[derive(Clone, Debug)]
@@ -1047,14 +1060,14 @@ static BUILTINS_EVAL_MEMBER: FunctionSpec = FunctionSpec {
     dynamic_keywords: false,
 };
 
-/// `builtins.exec`: same call shape as `eval`; the runtime reports an explicit
-/// `NotImplementedError` because there is no statement compiler.
+/// `builtins.exec`: same call shape as `eval`, plus the keyword-only
+/// `closure=None` parameter CPython 3.14 accepts.
 static BUILTINS_EXEC_MEMBER: FunctionSpec = FunctionSpec {
     name: "exec",
     min_args: 1,
-    max_args: 3,
+    max_args: 4,
     ret: Type::Any,
-    params: &["source", "globals", "locals"],
+    params: &["source", "globals", "locals", "closure"],
     dynamic_keywords: false,
 };
 
@@ -1272,19 +1285,28 @@ fn find_extension_in_search_dirs(
 }
 
 /// Directories searched by [`find_extension_for_source`], in order.
+///
+/// The environment-configured roots ([`extension_search_paths_from`]) come
+/// first, followed by the CPython `lib-dynload` directories derived from
+/// `HYDRO_STDLIB` (see [`crate::stdlib_extension_dirs`]). The derivation is
+/// shared with the module loader and mirrors the runtime `sys.path`, so a
+/// standard-library extension is linked and found at run time without a
+/// `PYTHONPATH` entry.
 fn extension_search_paths() -> Vec<PathBuf> {
     let hydro_extension_path = std::env::var_os("HYDRO_EXTENSION_PATH");
     let pythonpath = std::env::var_os("PYTHONPATH");
     let hydro_site_packages = std::env::var_os("HYDRO_SITE_PACKAGES");
     let virtual_env = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
     let conda_prefix = std::env::var_os("CONDA_PREFIX").map(PathBuf::from);
-    extension_search_paths_from(
+    let mut dirs = extension_search_paths_from(
         hydro_extension_path.as_deref(),
         pythonpath.as_deref(),
         hydro_site_packages.as_deref(),
         virtual_env.as_deref(),
         conda_prefix.as_deref(),
-    )
+    );
+    crate::push_stdlib_extension_dirs(&mut dirs, std::env::var_os("HYDRO_STDLIB").as_deref());
+    dirs
 }
 
 /// Builds the extension search path from raw environment values.
@@ -2746,10 +2768,15 @@ impl<'a> Lowerer<'a> {
         // `globals`/`vars` shadows the builtin, so only unshadowed references
         // count; module-level import bindings are module attributes too, so
         // they are part of that shadow set.
+        //
+        // A module-level PEP 562 `__getattr__` makes the static namespace
+        // incomplete for the same reason (importers may resolve names through
+        // it), so it is a dynamic-namespace construct too.
         let mut module_bound = self.global_names.clone();
         module_bound.extend(self.module_def_names.iter().cloned());
         collect_import_bindings(&module.body, &mut module_bound);
-        self.dynamic_module_globals = module_uses_dynamic_globals(&module.body, &module_bound);
+        self.dynamic_module_globals =
+            self.module_getattr || module_uses_dynamic_globals(&module.body, &module_bound);
 
         self.collect_top_imports(&module.body);
         self.collect_nested_imports(&module.body, true, ImportScope::Module);
@@ -2873,11 +2900,8 @@ impl<'a> Lowerer<'a> {
                         if self.has_runtime_function_decorators(&f.decorator_list) {
                             let (line, col) = self.span(f.range);
                             self.lower_module_function_definition(
-                                &f.decorator_list,
                                 fid,
-                                f.range,
-                                &f.args,
-                                f.returns.as_deref(),
+                                &FnDecl::from_def(f),
                                 &mut fs,
                                 &mut body,
                                 line,
@@ -2889,8 +2913,7 @@ impl<'a> Lowerer<'a> {
                     self.mirror_module_function(
                         start,
                         &def_ids,
-                        &f.args,
-                        f.returns.as_deref(),
+                        &FnDecl::from_def(f),
                         &mut fs,
                         &mut body,
                     );
@@ -2901,11 +2924,8 @@ impl<'a> Lowerer<'a> {
                         if self.has_runtime_function_decorators(&f.decorator_list) {
                             let (line, col) = self.span(f.range);
                             self.lower_module_function_definition(
-                                &f.decorator_list,
                                 fid,
-                                f.range,
-                                &f.args,
-                                f.returns.as_deref(),
+                                &FnDecl::from_async_def(f),
                                 &mut fs,
                                 &mut body,
                                 line,
@@ -2917,8 +2937,7 @@ impl<'a> Lowerer<'a> {
                     self.mirror_module_function(
                         start,
                         &def_ids,
-                        &f.args,
-                        f.returns.as_deref(),
+                        &FnDecl::from_async_def(f),
                         &mut fs,
                         &mut body,
                     );
@@ -3328,25 +3347,25 @@ impl<'a> Lowerer<'a> {
     ///
     /// The compiled function value is created on that path only, decorators
     /// are evaluated first and applied bottom-up, and the result is stored in
-    /// the module's runtime global table. Wrapping the sequence in `if True:`
-    /// keeps it one HIR statement; the enclosing branch condition still
-    /// decides whether it runs.
-    #[allow(clippy::too_many_arguments)]
+    /// the module's runtime global table. A PEP 695 parameter list is
+    /// evaluated on that path too, before the annotations. Wrapping the
+    /// sequence in `if True:` keeps it one HIR statement; the enclosing branch
+    /// condition still decides whether it runs.
     fn lower_conditional_function_definition(
         &mut self,
-        decorators: &[ast::Expr],
+        decl: &FnDecl<'_>,
         fid: FunctionId,
-        args: &ast::Arguments,
-        returns: Option<&ast::Expr>,
         fs: &mut FuncState,
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
         let name = self.functions.get(fid as usize)?.name.clone();
         let mut then_body = Vec::new();
-        let decorators = self.runtime_function_decorators(decorators);
+        let signature = self.function_signature_extras(decl, fs, line, col);
+        then_body.extend(signature.setup);
+        let decorators = self.runtime_function_decorators(decl.decorators);
         let temps = self.lower_decorator_temps(&decorators, fs, &mut then_body);
-        let (target, _) = self.hidden_temp(fs, "$condeff", Type::Any);
+        let (target, target_ref) = self.hidden_temp(fs, "$condeff", Type::Any);
         then_body.push(HStmt {
             kind: HStmtKind::Assign {
                 target,
@@ -3360,21 +3379,24 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
-        if let Some(annotations) = self.function_annotations_expr(args, returns, fs, line, col) {
+        if let Some(annotations) = signature.annotations {
             then_body.push(HStmt {
                 kind: HStmtKind::SetAttr {
-                    object: HExpr {
-                        kind: HExprKind::Local(target),
-                        ty: Ty::Concrete(Type::Any),
-                        line,
-                        col,
-                    },
+                    object: target_ref.clone(),
                     name: "__annotations__".to_string(),
                     value: annotations,
                 },
                 line,
                 col,
             });
+        }
+        if let Some(type_params) = signature.type_params {
+            then_body.push(Self::type_params_attribute(
+                target_ref,
+                type_params,
+                line,
+                col,
+            ));
         }
         self.apply_decorator_temps(&temps, target, fs, &mut then_body, line, col);
         then_body.push(HStmt {
@@ -3433,6 +3455,15 @@ impl<'a> Lowerer<'a> {
             fixtures.insert(function.name.to_string(), (wrapper, scope));
         }
 
+        // Only the entry module's globals are collected as tests: pytest
+        // never collects a function defined in an imported module, so a
+        // `test*` function there is an ordinary callable and its parameters
+        // are ordinary arguments, not fixtures. Without this gate every
+        // imported stdlib module with a `testmod`/`testfile`-style helper
+        // would report each of its parameters as a missing fixture.
+        if self.dunder_name != "__main__" {
+            return;
+        }
         for stmt in body {
             let ast::Stmt::FunctionDef(function) = stmt else {
                 continue;
@@ -3947,16 +3978,21 @@ impl<'a> Lowerer<'a> {
     /// are read by name from the module's global table, whose function entries
     /// this statement creates. Only imported units mirror, because only they
     /// have importers.
+    ///
+    /// A PEP 695 generic function is mirrored unconditionally: its parameter
+    /// list has runtime values that must be published as `__type_params__` on
+    /// the function object, and a plain module-level `def` is otherwise only
+    /// compiled into the function table with no statement that could create
+    /// them. CPython's `def` stores the function in `globals()` as well.
     fn mirror_module_function(
         &mut self,
         start: usize,
         def_ids: &HashMap<usize, FunctionId>,
-        args: &ast::Arguments,
-        returns: Option<&ast::Expr>,
+        decl: &FnDecl<'_>,
         fs: &mut FuncState,
         body: &mut Vec<HStmt>,
     ) {
-        if !self.mirror_all_globals {
+        if !self.mirror_all_globals && decl.type_params.is_empty() {
             return;
         }
         let Some(&fid) = def_ids.get(&start) else {
@@ -3964,6 +4000,8 @@ impl<'a> Lowerer<'a> {
         };
         let function = &self.functions[fid as usize];
         let (name, line, col) = (function.name.clone(), function.line, function.col);
+        let signature = self.function_signature_extras(decl, fs, line, col);
+        body.extend(signature.setup);
         body.push(HStmt {
             kind: HStmtKind::GlobalSet {
                 module: self.dunder_name.clone(),
@@ -3978,27 +4016,33 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
+        let object = HExpr {
+            kind: HExprKind::GlobalGet {
+                module: self.dunder_name.clone(),
+                name,
+            },
+            ty: Ty::Concrete(Type::Any),
+            line,
+            col,
+        };
         // The mirrored value is the object importers introspect. Attach the
         // signature's `__annotations__` so `module.f.__annotations__` and
         // `annotationlib.get_annotations(module.f)` agree with the source.
-        if let Some(annotations) = self.function_annotations_expr(args, returns, fs, line, col) {
+        if let Some(annotations) = signature.annotations {
             body.push(HStmt {
                 kind: HStmtKind::SetAttr {
-                    object: HExpr {
-                        kind: HExprKind::GlobalGet {
-                            module: self.dunder_name.clone(),
-                            name,
-                        },
-                        ty: Ty::Concrete(Type::Any),
-                        line,
-                        col,
-                    },
+                    object: object.clone(),
                     name: "__annotations__".to_string(),
                     value: annotations,
                 },
                 line,
                 col,
             });
+        }
+        // A generic definition publishes its parameter tuple, exactly like a
+        // generic class statement does.
+        if let Some(type_params) = signature.type_params {
+            body.push(Self::type_params_attribute(object, type_params, line, col));
         }
     }
 
@@ -6595,10 +6639,37 @@ impl<'a> Lowerer<'a> {
                 for arg in &call.args {
                     args.push(self.expr(arg, fs));
                 }
+                // A direct `Callee::Function` call passes exactly the
+                // generated parameter slots. Only use it when the caller
+                // supplied every positional slot and the callee has no
+                // keyword-only, `*args` or `**kwargs` slot; a call that omits
+                // a default must go through the function value so the runtime
+                // binder fills the remaining slots (`_simple_enum(StrEnum)` in
+                // `tkinter` is such a call). The indirect path is the same one
+                // the keyword form above already uses.
+                if self.direct_call_matches(id, args.len()) {
+                    return HExpr {
+                        kind: HExprKind::Call {
+                            callee: Callee::Function(id),
+                            args,
+                        },
+                        ty: self.infer.fresh(),
+                        line,
+                        col,
+                    };
+                }
+                let (callee_line, callee_col) = self.span(call.func.range());
+                let callee = HExpr {
+                    kind: HExprKind::FunctionRef(id),
+                    ty: Ty::Concrete(Type::Function),
+                    line: callee_line,
+                    col: callee_col,
+                };
                 HExpr {
-                    kind: HExprKind::Call {
-                        callee: Callee::Function(id),
+                    kind: HExprKind::IndirectCall {
+                        callee: Box::new(callee),
                         args,
+                        star: None,
                     },
                     ty: self.infer.fresh(),
                     line,
@@ -6944,6 +7015,15 @@ impl<'a> Lowerer<'a> {
     /// `@property`/`@classmethod`/`@staticmethod` are ordinary callables, so
     /// they are valid on a plain function too (typing_extensions applies
     /// `@classmethod` to a module-level helper).
+    ///
+    /// A PEP 695 parameter list is only validated here. The definition
+    /// statement evaluates it and publishes the runtime tuple
+    /// ([`Self::function_signature_extras`]), because bounds and annotations
+    /// belong to the scope where the `def` executes. A method has no
+    /// definition statement of its own — the class statement binds the method
+    /// value straight into its namespace or attribute table — so a generic
+    /// method's parameters are validated and shadow correctly but no
+    /// `__type_params__` tuple is published for it.
     fn create_function_with_captures(
         &mut self,
         decl: &FnDecl<'_>,
@@ -6953,9 +7033,11 @@ impl<'a> Lowerer<'a> {
         capture_cells: &[bool],
         mut default_scope: Option<&mut FuncState>,
     ) -> Option<FunctionId> {
-        if !decl.type_params.is_empty() {
-            self.error_at(decl.range, "type parameters are not supported in Phase 1");
-        }
+        // The parameter list is evaluated by the definition statement, not
+        // here: bounds may read names of the enclosing scope and every value
+        // is created where the `def` executes. Only the shapes the lowering
+        // cannot represent are diagnosed.
+        self.check_type_params(decl.type_params);
 
         let args = decl.args;
         let mut params = Vec::new();
@@ -7352,6 +7434,13 @@ impl<'a> Lowerer<'a> {
             }
             if let ast::Stmt::Expr(e) = stmt {
                 if is_docstring_expr(&e.value) {
+                    // A leading string statement is the class docstring.
+                    // CPython stores it in the class namespace as `__doc__`
+                    // (before the rest of the body runs), so it becomes an
+                    // ordinary class attribute; later assignments win.
+                    if idx == 0 {
+                        attributes.push(("__doc__".to_string(), idx));
+                    }
                     continue;
                 }
             }
@@ -8380,6 +8469,80 @@ impl<'a> Lowerer<'a> {
         Some(Const::None)
     }
 
+    /// Re-lower the parameter defaults of a class-body method where its `def`
+    /// executes.
+    ///
+    /// CPython evaluates a `def`'s defaults in the class body, so a name the
+    /// body bound earlier (`_noarg_ = [...]; def f(self, flag=_noarg_)`)
+    /// resolves from the class namespace, not from module globals. A method
+    /// function is registered before its class body runs, so its defaults were
+    /// lowered against an empty module-like scope; a default that reads a
+    /// class-body name is therefore lowered again here, while `fs` carries the
+    /// active class scope (`class_ns` for a dynamic body, `class_attr_scopes`
+    /// for a static plan). Every other default keeps the value it got at
+    /// registration, which is already the enclosing scope's.
+    ///
+    /// Slots are ordered captures, positional-only, positional, `*args`,
+    /// keyword-only, `**kwargs`; `*args` and `**kwargs` take no source default.
+    fn lower_class_method_defaults(
+        &mut self,
+        function: FunctionId,
+        args: &ast::Arguments,
+        fs: &mut FuncState,
+    ) {
+        let mut slot = self.functions[function as usize].capture_count;
+        for arg in args.posonlyargs.iter().chain(args.args.iter()) {
+            self.lower_class_method_default(function, slot, arg, fs);
+            slot += 1;
+        }
+        if args.vararg.is_some() {
+            slot += 1;
+        }
+        for arg in &args.kwonlyargs {
+            self.lower_class_method_default(function, slot, arg, fs);
+            slot += 1;
+        }
+    }
+
+    fn lower_class_method_default(
+        &mut self,
+        function: FunctionId,
+        slot: usize,
+        arg: &ast::ArgWithDefault,
+        fs: &mut FuncState,
+    ) {
+        let Some(default) = arg.default.as_deref() else {
+            return;
+        };
+        if !self.default_reads_class_scope(default, fs) {
+            return;
+        }
+        let Some(value) = self.lowered_default(Some(default), Some(&mut *fs)) else {
+            return;
+        };
+        if let Some(param) = self.functions[function as usize].params.get_mut(slot) {
+            param.default_expr = Some(value);
+        }
+    }
+
+    /// Whether a default expression reads a name the surrounding class body
+    /// binds: an earlier class attribute or a method of a static plan, or any
+    /// namespace binding of a dynamic body.
+    fn default_reads_class_scope(&self, default: &ast::Expr, fs: &FuncState) -> bool {
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        walk_free_expr(default, &HashSet::new(), &mut names, &mut seen);
+        names.iter().any(|name| {
+            fs.class_ns
+                .as_ref()
+                .is_some_and(|state| state.bindings.contains(name))
+                || self
+                    .class_attr_scopes
+                    .last()
+                    .is_some_and(|scope| scope.contains_key(name))
+        })
+    }
+
     /// Recognise a literal constant usable as a parameter default, including a
     /// unary minus on a numeric literal. Returns `None` after reporting when
     /// the expression is not a literal.
@@ -8730,7 +8893,10 @@ impl<'a> Lowerer<'a> {
 
         let function = self.fid_base + fid;
         let decorators = self.runtime_function_decorators(decl.decorators);
-        let annotations = self.function_annotations_expr(decl.args, decl.returns, fs, line, col);
+        // The PEP 695 parameter list is evaluated in the enclosing scope where
+        // the `def` statement runs, and the annotations are lowered with those
+        // parameter names in scope.
+        let signature = self.function_signature_extras(&decl, fs, line, col);
         // A plain `def` whose binding is an ordinary local: the closure value
         // goes straight into the slot.
         if decorators.is_empty() && !fs.is_cell(target) {
@@ -8743,30 +8909,32 @@ impl<'a> Lowerer<'a> {
                 line,
                 col,
             };
-            let Some(annotations) = annotations else {
+            if signature.annotations.is_none() && signature.type_params.is_none() {
                 return Some(closure);
-            };
-            return Some(if_true_block(
-                vec![
-                    closure,
-                    HStmt {
-                        kind: HStmtKind::SetAttr {
-                            object: HExpr {
-                                kind: HExprKind::Local(target),
-                                ty: Ty::Concrete(Type::Any),
-                                line,
-                                col,
-                            },
-                            name: "__annotations__".to_string(),
-                            value: annotations,
-                        },
-                        line,
-                        col,
-                    },
-                ],
+            }
+            let mut block = signature.setup;
+            block.push(closure);
+            let object = HExpr {
+                kind: HExprKind::Local(target),
+                ty: Ty::Concrete(Type::Any),
                 line,
                 col,
-            ));
+            };
+            if let Some(annotations) = signature.annotations {
+                block.push(HStmt {
+                    kind: HStmtKind::SetAttr {
+                        object: object.clone(),
+                        name: "__annotations__".to_string(),
+                        value: annotations,
+                    },
+                    line,
+                    col,
+                });
+            }
+            if let Some(type_params) = signature.type_params {
+                block.push(Self::type_params_attribute(object, type_params, line, col));
+            }
+            return Some(if_true_block(block, line, col));
         }
         // Otherwise the slot holds a cell (recursion/mutual recursion reads
         // the binding through it) or decorators run at runtime. Evaluate the
@@ -8774,7 +8942,7 @@ impl<'a> Lowerer<'a> {
         // decorators bottom-up and bind the final value to the function's
         // name — through the cell when the binding is one. The block statement
         // keeps this a single lowered statement.
-        let mut body = Vec::new();
+        let mut body = signature.setup;
         let temps = self.lower_decorator_temps(&decorators, fs, &mut body);
         // The closure value is built in a hidden local: the definition cannot
         // overwrite the cell (or apply decorators to the binding) before the
@@ -8794,21 +8962,24 @@ impl<'a> Lowerer<'a> {
             line,
             col,
         });
-        if let Some(annotations) = annotations {
+        if let Some(annotations) = signature.annotations {
             body.push(HStmt {
                 kind: HStmtKind::SetAttr {
-                    object: HExpr {
-                        kind: HExprKind::Local(function_temp),
-                        ty: Ty::Concrete(Type::Any),
-                        line,
-                        col,
-                    },
+                    object: function_temp_ref.clone(),
                     name: "__annotations__".to_string(),
                     value: annotations,
                 },
                 line,
                 col,
             });
+        }
+        if let Some(type_params) = signature.type_params {
+            body.push(Self::type_params_attribute(
+                function_temp_ref.clone(),
+                type_params,
+                line,
+                col,
+            ));
         }
         self.apply_decorator_temps(&temps, function_temp, fs, &mut body, line, col);
         body.push(HStmt {
@@ -9316,6 +9487,7 @@ impl<'a> Lowerer<'a> {
                     return self.lower_class_body_function(
                         s.name.as_str(),
                         u32::from(s.range.start()),
+                        s.args.as_ref(),
                         fs,
                         line,
                         col,
@@ -9331,10 +9503,8 @@ impl<'a> Lowerer<'a> {
                         return None;
                     };
                     return self.lower_conditional_function_definition(
-                        &s.decorator_list,
+                        &FnDecl::from_def(s),
                         fid,
-                        &s.args,
-                        s.returns.as_deref(),
                         fs,
                         line,
                         col,
@@ -9347,6 +9517,7 @@ impl<'a> Lowerer<'a> {
                     return self.lower_class_body_function(
                         s.name.as_str(),
                         u32::from(s.range.start()),
+                        s.args.as_ref(),
                         fs,
                         line,
                         col,
@@ -9362,10 +9533,8 @@ impl<'a> Lowerer<'a> {
                         return None;
                     };
                     return self.lower_conditional_function_definition(
-                        &s.decorator_list,
+                        &FnDecl::from_async_def(s),
                         fid,
-                        &s.args,
-                        s.returns.as_deref(),
                         fs,
                         line,
                         col,
@@ -9490,6 +9659,7 @@ impl<'a> Lowerer<'a> {
             return None;
         };
         let alias_name = target.id.to_string();
+        self.check_type_params(&s.type_params);
         let mut setup: Vec<HStmt> = Vec::new();
         let (type_params, saved) =
             self.begin_type_params(&s.type_params, fs, &mut setup, line, col);
@@ -9596,6 +9766,96 @@ impl<'a> Lowerer<'a> {
             col,
         };
         (tuple, saved)
+    }
+
+    /// Validate one PEP 695 type-parameter list.
+    ///
+    /// `T: Bound`, `[*Ts]` and `[**P]` are all representable: the owning
+    /// definition evaluates each parameter into a hidden local holding a real
+    /// `typing.TypeVar`/`TypeVarTuple`/`ParamSpec` value, and the bounds are
+    /// ordinary expressions in the enclosing scope. The vendored parser's
+    /// `TypeParam` node has no PEP 696 default field, so `[T = int]` is a
+    /// syntax error before lowering ever runs. A tuple annotation
+    /// (`[T: (int, str)]`) is the only constraint spelling the grammar admits;
+    /// CPython rejects it with a syntax error as well.
+    ///
+    /// Called for every `def` when its signature is registered (so methods,
+    /// whose parameter lists are only evaluated in a class namespace, are
+    /// covered too) and for the `class`/`type` forms when their statement
+    /// lowers.
+    fn check_type_params(&mut self, params: &[ast::TypeParam]) {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for param in params {
+            let name = type_param_name(param);
+            if !seen.insert(name) {
+                self.error_at_code(
+                    type_param_range(param),
+                    codes::SYNTAX,
+                    format!("duplicate type parameter '{name}'"),
+                );
+                continue;
+            }
+            if let ast::TypeParam::TypeVar(v) = param {
+                if let Some(bound) = &v.bound {
+                    if matches!(**bound, ast::Expr::Tuple(_)) {
+                        self.error_at_code(
+                            bound.range(),
+                            codes::SYNTAX,
+                            "cannot use constraints with type parameter syntax",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The definition-time pieces a PEP 695 header adds to a `def`.
+    ///
+    /// `setup` evaluates the parameter list (one `TypeVar`/`ParamSpec`/
+    /// `TypeVarTuple` per parameter) in source order; `type_params` is the
+    /// runtime `__type_params__` tuple and `annotations` the signature's
+    /// `__annotations__` mapping. CPython evaluates the bounds and the
+    /// annotations in the implicit annotation scope, so `def f[T](x: T) -> T`
+    /// resolves `T` there; the parameter defaults are evaluated outside it
+    /// (see [`Self::create_function_with_captures`]) and the body never sees
+    /// the names. Callers push `setup` before the statement that creates the
+    /// function value and attach the two expressions to the raw function
+    /// object afterwards.
+    fn function_signature_extras(
+        &mut self,
+        decl: &FnDecl<'_>,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> FunctionSignatureExtras {
+        let mut setup = Vec::new();
+        let (type_params, saved) = if decl.type_params.is_empty() {
+            (None, Vec::new())
+        } else {
+            let (params, saved) =
+                self.begin_type_params(decl.type_params, fs, &mut setup, line, col);
+            (Some(params), saved)
+        };
+        let annotations = self.function_annotations_expr(decl.args, decl.returns, fs, line, col);
+        Self::end_type_params(fs, saved);
+        FunctionSignatureExtras {
+            setup,
+            type_params,
+            annotations,
+        }
+    }
+
+    /// `function.__type_params__ = <tuple>` for a definition statement.
+    fn type_params_attribute(object: HExpr, type_params: HExpr, line: u32, col: u32) -> HStmt {
+        HStmt {
+            kind: HStmtKind::SetAttr {
+                object,
+                name: "__type_params__".to_string(),
+                value: type_params,
+            },
+            line,
+            col,
+        }
     }
 
     /// Undo [`Self::begin_type_params`], so the parameter names are no longer
@@ -11235,6 +11495,30 @@ impl<'a> Lowerer<'a> {
                 col,
             });
         }
+        // The leading string statement is the class docstring. CPython binds
+        // it into the class namespace before the body runs, like
+        // `__module__`/`__qualname__`; a later body assignment still wins.
+        if let Some(doc) = module_docstring(&s.body) {
+            statements.push(HStmt {
+                kind: HStmtKind::SetSubscript {
+                    object: ns_ref.clone(),
+                    index: HExpr {
+                        kind: HExprKind::Const(Const::Str("__doc__".to_string())),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    },
+                    value: HExpr {
+                        kind: HExprKind::Const(Const::Str(doc)),
+                        ty: Ty::Concrete(Type::Str),
+                        line,
+                        col,
+                    },
+                },
+                line,
+                col,
+            });
+        }
         // Synthesized methods (the dataclass `__init__`) exist before the
         // body runs, so a body definition can still replace them.
         for method in &plan.methods {
@@ -11434,10 +11718,12 @@ impl<'a> Lowerer<'a> {
     /// is applied as its descriptor factory, exactly like CPython's decorator
     /// call would; any other decorator expression is evaluated in the class
     /// namespace and called with the value produced below it.
+    #[allow(clippy::too_many_arguments)]
     fn lower_class_body_function(
         &mut self,
         name: &str,
         definition_start: u32,
+        args: &ast::Arguments,
         fs: &mut FuncState,
         line: u32,
         col: u32,
@@ -11451,8 +11737,15 @@ impl<'a> Lowerer<'a> {
         // `method_has_runtime_decorators` selects the namespace path.
         let entry = entry?;
         let mut statements = Vec::new();
-        let value =
-            self.class_method_value(&entry, fs, &mut statements, definition_start, line, col)?;
+        let value = self.class_method_value(
+            &entry,
+            args,
+            fs,
+            &mut statements,
+            definition_start,
+            line,
+            col,
+        )?;
         statements.push(HStmt {
             kind: HStmtKind::SetSubscript {
                 object: HExpr {
@@ -11484,9 +11777,11 @@ impl<'a> Lowerer<'a> {
     /// `@property`/`@classmethod`/`@staticmethod` is a descriptor factory the
     /// compiler calls directly, so it needs no runtime lookup; every other
     /// decorator expression is evaluated now and parked in a hidden local.
+    #[allow(clippy::too_many_arguments)]
     fn class_method_value(
         &mut self,
         binding: &ClassMethodBinding,
+        args: &ast::Arguments,
         fs: &mut FuncState,
         out: &mut Vec<HStmt>,
         definition_start: u32,
@@ -11532,6 +11827,11 @@ impl<'a> Lowerer<'a> {
             });
             evaluated.push(Some(temp));
         }
+        // CPython evaluates the decorator expressions top-down, then the
+        // parameter defaults, then creates the function object. The defaults
+        // therefore see the class-body namespace as of this `def` statement
+        // (`_noarg_ = [...]; def f(self, flag=_noarg_)`).
+        self.lower_class_method_defaults(binding.function, args, fs);
         let mut value = if captures.is_some() {
             let (temp, temp_ref) = self.hidden_temp(fs, "$method", Type::Any);
             out.push(HStmt {
@@ -11836,6 +12136,7 @@ impl<'a> Lowerer<'a> {
         if s.type_params.is_empty() {
             return self.lower_class_statement(s, &plan, fs, None, line, col);
         }
+        self.check_type_params(&s.type_params);
         // PEP 695: the parameter list is evaluated in the enclosing scope
         // before the class header, and the parameters stay visible to the
         // bases, the header keywords and the body (annotations included),
@@ -12044,6 +12345,17 @@ impl<'a> Lowerer<'a> {
             col,
             ..
         } = emission;
+        // A method's `def` executes inside the class body, so a default that
+        // reads a class attribute must observe the value the body bound (the
+        // same object, in the same declaration order). Park every attribute
+        // such a default reads and lower those defaults while the class scope
+        // is still active.
+        let method_args = class_method_arguments(&s.body);
+        let method_default_names: HashSet<String> = method_args
+            .values()
+            .copied()
+            .flat_map(function_default_free_names)
+            .collect();
         let bases: Vec<HExpr> = plan
             .bases
             .iter()
@@ -12121,8 +12433,12 @@ impl<'a> Lowerer<'a> {
             // those shapes the values stay inline in the class statement.
             let parked = plan
                 .attributes
-                .windows(2)
-                .any(|pair| pair[0].1 == pair[1].1)
+                .iter()
+                .any(|(attribute, _)| method_default_names.contains(attribute))
+                || plan
+                    .attributes
+                    .windows(2)
+                    .any(|pair| pair[0].1 == pair[1].1)
                 || plan.attributes.iter().any(|(_, index)| {
                     matches!(
                         &s.body[*index],
@@ -12151,6 +12467,9 @@ impl<'a> Lowerer<'a> {
                         .take_while(|(_, other)| *other == index)
                         .count();
                 let values = match &s.body[index] {
+                    ast::Stmt::Expr(expression) if is_docstring_expr(&expression.value) => {
+                        HashMap::from([("__doc__".to_string(), self.expr(&expression.value, fs))])
+                    }
                     ast::Stmt::Assign(assign) => self.lower_class_body_assignment(
                         assign,
                         parked,
@@ -12213,6 +12532,18 @@ impl<'a> Lowerer<'a> {
                     scope.insert("__dataclass_fields__".to_string(), metadata.clone());
                 }
                 attributes.push(("__dataclass_fields__".to_string(), metadata));
+            }
+            // A method has no statement of its own in the static plan, but its
+            // `def` executes in the class body: lower its defaults now, while
+            // the class attribute scope still resolves class-body names.
+            for method in &plan.methods {
+                let Some(start) = method.start else {
+                    continue;
+                };
+                let Some(args) = method_args.get(&start) else {
+                    continue;
+                };
+                self.lower_class_method_defaults(method.function, args, fs);
             }
             self.class_attr_scopes.pop();
             self.class_method_starts.pop();
@@ -13513,14 +13844,10 @@ impl<'a> Lowerer<'a> {
     /// its defaults), apply the decorators bottom-up and bind the result to
     /// the module local and, when importers or functions read it, the runtime
     /// global table.
-    #[allow(clippy::too_many_arguments)]
     fn lower_module_function_definition(
         &mut self,
-        decorators: &[ast::Expr],
         fid: FunctionId,
-        range: TextRange,
-        args: &ast::Arguments,
-        returns: Option<&ast::Expr>,
+        decl: &FnDecl<'_>,
         fs: &mut FuncState,
         out: &mut Vec<HStmt>,
         line: u32,
@@ -13532,16 +13859,21 @@ impl<'a> Lowerer<'a> {
         let name = function.name.clone();
         let Some(target) = fs.lookup(&name) else {
             self.error_name(
-                range,
+                decl.range,
                 &name,
                 fs,
                 format!("function '{name}' has no local slot"),
             );
             return;
         };
-        let decorators = self.runtime_function_decorators(decorators);
+        // A PEP 695 parameter list is evaluated before the function object
+        // exists; the annotations then see the parameters, like CPython's
+        // annotation scope.
+        let signature = self.function_signature_extras(decl, fs, line, col);
+        out.extend(signature.setup);
+        let decorators = self.runtime_function_decorators(decl.decorators);
         let temps = self.lower_decorator_temps(&decorators, fs, out);
-        let (function_temp, _) = self.hidden_temp(fs, "$decor", Type::Any);
+        let (function_temp, function_temp_ref) = self.hidden_temp(fs, "$decor", Type::Any);
         out.push(HStmt {
             kind: HStmtKind::Assign {
                 target: function_temp,
@@ -13557,21 +13889,24 @@ impl<'a> Lowerer<'a> {
         });
         // Annotations belong to the raw function the `def` statement creates;
         // decorators run afterwards and may replace it, exactly like CPython.
-        if let Some(annotations) = self.function_annotations_expr(args, returns, fs, line, col) {
+        if let Some(annotations) = signature.annotations {
             out.push(HStmt {
                 kind: HStmtKind::SetAttr {
-                    object: HExpr {
-                        kind: HExprKind::Local(function_temp),
-                        ty: Ty::Concrete(Type::Any),
-                        line,
-                        col,
-                    },
+                    object: function_temp_ref.clone(),
                     name: "__annotations__".to_string(),
                     value: annotations,
                 },
                 line,
                 col,
             });
+        }
+        if let Some(type_params) = signature.type_params {
+            out.push(Self::type_params_attribute(
+                function_temp_ref,
+                type_params,
+                line,
+                col,
+            ));
         }
         self.apply_decorator_temps(&temps, function_temp, fs, out, line, col);
         let ty = Ty::Concrete(Type::Any);
@@ -17113,6 +17448,35 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
+                } else if name == "__builtins__" {
+                    // CPython injects the builtins namespace into every
+                    // module's globals: the `builtins` module in `__main__`,
+                    // and its `__dict__` in imported modules. Hydro has no
+                    // per-module dict object, so the read resolves to the same
+                    // values: the cached builtins module value for `__main__`
+                    // and the module's stable namespace dict elsewhere. A
+                    // module-level binding of the name is handled above by
+                    // `global_names`/`fs.lookup`, as in CPython.
+                    if self.dunder_name == "__main__" {
+                        HExpr {
+                            kind: HExprKind::ModuleRef {
+                                module: "builtins".to_string(),
+                            },
+                            ty: Ty::Concrete(Type::Any),
+                            line,
+                            col,
+                        }
+                    } else {
+                        HExpr {
+                            kind: HExprKind::ModuleAttr {
+                                module: "builtins".to_string(),
+                                name: "__dict__".to_string(),
+                            },
+                            ty: Ty::Concrete(Type::Any),
+                            line,
+                            col,
+                        }
+                    }
                 } else if is_attribute_only_builtin(name) {
                     // `setattr`/`delattr`/`pow` live in the `builtins` module
                     // table (the runtime implements them there) but are also
@@ -18008,19 +18372,15 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        let mut rejected = false;
+        // `*args` and `**kwargs` are ordinary binding parameters of the
+        // synthetic function; the runtime binder fills their list/dict. A
+        // keyword-only parameter needs a default-evaluation slot the lambda's
+        // parameter list does not build, so it stays unsupported.
         if let Some(first) = l.args.kwonlyargs.first() {
             self.error_at(
                 first.def.range,
                 "lambda keyword-only parameters are not supported",
             );
-            rejected = true;
-        }
-        if let Some(kwarg) = &l.args.kwarg {
-            self.error_at(kwarg.range, "lambda **kwargs parameters are not supported");
-            rejected = true;
-        }
-        if rejected {
             return self.error_expr(l.range);
         }
 
@@ -18169,11 +18529,35 @@ impl<'a> Lowerer<'a> {
             );
         }
         if let Some(vararg) = &l.args.vararg {
+            // Omitted `*args` binds an empty list, exactly like a `def`.
             self.add_param(
                 vararg,
                 None,
-                None,
+                Some(HExpr {
+                    kind: HExprKind::List(Vec::new()),
+                    ty: Ty::Concrete(Type::List),
+                    line,
+                    col,
+                }),
                 ParamKind::VarArg,
+                &mut params,
+                &mut locals,
+                &mut seen,
+            );
+        }
+        if let Some(kwarg) = &l.args.kwarg {
+            // Omitted `**kwargs` binds an empty dict; the runtime binder fills
+            // the slot with the extra keyword arguments of a call.
+            self.add_param(
+                kwarg,
+                None,
+                Some(HExpr {
+                    kind: HExprKind::Dict(Vec::new()),
+                    ty: Ty::Concrete(Type::Dict),
+                    line,
+                    col,
+                }),
+                ParamKind::KwArg,
                 &mut params,
                 &mut locals,
                 &mut seen,
@@ -20875,6 +21259,23 @@ impl<'a> Lowerer<'a> {
         self.call_signature(id)
     }
 
+    /// Whether a call with `supplied` positional arguments can use the direct
+    /// function entry.
+    ///
+    /// A `Callee::Function` call passes exactly the generated parameter slots,
+    /// so it is only valid when every parameter is positional and the caller
+    /// supplied all of them. A call that omits a default, or whose callee has
+    /// a keyword-only/`*args`/`**kwargs` slot, must go through the function
+    /// value so the runtime binder fills the remaining slots.
+    fn direct_call_matches(&self, id: FunctionId, supplied: usize) -> bool {
+        let Some(signature) = self.call_signature_for(id) else {
+            return false;
+        };
+        let start = signature.capture_count.min(signature.params.len());
+        let params = &signature.params[start..];
+        params.len() == supplied && params.iter().all(|(_, _, kind)| kind.is_positional())
+    }
+
     fn call_signature(&self, id: FunctionId) -> Option<CallSignature> {
         id.checked_sub(self.fid_base)
             .and_then(|index| self.functions.get(index as usize))
@@ -22158,9 +22559,12 @@ impl<'a> Lowerer<'a> {
                     .collect(),
             );
         }
-        // `eval(source, globals=None, locals=None)` and `exec(...)` expose
-        // their parameters by name. Bind the keywords into the positional
-        // slots the runtime entry point expects; omitted slots become `None`.
+        // `eval(source, globals=None, locals=None)` and
+        // `exec(source, globals=None, locals=None, /, *, closure=None)`
+        // expose their parameters by name. Bind the keywords into the
+        // positional slots the runtime entry point expects; omitted slots
+        // become `None`. `closure` exists only on `exec` and is its
+        // keyword-only fourth slot.
         if matches!(builtin, Builtin::Eval | Builtin::Exec) {
             let positional = args.len();
             if positional > 3 {
@@ -22175,8 +22579,9 @@ impl<'a> Lowerer<'a> {
                 );
                 return None;
             }
+            let slots_len = if builtin == Builtin::Exec { 4 } else { 3 };
             let mut slots: Vec<Option<HExpr>> = args.into_iter().map(Some).collect();
-            slots.resize(3, None);
+            slots.resize(slots_len, None);
             let mut provided = positional;
             for keyword in &call.keywords {
                 let Some(name) = keyword.arg.as_ref() else {
@@ -22191,6 +22596,7 @@ impl<'a> Lowerer<'a> {
                     "source" => 0,
                     "globals" => 1,
                     "locals" => 2,
+                    "closure" if builtin == Builtin::Exec => 3,
                     _ => {
                         self.error_at_code(
                             keyword.range,
@@ -22683,6 +23089,37 @@ fn class_method_bodies(body: &[ast::Stmt]) -> HashMap<u32, &[ast::Stmt]> {
     }
     walk(body, &mut bodies);
     bodies
+}
+
+/// Parameter lists of every method definition reachable from `body`, keyed by
+/// the definition's source range start.
+///
+/// A class-body `def` executes in the class namespace, so its parameter
+/// defaults are lowered where that namespace is the active scope; the static
+/// plan has no statement of its own for a method, so its defaults are lowered
+/// from this table while the class attribute scope is still pushed.
+fn class_method_arguments(body: &[ast::Stmt]) -> HashMap<u32, &ast::Arguments> {
+    let mut arguments = HashMap::new();
+    fn walk<'a>(body: &'a [ast::Stmt], arguments: &mut HashMap<u32, &'a ast::Arguments>) {
+        for stmt in body {
+            match stmt {
+                ast::Stmt::FunctionDef(f) => {
+                    arguments.insert(u32::from(f.range.start()), f.args.as_ref());
+                }
+                ast::Stmt::AsyncFunctionDef(f) => {
+                    arguments.insert(u32::from(f.range.start()), f.args.as_ref());
+                }
+                ast::Stmt::ClassDef(_) => {}
+                other => {
+                    for block in class_body_blocks(other) {
+                        walk(block, arguments);
+                    }
+                }
+            }
+        }
+    }
+    walk(body, &mut arguments);
+    arguments
 }
 
 /// Names bound by an assignment target: a plain name or a tuple/list of
@@ -25064,6 +25501,15 @@ fn type_param_name(param: &ast::TypeParam) -> &str {
     }
 }
 
+/// Source range of one PEP 695 type parameter, for diagnostics.
+fn type_param_range(param: &ast::TypeParam) -> TextRange {
+    match param {
+        ast::TypeParam::TypeVar(p) => p.range,
+        ast::TypeParam::ParamSpec(p) => p.range,
+        ast::TypeParam::TypeVarTuple(p) => p.range,
+    }
+}
+
 fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool) {
     for stmt in stmts {
         match stmt {
@@ -25710,14 +26156,18 @@ fn walk_free_comp(
 ///
 /// `shadowed` is the set of names bound at module level: a module that binds
 /// `globals`/`vars` itself uses that binding, not the builtin, so those names
-/// are ignored. Function bodies are separate scopes and are skipped; a
-/// function that mutates the namespace only matters when module code can reach
-/// it through an alias, and the alias assignment is itself a module-level use.
-/// Class bodies run while the module initializes, so they are scanned too;
-/// their methods are not. Lambda free names are part of the walk (they are
-/// needed for closure analysis), so a lambda that only *reads* `globals`/
-/// `vars` also marks the module dynamic: that direction only turns static name
-/// errors into runtime lookups, like the aliasing case.
+/// are ignored. Class bodies run while the module initializes, so their
+/// statements are scanned like module-level code.
+///
+/// A function or method body is a separate scope, but `globals()` inside it
+/// still returns this module's namespace: `exec(source, globals())` and
+/// `globals()[name] = value` there install names the static binding scan cannot
+/// see (`turtle._make_global_funcs`). Function bodies are therefore scanned
+/// for those namespace writes, including nested functions and methods, see
+/// [`function_body_writes_dynamic_globals`]. A lambda is part of the free-name
+/// walk (it is needed for closure analysis), so a lambda that only *reads*
+/// `globals`/`vars` also marks the module dynamic: that direction only turns
+/// static name errors into runtime lookups, like the aliasing case.
 fn module_uses_dynamic_globals(stmts: &[ast::Stmt], shadowed: &HashSet<String>) -> bool {
     stmts
         .iter()
@@ -25832,18 +26282,22 @@ fn stmt_uses_dynamic_globals(stmt: &ast::Stmt, shadowed: &HashSet<String>) -> bo
                 })
         }
         // A function definition executes its decorators and default values at
-        // module scope; the body runs later, in its own scope.
+        // module scope; the body runs later, but `globals()` inside it still
+        // names this module's namespace, so a body that writes that namespace
+        // makes the static binding scan incomplete too.
         ast::Stmt::FunctionDef(s) => {
             s.decorator_list
                 .iter()
                 .any(|decorator| expr_mentions_dynamic_globals(decorator, shadowed))
                 || function_defaults_use_dynamic_globals(&s.args, shadowed)
+                || function_body_writes_dynamic_globals(&s.body, &s.args, shadowed)
         }
         ast::Stmt::AsyncFunctionDef(s) => {
             s.decorator_list
                 .iter()
                 .any(|decorator| expr_mentions_dynamic_globals(decorator, shadowed))
                 || function_defaults_use_dynamic_globals(&s.args, shadowed)
+                || function_body_writes_dynamic_globals(&s.body, &s.args, shadowed)
         }
         // A class statement evaluates its bases, keywords and decorators at
         // module scope, and its body statements run at module scope too.
@@ -25954,6 +26408,167 @@ fn expr_calls_namespace_update(expr: &ast::Expr) -> bool {
         ast::Expr::Attribute(dictionary) => dictionary.attr.as_str() == "__dict__",
         _ => false,
     }
+}
+
+/// Whether a function or method body writes this module's namespace through
+/// `globals()`.
+///
+/// A function body is its own scope, but `globals()` inside it still returns
+/// the defining module's namespace. `exec(source, globals())` installs every
+/// name the source defines, `globals()[name] = value` binds one directly and
+/// `globals().update(mapping)` merges a mapping; all of them make the module's
+/// static binding table incomplete, exactly like the same writes at module
+/// scope (`turtle._make_global_funcs` installs `forward`, `mainloop` and the
+/// rest this way).
+///
+/// `module_bound` is the module-level binding set: a module that binds
+/// `globals` itself shadows the builtin inside its functions too. A function's
+/// own parameters and locals are excluded by [`function_free_names`], so a
+/// local variable called `globals` never counts as the builtin.
+fn function_body_writes_dynamic_globals(
+    body: &[ast::Stmt],
+    args: &ast::Arguments,
+    module_bound: &HashSet<String>,
+) -> bool {
+    if module_bound.contains("globals") {
+        return false;
+    }
+    function_free_names(body, args)
+        .iter()
+        .any(|name| name.as_str() == "globals")
+        && stmts_write_dynamic_globals(body)
+}
+
+/// Whether a statement sequence contains a write through `globals()`.
+///
+/// Compound statements are searched because the write may be conditional.
+/// Nested `def`/`class` bodies are searched too: they run with the same
+/// module globals, and the ordinary module scan only visits definitions that
+/// reach module or class scope.
+fn stmts_write_dynamic_globals(stmts: &[ast::Stmt]) -> bool {
+    stmts.iter().any(stmt_writes_dynamic_globals)
+}
+
+fn stmt_writes_dynamic_globals(stmt: &ast::Stmt) -> bool {
+    match stmt {
+        ast::Stmt::Expr(s) => expr_writes_dynamic_globals(&s.value),
+        ast::Stmt::Assign(s) => {
+            s.targets.iter().any(target_writes_dynamic_globals)
+                || expr_writes_dynamic_globals(&s.value)
+        }
+        ast::Stmt::AnnAssign(s) => {
+            target_writes_dynamic_globals(&s.target)
+                || s.value.as_deref().is_some_and(expr_writes_dynamic_globals)
+        }
+        ast::Stmt::AugAssign(s) => target_writes_dynamic_globals(&s.target),
+        ast::Stmt::Delete(s) => s.targets.iter().any(target_writes_dynamic_globals),
+        ast::Stmt::If(s) => {
+            stmts_write_dynamic_globals(&s.body) || stmts_write_dynamic_globals(&s.orelse)
+        }
+        ast::Stmt::While(s) => {
+            stmts_write_dynamic_globals(&s.body) || stmts_write_dynamic_globals(&s.orelse)
+        }
+        ast::Stmt::For(s) => {
+            stmts_write_dynamic_globals(&s.body) || stmts_write_dynamic_globals(&s.orelse)
+        }
+        ast::Stmt::AsyncFor(s) => {
+            stmts_write_dynamic_globals(&s.body) || stmts_write_dynamic_globals(&s.orelse)
+        }
+        ast::Stmt::With(s) => stmts_write_dynamic_globals(&s.body),
+        ast::Stmt::AsyncWith(s) => stmts_write_dynamic_globals(&s.body),
+        ast::Stmt::Try(s) => {
+            stmts_write_dynamic_globals(&s.body)
+                || s.handlers.iter().any(|handler| {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    stmts_write_dynamic_globals(&handler.body)
+                })
+                || stmts_write_dynamic_globals(&s.orelse)
+                || stmts_write_dynamic_globals(&s.finalbody)
+        }
+        ast::Stmt::TryStar(s) => {
+            stmts_write_dynamic_globals(&s.body)
+                || s.handlers.iter().any(|handler| {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    stmts_write_dynamic_globals(&handler.body)
+                })
+                || stmts_write_dynamic_globals(&s.orelse)
+                || stmts_write_dynamic_globals(&s.finalbody)
+        }
+        ast::Stmt::Match(s) => s
+            .cases
+            .iter()
+            .any(|case| stmts_write_dynamic_globals(&case.body)),
+        ast::Stmt::FunctionDef(s) => stmts_write_dynamic_globals(&s.body),
+        ast::Stmt::AsyncFunctionDef(s) => stmts_write_dynamic_globals(&s.body),
+        ast::Stmt::ClassDef(s) => stmts_write_dynamic_globals(&s.body),
+        _ => false,
+    }
+}
+
+/// Whether an expression statement writes the module namespace: an `exec`
+/// call whose namespace argument is `globals()`, or a mutating mapping method
+/// called on the result of `globals()`.
+fn expr_writes_dynamic_globals(expr: &ast::Expr) -> bool {
+    let ast::Expr::Call(call) = expr else {
+        return false;
+    };
+    if let ast::Expr::Name(name) = &*call.func {
+        if name.id.as_str() == "exec" {
+            // `exec(source, globals()[, locals()])`; the keyword spelling is
+            // `exec(source, globals=globals())`.
+            let namespace = call.args.get(1).or_else(|| {
+                call.keywords
+                    .iter()
+                    .find(|keyword| {
+                        keyword
+                            .arg
+                            .as_ref()
+                            .is_some_and(|arg| arg.as_str() == "globals")
+                    })
+                    .map(|keyword| &keyword.value)
+            });
+            return namespace.is_some_and(is_bare_globals_call);
+        }
+        return false;
+    }
+    let ast::Expr::Attribute(method) = &*call.func else {
+        return false;
+    };
+    matches!(
+        method.attr.as_str(),
+        "update" | "setdefault" | "pop" | "popitem" | "clear" | "__setitem__"
+    ) && is_bare_globals_call(&method.value)
+}
+
+/// Whether an assignment or deletion target writes a binding of `globals()`:
+/// `globals()[name] = value`, `del globals()[name]`, or an attribute of such
+/// an item (`globals()[name].__doc__ = ...`, the form turtle uses).
+fn target_writes_dynamic_globals(target: &ast::Expr) -> bool {
+    match target {
+        ast::Expr::Attribute(attribute) => target_writes_dynamic_globals(&attribute.value),
+        ast::Expr::Subscript(subscript) => {
+            is_bare_globals_call(&subscript.value)
+                || target_writes_dynamic_globals(&subscript.value)
+        }
+        ast::Expr::Tuple(tuple) => tuple.elts.iter().any(target_writes_dynamic_globals),
+        ast::Expr::List(list) => list.elts.iter().any(target_writes_dynamic_globals),
+        ast::Expr::Starred(starred) => target_writes_dynamic_globals(&starred.value),
+        _ => false,
+    }
+}
+
+/// Whether an expression is a bare `globals()` call.
+///
+/// Shadowing is decided by the caller through the enclosing function's free
+/// names, so this only checks the syntactic shape.
+fn is_bare_globals_call(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Call(call)
+            if matches!(&*call.func, ast::Expr::Name(name) if name.id.as_str() == "globals")
+                && call.args.is_empty()
+                && call.keywords.is_empty()
+    )
 }
 
 /// Wrap a lowered statement sequence in an always-true `if`.

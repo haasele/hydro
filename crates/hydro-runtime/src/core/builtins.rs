@@ -2860,10 +2860,18 @@ pub(crate) fn call_kw(
                 // SAFETY: nil with argc > 0 was rejected by the caller.
                 unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
             };
-            if args.len() > 3 {
-                return builtin_arity_error(builtin.name(), "1 to 3", args.len());
+            // `exec` takes the keyword-only `closure` as a fourth argument;
+            // `eval` keeps the three-argument limit.
+            let max_args = if *builtin == Builtin::Exec { 4 } else { 3 };
+            if args.len() > max_args {
+                return builtin_arity_error(
+                    builtin.name(),
+                    if max_args == 4 { "1 to 4" } else { "1 to 3" },
+                    args.len(),
+                );
             }
-            let mut slots: Vec<Option<i64>> = vec![None; 3];
+            let slot_count = if *builtin == Builtin::Exec { 4 } else { 3 };
+            let mut slots: Vec<Option<i64>> = vec![None; slot_count];
             for (index, argument) in args.into_iter().enumerate() {
                 slots[index] = Some(argument);
             }
@@ -2885,6 +2893,8 @@ pub(crate) fn call_kw(
                     "source" => 0,
                     "globals" => 1,
                     "locals" => 2,
+                    // `exec`'s keyword-only `closure`; `eval` rejects it.
+                    "closure" if builtin == &Builtin::Exec => 3,
                     _ => {
                         return exc::raise_with_message(
                             TYPE_ERROR,
@@ -5371,7 +5381,7 @@ struct ExecSource {
     check: value::ExecCheck,
 }
 
-/// `exec(source[, globals[, locals]])`.
+/// `exec(source[, globals[, locals]][, *, closure])`.
 ///
 /// Hydro has no runtime statement compiler. The one generated source shape the
 /// standard library builds at runtime is the pair of factories in
@@ -5382,8 +5392,18 @@ struct ExecSource {
 /// raises a `NotImplementedError` naming the rejected construct instead of
 /// silently doing nothing.
 fn exec_builtin(args: &[i64]) -> i64 {
-    if args.is_empty() || args.len() > 3 {
-        return builtin_arity_error("exec", "1 to 3", args.len());
+    if args.is_empty() || args.len() > 4 {
+        return builtin_arity_error("exec", "1 to 4", args.len());
+    }
+    // `exec(source, globals=None, locals=None, /, *, closure=None)`. Hydro's
+    // `exec` accepts source text only (there is no runtime code object), so a
+    // non-`None` closure can only have come with a code object and reports
+    // CPython's TypeError before the source type is inspected.
+    if args.len() > 3 && args[3] != NONE {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "closure can only be used when source is a code object",
+        );
     }
     let Some(source) = value::as_str(args[0]) else {
         return exc::raise_with_message(
@@ -10814,6 +10834,52 @@ mod tests {
             );
             exc::clear();
         }
+    }
+
+    #[test]
+    fn exec_accepts_closure_none_and_rejects_a_real_closure() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        globals::reset();
+        let function = value::builtin_function_new(Builtin::Exec);
+        let source = string("x = 1");
+        let globals = value::dict_new(Vec::new());
+        let locals = value::dict_new(Vec::new());
+        let args = [source, globals, locals];
+
+        // `closure=None` is the documented default and is accepted; the
+        // ordinary source-compilation rejection then applies.
+        let none_pair = [string("closure"), NONE];
+        let _ = call_kw(function, 3, args.as_ptr(), 1, none_pair.as_ptr());
+        assert_eq!(
+            exc::pending_tag(),
+            NOT_IMPLEMENTED_ERROR as i64,
+            "{}",
+            pending_message()
+        );
+        exc::clear();
+
+        // A real closure tuple needs a code object, which Hydro cannot accept.
+        let cells = value::tuple_new(vec![NONE]);
+        let pair = [string("closure"), cells];
+        let _ = call_kw(function, 3, args.as_ptr(), 1, pair.as_ptr());
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "closure can only be used when source is a code object"
+        );
+        exc::clear();
+
+        // Five arguments are still too many.
+        let too_many = [source, globals, locals, NONE, NONE];
+        let _ = builtin_call(Builtin::Exec, &too_many);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(
+            pending_message().contains("1 to 4"),
+            "{}",
+            pending_message()
+        );
+        exc::clear();
     }
 
     /// Builds a function whose only reference to the globals mapping is the

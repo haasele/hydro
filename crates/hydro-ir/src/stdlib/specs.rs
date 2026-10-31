@@ -14,6 +14,11 @@ pub static MATH: ModuleSpec = ModuleSpec {
         f("asin", 1, 1, Type::Float),
         f("acos", 1, 1, Type::Float),
         f("atan", 1, 1, Type::Float),
+        // `atan2(y, x)`: the quadrant-aware arctangent of `y/x`, in radians.
+        f("atan2", 2, 2, Type::Float),
+        // `hypot(*coordinates)`: Euclidean norm of any number of arguments
+        // (zero arguments yield `0.0`), computed without intermediate overflow.
+        f("hypot", 0, usize::MAX, Type::Float),
         f("exp", 1, 1, Type::Float),
         f("log", 1, 1, Type::Float),
         f("log10", 1, 1, Type::Float),
@@ -23,6 +28,10 @@ pub static MATH: ModuleSpec = ModuleSpec {
         f("ceil", 1, 1, Type::Int),
         f("trunc", 1, 1, Type::Int),
         f("fabs", 1, 1, Type::Float),
+        // `radians(deg)` / `degrees(rad)`: angle conversion between degrees
+        // and radians.
+        f("radians", 1, 1, Type::Float),
+        f("degrees", 1, 1, Type::Float),
         // `modf(x)`: the `(fractional, integral)` pair, both as floats.
         f("modf", 1, 1, Type::Tuple),
         // `copysign(x, y)`: magnitude of `x` with the sign of `y`.
@@ -502,6 +511,9 @@ pub static OS: ModuleSpec = ModuleSpec {
         kw("fspath", 1, 1, Type::Any, &["path"]),
         f("fork", 0, 0, Type::Int),
         f("waitpid", 2, 2, Type::Tuple),
+        // `os.kill(pid, sig)`: sends `sig` to `pid` (signal 0 only checks
+        // whether the process exists). Both parameters are positional-only.
+        f("kill", 2, 2, Type::None),
         f("_exit", 1, 1, Type::None),
         f("remove", 1, 1, Type::None),
         // `unlink(path)`: the file-removal spelling. The runtime additionally
@@ -1251,7 +1263,16 @@ pub static CMATH: ModuleSpec = ModuleSpec {
 pub static THREADING: ModuleSpec = ModuleSpec {
     name: "threading",
     functions: &[
-        kw("Thread", 1, 3, Type::Any, &["target", "args", "name"]),
+        // `Thread(target=None, args=(), name=None, *, daemon=None)`: the
+        // runtime applies Hydro's reduced slot layout, with `daemon` last as
+        // the keyword-only parameter CPython 3.14 spells after `name`.
+        kw(
+            "Thread",
+            1,
+            4,
+            Type::Any,
+            &["target", "args", "name", "daemon"],
+        ),
         f("Lock", 0, 0, Type::Any),
         f("RLock", 0, 0, Type::Any),
         f("Event", 0, 0, Type::Any),
@@ -1464,6 +1485,23 @@ pub static SYS: ModuleSpec = ModuleSpec {
         // has no callback hooks yet, so the names exist for imports.
         f("settrace", 1, 1, Type::None),
         f("setprofile", 1, 1, Type::None),
+        // `gettrace()` / `getprofile()`: the installed callback. No callback
+        // can be installed (see above), so both return `None`; `doctest`
+        // saves and restores this value around every example.
+        f("gettrace", 0, 0, Type::Any),
+        f("getprofile", 0, 0, Type::Any),
+        // `displayhook(value)`: the interactive display hook. `None` prints
+        // nothing; any other value binds `builtins._` and writes `repr(value)`
+        // plus a newline to the current `sys.stdout`.
+        f("displayhook", 1, 1, Type::None),
+        // `call_tracing(func, args)`: calls `func(*args)` while tracing is
+        // enabled. Hydro's runtime has no trace callbacks, so the call is
+        // dispatched directly (the observable behaviour of a traced call).
+        f("call_tracing", 2, 2, Type::Any),
+        // `remote_exec(pid, script)`: PEP 768 remote debugging. Hydro has no
+        // attach/debugger-injection protocol, so the attribute exists and the
+        // call reports that limitation instead of claiming success.
+        f("remote_exec", 2, 2, Type::None),
     ],
     constants: &[
         c("argv", Type::List),
@@ -1477,6 +1515,9 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("executable", Type::Str),
         c("_base_executable", Type::Str),
         c("__excepthook__", Type::Any),
+        // The original display hook, read by programs (doctest, code) that
+        // temporarily replace `sys.displayhook` and restore this value.
+        c("__displayhook__", Type::Any),
         // Interactive prompt strings read by `code`/`pdb`.
         c("ps1", Type::Str),
         c("ps2", Type::Str),
@@ -1858,6 +1899,17 @@ const IO_FUNCTIONS: &[FunctionSpec] = &[
             "line_buffering",
             "write_through",
         ],
+    ),
+    // `IncrementalNewlineDecoder(decoder, translate, errors='strict')`: the
+    // universal-newline codec wrapper CPython's `io` module exposes (`doctest`
+    // imports it). Declared as a function so calls lower as module calls; the
+    // runtime value is the cached class.
+    kw(
+        "IncrementalNewlineDecoder",
+        2,
+        3,
+        Type::Any,
+        &["decoder", "translate", "errors"],
     ),
     // `text_encoding(encoding, stacklevel=2)`: reports the encoding a call
     // would use, falling back to the locale when `encoding` is `None`.
@@ -2393,9 +2445,10 @@ pub static ERRNO: ModuleSpec = ModuleSpec {
 
 /// `unittest`: the minimal test runner used by the compatibility corpus.
 ///
-/// `TestCase` is a native class whose methods are dispatched by the runtime;
-/// `main()` runs every registered test case. The `_`-prefixed functions are
-/// internal runtime hooks and are not part of the Python-visible API.
+/// `TestCase` and `TestSuite` are native classes whose methods are dispatched
+/// by the runtime; `main()` runs every registered test case. The `_`-prefixed
+/// functions are internal runtime hooks and are not part of the Python-visible
+/// API.
 pub static UNITTEST: ModuleSpec = ModuleSpec {
     name: "unittest",
     functions: &[
@@ -2409,7 +2462,10 @@ pub static UNITTEST: ModuleSpec = ModuleSpec {
         f("_assert_is", 3, 3, Type::None),
         f("_fail", 1, 2, Type::None),
     ],
-    constants: &[c("TestCase", Type::Any)],
+    // `TestCase` and `TestSuite` are classes (not constructors declared as
+    // functions), so reads resolve them directly; `Type::Any` keeps
+    // subclassing and construction lowering to the runtime values.
+    constants: &[c("TestCase", Type::Any), c("TestSuite", Type::Any)],
 };
 
 /// `pytest`: the Hydro test runner's native support module.
@@ -2912,12 +2968,14 @@ pub static TMPFILE: ModuleSpec = ModuleSpec {
         f("_tempdir_exit", 4, 4, Type::None),
         f("_tempdir_cleanup", 1, 1, Type::None),
         // `NamedTemporaryFile(mode='w+b', buffering=-1, encoding=None,
-        // newline=None, suffix=None, prefix=None, dir=None, delete=True,
-        // errors=None)`: the file object is deleted when it is closed.
+        // newline=None, suffix=None, prefix=None, dir=None, delete=True, *,
+        // errors=None, delete_on_close=True)`: the file object is deleted when
+        // it is closed (`delete_on_close`) or when the final reference goes
+        // away (`delete`).
         kw(
             "NamedTemporaryFile",
             0,
-            9,
+            10,
             Type::Any,
             &[
                 "mode",
@@ -2929,6 +2987,7 @@ pub static TMPFILE: ModuleSpec = ModuleSpec {
                 "dir",
                 "delete",
                 "errors",
+                "delete_on_close",
             ],
         ),
     ],
@@ -5945,6 +6004,12 @@ pub static READLINE: ModuleSpec = ModuleSpec {
         f("read_history_file", 0, 1, Type::None),
         f("write_history_file", 0, 1, Type::None),
         f("add_history", 1, 1, Type::None),
+        // `get_history_item(index)`: the 1-based history entry as `str`, or
+        // `None` when the index is out of range.
+        f("get_history_item", 1, 1, Type::Any),
+        // `set_startup_hook(function=None)`: installs (or clears) the hook
+        // libreadline calls before the first prompt of a line-editing session.
+        f("set_startup_hook", 0, 1, Type::None),
         f("clear_history", 0, 0, Type::None),
         f("get_history_length", 0, 0, Type::Int),
         f("set_history_length", 1, 1, Type::None),
@@ -6531,6 +6596,10 @@ pub static RUNPY: ModuleSpec = ModuleSpec {
         // `_get_module_details(mod_name)`: the internal helper that resolves
         // the module metadata `run_module` executes.
         f("_get_module_details", 1, 1, Type::Any),
+        // `_get_main_module_details(error=ImportError)`: resolves `__main__`
+        // the same way, converting the "cannot find `__main__`" failure into
+        // the caller-selected exception class (3.14 signature).
+        kw("_get_main_module_details", 0, 1, Type::Tuple, &["error"]),
     ],
     constants: &[],
 };
@@ -6829,6 +6898,9 @@ mod tests {
     fn os_and_platform_new_entries() {
         assert_eq!(function("os", "sysconf").unwrap().ret, Type::Int);
         assert_eq!(function("os", "getloadavg").unwrap().ret, Type::Tuple);
+        // `os.kill(pid, sig)`.
+        let kill = function("os", "kill").expect("os.kill");
+        assert_eq!((kill.min_args, kill.max_args, kill.ret), (2, 2, Type::None));
         let uname = function("os", "uname").expect("os.uname");
         assert_eq!(
             (uname.min_args, uname.max_args, uname.ret),
@@ -7668,6 +7740,24 @@ mod tests {
     }
 
     #[test]
+    fn math_hypot_atan2_radians_and_degrees_are_registered() {
+        // `hypot(*coordinates)` is variadic and accepts zero arguments.
+        let hypot = function("math", "hypot").expect("math.hypot");
+        assert_eq!((hypot.min_args, hypot.max_args), (0, usize::MAX));
+        assert_eq!(hypot.ret, Type::Float);
+        assert!(hypot.params.is_empty());
+        let atan2 = function("math", "atan2").expect("math.atan2");
+        assert_eq!((atan2.min_args, atan2.max_args), (2, 2));
+        assert_eq!(atan2.ret, Type::Float);
+        for name in ["radians", "degrees"] {
+            let spec = function("math", name).unwrap_or_else(|| panic!("math.{name}"));
+            assert_eq!((spec.min_args, spec.max_args), (1, 1), "{name}");
+            assert_eq!(spec.ret, Type::Float, "{name}");
+            assert!(!spec.dynamic_keywords, "{name}");
+        }
+    }
+
+    #[test]
     fn math_prod_is_registered_with_a_keyword_only_start() {
         let prod = function("math", "prod").expect("math.prod");
         // `iterable` is the only positional slot; `start` is keyword-only.
@@ -7743,6 +7833,8 @@ mod tests {
             ("prefix", Type::Str),
             ("base_prefix", Type::Str),
             ("exec_prefix", Type::Str),
+            // The saved original display hook read by `doctest`/`code`.
+            ("__displayhook__", Type::Any),
             ("last_exc", Type::Any),
             ("last_type", Type::Any),
             ("last_value", Type::Any),
@@ -7778,6 +7870,25 @@ mod tests {
             (frame.min_args, frame.max_args, frame.ret),
             (0, 1, Type::Any)
         );
+        for (name, min, max, ret) in [
+            // `sys.displayhook(value)`.
+            ("displayhook", 1, 1, Type::None),
+            // `sys.call_tracing(func, args)`.
+            ("call_tracing", 2, 2, Type::Any),
+            // `sys.remote_exec(pid, script)`.
+            ("remote_exec", 2, 2, Type::None),
+            // `sys.gettrace()` / `sys.getprofile()`: no callback can be
+            // installed, so the getters return `None` (`Type::Any` covers the
+            // callable CPython would report).
+            ("gettrace", 0, 0, Type::Any),
+            ("getprofile", 0, 0, Type::Any),
+        ] {
+            let spec = function("sys", name).unwrap_or_else(|| panic!("sys.{name}"));
+            assert_eq!((spec.min_args, spec.max_args, spec.ret), (min, max, ret));
+        }
+        let thread = function("threading", "Thread").expect("threading.Thread");
+        assert_eq!((thread.min_args, thread.max_args), (1, 4));
+        assert_eq!(thread.params, &["target", "args", "name", "daemon"][..]);
         assert_eq!(
             crate::stdlib::module("builtins")
                 .expect("builtins spec")
@@ -7831,6 +7942,27 @@ mod tests {
         ] {
             assert!(constant("builtins", name).is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn unittest_classes_are_declared_as_constants() {
+        // `TestCase` and `TestSuite` are classes, not module functions: reads
+        // resolve them directly and the runtime hands back native class
+        // values (methods are dispatched under qualified names).
+        for name in ["TestCase", "TestSuite"] {
+            assert_eq!(
+                constant("unittest", name)
+                    .unwrap_or_else(|| panic!("unittest.{name}"))
+                    .ty,
+                Type::Any,
+                "{name}"
+            );
+            assert!(function("unittest", name).is_none(), "{name}");
+        }
+        // Suite methods are runtime-only qualified names, so the module spec
+        // must not advertise them as module functions.
+        assert!(function("unittest", "TestSuite.addTest").is_none());
+        assert!(function("unittest", "TestSuite.run").is_none());
     }
 
     #[test]
@@ -8871,6 +9003,19 @@ mod tests {
             (details.min_args, details.max_args, details.ret),
             (1, 1, Type::Any)
         );
+        // `_get_main_module_details(error=ImportError)` is the 3.14 helper
+        // `pdb` calls, with its keyword-only-looking `error` parameter.
+        let main_details =
+            function("runpy", "_get_main_module_details").expect("runpy._get_main_module_details");
+        assert_eq!(
+            (
+                main_details.min_args,
+                main_details.max_args,
+                main_details.ret
+            ),
+            (0, 1, Type::Tuple)
+        );
+        assert_eq!(main_details.params, &["error"][..]);
         // Every alias is registered exactly once.
         for name in [
             "_abc",
@@ -9383,6 +9528,8 @@ mod tests {
             ("get_begidx", 0, 0, Type::Int),
             ("get_completer_delims", 0, 0, Type::Str),
             ("get_current_history_length", 0, 0, Type::Int),
+            ("get_history_item", 1, 1, Type::Any),
+            ("set_startup_hook", 0, 1, Type::None),
             ("redisplay", 0, 1, Type::None),
         ] {
             let spec = function("readline", name).unwrap_or_else(|| panic!("readline.{name}"));
@@ -9937,5 +10084,30 @@ mod tests {
             constant("importlib", "_bootstrap").expect("_bootstrap").ty,
             Type::Any
         );
+    }
+
+    #[test]
+    fn tempfile_named_temporary_file_accepts_delete_on_close() {
+        // `NamedTemporaryFile(mode, buffering, encoding, newline, suffix,
+        // prefix, dir, delete, *, errors, delete_on_close)`: the full keyword
+        // set `pdb.attach` uses.
+        let spec = function("tempfile", "NamedTemporaryFile").expect("NamedTemporaryFile");
+        assert_eq!((spec.min_args, spec.max_args, spec.ret), (0, 10, Type::Any));
+        assert_eq!(
+            spec.params,
+            &[
+                "mode",
+                "buffering",
+                "encoding",
+                "newline",
+                "suffix",
+                "prefix",
+                "dir",
+                "delete",
+                "errors",
+                "delete_on_close",
+            ][..]
+        );
+        assert!(!spec.dynamic_keywords);
     }
 }

@@ -772,6 +772,28 @@ pub extern "C" fn hydro_function_params(function: i64, count: usize, names: *con
     function
 }
 
+/// Attaches the source docstring of a generated function value.
+///
+/// `doc_ptr..doc_ptr+doc_len` holds the UTF-8 text of the leading string
+/// statement of the definition (empty for `def f(): ''`). Codegen calls this
+/// once, right after creating the wrapper, so `func.__doc__` matches CPython.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn hydro_function_set_doc(function: i64, doc_ptr: *const c_uchar, doc_len: usize) {
+    let doc = if doc_len == 0 {
+        String::new()
+    } else {
+        match required_name(doc_ptr, doc_len) {
+            Some(doc) => doc,
+            None => {
+                exc::raise_with_message(exc::TYPE_ERROR, "function docstring must be a string");
+                return;
+            }
+        }
+    };
+    value::function_set_doc(function, &doc);
+}
+
 /// Copies `argc` tagged arguments for a new fiber. `NULL` with `argc > 0` and
 /// over-long counts are reported as an internal error.
 fn copy_fiber_args(argc: usize, argv: *const i64) -> Option<Vec<i64>> {

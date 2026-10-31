@@ -176,6 +176,9 @@ struct Runtime {
     cell_get: FuncId,
     cell_set: FuncId,
     function_params: FuncId,
+    /// Attaches the source docstring of a generated wrapper
+    /// (`hydro_function_set_doc(function, ptr, len)`).
+    function_set_doc: FuncId,
     function_meta: FuncId,
     coroutine_new: FuncId,
     generator_new: FuncId,
@@ -409,6 +412,12 @@ impl Runtime {
                 "hydro_function_params",
                 &[i64t, ptr, ptr],
                 Some(i64t),
+            )?,
+            function_set_doc: declare_runtime(
+                module,
+                "hydro_function_set_doc",
+                &[i64t, ptr, ptr],
+                None,
             )?,
             function_meta: declare_runtime(
                 module,
@@ -6281,6 +6290,25 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         name.rsplit('.').next().unwrap_or(name)
     }
 
+    /// The source docstring of a generated definition: the leading string
+    /// expression statement of the body, after the synthetic `CellInit`
+    /// prologue the frontend prepends for captured locals. CPython only treats
+    /// a string as a docstring when it is the first statement, so anything
+    /// else (including an undocumented body) yields `None`.
+    fn function_docstring(function: &Function) -> Option<&str> {
+        let statement = function
+            .body
+            .iter()
+            .find(|statement| !matches!(&statement.kind, StmtKind::CellInit { .. }))?;
+        match &statement.kind {
+            StmtKind::Expr(expression) => match &expression.kind {
+                ExprKind::Const(Const::Str(text)) => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Lower a reference to a program function to a first-class function
     /// value via `hydro_function_new(wrapper, arity, name, name_len, flags)`.
     fn lower_function_ref(&mut self, id: FunctionId) -> Result<Value, CodegenError> {
@@ -6374,6 +6402,17 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         // the parameter defaults are evaluated.
         let mark = self.scratch_mark();
         self.scratch_push(value)?;
+        // The leading string statement of the definition is the function's
+        // `__doc__`. It lives in the IR body, so attach it here where both
+        // named functions and closures publish their metadata; the value is
+        // rooted above while the runtime allocates the docstring.
+        if let Some(doc) = Self::function_docstring(function) {
+            let (slot, len) = make_bytes_slot(&mut self.builder, doc.as_bytes())?;
+            let doc_ptr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
+            let doc_len = self.builder.ins().iconst(self.ptr_ty, len as i64);
+            let id = self.runtime.function_set_doc;
+            self.call_void(id, &[value, doc_ptr, doc_len]);
+        }
         let reference = self.func_ref(full_wrapper);
         let address = self.builder.ins().func_addr(self.ptr_ty, reference);
         let address = self.pointer_to_i64(address);
@@ -8948,6 +8987,54 @@ mod tests {
             crate::compile_object(&program).expect("a closure-valued class method must lower");
         assert!(runtime_call_sites(&object, "hydro_closure_new") > 0);
         assert!(runtime_call_sites(&object, "hydro_class_new") > 0);
+    }
+
+    #[test]
+    fn function_docstrings_attach_through_the_runtime() {
+        let documented = Function {
+            name: "f".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: Vec::new(),
+            body: vec![Stmt::new(
+                StmtKind::Expr(Expr::new(
+                    ExprKind::Const(Const::Str("source doc".to_string())),
+                    Type::Str,
+                    1,
+                )),
+                1,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let module_body = Function {
+            name: "<module>".to_string(),
+            params: Vec::new(),
+            capture_count: 0,
+            ret_ty: Type::None,
+            locals: vec![LocalInfo {
+                name: "f".to_string(),
+                ty: Type::Any,
+            }],
+            body: vec![Stmt::new(
+                StmtKind::Assign {
+                    target: 0,
+                    value: Expr::new(ExprKind::FunctionRef(1), Type::Function, 2),
+                },
+                2,
+            )],
+            is_async: false,
+            is_generator: false,
+        };
+        let program = Program {
+            source_name: "test.py".to_string(),
+            functions: vec![module_body, documented],
+            main: 0,
+            initializers: Vec::new(),
+        };
+        let object = crate::compile_object(&program).expect("a documented function must lower");
+        assert!(runtime_call_sites(&object, "hydro_function_set_doc") > 0);
     }
 
     #[test]

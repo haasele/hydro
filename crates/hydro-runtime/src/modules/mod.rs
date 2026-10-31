@@ -324,9 +324,11 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         stdlib::FunctionSpec {
             name: "exec",
             min_args: 1,
-            max_args: 3,
+            max_args: 4,
             ret: hydro_ir::Type::Any,
-            params: &["source", "globals", "locals"],
+            // `exec(source, globals=None, locals=None, /, *, closure=None)`;
+            // `closure` is the keyword-only slot the runtime validates.
+            params: &["source", "globals", "locals", "closure"],
             dynamic_keywords: false,
         },
     ),
@@ -475,6 +477,65 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
             min_args: 1,
             max_args: 1,
             ret: hydro_ir::Type::Set,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    // Native methods of `io.IncrementalNewlineDecoder`: the universal-newline
+    // codec wrapper (its `decode` takes the optional `final` keyword). Like
+    // the other stream methods it is only reachable through the class
+    // namespace, so the table carries just the arity spec.
+    (
+        "io.IncrementalNewlineDecoder.__init__",
+        stdlib::FunctionSpec {
+            name: "IncrementalNewlineDecoder.__init__",
+            min_args: 2,
+            max_args: 4,
+            ret: hydro_ir::Type::None,
+            params: &["self", "decoder", "translate", "errors"],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.IncrementalNewlineDecoder.decode",
+        stdlib::FunctionSpec {
+            name: "IncrementalNewlineDecoder.decode",
+            min_args: 2,
+            max_args: 3,
+            ret: hydro_ir::Type::Str,
+            params: &["self", "input", "final"],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.IncrementalNewlineDecoder.getstate",
+        stdlib::FunctionSpec {
+            name: "IncrementalNewlineDecoder.getstate",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::Tuple,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.IncrementalNewlineDecoder.setstate",
+        stdlib::FunctionSpec {
+            name: "IncrementalNewlineDecoder.setstate",
+            min_args: 2,
+            max_args: 2,
+            ret: hydro_ir::Type::None,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "io.IncrementalNewlineDecoder.reset",
+        stdlib::FunctionSpec {
+            name: "IncrementalNewlineDecoder.reset",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::None,
             params: &[],
             dynamic_keywords: false,
         },
@@ -2360,6 +2421,48 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         "os.ScandirIterator.close",
         native_member("ScandirIterator.close", 1, 1),
     ),
+    // `unittest.TestSuite` is a native class (the module has no Python
+    // source), so its methods are qualified names outside the module's
+    // function table, like the `os` iterator above.
+    (
+        "unittest.TestSuite.__init__",
+        stdlib::FunctionSpec {
+            name: "TestSuite.__init__",
+            min_args: 1,
+            max_args: 2,
+            ret: hydro_ir::Type::None,
+            params: &["self", "tests"],
+            dynamic_keywords: false,
+        },
+    ),
+    (
+        "unittest.TestSuite.addTest",
+        native_member_ret("TestSuite.addTest", 2, 2, hydro_ir::Type::None),
+    ),
+    (
+        "unittest.TestSuite.addTests",
+        native_member_ret("TestSuite.addTests", 2, 2, hydro_ir::Type::None),
+    ),
+    (
+        "unittest.TestSuite.countTestCases",
+        native_member_ret("TestSuite.countTestCases", 1, 1, hydro_ir::Type::Int),
+    ),
+    (
+        "unittest.TestSuite.run",
+        native_member("TestSuite.run", 2, 3),
+    ),
+    (
+        "unittest.TestSuite.__iter__",
+        native_member("TestSuite.__iter__", 1, 1),
+    ),
+    (
+        "unittest.TestSuite.__len__",
+        native_member_ret("TestSuite.__len__", 1, 1, hydro_ir::Type::Int),
+    ),
+    (
+        "unittest.TestSuite.__repr__",
+        native_member_ret("TestSuite.__repr__", 1, 1, hydro_ir::Type::Str),
+    ),
     // The `random.Random` proxy exposes the generator's methods on the class
     // value. Constructing through it runs the real generator factory.
     (
@@ -2849,8 +2952,12 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if module == "errno" {
         return errno::lookup(name);
     }
-    if module == "unittest" && name == "TestCase" {
-        return unittest::test_case();
+    if module == "unittest" {
+        match name {
+            "TestCase" => return unittest::test_case(),
+            "TestSuite" => return unittest_test_suite_class(),
+            _ => {}
+        }
     }
     if module == "pytest" && name == "mark" {
         return pytest::marks();
@@ -2874,6 +2981,7 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
             "StringIO" => return string_io_class(),
             "BytesIO" => return bytes_io_class(),
             "TextIOWrapper" => return text_io_wrapper_class(),
+            "IncrementalNewlineDecoder" => return incremental_newline_decoder_class(),
             "FileIO" => return io_file_class(value::FileClass::FileIO),
             "BufferedReader" => return io_file_class(value::FileClass::BufferedReader),
             "BufferedWriter" => return io_file_class(value::FileClass::BufferedWriter),
@@ -3248,6 +3356,11 @@ fn supplemental_value(module: &str, name: &str) -> Option<i64> {
             "runpy",
             "_get_module_details",
             2,
+        )),
+        ("runpy", "_get_main_module_details") => Some(value::native_function_new(
+            "runpy",
+            "_get_main_module_details",
+            1,
         )),
         // `traceback` reads this helper off the module value; the central spec
         // may still be empty while the runtime table carries its arity.
@@ -3653,7 +3766,12 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         }
         // `runpy.run_module(mod_name, init_globals, run_name, alter_sys)`: the
         // keyword binder has already moved declared names into their slots.
-        "runpy" => importlib::runpy_call_kw(function, args, &keywords),
+        // `_get_main_module_details(error=...)` keeps its keyword-only
+        // `error` selector here.
+        "runpy" => match function {
+            "_get_main_module_details" => runpy_get_main_module_details_kw(args, &keywords),
+            _ => importlib::runpy_call_kw(function, args, &keywords),
+        },
         // `importlib.util`'s helpers take their keyword names positionally
         // after the generic binder (and `_find_spec_from_path` takes two).
         "importlib.util" => importlib_util::call(function, args),
@@ -4241,6 +4359,10 @@ fn builtins_dispatch_kw(function: &str, args: &[i64], keywords: &[(String, i64)]
             ("pow", "mod") => 2,
             ("format", "value") => 0,
             ("format", "format_spec") => 1,
+            // `exec(source, globals=None, locals=None, /, *, closure=None)`:
+            // the keyword-only closure slot. The frontend usually binds it
+            // positionally already; this covers dynamic calls.
+            ("exec", "closure") => 3,
             // `compile`'s only keyword-only parameter; the runtime compiler
             // is unavailable, so the value is accepted and then the call
             // raises the truthful NotImplementedError. Every other parameter
@@ -4374,7 +4496,10 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "selectors" => select::selectors_call(function, args),
         "ssl" => socket::ssl_call(function, args),
         "asyncio" => asyncio::call(function, args),
-        "unittest" => unittest::call(function, args),
+        "unittest" => match unittest_suite_call(function, args) {
+            Some(result) => result,
+            None => unittest::call(function, args),
+        },
         "pytest" => pytest::call(function, args),
         "binascii" => binascii::call(function, args),
         "base64" => base64::call(function, args),
@@ -4424,6 +4549,380 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "_hydro_sidecar" => sidecar::call(function, args),
         _ => missing_attribute(module, function),
     }
+}
+
+// `unittest.TestSuite`
+//
+// `unittest` is native (there is no Python source for it), so the suite is a
+// native class whose tests live in an ordinary Python list at `self._tests`.
+// A Python subclass such as doctest's `_DocTestSuite` inherits every method and
+// may even replace the list; the methods only ever talk to that attribute and
+// keep no Rust-side state.
+
+/// Cached native `unittest.TestSuite` class.
+fn unittest_test_suite_class() -> i64 {
+    const KEY: &str = "unittest.TestSuite.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    // (Python name, dispatch name, minimum argc including `self`).
+    const METHODS: [(&str, &str, usize); 8] = [
+        ("__init__", "TestSuite.__init__", 1),
+        ("addTest", "TestSuite.addTest", 2),
+        ("addTests", "TestSuite.addTests", 2),
+        ("countTestCases", "TestSuite.countTestCases", 1),
+        ("run", "TestSuite.run", 2),
+        ("__iter__", "TestSuite.__iter__", 1),
+        ("__len__", "TestSuite.__len__", 1),
+        ("__repr__", "TestSuite.__repr__", 1),
+    ];
+    let mut functions = [NONE; METHODS.len()];
+    for (slot, (_, native, arity)) in functions.iter_mut().zip(METHODS) {
+        *slot = value::native_function_new("unittest", native, arity);
+    }
+    let method_values = functions.to_vec();
+    let method_roots = heap::root_values(&method_values);
+    let methods = METHODS
+        .iter()
+        .zip(functions)
+        .map(|((python_name, _, _), function)| ((*python_name).to_string(), function))
+        .collect();
+    let class = value::class_new("TestSuite".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// Dispatches the native methods of `unittest.TestSuite`.
+///
+/// Returns `None` for every name that is not a suite method, so the caller
+/// falls back to the rest of the `unittest` module table.
+fn unittest_suite_call(function: &str, args: &[i64]) -> Option<i64> {
+    Some(match function {
+        "TestSuite.__init__" => unittest_suite_init(args),
+        "TestSuite.addTest" => unittest_suite_add_test(args),
+        "TestSuite.addTests" => unittest_suite_add_tests(args),
+        "TestSuite.countTestCases" => unittest_suite_count(args),
+        "TestSuite.run" => unittest_suite_run(args),
+        "TestSuite.__iter__" => unittest_suite_iter(args),
+        "TestSuite.__len__" => unittest_suite_len(args),
+        "TestSuite.__repr__" => unittest_suite_repr(args),
+        _ => return None,
+    })
+}
+
+/// The `_tests` list of a suite instance.
+///
+/// `None` means the instance has no usable `_tests` list; the
+/// `AttributeError`/`TypeError` is already pending.
+fn unittest_suite_tests(instance: i64) -> Option<i64> {
+    match value::instance_attr(instance, "_tests") {
+        Some(tests) if value::as_list(tests).is_some() => Some(tests),
+        Some(_) => {
+            exc::raise_with_message(TYPE_ERROR, "TestSuite._tests must be a list");
+            None
+        }
+        None => {
+            exc::raise_with_message(
+                ATTRIBUTE_ERROR,
+                &format!(
+                    "'{}' object has no attribute '_tests'",
+                    value::type_name(instance)
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// A required argument of a suite method. The central spec already validates
+/// arity for real calls; this only guards direct dispatch.
+fn unittest_suite_argument(args: &[i64], index: usize, method: &str) -> Option<i64> {
+    match args.get(index) {
+        Some(&argument) => Some(argument),
+        None => {
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("unittest.TestSuite.{method}() received too few arguments"),
+            );
+            None
+        }
+    }
+}
+
+/// `TestSuite.__init__(tests=())`: installs `_tests` as a copy of `tests`.
+///
+/// The empty list is stored before the iterable is consumed, so a failing
+/// iteration leaves a suite whose `_tests` exists; CPython likewise assigns
+/// `self._tests = []` and then extends it.
+fn unittest_suite_init(args: &[i64]) -> i64 {
+    let Some(instance) = unittest_suite_argument(args, 0, "__init__") else {
+        return NONE;
+    };
+    let tests = value::list_new(Vec::new());
+    let roots = heap::root_values(&[tests]);
+    value::instance_setattr(instance, "_tests".to_string(), tests);
+    let result = match args.get(1) {
+        Some(&given) => unittest_suite_extend(tests, given),
+        None => NONE,
+    };
+    heap::release_roots(roots);
+    result
+}
+
+/// Appends every element of the iterable `tests` to the list `list`.
+fn unittest_suite_extend(list: i64, tests: i64) -> i64 {
+    let roots = heap::root_values(&[list, tests]);
+    let iterator = iter::iter_new(tests);
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let iterator_roots = heap::root_values(&[iterator]);
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() || status == 0 {
+            break;
+        }
+        let item_roots = heap::root_values(&[item]);
+        container::list_append(list, item);
+        heap::release_roots(item_roots);
+        if exc::pending() {
+            break;
+        }
+    }
+    heap::release_roots(iterator_roots);
+    heap::release_roots(roots);
+    NONE
+}
+
+/// `TestSuite.addTest(test)`: appends one test.
+fn unittest_suite_add_test(args: &[i64]) -> i64 {
+    let Some(instance) = unittest_suite_argument(args, 0, "addTest") else {
+        return NONE;
+    };
+    let Some(test) = unittest_suite_argument(args, 1, "addTest") else {
+        return NONE;
+    };
+    let Some(tests) = unittest_suite_tests(instance) else {
+        return NONE;
+    };
+    let roots = heap::root_values(&[tests, test]);
+    let result = container::list_append(tests, test);
+    heap::release_roots(roots);
+    result
+}
+
+/// `TestSuite.addTests(tests)`: appends every test of an iterable.
+fn unittest_suite_add_tests(args: &[i64]) -> i64 {
+    let Some(instance) = unittest_suite_argument(args, 0, "addTests") else {
+        return NONE;
+    };
+    let Some(given) = unittest_suite_argument(args, 1, "addTests") else {
+        return NONE;
+    };
+    let Some(tests) = unittest_suite_tests(instance) else {
+        return NONE;
+    };
+    unittest_suite_extend(tests, given)
+}
+
+/// `TestSuite.countTestCases()`: the sum of the elements' own counts.
+fn unittest_suite_count(args: &[i64]) -> i64 {
+    let Some(instance) = unittest_suite_argument(args, 0, "countTestCases") else {
+        return NONE;
+    };
+    let Some(tests) = unittest_suite_tests(instance) else {
+        return NONE;
+    };
+    let items: Vec<i64> = value::as_list(tests)
+        .map(<[i64]>::to_vec)
+        .unwrap_or_default();
+    let roots = heap::root_values(&items);
+    let mut total: i64 = 0;
+    for item in items {
+        let item_roots = heap::root_values(&[item]);
+        let count = unittest_test_count(item);
+        heap::release_roots(item_roots);
+        let Some(count) = count else {
+            heap::release_roots(roots);
+            return NONE;
+        };
+        let Some(sum) = total.checked_add(count) else {
+            heap::release_roots(roots);
+            return exc::raise_with_message(OVERFLOW_ERROR, "integer overflow");
+        };
+        total = sum;
+    }
+    heap::release_roots(roots);
+    encode_int(total)
+}
+
+/// Number of test cases behind one suite element: the element's own
+/// `countTestCases()` when it defines one, otherwise 1 (the `TestCase`
+/// default). `None` means an exception is pending.
+fn unittest_test_count(test: i64) -> Option<i64> {
+    let Some(instance) = value::as_instance(test) else {
+        return Some(1);
+    };
+    if !unittest_test_method(instance.class, test, "countTestCases") {
+        return Some(1);
+    }
+    let count = crate::core::methods::call(
+        test,
+        b"countTestCases".as_ptr(),
+        "countTestCases".len(),
+        0,
+        std::ptr::null(),
+    );
+    if exc::pending() {
+        return None;
+    }
+    match value::as_integer(count) {
+        Some(count) => Some(count),
+        None => {
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "countTestCases() returned non-integer '{}'",
+                    value::type_name(count)
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// Whether `obj.name` resolves to a class-namespace entry or an instance
+/// attribute. `methods::call` then performs the binding (descriptors,
+/// staticmethod/classmethod) exactly as a Python attribute call would.
+fn unittest_test_method(class: i64, instance: i64, name: &str) -> bool {
+    value::class_lookup(class, name).is_some() || value::instance_attr(instance, name).is_some()
+}
+
+/// `TestSuite.run(result, debug=False)`: runs every element against `result`.
+///
+/// The loop is CPython's: every element receives the caller's result object,
+/// so the outcome of each test accumulates there, and the unchanged result is
+/// returned. An element that defines `run` is called as `run(result)`, which
+/// is also how a nested suite forwards the same result; a callable element is
+/// called as `test(result)` (CPython's `TestSuite.__call__` protocol). Any
+/// other element raises `TypeError` instead of being skipped, because Hydro's
+/// native `unittest.TestCase` has no `run(result)`, and therefore no result to
+/// report into. `debug=True` calls the element's `debug()` when it has one.
+fn unittest_suite_run(args: &[i64]) -> i64 {
+    let Some(instance) = unittest_suite_argument(args, 0, "run") else {
+        return NONE;
+    };
+    let Some(result) = unittest_suite_argument(args, 1, "run") else {
+        return NONE;
+    };
+    if result == NONE {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "TestSuite.run() requires a result object, not None",
+        );
+    }
+    let debug = args.get(2).copied().is_some_and(value::truthy);
+    let Some(tests) = unittest_suite_tests(instance) else {
+        return NONE;
+    };
+    // Snapshot: a test may add more tests to the suite while it runs.
+    let items: Vec<i64> = value::as_list(tests)
+        .map(<[i64]>::to_vec)
+        .unwrap_or_default();
+    let roots = heap::root_values(&items);
+    for test in items {
+        let test_roots = heap::root_values(&[test]);
+        unittest_suite_run_test(test, result, debug);
+        let failed = exc::pending();
+        heap::release_roots(test_roots);
+        if failed {
+            // The element's own `run` reports failures in the result object,
+            // as CPython's `TestCase.run` does; an exception that escapes it
+            // aborts the suite with that exception.
+            heap::release_roots(roots);
+            return NONE;
+        }
+    }
+    heap::release_roots(roots);
+    result
+}
+
+/// Runs one element of a suite against `result`.
+fn unittest_suite_run_test(test: i64, result: i64, debug: bool) -> i64 {
+    if let Some(instance) = value::as_instance(test) {
+        if debug && unittest_test_method(instance.class, test, "debug") {
+            return crate::core::methods::call(
+                test,
+                b"debug".as_ptr(),
+                "debug".len(),
+                0,
+                std::ptr::null(),
+            );
+        }
+        if unittest_test_method(instance.class, test, "run") {
+            let argv = [result];
+            return crate::core::methods::call(
+                test,
+                b"run".as_ptr(),
+                "run".len(),
+                1,
+                argv.as_ptr(),
+            );
+        }
+    }
+    // Everything else is called with the result object, so an object that
+    // implements `__call__` runs and one that does not raises the same
+    // `TypeError` CPython's loop would.
+    let argv = [result];
+    crate::builtins::call(test, 1, argv.as_ptr())
+}
+
+/// `TestSuite.__iter__()`: iterates over the suite's tests.
+fn unittest_suite_iter(args: &[i64]) -> i64 {
+    let Some(instance) = unittest_suite_argument(args, 0, "__iter__") else {
+        return NONE;
+    };
+    let Some(tests) = unittest_suite_tests(instance) else {
+        return NONE;
+    };
+    let roots = heap::root_values(&[tests]);
+    let iterator = iter::iter_new(tests);
+    heap::release_roots(roots);
+    iterator
+}
+
+/// `TestSuite.__len__()`: the number of tests stored in the suite.
+fn unittest_suite_len(args: &[i64]) -> i64 {
+    let Some(instance) = unittest_suite_argument(args, 0, "__len__") else {
+        return NONE;
+    };
+    let Some(tests) = unittest_suite_tests(instance) else {
+        return NONE;
+    };
+    encode_int(value::as_list(tests).map_or(0, |items| items.len() as i64))
+}
+
+/// `TestSuite.__repr__()`: `"<TestSuite tests=[...]>"`, like CPython.
+fn unittest_suite_repr(args: &[i64]) -> i64 {
+    let Some(instance) = unittest_suite_argument(args, 0, "__repr__") else {
+        return NONE;
+    };
+    let Some(tests) = unittest_suite_tests(instance) else {
+        return NONE;
+    };
+    let roots = heap::root_values(&[tests]);
+    let text = format!(
+        "<{} tests={}>",
+        value::instance_class_name(instance).unwrap_or("TestSuite"),
+        value::repr(tests)
+    );
+    heap::release_roots(roots);
+    value::str_alloc(text)
 }
 
 // Runtime module registry
@@ -4781,12 +5280,16 @@ const fn python_hexversion() -> i64 {
 /// Builds `sys.path` from the environment.
 ///
 /// Order: `HYDRO_SITE_PACKAGES`, the site-packages directories of
-/// `VIRTUAL_ENV` then `CONDA_PREFIX`, `PYTHONPATH`, `HYDRO_STDLIB`, and
-/// finally the pure-Python standard library modules vendored with Hydro
-/// (`stdlib/`, see [`bundled_stdlib_root`]). Empty, missing and non-directory
-/// entries are dropped and duplicates are kept once, so the result is
-/// deterministic for a given environment. Explicit roots precede the vendored
-/// tree, so an override installed there wins.
+/// `VIRTUAL_ENV` then `CONDA_PREFIX`, `PYTHONPATH`, the pure-Python standard
+/// library modules vendored with Hydro (`stdlib/`, see
+/// [`bundled_stdlib_root`]) and finally `HYDRO_STDLIB` together with the
+/// `lib-dynload` directories derived from it (see
+/// [`stdlib_extension_dirs`]). The vendored tree precedes the CPython sysroot
+/// so an override installed there wins, and the sysroot precedes its own
+/// `lib-dynload` directories so a `Lib/*.py` module wins over an extension of
+/// the same name. Empty, missing and non-directory entries are dropped and
+/// duplicates are kept once, so the result is deterministic for a given
+/// environment.
 pub(crate) fn search_path() -> Vec<String> {
     let bundled_stdlib = bundled_stdlib_root();
     search_path_from(
@@ -4861,6 +5364,11 @@ fn search_path_from(
     if let Some(stdlib) = hydro_stdlib {
         dirs.push(PathBuf::from(stdlib));
     }
+    // CPython's C extensions are not in the `Lib` source tree: derive their
+    // `lib-dynload` directories from the same variable so a `HYDRO_STDLIB`
+    // installation imports them without a `PYTHONPATH` entry. They follow the
+    // sysroot, matching CPython's `Lib`-before-`lib-dynload` order.
+    dirs.extend(stdlib_extension_dirs(hydro_stdlib));
     let mut seen = HashSet::new();
     dirs.into_iter()
         .filter(|dir| {
@@ -4872,6 +5380,51 @@ fn search_path_from(
         })
         .map(|dir| dir.to_string_lossy().into_owned())
         .collect()
+}
+
+/// CPython extension directories implied by `HYDRO_STDLIB`.
+///
+/// Hydro must not require a `PYTHONPATH` entry for CPython's C extension
+/// modules: they live in `lib-dynload` next to the standard library, not in
+/// the `Lib` source tree. `HYDRO_STDLIB` names either a `Lib` tree
+/// (`<cpython>/Lib`, whose sibling `<cpython>/lib-dynload` holds the extension
+/// modules) or an installed version root such as `/usr/lib/python3.14` (whose
+/// child `<root>/lib-dynload` does). Both layouts are tried in that order
+/// (`<stdlib>/lib-dynload`, then `<stdlib>/../lib-dynload`); only existing
+/// directories are returned and duplicates are kept once, so the order is
+/// deterministic. The `..` of the sibling layout is resolved lexically, so no
+/// `sys.path` entry carries a `..` component.
+///
+/// The frontend compiles the same list (`hydro_frontend::stdlib_extension_dirs`)
+/// so the modules it links are exactly the ones this search path finds. Keep
+/// the two implementations in sync.
+fn stdlib_extension_dirs(hydro_stdlib: Option<&OsStr>) -> Vec<PathBuf> {
+    let Some(list) = hydro_stdlib else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut seen = HashSet::new();
+    for stdlib in std::env::split_paths(list) {
+        if stdlib.as_os_str().is_empty() {
+            continue;
+        }
+        for candidate in [
+            stdlib.join("lib-dynload"),
+            stdlib.join("..").join("lib-dynload"),
+        ] {
+            if !candidate.is_dir() {
+                continue;
+            }
+            // The sibling layout is built as `<stdlib>/../lib-dynload`; report
+            // the lexically normalised form so `sys.path` carries no `..`.
+            let dir = normalize_path(&candidate);
+            let key = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            if seen.insert(key) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
 }
 
 /// Site-packages directories of an environment prefix, in deterministic
@@ -6011,6 +6564,13 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `codecs.CodecInfo`: the tuple-like registry entry `encodings` builds
         // with `CodecInfo(*entry)` and checks with `isinstance`.
         ("codecs" | "_codecs", "CodecInfo") => codecs_codecinfo_class(),
+        // `unittest` declares its two classes as spec constants; they are
+        // constructor values over native classes, not module functions.
+        ("unittest", name) => match name {
+            "TestCase" => unittest::test_case(),
+            "TestSuite" => unittest_test_suite_class(),
+            _ => missing_attribute("unittest", name),
+        },
         ("types", name) => types::constant(name),
         ("json", "JSONDecodeError") => crate::exc::exception_class(crate::exc::VALUE_ERROR),
         ("annotationlib", name) => annotationlib::constant(name),
@@ -6047,6 +6607,10 @@ fn constant_value(module: &str, name: &str) -> i64 {
                 .unwrap_or_default(),
         ),
         ("sys", "__excepthook__") => value::native_function_new("sys", "excepthook", 3),
+        // The original display hook, saved so a program can restore it after
+        // replacing `sys.displayhook`. This runtime never rebinds the
+        // attribute itself, so both spellings run the same implementation.
+        ("sys", "__displayhook__") => value::native_function_new("sys", "displayhook", 1),
         ("sys", "ps1") => value::str_from_bytes(b">>> "),
         ("sys", "ps2") => value::str_from_bytes(b"... "),
         ("sys", "platform") => value::str_from_bytes(platform().as_bytes()),
@@ -8957,6 +9521,19 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
             Ok(x) => value::float_new(x.sqrt()),
             Err(err) => err,
         },
+        // `hypot(*coordinates)`: the Euclidean norm. Each argument is scaled
+        // through `f64::hypot`, so large intermediates never overflow; an
+        // infinity wins over a NaN exactly as in C's `hypot`.
+        "hypot" => {
+            let mut norm = 0.0_f64;
+            for arg in args {
+                match number(*arg) {
+                    Ok(x) => norm = norm.hypot(x),
+                    Err(err) => return err,
+                }
+            }
+            value::float_new(norm)
+        }
         "sin" | "cos" | "tan" => match number(args[0]) {
             // CPython rejects infinite inputs for the trigonometric family.
             Ok(x) if x.is_infinite() => domain_error(),
@@ -8984,6 +9561,27 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
         },
         "atan" => match number(args[0]) {
             Ok(x) => value::float_new(x.atan()),
+            Err(err) => err,
+        },
+        // `atan2(y, x)` keeps the sign of both operands, so the result is the
+        // angle of the point `(x, y)` in radians.
+        "atan2" => {
+            let y = match number(args[0]) {
+                Ok(y) => y,
+                Err(err) => return err,
+            };
+            let x = match number(args[1]) {
+                Ok(x) => x,
+                Err(err) => return err,
+            };
+            value::float_new(y.atan2(x))
+        }
+        "radians" => match number(args[0]) {
+            Ok(x) => value::float_new(x.to_radians()),
+            Err(err) => err,
+        },
+        "degrees" => match number(args[0]) {
+            Ok(x) => value::float_new(x.to_degrees()),
             Err(err) => err,
         },
         "exp" => match number(args[0]) {
@@ -11404,17 +12002,25 @@ fn spawn_arity_error(function: i64, argc: usize) -> Option<String> {
 /// registers itself (with the callable and arguments as explicit GC roots)
 /// before running user code, and the returned id keys the join registry.
 /// `finished` is set by the child just before it leaves the runtime, allowing
-/// `Thread.is_alive` to observe termination.
+/// `Thread.is_alive` to observe termination. `daemon` is published under
+/// `threading.daemon.<id>` so the child's `current_thread()` placeholder
+/// reports the status its `Thread` object carries.
 pub(crate) fn spawn_thread(
     function: i64,
     argv: Vec<i64>,
     finished: Option<Arc<AtomicBool>>,
+    daemon: bool,
 ) -> Result<i64, String> {
     // All objects created so far (including `function` and every argument)
     // move into the shared heap before a second thread can observe them.
     heap::enable_shared();
 
     let id = heap::new_thread_id();
+    // Publish the daemon flag the child reads for `current_thread()`.
+    globals::registry_set(
+        &format!("threading.daemon.{id}"),
+        if daemon { TRUE } else { FALSE },
+    );
     let argc = argv.len();
     // Stable argument buffer: the boxed slice lives in the closure until the
     // thread has finished. Its tagged contents are not on either thread's
@@ -11500,7 +12106,7 @@ fn start_new_thread(function: i64, args_value: i64) -> i64 {
     if let Some(message) = spawn_arity_error(function, argv.len()) {
         return exc::raise_with_message(TYPE_ERROR, &message);
     }
-    match spawn_thread(function, argv, None) {
+    match spawn_thread(function, argv, None, false) {
         Ok(id) => encode_int(id),
         Err(message) => exc::raise_with_message(RUNTIME_ERROR, &message),
     }
@@ -11676,7 +12282,12 @@ fn threadbase_start(args: &[i64]) -> i64 {
     if exc::pending() {
         return NONE;
     }
-    let thread = value::thread_new(run, Vec::new(), "Thread".to_string());
+    // A user subclass stores its own `daemon` attribute (`Thread.__init__`
+    // accepts the keyword); the native thread inherits it.
+    let daemon = value::instance_attr(instance, "daemon")
+        .map(value::truthy)
+        .unwrap_or(false);
+    let thread = value::thread_new_with_daemon(run, Vec::new(), "Thread".to_string(), daemon);
     let result = crate::core::methods::call(thread, b"start".as_ptr(), 5, 0, std::ptr::null());
     if exc::pending() {
         return result;
@@ -11780,7 +12391,13 @@ fn threading_call(function: &str, args: &[i64]) -> i64 {
                 Ok(name) => name,
                 Err(err) => return err,
             };
-            value::thread_new(target, argv, name)
+            // `daemon=None` inherits `current_thread().daemon`, exactly like
+            // `Thread.__init__`; any other value is stored as a bool.
+            let daemon = match optional(args, 3) {
+                NONE => current_thread_daemon(),
+                flag => value::truthy(flag),
+            };
+            value::thread_new_with_daemon(target, argv, name, daemon)
         }
         "Lock" => value::lock_new(),
         "RLock" => value::lock_new_reentrant(),
@@ -11807,6 +12424,8 @@ static THREAD_OBJECTS_LOCK: Mutex<()> = Mutex::new(());
 /// the requested id) and is cached in the rooted module registry, so repeated
 /// `current_thread()` calls in one thread return the same object. The main
 /// thread (id 1) is named `MainThread`, worker placeholders `Thread-<id>`.
+/// The daemon flag comes from the registry entry `spawn_thread` publishes, so
+/// `current_thread().daemon` matches the `Thread` object that was started.
 /// Limitation: a `threading.Thread` object started by user code is not the
 /// same object as its worker's placeholder, because the native `start` path
 /// lives in `core::methods` and does not hand the object to the child.
@@ -11823,12 +12442,20 @@ fn threading_thread_for_ident(ident: i64) -> i64 {
     } else {
         format!("Thread-{ident}")
     };
-    let thread = value::thread_new(NONE, Vec::new(), name);
+    let daemon = globals::registry_get(&format!("threading.daemon.{ident}")) == Some(TRUE);
+    let thread = value::thread_new_with_daemon(NONE, Vec::new(), name, daemon);
     if let Some(state) = value::as_thread(thread) {
         state.id.store(ident, Ordering::Release);
     }
     globals::registry_set(&key, thread);
     thread
+}
+
+/// `Thread.daemon` inherited by a thread created with an omitted `daemon`
+/// argument: CPython's `Thread.__init__` copies `current_thread().daemon`.
+fn current_thread_daemon() -> bool {
+    let ident = heap::current_thread_id();
+    globals::registry_get(&format!("threading.daemon.{ident}")) == Some(TRUE)
 }
 
 /// `threading.current_thread()`: the `Thread` object for the running thread.
@@ -16001,6 +16628,8 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
                 }
             }
         }
+        // `os.kill(pid, sig)`: both parameters are positional-only integers.
+        "kill" => os_kill(args),
         "_exit" => {
             let Some(code) = value::as_integer(args[0]) else {
                 return exc::raise_with_message(
@@ -17118,7 +17747,69 @@ fn os_error_from_io(function: &str, error: std::io::Error, path: Option<&str>) -
     }
 }
 
-/// `os.access(path, mode)`: Linux permission bits, no exception on failure.
+/// `os.kill(pid, sig)`: sends `sig` to `pid` with `kill(2)`.
+///
+/// Both arguments are C `int`s in CPython, so out-of-range values raise
+/// `OverflowError` before the syscall. The kernel's error is reported with
+/// CPython's exception taxonomy: `ProcessLookupError` for `ESRCH`,
+/// `PermissionError` for `EPERM`/`EACCES`, and `OSError` otherwise, each with
+/// the `[Errno N] detail` message CPython prints for this function.
+fn os_kill(args: &[i64]) -> i64 {
+    let int_argument = |index: usize, label: &str| -> Result<i64, i64> {
+        let argument = args.get(index).copied().unwrap_or(NONE);
+        let Some(number) = value::as_integer(argument) else {
+            return Err(exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "{label} must be an integer, not {}",
+                    value::type_name(argument)
+                ),
+            ));
+        };
+        Ok(number)
+    };
+    let pid = match int_argument(0, "pid") {
+        Ok(pid) => pid,
+        Err(raised) => return raised,
+    };
+    let signal = match int_argument(1, "sig") {
+        Ok(signal) => signal,
+        Err(raised) => return raised,
+    };
+    let (Ok(pid), Ok(signal)) = (i32::try_from(pid), i32::try_from(signal)) else {
+        return exc::raise_with_message(
+            OVERFLOW_ERROR,
+            "os.kill(): pid and sig must fit in a C int",
+        );
+    };
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(2)` only reads the two integer arguments.
+        let result = unsafe { libc::kill(pid as libc::pid_t, signal as libc::c_int) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            let code = error.raw_os_error().unwrap_or(0);
+            let tag = match code {
+                libc::ESRCH => exc::PROCESS_LOOKUP_ERROR,
+                libc::EPERM | libc::EACCES => exc::PERMISSION_ERROR,
+                _ => OS_ERROR,
+            };
+            let text = error.to_string();
+            let detail = text.split(" (os error").next().unwrap_or(text.as_str());
+            return exc::raise_with_message(tag, &format!("[Errno {code}] {detail}"));
+        }
+        NONE
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, signal);
+        exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            "os.kill() is not available on this platform",
+        )
+    }
+}
+
 /// `os.lseek(fd, offset, whence)`.
 /// `os.openpty()`: the `(master, slave)` pseudo-terminal descriptors.
 fn os_openpty() -> i64 {
@@ -17488,10 +18179,11 @@ fn os_fspath(path: i64) -> i64 {
 /// packages are diagnosed like CPython) and reports the missing code object
 /// instead of fabricating one.
 fn runpy_details_call(function: &str, args: &[i64]) -> Option<i64> {
-    if function != "_get_module_details" {
-        return None;
+    match function {
+        "_get_module_details" => Some(runpy_get_module_details(args)),
+        "_get_main_module_details" => Some(runpy_get_main_module_details(args)),
+        _ => None,
     }
-    Some(runpy_get_module_details(args))
 }
 
 /// `_frozen_importlib._gcd_import(name, package=None, level=0)`.
@@ -17610,6 +18302,102 @@ fn runpy_get_module_details(args: &[i64]) -> i64 {
     )
 }
 
+/// `runpy._get_main_module_details(error=ImportError)`.
+///
+/// CPython's helper temporarily removes `__main__` from `sys.modules`, asks
+/// `_get_module_details("__main__")` to locate a replacement and restores the
+/// saved entry, converting a failure that names `__main__` into the caller's
+/// `error` class (`can't find '__main__' module in <sys.path[0]>`, with
+/// `name="__main__"` when `error` is an `ImportError` subclass).
+///
+/// Hydro compiles the entry program ahead of time and has no runtime source
+/// compiler, so a replacement module can never be produced: the helper
+/// performs the same lookup and restoration, then raises the same
+/// `ImportError`-shaped failure. `_get_module_details` reports "No module
+/// named __main__" (or "No code object available for __main__"), both of
+/// which name `__main__`, so the conversion is the one CPython applies.
+fn runpy_get_main_module_details(args: &[i64]) -> i64 {
+    let import_error = exc::exception_class(IMPORT_ERROR);
+    let error = match args.first().copied() {
+        None | Some(NONE) => import_error,
+        Some(class) => class,
+    };
+    // `issubclass(error, ImportError)` selects the `name` argument CPython
+    // passes; a non-class `error` raises the same TypeError here.
+    let is_import_error = crate::builtins::issubclass(error, import_error);
+    if exc::pending() {
+        return NONE;
+    }
+    let name_value = value::str_alloc("__main__".to_string());
+    let roots = heap::root_values(&[name_value]);
+    let modules = sys_modules();
+    let saved = registry_lookup("__main__");
+    // Keep the removed module reachable while the lookup allocates.
+    let saved_roots = saved.map(|module| heap::root_values(&[module]));
+    remove_namespace_entry(modules, "__main__");
+    let result = runpy_get_module_details(&[name_value]);
+    if let (Some(saved), Some(saved_roots)) = (saved, saved_roots) {
+        insert_namespace_entry(modules, "__main__", saved);
+        heap::release_roots(saved_roots);
+    }
+    heap::release_roots(roots);
+    if !exc::pending() {
+        return result;
+    }
+    let message = value::to_string(exc::pending_value());
+    if !message.contains("__main__") {
+        // Any other ImportError is re-raised unchanged, like CPython.
+        return NONE;
+    }
+    exc::clear();
+    let path = value::as_list(sys_path())
+        .and_then(|entries| entries.first().copied())
+        .unwrap_or(NONE);
+    let rendered_path = if path == NONE {
+        String::new()
+    } else {
+        value::repr(path)
+    };
+    let message_value =
+        value::str_alloc(format!("can't find '__main__' module in {rendered_path}"));
+    let roots = heap::root_values(&[message_value, error]);
+    let mut argv = [message_value];
+    let instance = crate::builtins::call(error, 1, argv.as_mut_ptr());
+    heap::release_roots(roots);
+    if exc::pending() {
+        return NONE;
+    }
+    if is_import_error == TRUE {
+        // CPython passes `name="__main__"` to an ImportError-shaped `error`.
+        let name = value::str_alloc("__main__".to_string());
+        let roots = heap::root_values(&[name, instance]);
+        value::instance_setattr(instance, "name".to_string(), name);
+        heap::release_roots(roots);
+    }
+    exc::raise_value(instance)
+}
+
+/// Keyword entry point for `runpy._get_main_module_details(error=...)`.
+fn runpy_get_main_module_details_kw(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let mut bound = args.to_vec();
+    for (name, item) in keywords {
+        if name != "error" {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("_get_main_module_details() got an unexpected keyword argument '{name}'"),
+            );
+        }
+        if !bound.is_empty() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "_get_main_module_details() got multiple values for argument 'error'",
+            );
+        }
+        bound.push(*item);
+    }
+    runpy_get_main_module_details(&bound)
+}
+
 // sys
 
 /// `sys.getsizeof(obj[, default])`: a shallow size estimate in bytes for the
@@ -17670,6 +18458,11 @@ fn sys_call(function: &str, args: &[i64]) -> i64 {
         // for imports (the `threading`/`unittest` bootstraps call them) and
         // report `None` like CPython's installers.
         "settrace" | "setprofile" => NONE,
+        // `gettrace`/`getprofile` report the callback those installers put in
+        // place. Hydro has no trace callbacks (see above), so the truthful
+        // answer is `None` rather than a fabricated function; `doctest` saves
+        // and restores this value around each example.
+        "gettrace" | "getprofile" => NONE,
         "getrecursionlimit" => sys_getrecursionlimit(),
         "getsizeof" => sys_getsizeof(args),
         "setrecursionlimit" => sys_setrecursionlimit(args),
@@ -17698,8 +18491,139 @@ fn sys_call(function: &str, args: &[i64]) -> i64 {
         }
         "getswitchinterval" => value::float_new(0.005),
         "setswitchinterval" => NONE,
+        "displayhook" => sys_displayhook(args),
+        "call_tracing" => sys_call_tracing(args),
+        "remote_exec" => sys_remote_exec(args),
         _ => missing_attribute("sys", function),
     }
+}
+
+/// `sys.displayhook(value)`: CPython's interactive display hook.
+///
+/// `None` prints nothing. Any other value clears `builtins._`, writes
+/// `repr(value)` plus a newline to the current `sys.stdout` and then binds
+/// `builtins._ = value`, so a failing `__repr__` cannot leave a recursive
+/// value behind. The write goes through the `write` method of the `sys.stdout`
+/// value, which therefore honours a program's rebinding of `sys.stdout`.
+fn sys_displayhook(args: &[i64]) -> i64 {
+    let Some(&item) = args.first() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "displayhook() missing required argument: 'value'",
+        );
+    };
+    if item == NONE {
+        return NONE;
+    }
+    globals::set_attribute_override("builtins", "_", NONE);
+    let text = crate::builtins::to_repr(item);
+    if exc::pending() {
+        return text;
+    }
+    let stdout = module_get_by_name("sys", "stdout");
+    let roots = heap::root_values(&[stdout, text]);
+    let mut argv = [text];
+    let result = crate::core::methods::call(
+        stdout,
+        b"write".as_ptr(),
+        "write".len(),
+        1,
+        argv.as_mut_ptr(),
+    );
+    heap::release_roots(roots);
+    if exc::pending() {
+        return result;
+    }
+    let newline = value::str_alloc("\n".to_string());
+    let stdout = module_get_by_name("sys", "stdout");
+    let roots = heap::root_values(&[stdout, newline]);
+    let mut argv = [newline];
+    let result = crate::core::methods::call(
+        stdout,
+        b"write".as_ptr(),
+        "write".len(),
+        1,
+        argv.as_mut_ptr(),
+    );
+    heap::release_roots(roots);
+    if exc::pending() {
+        return result;
+    }
+    globals::set_attribute_override("builtins", "_", item);
+    NONE
+}
+
+/// `sys.call_tracing(func, args)`: calls `func(*args)`.
+///
+/// CPython temporarily re-enables tracing around the call. Hydro's runtime has
+/// no trace callbacks (see `sys.settrace`), so there is no tracing state to
+/// toggle and the call is dispatched directly; that is also exactly what the
+/// callee observes in CPython. `func` must be callable and `args` a tuple.
+fn sys_call_tracing(args: &[i64]) -> i64 {
+    let function = args.first().copied().unwrap_or(NONE);
+    let function_args = args.get(1).copied().unwrap_or(NONE);
+    if crate::builtins::callable(function) != TRUE {
+        return exc::raise_with_message(TYPE_ERROR, "call_tracing() argument 1 must be callable");
+    }
+    let Some(items) = value::as_tuple(function_args) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "call_tracing() argument 2 must be a tuple, not '{}'",
+                value::type_name(function_args)
+            ),
+        );
+    };
+    // Copy the arguments out of the tuple and root both the callable and the
+    // copy: the call may trigger a collection.
+    let items: Vec<i64> = items.to_vec();
+    let mut roots = Vec::with_capacity(items.len() + 1);
+    roots.push(function);
+    roots.extend_from_slice(&items);
+    let roots = heap::root_values(&roots);
+    let result = crate::builtins::call(function, items.len(), items.as_ptr());
+    heap::release_roots(roots);
+    result
+}
+
+/// `sys.remote_exec(pid, script)`: PEP 768 remote debugging.
+///
+/// CPython's implementation injects `script` into another process through the
+/// remote debugging protocol that the target interpreter's `_PyRemoteDebuggerSupport`
+/// entry point exposes. Hydro has no attach/injection protocol and no runtime
+/// Python compiler, so no real operation can run the script in `pid`; the call
+/// reports that exact limitation instead of pretending to succeed.
+fn sys_remote_exec(args: &[i64]) -> i64 {
+    let Some(pid) = args
+        .first()
+        .and_then(|argument| value::as_integer(*argument))
+    else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "remote_exec() argument 1 must be an integer, not '{}'",
+                value::type_name(args.first().copied().unwrap_or(NONE))
+            ),
+        );
+    };
+    let Some(script) = args.get(1).and_then(|argument| value::as_str(*argument)) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "remote_exec() argument 2 must be str, not '{}'",
+                value::type_name(args.get(1).copied().unwrap_or(NONE))
+            ),
+        );
+    };
+    let _ = script;
+    exc::raise_with_message(
+        NOT_IMPLEMENTED_ERROR,
+        &format!(
+            "sys.remote_exec() is not implemented: Hydro has no remote debugging \
+             attach protocol (CPython's PEP 768 _PyRemoteDebuggerSupport) and no \
+             runtime compiler, so the script cannot be injected into pid {pid}"
+        ),
+    )
 }
 
 /// Registry key holding the process-wide audit hook tuple.
@@ -18226,11 +19150,15 @@ fn io_call(function: &str, args: &[i64]) -> i64 {
     if let Some(method) = function.strip_prefix("TextIOWrapper.") {
         return text_io_wrapper_method(method, args);
     }
+    if let Some(method) = function.strip_prefix("IncrementalNewlineDecoder.") {
+        return incremental_newline_decoder_method(method, args);
+    }
     match function {
         "open" => io_open(args),
         "StringIO" => string_io_new(args),
         "BytesIO" => bytes_io_new(args),
         "TextIOWrapper" => text_io_wrapper_new(args),
+        "IncrementalNewlineDecoder" => incremental_newline_decoder_new(args),
         "FileIO" => file_io_new(args),
         "BufferedReader" => buffered_reader_new(args),
         "BufferedWriter" => buffered_writer_new(args),
@@ -18273,6 +19201,7 @@ fn io_all_list() -> i64 {
         "BufferedWriter",
         "BufferedReader",
         "FileIO",
+        "IncrementalNewlineDecoder",
         "IOBase",
         "RawIOBase",
         "TextIOBase",
@@ -18508,6 +19437,338 @@ fn io_protocol_subclasshook(candidate: i64, method: &str) -> i64 {
     } else {
         value::NOT_IMPLEMENTED
     }
+}
+
+const IND_DECODER: &str = "_hydro_ind_decoder";
+const IND_TRANSLATE: &str = "_hydro_ind_translate";
+const IND_PENDING: &str = "_hydro_ind_pending";
+const IND_SEEN: &str = "_hydro_ind_seen";
+
+/// The cached `io.IncrementalNewlineDecoder` class.
+///
+/// The instance state lives in attributes: the wrapped decoder, the
+/// `translate` flag, the pending trailing `\r` and the newline-kind flags
+/// behind the public `newlines` attribute. `doctest` constructs it with
+/// `decoder=None`, which decodes `str` input directly.
+fn incremental_newline_decoder_class() -> i64 {
+    in_memory_class(
+        "IncrementalNewlineDecoder",
+        value::object_class(),
+        vec![
+            (
+                "__init__".to_string(),
+                value::native_function_new("io", "IncrementalNewlineDecoder.__init__", usize::MAX),
+            ),
+            (
+                "decode".to_string(),
+                value::native_function_new("io", "IncrementalNewlineDecoder.decode", usize::MAX),
+            ),
+            (
+                "getstate".to_string(),
+                value::native_function_new("io", "IncrementalNewlineDecoder.getstate", 1),
+            ),
+            (
+                "setstate".to_string(),
+                value::native_function_new("io", "IncrementalNewlineDecoder.setstate", 2),
+            ),
+            (
+                "reset".to_string(),
+                value::native_function_new("io", "IncrementalNewlineDecoder.reset", 1),
+            ),
+        ],
+    )
+}
+
+/// `IncrementalNewlineDecoder(decoder, translate, errors='strict')`.
+fn incremental_newline_decoder_new(args: &[i64]) -> i64 {
+    let instance = value::instance_new(incremental_newline_decoder_class());
+    let roots = heap::root_values(&[instance]);
+    incremental_newline_decoder_init(instance, args, 0);
+    heap::release_roots(roots);
+    if exc::pending() {
+        NONE
+    } else {
+        instance
+    }
+}
+
+/// `IncrementalNewlineDecoder.__init__`: shared by the module-call constructor
+/// and by a class call through a first-class class value.
+fn incremental_newline_decoder_init(instance: i64, args: &[i64], start: usize) -> i64 {
+    let decoder = args.get(start).copied().unwrap_or(NONE);
+    let translate = args
+        .get(start + 1)
+        .copied()
+        .map(value::truthy)
+        .unwrap_or(false);
+    io_store(instance, IND_DECODER, decoder);
+    io_store(instance, IND_TRANSLATE, value::bool_value(translate));
+    io_store(instance, IND_PENDING, value::str_from_bytes(b""));
+    io_store(instance, IND_SEEN, encode_int(0));
+    io_store(instance, "newlines", NONE);
+    NONE
+}
+
+fn incremental_newline_decoder_method(method: &str, args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("IncrementalNewlineDecoder.{method}() missing self"),
+        );
+    };
+    match method {
+        "__init__" => incremental_newline_decoder_init(instance, args, 1),
+        "decode" => incremental_newline_decoder_decode(instance, args),
+        "getstate" => {
+            // CPython's state is `(buffer, flag)`: the undecoded buffer of
+            // the wrapped decoder (empty for `decoder=None`) and the
+            // decoder's own flag shifted left one bit, with the pending `\r`
+            // for a split `\r\n` in bit 0.
+            let decoder = value::instance_attr(instance, IND_DECODER).unwrap_or(NONE);
+            let pending = value::instance_attr(instance, IND_PENDING)
+                .and_then(value::as_str)
+                .unwrap_or("");
+            let (buffer, flag) = if decoder == NONE {
+                (value::bytes_from_slice(b""), 0)
+            } else {
+                let getstate = crate::core::methods::getattr(decoder, b"getstate".as_ptr(), 8);
+                if exc::pending() {
+                    return NONE;
+                }
+                let state = crate::core::builtins::call(getstate, 0, std::ptr::null());
+                if exc::pending() {
+                    return NONE;
+                }
+                match value::as_tuple(state).or_else(|| value::as_list(state)) {
+                    Some(items) if items.len() >= 2 => {
+                        (items[0], value::as_integer(items[1]).unwrap_or(0))
+                    }
+                    _ => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!(
+                                "getstate() must return a tuple, not {}",
+                                value::type_name(state)
+                            ),
+                        )
+                    }
+                }
+            };
+            let mut flag = flag.wrapping_shl(1);
+            if !pending.is_empty() {
+                flag |= 1;
+            }
+            value::tuple_new(vec![buffer, ops::int_result(flag)])
+        }
+        "setstate" => {
+            let Some(state) = args.get(1).copied() else {
+                return exc::raise_with_message(TYPE_ERROR, "setstate() missing required argument");
+            };
+            let items = value::as_tuple(state).or_else(|| value::as_list(state));
+            let Some(items) = items else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "setstate() argument must be a tuple, not {}",
+                        value::type_name(state)
+                    ),
+                );
+            };
+            if items.len() < 2 {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "setstate() argument must be a 2-tuple",
+                );
+            }
+            let Some(flag) = value::as_integer(items[1]) else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "setstate() flag must be an integer, not {}",
+                        value::type_name(items[1])
+                    ),
+                );
+            };
+            // Bit 0 is the pending `\r`; the rest is the wrapped decoder's
+            // own state. `newlines` is not part of the state (like CPython).
+            io_store(
+                instance,
+                IND_PENDING,
+                if flag & 1 != 0 {
+                    value::str_from_bytes(b"\r")
+                } else {
+                    value::str_from_bytes(b"")
+                },
+            );
+            let decoder = value::instance_attr(instance, IND_DECODER).unwrap_or(NONE);
+            if decoder != NONE {
+                let setstate = crate::core::methods::getattr(decoder, b"setstate".as_ptr(), 8);
+                if exc::pending() {
+                    return NONE;
+                }
+                let inner = value::tuple_new(vec![items[0], ops::int_result(flag >> 1)]);
+                let argv = [inner];
+                let result = crate::core::builtins::call(setstate, argv.len(), argv.as_ptr());
+                if exc::pending() {
+                    return NONE;
+                }
+                let _ = result;
+            }
+            NONE
+        }
+        "reset" => {
+            io_store(instance, IND_PENDING, value::str_from_bytes(b""));
+            io_store(instance, IND_SEEN, encode_int(0));
+            io_store(instance, "newlines", NONE);
+            NONE
+        }
+        _ => missing_attribute("io", method),
+    }
+}
+
+fn incremental_newline_decoder_decode(instance: i64, args: &[i64]) -> i64 {
+    let input = args.get(1).copied().unwrap_or(NONE);
+    let final_input = args.get(2).copied().map(value::truthy).unwrap_or(false);
+    let decoder = value::instance_attr(instance, IND_DECODER).unwrap_or(NONE);
+    let decoded = if decoder == NONE {
+        match value::as_str(input) {
+            Some(text) => text.to_string(),
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "decoder should return a string result, not '{}'",
+                        value::type_name(input)
+                    ),
+                )
+            }
+        }
+    } else {
+        let decode = crate::core::methods::getattr(decoder, b"decode".as_ptr(), 6);
+        if exc::pending() {
+            return NONE;
+        }
+        let argv = [input, value::bool_value(final_input)];
+        let result = crate::core::builtins::call(decode, argv.len(), argv.as_ptr());
+        if exc::pending() {
+            return NONE;
+        }
+        match value::as_str(result) {
+            Some(text) => text.to_string(),
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "decoder should return a string result, not '{}'",
+                        value::type_name(result)
+                    ),
+                )
+            }
+        }
+    };
+    let translate = value::instance_attr(instance, IND_TRANSLATE)
+        .map(value::truthy)
+        .unwrap_or(false);
+    let pending = value::instance_attr(instance, IND_PENDING)
+        .and_then(value::as_str)
+        .unwrap_or("");
+    let mut text = String::with_capacity(pending.len() + decoded.len());
+    text.push_str(pending);
+    text.push_str(&decoded);
+    // Hold a trailing `\r` until the next chunk (or the final call) so a
+    // split `\r\n` is never mistaken for two line endings.
+    let mut pending = String::new();
+    if !final_input && text.ends_with('\r') {
+        text.pop();
+        pending.push('\r');
+    }
+    incremental_record_newlines(instance, &text);
+    if translate {
+        text = translate_newlines_for_decoder(&text);
+    }
+    io_store(
+        instance,
+        IND_PENDING,
+        value::str_from_bytes(pending.as_bytes()),
+    );
+    value::str_alloc(text)
+}
+
+/// Universal-newline translation for the decoder (`translate=True`).
+fn translate_newlines_for_decoder(text: &str) -> String {
+    if !text.contains('\r') {
+        return text.to_string();
+    }
+    let mut translated = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            translated.push('\n');
+        } else {
+            translated.push(ch);
+        }
+    }
+    translated
+}
+
+/// Records the newline kinds in `text` and refreshes the public `newlines`
+/// attribute. The flag bits mirror CPython's decoder: `\r` = 1, `\n` = 2,
+/// `\r\n` = 4.
+fn incremental_record_newlines(instance: i64, text: &str) {
+    let mut seen = value::instance_attr(instance, IND_SEEN)
+        .and_then(value::as_integer)
+        .unwrap_or(0);
+    let before = seen;
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            '\r' => {
+                if chars.get(index + 1) == Some(&'\n') {
+                    seen |= 4;
+                    index += 1;
+                } else {
+                    seen |= 1;
+                }
+            }
+            '\n' => seen |= 2,
+            _ => {}
+        }
+        index += 1;
+    }
+    if seen == before {
+        return;
+    }
+    io_store(instance, IND_SEEN, ops::int_result(seen));
+    incremental_store_newlines(instance, seen);
+}
+
+/// Publishes the `newlines` attribute for the newline-kind flag bits.
+fn incremental_store_newlines(instance: i64, seen: i64) {
+    let mut names: Vec<&str> = Vec::new();
+    if seen & 1 != 0 {
+        names.push("\r");
+    }
+    if seen & 2 != 0 {
+        names.push("\n");
+    }
+    if seen & 4 != 0 {
+        names.push("\r\n");
+    }
+    let newlines = match names.as_slice() {
+        [] => NONE,
+        [only] => value::str_from_bytes(only.as_bytes()),
+        names => value::tuple_new(
+            names
+                .iter()
+                .map(|name| value::str_from_bytes(name.as_bytes()))
+                .collect(),
+        ),
+    };
+    io_store(instance, "newlines", newlines);
 }
 
 /// The cached class for a file object's current state. Used by `type()`,
@@ -20505,6 +21766,94 @@ mod tests {
     }
 
     #[test]
+    fn math_hypot_atan2_radians_and_degrees_match_cpython() {
+        exc::init();
+        // `hypot` is variadic: no arguments is `0.0`, and the norm is taken
+        // over every coordinate.
+        assert_eq!(as_float(call("math", "hypot", &[])), 0.0);
+        assert_eq!(as_float(call("math", "hypot", &[int(3), int(4)])), 5.0);
+        assert_eq!(as_float(call("math", "hypot", &[int(5)])), 5.0);
+        assert_eq!(
+            as_float(call("math", "hypot", &[int(3), int(4), int(12)])),
+            13.0
+        );
+        // Negative coordinates are squared, so the sign does not matter.
+        assert_eq!(as_float(call("math", "hypot", &[int(-3), int(-4)])), 5.0);
+        // Scaling: the norm of two `1e308`-scale values must stay finite.
+        let huge = value::float_new(1e308);
+        let scaled = as_float(call("math", "hypot", &[huge, huge]));
+        assert!(scaled.is_finite());
+        assert!((scaled / 1e308 - 2f64.sqrt()).abs() < 1e-12);
+        // An infinity wins over a NaN in either order, matching C `hypot`.
+        let inf = value::float_new(f64::INFINITY);
+        let nan = value::float_new(f64::NAN);
+        assert!(as_float(call("math", "hypot", &[inf, nan])).is_infinite());
+        assert!(as_float(call("math", "hypot", &[nan, inf])).is_infinite());
+        assert!(as_float(call("math", "hypot", &[nan, int(1)])).is_nan());
+
+        // `atan2(y, x)` returns the quadrant-correct angle in radians.
+        assert_eq!(as_float(call("math", "atan2", &[int(0), int(0)])), 0.0);
+        assert!(
+            (as_float(call("math", "atan2", &[int(1), int(1)])) - std::f64::consts::FRAC_PI_4)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (as_float(call("math", "atan2", &[int(0), int(-1)])) - std::f64::consts::PI).abs()
+                < 1e-12
+        );
+        assert!(
+            (as_float(call("math", "atan2", &[int(0), value::float_new(-0.0)]))
+                - std::f64::consts::PI)
+                .abs()
+                < 1e-12
+        );
+        assert!(as_float(call("math", "atan2", &[nan, int(1)])).is_nan());
+
+        // Angle conversion round-trips and preserves infinities/NaNs.
+        assert!(
+            (as_float(call("math", "radians", &[int(180)])) - std::f64::consts::PI).abs() < 1e-12
+        );
+        assert!((as_float(call("math", "degrees", &[get("math", "pi")])) - 180.0).abs() < 1e-12);
+        assert!(as_float(call("math", "degrees", &[value::float_new(-0.0)])).is_sign_negative());
+        assert!(as_float(call("math", "radians", &[inf])).is_infinite());
+        assert!(as_float(call("math", "degrees", &[nan])).is_nan());
+    }
+
+    #[test]
+    fn math_hypot_atan2_radians_and_degrees_errors() {
+        exc::init();
+        assert_eq!(call("math", "hypot", &[string("x"), int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "must be real number, not str");
+        exc::init();
+        assert_eq!(call("math", "radians", &[string("x")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "must be real number, not str");
+        exc::init();
+        assert_eq!(call("math", "atan2", &[int(1), string("x")]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "must be real number, not str");
+        exc::init();
+        assert_eq!(call("math", "atan2", &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "math.atan2() takes 2 arguments (1 given)");
+        exc::init();
+        assert_eq!(call("math", "radians", &[int(1), int(2)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "math.radians() takes 1 arguments (2 given)");
+        exc::init();
+        assert_eq!(call("math", "degrees", &[]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "math.degrees() takes 1 arguments (0 given)");
+        // No math function takes keywords; the dispatcher rejects them.
+        exc::init();
+        assert_eq!(call_kw("math", "hypot", &[], &[("x", int(3))]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(message(), "math.hypot() does not accept keyword arguments");
+    }
+
+    #[test]
     fn math_domain_and_type_errors() {
         exc::init();
         assert_eq!(call("math", "sqrt", &[int(-1)]), NONE);
@@ -22094,6 +23443,62 @@ mod tests {
             vec![bundled.to_string_lossy().into_owned()],
             "the vendored tree is the last search entry"
         );
+        std::fs::remove_dir_all(&root).expect("remove scratch directory");
+    }
+
+    /// `HYDRO_STDLIB` names either a `Lib` tree or a version root, so both
+    /// `lib-dynload` layouts must be derived, in that order and once each.
+    #[test]
+    fn stdlib_extension_dirs_follow_the_stdlib_layout() {
+        let root = temp_root("stdlib-extension-dirs");
+        let stdlib = make_dir(&root.join("Lib"));
+        let nested = make_dir(&stdlib.join("lib-dynload"));
+        let sibling = make_dir(&root.join("lib-dynload"));
+
+        assert_eq!(
+            stdlib_extension_dirs(Some(stdlib.as_os_str())),
+            vec![nested.clone(), sibling.clone()],
+            "`<stdlib>/lib-dynload` precedes `<stdlib>/../lib-dynload`"
+        );
+
+        // A root without extension modules contributes nothing, and an unset
+        // variable derives no directory at all. The bare root gets its own
+        // parent so the shared sibling `lib-dynload` above is not found.
+        let bare = make_dir(&root.join("bare-parent").join("bare"));
+        assert!(stdlib_extension_dirs(Some(bare.as_os_str())).is_empty());
+        assert!(stdlib_extension_dirs(None).is_empty());
+
+        // `HYDRO_STDLIB` is path-split, so a repeated root keeps each derived
+        // directory once.
+        let repeated =
+            std::env::join_paths([stdlib.as_path(), stdlib.as_path()]).expect("join stdlib roots");
+        assert_eq!(
+            stdlib_extension_dirs(Some(repeated.as_os_str())),
+            vec![nested, sibling]
+        );
+
+        std::fs::remove_dir_all(&root).expect("remove scratch directory");
+    }
+
+    /// Extension modules must be importable from `sys.path` without an
+    /// explicit `PYTHONPATH` entry, after the standard library source root.
+    #[test]
+    fn sys_path_appends_derived_lib_dynload_after_the_stdlib_root() {
+        let root = temp_root("sys-path-dynload");
+        let stdlib = make_dir(&root.join("Lib"));
+        let nested = make_dir(&stdlib.join("lib-dynload"));
+        let sibling = make_dir(&root.join("lib-dynload"));
+
+        let path = search_path_from(None, None, None, None, Some(stdlib.as_os_str()), None);
+        let expected: Vec<String> = [&stdlib, &nested, &sibling]
+            .into_iter()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(path, expected);
+
+        // Without `HYDRO_STDLIB` nothing is derived.
+        assert!(search_path_from(None, None, None, None, None, None).is_empty());
+
         std::fs::remove_dir_all(&root).expect("remove scratch directory");
     }
 
@@ -24847,6 +26252,77 @@ mod tests {
             );
         }
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn incremental_newline_decoder_translates_like_cpython() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        // The class is a real module attribute, shared by `io` and `_io`.
+        let class = get("io", "IncrementalNewlineDecoder");
+        assert!(value::as_class(class).is_some());
+        assert_eq!(class, get("_io", "IncrementalNewlineDecoder"));
+        let method = |name: &str| match value::class_lookup(class, name) {
+            Some(value::ClassEntry::Method(_, function))
+            | Some(value::ClassEntry::Attr(function)) => function,
+            None => panic!("missing {name} method"),
+        };
+        let decode = method("decode");
+        let getstate = method("getstate");
+        let setstate = method("setstate");
+        let reset = method("reset");
+        let decode = |decoder: i64, text: i64, final_input: i64| {
+            call_value(decode, &[decoder, text, final_input])
+        };
+
+        // `doctest`'s exact use: decoder=None, translate=True, final=True.
+        let decoder = call("io", "IncrementalNewlineDecoder", &[NONE, TRUE]);
+        assert!(value::as_instance(decoder).is_some());
+        assert_eq!(
+            value::as_str(decode(decoder, string("a\r\nb\rc\n"), TRUE)),
+            Some("a\nb\nc\n")
+        );
+        let observed: Vec<String> =
+            value::as_tuple(value::instance_attr(decoder, "newlines").expect("newlines attribute"))
+                .expect("newlines tuple")
+                .iter()
+                .map(|name| value::as_str(*name).expect("newline name").to_string())
+                .collect();
+        assert_eq!(
+            observed,
+            vec!["\r".to_string(), "\n".to_string(), "\r\n".to_string()]
+        );
+
+        // A trailing `\r` is held until the next chunk (or the final call), so
+        // a split `\r\n` becomes one newline rather than two.
+        let split = call("io", "IncrementalNewlineDecoder", &[NONE, TRUE]);
+        assert_eq!(
+            value::as_str(decode(split, string("a\r"), FALSE)),
+            Some("a")
+        );
+        assert_eq!(
+            value::as_str(decode(split, string("\nb"), TRUE)),
+            Some("\nb")
+        );
+
+        // `translate=False` preserves the line endings but still joins a
+        // split `\r\n` into a single `\r\n` (it is one newline, not two).
+        let raw = call("io", "IncrementalNewlineDecoder", &[NONE, FALSE]);
+        assert_eq!(value::as_str(decode(raw, string("a\r"), FALSE)), Some("a"));
+        assert_eq!(
+            value::as_str(decode(raw, string("\nb\r\nc"), TRUE)),
+            Some("\r\nb\r\nc")
+        );
+
+        // State round-trips through `getstate`/`setstate`; `reset` clears the
+        // pending text and the observed newline kinds.
+        let state = call_value(getstate, &[split]);
+        assert!(value::as_tuple(state).is_some());
+        assert_eq!(call_value(setstate, &[split, state]), NONE);
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(call_value(reset, &[split]), NONE);
+        assert_eq!(value::instance_attr(split, "newlines"), Some(NONE));
+        assert!(!exc::pending(), "{}", message());
     }
 
     #[test]
@@ -29534,5 +31010,119 @@ mod tests {
         let restored = call("pickle", "loads", &[string(&payload)]);
         assert_eq!(as_int(restored), 42);
         assert!(value::as_class(get("pickle", "Pickler")).is_some());
+    }
+
+    #[test]
+    fn sys_trace_getters_and_saved_displayhook() {
+        exc::init();
+        // `settrace` cannot install a callback, so the getters report that no
+        // hook is installed and the installers stay harmless no-ops.
+        assert_eq!(call("sys", "gettrace", &[]), NONE);
+        assert_eq!(call("sys", "getprofile", &[]), NONE);
+        assert_eq!(call("sys", "settrace", &[NONE]), NONE);
+        assert_eq!(call("sys", "setprofile", &[NONE]), NONE);
+        assert!(!exc::pending());
+        assert_eq!(call("sys", "gettrace", &[]), NONE);
+
+        // `sys.__displayhook__` is the saved original hook: it prints nothing
+        // for `None` and enforces the same single-argument signature.
+        let hook = get("sys", "__displayhook__");
+        assert!(value::as_function(hook).is_some());
+        assert_eq!(call_value(hook, &[NONE]), NONE);
+        assert!(!exc::pending());
+        assert_eq!(call_value(hook, &[]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    #[test]
+    fn unittest_test_suite_container_and_run() {
+        exc::init();
+        let suite_class = get("unittest", "TestSuite");
+        assert!(value::as_class(suite_class).is_some());
+        // Repeated reads share one class value, so `is` and subclasses agree.
+        assert_eq!(get("unittest", "TestSuite"), suite_class);
+
+        // `TestSuite()` starts empty, with `_tests` as a real list.
+        let suite = call_value(suite_class, &[]);
+        assert!(!exc::pending());
+        assert!(value::as_instance(suite).is_some());
+        assert!(value::as_list(value::instance_attr(suite, "_tests").expect("_tests")).is_some());
+        assert_eq!(as_int(crate::builtins::len(suite)), 0);
+        assert_eq!(as_int(method(suite, "countTestCases", &[])), 0);
+
+        // `addTest` and `addTests` keep insertion order.
+        let first = call_value(get("unittest", "TestCase"), &[]);
+        let second = call_value(get("unittest", "TestCase"), &[]);
+        assert_eq!(method(suite, "addTest", &[first]), NONE);
+        let more = value::list_new(vec![second]);
+        let roots = heap::root_values(&[more]);
+        assert_eq!(method(suite, "addTests", &[more]), NONE);
+        heap::release_roots(roots);
+        assert_eq!(as_int(crate::builtins::len(suite)), 2);
+        assert_eq!(as_int(method(suite, "countTestCases", &[])), 2);
+
+        // Iteration yields the stored tests in order.
+        let iterator = crate::iter::iter_new(suite);
+        let mut produced = Vec::new();
+        loop {
+            let mut item = NONE;
+            if crate::iter::iter_next(iterator, &mut item) == 0 {
+                break;
+            }
+            produced.push(item);
+        }
+        assert_eq!(produced, vec![first, second]);
+
+        // `TestSuite(tests)` copies the constructor argument.
+        let source = value::list_new(vec![second]);
+        let roots = heap::root_values(&[source]);
+        let copied = call_value(suite_class, &[source]);
+        heap::release_roots(roots);
+        assert_eq!(as_int(crate::builtins::len(copied)), 1);
+        assert_eq!(as_int(method(copied, "countTestCases", &[])), 1);
+
+        // A subclass inherits the container (doctest's `_DocTestSuite`).
+        let derived = value::class_new("DerivedSuite".to_string(), suite_class, Vec::new());
+        let derived_roots = heap::root_values(&[derived]);
+        let instance = call_value(derived, &[]);
+        heap::release_roots(derived_roots);
+        assert_eq!(as_int(crate::builtins::len(instance)), 0);
+        assert_eq!(method(instance, "addTest", &[first]), NONE);
+        assert_eq!(as_int(crate::builtins::len(instance)), 1);
+
+        // Counts aggregate recursively through nested suites.
+        let nested_list = value::list_new(vec![first, second]);
+        let roots = heap::root_values(&[nested_list]);
+        let nested = call_value(suite_class, &[nested_list]);
+        heap::release_roots(roots);
+        let outer_list = value::list_new(vec![nested]);
+        let roots = heap::root_values(&[outer_list]);
+        let outer = call_value(suite_class, &[outer_list]);
+        heap::release_roots(roots);
+        assert_eq!(as_int(method(outer, "countTestCases", &[])), 2);
+
+        // `run(result)` forwards the caller's result object to nested suites
+        // and returns it unchanged.
+        let empty = call_value(suite_class, &[]);
+        let runner_list = value::list_new(vec![empty]);
+        let roots = heap::root_values(&[runner_list]);
+        let runner = call_value(suite_class, &[runner_list]);
+        heap::release_roots(roots);
+        let result = string("result");
+        let run_roots = heap::root_values(&[runner, result]);
+        assert_eq!(method(runner, "run", &[result]), result);
+        heap::release_roots(run_roots);
+        assert!(!exc::pending());
+
+        // A native `TestCase` has no `run(result)`, so running one raises
+        // `TypeError` instead of pretending the test ran.
+        let cases_list = value::list_new(vec![first]);
+        let roots = heap::root_values(&[cases_list]);
+        let cases = call_value(suite_class, &[cases_list]);
+        heap::release_roots(roots);
+        let run_roots = heap::root_values(&[cases, result]);
+        assert_eq!(method(cases, "run", &[result]), NONE);
+        heap::release_roots(run_roots);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
     }
 }

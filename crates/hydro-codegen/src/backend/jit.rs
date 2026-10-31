@@ -64,6 +64,7 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         hydro_cell_get,
         hydro_cell_set,
         hydro_function_params,
+        hydro_function_set_doc,
         hydro_function_meta,
         hydro_builtin_function,
         hydro_call,

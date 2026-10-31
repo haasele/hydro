@@ -181,6 +181,8 @@ i64  hydro_function_new(const uint8_t* wrapper, uint64_t arity,
 i64  hydro_function_params(i64 fn, uint64_t count, const i64* names);
                                     // 2*count words [ptr, len, ...]:
                                     // user-visible positional parameter names
+void hydro_function_set_doc(i64 fn, const uint8_t* doc, size_t len);
+                                    // attach the source docstring (__doc__)
 i64  hydro_function_meta(i64 fn, i64 full_entry, uintptr_t count,
                        const i64* names, const i64* kinds,
                        const i64* defaults, const i64* default_flags);

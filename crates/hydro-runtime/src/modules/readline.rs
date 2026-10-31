@@ -9,9 +9,10 @@
 //!
 //! The Python-visible surface follows CPython 3.14's `Modules/readline.c`:
 //! `parse_and_bind`, `get_line_buffer`, `insert_text`, `read_history_file`,
-//! `write_history_file`, `add_history`, `clear_history`, `get_history_length`,
-//! `set_history_length`, `get_completer`, `set_completer`, `get_begidx`,
-//! `get_endidx`, `set_completer_delims` and `get_completer_delims`. The
+//! `write_history_file`, `add_history`, `get_history_item`, `clear_history`,
+//! `get_history_length`, `set_history_length`, `get_completer`, `set_completer`,
+//! `get_begidx`, `get_endidx`, `set_completer_delims`, `get_completer_delims`
+//! and `set_startup_hook`. The
 //! `readline()` entry point is bound as well; CPython 3.14 no longer publishes
 //! it as a module function, so it is kept as the runtime's line-editor hook
 //! rather than advertised.
@@ -48,6 +49,10 @@ mod unix {
     type ReadlineFn = unsafe extern "C" fn(*const c_char) -> *mut c_char;
     /// `void add_history(const char *)`.
     type AddHistoryFn = unsafe extern "C" fn(*const c_char);
+    /// `HIST_ENTRY *history_get(int)`.
+    type HistoryGetFn = unsafe extern "C" fn(c_int) -> *mut HistEntry;
+    /// `int (*rl_startup_hook)(void)`.
+    type StartupHookFn = unsafe extern "C" fn() -> c_int;
     /// `void clear_history(void)`.
     type ClearHistoryFn = unsafe extern "C" fn();
     /// `int rl_insert_text(const char *)`.
@@ -81,6 +86,14 @@ mod unix {
         _flags: c_int,
     }
 
+    /// GNU readline's `HIST_ENTRY` layout (`struct _hist_entry`).
+    #[repr(C)]
+    struct HistEntry {
+        /// The history line, valid for the lifetime of the entry.
+        line: *mut c_char,
+        _timestamp: *mut c_char,
+    }
+
     /// The bound GNU readline library.
     ///
     /// The function pointers and data addresses are immutable after `open`
@@ -93,6 +106,7 @@ mod unix {
         _handle: *mut c_void,
         readline: ReadlineFn,
         add_history: AddHistoryFn,
+        history_get: HistoryGetFn,
         clear_history: ClearHistoryFn,
         insert_text: InsertTextFn,
         read_history: HistoryFileFn,
@@ -105,8 +119,10 @@ mod unix {
         line_buffer: *mut *mut c_char,
         /// Address of `rl_attempted_completion_function`.
         attempted_completion: *mut c_void,
-        /// Address of `int rl_attempted_completion_over`.
+        /// Address of `rl_attempted_completion_over`.
         attempted_completion_over: *mut c_int,
+        /// Address of `rl_startup_hook` (`int (*)(void)`).
+        startup_hook: *mut c_void,
         /// Address of `const char *rl_completer_word_break_characters`.
         word_break: *mut *mut c_char,
         /// The `rl_readline_name` value; kept alive for the program lifetime.
@@ -145,10 +161,20 @@ mod unix {
         root: usize,
     }
 
+    /// The Python startup hook installed by `set_startup_hook`, with its
+    /// persistent root slot. It runs inside libreadline's
+    /// `int (*rl_startup_hook)(void)` callback.
+    struct StartupHook {
+        value: i64,
+        root: usize,
+    }
+
     thread_local! {
         /// The thread's completer hook. Readline is driven by one thread, so a
         /// thread-local keeps a handle from one thread's heap out of another's.
         static COMPLETER: RefCell<Option<CompleterHook>> = const { RefCell::new(None) };
+        /// The thread's startup hook (see [`set_startup_hook_call`]).
+        static STARTUP_HOOK: RefCell<Option<StartupHook>> = const { RefCell::new(None) };
         /// `(begidx, endidx)` captured by the last completion attempt.
         static INDICES: Cell<(i64, i64)> = const { Cell::new((0, 0)) };
     }
@@ -192,6 +218,7 @@ mod unix {
 
         let readline = function::<ReadlineFn>(handle, b"readline\0");
         let add_history = function::<AddHistoryFn>(handle, b"add_history\0");
+        let history_get = function::<HistoryGetFn>(handle, b"history_get\0");
         let clear_history = function::<ClearHistoryFn>(handle, b"clear_history\0");
         let insert_text = function::<InsertTextFn>(handle, b"rl_insert_text\0");
         let read_history = function::<HistoryFileFn>(handle, b"read_history\0");
@@ -205,6 +232,7 @@ mod unix {
         let line_buffer = data_symbol(handle, b"rl_line_buffer\0");
         let attempted_completion = data_symbol(handle, b"rl_attempted_completion_function\0");
         let attempted_completion_over = data_symbol(handle, b"rl_attempted_completion_over\0");
+        let startup_hook = data_symbol(handle, b"rl_startup_hook\0");
         let word_break = data_symbol(handle, b"rl_completer_word_break_characters\0");
         let readline_name_slot = data_symbol(handle, b"rl_readline_name\0");
 
@@ -221,6 +249,7 @@ mod unix {
         }
         let readline = required!(readline);
         let add_history = required!(add_history);
+        let history_get = required!(history_get);
         let clear_history = required!(clear_history);
         let insert_text = required!(insert_text);
         let read_history = required!(read_history);
@@ -233,6 +262,7 @@ mod unix {
         let line_buffer = required!(line_buffer);
         let attempted_completion = required!(attempted_completion);
         let attempted_completion_over = required!(attempted_completion_over);
+        let startup_hook = required!(startup_hook);
         let word_break = required!(word_break);
         let readline_name_slot = required!(readline_name_slot);
 
@@ -262,6 +292,7 @@ mod unix {
             _handle: handle,
             readline,
             add_history,
+            history_get,
             clear_history,
             insert_text,
             read_history,
@@ -273,6 +304,7 @@ mod unix {
             line_buffer: line_buffer as *mut *mut c_char,
             attempted_completion,
             attempted_completion_over: attempted_completion_over as *mut c_int,
+            startup_hook,
             word_break: word_break as *mut *mut c_char,
             _name: name,
         })
@@ -423,6 +455,26 @@ mod unix {
             Some(text) => libc::strdup(text.as_ptr()),
             None => std::ptr::null_mut(),
         }
+    }
+
+    /// The libreadline startup-hook callback: calls the Python hook with no
+    /// arguments and returns `0`, or `-1` to tell readline the hook failed.
+    ///
+    /// Readline's `int (*)(void)` signature cannot carry a Python exception,
+    /// so a failing hook is reported like an uncaught exception (CPython's
+    /// callback prints it the same way) and the line editor aborts the start.
+    unsafe extern "C" fn on_startup_hook() -> c_int {
+        let hook = STARTUP_HOOK.with(|slot| slot.borrow().as_ref().map(|hook| hook.value));
+        let Some(hook) = hook else {
+            return 0;
+        };
+        let result = builtins::call(hook, 0, std::ptr::null());
+        if exc::pending() {
+            let _ = exc::uncaught();
+            return -1;
+        }
+        let _ = result;
+        0
     }
 
     /// The attempted-completion callback: records the completion scope and
@@ -848,6 +900,86 @@ mod unix {
         }
     }
 
+    /// `get_history_item(index)`: CPython's wrapper around `history_get`.
+    ///
+    /// The index is a 1-based absolute history position; an index outside the
+    /// list returns `None`, exactly like CPython. The value is a C `int` in
+    /// CPython's argument parser, so integers outside that range raise
+    /// `OverflowError` instead of wrapping.
+    fn get_history_item_call(args: &[i64]) -> i64 {
+        if args.len() != 1 {
+            return bad_arity("get_history_item", "exactly 1 argument", args.len());
+        }
+        let Some(library) = load() else {
+            return unavailable();
+        };
+        let Some(index) = value::as_integer(args[0]) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "get_history_item() argument must be int, not '{}'",
+                    value::type_name(args[0])
+                ),
+            );
+        };
+        let Ok(index) = i32::try_from(index) else {
+            return exc::raise_with_message(
+                OVERFLOW_ERROR,
+                "get_history_item() argument is out of range for a C int",
+            );
+        };
+        let entry = unsafe { (library.history_get)(index) };
+        if entry.is_null() {
+            return NONE;
+        }
+        // SAFETY: `history_get` returns a live `HIST_ENTRY`; `line` is a
+        // NUL-terminated string owned by the history list.
+        let line = unsafe { borrow_c_string((*entry).line) };
+        value::str_alloc(line)
+    }
+
+    /// `set_startup_hook(function=None)`: installs the hook libreadline runs
+    /// before the first prompt of a line-editing session.
+    ///
+    /// CPython stores the callable and installs its own `on_startup_hook`
+    /// trampoline in the `rl_startup_hook` global; `None` clears the point and
+    /// drops the stored callable. A non-callable argument raises the same
+    /// `TypeError: argument must be callable` CPython reports.
+    fn set_startup_hook_call(args: &[i64]) -> i64 {
+        if args.len() > 1 {
+            return bad_arity("set_startup_hook", "at most 1 argument", args.len());
+        }
+        let Some(library) = load() else {
+            return unavailable();
+        };
+        let hook = args.first().copied().unwrap_or(NONE);
+        if hook == NONE {
+            STARTUP_HOOK.with(|slot| {
+                if let Some(previous) = slot.borrow_mut().take() {
+                    heap::release_persistent_root(previous.root, previous.value);
+                }
+            });
+            unsafe {
+                *(library.startup_hook as *mut Option<StartupHookFn>) = None;
+            }
+            return NONE;
+        }
+        if builtins::callable(hook) != value::TRUE {
+            return exc::raise_with_message(TYPE_ERROR, "argument must be callable");
+        }
+        let root = heap::add_persistent_root(hook);
+        STARTUP_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some(previous) = slot.replace(StartupHook { value: hook, root }) {
+                heap::release_persistent_root(previous.root, previous.value);
+            }
+        });
+        unsafe {
+            *(library.startup_hook as *mut Option<StartupHookFn>) = Some(on_startup_hook);
+        }
+        NONE
+    }
+
     /// Dispatches a native `readline` function.
     pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         if function == "redisplay" {
@@ -859,6 +991,8 @@ mod unix {
         match function {
             "readline" => readline_call(args),
             "add_history" => add_history_call(args),
+            "get_history_item" => get_history_item_call(args),
+            "set_startup_hook" => set_startup_hook_call(args),
             "clear_history" => clear_history_call(args),
             "get_line_buffer" => get_line_buffer_call(args),
             "insert_text" => insert_text_call(args),
@@ -1066,6 +1200,55 @@ mod unix {
             call("set_history_length", &[int(i64::from(i32::MAX) + 1)]);
             assert_eq!(exc::pending_tag(), OVERFLOW_ERROR as i64);
             exc::clear();
+        }
+
+        #[test]
+        fn history_items_and_startup_hook() {
+            exc::init();
+            if !available() {
+                return;
+            }
+            let _guard = lock();
+            call("clear_history", &[]);
+            with_roots(&[text("alpha")], "add_history");
+            with_roots(&[text("beta")], "add_history");
+
+            // `get_history_item` is 1-based and returns `None` past the end.
+            let first = call("get_history_item", &[int(1)]);
+            assert_eq!(value::as_str(first), Some("alpha"));
+            let second = call("get_history_item", &[int(2)]);
+            assert_eq!(value::as_str(second), Some("beta"));
+            assert_eq!(call("get_history_item", &[int(99)]), NONE);
+            assert!(!exc::pending(), "out-of-range index must return None");
+
+            call("get_history_item", &[text("x")]);
+            assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+            exc::clear();
+            call("get_history_item", &[int(i64::from(i32::MAX) + 1)]);
+            assert_eq!(exc::pending_tag(), OVERFLOW_ERROR as i64);
+            exc::clear();
+
+            // `set_startup_hook` stores a callable, installs the readline
+            // trampoline and clears both again for `None`.
+            let hook = value::builtin_function_new(hydro_ir::Builtin::Dict);
+            let roots = heap::root_values(&[hook]);
+            call("set_startup_hook", &[hook]);
+            assert!(!exc::pending());
+            // The trampoline calls the hook with no arguments; `dict()`
+            // succeeds, so it reports success to readline.
+            assert_eq!(unsafe { on_startup_hook() }, 0);
+            assert!(!exc::pending());
+            call("set_startup_hook", &[NONE]);
+            assert!(!exc::pending());
+            assert_eq!(unsafe { on_startup_hook() }, 0);
+
+            call("set_startup_hook", &[int(5)]);
+            assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+            exc::clear();
+            call("set_startup_hook", &[hook, hook]);
+            assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+            exc::clear();
+            heap::release_roots(roots);
         }
     }
 }

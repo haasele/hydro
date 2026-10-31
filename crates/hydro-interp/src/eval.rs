@@ -33,6 +33,23 @@ fn bytes(text: &str) -> (*const u8, usize) {
     (text.as_ptr(), text.len())
 }
 
+/// The source docstring of an interpreted definition: its leading string
+/// expression statement, after the synthetic `CellInit` prologue. Mirrors the
+/// JIT's `Lowerer::function_docstring`.
+fn function_docstring(function: &hydro_ir::Function) -> Option<String> {
+    let statement = function
+        .body
+        .iter()
+        .find(|statement| !matches!(&statement.kind, hydro_ir::StmtKind::CellInit { .. }))?;
+    match &statement.kind {
+        hydro_ir::StmtKind::Expr(expression) => match &expression.kind {
+            ExprKind::Const(Const::Str(text)) => Some(text.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 impl Interp {
     pub(crate) fn truthy(&self, value: i64) -> bool {
         abi::hydro_truthy(value) != 0
@@ -972,6 +989,7 @@ impl Interp {
             is_async,
             is_generator,
             host_params,
+            function_docstring(func),
         );
         let value = self.check(value);
         self.scratch_release(mark);

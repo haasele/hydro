@@ -4394,13 +4394,17 @@ impl<'a> Checker<'a> {
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Dict));
             }
             Builtin::Eval | Builtin::Exec => {
-                if count == 0 || count > 3 {
+                // `exec(source, globals=None, locals=None, /, *, closure=None)`
+                // takes the keyword-only `closure` slot; `eval` has no
+                // closure parameter.
+                let max = if builtin == Builtin::Exec { 4 } else { 3 };
+                if count == 0 || count > max {
                     self.error_code(
                         line,
                         col,
                         codes::CALL,
                         format!(
-                            "{}() takes 1 to 3 arguments ({count} given)",
+                            "{}() takes 1 to {max} arguments ({count} given)",
                             builtin.name()
                         ),
                     );

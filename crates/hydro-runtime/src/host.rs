@@ -62,6 +62,15 @@ pub struct HostParam {
 ///
 /// The values in `captures` and every `HostParam::default` are rooted while
 /// the function object is allocated; `token` is opaque to the runtime.
+/// `doc` is the source docstring of the definition (the leading string
+/// statement), published through the same `__doc__` slot generated wrappers
+/// use.
+// The parameter list mirrors the interpreter-to-runtime bridge: one argument
+// per `FunctionObj` field the interpreter materialises (token, captures,
+// arity, name, async/generator flags, bound parameters, docstring). Keeping it
+// flat preserves the existing call shape and avoids a transient one-use
+// struct at the single bridge call site.
+#[allow(clippy::too_many_arguments)]
 pub fn function_new(
     token: u64,
     captures: Vec<i64>,
@@ -70,6 +79,7 @@ pub fn function_new(
     is_async: bool,
     is_generator: bool,
     params: Vec<HostParam>,
+    doc: Option<String>,
 ) -> i64 {
     let flags = u32::from(is_async)
         | (u32::from(is_generator) << 1)
@@ -83,6 +93,13 @@ pub fn function_new(
         .collect();
     let function = value::host_function_new(token, captures, arity, name, flags, specs);
     heap::release_roots(roots);
+    if let Some(doc) = doc {
+        // `function_set_doc` allocates the string; keep the new function value
+        // reachable across it.
+        let function_root = heap::root_values(&[function]);
+        value::function_set_doc(function, &doc);
+        heap::release_roots(function_root);
+    }
     function
 }
 

@@ -201,6 +201,7 @@
 pub(crate) mod buffer;
 pub(crate) mod container_api;
 pub(crate) mod descriptor_api;
+pub(crate) mod dynload_api;
 pub(crate) mod numeric_api;
 pub(crate) mod object_api;
 pub(crate) mod tuple_layout;
@@ -1182,7 +1183,10 @@ pub(crate) unsafe fn kind_pointer(object: *mut ShimObject) -> *mut ShimKind {
     let base = object as *mut u8;
     // SAFETY: every handle starts with the CPython header.
     let type_object = unsafe { (*object).head.ob_type };
-    if !type_object.is_null() && type_object == ptr::addr_of_mut!(types::TUPLE_TYPE) {
+    if !type_object.is_null()
+        && (type_object == ptr::addr_of_mut!(types::TUPLE_TYPE)
+            || dynload_api::is_structseq_type(type_object))
+    {
         // SAFETY: a tuple's `ob_size` describes its inline array.
         let count = unsafe { (*object).ob_size.load(Ordering::Relaxed) }.max(0) as usize;
         return base.add(tuple_layout::tuple_kind_offset(count)) as *mut ShimKind;
@@ -1227,7 +1231,10 @@ pub(crate) fn sync_list_prefix(object: *mut ShimObject) {
 fn object_layout(object: *mut ShimObject) -> std::alloc::Layout {
     // SAFETY: every handle starts with the CPython header.
     let type_object = unsafe { (*object).head.ob_type };
-    if !type_object.is_null() && type_object == ptr::addr_of_mut!(types::TUPLE_TYPE) {
+    if !type_object.is_null()
+        && (type_object == ptr::addr_of_mut!(types::TUPLE_TYPE)
+            || dynload_api::is_structseq_type(type_object))
+    {
         // SAFETY: a tuple's `ob_size` describes its inline array.
         let count = unsafe { (*object).ob_size.load(Ordering::Relaxed) }.max(0) as usize;
         let size = tuple_layout::tuple_kind_offset(count) + std::mem::size_of::<ShimKind>();
@@ -2000,6 +2007,7 @@ exception_type_symbols! {
     PyExc_PendingDeprecationWarning => "PendingDeprecationWarning",
     PyExc_PermissionError => "PermissionError",
     PyExc_ProcessLookupError => "ProcessLookupError",
+    PyExc_PythonFinalizationError => "PythonFinalizationError",
     PyExc_RecursionError => "RecursionError",
     PyExc_ReferenceError => "ReferenceError",
     PyExc_ResourceWarning => "ResourceWarning",
@@ -2093,6 +2101,7 @@ exception_bases! {
     PyExc_NotADirectoryError => PyExc_OSError,
     PyExc_PermissionError => PyExc_OSError,
     PyExc_ProcessLookupError => PyExc_OSError,
+    PyExc_PythonFinalizationError => PyExc_RuntimeError,
     PyExc_TimeoutError => PyExc_OSError,
     PyExc_ConnectionAbortedError => PyExc_ConnectionError,
     PyExc_ConnectionRefusedError => PyExc_ConnectionError,
@@ -15428,6 +15437,8 @@ pub(crate) fn anchor() {
     initialize_exception_types();
     anchor_exception_types();
     anchor_constant_objects();
+    // Internals imported by the pinned `lib-dynload` extensions.
+    dynload_api::anchor();
     // Builtin type data symbols: staticlib linkers keep a definition only when
     // something references it, so take every address here.
     let type_symbols: [*const TypeObject; 41] = {
@@ -15910,6 +15921,8 @@ pub(crate) fn anchor() {
         object_api::PyWeakref_NewRef as *const (),
         object_api::PyThread_allocate_lock as *const (),
         object_api::PyThread_free_lock as *const (),
+        object_api::PyThread_acquire_lock as *const (),
+        object_api::PyThread_release_lock as *const (),
         object_api::PyThreadState_GetFrame as *const (),
         object_api::PyTraceBack_Here as *const (),
         object_api::PyFrame_New as *const (),

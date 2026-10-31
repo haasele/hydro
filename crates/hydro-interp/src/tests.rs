@@ -854,6 +854,55 @@ assert bump(3) == 8
 }
 
 #[test]
+fn user_module_call_binds_omitted_defaults_and_keyword_only() {
+    // A cross-module call that omits a default (or passes a keyword-only
+    // argument) must reach the runtime signature binder; taking the direct
+    // function entry would pass too few slots. `tkinter`'s
+    // `@enum._simple_enum(enum.StrEnum)` is the motivating shape.
+    let _guard = guard();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "hydro-interp-defaults-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("helper.py"),
+        "\
+def shifted(value, *, offset=1):
+    return value + offset
+
+def pair(a, b=2):
+    return (a, b)
+",
+    )
+    .unwrap();
+    let main = dir.join("main.py");
+    std::fs::write(
+        &main,
+        "\
+import helper
+from helper import pair, shifted
+
+assert helper.shifted(3) == 4
+assert helper.shifted(3, offset=10) == 13
+assert helper.pair(1) == (1, 2)
+assert helper.pair(1, 5) == (1, 5)
+assert shifted(3) == 4
+assert pair(1) == (1, 2)
+",
+    )
+    .unwrap();
+    let program = hydro_frontend::check_file(&main)
+        .unwrap_or_else(|diagnostics| panic!("frontend rejected modules: {diagnostics:?}"));
+    run_program(program);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn native_callbacks_reenter_the_interpreter() {
     run_source(
         "\

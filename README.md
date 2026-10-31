@@ -41,7 +41,7 @@ monorepo carries the unit/integration suites; CLI/E2E/AOT tests live in Tea.
 Compatibility target: **CPython 3.14.9**; the official `Lib/test` baseline is
 **3/398** (`test_errno.py`, `test_int_literal.py`, `test_longexp.py`), tracked in
 [`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md). The generated stdlib import
-matrix is **269/297** ([`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).
+matrix is **283/297** ([`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).
 Hydro JIT (`tea infuse`) and AOT (`tea build`) share this runtime and IR.
 Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), work list in
 [`docs/TODO.md`](docs/TODO.md), source tree in
@@ -294,7 +294,7 @@ User decorators and pattern matching remain incomplete; `except*` grouping and
 `await`/cancellation edge cases are still open. The general descriptor and
 metaclass protocols, `bytearray`/`memoryview`, async generators and async
 comprehensions are implemented. Arbitrary C extensions/full CPython ABI
-semantics and the complete stdlib remain open (269/297 modules import; see
+semantics and the complete stdlib remain open (283/297 modules import; see
 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). A general `sys.path`/
 `sys.modules` model, dynamic imports from unlinked packages, namespace/zip/
 frozen imports and `from x import *` are incomplete; packages, dotted/relative

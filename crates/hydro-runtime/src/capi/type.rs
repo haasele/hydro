@@ -638,7 +638,9 @@ pub(crate) static mut LIST_TYPE: TypeObject = TypeObject::builtin(
 pub(crate) static mut TUPLE_TYPE: TypeObject = TypeObject::builtin(
     c"tuple".as_ptr(),
     TypeRole::Shim,
-    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_TUPLE_SUBCLASS,
+    // CPython's tuple type is subclassable; struct sequences are tuple
+    // subclasses built through `PyType_FromSpecWithBases`.
+    PY_TPFLAGS_IMMUTABLETYPE | PY_TPFLAGS_TUPLE_SUBCLASS | PY_TPFLAGS_BASETYPE,
 );
 #[export_name = "PyDict_Type"]
 pub(crate) static mut DICT_TYPE: TypeObject = TypeObject::builtin(

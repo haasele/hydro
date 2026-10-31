@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import subprocess
+import sysconfig
 import sys
 import tempfile
 import time
@@ -621,6 +622,14 @@ def main(argv: list[str] | None = None) -> int:
         stdlib = cpython.parent.parent / "lib" / f"python{minor}"
         if stdlib.is_dir():
             env["HYDRO_STDLIB"] = str(stdlib)
+    # A statically-linked CPython (uv builds) ships many extension modules
+    # inside the interpreter binary instead of lib-dynload. Hydro can only
+    # load shared objects, so fall back to the host's ABI-compatible CPython
+    # extension directory when it exists.
+    if "HYDRO_EXTENSION_PATH" not in env:
+        dynload = Path(sysconfig.get_path("platstdlib")) / "lib-dynload"
+        if dynload.is_dir():
+            env["HYDRO_EXTENSION_PATH"] = str(dynload)
 
     json_path = Path(args.json) if args.json else DEFAULT_JSON
     md_path = Path(args.md) if args.md else DEFAULT_MD

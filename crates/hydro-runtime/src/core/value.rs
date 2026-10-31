@@ -820,7 +820,8 @@ impl RandomState {
 /// `target` and `args` are immutable after construction, so the collector may
 /// trace them without synchronisation. `started`, `id`, `joined` and the
 /// shared `finished` flag are atomics: the spawning, joining and child threads
-/// all observe them.
+/// all observe them. `daemon` is the CPython `Thread.daemon` state: settable
+/// until the thread starts, readable from any thread afterwards.
 pub(crate) struct ThreadState {
     pub(crate) target: i64,
     pub(crate) args: Vec<i64>,
@@ -829,12 +830,14 @@ pub(crate) struct ThreadState {
     /// Python-visible id assigned when the OS thread is spawned (`0` before).
     pub(crate) id: AtomicI64,
     pub(crate) joined: AtomicBool,
+    /// `Thread.daemon`: whether the interpreter may abandon the thread.
+    pub(crate) daemon: AtomicBool,
     /// Set by the child just before it leaves the runtime.
     pub(crate) finished: Arc<AtomicBool>,
 }
 
 impl ThreadState {
-    fn new(target: i64, args: Vec<i64>, name: String) -> ThreadState {
+    fn new(target: i64, args: Vec<i64>, name: String, daemon: bool) -> ThreadState {
         ThreadState {
             target,
             args,
@@ -842,6 +845,7 @@ impl ThreadState {
             started: AtomicBool::new(false),
             id: AtomicI64::new(0),
             joined: AtomicBool::new(false),
+            daemon: AtomicBool::new(daemon),
             finished: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -7123,6 +7127,22 @@ pub(crate) fn function_set_signature(function: i64, signature: Vec<ParamMeta>) {
     }
 }
 
+/// Stores the source docstring of a generated function value.
+///
+/// Codegen calls this right after creating a wrapper, before the function can
+/// be observed by Python code, so `func.__doc__` reports the leading string
+/// statement of the definition. Native functions have no writable metadata
+/// surface and keep their builtin `__doc__` behaviour.
+pub(crate) fn function_set_doc(function: i64, doc: &str) {
+    if !function_has_attributes(function) {
+        return;
+    }
+    let text = str_alloc(doc.to_string());
+    let roots = crate::heap::root_values(&[text]);
+    function_setattr(function, "__doc__", text);
+    crate::heap::release_roots(roots);
+}
+
 /// Number of leading positional-only parameters of a function value.
 ///
 /// `PosOnly` parameters always form the leading positional run, so callers can
@@ -7424,11 +7444,18 @@ pub(crate) fn lock_new_reentrant() -> i64 {
     alloc(KIND_LOCK, ObjData::Lock(LockState::new_reentrant()))
 }
 
-/// Allocates a `threading.Thread` object. `args` is immutable afterwards.
-pub(crate) fn thread_new(target: i64, args: Vec<i64>, name: String) -> i64 {
+/// Allocates a `threading.Thread` object with an explicit `daemon` flag.
+/// `args` is immutable afterwards; callers that want CPython's default pass
+/// `daemon = false`.
+pub(crate) fn thread_new_with_daemon(
+    target: i64,
+    args: Vec<i64>,
+    name: String,
+    daemon: bool,
+) -> i64 {
     alloc(
         KIND_THREAD,
-        ObjData::Thread(ThreadState::new(target, args, name)),
+        ObjData::Thread(ThreadState::new(target, args, name, daemon)),
     )
 }
 

@@ -2616,6 +2616,30 @@ pub(crate) extern "C" fn container_copy_entry(argv: *const i64) -> i64 {
     call(target, b"copy".as_ptr(), "copy".len(), 0, std::ptr::null())
 }
 
+/// `function.__doc__`, including CPython's delegation through a bound method
+/// to its underlying function (`obj.method.__doc__ is type(obj).method.__doc__`).
+/// Builtin type spellings keep their synthesized `"<name> built-in type"` doc.
+fn function_doc_attribute(obj: i64) -> i64 {
+    let doc = value::function_doc(obj);
+    if doc != NONE {
+        return doc;
+    }
+    if let Some(function) = value::as_function(obj) {
+        if let value::FunctionBody::BoundMethod { receiver, method } = &function.body {
+            if let Some(inner) = bound_method_function(*receiver, method) {
+                let inner_doc = value::function_doc(inner);
+                if inner_doc != NONE {
+                    return inner_doc;
+                }
+            }
+        }
+    }
+    match value::builtin_type_name(obj) {
+        Some(name) => value::str_alloc(format!("{name} built-in type")),
+        None => NONE,
+    }
+}
+
 /// The default attribute lookup: data descriptors, the instance dictionary,
 /// class attributes and every native receiver kind.
 fn getattr_named(obj: i64, attr: &str) -> i64 {
@@ -2863,13 +2887,7 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
             "__qualname__" => value::str_alloc(value::function_qualname(obj)),
             // `str.__doc__`/`str.__module__` describe the type, not a plain
             // function; `inspect_namespace` reads them off `value.__class__`.
-            "__doc__" => match value::function_doc(obj) {
-                doc if doc != NONE => doc,
-                doc => match value::builtin_type_name(obj) {
-                    Some(name) => value::str_alloc(format!("{name} built-in type")),
-                    None => doc,
-                },
-            },
+            "__doc__" => function_doc_attribute(obj),
             "__module__" => match value::function_module(obj) {
                 Some(module) => module,
                 None if value::builtin_type_name(obj).is_some() => {
@@ -3482,6 +3500,23 @@ fn setattr_named(obj: i64, attr: &str, new_value: i64) -> i64 {
         }
         return attribute_error(obj, attr);
     }
+    if let Some(thread) = value::as_thread(obj) {
+        // `Thread.daemon = value`: writable until the thread starts, exactly
+        // like CPython's property setter.
+        if attr == "daemon" {
+            if thread.started.load(Ordering::Acquire) {
+                return exc::raise_with_message(
+                    RUNTIME_ERROR,
+                    "cannot set daemon status of active thread",
+                );
+            }
+            thread
+                .daemon
+                .store(value::truthy(new_value), Ordering::Release);
+            return NONE;
+        }
+        return attribute_error(obj, attr);
+    }
     if let Some(class) = value::instance_class_value(obj) {
         if attr == "__dict__" {
             if value::instance_set_dict(obj, new_value) {
@@ -3685,8 +3720,10 @@ fn thread_attr(obj: i64, attr: &str) -> i64 {
                 ops::int_result(id)
             }
         }
-        // The runtime always spawns non-daemon threads.
-        "daemon" => value::FALSE,
+        // `Thread.daemon`: the flag the constructor or a later assignment
+        // stored (`False` by default, inherited from the creating thread when
+        // the constructor receives no explicit value).
+        "daemon" => value::bool_value(thread.daemon.load(Ordering::Acquire)),
         _ => attribute_error(obj, attr),
     }
 }
@@ -7625,7 +7662,10 @@ fn thread_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             let target = thread.target;
             let argv = thread.args.clone();
             let finished = thread.finished.clone();
-            match modules::spawn_thread(target, argv, Some(finished)) {
+            // Snapshot `daemon` with the other owned inputs: the child's
+            // `current_thread()` placeholder reads it from the registry.
+            let daemon = thread.daemon.load(Ordering::Acquire);
+            match modules::spawn_thread(target, argv, Some(finished), daemon) {
                 Ok(id) => {
                     // `obj` keeps the Thread object reachable; re-derive the
                     // reference instead of carrying one across the spawn.
@@ -11943,6 +11983,67 @@ mod tests {
             i64::from(crate::exc::ATTRIBUTE_ERROR)
         );
         let _ = crate::exc::clear();
+    }
+
+    #[test]
+    fn user_function_and_method_docstrings_are_metadata() {
+        reset();
+        // Plain function: the docstring slot is `None` until codegen attaches
+        // the definition's leading string statement.
+        let plain =
+            value::function_new(first_argument as *const () as usize, 1, "plain".to_string());
+        assert_eq!(getattr(plain, b"__doc__".as_ptr(), 7), NONE);
+        value::function_set_doc(plain, "plain doc");
+        assert_eq!(text(getattr(plain, b"__doc__".as_ptr(), 7)), "plain doc");
+
+        // Nested function: same function-value surface, independent slot.
+        let nested = value::function_new(
+            first_argument as *const () as usize,
+            1,
+            "outer.inner".to_string(),
+        );
+        value::function_set_doc(nested, "nested doc");
+        assert_eq!(text(getattr(nested, b"__doc__".as_ptr(), 7)), "nested doc");
+
+        // Class method: `C.method.__doc__` and the bound method's
+        // `C().method.__doc__` both report the underlying function slot.
+        let method = value::function_new(
+            first_argument as *const () as usize,
+            2,
+            "C.method".to_string(),
+        );
+        value::function_set_doc(method, "method doc");
+        // Root the values that cross class creation: they live on the Rust
+        // stack, which the collector does not scan.
+        let class_doc = string("class doc");
+        let class_values = crate::heap::root_values(&[method, class_doc]);
+        let class = value::class_new_full(
+            "C".to_string(),
+            value::object_class(),
+            vec![("method".to_string(), method, MethodKind::Normal)],
+            vec![("__doc__".to_string(), class_doc)],
+        );
+        crate::heap::release_roots(class_values);
+        let class_root = crate::heap::root_values(&[class]);
+        assert_eq!(text(getattr(class, b"__doc__".as_ptr(), 7)), "class doc");
+        let unbound = getattr(class, b"method".as_ptr(), 6);
+        assert_eq!(text(getattr(unbound, b"__doc__".as_ptr(), 7)), "method doc");
+        let instance = value::instance_new(class);
+        let bound = getattr(instance, b"method".as_ptr(), 6);
+        assert_eq!(text(getattr(bound, b"__doc__".as_ptr(), 7)), "method doc");
+        crate::heap::release_roots(class_root);
+
+        // A function with no leading string statement keeps `None`, and a
+        // class without a docstring reports `None` too.
+        let undocumented = value::function_new(
+            first_argument as *const () as usize,
+            1,
+            "undocumented".to_string(),
+        );
+        assert_eq!(getattr(undocumented, b"__doc__".as_ptr(), 7), NONE);
+        let plain_class = value::class_new("Plain".to_string(), NONE, Vec::new());
+        assert_eq!(getattr(plain_class, b"__doc__".as_ptr(), 7), NONE);
+        assert!(!crate::exc::pending(), "{}", message());
     }
 
     #[test]

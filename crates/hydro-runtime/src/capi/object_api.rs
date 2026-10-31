@@ -78,7 +78,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard, Once, PoisonError};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, Once, PoisonError};
 
 use super::*;
 
@@ -893,20 +893,22 @@ pub unsafe extern "C" fn PyWeakref_GetRef(
 
 /// A `PyThread_type_lock`.
 ///
-/// Real locks are allocated so that a caller that hands one to
-/// `PyThread_acquire_lock`/`PyThread_release_lock` in a host that exports them
-/// gets mutual exclusion; this module only owns the allocate/free half of the
-/// pair (the two symbols the pinned wheels reference).
+/// CPython locks are binary semaphores: `PyThread_acquire_lock` marks the lock
+/// held and `PyThread_release_lock` makes it available again, independently of
+/// any Rust guard lifetime. A `Mutex<bool>` plus a condition variable models
+/// that faithfully, including the blocking (`WAIT_LOCK`) and non-blocking
+/// (`NOWAIT_LOCK`) acquire modes.
 struct ThreadLock {
-    #[allow(dead_code)]
-    mutex: Mutex<()>,
+    state: Mutex<bool>,
+    available: Condvar,
 }
 
 /// `PyThread_allocate_lock`.
 #[no_mangle]
 pub unsafe extern "C" fn PyThread_allocate_lock() -> *mut c_void {
     let lock = Box::new(ThreadLock {
-        mutex: Mutex::new(()),
+        state: Mutex::new(false),
+        available: Condvar::new(),
     });
     Box::into_raw(lock) as *mut c_void
 }
@@ -920,6 +922,47 @@ pub unsafe extern "C" fn PyThread_free_lock(lock: *mut c_void) {
     // SAFETY: `lock` came from `PyThread_allocate_lock` and the caller gives up
     // ownership here, as CPython requires.
     drop(unsafe { Box::from_raw(lock as *mut ThreadLock) });
+}
+
+/// `PyThread_acquire_lock`: acquire `lock`, blocking when `waitflag` is
+/// `WAIT_LOCK` (1) and failing immediately when it is `NOWAIT_LOCK` (0).
+///
+/// Returns `PY_LOCK_ACQUIRED` (1) on success and `PY_LOCK_FAILURE` (0)
+/// otherwise, matching CPython's legacy `int` entry point.
+#[no_mangle]
+pub unsafe extern "C" fn PyThread_acquire_lock(lock: *mut c_void, waitflag: c_int) -> c_int {
+    if lock.is_null() {
+        return 0;
+    }
+    // SAFETY: `lock` came from `PyThread_allocate_lock`.
+    let lock = unsafe { &*(lock as *const ThreadLock) };
+    let mut held = lock.state.lock().unwrap_or_else(PoisonError::into_inner);
+    if *held {
+        if waitflag == 0 {
+            return 0;
+        }
+        while *held {
+            held = lock
+                .available
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+    *held = true;
+    1
+}
+
+/// `PyThread_release_lock`: mark a held lock available again.
+#[no_mangle]
+pub unsafe extern "C" fn PyThread_release_lock(lock: *mut c_void) {
+    if lock.is_null() {
+        return;
+    }
+    // SAFETY: `lock` came from `PyThread_allocate_lock`.
+    let lock = unsafe { &*(lock as *const ThreadLock) };
+    let mut held = lock.state.lock().unwrap_or_else(PoisonError::into_inner);
+    *held = false;
+    lock.available.notify_one();
 }
 
 /// `PyThreadState_GetFrame`: the frame currently being executed by `tstate`.

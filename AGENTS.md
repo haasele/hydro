@@ -78,18 +78,18 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-10-30: **2963 tests run
-(2963 passed, 1 skipped)**; the per-crate breakdown below sums to 2963
+`cargo nextest run --workspace` on 2026-10-30: **3025 tests run
+(3025 passed, 1 skipped)**; the per-crate breakdown below sums to 3025
 (the skipped test is not included in the listed binaries):
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 1894 |
-| frontend | 841 |
-| codegen | 77 |
-| IR | 64 |
+| runtime (unit + integration) | 1932 |
+| frontend | 860 |
+| codegen | 78 |
+| IR | 67 |
 | bindgen | 42 |
-| interpreter | 26 |
+| interpreter | 27 |
 | parser | 19 |
 | hna | 0 |
 | hna-fixture | 0 |
@@ -101,8 +101,8 @@ Other docs must link here instead of repeating the total.
 
 ### Compatibility checkpoint (2026-10-30)
 
-- **Import matrix:** **269/297 modules importable** (50 builtin/frozen, 167 pure,
-  52 extension; 28 fail; 9 modules fail under CPython 3.14.9 itself). The
+- **Import matrix:** **283/297 modules importable** (50 builtin/frozen, 171 pure,
+  52 extension; 14 fail; 9 modules fail under CPython 3.14.9 itself). The
   harness now sets `HYDRO_STDLIB` to the pinned CPython `Lib` tree; the earlier
   159 count used the toolchain's default subset. Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
@@ -149,7 +149,7 @@ Other docs must link here instead of repeating the total.
   resumes remain the narrowest compute result but are now faster than CPython
   (P5 focuses on PGO/inlining).
 - Full CPython stdlib/P7 parity, C extensions/full ABI behavior, and the
-  ecosystem suites remain open; 269/297 stdlib modules import.
+  ecosystem suites remain open; 283/297 stdlib modules import.
 - Imports: packages, dotted/relative imports, site-packages and vendored
   `stdlib/` work; dynamic imports of unlinked package submodules, namespace/
   zip/frozen imports and `from x import *` remain incomplete.

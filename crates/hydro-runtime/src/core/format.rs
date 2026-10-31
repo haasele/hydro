@@ -12,6 +12,9 @@
 //! the common cases: `[[fill]align][sign][#][0][width][,][.precision][type]`
 //! with the types `s b c d o x X e E f F g G %`.
 //!
+//! `%` formatting accepts a tuple of positional arguments, a single object,
+//! or a mapping operand whose `%(key)` fields are looked up with `[]`.
+//!
 //! No user input can panic here: every malformed spec becomes a
 //! [`FormatError`] carrying the exception tag (`ValueError` for invalid
 //! specs, `TypeError` for wrong operand types).
@@ -363,15 +366,23 @@ fn split_field(field: &str) -> Result<(String, u8, String), FormatError> {
 
 /// `"template" % rhs`.
 pub(crate) fn percent_format(template: &str, rhs: i64) -> Result<String, FormatError> {
-    let args: Vec<i64> = match value::as_tuple(rhs) {
+    // A tuple supplies positional arguments; every other operand is a single
+    // argument. A mapping operand additionally answers `%(key)` lookups.
+    let positional = value::as_tuple(rhs);
+    let args: Vec<i64> = match positional {
         Some(items) => items.to_vec(),
         None => vec![rhs],
     };
+    // CPython's argument cursor: a negative `arglen` marks a non-tuple
+    // operand, whose one value is reused from `args[0]`.
+    let tuple_len = positional.map(|items| items.len() as isize);
+    let arglen = tuple_len.unwrap_or(-1);
+    let mut argidx: isize = if tuple_len.is_some() { 0 } else { -2 };
+    let mapping = percent_mapping(rhs);
 
     let chars: Vec<char> = template.chars().collect();
     let mut out = String::with_capacity(template.len() + 16);
     let mut i = 0;
-    let mut next_arg = 0usize;
 
     while i < chars.len() {
         if chars[i] != '%' {
@@ -385,10 +396,41 @@ pub(crate) fn percent_format(template: &str, rhs: i64) -> Result<String, FormatE
             continue;
         }
         i += 1;
+
+        // `%(key)` takes the conversion's value from the mapping instead of
+        // the positional argument cursor.
+        let mut named: Option<i64> = None;
         if chars.get(i) == Some(&'(') {
-            return Err(FormatError::type_error(
-                "format requires a mapping (named %()s keys are not supported)",
-            ));
+            let Some(mapping) = mapping else {
+                return Err(FormatError::type_error("format requires a mapping"));
+            };
+            i += 1;
+            let key_start = i;
+            let mut depth = 1usize;
+            while i < chars.len() {
+                match chars[i] {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            if i >= chars.len() {
+                return Err(FormatError::value_error("incomplete format key"));
+            }
+            let key: String = match chars.get(key_start..i) {
+                Some(slice) => slice.iter().collect(),
+                None => {
+                    return Err(FormatError::value_error("incomplete format key"));
+                }
+            };
+            i += 1; // the closing ')'
+            named = Some(percent_lookup(mapping, &key)?);
         }
 
         let mut flags = String::new();
@@ -436,31 +478,115 @@ pub(crate) fn percent_format(template: &str, rhs: i64) -> Result<String, FormatE
             return Err(FormatError::value_error("incomplete format"));
         };
         i += 1;
+        let type_index = i.saturating_sub(1);
         if ty == '%' {
+            // A bare `%%` is handled above; a `%` reached through width or
+            // precision is only a literal when no key introduced it.
+            if named.is_some() {
+                return Err(FormatError::value_error(format!(
+                    "unsupported format character '%' (0x{:x}) at index {}",
+                    '%' as u32, type_index
+                )));
+            }
             out.push('%');
             continue;
         }
 
-        let Some(arg) = args.get(next_arg).copied() else {
+        let arg = if let Some(named) = named {
+            // The mapped value is this conversion's argument, and a later
+            // positional conversion has nothing left to consume.
+            argidx = -1;
+            named
+        } else if argidx < arglen {
+            // CPython reads the item at the cursor's *old* position, then
+            // advances; a non-tuple operand reuses its single value.
+            let index = argidx;
+            argidx += 1;
+            if arglen < 0 {
+                match args.first() {
+                    Some(arg) => *arg,
+                    None => {
+                        return Err(FormatError::type_error(
+                            "not enough arguments for format string",
+                        ));
+                    }
+                }
+            } else {
+                match usize::try_from(index).ok().and_then(|slot| args.get(slot)) {
+                    Some(arg) => *arg,
+                    None => {
+                        return Err(FormatError::type_error(
+                            "not enough arguments for format string",
+                        ));
+                    }
+                }
+            }
+        } else {
             return Err(FormatError::type_error(
                 "not enough arguments for format string",
             ));
         };
-        next_arg += 1;
 
-        let piece = percent_piece(arg, ty, precision, i - 1, &flags)?;
+        let piece = percent_piece(arg, ty, precision, type_index, &flags)?;
         out.push_str(&percent_pad(&piece, width, &flags));
     }
 
-    // CPython accepts a dict right operand for a template without mapping
-    // keys even though it consumed no argument.
-    let mapping_operand = next_arg == 0 && value::as_dict(rhs).is_some();
-    if next_arg < args.len() && !mapping_operand {
+    // A mapping operand answers `%(key)` on demand and is never "converted";
+    // every other operand must have been consumed by the template.
+    if argidx < arglen && mapping.is_none() {
         return Err(FormatError::type_error(
             "not all arguments converted during string formatting",
         ));
     }
     Ok(out)
+}
+
+/// The mapping operand of a `%` format, mirroring CPython's
+/// `PyMapping_Check(args) && !PyTuple_Check(args) && !PyUnicode_Check(args)`.
+fn percent_mapping(rhs: i64) -> Option<i64> {
+    if value::as_tuple(rhs).is_some() || value::as_str(rhs).is_some() {
+        return None;
+    }
+    // A user class participates when it declares `__getitem__`; the native
+    // mapping storages (`dict`, `defaultdict`, `dict` subclasses) always do.
+    let getitem =
+        value::as_instance(rhs).and_then(|state| value::class_lookup(state.class, "__getitem__"));
+    if value::mapping_pairs(rhs).is_some()
+        || matches!(getitem, Some(value::ClassEntry::Method(_, _)))
+        || value::as_list(rhs).is_some()
+        || value::as_bytes(rhs).is_some()
+        || value::as_memoryview(rhs).is_some()
+        || value::as_range(rhs).is_some()
+        || value::as_match(rhs).is_some()
+    {
+        Some(rhs)
+    } else {
+        None
+    }
+}
+
+/// One `%(key)` lookup: `mapping[key]` with Python's own error reporting.
+fn percent_lookup(mapping: i64, key: &str) -> Result<i64, FormatError> {
+    let key_value = value::str_alloc(key.to_string());
+    // `subscript` may run user code; keep the mapping and the temporary key
+    // reachable across any collection it triggers.
+    let before = crate::exc::pending_value();
+    let roots = crate::heap::root_values(&[mapping, key_value]);
+    let item = crate::container::subscript(mapping, key_value);
+    crate::heap::release_roots(roots);
+    let after = crate::exc::pending_value();
+    if after == before {
+        return Ok(item);
+    }
+    let error = match value::exception_data(after) {
+        Some(data) => FormatError {
+            tag: data.tag,
+            message: data.msg.clone(),
+        },
+        None => FormatError::value_error("invalid format operation"),
+    };
+    crate::exc::clear();
+    Err(error)
 }
 
 // Native value formatting
@@ -1371,6 +1497,101 @@ mod tests {
             crate::exc::VALUE_ERROR
         );
         assert_eq!(error_tag(call_format("{", &[])), crate::exc::VALUE_ERROR);
+    }
+
+    #[test]
+    fn percent_format_positional_cursor() {
+        // Each conversion consumes the item at the cursor's current position;
+        // an off-by-one here used to index past the end of the tuple.
+        assert_eq!(
+            text(percent_format(
+                "%s:%d:%s",
+                tuple(&[string("a"), int(2), string("b")])
+            )),
+            "a:2:b"
+        );
+        assert_eq!(
+            text(percent_format("%s%s", tuple(&[string("a"), string("b")]))),
+            "ab"
+        );
+        assert_eq!(text(percent_format("%s", tuple(&[string("only")]))), "only");
+        assert_eq!(text(percent_format("%s", string("solo"))), "solo");
+        assert_eq!(
+            text(percent_format(
+                "%s %(a)s",
+                dict(&[(string("a"), string("m"))])
+            )),
+            "{'a': 'm'} m"
+        );
+        assert_eq!(
+            error_tag(percent_format("%s %s", tuple(&[string("a")]))),
+            crate::exc::TYPE_ERROR
+        );
+        assert_eq!(
+            error_tag(percent_format("%s", tuple(&[]))),
+            crate::exc::TYPE_ERROR
+        );
+    }
+
+    #[test]
+    fn percent_format_mapping_fields() {
+        let mapping = dict(&[
+            (string("a"), string("x")),
+            (string("b"), int(3)),
+            (string("f"), float(2.5)),
+            (string("neg"), int(-255)),
+        ]);
+        assert_eq!(text(percent_format("%(a)s:%(b)04d", mapping)), "x:0003");
+        assert_eq!(text(percent_format("%(a)s/%(a)s", mapping)), "x/x");
+        assert_eq!(text(percent_format("%(a)r", mapping)), "'x'");
+        assert_eq!(text(percent_format("%(a)-5s|", mapping)), "x    |");
+        assert_eq!(text(percent_format("%(b)+05d", mapping)), "+0003");
+        assert_eq!(text(percent_format("%(neg)#x", mapping)), "-0xff");
+        assert_eq!(text(percent_format("%(f)08.2f", mapping)), "00002.50");
+        assert_eq!(text(percent_format("%(f).1e", mapping)), "2.5e+00");
+        assert_eq!(
+            text(percent_format(
+                "%()s",
+                dict(&[(string(""), string("empty"))])
+            )),
+            "empty"
+        );
+
+        // Missing keys raise `KeyError`, non-mapping operands `TypeError`.
+        assert_eq!(
+            error_tag(percent_format("%(missing)s", mapping)),
+            crate::exc::KEY_ERROR
+        );
+        assert_eq!(
+            error_tag(percent_format("%(a)s", int(1))),
+            crate::exc::TYPE_ERROR
+        );
+        assert_eq!(
+            error_tag(percent_format("%(a)s", tuple(&[string("x")]))),
+            crate::exc::TYPE_ERROR
+        );
+
+        // A named conversion leaves no positional argument behind.
+        assert_eq!(
+            error_tag(percent_format("%(a)s %s", mapping)),
+            crate::exc::TYPE_ERROR
+        );
+        // Matches CPython: a mapping operand may go unused, a string cannot.
+        assert_eq!(text(percent_format("no fields", mapping)), "no fields");
+        assert_eq!(
+            error_tag(percent_format("%(a)s", string("{'a': 1}"))),
+            crate::exc::TYPE_ERROR
+        );
+
+        // Sequence and single-argument formatting are unchanged.
+        assert_eq!(
+            text(percent_format("%s:%d", tuple(&[string("x"), int(3)]))),
+            "x:3"
+        );
+        assert_eq!(
+            text(percent_format("%s", dict(&[(string("a"), string("x"))]))),
+            "{'a': 'x'}"
+        );
     }
 
     #[test]

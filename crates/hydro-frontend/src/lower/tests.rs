@@ -642,22 +642,21 @@ fn module_level_try_import_binds_a_preloaded_submodule() {
     drop(lowerer);
     assert!(diags.is_empty(), "{diags:?}");
 
-    // The function links the submodule export directly.
+    // The function links the submodule export through its function value so
+    // the runtime binder supplies the omitted parameter defaults.
     let body = function_body(&hir, "get");
     let HStmtKind::Return(Some(value)) = &body[0].kind else {
         panic!("expected a return statement");
     };
+    let HExprKind::IndirectCall { callee, args, .. } = &value.kind else {
+        panic!("expected an indirect submodule call, got {:?}", value.kind);
+    };
     assert!(
-        matches!(
-            &value.kind,
-            HExprKind::Call {
-                callee: Callee::Function(9),
-                ..
-            }
-        ),
+        matches!(&callee.kind, HExprKind::FunctionRef(9)),
         "expected a linked submodule function, got {:?}",
-        value.kind
+        callee.kind
     );
+    assert!(args.is_empty(), "{args:?}");
 
     // The try body mirrors the module binding so later code and importers can
     // read `pkg.sub` through the package module value.
@@ -682,8 +681,9 @@ fn module_level_try_import_binds_a_preloaded_submodule() {
 fn optional_native_import_binds_a_missing_member_at_runtime() {
     // `from _socket import NOPE` names no native member: outside a handler the
     // compiler rejects it, but an `except ImportError` fallback makes the
-    // import a runtime one, so the handler binds the fallback and every later
-    // read sees it through the module local/global table.
+    // import a deferred one through the `_socket` extension shared object, so
+    // the handler binds the fallback and every later read sees it through the
+    // module local/global table.
     let source =
         "try:\n    from _socket import NOPE\nexcept ImportError:\n    NOPE = 42\n\nvalue = NOPE\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
@@ -695,9 +695,11 @@ fn optional_native_import_binds_a_missing_member_at_runtime() {
         matches!(
             &imported.kind,
             HExprKind::DeferredImport { module, member, path }
-                if module == "_socket" && member.as_deref() == Some("NOPE") && path.is_none()
+                if module == "_socket"
+                    && member.as_deref() == Some("NOPE")
+                    && path.as_deref().is_some_and(|path| path.ends_with(".so"))
         ),
-        "expected a runtime import, got {:?}",
+        "expected a deferred extension import, got {:?}",
         imported.kind
     );
 
@@ -1137,10 +1139,14 @@ fn relative_from_import_binds_a_sibling_package() {
     drop(lowerer);
     assert!(diags.is_empty(), "{diags:?}");
     match &assigned(&hir, "x").kind {
-        HExprKind::Call {
-            callee: Callee::Function(7),
-            args,
-        } => assert!(args.is_empty(), "{args:?}"),
+        HExprKind::IndirectCall { callee, args, .. } => {
+            assert!(
+                matches!(&callee.kind, HExprKind::FunctionRef(7)),
+                "expected the linked subpackage function, got {:?}",
+                callee.kind
+            );
+            assert!(args.is_empty(), "{args:?}");
+        }
         other => panic!("expected the linked subpackage function, got {other:?}"),
     }
 }
@@ -5412,18 +5418,46 @@ fn lambda_defaults_lower_like_function_defaults() {
 
 #[test]
 fn lambda_rejects_unsupported_parameter_forms() {
-    for (source, expected) in [
-        ("f = lambda *, x: x\n", "keyword-only"),
-        ("f = lambda **kwargs: kwargs\n", "kwargs"),
-    ] {
-        let (_, _, diags) = lower_source(source, &parse(source));
-        assert_eq!(diags.len(), 1, "{source}: {diags:?}");
-        assert!(
-            diags[0].message.contains(expected),
-            "{source}: {}",
-            diags[0].message
-        );
-    }
+    let source = "f = lambda *, x: x\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{source}: {diags:?}");
+    assert!(
+        diags[0].message.contains("keyword-only"),
+        "{source}: {}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn lambda_varargs_and_kwargs_bind_like_a_def() {
+    // `lambda *args, **kwargs: ...` is doctest's `_colorize` shim: the
+    // synthetic function needs real variadic slots, not a lowering error.
+    let source = "f = lambda *args, **kwargs: (args, kwargs)\nf(1, extra=2)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let lambda = function(&hir, "<lambda>");
+    let kinds: Vec<ParamKind> = lambda.params.iter().map(|param| param.kind).collect();
+    assert_eq!(&kinds[..], &[ParamKind::VarArg, ParamKind::KwArg]);
+    assert_eq!(lambda.params[0].name, "args");
+    assert_eq!(lambda.params[1].name, "kwargs");
+    // An omitted variadic argument binds its empty value, exactly like a
+    // `def` with the same signature.
+    assert!(
+        matches!(
+            lambda.params[0].default_expr.as_ref().map(|value| &value.kind),
+            Some(HExprKind::List(items)) if items.is_empty()
+        ),
+        "{:?}",
+        lambda.params[0].default_expr
+    );
+    assert!(
+        matches!(
+            lambda.params[1].default_expr.as_ref().map(|value| &value.kind),
+            Some(HExprKind::Dict(pairs)) if pairs.is_empty()
+        ),
+        "{:?}",
+        lambda.params[1].default_expr
+    );
 }
 
 /// The binder function of the first capturing lambda, the lambda function it
@@ -6381,9 +6415,12 @@ fn native_constructor_keywords_are_reordered() {
         (module.as_str(), function.as_str()),
         ("threading", "Thread")
     );
-    assert_eq!(args.len(), 3);
+    // `Thread(target=None, args=(), name=None, *, daemon=None)`: all four
+    // parameter slots are positional after the keyword reordering.
+    assert_eq!(args.len(), 4);
     assert!(matches!(args[1].kind, HExprKind::Tuple { .. }));
     assert!(matches!(&args[2].kind, HExprKind::Const(Const::Str(s)) if s == "w"));
+    assert!(matches!(args[3].kind, HExprKind::Const(Const::None)));
 }
 
 #[test]
@@ -6396,7 +6433,11 @@ fn imported_native_constructor_keywords_are_reordered() {
     let HExprKind::ModuleCall { args, .. } = &value.kind else {
         panic!("expected a module call");
     };
-    assert_eq!(args.len(), 3);
+    // `target` plus the filled `args`, `name` and `daemon` slots.
+    assert_eq!(args.len(), 4);
+    assert!(matches!(args[1].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(args[2].kind, HExprKind::Const(Const::None)));
+    assert!(matches!(args[3].kind, HExprKind::Const(Const::None)));
 }
 
 #[test]
@@ -7695,10 +7736,24 @@ fn class_docstrings_and_pass_are_allowed() {
     let source = "class C:\n    \"\"\"doc\"\"\"\n    pass\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
-    let HStmtKind::ClassDef { methods, .. } = &hir.functions[0].body[0].kind else {
+    let HStmtKind::ClassDef {
+        methods,
+        attributes,
+        ..
+    } = &hir.functions[0].body[0].kind
+    else {
         panic!("expected a class definition");
     };
     assert!(methods.is_empty());
+    // The leading string is published as the class's `__doc__` attribute.
+    let doc = attributes
+        .iter()
+        .find(|(name, _)| name == "__doc__")
+        .map(|(_, value)| match &value.kind {
+            HExprKind::Const(Const::Str(text)) => text.as_str(),
+            _ => "",
+        });
+    assert_eq!(doc, Some("doc"));
 }
 
 /// Returns the function with `name`, or panics.
@@ -10911,11 +10966,15 @@ fn known_user_module_members_keep_their_static_path() {
     drop(lowerer);
     assert!(diags.is_empty(), "{diags:?}");
     match &assigned(&hir, "x").kind {
-        HExprKind::Call { callee, args } => {
-            assert_eq!(*callee, Callee::Function(1));
+        HExprKind::IndirectCall { callee, args, .. } => {
+            assert!(
+                matches!(&callee.kind, HExprKind::FunctionRef(1)),
+                "expected a function reference, got {:?}",
+                callee.kind
+            );
             assert_eq!(args.len(), 2);
         }
-        other => panic!("expected a direct function call, got {other:?}"),
+        other => panic!("expected an indirect function call, got {other:?}"),
     }
     match &assigned(&hir, "y").kind {
         HExprKind::GlobalGet { module, name } => {
@@ -15135,6 +15194,119 @@ class C:
 }
 
 #[test]
+fn static_class_method_default_reads_the_class_attribute() {
+    // A `def` inside a class body evaluates its defaults in that body, so
+    // `flag=_noarg_` must read the class attribute (the same object), not the
+    // module global of the same name.
+    let source = "\
+_noarg_ = 'module'
+class Misc:
+    _noarg_ = ['_noarg_']
+    def pack_propagate(self, flag=_noarg_):
+        return flag
+";
+    let hir = lower_ok(source);
+    let HStmtKind::ClassDef {
+        attributes,
+        methods,
+        ..
+    } = &find_stmt(
+        &hir.functions[0].body,
+        &|stmt| matches!(&stmt.kind, HStmtKind::ClassDef { name, .. } if name == "Misc"),
+    )
+    .expect("class Misc")
+    .kind
+    else {
+        unreachable!()
+    };
+    let HExprKind::Local(attribute) = attributes
+        .iter()
+        .find(|(name, _)| name == "_noarg_")
+        .map(|(_, value)| &value.kind)
+        .expect("_noarg_ attribute")
+    else {
+        panic!("the attribute a method default reads is parked in a local");
+    };
+    let function = methods
+        .iter()
+        .find(|(name, _, _)| name == "pack_propagate")
+        .map(|(_, function, _)| *function)
+        .expect("method");
+    let default = hir.functions[function as usize]
+        .params
+        .get(1)
+        .and_then(|param| param.default_expr.as_ref())
+        .expect("pack_propagate has a default");
+    assert!(
+        matches!(&default.kind, HExprKind::Local(local) if local == attribute),
+        "the default must read the parked class attribute, got {default:?}"
+    );
+}
+
+#[test]
+fn dynamic_class_method_default_reads_the_class_namespace() {
+    // A class registered inside a function runs against the runtime namespace
+    // dict, so a method default that reads a class-body binding becomes a
+    // lookup in that dict at the `def` statement.
+    let source = "\
+def make():
+    class C:
+        sentinel = object()
+        def f(self, value=sentinel):
+            return value
+    return C
+";
+    let hir = lower_ok(source);
+    let default = function(&hir, "C.f").params[1]
+        .default_expr
+        .as_ref()
+        .expect("f has a default");
+    let HExprKind::Subscript { object, index } = &default.kind else {
+        panic!("expected a class-namespace read, got {default:?}");
+    };
+    assert!(
+        matches!(&object.kind, HExprKind::Local(_)),
+        "the class namespace is a local dict: {object:?}"
+    );
+    assert!(
+        matches!(&index.kind, HExprKind::Const(Const::Str(name)) if name == "sentinel"),
+        "{index:?}"
+    );
+}
+
+#[test]
+fn imported_module_test_functions_are_not_pytest_tests() {
+    // A `test*` helper of an imported module is an ordinary function: pytest
+    // only collects the entry file, so its parameters must not be resolved as
+    // fixtures (`doctest.testmod(m=None, ...)`).
+    let source = "\
+def testmod(m=None, name=None):
+    return m
+";
+    let module = parse(source);
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "helper.py", &mut infer);
+    lowerer.set_dunder_name("helper");
+    let _hir = lowerer.lower_module(&module);
+    let diags = std::mem::take(&mut lowerer.diags);
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn entry_module_test_functions_keep_pytest_fixture_binding() {
+    // The entry module is the file pytest collects, so its test parameters
+    // still resolve against the fixture table.
+    let source = "def test_sum(left, right):\n    return left + right\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(
+        diags.iter().any(|diag| diag
+            .message
+            .contains("pytest fixture 'left' is not defined")),
+        "{diags:?}"
+    );
+}
+
+#[test]
 fn zero_argument_super_supports_attributes_and_methods() {
     let source = "\
 class A:
@@ -15824,6 +15996,81 @@ fn undefined_name_in_an_ordinary_module_still_errors() {
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, codes::NAME);
     assert_eq!(diags[0].message, "name 'valeu' is not defined");
+}
+
+#[test]
+fn function_body_namespace_writes_make_module_reads_dynamic() {
+    // CPython's turtle installs its module-level functions from inside
+    // `_make_global_funcs`: `exec(defstr, globals())` defines them and
+    // `globals()[name].__doc__ = ...` touches the installed binding. Both run
+    // in a function body but write this module's namespace, so names the
+    // static binding scan cannot see (`mainloop`, `exit`) must be runtime
+    // global reads instead of compile-time errors.
+    let source = "\
+def _make_global_funcs(functions):
+    for methodname in functions:
+        exec('def %s(): pass' % methodname, globals())
+        globals()[methodname].__doc__ = ''
+
+_make_global_funcs(['mainloop'])
+done = mainloop
+
+class Screen:
+    def exitonclick(self):
+        mainloop()
+        exit(0)
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(
+            &assigned(&hir, "done").kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "mainloop"
+        ),
+        "the module-level alias must read the dynamically installed name, got {:?}",
+        assigned(&hir, "done").kind
+    );
+    let body = function_body(&hir, "Screen.exitonclick");
+    let mut reads = Vec::new();
+    for stmt in body {
+        if let HStmtKind::Expr(call) = &stmt.kind {
+            if let HExprKind::IndirectCall { callee, .. } = &call.kind {
+                if let HExprKind::GlobalGet { module, name } = &callee.kind {
+                    reads.push((module.clone(), name.clone()));
+                }
+            }
+        }
+    }
+    for expected in ["mainloop", "exit"] {
+        assert!(
+            reads
+                .iter()
+                .any(|(module, name)| module == "__main__" && name == expected),
+            "`{expected}` must be a module-table read, got {reads:?}"
+        );
+    }
+    crate::sema::check(&hir, &mut infer, "test.py")
+        .expect("dynamic reads through the module table");
+}
+
+#[test]
+fn a_local_globals_binding_does_not_make_module_reads_dynamic() {
+    // `globals` is an ordinary function local here, not the builtin, so the
+    // write targets that local mapping: the module namespace is untouched and
+    // an undefined module-level read is still a compile-time error.
+    let source = "\
+def install(name):
+    globals = {}
+    globals[name] = 1
+    return globals
+
+value = missing
+";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::NAME);
+    assert_eq!(diags[0].message, "name 'missing' is not defined");
 }
 
 #[test]
@@ -17049,6 +17296,189 @@ class Outer[T]:
     assert!(
         read_outer,
         "the dynamic class body must read the parameter: {body:?}"
+    );
+}
+
+#[test]
+fn generic_function_publishes_type_params_and_scopes_annotations() {
+    let source = "def f[T](x: T) -> T:\n    return x\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let body = &hir.functions[0].body;
+    // Setup parameter, mirrored binding, then the two signature extras.
+    assert_eq!(body.len(), 4, "{body:?}");
+
+    // The runtime `TypeVar` value is created in a hidden local.
+    let HStmtKind::Assign { value, .. } = &body[0].kind else {
+        panic!("expected the type-parameter setup: {body:?}");
+    };
+    let (module, function, args) = alias_constructor(value);
+    assert_eq!((module, function), ("typing", "TypeVar"));
+    assert!(matches!(&args[0].kind, HExprKind::Const(Const::Str(name)) if name == "T"));
+
+    // The module-level function is mirrored so the object exists at runtime
+    // (a generic definition is mirrored even in an entry unit).
+    let HStmtKind::GlobalSet { name, .. } = &body[1].kind else {
+        panic!("expected the mirrored function binding: {body:?}");
+    };
+    assert_eq!(name, "f");
+
+    // Both annotations read the parameter local: the annotation scope sees
+    // `T` exactly like CPython's.
+    let HStmtKind::SetAttr { name, value, .. } = &body[2].kind else {
+        panic!("expected the `__annotations__` attribute: {body:?}");
+    };
+    assert_eq!(name, "__annotations__");
+    let HExprKind::Dict(entries) = &value.kind else {
+        panic!("`__annotations__` must be a dict: {value:?}");
+    };
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    let hidden = hidden_local_name(&hir, &entries[0].1).expect("the annotation reads the local");
+    assert!(
+        hidden.starts_with("$typeparam"),
+        "unexpected local name: {hidden}"
+    );
+    assert_eq!(hidden_local_name(&hir, &entries[1].1), Some(hidden));
+
+    // The parameter tuple is published on the function object.
+    let HStmtKind::SetAttr { name, value, .. } = &body[3].kind else {
+        panic!("expected the `__type_params__` attribute: {body:?}");
+    };
+    assert_eq!(name, "__type_params__");
+    let HExprKind::Tuple(items) = &value.kind else {
+        panic!("`__type_params__` must be a tuple: {value:?}");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(hidden_local_name(&hir, &items[0]), Some(hidden));
+
+    // The parameter is scoped to the definition statement, like a class's.
+    let leaked = "def f[T](x: T) -> T:\n    return x\nleaked = T\n";
+    let (_, _, diags) = lower_source(leaked, &parse(leaked));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::NAME);
+
+    // ... and it is never a module local.
+    assert!(!hir.functions[0]
+        .locals
+        .iter()
+        .any(|local| local.name == "T"));
+}
+
+#[test]
+fn generic_function_type_parameter_forms_lower() {
+    let source = "def f[T: int](x: T) -> T:\n    return x\n\
+                  def g[*Ts]():\n    return 1\n\
+                  def h[**P]():\n    return 1\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    // Bounded parameter: the TypeVar call carries `bound=`.
+    let HStmtKind::Assign { value, .. } = &hir.functions[0].body[0].kind else {
+        panic!(
+            "expected the type-parameter setup: {:?}",
+            hir.functions[0].body
+        );
+    };
+    let HExprKind::ModuleCall { keywords, .. } = &value.kind else {
+        panic!("expected a TypeVar call: {value:?}");
+    };
+    assert_eq!(keywords.len(), 1);
+    assert_eq!(keywords[0].0, "bound");
+
+    // Variadic and parametric parameters allocate their runtime objects too,
+    // each carrying its own name the way `__type_params__` reports it.
+    let mut calls = Vec::new();
+    type_param_calls(&hir.functions[0].body, &mut calls);
+    let constructors: Vec<&str> = calls.iter().map(|(call, _)| call.as_str()).collect();
+    assert_eq!(
+        constructors,
+        ["typing.TypeVar", "typing.TypeVarTuple", "typing.ParamSpec"]
+    );
+    let names: Vec<&str> = calls.iter().map(|(_, name)| name.as_str()).collect();
+    assert_eq!(names, ["T", "Ts", "P"]);
+}
+
+#[test]
+fn generic_function_in_a_function_publishes_its_type_params() {
+    let source = "def outer():\n    def inner[T](x: T) -> T:\n        return x\n    return inner\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let body = function_body(&hir, "outer");
+    assert_eq!(body.len(), 2, "{body:?}");
+    let HStmtKind::If { then_body, .. } = &body[0].kind else {
+        panic!("the nested definition lowers through an `if True:` block: {body:?}");
+    };
+    let attributes: Vec<&str> = then_body
+        .iter()
+        .filter_map(|stmt| match &stmt.kind {
+            HStmtKind::SetAttr { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attributes, ["__annotations__", "__type_params__"]);
+}
+
+#[test]
+fn generic_method_type_params_register_without_diagnostics() {
+    // A method's parameter list is only materialised when the class namespace
+    // is built at runtime, so its declarations must at least register.
+    let source = "class Box:\n    def get[U](self, x: U) -> U:\n        return x\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn pep695_declarations_lower_without_diagnostics() {
+    let source = "def f[T](x: T) -> T:\n    return x\n\n\
+                  class C[T]:\n    value = T\n\n\
+                  type Alias[T] = list[T]\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn function_type_parameter_constraints_are_rejected() {
+    let source = "def f[T: (int, str)](x: T) -> T:\n    return x\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::SYNTAX);
+    assert!(
+        diags[0]
+            .message
+            .contains("constraints with type parameter syntax"),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn pep696_type_parameter_defaults_are_parse_errors() {
+    // PEP 696 defaults (`[T = int]`) never reach lowering: the vendored
+    // `TypeParam` node has no default slot and the grammar has no `=`
+    // production, so every form is a syntax error, exactly like the constraint
+    // spelling above.
+    for source in [
+        "def f[T = int]():\n    pass\n",
+        "class C[T = int]:\n    pass\n",
+        "type A[T = int] = list[T]\n",
+    ] {
+        assert!(
+            rustpython_parser::parse(source, Mode::Module, "test.py").is_err(),
+            "expected a syntax error for {source:?}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_type_parameters_are_rejected() {
+    let source = "def f[T, T](x: T) -> T:\n    return x\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, codes::SYNTAX);
+    assert!(
+        diags[0].message.contains("duplicate type parameter 'T'"),
+        "{diags:?}"
     );
 }
 

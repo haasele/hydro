@@ -37,17 +37,18 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 50 | 2 |
-| pure | 174 | 167 | 7 |
-| extension | 63 | 52 | 11 |
+| pure | 174 | 171 | 3 |
+| extension | 63 | 62 | 1 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 269 | 28 |
+| **Total** | 297 | 283 | 14 |
 
 ## Failure classes
 
 | Status | Count |
 | --- | ---: |
-| compile_error:HYD0002 | 19 |
 | cpython_failed | 9 |
+| compile_error:HYD0002 | 4 |
+| runtime_error | 1 |
 
 ## Modules by layer
 
@@ -142,7 +143,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `bdb` | ok | ok | ok | - |
 | `bisect` | ok | ok | ok | - |
 | `bz2` | ok | ok | ok | - |
-| `cProfile` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
+| `cProfile` | ok | ok | ok | - |
 | `calendar` | ok | ok | ok | - |
 | `cmd` | ok | ok | ok | - |
 | `code` | ok | ok | ok | - |
@@ -166,7 +167,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `decimal` | ok | ok | ok | - |
 | `difflib` | ok | ok | ok | - |
 | `dis` | ok | ok | ok | - |
-| `doctest` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: type parameters are not supported in Phase 1 |
+| `doctest` | ok | ok | ok | - |
 | `email` | ok | ok | ok | - |
 | `encodings` | ok | ok | ok | - |
 | `ensurepip` | ok | ok | ok | - |
@@ -210,7 +211,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `operator` | ok | ok | ok | - |
 | `optparse` | ok | ok | ok | - |
 | `pathlib` | ok | ok | ok | - |
-| `pdb` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: type parameters are not supported in Phase 1 |
+| `pdb` | ok | ok | ok | - |
 | `pickle` | ok | ok | ok | - |
 | `pickletools` | ok | ok | ok | - |
 | `pkgutil` | ok | ok | ok | - |
@@ -260,7 +261,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `this` | ok | ok | ok | - |
 | `threading` | ok | ok | ok | - |
 | `timeit` | ok | ok | ok | - |
-| `tkinter` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
+| `tkinter` | ok | ok | ok | - |
 | `token` | ok | ok | ok | - |
 | `tokenize` | ok | ok | ok | - |
 | `tomllib` | ok | ok | ok | - |
@@ -268,7 +269,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `traceback` | ok | ok | ok | - |
 | `tracemalloc` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tracemalloc' not found: not supported on the import search path |
 | `tty` | ok | ok | ok | - |
-| `turtle` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
+| `turtle` | ok | exit 1 | runtime_error | NotImplementedError: exec() cannot compile Python source at runtime in Hydro: a parameter… |
 | `turtledemo` | ok | ok | ok | - |
 | `types` | ok | ok | ok | - |
 | `typing` | ok | ok | ok | - |
@@ -304,29 +305,29 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_csv` | ok | ok | ok | - |
 | `_ctypes` | ok | ok | ok | - |
 | `_curses` | ok | ok | ok | - |
-| `_curses_panel` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_curses_panel' not found: not supported on the import search path |
+| `_curses_panel` | ok | ok | ok | - |
 | `_dbm` | ok | ok | ok | - |
 | `_decimal` | ok | ok | ok | - |
-| `_elementtree` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_elementtree' not found: not supported on the import search path |
+| `_elementtree` | ok | ok | ok | - |
 | `_gdbm` | exit 1 | ok | cpython_failed | ModuleNotFoundError: No module named '_gdbm' |
 | `_hashlib` | ok | ok | ok | - |
 | `_heapq` | ok | ok | ok | - |
 | `_hmac` | ok | ok | ok | - |
-| `_interpchannels` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_interpchannels' not found: not supported on the import search pa… |
-| `_interpqueues` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_interpqueues' not found: not supported on the import search path |
-| `_interpreters` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
+| `_interpchannels` | ok | ok | ok | - |
+| `_interpqueues` | ok | ok | ok | - |
+| `_interpreters` | ok | ok | ok | - |
 | `_json` | ok | ok | ok | - |
-| `_lsprof` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
+| `_lsprof` | ok | ok | ok | - |
 | `_lzma` | ok | ok | ok | - |
 | `_md5` | ok | ok | ok | - |
 | `_multibytecodec` | ok | ok | ok | - |
 | `_multiprocessing` | ok | ok | ok | - |
 | `_pickle` | ok | ok | ok | - |
-| `_posixshmem` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_posixshmem' not found: not supported on the import search path |
-| `_posixsubprocess` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_posixsubprocess' not found: not supported on the import search p… |
+| `_posixshmem` | ok | ok | ok | - |
+| `_posixsubprocess` | ok | ok | ok | - |
 | `_queue` | ok | ok | ok | - |
 | `_random` | ok | ok | ok | - |
-| `_remote_debugging` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_remote_debugging' not found: not supported on the import search… |
+| `_remote_debugging` | ok | ok | ok | - |
 | `_sha1` | ok | ok | ok | - |
 | `_sha2` | ok | ok | ok | - |
 | `_sha3` | ok | ok | ok | - |
@@ -335,7 +336,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `_ssl` | ok | ok | ok | - |
 | `_statistics` | ok | ok | ok | - |
 | `_struct` | ok | ok | ok | - |
-| `_tkinter` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
+| `_tkinter` | ok | ok | ok | - |
 | `_uuid` | ok | ok | ok | - |
 | `_zoneinfo` | ok | ok | ok | - |
 | `_zstd` | ok | ok | ok | - |

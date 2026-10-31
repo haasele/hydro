@@ -2360,7 +2360,8 @@ fn is_site_package_path(path: &Path) -> bool {
 /// directory, the root of the current package chain (so `pkg.a` can import
 /// `pkg.b`), `HYDRO_SITE_PACKAGES`, the site-packages directories of
 /// `VIRTUAL_ENV`/`CONDA_PREFIX`, `PYTHONPATH`, the vendored `stdlib/` tree
-/// shipped with Hydro and finally `HYDRO_STDLIB`.
+/// shipped with Hydro, `HYDRO_STDLIB` and the `lib-dynload` directories
+/// derived from it ([`stdlib_extension_dirs`]).
 ///
 /// `HYDRO_STDLIB` is a CPython `Lib` directory that backs the standard library
 /// sources (`<cpython>/Lib`). Project modules, site-packages and `PYTHONPATH`
@@ -2368,7 +2369,7 @@ fn is_site_package_path(path: &Path) -> bool {
 /// `HYDRO_STDLIB`: they are Hydro's compatibility adaptations, so an override
 /// installed in `stdlib/` stays observable even for an importer that lives
 /// inside the `Lib` tree. Modules Hydro does not vendor fall through to
-/// `HYDRO_STDLIB`.
+/// `HYDRO_STDLIB` and, for compiled extensions, to its `lib-dynload` siblings.
 fn module_search_roots(importer_dir: &Path, module_root: &Path) -> Vec<PathBuf> {
     let hydro_site_packages = std::env::var_os("HYDRO_SITE_PACKAGES");
     let pythonpath = std::env::var_os("PYTHONPATH");
@@ -2424,14 +2425,107 @@ fn bundled_stdlib_root() -> Option<&'static Path> {
     ROOT.as_deref()
 }
 
+/// `lib-dynload` directories that hold the C extension modules of the CPython
+/// standard library named by `HYDRO_STDLIB`.
+///
+/// CPython keeps extension modules next to the standard library, not inside
+/// `Lib`, so a `HYDRO_STDLIB` installation must not need a `PYTHONPATH` entry
+/// to import them. `HYDRO_STDLIB` names either a `Lib` tree
+/// (`<cpython>/Lib`, whose sibling `<cpython>/lib-dynload` holds the extension
+/// modules) or an installed version root such as `/usr/lib/python3.14` (whose
+/// child `<root>/lib-dynload` does). Both layouts are tried in that order
+/// (`<stdlib>/lib-dynload`, then `<stdlib>/../lib-dynload`); only existing
+/// directories are returned and duplicates are kept once, so the order is
+/// deterministic. The `..` of the sibling layout is resolved lexically, so no
+/// returned path carries a `..` component.
+///
+/// This is the single frontend definition of the list: the module loader seeds
+/// it as a search root and the lowerer's extension lookup appends it, so a
+/// compiled `import _elementtree` and its runtime resolution agree. The
+/// runtime derives the same directories for `sys.path` (see
+/// `hydro_runtime::modules::search_path`); keep the two in sync.
+pub(crate) fn stdlib_extension_dirs(hydro_stdlib: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let Some(list) = hydro_stdlib else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut seen = HashSet::new();
+    for stdlib in std::env::split_paths(list) {
+        if stdlib.as_os_str().is_empty() {
+            continue;
+        }
+        for candidate in [
+            stdlib.join("lib-dynload"),
+            stdlib.join("..").join("lib-dynload"),
+        ] {
+            if !candidate.is_dir() {
+                continue;
+            }
+            // The sibling layout is built as `<stdlib>/../lib-dynload`; report
+            // the lexically normalised form so search roots carry no `..`.
+            let dir = lexical_normalize(&candidate);
+            let key = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            if seen.insert(key) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
+/// Lexically normalises a path: drops `.` components and resolves `..`
+/// without touching the filesystem (like `os.path.normpath`).
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(std::path::MAIN_SEPARATOR.to_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() && !path.is_absolute() {
+                    out.push("..");
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+/// Appends [`stdlib_extension_dirs`] to `dirs`, skipping entries already
+/// present (compared after canonicalization).
+///
+/// Used by the lowerer's extension search, which has no final deduplication
+/// pass of its own; the module loader and the runtime fall back to their
+/// existing filter.
+pub(crate) fn push_stdlib_extension_dirs(
+    dirs: &mut Vec<PathBuf>,
+    hydro_stdlib: Option<&std::ffi::OsStr>,
+) {
+    let mut seen: HashSet<PathBuf> = dirs
+        .iter()
+        .map(|dir| fs::canonicalize(dir).unwrap_or_else(|_| dir.clone()))
+        .collect();
+    for dir in stdlib_extension_dirs(hydro_stdlib) {
+        let key = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if seen.insert(key) {
+            dirs.push(dir);
+        }
+    }
+}
+
 /// Builds the module search path from raw environment values.
 ///
 /// Order: the importing directory and the current package root, then
 /// `HYDRO_SITE_PACKAGES`, the site-packages directories of `VIRTUAL_ENV` and
 /// `CONDA_PREFIX`, `PYTHONPATH`, the vendored `stdlib/` tree
-/// ([`bundled_stdlib_root`]) and finally `HYDRO_STDLIB`. Every user location
-/// therefore takes precedence over the standard library, while a vendored
-/// adaptation wins over the generic `Lib` source.
+/// ([`bundled_stdlib_root`]), `HYDRO_STDLIB` and the `lib-dynload` directories
+/// derived from it ([`stdlib_extension_dirs`]). Every user location therefore
+/// takes precedence over the standard library, while a vendored adaptation
+/// wins over the generic `Lib` source, which in turn wins over an extension of
+/// the same name in `lib-dynload`.
 ///
 /// The importing directory and the current package root normally come first so
 /// relative and sibling imports resolve like CPython's. When the importer
@@ -2493,6 +2587,12 @@ fn module_search_roots_from(
     dirs.extend(bundled_stdlib.map(Path::to_path_buf));
     dirs.extend(sysroot_scoped);
     dirs.extend(sysroot);
+    // CPython's C extension modules live in `lib-dynload` next to the standard
+    // library. Deriving them from `HYDRO_STDLIB` keeps `import _elementtree`
+    // linkable without a `PYTHONPATH` entry. They follow the sysroot so a
+    // `Lib/*.py` module wins over an extension of the same name, and the
+    // deduplication below drops repeats of an explicit `PYTHONPATH` entry.
+    dirs.extend(stdlib_extension_dirs(hydro_stdlib));
 
     let mut seen = HashSet::new();
     dirs.retain(|dir| {
@@ -4323,6 +4423,112 @@ mod tests {
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert_eq!(diags[0].code, codes::NAME);
         assert_eq!(diags[0].help.as_deref(), Some("did you mean `value`?"));
+    }
+
+    // ------------------------------------------------------------------
+    // HYDRO_STDLIB extension directories
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn stdlib_extension_dirs_follow_the_stdlib_layout() {
+        let dir = TestDir::new("stdlib-extension-dirs");
+        let stdlib = dir.path.join("Lib");
+        let nested = stdlib.join("lib-dynload");
+        let sibling = dir.path.join("lib-dynload");
+        fs::create_dir_all(&nested).expect("create nested lib-dynload");
+        fs::create_dir_all(&sibling).expect("create sibling lib-dynload");
+
+        // `HYDRO_STDLIB` may be a `Lib` tree or a version root; both layouts
+        // are tried, `<stdlib>/lib-dynload` first.
+        assert_eq!(
+            stdlib_extension_dirs(Some(stdlib.as_os_str())),
+            vec![nested.clone(), sibling.clone()]
+        );
+
+        // A root without extension modules contributes nothing, and an unset
+        // variable derives no directory at all. The bare root gets its own
+        // parent so the shared sibling `lib-dynload` above is not found.
+        let bare = dir.path.join("bare-parent").join("bare");
+        fs::create_dir_all(&bare).expect("create bare root");
+        assert!(stdlib_extension_dirs(Some(bare.as_os_str())).is_empty());
+        assert!(stdlib_extension_dirs(None).is_empty());
+
+        // `HYDRO_STDLIB` is path-split, so a repeated root keeps each derived
+        // directory once.
+        let repeated =
+            std::env::join_paths([stdlib.as_path(), stdlib.as_path()]).expect("join stdlib roots");
+        assert_eq!(
+            stdlib_extension_dirs(Some(repeated.as_os_str())),
+            vec![nested, sibling]
+        );
+    }
+
+    #[test]
+    fn module_search_roots_place_lib_dynload_after_the_sysroot() {
+        let dir = TestDir::new("roots-lib-dynload");
+        let stdlib = dir.path.join("Lib");
+        let nested = stdlib.join("lib-dynload");
+        let sibling = dir.path.join("lib-dynload");
+        fs::create_dir_all(&nested).expect("create nested lib-dynload");
+        fs::create_dir_all(&sibling).expect("create sibling lib-dynload");
+        let importer = dir.path.join("project");
+        fs::create_dir_all(&importer).expect("create importer root");
+
+        let roots = module_search_roots_from(
+            &importer,
+            &importer,
+            None,
+            None,
+            Some(stdlib.as_os_str()),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(roots, vec![importer, stdlib, nested, sibling]);
+    }
+
+    #[test]
+    fn push_stdlib_extension_dirs_keeps_existing_entries_once() {
+        let dir = TestDir::new("push-lib-dynload");
+        let stdlib = dir.path.join("Lib");
+        let nested = stdlib.join("lib-dynload");
+        let sibling = dir.path.join("lib-dynload");
+        fs::create_dir_all(&nested).expect("create nested lib-dynload");
+        fs::create_dir_all(&sibling).expect("create sibling lib-dynload");
+
+        // An explicit search root that already names a derived directory (a
+        // `PYTHONPATH` entry, for example) is not repeated.
+        let mut roots = vec![sibling.clone()];
+        push_stdlib_extension_dirs(&mut roots, Some(stdlib.as_os_str()));
+        assert_eq!(roots, vec![sibling, nested]);
+    }
+
+    #[test]
+    fn hydro_stdlib_lib_dynload_makes_a_standard_extension_linkable() {
+        // Acceptance shape: only `HYDRO_STDLIB` is set, with no `PYTHONPATH`
+        // entry naming the extension directory. The import scan and the
+        // lowerer resolve shared objects through the same extension search
+        // path, so a stub artifact is enough: the frontend only needs its
+        // path, loading happens at runtime.
+        let _env = env_lock();
+        let dir = TestDir::new("stdlib-lib-dynload-import");
+        let stdlib = dir.path.join("python3.14");
+        let dynload = stdlib.join("lib-dynload");
+        fs::create_dir_all(&dynload).expect("create lib-dynload");
+        fs::write(dynload.join("_elementtree.abi3.so"), b"").expect("write extension stub");
+        let main = dir.write("main.py", "import _elementtree\n");
+
+        let _stdlib = EnvVar::set("HYDRO_STDLIB", stdlib.as_os_str());
+        let _pythonpath = EnvVar::unset("PYTHONPATH");
+        let _site = EnvVar::unset("HYDRO_SITE_PACKAGES");
+        let _extensions = EnvVar::unset("HYDRO_EXTENSION_PATH");
+
+        let program =
+            check_file(&main).expect("the extension must resolve from HYDRO_STDLIB alone");
+        assert!(
+            !program.functions.is_empty(),
+            "the entry module must compile"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -6867,9 +7073,9 @@ def __getattr__(name):
     #[test]
     fn optional_import_of_a_missing_native_member_runs_its_handler() {
         // `from _socket import NOPE` names no native member. Inside a `try`
-        // whose handler catches `ImportError` the statement is a runtime
-        // import, so the handler binds the fallback instead of the compiler
-        // rejecting the program.
+        // whose handler catches `ImportError` the statement is deferred
+        // through the extension shared object, so the handler binds the
+        // fallback instead of the compiler rejecting the program.
         let dir = TestDir::new("optional-native-member");
         let main = dir.write(
             "main.py",
@@ -6886,9 +7092,9 @@ def __getattr__(name):
                 ExprKind::DeferredImport { module, member, path }
                     if module == "_socket"
                         && member.as_deref() == Some("NOPE")
-                        && path.is_none()
+                        && path.as_deref().is_some_and(|path| path.ends_with(".so"))
             ),
-            "expected a runtime import, got {:?}",
+            "expected a deferred extension import, got {:?}",
             imported.kind
         );
 
