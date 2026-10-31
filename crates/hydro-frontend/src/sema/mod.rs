@@ -1267,6 +1267,20 @@ struct Checker<'a> {
     /// type instead of the function-wide slot; an assignment to the local
     /// removes the entry so later reads see the value it stores.
     narrow: HashMap<LocalId, Ty>,
+    /// Locals whose declared annotation no longer describes the stored value.
+    ///
+    /// CPython never enforces an annotation: a local or parameter may be
+    /// rebound to a value of any type (`data: dict` followed by
+    /// `data = list(data.values())`, which pandas even spells with a
+    /// `# type: ignore[assignment]` comment). Such a rebind is accepted and
+    /// the local is marked here so that later reads and operators stay
+    /// dynamic instead of being checked against a declaration the value
+    /// contradicts. The mark lasts for the rest of the function: a later
+    /// assignment may run on one path only, so narrowing the read back to the
+    /// annotation could reject the other path. The state is cleared per
+    /// function like `narrow`, and it is conservative across branches: a
+    /// widened read is only ever wider, so no branch can make it wrong.
+    widened: HashSet<LocalId>,
 }
 
 impl<'a> Checker<'a> {
@@ -1329,6 +1343,9 @@ impl<'a> Checker<'a> {
         // Narrowing facts are scoped to the branch that established them;
         // no fact survives into another function body.
         self.narrow.clear();
+        // Like the narrowing facts, a widened slot is a property of the
+        // function being walked; local ids restart in the next function.
+        self.widened.clear();
         // An unannotated return type starts as a fresh inference variable and
         // an annotation starts concrete; only the inferred slot may be
         // widened by the body, so record its shape before the walk binds it.
@@ -1577,9 +1594,19 @@ impl<'a> Checker<'a> {
     /// Assigning a value whose type is not resolved yet must not pin it to the
     /// slot's previous type (`x = None` followed by `x = maybe_value`); the
     /// slot becomes dynamic instead, so later uses keep checking dynamically.
-    /// Annotated parameter slots are stored concrete and keep their strict
-    /// check.
-    fn assign_local(&mut self, local_ty: Ty, value_ty: Ty, name: &str, line: u32, col: u32) {
+    ///
+    /// A declared annotation is a hint, not a runtime constraint, so an
+    /// annotation the assigned value contradicts is a rebind like any other
+    /// rather than a static error (`data: dict` followed by
+    /// `data = list(data.values())` is valid CPython and is exactly what
+    /// pandas does). The local is marked in `widened`, which makes every
+    /// later read dynamic: the value no longer has the annotated type, and
+    /// `Any` keeps later operators and attributes checked by the runtime
+    /// instead of reporting them against a type the value contradicts. The
+    /// mark is not removed by a later assignment, which may run on only one
+    /// path; narrowing the local back would then reject code that the other
+    /// path legitimately takes.
+    fn assign_local(&mut self, local: LocalId, local_ty: Ty, value_ty: Ty) {
         if matches!(local_ty, Ty::Concrete(_)) {
             if let Err((expected, got)) = self.inf.unify(local_ty, value_ty) {
                 if self.inf.is_gradual(value_ty) {
@@ -1590,16 +1617,9 @@ impl<'a> Checker<'a> {
                 } else if (expected == Type::None) != (got == Type::None) {
                     self.force_any(value_ty);
                 } else {
-                    self.error(
-                        line,
-                        col,
-                        format!(
-                            "cannot assign type {} to variable '{}' of type {}",
-                            got.name(),
-                            name,
-                            expected.name()
-                        ),
-                    );
+                    // The annotation is not enforced: the slot keeps holding
+                    // a value of another type from here on.
+                    self.widened.insert(local);
                 }
             }
             return;
@@ -1669,7 +1689,7 @@ impl<'a> Checker<'a> {
                 // slot again rather than the narrowed type.
                 self.narrow.remove(target);
                 let local = &f.locals[*target as usize];
-                self.assign_local(local.ty, value.ty, &local.name, stmt.line, stmt.col);
+                self.assign_local(*target, local.ty, value.ty);
             }
             HStmtKind::CellInit { value, .. } => {
                 if let Some(value) = value {
@@ -1680,7 +1700,7 @@ impl<'a> Checker<'a> {
                 self.check_expr(value, f);
                 self.narrow.remove(target);
                 let local = &f.locals[*target as usize];
-                self.assign_local(local.ty, value.ty, &local.name, stmt.line, stmt.col);
+                self.assign_local(*target, local.ty, value.ty);
             }
             HStmtKind::GlobalSet { value, .. } => {
                 // The global table stores dynamically typed values.
@@ -1723,15 +1743,27 @@ impl<'a> Checker<'a> {
                 self.check_expr(value, f);
                 let local_ty = f.locals[*target as usize].ty;
                 // The read side sees the guard's type; the store updates the
-                // slot, so the fact ends after this statement.
-                let read_ty = self.narrow.remove(target).unwrap_or(local_ty);
+                // slot, so the fact ends after this statement. A widened slot
+                // holds a value its annotation does not describe, so both the
+                // read and the result stay dynamic instead of being checked
+                // against the stale declaration.
+                let widened = self.widened.contains(target);
+                let read_ty = match self.narrow.remove(target) {
+                    Some(narrowed) => narrowed,
+                    None if widened => Ty::Concrete(Type::Any),
+                    None => local_ty,
+                };
                 let a = self.inf.freeze(read_ty);
                 let b = self.inf.freeze(value.ty);
                 self.ops.push(Op {
                     kind: OpKind::Bin(*op),
                     a,
                     b,
-                    out: local_ty,
+                    out: if widened {
+                        Ty::Concrete(Type::Any)
+                    } else {
+                        local_ty
+                    },
                     line: stmt.line,
                     col: stmt.col,
                     done: false,
@@ -2340,14 +2372,24 @@ impl<'a> Checker<'a> {
                     // unify with the function-wide slot, whose optional shape
                     // stays visible outside the guard.
                     let _ = self.inf.unify(expr.ty, narrowed);
+                } else if self.widened.contains(id) {
+                    // The slot was rebound to a value its annotation does not
+                    // describe; the runtime decides what the read supports.
+                    self.force_any(expr.ty);
                 } else {
                     let local_ty = f.locals[*id as usize].ty;
                     let _ = self.inf.unify(local_ty, expr.ty);
                 }
             }
             HExprKind::CellGet(id) => {
-                let local_ty = f.locals[*id as usize].ty;
-                let _ = self.inf.unify(local_ty, expr.ty);
+                if self.widened.contains(id) {
+                    // See `HExprKind::Local`: the cell holds a value of a
+                    // type its annotation no longer describes.
+                    self.force_any(expr.ty);
+                } else {
+                    let local_ty = f.locals[*id as usize].ty;
+                    let _ = self.inf.unify(local_ty, expr.ty);
+                }
             }
             HExprKind::CellSet { target, value } => {
                 self.check_expr(value, f);
@@ -5046,6 +5088,7 @@ pub fn check(prog: &LHir, inf: &mut Infer, filename: &str) -> Result<(), Vec<Dia
         checks: Vec::new(),
         spans: HashMap::new(),
         narrow: HashMap::new(),
+        widened: HashSet::new(),
     };
 
     let functions = prog.functions.clone();

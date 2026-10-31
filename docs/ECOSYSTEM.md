@@ -122,10 +122,10 @@ A case passes only when the oracle, Hydro JIT and (unless `--no-aot`) the AOT bi
 
 | Case | CPython | Hydro JIT | Hydro AOT | Status | Detail |
 | --- | --- | --- | --- | --- | --- |
-| `numpy:import` | ok | exit 1 | exit 1 | runtime_error | jit: TypeError: Can only register classes |
-| `numpy:smoke` | ok | exit 1 | exit 1 | runtime_error | jit: TypeError: Can only register classes |
-| `pandas:import` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0102]: error[HYD0102]: cannot assign type list to variable 'data' of type dict |
-| `pandas:smoke` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0102]: error[HYD0102]: cannot assign type list to variable 'data' of type dict |
+| `numpy:import` | ok | exit 1 | exit 1 | runtime_error | jit: AttributeError: 'code' object has no attribute 'co_kwonlyargcount' |
+| `numpy:smoke` | ok | exit 1 | exit 1 | runtime_error | jit: AttributeError: 'code' object has no attribute 'co_kwonlyargcount' |
+| `pandas:import` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0201]: error[HYD0201]: module 'queue' has no attribute 'SimpleQueue' |
+| `pandas:smoke` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0201]: error[HYD0201]: module 'queue' has no attribute 'SimpleQueue' |
 | `pydantic:import` | ok | ok | ok | pass | - |
 | `pydantic:smoke` | ok | ok | ok | pass | - |
 | `pydantic-core:import` | ok | ok | ok | pass | - |

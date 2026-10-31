@@ -11993,9 +11993,13 @@ pub extern "C" fn PyObject_IsSubclass(derived: *mut ShimObject, class: *mut Shim
         return -1;
     }
     if !types::is_type_pointer(class) {
-        // A C type cannot derive from a Hydro class.
-        if hydro_class_value(class).is_some() {
-            return 0;
+        // A C type never derives from a Hydro class by inheritance, but it
+        // may have been registered as a virtual subclass through
+        // `ABCMeta.register` (NumPy registers its scalar types with the
+        // `numbers` ABCs).
+        if let Some(class_value) = hydro_class_value(class) {
+            return crate::modules::abc::is_virtual_extension_subclass(derived, class_value)
+                as c_int;
         }
         set_error("TypeError: issubclass() arg 2 must be a class, a tuple of classes, or a union");
         return -1;

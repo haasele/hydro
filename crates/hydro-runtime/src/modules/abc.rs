@@ -10,13 +10,14 @@
 //! * `register(subclass)` records a virtual-subclass edge. The edge is
 //!   consulted by the builtin `isinstance`/`issubclass` paths, so a
 //!   registration really changes later checks. Registering a real subclass is
-//!   a no-op that returns it; a duplicate registration is idempotent; neither
-//!   class values nor the runtime's native type spellings (`int`, `float`, …)
-//!   are rejected. Nothing is recorded when the target is not a class, so
-//!   `register` never reports a success that has no effect. Every native
-//!   `collections.abc` class is an `ABCMeta` instance, so `Mapping.register`
-//!   resolves here through the ordinary metaclass lookup and records into the
-//!   same registry.
+//!   a no-op that returns it; a duplicate registration is idempotent; class
+//!   values, the runtime's native type spellings (`int`, `float`, …) and
+//!   extension class handles (NumPy's scalar types, which reach Hydro as
+//!   opaque C handles) are all accepted. Nothing is recorded when the target
+//!   is not a class, so `register` never reports a success that has no
+//!   effect. Every native `collections.abc` class is an `ABCMeta` instance, so
+//!   `Mapping.register` resolves here through the ordinary metaclass lookup and
+//!   records into the same registry.
 //! * `__instancecheck__`/`__subclasscheck__` delegate to the same checks, and
 //!   `__abstractmethods__` reports the abstract names computed from the class
 //!   namespace and the MRO.
@@ -114,20 +115,23 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
 /// Mirrors `ABCMeta.__subclasscheck__` for the parts the runtime models: a
 /// class is a virtual subclass when it (or a real ancestor) was registered
 /// with `ancestor` or with a real subclass of `ancestor` (CPython checks the
-/// registries of every subclass as well). Both arguments must be classes;
-/// native type spellings are handled by [`is_virtual_instance`].
+/// registries of every subclass as well). Both arguments must be classes —
+/// Hydro class values or extension class handles; native type spellings are
+/// handled by [`is_virtual_instance`].
 pub(crate) fn is_virtual_subclass(subclass: i64, ancestor: i64) -> bool {
     if VIRTUAL_EDGES.load(Ordering::Relaxed) == 0 {
         return false;
     }
-    if value::as_class(subclass).is_none() || value::as_class(ancestor).is_none() {
+    let subclass_is_class =
+        value::as_class(subclass).is_some() || extension_class_target(subclass).is_some();
+    if !subclass_is_class || value::as_class(ancestor).is_none() {
         return false;
     }
     let Some(edges) = virtual_edges() else {
         return false;
     };
     edges.as_chunks::<2>().0.iter().any(|&[abc, target]| {
-        registered_under(abc, ancestor) && value::is_subclass_of(subclass, target)
+        registered_under(abc, ancestor) && edge_matches_subclass(subclass, target)
     })
 }
 
@@ -137,6 +141,8 @@ pub(crate) fn is_virtual_subclass(subclass: i64, ancestor: i64) -> bool {
 /// metaclass one, handled by the ordinary builtin path). Every other value is
 /// tested by its real class and, for native scalars registered through their
 /// builtin spelling (`Number.register(int)`), by its static type name.
+/// Extension handles are tested with `PyObject_IsInstance`, so a registered C
+/// base class covers the extension's own subclasses.
 pub(crate) fn is_virtual_instance(value: i64, ancestor: i64) -> bool {
     if VIRTUAL_EDGES.load(Ordering::Relaxed) == 0 {
         return false;
@@ -158,7 +164,7 @@ pub(crate) fn is_virtual_instance(value: i64, ancestor: i64) -> bool {
         }
         match native_type_target(target) {
             Some(name) => actual == name || (actual == "bool" && name == "int"),
-            None => value::is_subclass_of(value, target),
+            None => edge_matches_instance(value, target),
         }
     })
 }
@@ -204,7 +210,10 @@ fn register(args: &[i64]) -> i64 {
         );
     }
     let native_target = native_type_target(subclass);
-    if native_target.is_none() && value::as_class(subclass).is_none() {
+    if native_target.is_none()
+        && value::as_class(subclass).is_none()
+        && extension_class_target(subclass).is_none()
+    {
         return exc::raise_with_message(TYPE_ERROR, "Can only register classes");
     }
     // Registering an existing real subclass changes nothing.
@@ -250,7 +259,7 @@ fn has_virtual_edge(abc: i64, subclass: i64) -> bool {
             .as_chunks::<2>()
             .0
             .iter()
-            .any(|&[owner, target]| owner == abc && target == subclass)
+            .any(|&[owner, target]| owner == abc && same_target(target, subclass))
     })
 }
 
@@ -289,6 +298,121 @@ fn native_type_target(v: i64) -> Option<&'static str> {
         "int" | "float" | "complex" | "bool" | "str" | "bytes" | "bytearray" | "list" | "dict"
         | "tuple" | "set" | "frozenset" | "memoryview" => Some(builtin.name()),
         _ => None,
+    }
+}
+
+// -------------------------------------------------------------------------
+// Extension class targets
+// -------------------------------------------------------------------------
+
+/// The extension type object behind `v`, when `v` is an extension class.
+///
+/// C extensions expose their classes to Hydro as opaque handles: NumPy's
+/// scalar types (`numpy.integer`, `numpy.float64`, …) are `PyTypeObject`s that
+/// arrive wrapped in [`value::ExtObjectData`]. Only a real type object is a
+/// class here: the predicate is the host's `PyType_Check`, so an extension
+/// *instance* (whose type is not a metaclass) is still rejected. The check is
+/// generic; no module or type name is special-cased.
+fn extension_class_target(v: i64) -> Option<*mut crate::capi::ShimObject> {
+    let state = value::as_ext_object(v)?;
+    crate::capi::object_is_type(state.object).then_some(state.object)
+}
+
+/// Whether two extension type pointers name the same type or a real subclass.
+fn extension_subclass_of_pointer(
+    derived: *mut crate::capi::ShimObject,
+    target: *mut crate::capi::ShimObject,
+) -> bool {
+    derived == target || crate::capi::object_is_subclass(derived, target).unwrap_or(false)
+}
+
+/// Whether `subclass` is extension type `target` or derives from it.
+///
+/// An extension class answers through the extension's own type hierarchy
+/// (`PyObject_IsSubclass`). A Hydro class that names an extension type among
+/// its bases is handled by walking its linearization, mirroring the builtin
+/// `issubclass` path in `builtins.rs`.
+fn extension_subclass_of(subclass: i64, target: *mut crate::capi::ShimObject) -> bool {
+    if let Some(state) = value::as_ext_object(subclass) {
+        return extension_subclass_of_pointer(state.object, target);
+    }
+    if value::as_class(subclass).is_none() {
+        return false;
+    }
+    value::class_mro(subclass).iter().any(|&ancestor| {
+        let Some(base) = value::as_ext_object(ancestor) else {
+            return false;
+        };
+        extension_subclass_of_pointer(base.object, target)
+    })
+}
+
+/// Whether the extension type `derived` is a registered virtual subclass of
+/// the Hydro ABC `ancestor`.
+///
+/// The C API receives extension classes as raw pointers, so this spelling
+/// mirrors [`is_virtual_subclass`] without materialising a Hydro handle.
+pub(crate) fn is_virtual_extension_subclass(
+    derived: *mut crate::capi::ShimObject,
+    ancestor: i64,
+) -> bool {
+    if VIRTUAL_EDGES.load(Ordering::Relaxed) == 0 || value::as_class(ancestor).is_none() {
+        return false;
+    }
+    if !crate::capi::object_is_type(derived) {
+        return false;
+    }
+    let Some(edges) = virtual_edges() else {
+        return false;
+    };
+    edges.as_chunks::<2>().0.iter().any(|&[abc, target]| {
+        registered_under(abc, ancestor)
+            && extension_class_target(target)
+                .is_some_and(|extension| extension_subclass_of_pointer(derived, extension))
+    })
+}
+
+/// Whether `value` is an instance of extension type `target`.
+///
+/// An extension handle answers through `PyObject_IsInstance`, so a registered
+/// base type covers the extension's own subclasses (NumPy's `numpy.integer`
+/// covers `numpy.int64`). A Hydro value is tested through its class's
+/// linearization, which may contain extension bases.
+fn extension_instance_of(value: i64, target: *mut crate::capi::ShimObject) -> bool {
+    if let Some(state) = value::as_ext_object(value) {
+        return crate::capi::object_isinstance(state.object, target).unwrap_or(false);
+    }
+    extension_subclass_of(value::type_class(value), target)
+}
+
+/// Whether the edge target `target` covers the class `subclass`.
+fn edge_matches_subclass(subclass: i64, target: i64) -> bool {
+    match extension_class_target(target) {
+        Some(extension) => extension_subclass_of(subclass, extension),
+        None => value::is_subclass_of(subclass, target),
+    }
+}
+
+/// Whether the edge target `target` covers the non-class value `value`.
+fn edge_matches_instance(value: i64, target: i64) -> bool {
+    match extension_class_target(target) {
+        Some(extension) => extension_instance_of(value, extension),
+        None => value::is_subclass_of(value, target),
+    }
+}
+
+/// Whether two edge targets name the same class.
+///
+/// Extension handles are distinct heap values even when they wrap the same
+/// `PyTypeObject`, so a second registration of the same C class must compare
+/// the underlying type pointer instead of the handle.
+fn same_target(left: i64, right: i64) -> bool {
+    if left == right {
+        return true;
+    }
+    match (value::as_ext_object(left), value::as_ext_object(right)) {
+        (Some(left), Some(right)) => left.object == right.object,
+        _ => false,
     }
 }
 
@@ -530,6 +654,52 @@ mod tests {
         )
     }
 
+    /// Builds a synthetic heap extension type, optionally derived from `base`.
+    ///
+    /// The caller owns the returned reference. `BASETYPE` is set so the type
+    /// can serve as a base for the derived probe.
+    fn extension_type(
+        name: &std::ffi::CStr,
+        base: Option<*mut crate::capi::ShimObject>,
+    ) -> *mut crate::capi::ShimObject {
+        let mut slots = [crate::capi::PyTypeSlotMirror {
+            slot: 0,
+            pfunc: std::ptr::null_mut(),
+        }];
+        let mut spec = crate::capi::PyTypeSpecMirror {
+            name: name.as_ptr(),
+            basicsize: 32,
+            itemsize: 0,
+            flags: crate::capi::PY_TPFLAGS_BASETYPE as u32,
+            slots: slots.as_mut_ptr(),
+        };
+        let bases = match base {
+            Some(base) => {
+                let tuple = crate::capi::PyTuple_New(1);
+                assert!(!tuple.is_null());
+                crate::capi::Py_IncRef(base);
+                assert_eq!(crate::capi::PyTuple_SetItem(tuple, 0, base), 0);
+                tuple
+            }
+            None => std::ptr::null_mut(),
+        };
+        let type_object = crate::capi::PyType_FromSpecWithBases(&mut spec, bases);
+        if !bases.is_null() {
+            crate::capi::Py_DecRef(bases);
+        }
+        assert!(
+            !type_object.is_null(),
+            "extension type creation failed: {:?}",
+            crate::capi::take_error()
+        );
+        type_object
+    }
+
+    /// Wraps an extension reference as a Hydro value (which owns the reference).
+    fn extension_value(object: *mut crate::capi::ShimObject, type_name: &str) -> i64 {
+        value::ext_object_new(object, type_name.to_string())
+    }
+
     #[test]
     fn abc_meta_is_a_class_derived_from_type() {
         let _guard = guard();
@@ -592,6 +762,98 @@ mod tests {
         assert!(is_virtual_instance(ops::int_result(1), number));
         assert!(is_virtual_instance(value::TRUE, number));
         assert!(!is_virtual_instance(str_alloc("x".to_string()), number));
+    }
+
+    #[test]
+    fn register_accepts_extension_classes_and_matches_their_instances() {
+        let _guard = guard();
+        reset();
+        let number = number_abc();
+
+        // A synthetic heap extension type stands in for a NumPy scalar type
+        // (`numpy.integer`): a real `PyTypeObject` behind an opaque handle.
+        let base_type = extension_type(c"abcprobe.Base", None);
+        let base = extension_value(base_type, "type");
+        assert!(crate::capi::object_is_type(base_type));
+
+        // Registering the C class records the virtual edge and returns the
+        // argument unchanged, like the Hydro-class and builtin-spelling paths.
+        assert_eq!(call("ABCMeta.register", &[number, base]), base);
+        assert!(!exc::pending());
+        assert!(is_virtual_subclass(base, number));
+        // The C API spelling consults the same registry, so extension code
+        // calling `PyObject_IsSubclass(numpy.integer, numbers.Integral)` sees
+        // the registration.
+        assert!(is_virtual_extension_subclass(base_type, number));
+        let abc_handle = crate::capi::value_object(crate::capi::hydro_shim(number));
+        assert_eq!(crate::capi::PyObject_IsSubclass(base_type, abc_handle), 1);
+        crate::capi::Py_DecRef(abc_handle);
+        assert_eq!(call("get_cache_token", &[]), ops::int_result(1));
+
+        // Instances of the registered C class match through
+        // `PyObject_IsInstance`.
+        let instance_like = extension_value(
+            crate::capi::_PyObject_New(base_type),
+            "abcprobe.Base instance",
+        );
+        assert!(is_virtual_instance(instance_like, number));
+        // The C API `isinstance` spelling routes through Hydro's registry too.
+        let instance_handle = crate::capi::value_object(crate::capi::hydro_shim(number));
+        assert_eq!(
+            crate::capi::PyObject_IsInstance(
+                value::ext_object_pointer(instance_like).expect("extension handle"),
+                instance_handle,
+            ),
+            1
+        );
+        crate::capi::Py_DecRef(instance_handle);
+
+        // The extension's own subclasses match too.
+        let derived_type = extension_type(c"abcprobe.Derived", Some(base_type));
+        let derived = extension_value(derived_type, "type");
+        assert!(is_virtual_subclass(derived, number));
+        let derived_instance = extension_value(
+            crate::capi::_PyObject_New(derived_type),
+            "abcprobe.Derived instance",
+        );
+        assert!(is_virtual_instance(derived_instance, number));
+
+        // An unrelated extension type does not match.
+        let other_type = extension_type(c"abcprobe.Other", None);
+        let other_instance = extension_value(
+            crate::capi::_PyObject_New(other_type),
+            "abcprobe.Other instance",
+        );
+        assert!(!is_virtual_instance(other_instance, number));
+        let other_class = extension_value(other_type, "type");
+        assert!(!is_virtual_subclass(other_class, number));
+
+        // A second handle to the same type is the same registration: it is
+        // idempotent and does not bump the cache token.
+        crate::capi::Py_IncRef(base_type);
+        let duplicate = extension_value(base_type, "type");
+        assert_eq!(call("ABCMeta.register", &[number, duplicate]), duplicate);
+        assert_eq!(call("get_cache_token", &[]), ops::int_result(1));
+    }
+
+    #[test]
+    fn register_rejects_extension_instances() {
+        let _guard = guard();
+        reset();
+        let number = number_abc();
+        let type_object = extension_type(c"abcprobe.Instance", None);
+        // A C *instance* is an opaque handle whose type is not a metaclass;
+        // `register` must reject it instead of recording an edge with no
+        // effect.
+        let instance =
+            extension_value(crate::capi::_PyObject_New(type_object), "abcprobe.Instance");
+        assert!(!crate::capi::object_is_type(
+            value::ext_object_pointer(instance).expect("extension handle")
+        ));
+        call("ABCMeta.register", &[number, instance]);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+        assert!(!is_virtual_instance(instance, number));
     }
 
     #[test]

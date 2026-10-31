@@ -19,6 +19,7 @@ fn checker<'a>(prog: &'a LHir, inf: &'a mut Infer) -> Checker<'a> {
         checks: Vec::new(),
         spans: HashMap::new(),
         narrow: HashMap::new(),
+        widened: HashSet::new(),
     }
 }
 
@@ -3678,6 +3679,89 @@ fn annotated_parameter_mismatch_is_still_reported() {
     assert_eq!(
         errors,
         vec!["argument 2 of f has type str, expected int"],
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn annotated_parameter_rebound_to_another_type_is_accepted() {
+    // pandas' `DataFrame.from_dict` declares `data: dict` and later rebinds it
+    // with `data = list(data.values())  # type: ignore[assignment]`. CPython
+    // never enforces annotations, so the rebind is not a static error and the
+    // stored value's own operations must keep working.
+    let program = crate::check_source(
+        r#"
+def from_dict(data: dict, orient: str):
+    if orient == "index":
+        data = list(data.values())  # type: ignore[assignment]
+        data.append(3)
+        data += [4]
+        data[0] = data[1]
+        return data[0], len(data)
+    return data
+"#,
+        "test.py",
+    )
+    .expect("an annotated parameter may be rebound to another type");
+
+    // The annotation is metadata once the body stores another type: it stays
+    // on the parameter for `__annotations__`/`inspect`, it is not rewritten.
+    let f = program_function(&program, "from_dict");
+    assert!(f.params[0].declared, "the annotation is preserved");
+    assert_eq!(f.params[0].ty, Type::Dict);
+}
+
+#[test]
+fn annotated_parameter_rebound_from_int_to_str_is_accepted() {
+    // `value: int` followed by `value = "row"` is ordinary Python; reads keep
+    // the runtime's dynamic behaviour instead of the stale declaration.
+    let source = r#"
+def label(value: int):
+    value = "row"
+    value += "!"
+    return value.upper()
+"#;
+    crate::check_source(source, "test.py")
+        .expect("an annotated parameter may be rebound from int to str");
+
+    // The same holds for an annotated local (lowering already keeps one
+    // dynamic) and for a rebind inside a branch.
+    let source = r#"
+def f(flag):
+    data: dict = {}
+    data = [1]
+    data.append(2)
+    if flag:
+        data = {}
+    return data
+"#;
+    crate::check_source(source, "test.py")
+        .expect("an annotated local may be rebound to another type");
+}
+
+#[test]
+fn invalid_operations_after_a_rebind_are_still_reported() {
+    // Widening only affects the rebound local: an operation whose operand
+    // types are still known stays a static error.
+    let errors = check_errors(
+        "def f(data: dict):\n    data = list(data.values())\n    return list(data) + 1\n",
+    );
+    assert_eq!(
+        errors,
+        vec!["unsupported operand type(s) for +: 'list' and 'int'"],
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn an_unrebound_annotated_parameter_keeps_its_checks() {
+    // Accepting contradictory rebinds must not weaken the declaration for a
+    // parameter the body never rebinds: ordinary body operator checks still
+    // use the annotated type.
+    let errors = check_errors("def f(data: dict):\n    return data + 1\n");
+    assert_eq!(
+        errors,
+        vec!["unsupported operand type(s) for +: 'dict' and 'int'"],
         "{errors:?}"
     );
 }

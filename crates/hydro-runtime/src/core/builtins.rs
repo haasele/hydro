@@ -7161,8 +7161,14 @@ fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
             return Ok(true);
         }
         if value::as_class(class).is_some() {
-            // A C type never derives from another Hydro class.
-            return Ok(false);
+            // A C type does not inherit from a Hydro class, but it may have
+            // been registered as a virtual subclass: NumPy's import runs
+            // `numbers.Integral.register(numpy.integer)`, and NumPy's own
+            // tests assert `issubclass(np.integer, numbers.Integral)`.
+            return Ok(crate::modules::abc::is_virtual_extension_subclass(
+                derived.object,
+                class,
+            ));
         }
         return Err(SubclassError::Class);
     }
@@ -9426,6 +9432,83 @@ mod tests {
         let pair = value::tuple_new(vec![int(3)]);
         let tuple_copy = methods::getattr(value::type_class(pair), b"copy".as_ptr(), "copy".len());
         assert_eq!(crate::builtins::call(tuple_copy, 1, [pair].as_ptr()), pair);
+        assert!(!exc::pending());
+    }
+
+    /// Creates a synthetic heap extension type for ABC-registry tests.
+    fn extension_type(name: &std::ffi::CStr) -> *mut crate::capi::ShimObject {
+        let mut slots = [crate::capi::PyTypeSlotMirror {
+            slot: 0,
+            pfunc: std::ptr::null_mut(),
+        }];
+        let mut spec = crate::capi::PyTypeSpecMirror {
+            name: name.as_ptr(),
+            basicsize: 32,
+            itemsize: 0,
+            flags: crate::capi::PY_TPFLAGS_BASETYPE as u32,
+            slots: slots.as_mut_ptr(),
+        };
+        let type_object = crate::capi::PyType_FromSpecWithBases(&mut spec, std::ptr::null_mut());
+        assert!(
+            !type_object.is_null(),
+            "extension type creation failed: {:?}",
+            crate::capi::take_error()
+        );
+        type_object
+    }
+
+    #[test]
+    fn issubclass_consults_the_abc_registry_for_extension_classes() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        let metaclass = crate::modules::abc::constant("ABCMeta");
+        assert!(!exc::pending(), "ABCMeta materialises");
+        // `Integral` is a real subclass of `Number`, like `numbers.py`'s
+        // hierarchy; a registration under `Integral` also counts for `Number`.
+        let number = value::class_new_multi(
+            "Number".to_string(),
+            Vec::new(),
+            metaclass,
+            Vec::new(),
+            Vec::new(),
+        );
+        let integral = value::class_new_multi(
+            "Integral".to_string(),
+            vec![number],
+            metaclass,
+            Vec::new(),
+            Vec::new(),
+        );
+        let scalar_type = extension_type(c"probe.IntegralScalar");
+        let scalar = value::ext_object_new(scalar_type, "probe.IntegralScalar".to_string());
+
+        // Before registration a C class is not a subclass of the ABC.
+        assert_eq!(issubclass(scalar, integral), FALSE);
+        assert_eq!(issubclass(scalar, number), FALSE);
+
+        // `numbers.Integral.register(integer)` is the NumPy import path: the
+        // registered C class becomes a virtual subclass.
+        let registered = crate::modules::abc::register_from_method(&[integral, scalar]);
+        assert_eq!(registered, scalar);
+        assert!(!exc::pending());
+        assert_eq!(issubclass(scalar, integral), TRUE);
+        // The registry of a subclass counts for its ancestors, as in CPython's
+        // `ABCMeta.__subclasscheck__`.
+        assert_eq!(issubclass(scalar, number), TRUE);
+        // A tuple of classes behaves like the direct operand.
+        assert_eq!(issubclass(scalar, value::tuple_new(vec![integral])), TRUE);
+        // Instances of the registered C class are virtual instances too.
+        let scalar_instance = value::ext_object_new(
+            crate::capi::_PyObject_New(scalar_type),
+            "probe.IntegralScalar instance".to_string(),
+        );
+        assert_eq!(isinstance(scalar_instance, integral), TRUE);
+        assert_eq!(isinstance(scalar_instance, number), TRUE);
+        // An unrelated Hydro class is still not a superclass, and `object`
+        // still covers every class.
+        let unrelated = value::class_new("Unrelated".to_string(), NONE, Vec::new());
+        assert_eq!(issubclass(scalar, unrelated), FALSE);
+        assert_eq!(issubclass(scalar, value::object_class()), TRUE);
         assert!(!exc::pending());
     }
 

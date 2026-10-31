@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-10-31T21:05:48Z",
+    "date": "2026-10-31T21:35:42Z",
     "python": "CPython 3.14.9",
     "python_version": "3.14.9",
     "python_executable": "/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14",
@@ -22,7 +22,7 @@
       "tests": null
     },
     "cwd": "/mnt/Vault/GitHub/hydro",
-    "elapsed_seconds": 137.7,
+    "elapsed_seconds": 140.5,
     "pins_ok": true,
     "upstream_note": null
   },
@@ -184,13 +184,13 @@
       "package": "numpy",
       "kind": "import",
       "status": "runtime_error",
-      "detail": "jit: TypeError: Can only register classes",
+      "detail": "jit: AttributeError: 'code' object has no attribute 'co_kwonlyargcount'",
       "differences": {},
       "runs": {
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 101.7,
+          "duration_ms": 92.2,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -199,26 +199,26 @@
         "jit": {
           "exit": 1,
           "timed_out": false,
-          "duration_ms": 9696.8,
+          "duration_ms": 9592.8,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
-          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-7rcwqdi4/import_numpy.py\", line 563, in numpy._core.numerictypes._register_types\nTypeError: Can only register classes\n"
+          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-erkw07y2/import_numpy.py\", line 152, in numpy._core.overrides.array_function_dispatch.decorator\nAttributeError: 'code' object has no attribute 'co_kwonlyargcount'\n"
         },
         "aot": {
           "exit": 1,
           "timed_out": false,
-          "duration_ms": 44.3,
+          "duration_ms": 44.6,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
-          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-7rcwqdi4/import_numpy.py\", line 563, in numpy._core.numerictypes._register_types\nTypeError: Can only register classes\n"
+          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-erkw07y2/import_numpy.py\", line 152, in numpy._core.overrides.array_function_dispatch.decorator\nAttributeError: 'code' object has no attribute 'co_kwonlyargcount'\n"
         }
       },
       "aot_build": {
         "exit": 0,
         "timed_out": false,
-        "duration_ms": 10156.7,
+        "duration_ms": 10186.3,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
@@ -230,13 +230,13 @@
       "package": "numpy",
       "kind": "smoke",
       "status": "runtime_error",
-      "detail": "jit: TypeError: Can only register classes",
+      "detail": "jit: AttributeError: 'code' object has no attribute 'co_kwonlyargcount'",
       "differences": {},
       "runs": {
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 155.0,
+          "duration_ms": 127.3,
           "stdout_sha256": "0323dea80ac074f1bd604113f98b1dbb4ead84e0c3423ee62aede3d3ec5712e1",
           "stdout_bytes": 763,
           "stdout": "numpy 2.5.0\narray (3, 4) <i8 [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]\nreduce 66 5.5 11\naxis [6, 22, 38]\nslice [[4, 6], [8, 10]]\ntranspose (4, 3) [0, 4, 8]\nlinspace [0.0, 0.25, 0.5, 0.75, 1.0]\nbroadcast [[10, 21, 32, 43], [14, 25, 36, 47]]\nufunc [1.0, 1.414214, 1.732051, 2.0, 2.236068]\nwhere [[0, -1, 2, -1], [4, -1, 6, -1], [8, -1, 10, -1]]\nclip [[2, 2, 2, 3], [4, 5, 6, 7], [7, 7, 7, 7]]\nunique [0, 1, 2, 3, 4]\ndet 11.0\ninv [[0.272727, -0.090909], [-0.090909, 0.363636]]\nsolve [0.090909, 0.636364]\neigh [2.381966, 4.618034]\nmatmul [[58, 64], [139, 154]]\neinsum [[58, 64], [139, 154]]\nrandom [0.205682, 0.738822, 0.125443, 0.517044]\nrandom_int [93, 1, 57, 31, 97]\nsave_load (3, 4) <i8 True\nargmax [3, 3, 3]\nsort [1, 2, 3]\nastype 66.0\ndatetime64 2020-01-06 8\n",
@@ -245,26 +245,26 @@
         "jit": {
           "exit": 1,
           "timed_out": false,
-          "duration_ms": 9685.1,
+          "duration_ms": 9616.1,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
-          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-ch7bc0ne/numpy_smoke.py\", line 563, in numpy._core.numerictypes._register_types\nTypeError: Can only register classes\n"
+          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-897t0l95/numpy_smoke.py\", line 152, in numpy._core.overrides.array_function_dispatch.decorator\nAttributeError: 'code' object has no attribute 'co_kwonlyargcount'\n"
         },
         "aot": {
           "exit": 1,
           "timed_out": false,
-          "duration_ms": 41.8,
+          "duration_ms": 45.1,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
-          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-ch7bc0ne/numpy_smoke.py\", line 563, in numpy._core.numerictypes._register_types\nTypeError: Can only register classes\n"
+          "stderr_tail": "Traceback (most recent call last):\n  File \"/tmp/hydro-ecosystem-897t0l95/numpy_smoke.py\", line 152, in numpy._core.overrides.array_function_dispatch.decorator\nAttributeError: 'code' object has no attribute 'co_kwonlyargcount'\n"
         }
       },
       "aot_build": {
         "exit": 0,
         "timed_out": false,
-        "duration_ms": 10247.7,
+        "duration_ms": 10080.1,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
@@ -276,13 +276,13 @@
       "package": "pandas",
       "kind": "import",
       "status": "aot_build_error",
-      "detail": "AOT build failed (exit 1) [HYD0102]: error[HYD0102]: cannot assign type list to variable 'data' of type dict",
+      "detail": "AOT build failed (exit 1) [HYD0201]: error[HYD0201]: module 'queue' has no attribute 'SimpleQueue'",
       "differences": {},
       "runs": {
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 915.2,
+          "duration_ms": 779.4,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -291,22 +291,22 @@
         "jit": {
           "exit": 1,
           "timed_out": false,
-          "duration_ms": 14621.2,
+          "duration_ms": 15568.9,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
-          "stderr_tail": "error[HYD0102]: cannot assign type list to variable 'data' of type dict\n     --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/core/frame.py:1802:21\n      |\n 1802 |                     data = list(data.values())  # type: ignore[assignment]\n      |                     ^\n      |\n      = help: check the operand types or add an explicit conversion\nerror: could not compile '/tmp/hydro-ecosystem-fypxe7g2/import_pandas.py' due to 1 previous error(s)\n"
+          "stderr_tail": "error[HYD0201]: module 'queue' has no attribute 'SimpleQueue'\n     --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/io/parsers/readers.py:1004:38\n      |\n 1004 |     chunk_queue: queue.SimpleQueue = queue.SimpleQueue()\n      |                                      ^^^^^^^^^^^^^^^^^^^\nerror: could not compile '/tmp/hydro-ecosystem-d2sco61o/import_pandas.py' due to 1 previous error(s)\n"
         },
         "aot": null
       },
       "aot_build": {
         "exit": 1,
         "timed_out": false,
-        "duration_ms": 14748.8,
+        "duration_ms": 15915.3,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
-        "stderr_tail": "error[HYD0102]: cannot assign type list to variable 'data' of type dict\n     --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/core/frame.py:1802:21\n      |\n 1802 |                     data = list(data.values())  # type: ignore[assignment]\n      |                     ^\n      |\n      = help: check the operand types or add an explicit conversion\nerror: could not compile '/tmp/hydro-ecosystem-fypxe7g2/import_pandas.py' due to 1 previous error(s)\n"
+        "stderr_tail": "error[HYD0201]: module 'queue' has no attribute 'SimpleQueue'\n     --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/io/parsers/readers.py:1004:38\n      |\n 1004 |     chunk_queue: queue.SimpleQueue = queue.SimpleQueue()\n      |                                      ^^^^^^^^^^^^^^^^^^^\nerror: could not compile '/tmp/hydro-ecosystem-d2sco61o/import_pandas.py' due to 1 previous error(s)\n"
       }
     },
     {
@@ -314,37 +314,37 @@
       "package": "pandas",
       "kind": "smoke",
       "status": "aot_build_error",
-      "detail": "AOT build failed (exit 1) [HYD0102]: error[HYD0102]: cannot assign type list to variable 'data' of type dict",
+      "detail": "AOT build failed (exit 1) [HYD0201]: error[HYD0201]: module 'queue' has no attribute 'SimpleQueue'",
       "differences": {},
       "runs": {
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 752.6,
+          "duration_ms": 764.7,
           "stdout_sha256": "91c875a0b4440cfe6a66b140568641712c927e7efbb615c66112b566fe8fcecd",
           "stdout_bytes": 561,
           "stdout": "pandas 3.1.0\nseries [4, 1, 3, 2] ['d', 'a', 'c', 'b'] int64\nstats 10 2.5 4 d\nsorted [1, 2, 3, 4]\nshape (4, 3)\ncolumns ['group', 'value', 'flag']\ndtypes ['str', 'int64', 'bool']\nvalue_sum 14 3.5\ngroupby_sum {'x': 4, 'y': 10}\ngroupby_agg {'count': [2, 2], 'min': [1, 2], 'max': [3, 8]}\nmerge ['a', 'b', 'c'] [-1, 20, 30]\nconcat (8, 3) 28\nmissing [False, True, False] [1.0, 0.0, 3.0]\nffill [1.0, 1.0, 3.0]\ncsv [1, 2] ['x', 'y']\ndatetime ['2021-01-01', '2021-01-04', '2021-02-01']\ndelta_days 3\ndayofweek [4, 0, 0] month [1, 1, 2]\npivot ['x', 'y'] [4, 10]\ncast 14.0\n",
-          "stderr_tail": "/tmp/hydro-ecosystem-qg3qmem5/pandas_smoke.py:70: Pandas4Warning: Series.dt.dayofweek is deprecated and will be removed in a future version. Use Series.dt.day_of_week instead.\n  print(\"dayofweek\", dates.dt.dayofweek.tolist(), \"month\", dates.dt.month.tolist())\n"
+          "stderr_tail": "/tmp/hydro-ecosystem-2jllfzpe/pandas_smoke.py:70: Pandas4Warning: Series.dt.dayofweek is deprecated and will be removed in a future version. Use Series.dt.day_of_week instead.\n  print(\"dayofweek\", dates.dt.dayofweek.tolist(), \"month\", dates.dt.month.tolist())\n"
         },
         "jit": {
           "exit": 1,
           "timed_out": false,
-          "duration_ms": 14844.6,
+          "duration_ms": 15635.1,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
-          "stderr_tail": "error[HYD0102]: cannot assign type list to variable 'data' of type dict\n     --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/core/frame.py:1802:21\n      |\n 1802 |                     data = list(data.values())  # type: ignore[assignment]\n      |                     ^\n      |\n      = help: check the operand types or add an explicit conversion\nerror: could not compile '/tmp/hydro-ecosystem-qg3qmem5/pandas_smoke.py' due to 1 previous error(s)\n"
+          "stderr_tail": "error[HYD0201]: module 'queue' has no attribute 'SimpleQueue'\n     --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/io/parsers/readers.py:1004:38\n      |\n 1004 |     chunk_queue: queue.SimpleQueue = queue.SimpleQueue()\n      |                                      ^^^^^^^^^^^^^^^^^^^\nerror: could not compile '/tmp/hydro-ecosystem-2jllfzpe/pandas_smoke.py' due to 1 previous error(s)\n"
         },
         "aot": null
       },
       "aot_build": {
         "exit": 1,
         "timed_out": false,
-        "duration_ms": 16116.0,
+        "duration_ms": 15588.9,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
-        "stderr_tail": "error[HYD0102]: cannot assign type list to variable 'data' of type dict\n     --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/core/frame.py:1802:21\n      |\n 1802 |                     data = list(data.values())  # type: ignore[assignment]\n      |                     ^\n      |\n      = help: check the operand types or add an explicit conversion\nerror: could not compile '/tmp/hydro-ecosystem-qg3qmem5/pandas_smoke.py' due to 1 previous error(s)\n"
+        "stderr_tail": "error[HYD0201]: module 'queue' has no attribute 'SimpleQueue'\n     --> /mnt/Vault/GitHub/hydro/.hydro/ecosystem/site/pandas/io/parsers/readers.py:1004:38\n      |\n 1004 |     chunk_queue: queue.SimpleQueue = queue.SimpleQueue()\n      |                                      ^^^^^^^^^^^^^^^^^^^\nerror: could not compile '/tmp/hydro-ecosystem-2jllfzpe/pandas_smoke.py' due to 1 previous error(s)\n"
       }
     },
     {
@@ -358,7 +358,7 @@
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 51.7,
+          "duration_ms": 39.5,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -367,7 +367,7 @@
         "jit": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 6589.5,
+          "duration_ms": 6542.6,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -376,7 +376,7 @@
         "aot": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 561.8,
+          "duration_ms": 547.9,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -386,7 +386,7 @@
       "aot_build": {
         "exit": 0,
         "timed_out": false,
-        "duration_ms": 6682.9,
+        "duration_ms": 6674.5,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
@@ -404,7 +404,7 @@
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 103.2,
+          "duration_ms": 79.1,
           "stdout_sha256": "fc64c59b9e537b2d8b714b4582007e0a9ff566f316d0cb49db0a4c920fe3ca55",
           "stdout_bytes": 785,
           "stdout": "pydantic 2.14.1 core 2.50.1\ndump {'id': 7, 'name': 'Ada', 'email': None, 'tags': ['admin'], 'address': {'city': 'London', 'zip_code': 12345}}\ndump_alias {'id': 7, 'name': 'Ada', 'email': None, 'tags': ['admin'], 'address': {'city': 'London', 'zip': 12345}}\njson {\"id\":7,\"name\":\"Ada\",\"email\":null,\"tags\":[\"admin\"],\"address\":{\"city\":\"London\",\"zip_code\":12345}}\nroundtrip True\nerrors 2\nerror_types ['int_parsing', 'string_type']\nerror_locs [['id'], ['name']]\ncoerce {'x': 1.5, 'y': 2.0}\nadapter [1, 2, 3]\nadapter_json [4, 5]\nschema_keys ['$defs', 'properties', 'required', 'title', 'type']\nschema_properties ['address', 'email', 'id', 'name', 'tags']\nschema_required ['id', 'name']\ndefs ['Address']\ncore_py 42\ncore_json 7\ncore_error 1 ['int_parsing']\ntyped_dict {'name': 'Bob', 'age': 3}\n",
@@ -413,7 +413,7 @@
         "jit": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 6591.2,
+          "duration_ms": 7218.3,
           "stdout_sha256": "fc64c59b9e537b2d8b714b4582007e0a9ff566f316d0cb49db0a4c920fe3ca55",
           "stdout_bytes": 785,
           "stdout": "pydantic 2.14.1 core 2.50.1\ndump {'id': 7, 'name': 'Ada', 'email': None, 'tags': ['admin'], 'address': {'city': 'London', 'zip_code': 12345}}\ndump_alias {'id': 7, 'name': 'Ada', 'email': None, 'tags': ['admin'], 'address': {'city': 'London', 'zip': 12345}}\njson {\"id\":7,\"name\":\"Ada\",\"email\":null,\"tags\":[\"admin\"],\"address\":{\"city\":\"London\",\"zip_code\":12345}}\nroundtrip True\nerrors 2\nerror_types ['int_parsing', 'string_type']\nerror_locs [['id'], ['name']]\ncoerce {'x': 1.5, 'y': 2.0}\nadapter [1, 2, 3]\nadapter_json [4, 5]\nschema_keys ['$defs', 'properties', 'required', 'title', 'type']\nschema_properties ['address', 'email', 'id', 'name', 'tags']\nschema_required ['id', 'name']\ndefs ['Address']\ncore_py 42\ncore_json 7\ncore_error 1 ['int_parsing']\ntyped_dict {'name': 'Bob', 'age': 3}\n",
@@ -422,7 +422,7 @@
         "aot": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 572.3,
+          "duration_ms": 558.9,
           "stdout_sha256": "fc64c59b9e537b2d8b714b4582007e0a9ff566f316d0cb49db0a4c920fe3ca55",
           "stdout_bytes": 785,
           "stdout": "pydantic 2.14.1 core 2.50.1\ndump {'id': 7, 'name': 'Ada', 'email': None, 'tags': ['admin'], 'address': {'city': 'London', 'zip_code': 12345}}\ndump_alias {'id': 7, 'name': 'Ada', 'email': None, 'tags': ['admin'], 'address': {'city': 'London', 'zip': 12345}}\njson {\"id\":7,\"name\":\"Ada\",\"email\":null,\"tags\":[\"admin\"],\"address\":{\"city\":\"London\",\"zip_code\":12345}}\nroundtrip True\nerrors 2\nerror_types ['int_parsing', 'string_type']\nerror_locs [['id'], ['name']]\ncoerce {'x': 1.5, 'y': 2.0}\nadapter [1, 2, 3]\nadapter_json [4, 5]\nschema_keys ['$defs', 'properties', 'required', 'title', 'type']\nschema_properties ['address', 'email', 'id', 'name', 'tags']\nschema_required ['id', 'name']\ndefs ['Address']\ncore_py 42\ncore_json 7\ncore_error 1 ['int_parsing']\ntyped_dict {'name': 'Bob', 'age': 3}\n",
@@ -432,7 +432,7 @@
       "aot_build": {
         "exit": 0,
         "timed_out": false,
-        "duration_ms": 6595.8,
+        "duration_ms": 6965.7,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
@@ -450,7 +450,7 @@
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 37.2,
+          "duration_ms": 34.2,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -459,7 +459,7 @@
         "jit": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 1713.0,
+          "duration_ms": 1755.3,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -468,7 +468,7 @@
         "aot": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 320.9,
+          "duration_ms": 317.3,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -478,7 +478,7 @@
       "aot_build": {
         "exit": 0,
         "timed_out": false,
-        "duration_ms": 1804.8,
+        "duration_ms": 1800.6,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
@@ -496,7 +496,7 @@
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 11.0,
+          "duration_ms": 11.3,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -505,7 +505,7 @@
         "jit": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 11.4,
+          "duration_ms": 10.3,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -524,7 +524,7 @@
       "aot_build": {
         "exit": 0,
         "timed_out": false,
-        "duration_ms": 299.1,
+        "duration_ms": 292.0,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
@@ -542,7 +542,7 @@
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 17.0,
+          "duration_ms": 18.2,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -551,7 +551,7 @@
         "jit": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 154.2,
+          "duration_ms": 152.2,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -560,7 +560,7 @@
         "aot": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 4.4,
+          "duration_ms": 4.3,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -570,7 +570,7 @@
       "aot_build": {
         "exit": 0,
         "timed_out": false,
-        "duration_ms": 430.6,
+        "duration_ms": 452.6,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
@@ -588,7 +588,7 @@
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 24.2,
+          "duration_ms": 23.3,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -597,7 +597,7 @@
         "jit": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 761.0,
+          "duration_ms": 763.3,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -606,7 +606,7 @@
         "aot": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 7.1,
+          "duration_ms": 7.5,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -616,7 +616,7 @@
       "aot_build": {
         "exit": 0,
         "timed_out": false,
-        "duration_ms": 1049.3,
+        "duration_ms": 1039.5,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
@@ -634,7 +634,7 @@
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 9.1,
+          "duration_ms": 8.7,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -643,7 +643,7 @@
         "jit": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 6.2,
+          "duration_ms": 5.3,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -652,7 +652,7 @@
         "aot": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 2.5,
+          "duration_ms": 2.6,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -662,7 +662,7 @@
       "aot_build": {
         "exit": 0,
         "timed_out": false,
-        "duration_ms": 296.4,
+        "duration_ms": 291.8,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
@@ -680,7 +680,7 @@
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 28.7,
+          "duration_ms": 28.3,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -689,7 +689,7 @@
         "jit": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 80.5,
+          "duration_ms": 82.4,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -698,7 +698,7 @@
         "aot": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 3.9,
+          "duration_ms": 3.6,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -708,7 +708,7 @@
       "aot_build": {
         "exit": 0,
         "timed_out": false,
-        "duration_ms": 370.3,
+        "duration_ms": 384.4,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",
@@ -726,7 +726,7 @@
         "cpython": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 13.5,
+          "duration_ms": 9.5,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -735,7 +735,7 @@
         "jit": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 6.6,
+          "duration_ms": 6.0,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -744,7 +744,7 @@
         "aot": {
           "exit": 0,
           "timed_out": false,
-          "duration_ms": 2.7,
+          "duration_ms": 3.2,
           "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "stdout_bytes": 0,
           "stdout": "",
@@ -754,7 +754,7 @@
       "aot_build": {
         "exit": 0,
         "timed_out": false,
-        "duration_ms": 298.0,
+        "duration_ms": 299.0,
         "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stdout_bytes": 0,
         "stdout": "",

@@ -78,14 +78,14 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-10-31: **3073 tests run
-(3073 passed, 1 skipped)**; the per-crate breakdown below sums to 3073
+`cargo nextest run --workspace` on 2026-10-31: **3080 tests run
+(3080 passed, 1 skipped)**; the per-crate breakdown below sums to 3080
 (the skipped test is not included in the listed binaries):
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 1964 |
-| frontend | 873 |
+| runtime (unit + integration) | 1967 |
+| frontend | 877 |
 | codegen | 79 |
 | IR | 68 |
 | bindgen | 42 |
@@ -114,8 +114,8 @@ Other docs must link here instead of repeating the total.
 - **Ecosystem:** **9/13 cases pass** under JIT and AOT. Pydantic 2.14.1,
   pydantic-core, python-dateutil, six, typing-extensions,
   typing-inspection, annotated-types and tzdata pass. NumPy 2.5 stops on the
-  `_multiarray_umath` class-registration path; pandas AOT compilation now
-  stops on a type-inference conflict in `frame.py`. The
+  `_multiarray_umath` code-object metadata path; pandas AOT compilation now
+  stops on missing `queue.SimpleQueue`. The
   ABI inventory reports **0 missing required symbols** across 68 pinned
   extension modules. Pinned ecosystem report:
   `docs/ECOSYSTEM.md`.
