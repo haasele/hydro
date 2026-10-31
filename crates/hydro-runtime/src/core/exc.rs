@@ -192,6 +192,31 @@ pub(crate) const TIMEOUT_ERROR: u32 = 67;
 // have no separate tags; `hydro_ir::ExcKind::IOError` and
 // `hydro_ir::ExcKind::EnvironmentError` both resolve to [`OS_ERROR`].
 
+/// Whether `tag` is `OSError` or one of its built-in subclasses. These
+/// constructors accept `(errno, strerror[, filename])`, unlike the
+/// single-message exception classes.
+pub(crate) fn is_os_error_tag(tag: u32) -> bool {
+    matches!(
+        tag,
+        OS_ERROR
+            | FILE_NOT_FOUND_ERROR
+            | BLOCKING_IO_ERROR
+            | CHILD_PROCESS_ERROR
+            | CONNECTION_ERROR
+            | BROKEN_PIPE_ERROR
+            | CONNECTION_ABORTED_ERROR
+            | CONNECTION_REFUSED_ERROR
+            | CONNECTION_RESET_ERROR
+            | FILE_EXISTS_ERROR
+            | INTERRUPTED_ERROR
+            | IS_A_DIRECTORY_ERROR
+            | NOT_A_DIRECTORY_ERROR
+            | PERMISSION_ERROR
+            | PROCESS_LOOKUP_ERROR
+            | TIMEOUT_ERROR
+    )
+}
+
 pub(crate) fn tag_name(tag: u32) -> &'static str {
     match tag {
         VALUE_ERROR => "ValueError",

@@ -3550,7 +3550,17 @@ fn push_item(list: i64, item: i64) {
 /// not arbitrary argument objects).
 fn instantiate_exception(tag: u32, argc: usize, argv: *const i64) -> i64 {
     let args: &[i64] = if argc > 0 && !argv.is_null() {
-        if argc > 1 {
+        if argc > 4 && exc::is_os_error_tag(tag) {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "{}() takes at most 4 arguments ({} given)",
+                    exc::tag_name(tag),
+                    argc
+                ),
+            );
+        }
+        if argc > 1 && !exc::is_os_error_tag(tag) {
             return exc::raise_with_message(
                 TYPE_ERROR,
                 &format!(
@@ -3560,8 +3570,8 @@ fn instantiate_exception(tag: u32, argc: usize, argv: *const i64) -> i64 {
                 ),
             );
         }
-        // SAFETY: ABI contract: `argv` points at one readable tagged value.
-        unsafe { std::slice::from_raw_parts(argv, 1) }
+        // SAFETY: ABI contract: `argv` points at `argc` readable tagged values.
+        unsafe { std::slice::from_raw_parts(argv, argc) }
     } else {
         &[]
     };
@@ -3578,6 +3588,9 @@ fn instantiate_exception(tag: u32, argc: usize, argv: *const i64) -> i64 {
 /// CPython's constructor.
 fn instantiate_exception_kw(tag: u32, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     if args.len() > 1 {
+        if exc::is_os_error_tag(tag) && args.len() <= 4 {
+            return os_error_value(tag, args, keywords);
+        }
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
@@ -3618,6 +3631,28 @@ fn instantiate_exception_kw(tag: u32, args: &[i64], keywords: &[(String, i64)]) 
         None => (String::new(), Vec::new()),
     };
     exc::exception_value_with_keywords(tag, &message, rendered_args, keywords.to_vec())
+}
+
+/// Builds `OSError(errno, strerror[, filename])` with CPython's rendered
+/// message (`[Errno 2] No such file: 'x'`). The raw arguments remain in
+/// `args`; the message is what `str(exception)` and tracebacks show.
+fn os_error_value(tag: u32, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|argument| value::to_string(*argument))
+        .collect();
+    let message = match (value::as_integer(args[0]), value::as_str(args[1])) {
+        (Some(errno), Some(text)) => {
+            let mut message = format!("[Errno {errno}] {text}");
+            if let Some(filename) = args.get(2).copied().filter(|value| *value != NONE) {
+                message.push_str(": ");
+                message.push_str(&value::repr(filename));
+            }
+            message
+        }
+        _ => rendered.first().cloned().unwrap_or_default(),
+    };
+    exc::exception_value_with_keywords(tag, &message, rendered, keywords.to_vec())
 }
 
 /// Builds the native payload for a user-defined exception class.

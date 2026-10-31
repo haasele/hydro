@@ -37,10 +37,10 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | Layer | Modules | Importable | Failed |
 | --- | ---: | ---: | ---: |
 | builtin/frozen | 52 | 50 | 2 |
-| pure | 174 | 159 | 15 |
+| pure | 174 | 160 | 14 |
 | extension | 63 | 52 | 11 |
 | unknown | 8 | 0 | 8 |
-| **Total** | 297 | 261 | 36 |
+| **Total** | 297 | 262 | 35 |
 
 ## Failure classes
 
@@ -48,7 +48,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | --- | ---: |
 | compile_error:HYD0002 | 21 |
 | cpython_failed | 9 |
-| runtime_error | 5 |
+| runtime_error | 4 |
 | compile_error:HYD0201 | 1 |
 
 ## Modules by layer
@@ -210,7 +210,7 @@ Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-l
 | `numbers` | ok | ok | ok | - |
 | `opcode` | ok | ok | ok | - |
 | `operator` | ok | ok | ok | - |
-| `optparse` | ok | exit 1 | runtime_error | TypeError: FileNotFoundError() takes at most 1 argument (3 given) |
+| `optparse` | ok | ok | ok | - |
 | `pathlib` | ok | ok | ok | - |
 | `pdb` | ok | exit 1 | compile_error:HYD0002 | error[HYD0002]: type parameters are not supported in Phase 1 |
 | `pickle` | ok | ok | ok | - |

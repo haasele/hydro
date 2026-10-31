@@ -35,8 +35,8 @@ initial state of the first runnable core.
   import reports.
 - The stdlib matrix now runs with `HYDRO_STDLIB` pointed at the pinned CPython
   `Lib` tree (the earlier 159 count used the toolchain's default subset); the
-  same code imports **261/297** modules, so the previous report undercounted
-  the implementation by 90 modules.
+  same code imports **262/297** modules, so the previous report undercounted
+  the implementation by 91 modules.
 - Closed the next stdlib-import cluster: `_pydatetime`, `_pyio`, `logging`,
   `venv` and `imaplib` now import. This required sequential class-body name
   visibility, real `@property` setter/deleter decorators, unary `__neg__`/
@@ -47,6 +47,9 @@ initial state of the first runnable core.
   `os.execlp`, `os.linesep`, `O_BINARY`, `SEEK_DATA`/`SEEK_HOLE`,
   `os.device_encoding`, plus `codecs.getincrementalencoder`/
   `getincrementaldecoder` and `tempfile.mkstemp`.
+- `optparse` now imports: `OSError` and its built-in subclasses accept
+  CPython's `(errno, strerror[, filename])` constructor form and render the
+  `[Errno N] ...: 'file'` message.
 - `compileall`, `py_compile` and `modulefinder` now import: implemented the
   `importlib._bootstrap_external` pyc header helpers (`_pack_uint32`,
   `_unpack_uint32`, `_calc_mode`, `_write_atomic`, timestamp/hash pyc
