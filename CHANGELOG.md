@@ -25,6 +25,10 @@ initial state of the first runnable core.
 - `with`/`async with` accept arbitrary assignment targets (attributes,
   subscripts, tuple/list unpacking), removing the name-only restriction used
   by pandas' `stata.py` and numba extension code.
+- CPython test-harness blockers removed: `platform.win32_is_iot`/
+  `win32_edition`/`win32_ver` fallbacks, runtime-conditional
+  `ctypes.windll`/`oledll`, and the private
+  `subprocess._args_from_interpreter_flags` helpers.
 - Ecosystem gate remains **9/13**: pydantic import/smoke pass; NumPy now stops
   on missing `_NoValue` after code-object metadata (`co_argcount`,
   `co_kwonlyargcount`, `co_varnames`, flags), DType/metatype, PARSE,

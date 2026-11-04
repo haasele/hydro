@@ -10714,6 +10714,15 @@ fn platform_call(function: &str, args: &[i64]) -> i64 {
         }
         "python_compiler" => value::str_from_bytes(b"rustc"),
         "processor" => value::str_from_bytes(platform_processor().as_bytes()),
+        // Non-Windows CPython returns None/False and an empty win32 version.
+        "win32_edition" => NONE,
+        "win32_is_iot" => FALSE,
+        "win32_ver" => value::tuple_new(vec![
+            value::str_from_bytes(b""),
+            value::str_from_bytes(b""),
+            value::str_from_bytes(b""),
+            value::str_from_bytes(b""),
+        ]),
         "uname" => platform_uname(),
         _ => missing_attribute("platform", function),
     }
@@ -28786,6 +28795,20 @@ mod tests {
             value::as_str(call("platform", "python_implementation", &[])),
             Some("Hydro")
         );
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn platform_win32_helpers_use_the_non_windows_fallbacks() {
+        exc::init();
+        assert_eq!(call("platform", "win32_edition", &[]), NONE);
+        assert_eq!(call("platform", "win32_is_iot", &[]), FALSE);
+        let version = call("platform", "win32_ver", &[]);
+        assert_eq!(value::as_tuple(version).map(|fields| fields.len()), Some(4));
+        assert!(value::as_tuple(version)
+            .unwrap()
+            .iter()
+            .all(|field| value::as_str(*field) == Some("")));
         assert!(!exc::pending());
     }
 

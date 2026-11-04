@@ -1117,7 +1117,9 @@ static TYPES_CELLTYPE_MEMBER: FunctionSpec = FunctionSpec {
 fn runtime_conditional_member(module: &str, name: &str) -> bool {
     matches!(
         (module, name),
-        ("sys", "pypy_version_info") | ("os", "O_BINARY" | "startfile")
+        ("sys", "pypy_version_info")
+            | ("os", "O_BINARY" | "startfile")
+            | ("ctypes", "windll" | "oledll")
     )
 }
 

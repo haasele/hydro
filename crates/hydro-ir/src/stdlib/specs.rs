@@ -347,6 +347,11 @@ pub static PLATFORM: ModuleSpec = ModuleSpec {
         f("python_build", 0, 0, Type::Tuple),
         f("python_compiler", 0, 0, Type::Str),
         f("processor", 0, 0, Type::Str),
+        // Windows-only helpers return the non-Windows fallbacks: no edition,
+        // not IoT, and four empty version fields.
+        f("win32_edition", 0, 0, Type::Any),
+        f("win32_is_iot", 0, 0, Type::Bool),
+        f("win32_ver", 0, 0, Type::Tuple),
         // `platform.uname()`: CPython's `uname_result` namedtuple with
         // `system`/`node`/`release`/`version`/`machine`/`processor`.
         f("uname", 0, 0, Type::Any),
@@ -3113,6 +3118,10 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
                 "args", "stdin", "input", "stderr", "cwd", "timeout", "text", "env",
             ],
         ),
+        // CPython-private relaunch helpers; Hydro starts with no interpreter
+        // flags, so the default environment needs no regenerated arguments.
+        f("_args_from_interpreter_flags", 0, 0, Type::List),
+        f("_optim_args_from_interpreter_flags", 0, 0, Type::List),
         // `Popen(args, cwd=None, stdout=None, stderr=None, text=None,
         // env=None, close_fds=True, start_new_session=False, stdin=None,
         // encoding=None, errors=None, preexec_fn=None)`: the trailing names

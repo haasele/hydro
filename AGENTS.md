@@ -78,13 +78,13 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-10-31: **3090 tests run
-(3090 passed, 1 skipped)**; the per-crate breakdown below sums to 3090
+`cargo nextest run --workspace` on 2026-10-31: **3091 tests run
+(3091 passed, 1 skipped)**; the per-crate breakdown below sums to 3091
 (the skipped test is not included in the listed binaries):
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 1969 |
+| runtime (unit + integration) | 1970 |
 | frontend | 885 |
 | codegen | 79 |
 | IR | 68 |
@@ -115,7 +115,10 @@ Other docs must link here instead of repeating the total.
   pydantic-core, python-dateutil, six, typing-extensions,
   typing-inspection, annotated-types and tzdata pass. NumPy 2.5 stops on the
   `_multiarray_umath` missing-`_NoValue` path; pandas AOT compilation now
-  stops on missing `sqlite3.register_adapter`. The
+  stops on missing `sqlite3.register_adapter`. The official test runner's
+  shared import blockers (`platform.win32_is_iot`, `ctypes.windll`,
+  `subprocess._args_from_interpreter_flags`) are fixed; failures now cluster
+  on unreachable Windows-only imports such as `_winapi`. The
   ABI inventory reports **0 missing required symbols** across 68 pinned
   extension modules. Pinned ecosystem report:
   `docs/ECOSYSTEM.md`.

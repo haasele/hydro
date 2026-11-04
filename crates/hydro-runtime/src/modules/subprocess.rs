@@ -1177,6 +1177,9 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         "run" => run(args),
         "check_output" => check_output(args),
+        "_args_from_interpreter_flags" | "_optim_args_from_interpreter_flags" => {
+            value::list_new(Vec::new())
+        }
         "Popen" => popen_new(args),
         "_popen_wait" | "_popen_poll" | "_popen_terminate" | "_popen_kill" => {
             popen_method(function, args)

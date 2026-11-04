@@ -460,11 +460,13 @@ fn build_specific_module_members_resolve_at_runtime() {
     // `hasattr` keeps reporting the host's answer) but compile as runtime
     // reads: guarded code never evaluates them here, and an unguarded read
     // raises CPython's `AttributeError`.
-    let source = "import os\nimport sys\n\
+    let source = "import os\nimport sys\nimport ctypes\n\
                   a = sys.pypy_version_info\n\
                   b = os.O_BINARY\n\
                   c = os.startfile\n\
-                  d = os.startfile('x')\n";
+                  d = os.startfile('x')\n\
+                  e = ctypes.windll\n\
+                  f = ctypes.oledll\n";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
 }
