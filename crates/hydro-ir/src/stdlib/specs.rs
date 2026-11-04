@@ -1413,7 +1413,12 @@ pub static RICH_STATUS: ModuleSpec = ModuleSpec {
 
 pub static QUEUE: ModuleSpec = ModuleSpec {
     name: "queue",
-    functions: &[kw("Queue", 0, 1, Type::Any, &["maxsize"])],
+    functions: &[
+        kw("Queue", 0, 1, Type::Any, &["maxsize"]),
+        // `SimpleQueue()`: CPython's unbounded FIFO. It takes no arguments
+        // (the runtime backs it with the same state as `Queue(0)`).
+        f("SimpleQueue", 0, 0, Type::Any),
+    ],
     constants: &[],
 };
 
@@ -10475,5 +10480,36 @@ mod tests {
             ][..]
         );
         assert!(!spec.dynamic_keywords);
+    }
+
+    #[test]
+    fn queue_exposes_simple_queue_alongside_queue() {
+        let queue = function("queue", "Queue").expect("queue.Queue");
+        assert_eq!(
+            (queue.min_args, queue.max_args, queue.ret),
+            (0, 1, Type::Any)
+        );
+        assert_eq!(queue.params, &["maxsize"][..]);
+
+        // `SimpleQueue()` is unbounded, so it declares no arguments at all.
+        let simple = function("queue", "SimpleQueue").expect("queue.SimpleQueue");
+        assert_eq!(
+            (simple.min_args, simple.max_args, simple.ret),
+            (0, 0, Type::Any)
+        );
+        assert!(simple.params.is_empty());
+        assert!(!simple.dynamic_keywords);
+
+        // The `_queue` accelerator shares the module table, so both members
+        // resolve there through the same spec entries.
+        for name in ["Queue", "SimpleQueue"] {
+            assert!(
+                std::ptr::eq(
+                    function("_queue", name).expect(name),
+                    function("queue", name).expect(name),
+                ),
+                "_queue.{name} must reuse the queue table entry"
+            );
+        }
     }
 }

@@ -960,6 +960,8 @@ pub(crate) fn code_attr(code: i64, name: &str) -> Option<i64> {
         "co_filename" => Some(value::str_alloc(state.filename.clone())),
         "co_firstlineno" => Some(int(state.first_line as usize)),
         "co_argcount" => Some(int(state.argcount)),
+        "co_posonlyargcount" => Some(int(state.posonlyargcount)),
+        "co_kwonlyargcount" => Some(int(state.kwonlyargcount)),
         "co_nlocals" => Some(int(state.nlocals)),
         "co_flags" => Some(int(state.flags as usize)),
         "co_varnames" => Some(string_tuple(&state.varnames)),
@@ -998,6 +1000,12 @@ fn frame_code(data: &Arc<FrameData>) -> i64 {
         filename: data.file.clone(),
         first_line: data.first_line.load(Ordering::Relaxed),
         argcount: data.argcount.load(Ordering::Relaxed),
+        // The frame ABI records only the positional count (`co_argcount`) and
+        // no parameter kinds, so a frame's code object cannot distinguish
+        // positional-only or keyword-only slots; `function.__code__` reports
+        // those from the attached signature instead.
+        posonlyargcount: 0,
+        kwonlyargcount: 0,
         flags: data.flags.load(Ordering::Relaxed),
         nlocals,
         varnames,

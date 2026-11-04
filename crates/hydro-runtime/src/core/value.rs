@@ -2473,15 +2473,26 @@ pub(crate) struct FrameState {
 
 /// Payload of a code object ([`KIND_CODE`]).
 ///
-/// Generated functions have no first-class code values; a frame materialises
-/// one on demand from this immutable metadata. It holds only native strings,
-/// so it has no Hydro children.
+/// Materialised on demand for `function.__code__` from the function's attached
+/// signature, and for `frame.f_code` from the activation record. Immutable
+/// native metadata: it holds only native strings, so it has no Hydro children.
 pub(crate) struct CodeState {
     pub(crate) name: String,
     pub(crate) qualname: String,
     pub(crate) filename: String,
     pub(crate) first_line: u32,
+    /// CPython `co_argcount`: positional-or-keyword parameters plus the
+    /// positional-only ones, excluding `*args`/`**kwargs`.
     pub(crate) argcount: usize,
+    /// CPython `co_posonlyargcount`: the leading positional-only parameters
+    /// (the `def f(x, /)` form), also counted in [`Self::argcount`].
+    pub(crate) posonlyargcount: usize,
+    /// CPython `co_kwonlyargcount`: parameters after `*args` (or a bare `*`)
+    /// that can only be passed by keyword, excluding `**kwargs`.
+    pub(crate) kwonlyargcount: usize,
+    /// CPython `co_flags` bits (optimized/newlocals/varargs/varkw/generator/
+    /// coroutine), encoded by codegen for frames and derived from the
+    /// signature and function flags for `function.__code__`.
     pub(crate) flags: u32,
     pub(crate) nlocals: usize,
     pub(crate) varnames: Vec<String>,
@@ -3639,6 +3650,94 @@ pub(crate) fn frame_new(data: std::sync::Arc<crate::exc::FrameData>) -> i64 {
 /// Allocates the code object attached to a frame.
 pub(crate) fn code_new(state: CodeState) -> i64 {
     alloc(KIND_CODE, ObjData::Code(state))
+}
+
+/// CPython `code.co_flags` bits (`Include/cpython/code.h`). Codegen already
+/// emits these for frame records; the same encoding describes a function's
+/// materialised `__code__`.
+const CO_OPTIMIZED: u32 = 0x0001;
+const CO_NEWLOCALS: u32 = 0x0002;
+const CO_VARARGS: u32 = 0x0004;
+const CO_VARKEYWORDS: u32 = 0x0008;
+const CO_GENERATOR: u32 = 0x0020;
+const CO_COROUTINE: u32 = 0x0080;
+const CO_ASYNC_GENERATOR: u32 = 0x0200;
+
+/// Builds the metadata of `function.__code__` from the signature attached to a
+/// function value.
+///
+/// Generated functions have no first-class code value, so the immutable
+/// CPython surface is derived on demand from [`function_signature`]. The
+/// signature's leading closure captures are recorded with a NUL-prefixed
+/// sentinel name (see codegen's parameter metadata); they are free variables,
+/// not parameters, so they are excluded here. The remaining counts follow
+/// CPython exactly: `co_argcount` covers the positional-only and
+/// positional-or-keyword slots, `co_posonlyargcount` and
+/// `co_kwonlyargcount` count the `def f(x, /)` and `def f(*, x)` forms, and
+/// `co_varnames` lists parameter slots in CPython order (positionals,
+/// keyword-only parameters, `*args`, `**kwargs`). `co_nlocals` reports the
+/// number of parameter slots because the function value keeps no separate
+/// record of body locals.
+pub(crate) fn function_code_state(function: i64) -> CodeState {
+    let signature = function_signature(function);
+    let params: Vec<&ParamMeta> = signature
+        .iter()
+        .filter(|param| !param.name.starts_with('\0'))
+        .collect();
+    let mut varnames = Vec::with_capacity(params.len());
+    let mut argcount = 0;
+    let mut posonlyargcount = 0;
+    let mut kwonlyargcount = 0;
+    let mut flags = CO_OPTIMIZED | CO_NEWLOCALS;
+    for param in &params {
+        if param.kind.is_positional() {
+            varnames.push(param.name.clone());
+            argcount += 1;
+            if param.kind == ParamKind::PosOnly {
+                posonlyargcount += 1;
+            }
+        }
+    }
+    for param in params
+        .iter()
+        .filter(|param| param.kind == ParamKind::KwOnly)
+    {
+        varnames.push(param.name.clone());
+        kwonlyargcount += 1;
+    }
+    for param in params
+        .iter()
+        .filter(|param| param.kind == ParamKind::VarArg)
+    {
+        varnames.push(param.name.clone());
+        flags |= CO_VARARGS;
+    }
+    for param in params.iter().filter(|param| param.kind == ParamKind::KwArg) {
+        varnames.push(param.name.clone());
+        flags |= CO_VARKEYWORDS;
+    }
+    let function_flags = as_function(function).map_or(0, |func| func.flags);
+    let generator = function_flags & FUNCTION_FLAG_GENERATOR != 0;
+    let asynchronous = function_flags & FUNCTION_FLAG_ASYNC != 0;
+    flags |= match (generator, asynchronous) {
+        (true, true) => CO_ASYNC_GENERATOR,
+        (true, false) => CO_GENERATOR,
+        (false, true) => CO_COROUTINE,
+        (false, false) => 0,
+    };
+    let nlocals = varnames.len();
+    CodeState {
+        name: function_name(function),
+        qualname: function_qualname(function),
+        filename: "<hydro>".to_string(),
+        first_line: 0,
+        argcount,
+        posonlyargcount,
+        kwonlyargcount,
+        flags,
+        nlocals,
+        varnames,
+    }
 }
 
 /// The cached native `frame` class used by `type(frame)` and

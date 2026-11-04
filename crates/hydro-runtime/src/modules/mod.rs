@@ -14435,6 +14435,12 @@ fn queue_call(function: &str, args: &[i64]) -> i64 {
             Ok(maxsize) => value::queue_new(maxsize),
             Err(err) => err,
         },
+        // `SimpleQueue()`: CPython's unbounded FIFO. It shares the queue
+        // object, condition variables and blocking `get` timeout of `Queue`;
+        // capacity `0` is the unbounded marker, so `put` never waits for room
+        // and `full()` stays false. The spec declares the zero-argument
+        // signature, so a stray argument is rejected before reaching here.
+        "SimpleQueue" => value::queue_new(0),
         _ => missing_attribute("queue", function),
     }
 }
@@ -35193,5 +35199,67 @@ mod tests {
         assert_eq!(value::as_str(fields[1]), Some("y"));
         heap::release_roots(derived_roots);
         heap::release_roots(attr_roots);
+    }
+
+    #[test]
+    fn simple_queue_is_an_unbounded_fifo() {
+        exc::init();
+        // `queue.SimpleQueue()` takes no arguments and has no capacity bound.
+        let queue = call("queue", "SimpleQueue", &[]);
+        assert!(!exc::pending(), "SimpleQueue() failed: {}", message());
+        let roots = heap::root_values(std::slice::from_ref(&queue));
+        assert_eq!(method(queue, "qsize", &[]), int(0));
+        assert_eq!(method(queue, "empty", &[]), TRUE);
+        assert_eq!(method(queue, "full", &[]), FALSE);
+
+        // FIFO order; insertion never waits because the queue is unbounded,
+        // so the non-blocking forms and `block=False` also succeed.
+        assert_eq!(method(queue, "put", &[int(1)]), NONE);
+        assert_eq!(method(queue, "put_nowait", &[int(2)]), NONE);
+        assert_eq!(method(queue, "put", &[int(3), FALSE]), NONE);
+        assert_eq!(method(queue, "qsize", &[]), int(3));
+        assert_eq!(method(queue, "empty", &[]), FALSE);
+        assert_eq!(as_int(method(queue, "get", &[])), 1);
+        assert_eq!(as_int(method(queue, "get_nowait", &[])), 2);
+        assert_eq!(
+            as_int(method(queue, "get", &[TRUE, value::float_new(0.01)])),
+            3
+        );
+        assert_eq!(method(queue, "empty", &[]), TRUE);
+
+        // A non-blocking get on the empty queue reports `queue.Empty` as
+        // `RuntimeError`, and a timed wait expires with the same error.
+        // The default `get()` blocks until an item arrives, as in CPython.
+        assert_eq!(method(queue, "get_nowait", &[]), NONE);
+        assert_eq!(exc::pending_tag(), RUNTIME_ERROR as i64);
+        assert_eq!(message(), "queue.Empty");
+        exc::clear();
+        assert_eq!(method(queue, "get", &[FALSE]), NONE);
+        assert_eq!(exc::pending_tag(), RUNTIME_ERROR as i64);
+        assert_eq!(message(), "queue.Empty");
+        exc::clear();
+        assert_eq!(method(queue, "get", &[TRUE, value::float_new(0.01)]), NONE);
+        assert_eq!(exc::pending_tag(), RUNTIME_ERROR as i64);
+        assert_eq!(message(), "queue.Empty");
+        exc::clear();
+
+        // The zero-argument spec rejects a stray argument.
+        assert_eq!(call("queue", "SimpleQueue", &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+
+        // `_queue.SimpleQueue` is the accelerator spelling of the same member.
+        assert!(value::as_function(get("_queue", "SimpleQueue")).is_some());
+        let alias = call("_queue", "SimpleQueue", &[]);
+        assert!(
+            !exc::pending(),
+            "_queue.SimpleQueue() failed: {}",
+            message()
+        );
+        let alias_roots = heap::root_values(std::slice::from_ref(&alias));
+        assert_eq!(method(alias, "put_nowait", &[int(7)]), NONE);
+        assert_eq!(as_int(method(alias, "get_nowait", &[])), 7);
+        heap::release_roots(alias_roots);
+        heap::release_roots(roots);
     }
 }

@@ -19,10 +19,12 @@ initial state of the first runnable core.
   (`test_colorsys`, `test_errno`, `test_int_literal`, `test_longexp`,
   `test_openpty`, `test_unary`); 330 `hydro_fail`, 62 `expected_fail`.
 - Ecosystem gate remains **9/13**: pydantic import/smoke pass; NumPy now stops
-  on missing code-object `co_kwonlyargcount` metadata after DType/metatype,
-  PARSE, instance-dict, extension-star and class-registration fixes; pandas AOT
-  stops on missing `queue.SimpleQueue` after dynamic `except` handlers, CSV
-  dialects, pickle classes, export ordering and annotation-rebind fixes.
+  on missing `_NoValue` after code-object metadata (`co_argcount`,
+  `co_kwonlyargcount`, `co_varnames`, flags), DType/metatype, PARSE,
+  instance-dict, extension-star and class-registration fixes; pandas AOT stops
+  on a non-simple `with ... as` target after `queue.SimpleQueue`, dynamic
+  `except` handlers, CSV dialects, pickle classes, export ordering and
+  annotation-rebind fixes.
 - Added PEP 695 generic function parameters, function/class docstrings,
   sequential class-body defaults, dynamic module globals, functional Enum
   metaclass construction, octal regex escapes, `%` mapping formatting,

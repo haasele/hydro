@@ -2862,19 +2862,9 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         }
         // Functions expose a code object and bound-metadata attributes.
         // Generated bodies have no first-class code value, so materialise the
-        // documented metadata from the function record.
+        // documented metadata from the function record's signature.
         if attr == "__code__" {
-            let name = value::function_name(obj);
-            return value::code_new(value::CodeState {
-                name: name.clone(),
-                qualname: name,
-                filename: "<hydro>".to_string(),
-                first_line: 0,
-                argcount: 0,
-                flags: 0,
-                nlocals: 0,
-                varnames: Vec::new(),
-            });
+            return value::code_new(value::function_code_state(obj));
         }
         if attr == "__repr__" {
             return value::native_function_new("builtins", "repr", 1);
@@ -12947,5 +12937,111 @@ mod tests {
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
         assert_eq!(message(), "repr() takes exactly 1 argument(s) (0 given)");
         crate::exc::clear();
+    }
+
+    /// `function.__code__` reports CPython's argument-kind metadata, which
+    /// `inspect.getargspec`/NumPy read while importing.
+    #[test]
+    fn function_code_reports_argument_kinds() {
+        reset();
+        let func =
+            value::function_new(first_argument as *const () as usize, 2, "mixed".to_string());
+        value::function_set_signature(
+            func,
+            vec![
+                value::ParamMeta {
+                    name: "only".to_string(),
+                    kind: ParamKind::PosOnly,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "plain".to_string(),
+                    kind: ParamKind::Positional,
+                    default: Some(NONE),
+                },
+                value::ParamMeta {
+                    name: "rest".to_string(),
+                    kind: ParamKind::VarArg,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "flag".to_string(),
+                    kind: ParamKind::KwOnly,
+                    default: None,
+                },
+                value::ParamMeta {
+                    name: "option".to_string(),
+                    kind: ParamKind::KwOnly,
+                    default: Some(NONE),
+                },
+                value::ParamMeta {
+                    name: "extra".to_string(),
+                    kind: ParamKind::KwArg,
+                    default: None,
+                },
+            ],
+        );
+        let code = getattr(func, b"__code__".as_ptr(), 8);
+        let read = |name: &[u8]| getattr(code, name.as_ptr(), name.len());
+        assert_eq!(value::as_integer(read(b"co_argcount")), Some(2));
+        assert_eq!(value::as_integer(read(b"co_posonlyargcount")), Some(1));
+        assert_eq!(value::as_integer(read(b"co_kwonlyargcount")), Some(2));
+        assert_eq!(value::as_integer(read(b"co_nlocals")), Some(6));
+        // CO_OPTIMIZED | CO_NEWLOCALS | CO_VARARGS | CO_VARKEYWORDS.
+        assert_eq!(value::as_integer(read(b"co_flags")), Some(0x0f));
+        let names: Vec<&str> = value::as_tuple(read(b"co_varnames"))
+            .expect("co_varnames is a tuple")
+            .iter()
+            .map(|name| value::as_str(*name).expect("varname is a string"))
+            .collect();
+        // CPython slot order: positionals, keyword-only, *args, **kwargs.
+        assert_eq!(names, ["only", "plain", "flag", "option", "rest", "extra"]);
+        assert!(!crate::exc::pending());
+
+        // Generator functions carry CO_GENERATOR on top of the local flags.
+        let generator = value::function_new_with_flags(
+            first_argument as *const () as usize,
+            0,
+            "gen".to_string(),
+            value::FUNCTION_FLAG_GENERATOR,
+        );
+        let gen_code = getattr(generator, b"__code__".as_ptr(), 8);
+        assert_eq!(
+            value::as_integer(getattr(gen_code, b"co_flags".as_ptr(), 8)),
+            Some(0x23)
+        );
+        assert!(!crate::exc::pending());
+
+        // A closure's leading capture slots are NUL-prefixed sentinels in the
+        // attached signature; they are free variables, not arguments, so the
+        // code object must not report them as parameters.
+        let closure =
+            value::function_new(first_argument as *const () as usize, 1, "closure".into());
+        value::function_set_signature(
+            closure,
+            vec![
+                value::ParamMeta {
+                    name: "\u{0}capture0".to_string(),
+                    kind: ParamKind::KwOnly,
+                    default: Some(NONE),
+                },
+                value::ParamMeta {
+                    name: "value".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+            ],
+        );
+        let closure_code = getattr(closure, b"__code__".as_ptr(), 8);
+        let read = |name: &[u8]| getattr(closure_code, name.as_ptr(), name.len());
+        assert_eq!(value::as_integer(read(b"co_argcount")), Some(1));
+        assert_eq!(value::as_integer(read(b"co_kwonlyargcount")), Some(0));
+        let closure_names: Vec<&str> = value::as_tuple(read(b"co_varnames"))
+            .expect("co_varnames is a tuple")
+            .iter()
+            .map(|name| value::as_str(*name).expect("varname is a string"))
+            .collect();
+        assert_eq!(closure_names, ["value"]);
+        assert!(!crate::exc::pending());
     }
 }
