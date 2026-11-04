@@ -124,8 +124,8 @@ A case passes only when the oracle, Hydro JIT and (unless `--no-aot`) the AOT bi
 | --- | --- | --- | --- | --- | --- |
 | `numpy:import` | ok | exit 1 | exit 1 | runtime_error | jit: NameError: name '_NoValue' is not defined |
 | `numpy:smoke` | ok | exit 1 | exit 1 | runtime_error | jit: NameError: name '_NoValue' is not defined |
-| `pandas:import` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0002]: error[HYD0002]: with ... as only supports a simple name target |
-| `pandas:smoke` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0002]: error[HYD0002]: with ... as only supports a simple name target |
+| `pandas:import` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0201]: error[HYD0201]: module 'sqlite3' has no attribute 'register_adapter' |
+| `pandas:smoke` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0201]: error[HYD0201]: module 'sqlite3' has no attribute 'register_adapter' |
 | `pydantic:import` | ok | ok | ok | pass | - |
 | `pydantic:smoke` | ok | ok | ok | pass | - |
 | `pydantic-core:import` | ok | ok | ok | pass | - |

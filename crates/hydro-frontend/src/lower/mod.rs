@@ -16774,7 +16774,7 @@ impl<'a> Lowerer<'a> {
     /// ```text
     /// $with = <context expression>
     /// $wexc = None
-    /// [x =] $with.__enter__()
+    /// [<target> =] $with.__enter__()
     /// try:
     ///     <body>
     /// except BaseException as $wexc:
@@ -16959,6 +16959,14 @@ impl<'a> Lowerer<'a> {
     /// Statement binding the `as` target of a `with`/`async with` item to its
     /// already-lowered entry value. Without a target the value is discarded,
     /// but it is still evaluated (the entry call must happen).
+    ///
+    /// The target takes every shape an ordinary `=` target does: a name
+    /// (including `global` names and class-body namespaces), an attribute, a
+    /// subscript, a slice, or a possibly nested tuple/list unpacking. It
+    /// lowers through [`Self::lower_store`], so descriptors, unpacking and
+    /// the relative order of the value and the target expressions match
+    /// Python: `__enter__()` runs first, then the target's receiver and index
+    /// expressions are evaluated.
     fn with_target_stmt(
         &mut self,
         optional_vars: Option<&ast::Expr>,
@@ -16967,46 +16975,15 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
-        match optional_vars {
-            None => Some(HStmt {
+        let Some(target) = optional_vars else {
+            return Some(HStmt {
                 kind: HStmtKind::Expr(value),
                 line,
                 col,
-            }),
-            Some(ast::Expr::Name(name)) => match fs.lookup(name.id.as_str()) {
-                Some(local) => Some(HStmt {
-                    kind: if fs.is_cell(local) {
-                        HStmtKind::CellAssign {
-                            target: local,
-                            value,
-                        }
-                    } else {
-                        HStmtKind::Assign {
-                            target: local,
-                            value,
-                        }
-                    },
-                    line,
-                    col,
-                }),
-                None => {
-                    self.error_name(
-                        name.range,
-                        name.id.as_str(),
-                        fs,
-                        format!("assignment to unknown name '{}'", name.id),
-                    );
-                    None
-                }
-            },
-            Some(other) => {
-                self.error_at(
-                    other.range(),
-                    "with ... as only supports a simple name target",
-                );
-                None
-            }
-        }
+            });
+        };
+        let kind = self.lower_store(target, value, fs)?;
+        Some(HStmt { kind, line, col })
     }
 
     /// Lower `async for target in iterable:` (and its optional `else:`).
@@ -17164,7 +17141,7 @@ impl<'a> Lowerer<'a> {
     /// ```text
     /// $with = <context expression>
     /// $aexc = None
-    /// [x =] await $with.__aenter__()
+    /// [<target> =] await $with.__aenter__()
     /// try:
     ///     <body>
     /// except BaseException as $aexc:

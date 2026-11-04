@@ -22,13 +22,16 @@ initial state of the first runnable core.
   package prefix, so submodule function defaults can resolve names defined
   before the import; this fixes initializing-package cycles for the
   `_NoValue`-style shape.
+- `with`/`async with` accept arbitrary assignment targets (attributes,
+  subscripts, tuple/list unpacking), removing the name-only restriction used
+  by pandas' `stata.py` and numba extension code.
 - Ecosystem gate remains **9/13**: pydantic import/smoke pass; NumPy now stops
   on missing `_NoValue` after code-object metadata (`co_argcount`,
   `co_kwonlyargcount`, `co_varnames`, flags), DType/metatype, PARSE,
   instance-dict, extension-star and class-registration fixes; pandas AOT stops
-  on a non-simple `with ... as` target after `queue.SimpleQueue`, dynamic
-  `except` handlers, CSV dialects, pickle classes, export ordering and
-  annotation-rebind fixes.
+  on missing `sqlite3.register_adapter` after arbitrary `with ... as` targets,
+  `queue.SimpleQueue`, dynamic `except` handlers, CSV dialects, pickle classes,
+  export ordering and annotation-rebind fixes.
 - Added PEP 695 generic function parameters, function/class docstrings,
   sequential class-body defaults, dynamic module globals, functional Enum
   metaclass construction, octal regex escapes, `%` mapping formatting,

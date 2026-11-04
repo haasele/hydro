@@ -2881,19 +2881,144 @@ fn with_open_for_loop_checks_cleanly() {
 }
 
 #[test]
-fn with_tuple_as_target_is_diagnosed() {
-    let source = "with open('x') as (a, b):\n    pass\n";
-    let (hir, _, diags) = lower_source(source, &parse(source));
-    assert!(
-        diags
-            .iter()
-            .any(|d| d.message == "with ... as only supports a simple name target"),
-        "{diags:?}"
-    );
-    // The body is still lowered and exited so later errors stay useful.
-    assert_eq!(hir.functions[0].body.len(), 1);
-    let (_, try_stmt) = with_parts(&hir.functions[0].body[0]);
+fn with_attribute_target_stores_the_entered_value() {
+    let source = "def f(self):\n    with open('x') as self.handles:\n        pass\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let (prelude, try_stmt) = with_parts(&f.body[0]);
+    // The context expression, the exception seed and the attribute store run
+    // before the guarded body. `__enter__()` is evaluated first and the
+    // receiver afterwards, exactly like CPython's `STORE_ATTR`.
+    assert_eq!(prelude.len(), 3);
+    let HStmtKind::SetAttr {
+        object,
+        name,
+        value,
+    } = &prelude[2].kind
+    else {
+        panic!("expected the attribute store, got {:?}", prelude[2].kind);
+    };
+    assert_eq!(name, "handles");
+    let HExprKind::Local(receiver) = &object.kind else {
+        panic!("expected the `self` local, got {:?}", object.kind);
+    };
+    assert_eq!(f.locals[*receiver as usize].name, "self");
+    assert_eq!(method_name(value), "__enter__");
     assert!(matches!(&try_stmt.kind, HStmtKind::Try { .. }));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn with_subscript_target_stores_the_entered_value() {
+    let source = "def f(targets):\n    with open('x') as targets[0]:\n        pass\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let (prelude, _) = with_parts(&f.body[0]);
+    let HStmtKind::SetSubscript {
+        object,
+        index,
+        value,
+    } = &prelude[2].kind
+    else {
+        panic!("expected the subscript store, got {:?}", prelude[2].kind);
+    };
+    let HExprKind::Local(receiver) = &object.kind else {
+        panic!("expected the `targets` local, got {:?}", object.kind);
+    };
+    assert_eq!(f.locals[*receiver as usize].name, "targets");
+    assert!(matches!(&index.kind, HExprKind::Const(Const::Int(0))));
+    assert_eq!(method_name(value), "__enter__");
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn with_tuple_target_unpacks_the_entered_value() {
+    let source = "def f():\n    with open('x') as (a, b):\n        return a, b\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let (prelude, try_stmt) = with_parts(&f.body[0]);
+    assert_eq!(prelude.len(), 3);
+    let HStmtKind::Unpack { targets, value } = &prelude[2].kind else {
+        panic!("expected the unpacking store, got {:?}", prelude[2].kind);
+    };
+    // `__enter__()` is the source value; the plain names bind left to right.
+    assert_eq!(method_name(value), "__enter__");
+    let names: Vec<&str> = targets
+        .iter()
+        .map(|target| match target {
+            HUnpackTarget::Name(local) => f.locals[*local as usize].name.as_str(),
+            other => panic!("expected a name target, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+    assert!(matches!(&try_stmt.kind, HStmtKind::Try { .. }));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn with_nested_tuple_target_unpacks_the_entered_value() {
+    let source = "def f(self):\n    with open('x') as ((a, self.attr), [b, c]):\n        pass\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let (prelude, _) = with_parts(&f.body[0]);
+    let HStmtKind::Unpack { targets, value } = &prelude[2].kind else {
+        panic!("expected the unpacking store, got {:?}", prelude[2].kind);
+    };
+    assert_eq!(method_name(value), "__enter__");
+    assert_eq!(targets.len(), 2, "the outer sequence has two elements");
+    let HUnpackTarget::Nested(inner) = &targets[0] else {
+        panic!("expected a nested sequence, got {:?}", targets[0]);
+    };
+    assert_eq!(inner.len(), 2);
+    let HUnpackTarget::Name(a) = &inner[0] else {
+        panic!("expected a name target, got {:?}", inner[0]);
+    };
+    assert_eq!(f.locals[*a as usize].name, "a");
+    let HUnpackTarget::Attr { name, .. } = &inner[1] else {
+        panic!("expected an attribute target, got {:?}", inner[1]);
+    };
+    assert_eq!(name, "attr");
+    let HUnpackTarget::Nested(inner) = &targets[1] else {
+        panic!("expected a nested sequence, got {:?}", targets[1]);
+    };
+    let names: Vec<&str> = inner
+        .iter()
+        .map(|target| match target {
+            HUnpackTarget::Name(local) => f.locals[*local as usize].name.as_str(),
+            other => panic!("expected a name target, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["b", "c"]);
+}
+
+#[test]
+fn async_with_attribute_target_stores_the_awaited_value() {
+    let source = "async def f(self, cm):\n    async with cm as self.value:\n        pass\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let stmts = block_body(&f.body[0]);
+    assert_eq!(stmts.len(), 4, "{stmts:?}");
+    // `$with = cm`, `$aexc = None`, `self.value = await $with.__aenter__()`.
+    let HStmtKind::SetAttr {
+        object,
+        name,
+        value,
+    } = &stmts[2].kind
+    else {
+        panic!("expected the attribute store, got {:?}", stmts[2].kind);
+    };
+    assert_eq!(name, "value");
+    let HExprKind::Local(receiver) = &object.kind else {
+        panic!("expected the `self` local, got {:?}", object.kind);
+    };
+    assert_eq!(f.locals[*receiver as usize].name, "self");
+    awaited_method(value, "__aenter__");
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
 
 #[test]
