@@ -15,7 +15,7 @@ initial state of the first runnable core.
   platform modules. Added Hydro-native `turtle`, `symtable`/`_symtable` and
   `tracemalloc`/`_tracemalloc`, plus native `http.server`, and loaded pinned
   C extensions through derived `lib-dynload`/`HYDRO_EXTENSION_PATH` roots.
-- Official `Lib/test` differential baseline rose from 3/398 to **6/398**
+- Official `Lib/test` differential baseline rose from 6/398 to **9/398**
   (`test_colorsys`, `test_errno`, `test_int_literal`, `test_longexp`,
   `test_openpty`, `test_unary`); 330 `hydro_fail`, 62 `expected_fail`.
 - Package initializers split at `from . import sub` when the submodule reads a

@@ -6,25 +6,28 @@ rules are documented in `docs/CPYTHON_TESTS.md`.
 
 Environment: CPython `3.14.9` (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` (`/mnt/Vault/GitHub/tea/target/release/tea`)
 
-Source: `/mnt/Vault/GitHub/hydro/.hydro/cpython/Python-3.14.9` · generated 2026-10-31T20:37:05Z
+Source: `/mnt/Vault/GitHub/hydro/.hydro/cpython/Python-3.14.9` · generated 2026-11-04T23:37:07Z
 
 ## Summary
 
 | Status | Tests |
 | --- | ---: |
-| hydro_pass | 6 |
-| hydro_fail | 330 |
+| hydro_pass | 9 |
+| hydro_fail | 327 |
 | cpython_fail | 0 |
 | expected_fail | 62 |
 | timeout | 0 |
 | **Total** | 398 |
 
-Passing: **6 / 398** (a pass requires Hydro and CPython 3.14.9 to both exit 0).
+Passing: **9 / 398** (a pass requires Hydro and CPython 3.14.9 to both exit 0).
 
 ## Passing tests
 
 - `test_colorsys.py`
+- `test_compiler_assemble.py`
+- `test_compiler_codegen.py`
 - `test_errno.py`
+- `test_file_eintr.py`
 - `test_int_literal.py`
 - `test_longexp.py`
 - `test_openpty.py`
@@ -34,410 +37,410 @@ Passing: **6 / 398** (a pass requires Hydro and CPython 3.14.9 to both exit 0).
 
 | Status | Tests |
 | --- | ---: |
-| hydro_fail | 330 |
+| hydro_fail | 327 |
 | expected_fail | 62 |
 
 ## Test results
 
 | Test | CPython 3.14.9 | Hydro | Status | First error |
 | --- | --- | --- | --- | --- |
-| `test___all__.py` | ok / 2312.5 ms | exit 1 / 356.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test__colorize.py` | ok / 89 ms | exit 1 / 297.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test__interpchannels.py` | ok / 1019.5 ms | exit 1 / 388.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test__interpreters.py` | ok / 708.4 ms | exit 1 / 378.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test__locale.py` | ok / 80.7 ms | exit 1 / 436 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test__opcode.py` | ok / 55.5 ms | exit 1 / 416.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test__osx_support.py` | ok / 56.9 ms | exit 1 / 370.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_abc.py` | ok / 51.4 ms | exit 1 / 10.5 ms | hydro_fail | error[HYD0002]: pytest fixture 'abc_ABCMeta' is not defined |
-| `test_abstract_numbers.py` | ok / 50.1 ms | exit 1 / 73.9 ms | hydro_fail | AssertionError: 7 test(s) failed |
-| `test_android.py` | exit 1 / 82.6 ms | exit 1 / 391.8 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_annotationlib.py` | ok / 78 ms | exit 1 / 364.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_apple.py` | exit 1 / 73.7 ms | exit 1 / 402.8 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_argparse.py` | ok / 1471.2 ms | exit 1 / 532.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_array.py` | ok / 334.4 ms | exit 1 / 368.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_asdl_parser.py` | exit 1 / 35.1 ms | exit 1 / 26 ms | expected_fail | RuntimeError: unittest.SkipTest: test irrelevant for an installed Python |
-| `test_asyncgen.py` | ok / 814.6 ms | exit 1 / 388.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_atexit.py` | exit 1 / 116.5 ms | exit 1 / 374.3 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_audit.py` | ok / 1660.4 ms | exit 1 / 371.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_augassign.py` | ok / 46.1 ms | exit 1 / 46 ms | hydro_fail | AssertionError: 3 test(s) failed |
-| `test_base64.py` | ok / 152.4 ms | exit 1 / 387.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_baseexception.py` | ok / 53.1 ms | exit 1 / 39.1 ms | hydro_fail | AssertionError: 9 test(s) failed |
-| `test_bdb.py` | exit 1 / 79.3 ms | exit 1 / 463.9 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_bigaddrspace.py` | ok / 56 ms | exit 1 / 382.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_bigmem.py` | ok / 62.6 ms | exit 1 / 366.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_binascii.py` | ok / 58.4 ms | exit 1 / 380 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_binop.py` | ok / 46.3 ms | exit 1 / 75.1 ms | hydro_fail | AssertionError: 9 test(s) failed |
-| `test_bisect.py` | ok / 60.8 ms | exit 1 / 365.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_bool.py` | ok / 52.2 ms | exit 1 / 398.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_buffer.py` | ok / 89.6 ms | exit 1 / 388.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_bufio.py` | ok / 156.2 ms | exit 1 / 369.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_build_details.py` | exit 1 / 96.5 ms | exit 1 / 364 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_builtin.py` | ok / 366.3 ms | exit 1 / 417.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_bytes.py` | exit 1 / 99.3 ms | exit 1 / 408.6 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_bz2.py` | ok / 469.1 ms | exit 1 / 376.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_c_locale_coercion.py` | ok / 1038.6 ms | exit 1 / 366.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_calendar.py` | ok / 1575.3 ms | exit 1 / 510.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_call.py` | exit 1 / 63.6 ms | exit 1 / 367 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_charmapcodec.py` | ok / 45.5 ms | exit 1 / 14.2 ms | hydro_fail | AssertionError: 4 test(s) failed |
-| `test_class.py` | ok / 63.2 ms | exit 1 / 375.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_clinic.py` | ok / 245.8 ms | exit 1 / 390.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_cmath.py` | ok / 114.9 ms | exit 1 / 416.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_cmd.py` | ok / 200.6 ms | exit 1 / 1035.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_cmd_line.py` | exit 1 / 1983 ms | exit 1 / 392.9 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_cmd_line_script.py` | exit 1 / 1563.4 ms | exit 1 / 477.7 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_code.py` | ok / 184.6 ms | exit 1 / 1055.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_code_module.py` | ok / 118.9 ms | exit 1 / 359.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codeccallbacks.py` | ok / 63.5 ms | exit 1 / 162.1 ms | hydro_fail | error[HYD0201]: module '_codecs' has no attribute '_unregister_error' |
-| `test_codecencodings_cn.py` | ok / 134.4 ms | exit 1 / 363.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codecencodings_hk.py` | ok / 107.8 ms | exit 1 / 361.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codecencodings_iso2022.py` | ok / 157.8 ms | exit 1 / 379.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codecencodings_jp.py` | ok / 177 ms | exit 1 / 391.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codecencodings_kr.py` | ok / 125 ms | exit 1 / 405.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codecencodings_tw.py` | ok / 146.3 ms | exit 1 / 429.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codecmaps_cn.py` | ok / 194.9 ms | exit 1 / 375.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codecmaps_hk.py` | ok / 126.6 ms | exit 1 / 366.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codecmaps_jp.py` | ok / 204.8 ms | exit 1 / 367.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codecmaps_kr.py` | ok / 195.6 ms | exit 1 / 359.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codecmaps_tw.py` | ok / 169.6 ms | exit 1 / 361.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codecs.py` | ok / 314.2 ms | exit 1 / 386 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_codeop.py` | ok / 57 ms | exit 1 / 372.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_collections.py` | ok / 1312.2 ms | exit 1 / 1036.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_colorsys.py` | ok / 46.2 ms | ok / 29.9 ms | hydro_pass | - |
-| `test_compare.py` | ok / 59 ms | exit 1 / 364.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_compile.py` | ok / 2311.2 ms | exit 1 / 409.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_compileall.py` | exit 1 / 66.3 ms | exit 1 / 494.4 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_compiler_assemble.py` | ok / 40.5 ms | exit 1 / 405.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_compiler_codegen.py` | ok / 48.1 ms | exit 1 / 376.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_complex.py` | ok / 71.5 ms | exit 1 / 384.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_configparser.py` | ok / 427.6 ms | exit 1 / 410.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_contains.py` | ok / 50.7 ms | exit 1 / 368 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_context.py` | ok / 544.7 ms | exit 1 / 372.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_contextlib.py` | ok / 73.3 ms | exit 1 / 356.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_contextlib_async.py` | ok / 78.3 ms | exit 1 / 394.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_copy.py` | ok / 85.3 ms | exit 1 / 383 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_copyreg.py` | ok / 88.9 ms | exit 1 / 252 ms | hydro_fail | error[HYD0202]: 'None' object does not support item assignment |
-| `test_coroutines.py` | ok / 286.8 ms | exit 1 / 384 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_cprofile.py` | ok / 574 ms | exit 1 / 582.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_crossinterp.py` | exit 1 / 55.9 ms | exit 1 / 374.4 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_csv.py` | ok / 263.1 ms | exit 1 / 372.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_curses.py` | ok / 266.8 ms | exit 1 / 294.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_datetime.py` | ok / 20567.4 ms | exit 1 / 372.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_dbm.py` | ok / 414.5 ms | exit 1 / 362 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_dbm_dumb.py` | ok / 75.4 ms | exit 1 / 365 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_dbm_gnu.py` | exit 1 / 50.8 ms | exit 1 / 386.8 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_dbm_ndbm.py` | ok / 108 ms | exit 1 / 365 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_dbm_sqlite3.py` | ok / 545.8 ms | exit 1 / 381.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_decimal.py` | ok / 1927.5 ms | exit 1 / 383.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_decorators.py` | ok / 45.9 ms | exit 1 / 70.4 ms | hydro_fail | AssertionError: 11 test(s) failed |
-| `test_defaultdict.py` | ok / 48.6 ms | exit -6 / 436 ms | hydro_fail | fatal runtime error: stack overflow, aborting |
-| `test_deque.py` | ok / 354.2 ms | exit 1 / 1177 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_descr.py` | exit 1 / 328.6 ms | exit 1 / 385.8 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_descrtut.py` | ok / 112.1 ms | exit 1 / 394.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_devpoll.py` | exit 1 / 42.1 ms | exit 1 / 361.6 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_dict.py` | ok / 319.4 ms | exit 1 / 388.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_dictcomps.py` | ok / 49.2 ms | exit 1 / 351.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_dictviews.py` | ok / 148 ms | exit 1 / 357 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_difflib.py` | ok / 208.6 ms | exit 1 / 455.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_dis.py` | ok / 242.7 ms | exit 1 / 404.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_docxmlrpc.py` | ok / 4674.8 ms | exit 1 / 210 ms | hydro_fail | error[HYD0201]: module 'errno' has no attribute 'ECONNRESET' |
-| `test_dtrace.py` | exit 1 / 55.6 ms | exit 1 / 522.2 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_dynamic.py` | ok / 52.8 ms | exit 1 / 366.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_dynamicclassattribute.py` | ok / 42.9 ms | exit 1 / 60.8 ms | hydro_fail | AssertionError: 6 test(s) failed |
-| `test_eintr.py` | exit 1 / 89.3 ms | exit 1 / 509.7 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_embed.py` | ok / 73 ms | exit 1 / 369.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_ensurepip.py` | ok / 131 ms | exit 1 / 397.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_enum.py` | exit 1 / 545 ms | exit 1 / 1290.8 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_enumerate.py` | ok / 86 ms | exit 1 / 408.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_eof.py` | ok / 321 ms | exit 1 / 372.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_epoll.py` | ok / 155 ms | exit 1 / 354.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_errno.py` | ok / 42.8 ms | ok / 10.9 ms | hydro_pass | - |
-| `test_except_star.py` | ok / 59.1 ms | exit 1 / 369.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_exception_group.py` | ok / 292.6 ms | exit 1 / 352 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_exception_hierarchy.py` | ok / 50.4 ms | exit 1 / 6.5 ms | hydro_fail | error[HYD0101]: name '_make_map' is not defined |
-| `test_exception_variations.py` | ok / 46.9 ms | exit 1 / 43.2 ms | hydro_fail | AssertionError: 8 test(s) failed |
-| `test_exceptions.py` | exit 1 / 1025.9 ms | exit 1 / 390.4 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_extcall.py` | exit 1 / 113.8 ms | exit 1 / 2658.4 ms | expected_fail | AssertionError: 1 test(s) failed |
-| `test_external_inspection.py` | ok / 1053.2 ms | exit 1 / 293.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_faulthandler.py` | ok / 18811.5 ms | exit 1 / 501.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_fcntl.py` | ok / 229.5 ms | exit 1 / 384.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_file.py` | ok / 87.6 ms | exit 1 / 507.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_file_eintr.py` | ok / 1449.9 ms | exit 1 / 495.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_filecmp.py` | ok / 110.9 ms | exit 1 / 385.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_fileinput.py` | ok / 104 ms | exit 1 / 401.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_fileio.py` | ok / 679.8 ms | exit 1 / 408.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_fileutils.py` | ok / 98.7 ms | exit 1 / 375.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_finalization.py` | ok / 110.7 ms | exit 1 / 363.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_float.py` | ok / 95.8 ms | exit 1 / 387 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_flufl.py` | ok / 47.2 ms | exit 1 / 19.3 ms | hydro_fail | AssertionError: 4 test(s) failed |
-| `test_fnmatch.py` | ok / 52.1 ms | exit 1 / 99.3 ms | hydro_fail | AssertionError: 44 test(s) failed |
-| `test_fork1.py` | ok / 5143.3 ms | exit 1 / 625.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_format.py` | ok / 71 ms | exit 1 / 474.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_fractions.py` | ok / 84.2 ms | exit 1 / 364.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_frame.py` | exit 1 / 1023.8 ms | exit 1 / 375.2 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_frozen.py` | ok / 49.4 ms | exit 1 / 385.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_fstring.py` | exit 1 / 433.3 ms | exit 1 / 6 ms | expected_fail | error[HYD0001]: invalid syntax: f-string: expressions nested too deeply |
-| `test_ftplib.py` | ok / 7189.1 ms | exit 1 / 406.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_funcattrs.py` | ok / 56.6 ms | exit 1 / 362.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_functools.py` | ok / 315.1 ms | exit 1 / 378.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_gc.py` | exit 1 / 1462.2 ms | exit 1 / 283.9 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_generated_cases.py` | ok / 126.8 ms | exit 1 / 340.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_generator_stop.py` | ok / 42.5 ms | exit 1 / 9.7 ms | hydro_fail | AssertionError: 2 test(s) failed |
-| `test_generators.py` | ok / 144.6 ms | exit 1 / 1000.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_genericalias.py` | ok / 162.5 ms | exit 1 / 296.3 ms | hydro_fail | error[HYD0201]: module 'queue' has no attribute 'SimpleQueue' |
-| `test_genericclass.py` | ok / 56.6 ms | exit 1 / 338.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_genericpath.py` | ok / 50.8 ms | exit 1 / 357.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_genexps.py` | ok / 117.8 ms | exit 1 / 2628.5 ms | hydro_fail | AssertionError: 1 test(s) failed |
-| `test_getopt.py` | ok / 144.7 ms | exit 1 / 1048.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_getpass.py` | ok / 93.3 ms | exit 1 / 387.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_getpath.py` | ok / 46.5 ms | exit 1 / 370.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_gettext.py` | exit 1 / 152.6 ms | exit 1 / 306 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_glob.py` | ok / 134.4 ms | exit 1 / 369.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_global.py` | ok / 52.2 ms | exit 1 / 418.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_grammar.py` | ok / 90.5 ms | exit 1 / 7.5 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token ',' |
-| `test_graphlib.py` | ok / 96.8 ms | exit 1 / 386.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_grp.py` | ok / 315.1 ms | exit 1 / 383.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_gzip.py` | ok / 892.5 ms | exit 1 / 388.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_hash.py` | ok / 354.8 ms | exit 1 / 372.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_hashlib.py` | ok / 14059.2 ms | exit 1 / 354.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_heapq.py` | ok / 225.9 ms | exit 1 / 972.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_hmac.py` | ok / 130.5 ms | exit 1 / 365.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_html.py` | ok / 46.9 ms | exit 1 / 15.9 ms | hydro_fail | AssertionError: 1 test(s) failed |
-| `test_htmlparser.py` | ok / 411 ms | exit 1 / 368 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_http_cookiejar.py` | ok / 276.7 ms | exit 1 / 395.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_http_cookies.py` | ok / 593.9 ms | exit 1 / 1020.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_httplib.py` | ok / 3405.1 ms | exit 1 / 480.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_httpservers.py` | ok / 4220.5 ms | exit 1 / 523.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_idle.py` | ok / 10097 ms | exit 1 / 335.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_imaplib.py` | timeout / 30003.5 ms | exit 1 / 367.8 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_index.py` | ok / 46.4 ms | exit 1 / 330.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_int.py` | ok / 21955.1 ms | exit 1 / 338 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_int_literal.py` | ok / 43.2 ms | ok / 19.1 ms | hydro_pass | - |
-| `test_io.py` | exit 1 / 29087 ms | exit 1 / 517.4 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_ioctl.py` | ok / 555.7 ms | exit 1 / 361.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_ipaddress.py` | ok / 92.6 ms | exit 1 / 446.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_isinstance.py` | ok / 872.4 ms | exit 1 / 376.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_iter.py` | ok / 61.6 ms | exit 1 / 354.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_iterlen.py` | ok / 43.9 ms | exit 1 / 37.2 ms | hydro_fail | AssertionError: 1 test(s) failed |
-| `test_itertools.py` | ok / 811.1 ms | exit 1 / 1049.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_keyword.py` | ok / 44.6 ms | exit 1 / 18.6 ms | hydro_fail | AssertionError: 2 test(s) failed |
-| `test_keywordonlyarg.py` | ok / 45.4 ms | exit 1 / 7.1 ms | hydro_fail | error[HYD0103]: keywordonly_sum() got an unexpected keyword argument 'non_existing_arg' |
-| `test_kqueue.py` | exit 1 / 43.1 ms | exit 1 / 380.7 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_largefile.py` | ok / 1364.3 ms | exit 1 / 360.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_launcher.py` | exit 1 / 64 ms | exit 1 / 28.4 ms | expected_fail | error[HYD0002]: module 'winreg' not found: not supported on the import search path |
-| `test_linecache.py` | ok / 135.5 ms | exit 1 / 543.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_list.py` | ok / 373.2 ms | exit 1 / 510.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_listcomps.py` | ok / 129.3 ms | exit 1 / 1046.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_lltrace.py` | ok / 49.1 ms | exit 1 / 429 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_locale.py` | ok / 111.5 ms | exit 1 / 353.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_logging.py` | ok / 21679.3 ms | exit 1 / 328 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPSConnection' |
-| `test_long.py` | ok / 533.3 ms | exit 1 / 369.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_longexp.py` | ok / 113.2 ms | ok / 7.7 ms | hydro_pass | - |
-| `test_lzma.py` | ok / 173.3 ms | exit 1 / 379.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_mailbox.py` | ok / 1357.7 ms | exit 1 / 551.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_marshal.py` | ok / 221.6 ms | exit 1 / 348.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_math.py` | ok / 9308.7 ms | exit 1 / 359.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_math_property.py` | ok / 35.3 ms | exit 1 / 340.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_memoryio.py` | ok / 73 ms | exit 1 / 342.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_memoryview.py` | ok / 301 ms | exit 1 / 342.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_metaclass.py` | ok / 92.9 ms | exit 1 / 2555.5 ms | hydro_fail | AssertionError: 1 test(s) failed |
-| `test_mimetypes.py` | ok / 406.3 ms | exit 1 / 273.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_minidom.py` | ok / 88.3 ms | exit 1 / 358.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_mmap.py` | ok / 116.8 ms | exit 1 / 376.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_modulefinder.py` | ok / 307 ms | exit 1 / 449.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_monitoring.py` | ok / 59.6 ms | exit 1 / 390.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_msvcrt.py` | exit 1 / 38.4 ms | exit 1 / 31.6 ms | expected_fail | error[HYD0002]: module '_winapi' not found: not supported on the import search path |
-| `test_multibytecodec.py` | ok / 211.9 ms | exit 1 / 339.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_multiprocessing_main_handling.py` | exit 1 / 1374.3 ms | exit 1 / 352.3 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_named_expressions.py` | ok / 50.2 ms | exit 1 / 29 ms | hydro_fail | error[HYD0101]: name '_Foo__x1' is not defined |
-| `test_netrc.py` | ok / 50.6 ms | exit 1 / 341.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_ntpath.py` | ok / 299.3 ms | exit 1 / 356.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_nturl2path.py` | ok / 61.1 ms | exit 1 / 485.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_numeric_tower.py` | ok / 74.2 ms | exit 1 / 38 ms | hydro_fail | AssertionError: 7 test(s) failed |
-| `test_opcache.py` | ok / 326.6 ms | exit 1 / 447.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_opcodes.py` | ok / 51.8 ms | exit 1 / 357.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_openpty.py` | ok / 43.1 ms | ok / 6.9 ms | hydro_pass | - |
-| `test_operator.py` | ok / 65.7 ms | exit 1 / 341.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_optimizer.py` | ok / 47.6 ms | exit 1 / 345.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_optparse.py` | ok / 129 ms | exit 1 / 353.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_ordered_dict.py` | ok / 158.4 ms | exit 1 / 367.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_os.py` | exit 1 / 12684.2 ms | exit 1 / 528.3 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_osx_env.py` | ok / 55.7 ms | exit 1 / 354.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_patma.py` | exit 1 / 50.8 ms | exit 1 / 541.2 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_pdb.py` | exit 1 / 16604.7 ms | exit 1 / 1199.4 ms | expected_fail | error[HYD0201]: module 'asyncio' has no attribute 'constants' |
-| `test_peepholer.py` | ok / 383.4 ms | exit 1 / 405.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_pep646_syntax.py` | ok / 230.8 ms | exit 1 / 2661.4 ms | hydro_fail | AssertionError: 1 test(s) failed |
-| `test_perf_profiler.py` | ok / 445 ms | exit 1 / 375.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_perfmaps.py` | ok / 111 ms | exit 1 / 14.4 ms | hydro_fail | ImportError: /usr/lib/python3.14/lib-dynload/_testinternalcapi.cpython-314-x86_64-linux-gnu.so: undefined sym… |
-| `test_pickle.py` | ok / 2297.1 ms | exit 1 / 1000.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_picklebuffer.py` | ok / 130.2 ms | exit 1 / 345.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_pickletools.py` | ok / 523.4 ms | exit 1 / 464.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_pkg.py` | ok / 125.3 ms | exit 1 / 35.4 ms | hydro_fail | AssertionError: 7 test(s) failed |
-| `test_pkgutil.py` | exit 1 / 142.4 ms | exit 1 / 359.1 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_platform.py` | ok / 404.3 ms | exit 1 / 367.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_plistlib.py` | ok / 235.8 ms | exit 1 / 478.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_poll.py` | ok / 11268.4 ms | exit 1 / 365 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_popen.py` | ok / 173.4 ms | exit 1 / 354.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_poplib.py` | ok / 6045.1 ms | exit 1 / 370.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_positional_only_arg.py` | ok / 129 ms | exit 1 / 375.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_posix.py` | exit 1 / 862 ms | exit 1 / 366.1 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_posixpath.py` | ok / 313.7 ms | exit 1 / 354.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_pow.py` | ok / 277.6 ms | exit 1 / 254 ms | hydro_fail | AssertionError: 4 test(s) failed |
-| `test_pprint.py` | ok / 169.8 ms | exit 1 / 352.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_print.py` | ok / 121.6 ms | exit 1 / 338.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_profile.py` | ok / 315.3 ms | exit 1 / 562.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_property.py` | ok / 104.2 ms | exit 1 / 334.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_pstats.py` | ok / 159 ms | exit 1 / 346.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_pty.py` | ok / 116.4 ms | exit 1 / 349.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_pulldom.py` | ok / 167.8 ms | exit 1 / 157.2 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
-| `test_pwd.py` | ok / 103.5 ms | exit 1 / 392.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_py_compile.py` | ok / 388.4 ms | exit 1 / 489.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_pyclbr.py` | exit 1 / 99.2 ms | exit 1 / 357 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_pyexpat.py` | ok / 228.1 ms | exit 1 / 375.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_queue.py` | ok / 7770.1 ms | exit 1 / 374.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_quopri.py` | ok / 140.3 ms | exit 1 / 353.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_raise.py` | ok / 93.2 ms | exit 1 / 359.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_random.py` | ok / 731.5 ms | exit 1 / 292.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_range.py` | ok / 214.5 ms | exit 1 / 357.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_re.py` | ok / 456.1 ms | exit 1 / 347.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_readline.py` | ok / 251.1 ms | exit 1 / 371.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_regrtest.py` | exit 1 / 1489.8 ms | exit 1 / 99 ms | expected_fail | error[HYD0002]: module '_overlapped' not found: not supported on the import search path |
-| `test_remote_pdb.py` | ok / 2066.6 ms | exit 1 / 423.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_repl.py` | ok / 897.1 ms | exit 1 / 345.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_reprlib.py` | ok / 72.7 ms | exit 1 / 339.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_resource.py` | ok / 90 ms | exit 1 / 361 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_richcmp.py` | ok / 42 ms | exit 1 / 344.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_rlcompleter.py` | ok / 77.7 ms | exit 1 / 268.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_robotparser.py` | ok / 1104.6 ms | exit 1 / 44 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
-| `test_runpy.py` | timeout / 30009.5 ms | exit 1 / 463.9 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_sax.py` | ok / 151.5 ms | exit 1 / 167.9 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
-| `test_sched.py` | ok / 589.9 ms | exit 1 / 336.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_scope.py` | ok / 46.8 ms | exit 1 / 338.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_script_helper.py` | ok / 148.7 ms | exit 1 / 366.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_secrets.py` | ok / 39.5 ms | exit 1 / 90.2 ms | hydro_fail | AssertionError: 1 test(s) failed |
-| `test_select.py` | ok / 1556.1 ms | exit 1 / 348.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_selectors.py` | ok / 14676.6 ms | exit 1 / 513.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_set.py` | ok / 771.9 ms | exit 1 / 395.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_setcomps.py` | ok / 92.9 ms | exit 1 / 1020.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_shelve.py` | ok / 2736.8 ms | exit 1 / 365.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_shlex.py` | ok / 104.7 ms | exit 1 / 282.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_shutil.py` | exit 1 / 472.1 ms | exit 1 / 316.7 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_signal.py` | timeout / 30018.7 ms | exit 1 / 458.6 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_site.py` | ok / 1439.7 ms | exit 1 / 362.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_slice.py` | ok / 53 ms | exit 1 / 360.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_smtplib.py` | ok / 1368.1 ms | exit 1 / 424.7 ms | hydro_fail | error[HYD0102]: sum() start argument must be a number, not list |
-| `test_smtpnet.py` | ok / 8407 ms | exit 1 / 404 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_socket.py` | ok / 27593.4 ms | exit 1 / 380.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_socketserver.py` | ok / 470.4 ms | exit 1 / 484.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_sort.py` | ok / 77.9 ms | exit 1 / 347.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_source_encoding.py` | ok / 13501.1 ms | exit 1 / 351.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_ssl.py` | ok / 20607.1 ms | exit 1 / 311.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_stable_abi_ctypes.py` | exit 1 / 130.2 ms | exit 1 / 382.7 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_startfile.py` | exit 1 / 123.8 ms | exit 1 / 389.1 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_stat.py` | ok / 149.3 ms | exit 1 / 366.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_statistics.py` | ok / 12022.1 ms | exit 1 / 1048.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_str.py` | ok / 1164.4 ms | exit 1 / 380.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_strftime.py` | ok / 172.2 ms | exit 1 / 513.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_string_literals.py` | ok / 145.9 ms | exit 1 / 68.3 ms | hydro_fail | AssertionError: 19 test(s) failed |
-| `test_stringprep.py` | ok / 123 ms | exit 1 / 139.8 ms | hydro_fail | AssertionError: 1 test(s) failed |
-| `test_strptime.py` | ok / 167.3 ms | exit 1 / 362.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_strtod.py` | ok / 280.3 ms | exit 1 / 378.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_struct.py` | ok / 423.8 ms | exit 1 / 384.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_structseq.py` | ok / 177.1 ms | exit 1 / 383.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_subclassinit.py` | ok / 127.5 ms | exit 1 / 5.9 ms | hydro_fail | error[HYD0002]: class keyword 'otherarg' cannot be forwarded together with metaclass=; Hydro's metaclass hook… |
-| `test_subprocess.py` | exit 1 / 16790.8 ms | exit 1 / 390.6 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_sundry.py` | ok / 106.5 ms | exit 1 / 379.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_super.py` | ok / 196.3 ms | exit 1 / 295.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_support.py` | exit 1 / 5215.7 ms | exit 1 / 538.5 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_symtable.py` | ok / 67.8 ms | exit 1 / 543.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_syntax.py` | ok / 175.3 ms | exit 1 / 1043.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_sys.py` | exit 1 / 1240.4 ms | exit 1 / 364.2 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_sys_setprofile.py` | ok / 52.1 ms | exit 1 / 163.1 ms | hydro_fail | AssertionError: 27 test(s) failed |
-| `test_sys_settrace.py` | ok / 816.8 ms | exit 1 / 370.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_sysconfig.py` | exit 1 / 199 ms | exit 1 / 368.7 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_syslog.py` | ok / 192.1 ms | exit 1 / 374 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_tabnanny.py` | ok / 91.3 ms | exit 1 / 355.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_tarfile.py` | exit 1 / 5443.5 ms | exit 1 / 308.1 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_tcl.py` | ok / 110.9 ms | exit 1 / 360.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_tempfile.py` | ok / 346.2 ms | exit 1 / 366.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_termios.py` | ok / 563.3 ms | exit 1 / 364.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_textwrap.py` | ok / 48.4 ms | exit 1 / 131.4 ms | hydro_fail | AssertionError: 33 test(s) failed |
-| `test_thread.py` | ok / 1289.7 ms | exit 1 / 365.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_thread_local_bytecode.py` | ok / 50.3 ms | exit 1 / 374 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_threadedtempfile.py` | ok / 62.9 ms | exit 1 / 342.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_threading.py` | exit 1 / 14105.1 ms | exit 1 / 360.1 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_threading_local.py` | ok / 294.6 ms | exit 1 / 1007.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_threadsignals.py` | ok / 4894.3 ms | exit 1 / 452.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_time.py` | ok / 3081.8 ms | exit 1 / 362.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_timeit.py` | ok / 64.6 ms | exit 1 / 339.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_timeout.py` | ok / 9943.3 ms | exit 1 / 337.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_tokenize.py` | ok / 6289.4 ms | exit 1 / 376 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_trace.py` | ok / 944.7 ms | exit 1 / 367 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_traceback.py` | exit 1 / 2134.8 ms | exit 1 / 279.3 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_tracemalloc.py` | ok / 660 ms | exit 1 / 280.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_tstring.py` | exit 1 / 277.2 ms | exit 1 / 343.5 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_ttk_textonly.py` | ok / 70 ms | exit 1 / 356 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_tty.py` | ok / 54.2 ms | exit 1 / 350.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_tuple.py` | ok / 221.2 ms | exit 1 / 334 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_turtle.py` | ok / 162.3 ms | exit 1 / 269.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_type_aliases.py` | ok / 51.4 ms | exit 1 / 351 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_type_annotations.py` | ok / 47.2 ms | exit 1 / 345 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_type_cache.py` | exit 1 / 55.1 ms | exit 1 / 380.4 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_type_comments.py` | ok / 51.6 ms | exit 1 / 350.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_type_params.py` | ok / 66 ms | exit 1 / 6.1 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token '=' |
-| `test_typechecks.py` | ok / 49.7 ms | exit 1 / 18.9 ms | hydro_fail | AssertionError: 3 test(s) failed |
-| `test_types.py` | ok / 194.3 ms | exit 1 / 373.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_typing.py` | ok / 351.3 ms | exit 1 / 307.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_ucn.py` | ok / 136 ms | exit 1 / 27.1 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
-| `test_unary.py` | ok / 44.7 ms | ok / 11.3 ms | hydro_pass | - |
-| `test_unicode_file.py` | ok / 48.5 ms | exit 1 / 359.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_unicode_file_functions.py` | ok / 78.4 ms | exit 1 / 335.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_unicode_identifiers.py` | ok / 42.1 ms | exit 1 / 8 ms | hydro_fail | AssertionError: 3 test(s) failed |
-| `test_unicodedata.py` | ok / 4313.3 ms | exit 1 / 357.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_univnewlines.py` | ok / 55.7 ms | exit 1 / 471.6 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_unpack.py` | exit 1 / 107.5 ms | exit 1 / 2522.8 ms | expected_fail | AssertionError: 2 test(s) failed |
-| `test_unpack_ex.py` | exit 1 / 113.3 ms | exit 1 / 2724.4 ms | expected_fail | AssertionError: 1 test(s) failed |
-| `test_unparse.py` | ok / 6608.3 ms | exit 1 / 376.1 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_urllib.py` | ok / 250.3 ms | exit 1 / 196.4 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
-| `test_urllib2.py` | ok / 1813.6 ms | exit 1 / 383.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_urllib2_localnet.py` | ok / 2275.3 ms | exit 1 / 156.2 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
-| `test_urllib2net.py` | ok / 27786.5 ms | exit 1 / 363.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_urllib_response.py` | ok / 58.7 ms | exit 1 / 26.6 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
-| `test_urllibnet.py` | ok / 6193.4 ms | exit 1 / 386.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_urlparse.py` | ok / 140.7 ms | exit 1 / 500 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_userdict.py` | ok / 138.3 ms | exit 1 / 379.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_userlist.py` | ok / 148.6 ms | exit 1 / 370.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_userstring.py` | ok / 615.6 ms | exit 1 / 365.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_utf8_mode.py` | ok / 436.7 ms | exit 1 / 372.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_utf8source.py` | ok / 46.3 ms | exit 1 / 9.4 ms | hydro_fail | AssertionError: 2 test(s) failed |
-| `test_uuid.py` | ok / 251.1 ms | exit 1 / 543.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_venv.py` | exit 1 / 8522.1 ms | exit 1 / 379.1 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_wait3.py` | ok / 5064.5 ms | exit 1 / 347.9 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_wait4.py` | ok / 5055.1 ms | exit 1 / 343.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_wave.py` | ok / 59.6 ms | exit 1 / 355.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_weakref.py` | exit 1 / 2497.5 ms | exit 1 / 990.5 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_weakset.py` | ok / 68.5 ms | exit 1 / 354.2 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_webbrowser.py` | ok / 2298.2 ms | exit 1 / 374.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_winapi.py` | exit 1 / 49.8 ms | exit 1 / 343.9 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_winconsoleio.py` | exit 1 / 51.4 ms | exit 1 / 29.7 ms | expected_fail | error[HYD0002]: module '_testconsole' not found: not supported on the import search path |
-| `test_winreg.py` | exit 1 / 51.6 ms | exit 1 / 29.1 ms | expected_fail | error[HYD0002]: module 'winreg' not found: not supported on the import search path |
-| `test_winsound.py` | exit 1 / 46.6 ms | exit 1 / 339.3 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_with.py` | ok / 50.8 ms | exit 1 / 132.7 ms | hydro_fail | error[HYD0101]: name 'foo' is not defined |
-| `test_wmi.py` | exit 1 / 57.6 ms | exit 1 / 341.4 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_wsgiref.py` | ok / 184.1 ms | exit 1 / 387.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_xml_dom_minicompat.py` | ok / 44.3 ms | exit 1 / 204.5 ms | hydro_fail | AssertionError: 11 test(s) failed |
-| `test_xml_dom_xmlbuilder.py` | ok / 129.8 ms | exit 1 / 466.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_xml_etree.py` | ok / 735.4 ms | exit 1 / 305 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_xml_etree_c.py` | ok / 482.1 ms | exit 1 / 337.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_xmlrpc.py` | ok / 27395.8 ms | exit 1 / 230.8 ms | hydro_fail | error[HYD0201]: module 'errno' has no attribute 'ECONNRESET' |
-| `test_xpickle.py` | ok / 2140.4 ms | exit 1 / 385 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_xxlimited.py` | exit 1 / 49.8 ms | exit 1 / 372.9 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_xxtestfuzz.py` | ok / 55.1 ms | exit 1 / 352.8 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_yield_from.py` | ok / 61.3 ms | exit 1 / 349.7 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_zipapp.py` | ok / 128.4 ms | exit 1 / 542.3 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_zipfile64.py` | timeout / 30019.2 ms | exit 1 / 368.3 ms | expected_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_zipimport.py` | ok / 18455.1 ms | exit 1 / 320.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
-| `test_zipimport_support.py` | ok / 437.9 ms | exit 1 / 396.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_zlib.py` | ok / 412.6 ms | exit 1 / 356.4 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
-| `test_zstd.py` | ok / 364.7 ms | exit 1 / 372.5 ms | hydro_fail | error[HYD0201]: module 'platform' has no attribute 'win32_is_iot' |
+| `test___all__.py` | ok / 1972.1 ms | exit 1 / 405.7 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test__colorize.py` | ok / 118.3 ms | exit 1 / 339.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test__interpchannels.py` | ok / 840.5 ms | exit 1 / 48.7 ms | hydro_fail | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
+| `test__interpreters.py` | ok / 680.7 ms | exit 1 / 35.7 ms | hydro_fail | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
+| `test__locale.py` | ok / 50.8 ms | exit 1 / 325.8 ms | hydro_fail | error[HYD0201]: module 'locale' has no attribute 'ALT_DIGITS' |
+| `test__opcode.py` | ok / 46.5 ms | exit 1 / 371.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test__osx_support.py` | ok / 50.1 ms | exit 1 / 1372.7 ms | hydro_fail | UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte |
+| `test_abc.py` | ok / 49.6 ms | exit 1 / 9.7 ms | hydro_fail | error[HYD0002]: pytest fixture 'abc_ABCMeta' is not defined |
+| `test_abstract_numbers.py` | ok / 43 ms | exit 1 / 67.5 ms | hydro_fail | AssertionError: 7 test(s) failed |
+| `test_android.py` | exit 1 / 72.4 ms | exit 1 / 482.2 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_annotationlib.py` | ok / 69.3 ms | exit 1 / 338 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_apple.py` | exit 1 / 67.3 ms | exit 1 / 469.7 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_argparse.py` | ok / 1291.4 ms | exit 1 / 462.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_array.py` | ok / 268 ms | exit 1 / 346.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_asdl_parser.py` | exit 1 / 31 ms | exit 1 / 19.4 ms | expected_fail | RuntimeError: unittest.SkipTest: test irrelevant for an installed Python |
+| `test_asyncgen.py` | ok / 789.8 ms | exit 1 / 355.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_atexit.py` | exit 1 / 109.5 ms | exit 1 / 447.7 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_audit.py` | ok / 1837.5 ms | exit 1 / 336 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_augassign.py` | ok / 42.3 ms | exit 1 / 41.6 ms | hydro_fail | AssertionError: 3 test(s) failed |
+| `test_base64.py` | ok / 143.4 ms | exit 1 / 458.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_baseexception.py` | ok / 47.1 ms | exit 1 / 31.9 ms | hydro_fail | AssertionError: 9 test(s) failed |
+| `test_bdb.py` | exit 1 / 65.6 ms | exit 1 / 366.8 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_bigaddrspace.py` | ok / 44.2 ms | exit 1 / 1221.7 ms | hydro_fail | AssertionError: 6 test(s) failed |
+| `test_bigmem.py` | ok / 56 ms | exit 1 / 338.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_binascii.py` | ok / 53.2 ms | exit 1 / 485.2 ms | hydro_fail | error[HYD0201]: module 'binascii' has no attribute 'Error' |
+| `test_binop.py` | ok / 42.7 ms | exit 1 / 68 ms | hydro_fail | AssertionError: 9 test(s) failed |
+| `test_bisect.py` | ok / 60.9 ms | exit 1 / 415.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_bool.py` | ok / 61.5 ms | exit 1 / 433.9 ms | hydro_fail | error[HYD0103]: bool() does not accept the keyword argument 'x' |
+| `test_buffer.py` | ok / 107.1 ms | exit 1 / 454 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_bufio.py` | ok / 179.8 ms | exit 1 / 2172.9 ms | hydro_fail | UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte |
+| `test_build_details.py` | exit 1 / 105 ms | exit 1 / 381.9 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_builtin.py` | ok / 390.1 ms | exit 1 / 449.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_bytes.py` | exit 1 / 112 ms | exit 1 / 438.5 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_bz2.py` | ok / 466.9 ms | exit 1 / 424.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_c_locale_coercion.py` | ok / 840.8 ms | exit 1 / 445.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_calendar.py` | ok / 1399.5 ms | exit 1 / 533 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_call.py` | exit 1 / 58.7 ms | exit 1 / 354.1 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_charmapcodec.py` | ok / 40.9 ms | exit 1 / 12 ms | hydro_fail | AssertionError: 4 test(s) failed |
+| `test_class.py` | ok / 61.7 ms | exit 1 / 29.5 ms | hydro_fail | error[HYD0002]: module '_testinternalcapi' not found: not supported on the import search path |
+| `test_clinic.py` | ok / 216.6 ms | exit 1 / 365.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_cmath.py` | ok / 87 ms | exit 1 / 358.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_cmd.py` | ok / 165.9 ms | exit 1 / 1008.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_cmd_line.py` | exit 1 / 1758.3 ms | exit 1 / 357.6 ms | expected_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_cmd_line_script.py` | exit 1 / 1373.5 ms | exit 1 / 496.5 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_code.py` | ok / 171.1 ms | exit 1 / 974 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_code_module.py` | ok / 99.9 ms | exit 1 / 344.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_codeccallbacks.py` | ok / 59.2 ms | exit 1 / 147.6 ms | hydro_fail | error[HYD0201]: module '_codecs' has no attribute '_unregister_error' |
+| `test_codecencodings_cn.py` | ok / 124.6 ms | exit 1 / 333 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPException' |
+| `test_codecencodings_hk.py` | ok / 95.6 ms | exit 1 / 337.5 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPException' |
+| `test_codecencodings_iso2022.py` | ok / 135.2 ms | exit 1 / 339.6 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPException' |
+| `test_codecencodings_jp.py` | ok / 164.1 ms | exit 1 / 410.9 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPException' |
+| `test_codecencodings_kr.py` | ok / 184.7 ms | exit 1 / 509.7 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPException' |
+| `test_codecencodings_tw.py` | ok / 127.7 ms | exit 1 / 372.1 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPException' |
+| `test_codecmaps_cn.py` | ok / 191.6 ms | exit 1 / 372.5 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPException' |
+| `test_codecmaps_hk.py` | ok / 124.3 ms | exit 1 / 377.1 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPException' |
+| `test_codecmaps_jp.py` | ok / 200.7 ms | exit 1 / 402.7 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPException' |
+| `test_codecmaps_kr.py` | ok / 174.4 ms | exit 1 / 396.1 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPException' |
+| `test_codecmaps_tw.py` | ok / 193 ms | exit 1 / 426.7 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPException' |
+| `test_codecs.py` | ok / 349.9 ms | exit 1 / 995.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_codeop.py` | ok / 71.3 ms | exit 1 / 425.9 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_collections.py` | ok / 1310.7 ms | exit 1 / 1168.6 ms | hydro_fail | error[HYD0201]: module 'collections' has no attribute '_count_elements' |
+| `test_colorsys.py` | ok / 41.6 ms | ok / 29.8 ms | hydro_pass | - |
+| `test_compare.py` | ok / 54.5 ms | exit 1 / 1340.1 ms | hydro_fail | AssertionError: 21 test(s) failed |
+| `test_compile.py` | ok / 2148.8 ms | exit 1 / 503 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_compileall.py` | exit 1 / 65.4 ms | exit 1 / 480.6 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_compiler_assemble.py` | ok / 36.7 ms | ok / 1481.7 ms | hydro_pass | - |
+| `test_compiler_codegen.py` | ok / 38.8 ms | ok / 1463.5 ms | hydro_pass | - |
+| `test_complex.py` | ok / 62.8 ms | exit 1 / 343.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_configparser.py` | ok / 410.3 ms | exit 1 / 1939.8 ms | hydro_fail | UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte |
+| `test_contains.py` | ok / 46.7 ms | exit 1 / 352.4 ms | hydro_fail | error[HYD0102]: 'in <str>' requires string left operand, not None |
+| `test_context.py` | ok / 525.4 ms | exit 1 / 368.6 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_contextlib.py` | ok / 76.5 ms | exit 1 / 386.4 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute 'mktemp' |
+| `test_contextlib_async.py` | ok / 72.9 ms | exit 1 / 396.1 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute 'mktemp' |
+| `test_copy.py` | ok / 78.1 ms | exit 1 / 1482.8 ms | hydro_fail | ModuleNotFoundError: No module named '_testinternalcapi' |
+| `test_copyreg.py` | ok / 78.8 ms | exit 1 / 241.8 ms | hydro_fail | error[HYD0202]: 'None' object does not support item assignment |
+| `test_coroutines.py` | ok / 254.6 ms | exit 1 / 393.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_cprofile.py` | ok / 495.6 ms | exit 1 / 40.2 ms | hydro_fail | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
+| `test_crossinterp.py` | exit 1 / 51.5 ms | exit 1 / 32.1 ms | expected_fail | error[HYD0002]: module '_interpreters' not found: not supported on the import search path |
+| `test_csv.py` | ok / 245.5 ms | exit 1 / 350.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_curses.py` | ok / 250 ms | exit 1 / 272.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_datetime.py` | ok / 19212.3 ms | exit 1 / 349.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_dbm.py` | ok / 427.5 ms | exit 1 / 352.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_dbm_dumb.py` | ok / 68 ms | exit 1 / 351.4 ms | hydro_fail | error[HYD0201]: module 'operator' has no attribute 'contains' |
+| `test_dbm_gnu.py` | exit 1 / 45.6 ms | exit 1 / 343.3 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_dbm_ndbm.py` | ok / 94.2 ms | exit 1 / 345.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_dbm_sqlite3.py` | ok / 510 ms | exit 1 / 348.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_decimal.py` | ok / 1763.3 ms | exit 1 / 368.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_decorators.py` | ok / 50.1 ms | exit 1 / 57.6 ms | hydro_fail | AssertionError: 11 test(s) failed |
+| `test_defaultdict.py` | ok / 42.9 ms | exit -6 / 424.8 ms | hydro_fail | fatal runtime error: stack overflow, aborting |
+| `test_deque.py` | ok / 325.6 ms | exit 1 / 996.7 ms | hydro_fail | error[HYD0103]: list.index() takes 1 positional argument(s) (3 given) |
+| `test_descr.py` | exit 1 / 300 ms | exit 1 / 470.9 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_descrtut.py` | ok / 96.9 ms | exit 1 / 3203.1 ms | hydro_fail | AssertionError: 1 test(s) failed |
+| `test_devpoll.py` | exit 1 / 40.1 ms | exit 1 / 333 ms | expected_fail | error[HYD0201]: module 'select' has no attribute 'devpoll' |
+| `test_dict.py` | ok / 286.8 ms | exit 1 / 354.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_dictcomps.py` | ok / 46.3 ms | exit 1 / 1265.7 ms | hydro_fail | AssertionError: 4 test(s) failed |
+| `test_dictviews.py` | ok / 132.6 ms | exit -6 / 1764.9 ms | hydro_fail | fatal runtime error: stack overflow, aborting |
+| `test_difflib.py` | ok / 205.6 ms | exit 1 / 3722.6 ms | hydro_fail | AssertionError: 30 test(s) failed |
+| `test_dis.py` | ok / 266.9 ms | exit 1 / 523.4 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_docxmlrpc.py` | ok / 4231.4 ms | exit 1 / 235.4 ms | hydro_fail | error[HYD0201]: module 'errno' has no attribute 'ECONNRESET' |
+| `test_dtrace.py` | exit 1 / 72.8 ms | exit 1 / 552.6 ms | expected_fail | error[HYD0201]: module 'os' has no attribute 'killpg' |
+| `test_dynamic.py` | ok / 45.8 ms | exit 1 / 1266.6 ms | hydro_fail | AssertionError: 11 test(s) failed |
+| `test_dynamicclassattribute.py` | ok / 43.5 ms | exit 1 / 57.6 ms | hydro_fail | AssertionError: 6 test(s) failed |
+| `test_eintr.py` | exit 1 / 85.5 ms | exit 1 / 476 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_embed.py` | ok / 63.1 ms | exit 1 / 364.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_ensurepip.py` | ok / 119.5 ms | exit 1 / 493.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_enum.py` | exit 1 / 514.9 ms | exit 1 / 1251.7 ms | expected_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_enumerate.py` | ok / 77.1 ms | exit 1 / 341.1 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_eof.py` | ok / 295.6 ms | exit 1 / 482.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_epoll.py` | ok / 152.5 ms | exit 1 / 331.9 ms | hydro_fail | error[HYD0201]: module 'errno' has no attribute 'EINPROGRESS' |
+| `test_errno.py` | ok / 41.3 ms | ok / 9.9 ms | hydro_pass | - |
+| `test_except_star.py` | ok / 55 ms | exit 1 / 1405.3 ms | hydro_fail | AssertionError: 87 test(s) failed |
+| `test_exception_group.py` | ok / 251.4 ms | exit 1 / 1416.2 ms | hydro_fail | AssertionError: 49 test(s) failed |
+| `test_exception_hierarchy.py` | ok / 46.5 ms | exit 1 / 6.1 ms | hydro_fail | error[HYD0101]: name '_make_map' is not defined |
+| `test_exception_variations.py` | ok / 42.2 ms | exit 1 / 41.5 ms | hydro_fail | AssertionError: 8 test(s) failed |
+| `test_exceptions.py` | exit 1 / 912.5 ms | exit 1 / 465.6 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_extcall.py` | exit 1 / 102.1 ms | exit 1 / 3004.2 ms | expected_fail | AssertionError: 1 test(s) failed |
+| `test_external_inspection.py` | ok / 1068.3 ms | exit 1 / 317.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_faulthandler.py` | ok / 18704.8 ms | exit 1 / 480.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_fcntl.py` | ok / 197.2 ms | exit 1 / 352.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_file.py` | ok / 84.6 ms | exit 1 / 485.2 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_file_eintr.py` | ok / 1419.3 ms | ok / 1941.4 ms | hydro_pass | - |
+| `test_filecmp.py` | ok / 65.6 ms | exit 1 / 345.7 ms | hydro_fail | error[HYD0201]: module 'shutil' has no attribute 'copystat' |
+| `test_fileinput.py` | ok / 90.9 ms | exit 1 / 401.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_fileio.py` | ok / 447.9 ms | exit 1 / 469 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_fileutils.py` | ok / 92.8 ms | exit 1 / 363.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_finalization.py` | ok / 100.8 ms | exit 1 / 344.8 ms | hydro_fail | error[HYD0201]: module 'gc' has no attribute 'garbage' |
+| `test_float.py` | ok / 84.7 ms | exit 1 / 463.4 ms | hydro_fail | error[HYD0201]: module 'math' has no attribute 'ldexp' |
+| `test_flufl.py` | ok / 42.4 ms | exit 1 / 17.3 ms | hydro_fail | AssertionError: 4 test(s) failed |
+| `test_fnmatch.py` | ok / 48 ms | exit 1 / 87.7 ms | hydro_fail | AssertionError: 44 test(s) failed |
+| `test_fork1.py` | ok / 5128 ms | exit 1 / 446.1 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_format.py` | ok / 49.6 ms | exit 1 / 343.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_fractions.py` | ok / 71.9 ms | exit 1 / 523.4 ms | hydro_fail | error[HYD0102]: format() argument 2 must be str, not None |
+| `test_frame.py` | exit 1 / 897.3 ms | exit 1 / 365.2 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_frozen.py` | ok / 46.9 ms | exit 1 / 340.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_fstring.py` | exit 1 / 376.7 ms | exit 1 / 5.5 ms | expected_fail | error[HYD0001]: invalid syntax: f-string: expressions nested too deeply |
+| `test_ftplib.py` | ok / 7358.5 ms | exit 1 / 433.2 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_funcattrs.py` | ok / 73.7 ms | exit 1 / 452 ms | hydro_fail | error[HYD0301]: nested function 'inner_global_function' has no local slot |
+| `test_functools.py` | ok / 497.9 ms | exit 1 / 672.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_gc.py` | exit 1 / 1708.8 ms | exit 1 / 377.6 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_generated_cases.py` | ok / 219.9 ms | exit 1 / 484.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_generator_stop.py` | ok / 58.5 ms | exit 1 / 13.9 ms | hydro_fail | AssertionError: 2 test(s) failed |
+| `test_generators.py` | ok / 235.4 ms | exit 1 / 1379.8 ms | hydro_fail | error[HYD0101]: no binding for nonlocal 'frame' found |
+| `test_genericalias.py` | ok / 248.2 ms | exit 1 / 400.3 ms | hydro_fail | error[HYD0201]: module 'threading' has no attribute 'Semaphore' |
+| `test_genericclass.py` | ok / 75.3 ms | exit 1 / 496.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_genericpath.py` | ok / 68.6 ms | exit 1 / 484.4 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_genexps.py` | ok / 146.2 ms | exit 1 / 3311.3 ms | hydro_fail | AssertionError: 1 test(s) failed |
+| `test_getopt.py` | ok / 150 ms | exit 1 / 1274.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_getpass.py` | ok / 104.3 ms | exit 1 / 430.4 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_getpath.py` | ok / 55.5 ms | exit 1 / 516.8 ms | hydro_fail | error[HYD0201]: type 'str' has no method 'casefold' |
+| `test_gettext.py` | exit 1 / 189.9 ms | exit 1 / 388.9 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_glob.py` | ok / 130.1 ms | exit 1 / 495.7 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'supports_dir_fd' |
+| `test_global.py` | ok / 70.8 ms | exit 1 / 455.6 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_grammar.py` | ok / 95.5 ms | exit 1 / 7.4 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token ',' |
+| `test_graphlib.py` | ok / 111.4 ms | exit 1 / 599.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_grp.py` | ok / 200.5 ms | exit 1 / 456.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_gzip.py` | ok / 982.5 ms | exit 1 / 403.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_hash.py` | ok / 327.7 ms | exit 1 / 499.4 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_hashlib.py` | ok / 13445.1 ms | exit 1 / 336.4 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_heapq.py` | ok / 195.7 ms | exit 1 / 927.4 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_hmac.py` | ok / 134.2 ms | exit 1 / 359.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_html.py` | ok / 45.8 ms | exit 1 / 16.1 ms | hydro_fail | AssertionError: 1 test(s) failed |
+| `test_htmlparser.py` | ok / 398.6 ms | exit 1 / 354.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_http_cookiejar.py` | ok / 252.1 ms | exit 1 / 354.7 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_http_cookies.py` | ok / 480.2 ms | exit 1 / 1040.5 ms | hydro_fail | error[HYD0201]: module 'http' has no attribute 'cookies' |
+| `test_httplib.py` | ok / 2146 ms | exit 1 / 444.4 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute 'has_ipv6' |
+| `test_httpservers.py` | ok / 3968.1 ms | exit 1 / 505.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_idle.py` | ok / 7459.1 ms | exit 1 / 332 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_imaplib.py` | timeout / 30004.1 ms | exit 1 / 344.1 ms | expected_fail | error[HYD0201]: module 'socket' has no attribute 'has_ipv6' |
+| `test_index.py` | ok / 46.1 ms | exit 1 / 325.8 ms | hydro_fail | error[HYD0201]: type 'int' has no method '__index__' |
+| `test_int.py` | ok / 20674.6 ms | exit 1 / 355.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_int_literal.py` | ok / 41.3 ms | ok / 16.9 ms | hydro_pass | - |
+| `test_io.py` | exit 1 / 27476.2 ms | exit 1 / 465.4 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_ioctl.py` | ok / 548.8 ms | exit 1 / 339.1 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_ipaddress.py` | ok / 86 ms | exit 1 / 2359.4 ms | hydro_fail | AssertionError: 82 test(s) failed |
+| `test_isinstance.py` | ok / 841 ms | exit 1 / 1285.1 ms | hydro_fail | ModuleNotFoundError: No module named '_testinternalcapi' |
+| `test_iter.py` | ok / 59.7 ms | exit 1 / 374.7 ms | hydro_fail | error[HYD0201]: module 'operator' has no attribute 'countOf' |
+| `test_iterlen.py` | ok / 43.7 ms | exit 1 / 36.3 ms | hydro_fail | AssertionError: 1 test(s) failed |
+| `test_itertools.py` | ok / 711.9 ms | exit 1 / 934.8 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_keyword.py` | ok / 40.5 ms | exit 1 / 15.7 ms | hydro_fail | AssertionError: 2 test(s) failed |
+| `test_keywordonlyarg.py` | ok / 45.6 ms | exit 1 / 5.9 ms | hydro_fail | error[HYD0103]: keywordonly_sum() got an unexpected keyword argument 'non_existing_arg' |
+| `test_kqueue.py` | exit 1 / 37.3 ms | exit 1 / 330.6 ms | expected_fail | error[HYD0201]: module 'select' has no attribute 'kqueue' |
+| `test_largefile.py` | ok / 1221.7 ms | exit 1 / 335.8 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute 'has_ipv6' |
+| `test_launcher.py` | exit 1 / 61.5 ms | exit 1 / 26.7 ms | expected_fail | error[HYD0002]: module 'winreg' not found: not supported on the import search path |
+| `test_linecache.py` | ok / 104.4 ms | exit 1 / 490.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_list.py` | ok / 357.3 ms | exit 1 / 473.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_listcomps.py` | ok / 122.9 ms | exit 1 / 939.8 ms | hydro_fail | error[HYD0101]: name '__class__' is not defined |
+| `test_lltrace.py` | ok / 53.7 ms | exit 1 / 490.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_locale.py` | ok / 104.7 ms | exit 1 / 340.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_logging.py` | ok / 22460.3 ms | exit 1 / 298.9 ms | hydro_fail | error[HYD0201]: module 'http.client' has no attribute 'HTTPSConnection' |
+| `test_long.py` | ok / 483.8 ms | exit 1 / 431.2 ms | hydro_fail | error[HYD0201]: module 'math' has no attribute 'ldexp' |
+| `test_longexp.py` | ok / 103.6 ms | ok / 9.4 ms | hydro_pass | - |
+| `test_lzma.py` | ok / 165.4 ms | exit 1 / 354.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_mailbox.py` | ok / 1211.9 ms | exit 1 / 530.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_marshal.py` | ok / 207.1 ms | exit 1 / 448.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_math.py` | ok / 8984.4 ms | exit 1 / 670.3 ms | hydro_fail | error[HYD0201]: module 'random' has no attribute 'gauss' |
+| `test_math_property.py` | ok / 53.7 ms | exit 1 / 459.8 ms | hydro_fail | error[HYD0201]: module 'math' has no attribute 'nextafter' |
+| `test_memoryio.py` | ok / 67.9 ms | exit 1 / 1693.9 ms | hydro_fail | AssertionError: 70 test(s) failed |
+| `test_memoryview.py` | ok / 284.6 ms | exit 1 / 344 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_metaclass.py` | ok / 96.4 ms | exit 1 / 2460.8 ms | hydro_fail | AssertionError: 1 test(s) failed |
+| `test_mimetypes.py` | ok / 400.1 ms | exit 1 / 272.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_minidom.py` | ok / 103.5 ms | exit 1 / 2303.4 ms | hydro_fail | AssertionError: 133 test(s) failed |
+| `test_mmap.py` | ok / 93.4 ms | exit 1 / 345.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_modulefinder.py` | ok / 367.8 ms | exit 1 / 597 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '__file__' |
+| `test_monitoring.py` | ok / 63.5 ms | exit 1 / 390.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_msvcrt.py` | exit 1 / 32.7 ms | exit 1 / 26.6 ms | expected_fail | error[HYD0002]: module '_winapi' not found: not supported on the import search path |
+| `test_multibytecodec.py` | ok / 208.7 ms | exit 1 / 338.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_multiprocessing_main_handling.py` | exit 1 / 1308 ms | exit 1 / 354.6 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_named_expressions.py` | ok / 54.7 ms | exit 1 / 29.6 ms | hydro_fail | error[HYD0101]: name '_Foo__x1' is not defined |
+| `test_netrc.py` | ok / 50.8 ms | exit 1 / 1355.1 ms | hydro_fail | UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte |
+| `test_ntpath.py` | ok / 280.5 ms | exit 1 / 428.6 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_nturl2path.py` | ok / 66.2 ms | exit 1 / 575.6 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_numeric_tower.py` | ok / 87.9 ms | exit 1 / 51.4 ms | hydro_fail | AssertionError: 7 test(s) failed |
+| `test_opcache.py` | ok / 371.5 ms | exit 1 / 381.7 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_opcodes.py` | ok / 45.5 ms | exit 1 / 336.8 ms | hydro_fail | error[HYD0201]: module 'types' has no attribute 'new_class' |
+| `test_openpty.py` | ok / 38.6 ms | ok / 6.9 ms | hydro_pass | - |
+| `test_operator.py` | ok / 64.4 ms | exit 1 / 346.4 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_optimizer.py` | ok / 44.5 ms | exit 1 / 344.4 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_optparse.py` | ok / 125.4 ms | exit 1 / 358.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_ordered_dict.py` | ok / 162.5 ms | exit 1 / 378.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_os.py` | exit 1 / 12603.3 ms | exit 1 / 510.8 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_osx_env.py` | ok / 49.1 ms | exit 1 / 349.9 ms | hydro_fail | error[HYD0201]: module 'subprocess' has no attribute 'call' |
+| `test_patma.py` | exit 1 / 56.7 ms | exit 1 / 2508.1 ms | expected_fail | ModuleNotFoundError: No module named 'pyperf' |
+| `test_pdb.py` | exit 1 / 15491 ms | exit 1 / 1118.5 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_peepholer.py` | ok / 333.2 ms | exit 1 / 567 ms | hydro_fail | error[HYD0101]: name 'a' is not defined |
+| `test_pep646_syntax.py` | ok / 185 ms | exit 1 / 2408 ms | hydro_fail | AssertionError: 1 test(s) failed |
+| `test_perf_profiler.py` | ok / 351.8 ms | exit 1 / 451 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_perfmaps.py` | ok / 101.4 ms | exit 1 / 8.4 ms | hydro_fail | ModuleNotFoundError: No module named '_testinternalcapi' |
+| `test_pickle.py` | ok / 2022.5 ms | exit 1 / 978.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_picklebuffer.py` | ok / 125.3 ms | exit 1 / 350.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_pickletools.py` | ok / 479.3 ms | exit 1 / 561.3 ms | hydro_fail | error[HYD0202]: 'None' object does not support item assignment |
+| `test_pkg.py` | ok / 114.2 ms | exit 1 / 35.7 ms | hydro_fail | AssertionError: 7 test(s) failed |
+| `test_pkgutil.py` | exit 1 / 135.4 ms | exit 1 / 355.3 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_platform.py` | ok / 374.7 ms | exit 1 / 361.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_plistlib.py` | ok / 237.7 ms | exit 1 / 1995.5 ms | hydro_fail | TypeError: 'iterator' object is not an iterator |
+| `test_poll.py` | ok / 11251.7 ms | exit 1 / 336.5 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_popen.py` | ok / 153.2 ms | exit 1 / 324.9 ms | hydro_fail | error[HYD0201]: module 'os' has no attribute 'popen' |
+| `test_poplib.py` | ok / 5931.3 ms | exit 1 / 355.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_positional_only_arg.py` | ok / 128.3 ms | exit 1 / 373.8 ms | hydro_fail | error[HYD0103]: global_pos_only_f() missing required positional argument 'a' |
+| `test_posix.py` | exit 1 / 830.4 ms | exit 1 / 353.5 ms | expected_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_posixpath.py` | ok / 289.5 ms | exit 1 / 349.2 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_pow.py` | ok / 258 ms | exit 1 / 239.1 ms | hydro_fail | AssertionError: 4 test(s) failed |
+| `test_pprint.py` | ok / 161.1 ms | exit 1 / 353.4 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_print.py` | ok / 120.9 ms | exit 1 / 1263 ms | hydro_fail | AssertionError: 8 test(s) failed |
+| `test_profile.py` | ok / 300.3 ms | exit 1 / 540.4 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_property.py` | ok / 90.4 ms | exit 1 / 1304.3 ms | hydro_fail | TypeError: class base of 'PropertySub' must be a class object or None, got 'function' |
+| `test_pstats.py` | ok / 155.2 ms | exit 1 / 36.1 ms | hydro_fail | error[HYD0002]: module '_lsprof' not found: not supported on the import search path |
+| `test_pty.py` | ok / 107.5 ms | exit 1 / 341.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_pulldom.py` | ok / 161.4 ms | exit 1 / 151.6 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
+| `test_pwd.py` | ok / 99.3 ms | exit 1 / 338.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_py_compile.py` | ok / 337.9 ms | exit 1 / 460.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_pyclbr.py` | exit 1 / 90.2 ms | exit 1 / 351 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_pyexpat.py` | ok / 272.9 ms | exit 1 / 347.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_queue.py` | ok / 7796.5 ms | exit 1 / 342.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_quopri.py` | ok / 129.6 ms | exit 1 / 342.6 ms | hydro_fail | error[HYD0201]: module 'quopri' has no attribute 'b2a_qp' |
+| `test_raise.py` | ok / 90.4 ms | exit 1 / 1343.9 ms | hydro_fail | TypeError: foo |
+| `test_random.py` | ok / 710 ms | exit 1 / 264.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_range.py` | ok / 225.5 ms | exit 1 / 353.8 ms | hydro_fail | error[HYD0103]: range() takes 1 to 3 positional arguments (0 given) |
+| `test_re.py` | ok / 425 ms | exit 1 / 337.6 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_readline.py` | ok / 245.9 ms | exit 1 / 339.3 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_regrtest.py` | exit 1 / 1434.6 ms | exit 1 / 89 ms | expected_fail | error[HYD0002]: module '_overlapped' not found: not supported on the import search path |
+| `test_remote_pdb.py` | ok / 2004.4 ms | exit 1 / 380.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_repl.py` | ok / 831.9 ms | exit 1 / 449 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_reprlib.py` | ok / 69.9 ms | exit 1 / 1404.5 ms | hydro_fail | UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte |
+| `test_resource.py` | ok / 81.2 ms | exit 1 / 340.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_richcmp.py` | ok / 36 ms | exit 1 / 339.8 ms | hydro_fail | error[HYD0201]: module 'operator' has no attribute '__lt__' |
+| `test_rlcompleter.py` | ok / 79.2 ms | exit 1 / 260 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_robotparser.py` | ok / 685.6 ms | exit 1 / 41.9 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
+| `test_runpy.py` | timeout / 30010.7 ms | exit 1 / 504.9 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_sax.py` | ok / 176.1 ms | exit 1 / 173.8 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
+| `test_sched.py` | ok / 592.6 ms | exit 1 / 326.6 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_scope.py` | ok / 51.6 ms | exit 1 / 343.5 ms | hydro_fail | error[HYD0101]: name 'global_nest_x' is not defined |
+| `test_script_helper.py` | ok / 148.5 ms | exit 1 / 447.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_secrets.py` | ok / 35.9 ms | exit 1 / 89.5 ms | hydro_fail | AssertionError: 1 test(s) failed |
+| `test_select.py` | ok / 1548 ms | exit 1 / 2247.8 ms | hydro_fail | AssertionError: 5 test(s) failed |
+| `test_selectors.py` | ok / 14644.3 ms | exit 1 / 496.2 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute 'has_ipv6' |
+| `test_set.py` | ok / 805.2 ms | exit 1 / 356.5 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_setcomps.py` | ok / 89.8 ms | exit 1 / 3494.3 ms | hydro_fail | AssertionError: 4 test(s) failed |
+| `test_shelve.py` | ok / 2569.3 ms | exit 1 / 426.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_shlex.py` | ok / 114 ms | exit 1 / 317.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_shutil.py` | exit 1 / 387.6 ms | exit 1 / 303.8 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_signal.py` | exit 1 / 14329.4 ms | exit 1 / 528.4 ms | expected_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_site.py` | ok / 976.7 ms | exit 1 / 596.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_slice.py` | ok / 69.7 ms | exit 1 / 1427.1 ms | hydro_fail | AssertionError: 8 test(s) failed |
+| `test_smtplib.py` | ok / 1421.7 ms | exit 1 / 480.9 ms | hydro_fail | error[HYD0102]: sum() start argument must be a number, not list |
+| `test_smtpnet.py` | ok / 3497.3 ms | exit 1 / 405.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_socket.py` | ok / 27349.4 ms | exit 1 / 422 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute 'has_ipv6' |
+| `test_socketserver.py` | ok / 503.4 ms | exit 1 / 541.8 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute 'has_ipv6' |
+| `test_sort.py` | ok / 92.6 ms | exit 1 / 1448.9 ms | hydro_fail | AssertionError: 11 test(s) failed |
+| `test_source_encoding.py` | ok / 12714.3 ms | exit 1 / 461.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_ssl.py` | ok / 20149.4 ms | exit 1 / 332.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_stable_abi_ctypes.py` | exit 1 / 126 ms | exit 1 / 385 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_startfile.py` | exit 1 / 113.2 ms | exit 1 / 359.9 ms | expected_fail | error[HYD0201]: module 'os' has no attribute 'path' |
+| `test_stat.py` | ok / 148.8 ms | exit 1 / 371.3 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute 'has_ipv6' |
+| `test_statistics.py` | ok / 9299.8 ms | exit 1 / 1045.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_str.py` | ok / 1069.1 ms | exit 1 / 355.2 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_strftime.py` | ok / 153.4 ms | exit 1 / 1672.1 ms | hydro_fail | AssertionError: 1 test(s) failed |
+| `test_string_literals.py` | ok / 124.1 ms | exit 1 / 61 ms | hydro_fail | AssertionError: 19 test(s) failed |
+| `test_stringprep.py` | ok / 108.3 ms | exit 1 / 130.5 ms | hydro_fail | AssertionError: 1 test(s) failed |
+| `test_strptime.py` | ok / 144.5 ms | exit 1 / 337.3 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_strtod.py` | ok / 261.9 ms | exit 1 / 1464.1 ms | hydro_fail | RuntimeError: unittest.SkipTest: correctly-rounded string->float conversions not available on this system |
+| `test_struct.py` | ok / 476.3 ms | exit 1 / 420.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_structseq.py` | ok / 206.4 ms | exit 1 / 507.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_subclassinit.py` | ok / 129.1 ms | exit 1 / 7.1 ms | hydro_fail | error[HYD0002]: class keyword 'otherarg' cannot be forwarded together with metaclass=; Hydro's metaclass hook… |
+| `test_subprocess.py` | exit 1 / 15755.3 ms | exit 1 / 367.2 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_sundry.py` | ok / 95.7 ms | exit 1 / 395.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_super.py` | ok / 212.5 ms | exit 1 / 328.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_support.py` | exit 1 / 5582.4 ms | exit 1 / 532.4 ms | expected_fail | error[HYD0102]: unsupported operand type(s) for -: 'None' and 'float' |
+| `test_symtable.py` | ok / 72.9 ms | exit 1 / 2167.5 ms | hydro_fail | UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte |
+| `test_syntax.py` | ok / 172.8 ms | exit 1 / 3955.9 ms | hydro_fail | AssertionError: 40 test(s) failed |
+| `test_sys.py` | exit 1 / 1499.8 ms | exit 1 / 540.5 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_sys_setprofile.py` | ok / 45.7 ms | exit 1 / 180.8 ms | hydro_fail | AssertionError: 27 test(s) failed |
+| `test_sys_settrace.py` | ok / 877.1 ms | exit 1 / 456.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_sysconfig.py` | exit 1 / 232.5 ms | exit 1 / 412.9 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_syslog.py` | ok / 197.4 ms | exit 1 / 388.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_tabnanny.py` | ok / 100.5 ms | exit 1 / 513.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_tarfile.py` | exit 1 / 6182.3 ms | exit 1 / 316.1 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_tcl.py` | ok / 108.9 ms | exit 1 / 48 ms | hydro_fail | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
+| `test_tempfile.py` | ok / 343.8 ms | exit 1 / 464.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_termios.py` | ok / 551.5 ms | exit 1 / 333.9 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_textwrap.py` | ok / 42.1 ms | exit 1 / 124.8 ms | hydro_fail | AssertionError: 33 test(s) failed |
+| `test_thread.py` | ok / 1268.4 ms | exit 1 / 331.8 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_thread_local_bytecode.py` | ok / 42.8 ms | exit 1 / 364.9 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_threadedtempfile.py` | ok / 46.8 ms | exit 1 / 325.7 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_threading.py` | exit 1 / 13948.2 ms | exit 1 / 342.3 ms | expected_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_threading_local.py` | ok / 278.7 ms | exit 1 / 980.8 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_threadsignals.py` | ok / 4881.3 ms | exit 1 / 446.6 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_time.py` | ok / 3075.1 ms | exit 1 / 337.8 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_timeit.py` | ok / 58.3 ms | exit 1 / 334.2 ms | hydro_fail | error[HYD0201]: module 'timeit' has no attribute 'reindent' |
+| `test_timeout.py` | ok / 9335.3 ms | exit 1 / 332.4 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute 'has_ipv6' |
+| `test_tokenize.py` | ok / 6720.1 ms | exit 1 / 496 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_trace.py` | ok / 966.4 ms | exit 1 / 460.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_traceback.py` | exit 1 / 2150.4 ms | exit 1 / 277.1 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_tracemalloc.py` | ok / 660.9 ms | exit 1 / 283.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_tstring.py` | exit 1 / 272.4 ms | exit 1 / 451.7 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_ttk_textonly.py` | ok / 72.7 ms | exit 1 / 41.9 ms | hydro_fail | error[HYD0002]: module '_tkinter' not found: not supported on the import search path |
+| `test_tty.py` | ok / 46.5 ms | exit 1 / 344.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_tuple.py` | ok / 219.3 ms | exit 1 / 344.3 ms | hydro_fail | error[HYD0103]: tuple() does not accept the keyword argument 'sequence' |
+| `test_turtle.py` | ok / 155.8 ms | exit 1 / 270.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_type_aliases.py` | ok / 53.2 ms | exit 1 / 340 ms | hydro_fail | error[HYD0101]: name 'A' is not defined |
+| `test_type_annotations.py` | ok / 50.5 ms | exit 1 / 357.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_type_cache.py` | exit 1 / 45.7 ms | exit 1 / 391.4 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_type_comments.py` | ok / 50.6 ms | exit 1 / 341.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_type_params.py` | ok / 56.6 ms | exit 1 / 5.7 ms | hydro_fail | error[HYD0001]: invalid syntax: invalid syntax. Got unexpected token '=' |
+| `test_typechecks.py` | ok / 42.1 ms | exit 1 / 19.2 ms | hydro_fail | AssertionError: 3 test(s) failed |
+| `test_types.py` | ok / 205.7 ms | exit 1 / 494.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_typing.py` | ok / 358.1 ms | exit 1 / 289.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_ucn.py` | ok / 131.1 ms | exit 1 / 27.4 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
+| `test_unary.py` | ok / 40.4 ms | ok / 11.8 ms | hydro_pass | - |
+| `test_unicode_file.py` | ok / 51.9 ms | exit 1 / 350.6 ms | hydro_fail | error[HYD0201]: module 'os.path' has no attribute 'supports_unicode_filenames' |
+| `test_unicode_file_functions.py` | ok / 69.7 ms | exit 1 / 336.4 ms | hydro_fail | error[HYD0201]: module 'os.path' has no attribute 'supports_unicode_filenames' |
+| `test_unicode_identifiers.py` | ok / 43.6 ms | exit 1 / 8.7 ms | hydro_fail | AssertionError: 3 test(s) failed |
+| `test_unicodedata.py` | ok / 4228.6 ms | exit 1 / 464.1 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_univnewlines.py` | ok / 55.6 ms | exit 1 / 1630.2 ms | hydro_fail | UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte |
+| `test_unpack.py` | exit 1 / 108 ms | exit 1 / 2475.7 ms | expected_fail | AssertionError: 2 test(s) failed |
+| `test_unpack_ex.py` | exit 1 / 111.8 ms | exit 1 / 2452.1 ms | expected_fail | AssertionError: 1 test(s) failed |
+| `test_unparse.py` | ok / 5980.6 ms | exit 1 / 1691.2 ms | hydro_fail | AssertionError: 863 test(s) failed |
+| `test_urllib.py` | ok / 353.5 ms | exit 1 / 198.2 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
+| `test_urllib2.py` | ok / 946 ms | exit 1 / 502.7 ms | hydro_fail | error[HYD0201]: module 'warnings' has no attribute 'WarningMessage' |
+| `test_urllib2_localnet.py` | ok / 2097.6 ms | exit 1 / 185.5 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
+| `test_urllib2net.py` | ok / 18017.9 ms | exit 1 / 424.2 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute 'has_ipv6' |
+| `test_urllib_response.py` | ok / 86.6 ms | exit 1 / 38 ms | hydro_fail | error[HYD0201]: module 'tempfile' has no attribute '_TemporaryFileWrapper' |
+| `test_urllibnet.py` | ok / 2944.4 ms | exit 1 / 409.8 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute 'has_ipv6' |
+| `test_urlparse.py` | ok / 122.8 ms | exit 1 / 602.7 ms | hydro_fail | error[HYD0201]: module 'sys' has no attribute 'maxunicode' |
+| `test_userdict.py` | ok / 128.2 ms | exit 1 / 1415.6 ms | hydro_fail | AssertionError: 82 test(s) failed |
+| `test_userlist.py` | ok / 136.6 ms | exit -6 / 1914.5 ms | hydro_fail | fatal runtime error: stack overflow, aborting |
+| `test_userstring.py` | ok / 572.4 ms | exit 1 / 358.5 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_utf8_mode.py` | ok / 410 ms | exit 1 / 458.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_utf8source.py` | ok / 42.3 ms | exit 1 / 8.2 ms | hydro_fail | AssertionError: 2 test(s) failed |
+| `test_uuid.py` | ok / 203.2 ms | exit 1 / 475.2 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_venv.py` | exit 1 / 8287.4 ms | exit 1 / 533.2 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_wait3.py` | ok / 5061.6 ms | exit 1 / 344.9 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_wait4.py` | ok / 5054.5 ms | exit 1 / 333.9 ms | hydro_fail | error[HYD0201]: module '_thread' has no attribute '_count' |
+| `test_wave.py` | ok / 68.7 ms | exit 1 / 1488.6 ms | hydro_fail | UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte |
+| `test_weakref.py` | exit 1 / 2363.5 ms | exit 1 / 982.6 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_weakset.py` | ok / 63 ms | exit 1 / 1765.9 ms | hydro_fail | AssertionError: 33 test(s) failed |
+| `test_webbrowser.py` | ok / 1997 ms | exit 1 / 356.7 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_winapi.py` | exit 1 / 45.6 ms | exit 1 / 339.6 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_winconsoleio.py` | exit 1 / 45.6 ms | exit 1 / 26.3 ms | expected_fail | error[HYD0002]: module '_testconsole' not found: not supported on the import search path |
+| `test_winreg.py` | exit 1 / 46.6 ms | exit 1 / 28.1 ms | expected_fail | error[HYD0002]: module 'winreg' not found: not supported on the import search path |
+| `test_winsound.py` | exit 1 / 46.5 ms | exit 1 / 354.5 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_with.py` | ok / 45.1 ms | exit 1 / 117.2 ms | hydro_fail | error[HYD0101]: name 'foo' is not defined |
+| `test_wmi.py` | exit 1 / 41.1 ms | exit 1 / 342.1 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_wsgiref.py` | ok / 187.5 ms | exit 1 / 371.7 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute 'has_ipv6' |
+| `test_xml_dom_minicompat.py` | ok / 43.7 ms | exit 1 / 194.3 ms | hydro_fail | AssertionError: 11 test(s) failed |
+| `test_xml_dom_xmlbuilder.py` | ok / 142.1 ms | exit 1 / 516.3 ms | hydro_fail | error[HYD0201]: module 'socket' has no attribute 'has_ipv6' |
+| `test_xml_etree.py` | ok / 1225.4 ms | exit 1 / 303 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_xml_etree_c.py` | ok / 506.3 ms | exit 1 / 455.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_xmlrpc.py` | ok / 27427.7 ms | exit 1 / 261.7 ms | hydro_fail | error[HYD0201]: module 'errno' has no attribute 'ECONNRESET' |
+| `test_xpickle.py` | ok / 2030.9 ms | exit 1 / 597.2 ms | hydro_fail | error[HYD0202]: 'None' object does not support item assignment |
+| `test_xxlimited.py` | exit 1 / 54.9 ms | exit 1 / 382.1 ms | expected_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_xxtestfuzz.py` | ok / 63.3 ms | exit 1 / 427.3 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_yield_from.py` | ok / 70.8 ms | exit 1 / 1683.5 ms | hydro_fail | AssertionError: 56 test(s) failed |
+| `test_zipapp.py` | ok / 140.7 ms | exit 1 / 701.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_zipfile64.py` | timeout / 30029.5 ms | exit 1 / 482.6 ms | expected_fail | error[HYD0201]: module 'tempfile' has no attribute 'TemporaryFile' |
+| `test_zipimport.py` | ok / 16211 ms | exit 1 / 301.4 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'result' |
+| `test_zipimport_support.py` | ok / 438.2 ms | exit 1 / 1121.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_zlib.py` | ok / 407.1 ms | exit 1 / 341.6 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
+| `test_zstd.py` | ok / 344.4 ms | exit 1 / 353.8 ms | hydro_fail | error[HYD0201]: module 'unittest' has no attribute 'mock' |
 
 <!-- END GENERATED RESULTS -->

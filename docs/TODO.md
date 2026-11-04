@@ -418,9 +418,11 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       **3.14.9** oracle, JSON + `docs/CPYTHON_TESTS.md`, release gate
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
       Manifest `tests/compat/cpython-3.14.9.json` records `minimum_passing=3`
-      for the 2026-10-31 full run's **6/398** genuine passes
-      (`test_colorsys.py`, `test_errno.py`, `test_int_literal.py`,
-      `test_longexp.py`, `test_openpty.py`, `test_unary.py`); `required`
+      for the 2026-11-05 full run's **9/398** genuine passes
+      (`test_colorsys.py`, `test_compiler_assemble.py`,
+      `test_compiler_codegen.py`, `test_errno.py`, `test_file_eintr.py`,
+      `test_int_literal.py`, `test_longexp.py`, `test_openpty.py`,
+      `test_unary.py`); `required`
       stays empty until a never-regress subset is pinned. It grows only from
       real `hydro_pass` results.
       Stdlib import baseline 2026-10-30: **288/297 importable** (52
@@ -434,7 +436,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       package/site-packages loader and the native
       `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/`importlib`/
       `__future__` modules are importable and API-tested.
-      Official-suite baseline 2026-10-31: **6/398 passing** (330
+      Official-suite baseline 2026-11-05: **9/398 passing** (327
       `hydro_fail`, 62 `expected_fail` where CPython also fails; 0 timeouts). No test is marked
       passing unless CPython 3.14.9 and Hydro both exit 0.
       The harness runs a defined subset of CPython 3.14 `Lib/test` against

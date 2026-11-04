@@ -106,7 +106,8 @@ Other docs must link here instead of repeating the total.
   harness now sets `HYDRO_STDLIB` to the pinned CPython `Lib` tree; the earlier
   159 count used the toolchain's default subset. Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
-- **Official suite:** **6/398 passing** (`test_colorsys.py`, `test_errno.py`,
+- **Official suite:** **9/398 passing** (`test_colorsys.py`, `test_compiler_assemble.py`,
+  `test_compiler_codegen.py`, `test_errno.py`, `test_file_eintr.py`,
   `test_int_literal.py`, `test_longexp.py`, `test_openpty.py`, `test_unary.py`),
   330 `hydro_fail`, 62 `expected_fail` (CPython also fails), 0 timeouts; full
   differential run took 894.3 s. Manifest `tests/compat/cpython-3.14.9.json`
