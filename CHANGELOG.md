@@ -18,6 +18,10 @@ initial state of the first runnable core.
 - Official `Lib/test` differential baseline rose from 3/398 to **6/398**
   (`test_colorsys`, `test_errno`, `test_int_literal`, `test_longexp`,
   `test_openpty`, `test_unary`); 330 `hydro_fail`, 62 `expected_fail`.
+- Package initializers split at `from . import sub` when the submodule reads a
+  package prefix, so submodule function defaults can resolve names defined
+  before the import; this fixes initializing-package cycles for the
+  `_NoValue`-style shape.
 - Ecosystem gate remains **9/13**: pydantic import/smoke pass; NumPy now stops
   on missing `_NoValue` after code-object metadata (`co_argcount`,
   `co_kwonlyargcount`, `co_varnames`, flags), DType/metatype, PARSE,

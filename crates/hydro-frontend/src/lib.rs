@@ -3527,6 +3527,38 @@ fn compound_imports_module(stmt: &ast::Stmt, package: &str, module: &str) -> boo
     }
 }
 
+/// Whether the module-level `from ... import ...` statement names the
+/// submodule `dep` of the package whose `__package__` is `package`.
+///
+/// `from ._path import Path` resolves straight to `pkg._path`. `from . import
+/// sub` (`module` is `None`) resolves to the package itself and names the
+/// submodule through one of the imported aliases, exactly like CPython's
+/// import machinery binds `pkg.sub` for that spelling.
+fn from_import_names_submodule(import: &ast::StmtImportFrom, package: &str, dep: &str) -> bool {
+    let level = import
+        .level
+        .as_ref()
+        .map(|level| level.to_u32())
+        .unwrap_or(0);
+    let Ok(module) = lower::resolve_import_name(
+        level,
+        import.module.as_ref().map(|module| module.as_str()),
+        package,
+    ) else {
+        return false;
+    };
+    if module == dep {
+        return true;
+    }
+    let Some((_, leaf)) = dep.rsplit_once('.') else {
+        return false;
+    };
+    if format!("{module}.{leaf}") != dep {
+        return false;
+    }
+    import.names.iter().any(|alias| alias.name.as_str() == leaf)
+}
+
 /// Whether `package` may initialize before the submodule `unit` it imports,
 /// even though `unit` names `package` as a late (cycle) import.
 ///
@@ -3538,14 +3570,21 @@ fn compound_imports_module(stmt: &ast::Stmt, package: &str, module: &str) -> boo
 /// order is package first, and the package's import bindings are published by
 /// an extra initializer segment.
 ///
+/// `pkgx/__init__.py` is the same shape with a module-identity import: it
+/// defines `_NoValue = 42` and then does `from . import sub`, and
+/// `pkgx/sub.py` reads `_NoValue` back at definition time (`def f(x=_NoValue)`).
+/// Running the submodule first leaves the package global table empty, so the
+/// read resolves to nothing; the package body's prefix must run first.
+///
 /// The reversal is only safe when every import of the submodule is a direct
-/// top-level `from <submodule> import ...`, the package body never reads the
-/// imported names while it initializes, and those imports are the *tail* of
-/// the module body (the `zipfile` shape). A package that defines more names
-/// after the import keeps the established submodule-first order: its later
-/// definitions must stay in the package body, not move to the deferred
-/// segment (`pkg/__init__.py` imports `run` first and defines `greeting`
-/// afterwards, and `pkg.child` resolves `greeting` late from a function).
+/// top-level `from <submodule> import ...` or `from . import <submodule>`, the
+/// package body never reads the imported names while it initializes, and those
+/// imports are the *tail* of the module body (the `zipfile` shape). A package
+/// that defines more names after the import keeps the established
+/// submodule-first order: its later definitions must stay in the package body,
+/// not move to the deferred segment (`pkg/__init__.py` imports `run` first and
+/// defines `greeting` afterwards, and `pkg.child` resolves `greeting` late from
+/// a function).
 fn deferrable_cycle_import(units: &[LoadedModule], package: usize, unit: usize) -> bool {
     let p = &units[package];
     let dep = units[unit].name.as_str();
@@ -3559,15 +3598,7 @@ fn deferrable_cycle_import(units: &[LoadedModule], package: usize, unit: usize) 
                 }
             }
             ast::Stmt::ImportFrom(s) => {
-                let level = s.level.as_ref().map(|level| level.to_u32()).unwrap_or(0);
-                let Ok(module) = lower::resolve_import_name(
-                    level,
-                    s.module.as_ref().map(|module| module.as_str()),
-                    &p.package,
-                ) else {
-                    continue;
-                };
-                if module != dep {
+                if !from_import_names_submodule(s, &p.package, dep) {
                     continue;
                 }
                 if s.names.iter().any(|alias| alias.name.as_str() == "*") {
@@ -3610,15 +3641,7 @@ fn deferrable_cycle_import(units: &[LoadedModule], package: usize, unit: usize) 
         let ast::Stmt::ImportFrom(s) = stmt else {
             return false;
         };
-        let level = s.level.as_ref().map(|level| level.to_u32()).unwrap_or(0);
-        let Ok(module) = lower::resolve_import_name(
-            level,
-            s.module.as_ref().map(|module| module.as_str()),
-            &p.package,
-        ) else {
-            return false;
-        };
-        if module != dep {
+        if !from_import_names_submodule(s, &p.package, dep) {
             return false;
         }
     }

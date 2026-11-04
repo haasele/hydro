@@ -3174,6 +3174,13 @@ impl<'a> Lowerer<'a> {
 
     /// The resolved module of a module-level `from ... import ...` statement
     /// when the loader ordered that module's body *after* this unit.
+    ///
+    /// `from <submodule> import name` names the deferred module directly.
+    /// `from . import sub` inside a package `__init__.py` resolves to the
+    /// package itself and names the deferred submodule through its alias, so
+    /// the statement still marks the boundary where the package body stops and
+    /// the submodule initializes (see
+    /// [`crate::reversed_cycle_imports`]).
     fn deferred_import_module(&self, import: &ast::StmtImportFrom) -> Option<String> {
         if self.initializer_deferred_modules.is_empty() {
             return None;
@@ -3189,9 +3196,25 @@ impl<'a> Lowerer<'a> {
             &self.package,
         )
         .ok()?;
-        self.initializer_deferred_modules
-            .contains(&module)
-            .then_some(module)
+        if self.initializer_deferred_modules.contains(&module) {
+            return Some(module);
+        }
+        // `from . import sub` is the package importing its own submodule: the
+        // statement resolves to this unit, so only the alias names the module
+        // whose initializer runs next. A statement naming several deferred
+        // submodules is not split: its module-identity stores are harmless
+        // before either body runs, and the tail contract keeps it last.
+        if module != self.dunder_name {
+            return None;
+        }
+        let mut deferred = import.names.iter().filter_map(|alias| {
+            let full = format!("{module}.{}", alias.name.as_str());
+            self.initializer_deferred_modules
+                .contains(&full)
+                .then_some(full)
+        });
+        let first = deferred.next()?;
+        deferred.next().is_none().then_some(first)
     }
 
     /// Split the lowered module body at the deferred import boundaries.
@@ -6322,7 +6345,20 @@ impl<'a> Lowerer<'a> {
                 }
                 value
             } else if let Some(module) = self.user_module_aliases.get(&binding).cloned() {
-                self.module_ref_expr(&module, line, col)
+                let value = self.module_ref_expr(&module, line, col);
+                if self.collect_initializer_segment
+                    && self.initializer_deferred_modules.contains(&module)
+                {
+                    // `from . import sub` imports a module this unit must let
+                    // initialize first (the loader reversed the cycle): the
+                    // module value itself is available through the registry,
+                    // but publishing the binding belongs after the submodule's
+                    // body ran, exactly where CPython binds it.
+                    let store = self.session_global_store(&binding, value, line, col);
+                    self.deferred_initializer_stores.push(store);
+                    continue;
+                }
+                value
             } else if let Some((module, function)) = self.imported_functions.get(&binding).copied()
             {
                 self.module_attr_expr(module.name, function.name, line, col)

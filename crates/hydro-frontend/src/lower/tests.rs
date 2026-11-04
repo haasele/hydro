@@ -19003,6 +19003,128 @@ fn deferred_import_binding_runs_in_a_later_initializer_segment() {
 }
 
 #[test]
+fn module_identity_import_of_a_deferred_submodule_splits_the_package_body() {
+    // `pkgx/__init__.py` defines `_NoValue` and only then imports `.sub`,
+    // which reads `_NoValue` back at definition time. The loader orders the
+    // package prefix first and publishes the submodule binding after `sub`
+    // initialized, so the prefix assignment must stay in the module body while
+    // `from . import sub` moves to a later initializer segment.
+    let source = "_NoValue = 42\nfrom . import sub\n";
+    let mut infer = Infer::new();
+    let mut lowerer = Lowerer::new(source, "pkgx/__init__.py", &mut infer);
+    lowerer.set_mirror_all_globals(true);
+    lowerer.set_dunder_name("pkgx");
+    lowerer.set_package("pkgx");
+    lowerer.set_user_modules(HashMap::from([(
+        "pkgx.sub".to_string(),
+        user_module("pkgx.sub", &[]),
+    )]));
+    lowerer.set_initializer_deferred_modules(std::collections::HashSet::from([
+        "pkgx.sub".to_string()
+    ]));
+    let hir = lowerer.lower_module(&parse(source));
+    let segments = lowerer.take_module_segments();
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    // The package prefix still runs in the module body.
+    assert!(matches!(
+        &assigned(&hir, "_NoValue").kind,
+        HExprKind::Const(Const::Int(42))
+    ));
+    assert!(
+        global_set_value(&hir.functions[0].body, "sub").is_none(),
+        "the submodule binding must not be published by the prefix"
+    );
+
+    assert_eq!(segments.len(), 1, "one deferred segment: {segments:?}");
+    let (segment_id, module) = &segments[0];
+    assert_eq!(module, "pkgx.sub");
+    let segment = hir
+        .functions
+        .get(*segment_id as usize)
+        .expect("segment function is lowered");
+    assert_eq!(segment.name, "<imports>");
+    assert!(
+        matches!(
+            global_set_value(&segment.body, "sub").map(|value| &value.kind),
+            Some(HExprKind::ModuleRef { module }) if module == "pkgx.sub"
+        ),
+        "segment must publish the submodule identity: {:?}",
+        segment.body
+    );
+}
+
+#[test]
+fn initializing_package_member_read_by_a_default_stays_a_late_read() {
+    // `pkgx/sub.py` (`from pkgx import _NoValue`, then `def f(x=_NoValue)`)
+    // while `pkgx` is still initializing: the binding must not be read
+    // eagerly, and the parameter default resolves through the package global
+    // table when the function value is created.
+    let source = "from pkgx import _NoValue\ndef f(x=_NoValue):\n    return x\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lower_package_submodule(source, &mut infer, vec![], &["pkgx"]);
+    // An imported unit mirrors its import bindings into its global table.
+    lowerer.set_mirror_all_globals(true);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    assert!(
+        global_set_value(&hir.functions[0].body, "_NoValue").is_none(),
+        "an initializing package member must not be read eagerly"
+    );
+    let function = hir
+        .functions
+        .iter()
+        .find(|function| function.name == "f")
+        .expect("f is lowered");
+    let default = function.params[0]
+        .default_expr
+        .as_ref()
+        .unwrap_or_else(|| panic!("f keeps its default expression: {function:?}"));
+    assert!(
+        matches!(
+            &default.kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "pkgx" && name == "_NoValue"
+        ),
+        "the default reads the package global: {:?}",
+        default.kind
+    );
+}
+
+#[test]
+fn linked_module_member_read_by_a_default_is_published_eagerly() {
+    // A linked module already initialized, so `from pkgx import value` is a
+    // compile-time read of its global table and the binding is mirrored where
+    // the import runs.
+    let source = "from pkgx import value\ndef f(x=value):\n    return x\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lower_package_submodule(
+        source,
+        &mut infer,
+        vec![user_module("pkgx", &[("value", UserExport::Global)])],
+        &[],
+    );
+    lowerer.set_mirror_all_globals(true);
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(
+            global_set_value(&hir.functions[0].body, "value").map(|value| &value.kind),
+            Some(HExprKind::GlobalGet { module, name })
+                if module == "pkgx" && name == "value"
+        ),
+        "the linked member is read where the import runs"
+    );
+}
+
+#[test]
 fn class_constructor_mapping_binds_required_slots_at_runtime() {
     // `Flags(self, **flags)` in pandas: the mapping keys are only known at
     // runtime, so the constructor binds through the runtime class-call
