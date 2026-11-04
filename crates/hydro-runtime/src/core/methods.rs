@@ -139,6 +139,17 @@ pub(crate) fn call(
     if let Some(result) = crate::core::template::call_method(obj, &method, argc, argv) {
         return result;
     }
+    // A namespace member used as `obj.method()` is a plain value stored in
+    // the namespace, not a bound method: call it without an implicit self.
+    if let Some(pairs) = value::as_namespace(obj) {
+        if let Some((_, function)) = pairs.iter().find(|(name, _)| name == &method) {
+            // A zero-argument native function stored in a namespace is a
+            // plain callable (`sys._jit.is_enabled`), not a bound method.
+            if value::as_function(*function).is_some_and(|function| function.arity == 0) {
+                return builtins::call(*function, argc, argv);
+            }
+        }
+    }
     if let Some(module) = value::as_module(obj) {
         let function = modules::module_attr(module, &method);
         if exc::pending() {
@@ -1731,6 +1742,13 @@ pub(crate) fn call_kw(
             return modules::extension::ext_object_method_kw(
                 extension, &method, argc, argv, kwargc, kw_argv,
             );
+        }
+    }
+    if let Some(pairs) = value::as_namespace(obj) {
+        if let Some((_, function)) = pairs.iter().find(|(name, _)| name == &method) {
+            if value::as_function(*function).is_some_and(|function| function.arity == 0) {
+                return builtins::call_kw(*function, argc, argv, kwargc, kw_argv);
+            }
         }
     }
     if let Some(module) = value::as_module(obj) {
@@ -5640,6 +5658,28 @@ fn float_class_method(obj: i64, method: &str, args: &[i64], keywords: &[(String,
                 return err;
             }
             builtins::float_fromhex(args[0])
+        }
+        "__getformat__" => {
+            if !keywords.is_empty() {
+                return type_error("__getformat__() takes no keyword arguments".to_string());
+            }
+            if let Some(err) = check_arity("float", method, args.len(), 1, 1) {
+                return err;
+            }
+            let Some(format) = value::as_str(args[0]) else {
+                return type_error(format!(
+                    "__getformat__() argument must be str, not {}",
+                    value::type_name(args[0])
+                ));
+            };
+            match format {
+                "double" | "float" => value::str_from_bytes(if cfg!(target_endian = "little") {
+                    b"IEEE, little-endian"
+                } else {
+                    b"IEEE, big-endian"
+                }),
+                _ => crate::exc::raise_with_message(crate::exc::VALUE_ERROR, "unknown format code"),
+            }
         }
         _ => attribute_error(obj, method),
     }

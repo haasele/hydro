@@ -320,6 +320,20 @@ fn is_empty(value_in: i64) -> bool {
     value_in == empty_class()
 }
 
+/// `inspect._sentinel`: the unique marker `find_name_in_mro` compares with
+/// `is` to distinguish "no default was supplied" from any value a caller can
+/// pass. Cached in the runtime registry, so every read of the module attribute
+/// is the same object.
+fn sentinel() -> i64 {
+    const KEY: &str = "inspect._sentinel";
+    if let Some(existing) = cached(KEY) {
+        return existing;
+    }
+    let marker = value::instance_new(value::object_class());
+    cache(KEY, marker);
+    marker
+}
+
 fn kind_member(index: i64) -> Option<i64> {
     // Out-of-range indices never map to a kind, so they must not materialize
     // the class either.
@@ -2020,7 +2034,7 @@ fn is_coroutine_function(obj: i64) -> bool {
 /// surface. As in CPython, a bound method marks its underlying function. A
 /// callable without writable function metadata (a native/builtin function)
 /// raises a precise `AttributeError` instead of silently succeeding.
-fn mark_coroutine_function(obj: i64) -> i64 {
+pub(crate) fn mark_coroutine_function(obj: i64) -> i64 {
     // Bound methods and `functools.partial` wrappers are marked on the
     // underlying function, exactly like `iscoroutinefunction` looks through
     // them.
@@ -3275,6 +3289,46 @@ fn getmro_impl(class: i64) -> i64 {
     value::tuple_new(value::class_mro(class))
 }
 
+/// `inspect._static_getmro(cls)`: CPython's `type.__dict__['__mro__']
+/// .__get__(cls)`, the MRO tuple without the descriptor protocol.
+///
+/// Hydro records the linearization on every class value, so the tuple is read
+/// straight from the class state. A non-class operand raises the `TypeError`
+/// the `type` descriptor raises for a value it does not apply to.
+fn static_getmro_impl(class: i64) -> i64 {
+    if value::as_class(class).is_none() {
+        return type_error(&format!(
+            "descriptor '__mro__' for 'type' objects doesn't apply to a '{}' object",
+            value::type_name(class)
+        ));
+    }
+    value::tuple_new(value::class_mro(class))
+}
+
+/// `inspect._get_dunder_dict_of_class(cls)`: the class namespace,
+/// `type.__dict__['__dict__'].__get__(cls)`.
+///
+/// Hydro has no `mappingproxy`, so the result is a dict snapshot of the
+/// class's own namespace in definition order (the same shape `Cls.__dict__`
+/// reports). `test.support` only probes it with `name in ns`/`ns[name]`, so a
+/// snapshot preserves the observable behaviour.
+fn dunder_dict_of_class_impl(class: i64) -> i64 {
+    if value::as_class(class).is_none() {
+        return type_error(&format!(
+            "descriptor '__dict__' for 'type' objects doesn't apply to a '{}' object",
+            value::type_name(class)
+        ));
+    }
+    let pairs = value::class_namespace(class);
+    let dict = value::dict_new(Vec::new());
+    let mut guard = Roots::new();
+    guard.keep(&[dict]);
+    for (name, item) in pairs {
+        dict_insert_name(dict, &name, item);
+    }
+    dict
+}
+
 /// `isinstance(object, types.<class_name>)` for the `types` placeholder
 /// classes (`TracebackType`, `MethodWrapperType`). Hydro reifies neither kind,
 /// so the predicate reports `False` for every value, exactly like CPython
@@ -3607,6 +3661,7 @@ pub(crate) fn constant(name: &str) -> i64 {
         return integer(flag);
     }
     match name {
+        "_sentinel" => sentinel(),
         "empty" | "_empty" => empty_class(),
         "_POSITIONAL_ONLY" => kind_member(POSITIONAL_ONLY).unwrap_or(NONE),
         "_POSITIONAL_OR_KEYWORD" => kind_member(POSITIONAL_OR_KEYWORD).unwrap_or(NONE),
@@ -3657,6 +3712,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "istraceback" => istraceback_impl(args[0]),
         "ismethodwrapper" => ismethodwrapper_impl(args[0]),
         "getmro" => getmro_impl(args[0]),
+        "_static_getmro" => static_getmro_impl(args[0]),
+        "_get_dunder_dict_of_class" => dunder_dict_of_class_impl(args[0]),
         // Hydro has no frame, code or traceback objects.
         "isframe" | "iscode" => FALSE,
         "ismethoddescriptor" => value::bool_value(object_is_method_descriptor(args[0])),
@@ -4552,5 +4609,55 @@ mod tests {
             value::as_module(call("getmodule", &[cleandoc])).map(|state| state.name().to_string()),
             Some("inspect".to_string())
         );
+    }
+
+    #[test]
+    fn private_mro_and_class_namespace_helpers() {
+        exc::init();
+        // `_sentinel` is one stable object: `find_name_in_mro` compares it
+        // with `is` to detect an omitted default.
+        let marker = constant("_sentinel");
+        assert_eq!(marker, constant("_sentinel"));
+        assert_ne!(marker, NONE);
+        assert!(value::instance_class_value(marker).is_some());
+
+        let attribute = value::str_alloc("shared".to_string());
+        let base = value::class_new_full(
+            "Base".to_string(),
+            NONE,
+            Vec::new(),
+            vec![("shared".to_string(), attribute)],
+        );
+        let derived = value::class_new("Derived".to_string(), base, Vec::new());
+        let roots = heap::root_values(&[base, derived, attribute]);
+        assert!(!exc::pending());
+
+        // `_static_getmro` is `type.__dict__['__mro__'].__get__(cls)`.
+        let mro = call("_static_getmro", &[derived]);
+        assert!(!exc::pending());
+        let mro = value::as_tuple(mro).expect("mro tuple");
+        assert_eq!(mro.first().copied(), Some(derived));
+        assert!(mro.contains(&base));
+
+        // The class namespace mapping exposes the class's own attributes and
+        // no inherited ones.
+        let namespace = call("_get_dunder_dict_of_class", &[derived]);
+        assert!(!exc::pending());
+        assert_eq!(dict_lookup_name(namespace, "shared"), None);
+        let base_namespace = call("_get_dunder_dict_of_class", &[base]);
+        assert!(!exc::pending());
+        assert_eq!(dict_lookup_name(base_namespace, "shared"), Some(attribute));
+
+        // Both helpers reject a non-class operand the way the `type`
+        // descriptors do.
+        exc::init();
+        let _ = call("_static_getmro", &[integer(3)]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+        exc::init();
+        let _ = call("_get_dunder_dict_of_class", &[integer(3)]);
+        assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
+        exc::clear();
+        heap::release_roots(roots);
     }
 }

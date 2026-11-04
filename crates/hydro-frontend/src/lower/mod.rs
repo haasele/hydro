@@ -1119,7 +1119,12 @@ fn runtime_conditional_member(module: &str, name: &str) -> bool {
         (module, name),
         ("sys", "pypy_version_info")
             | ("os", "O_BINARY" | "startfile")
-            | ("ctypes", "windll" | "oledll")
+            | (
+                "ctypes",
+                "windll" | "oledll" | "WinDLL" | "WinError" | "pythonapi"
+            )
+            | ("sysconfig", "customize_compiler")
+            | ("os", "chflags" | "lchflags")
     )
 }
 
@@ -1617,7 +1622,7 @@ fn exception_type_catches_import_error(type_expr: &ast::Expr) -> bool {
 /// Truth value of an `if` guard that the import contract fixes statically.
 ///
 /// Returns `Some(true)` when the body always runs, `Some(false)` when it
-/// never runs and `None` for a dynamic condition. Four guards are static:
+/// never runs and `None` for a dynamic condition. These guards are static:
 ///
 /// - `TYPE_CHECKING` (bare or `typing.TYPE_CHECKING`) is `False` at runtime
 ///   and this frontend never evaluates annotations, so the guarded body is
@@ -1632,8 +1637,11 @@ fn exception_type_catches_import_error(type_expr: &ast::Expr) -> bool {
 ///   `if hasattr(builtins, "sentinel"):` never types the unavailable member.
 ///   Only stdlib/native modules are decided this way; a user module may gain
 ///   attributes at runtime, so its guard stays dynamic.
-/// - `sys.platform == "<value>"` and `os.name == "<value>"` (and `!=`) are
-///   fixed by the host the program targets. A CPython module often keeps
+/// - `sys.platform` and `os.name` compared with string literals: `==`/`!=`,
+///   `in`/`not in` a literal tuple/list/set, and
+///   `sys.platform.startswith(...)`/`endswith(...)` (with the literal or a
+///   tuple of literals). Any of those may be negated with `not`. The values
+///   are fixed by the host the program targets. A CPython module often keeps
 ///   Windows-only imports and attribute reads in such a branch; compiling
 ///   them on Linux would resolve members the host runtime never provides
 ///   (`encodings._win_cp_codecs` reads `codecs.code_page_encode`).
@@ -1645,15 +1653,21 @@ pub(crate) fn static_if_branch(test: &ast::Expr, dunder_name: &str) -> Option<bo
     if is_type_checking(test) {
         return Some(false);
     }
-    // `not hasattr(...)` inverts only the static attribute check; every other
-    // negation stays dynamic.
+    // `not hasattr(...)` inverts the static attribute check; a negation of a
+    // platform guard is folded by [`static_platform_condition`], so this only
+    // answers the `hasattr` shape and lets every other negation fall through.
     if let ast::Expr::UnaryOp(unary) = test {
         if matches!(unary.op, ast::UnaryOp::Not) {
-            return static_hasattr(&unary.operand).map(|present| !present);
+            if let Some(present) = static_hasattr(&unary.operand) {
+                return Some(!present);
+            }
         }
     }
     if let Some(present) = static_hasattr(test) {
         return Some(present);
+    }
+    if let Some(value) = static_platform_condition(test) {
+        return Some(value);
     }
     if let ast::Expr::BoolOp(boolean) = test {
         let mut values = Vec::new();
@@ -1688,8 +1702,8 @@ pub(crate) fn static_if_branch(test: &ast::Expr, dunder_name: &str) -> Option<bo
         return None;
     }
     let (op, left, right) = (compare.ops[0], &*compare.left, &compare.comparators[0]);
-    // The string operand must be a literal; the other operand may be a bare
-    // name or a host-fixed attribute chain (`sys.platform`, `os.name`).
+    // Only `__name__` is decided here; host-fixed platform comparisons were
+    // already handled by [`static_platform_condition`] above.
     let (literal, operand) = match (left, right) {
         (operand, ast::Expr::Constant(constant)) | (ast::Expr::Constant(constant), operand) => {
             (constant, operand)
@@ -1699,26 +1713,175 @@ pub(crate) fn static_if_branch(test: &ast::Expr, dunder_name: &str) -> Option<bo
     let ast::Constant::Str(value) = &literal.value else {
         return None;
     };
-    if let ast::Expr::Name(name) = operand {
-        if name.id.as_str() != "__name__" {
-            return None;
-        }
-        if value.as_str() != "__main__" {
-            return None;
-        }
-        let is_entry = dunder_name == "__main__";
-        return match op {
-            ast::CmpOp::Eq => Some(is_entry),
-            ast::CmpOp::NotEq => Some(!is_entry),
-            _ => None,
-        };
+    let ast::Expr::Name(name) = operand else {
+        return None;
+    };
+    if name.id.as_str() != "__name__" || value.as_str() != "__main__" {
+        return None;
     }
-    let host = static_host_platform(operand)?;
+    let is_entry = dunder_name == "__main__";
     match op {
-        ast::CmpOp::Eq => Some(host == value.as_str()),
-        ast::CmpOp::NotEq => Some(host != value.as_str()),
+        ast::CmpOp::Eq => Some(is_entry),
+        ast::CmpOp::NotEq => Some(!is_entry),
         _ => None,
     }
+}
+
+/// Truth value of a guard decided by the host platform alone.
+///
+/// Every shape names `sys.platform` or `os.name` directly and compares it
+/// with string literals, so the answer is the same for every execution of the
+/// compiled program:
+///
+/// - `sys.platform == "<value>"` / `!=` (the literal on either side)
+/// - `sys.platform in (...)` / `not in (...)` (tuple, list or set of strings)
+/// - `sys.platform.startswith("<value>")` / `endswith(...)`, including the
+///   tuple-of-prefixes form
+/// - `not <any of the above>`
+///
+/// Nested `and`/`or` of such guards combine, so an `elif` chain is folded one
+/// link at a time. Anything else — a user variable, a computed string, a
+/// method call on another value — returns `None` and stays a runtime
+/// condition.
+fn static_platform_condition(test: &ast::Expr) -> Option<bool> {
+    match test {
+        ast::Expr::UnaryOp(unary) if matches!(unary.op, ast::UnaryOp::Not) => {
+            static_platform_condition(&unary.operand).map(|value| !value)
+        }
+        ast::Expr::BoolOp(boolean) => {
+            let mut values = Vec::with_capacity(boolean.values.len());
+            for value in &boolean.values {
+                values.push(static_platform_condition(value));
+            }
+            match boolean.op {
+                ast::BoolOp::And => {
+                    if values.contains(&Some(false)) {
+                        Some(false)
+                    } else if values.iter().all(|value| *value == Some(true)) {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }
+                ast::BoolOp::Or => {
+                    if values.contains(&Some(true)) {
+                        Some(true)
+                    } else if values.iter().all(|value| *value == Some(false)) {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        ast::Expr::Compare(compare) => static_platform_compare(compare),
+        ast::Expr::Call(call) => static_platform_call(call),
+        _ => None,
+    }
+}
+
+/// Truth value of `sys.platform`/`os.name` compared against string literals.
+fn static_platform_compare(compare: &ast::ExprCompare) -> Option<bool> {
+    if compare.ops.len() != 1 || compare.comparators.len() != 1 {
+        return None;
+    }
+    let op = compare.ops[0];
+    let left = &*compare.left;
+    let right = &compare.comparators[0];
+    if matches!(op, ast::CmpOp::Eq | ast::CmpOp::NotEq) {
+        let (literal, operand) = match (left, right) {
+            (operand, ast::Expr::Constant(constant)) | (ast::Expr::Constant(constant), operand) => {
+                (constant, operand)
+            }
+            _ => return None,
+        };
+        let ast::Constant::Str(value) = &literal.value else {
+            return None;
+        };
+        let host = static_host_platform(operand)?;
+        return Some(if op == ast::CmpOp::Eq {
+            host == value.as_str()
+        } else {
+            host != value.as_str()
+        });
+    }
+    if matches!(op, ast::CmpOp::In | ast::CmpOp::NotIn) {
+        let host = static_host_platform(left)?;
+        let values = static_string_sequence(right)?;
+        let contained = values.iter().any(|value| value == host);
+        return Some(if op == ast::CmpOp::In {
+            contained
+        } else {
+            !contained
+        });
+    }
+    None
+}
+
+/// Truth value of `sys.platform.startswith/endswith(...)`.
+fn static_platform_call(call: &ast::ExprCall) -> Option<bool> {
+    if !call.keywords.is_empty() || call.args.len() != 1 {
+        return None;
+    }
+    let ast::Expr::Attribute(attribute) = &*call.func else {
+        return None;
+    };
+    let method = attribute.attr.as_str();
+    if method != "startswith" && method != "endswith" {
+        return None;
+    }
+    let host = static_host_platform(&attribute.value)?;
+    // `str.startswith/endswith` accepts a string or a tuple of strings; a
+    // list or set would raise at runtime, so it stays dynamic.
+    let candidates = match &call.args[0] {
+        ast::Expr::Constant(constant) => {
+            let ast::Constant::Str(value) = &constant.value else {
+                return None;
+            };
+            vec![value.to_string()]
+        }
+        ast::Expr::Tuple(tuple) => {
+            let mut values = Vec::new();
+            push_string_literals(&tuple.elts, &mut values)?;
+            values
+        }
+        _ => return None,
+    };
+    Some(candidates.iter().any(|candidate| {
+        if method == "startswith" {
+            host.starts_with(candidate)
+        } else {
+            host.ends_with(candidate)
+        }
+    }))
+}
+
+/// The string literals spelled by a tuple/list/set display, when every element
+/// is one. Any other shape is dynamic; a bare string is not included because
+/// `x in "abc"` is a substring test, not a membership test over one value.
+fn static_string_sequence(expr: &ast::Expr) -> Option<Vec<String>> {
+    let elements = match expr {
+        ast::Expr::Tuple(tuple) => &tuple.elts,
+        ast::Expr::List(list) => &list.elts,
+        ast::Expr::Set(set) => &set.elts,
+        _ => return None,
+    };
+    let mut values = Vec::with_capacity(elements.len());
+    push_string_literals(elements, &mut values)?;
+    Some(values)
+}
+
+fn push_string_literals(exprs: &[ast::Expr], values: &mut Vec<String>) -> Option<()> {
+    for expr in exprs {
+        let ast::Expr::Constant(constant) = expr else {
+            return None;
+        };
+        let ast::Constant::Str(value) = &constant.value else {
+            return None;
+        };
+        values.push(value.to_string());
+    }
+    Some(())
 }
 
 /// The host value of a guard fixed by the target platform.
@@ -4703,6 +4866,7 @@ impl<'a> Lowerer<'a> {
                             self.collect_top_imports(&s.orelse);
                         }
                     }
+                    self.collect_dead_platform_imports(&s.test, &s.body, &s.orelse);
                 }
                 ast::Stmt::For(s) => {
                     self.collect_top_imports(&s.body);
@@ -4799,6 +4963,12 @@ impl<'a> Lowerer<'a> {
                             self.collect_nested_imports(&s.orelse, false, scope);
                         }
                     }
+                    // A class body has its own namespace: an import there does
+                    // not bind the enclosing module or function, so a live
+                    // read of it stays a diagnostic.
+                    if scope != ImportScope::Class {
+                        self.collect_dead_platform_imports(&s.test, &s.body, &s.orelse);
+                    }
                 }
                 ast::Stmt::For(s) => {
                     self.collect_nested_imports(&s.body, false, scope);
@@ -4837,6 +5007,123 @@ impl<'a> Lowerer<'a> {
                 _ => {}
             }
         }
+    }
+
+    /// Records the import bindings of the platform branch that never runs.
+    ///
+    /// Folding a platform `if` keeps the dead branch out of the HIR, but
+    /// CPython still compiles it, so an `import` there binds the name in its
+    /// scope. A live read of that name — `test.support.os_helper` references
+    /// `msvcrt` in a `finally:` that only the dead Windows branch arms — must
+    /// therefore resolve instead of becoming a compile error. Nothing is
+    /// linked and no statement is emitted: the binding is deferred, so
+    /// evaluating it raises the runtime import error rather than fabricating a
+    /// module.
+    ///
+    /// Only host-platform guards are honoured; a `TYPE_CHECKING` or
+    /// `__name__ == "__main__"` dead branch binds nothing at runtime, so a
+    /// read of a name imported there stays a diagnostic.
+    fn collect_dead_platform_imports(
+        &mut self,
+        test: &ast::Expr,
+        body: &[ast::Stmt],
+        orelse: &[ast::Stmt],
+    ) {
+        let Some(runs) = static_platform_condition(test) else {
+            return;
+        };
+        let dead = if runs { orelse } else { body };
+        self.collect_dead_imports(dead);
+    }
+
+    /// Registers every import binding of a branch the host platform never
+    /// executes, without linking it.
+    ///
+    /// The walk stays in the enclosing scope: a nested function or class
+    /// defines its own namespace and its body is not lowered when the branch
+    /// is dead. Every import in the dead subtree is walked without further
+    /// folding — the whole region is dead, so it cannot need a live binding.
+    fn collect_dead_imports(&mut self, stmts: &[ast::Stmt]) {
+        for stmt in stmts {
+            match stmt {
+                ast::Stmt::Import(s) => {
+                    for alias in &s.names {
+                        let imported = alias.name.as_str();
+                        let binding = match &alias.asname {
+                            Some(name) => name.as_str(),
+                            None => imported.split('.').next().unwrap_or(imported),
+                        };
+                        // `import a.b` binds and defers the top-level package,
+                        // an alias defers the full dotted name.
+                        let module = match &alias.asname {
+                            Some(_) => imported,
+                            None => binding,
+                        };
+                        self.record_dead_import(binding, module, None);
+                    }
+                }
+                ast::Stmt::ImportFrom(s) => {
+                    let level = s.level.as_ref().map(|level| level.to_u32()).unwrap_or(0);
+                    let Ok(module) = resolve_import_name(
+                        level,
+                        s.module.as_ref().map(|module| module.as_str()),
+                        &self.package,
+                    ) else {
+                        continue;
+                    };
+                    // A future import binds nothing at runtime.
+                    if module == "__future__" {
+                        continue;
+                    }
+                    for alias in &s.names {
+                        let member = alias.name.as_str();
+                        if member == "*" {
+                            // A star import binds names the frontend cannot
+                            // enumerate for an unlinked module.
+                            continue;
+                        }
+                        let binding = match &alias.asname {
+                            Some(name) => name.as_str(),
+                            None => member,
+                        };
+                        self.record_dead_import(binding, &module, Some(member));
+                    }
+                }
+                ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => {}
+                ast::Stmt::ClassDef(_) => {}
+                other => {
+                    for block in class_body_blocks(other) {
+                        self.collect_dead_imports(block);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Records one dead-branch import binding unless the name already has a
+    /// compile-time binding that the deferred fallback must not shadow.
+    fn record_dead_import(&mut self, binding: &str, module: &str, member: Option<&str>) {
+        if self.has_import_binding(binding) {
+            return;
+        }
+        self.record_deferred(binding, module, member);
+    }
+
+    /// Whether `name` already resolves through an import, a definition or a
+    /// module-level binding.
+    fn has_import_binding(&self, name: &str) -> bool {
+        self.deferred_imports.contains_key(name)
+            || self.imported_functions.contains_key(name)
+            || self.imported_constants.contains_key(name)
+            || self.imported_user_functions.contains_key(name)
+            || self.imported_user_globals.contains_key(name)
+            || self.imported_extension_members.contains_key(name)
+            || self.module_aliases.contains_key(name)
+            || self.user_module_aliases.contains_key(name)
+            || self.extension_aliases.contains_key(name)
+            || self.global_names.contains(name)
+            || self.module_def_names.contains(name)
+            || self.fn_ids.contains_key(name)
     }
 
     /// Claims a binding name for an import.
@@ -18303,6 +18590,12 @@ impl<'a> Lowerer<'a> {
             ast::Expr::GeneratorExp(c) => self.lower_generator_exp(c, fs, line, col),
             ast::Expr::Lambda(l) => self.lower_lambda(l, fs, line, col),
             ast::Expr::IfExp(i) => {
+                // A test fixed by the host platform (or another static guard)
+                // decides which side runs; only that side is lowered, so a
+                // dead branch cannot produce diagnostics of its own.
+                if let Some(runs) = static_if_branch(&i.test, &self.dunder_name) {
+                    return self.expr(if runs { &i.body } else { &i.orelse }, fs);
+                }
                 // `i.orelse` is only evaluated when the test is falsy; the IR
                 // node keeps that laziness for codegen.
                 let test = self.expr(&i.test, fs);
@@ -18597,18 +18890,6 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        // `*args` and `**kwargs` are ordinary binding parameters of the
-        // synthetic function; the runtime binder fills their list/dict. A
-        // keyword-only parameter needs a default-evaluation slot the lambda's
-        // parameter list does not build, so it stays unsupported.
-        if let Some(first) = l.args.kwonlyargs.first() {
-            self.error_at(
-                first.def.range,
-                "lambda keyword-only parameters are not supported",
-            );
-            return self.error_expr(l.range);
-        }
-
         // A parameter default is evaluated in the enclosing scope where the
         // lambda value is created, exactly like a `def`. A name it reads must
         // come from the enclosing locals even when the lambda body never reads
@@ -18765,6 +19046,22 @@ impl<'a> Lowerer<'a> {
                     col,
                 }),
                 ParamKind::VarArg,
+                &mut params,
+                &mut locals,
+                &mut seen,
+            );
+        }
+        // Keyword-only parameters (`lambda *args, key=0:` or a bare
+        // `lambda *, key=0:`): the runtime binder fills the slot by name or
+        // with the default lowered above, exactly like a `def`.
+        for arg in &l.args.kwonlyargs {
+            let default = self.param_default(arg.default.as_deref());
+            let default_expr = default_exprs.next().flatten();
+            self.add_param(
+                &arg.def,
+                default,
+                default_expr,
+                ParamKind::KwOnly,
                 &mut params,
                 &mut locals,
                 &mut seen,
@@ -18930,8 +19227,8 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Lowers a lambda's parameter defaults in the scope where the lambda
-    /// value is created, in parameter order (positional-only, then positional;
-    /// keyword-only parameters are rejected before this runs).
+    /// value is created, in evaluation order: positional-only, positional,
+    /// then keyword-only (`*args` and `**kwargs` take no source default).
     fn lambda_default_exprs(
         &mut self,
         l: &ast::ExprLambda,
@@ -18941,6 +19238,7 @@ impl<'a> Lowerer<'a> {
             .posonlyargs
             .iter()
             .chain(l.args.args.iter())
+            .chain(l.args.kwonlyargs.iter())
             .map(|arg| self.lowered_default(arg.default.as_deref(), Some(&mut *fs)))
             .collect()
     }
@@ -23107,13 +23405,33 @@ fn class_namespace_block(statements: Vec<HStmt>, line: u32, col: u32) -> HStmt {
 ///
 /// Used by the class-body walkers: a dynamic class body executes control flow
 /// at runtime, but its method definitions (and their bodies) still have to be
-/// registered before any body is lowered.
+/// registered before any body is lowered. A branch whose guard the host
+/// platform fixes (see [`static_platform_condition`]) never executes, so only
+/// the live side is returned — the dead side was not collected as imports and
+/// lowering it would diagnose names the host does not provide.
 fn class_body_blocks(stmt: &ast::Stmt) -> Vec<&[ast::Stmt]> {
     let mut blocks = Vec::new();
     match stmt {
         ast::Stmt::If(s) => {
-            blocks.push(s.body.as_slice());
-            blocks.push(s.orelse.as_slice());
+            // A guard fixed by the host platform contributes only the branch
+            // that executes, exactly like the module-level walkers: a
+            // Windows-only method of a class body must not be registered or
+            // have its body lowered on Linux (its imports are not collected).
+            let branch = match &*s.test {
+                ast::Expr::Constant(constant) => match &constant.value {
+                    ast::Constant::Bool(value) => Some(*value),
+                    _ => static_platform_condition(&s.test),
+                },
+                _ => static_platform_condition(&s.test),
+            };
+            match branch {
+                Some(true) => blocks.push(s.body.as_slice()),
+                Some(false) => blocks.push(s.orelse.as_slice()),
+                None => {
+                    blocks.push(s.body.as_slice());
+                    blocks.push(s.orelse.as_slice());
+                }
+            }
         }
         ast::Stmt::While(s) => {
             blocks.push(s.body.as_slice());

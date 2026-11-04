@@ -3249,6 +3249,12 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         "re._compiler_isstring",
         native_member("_compiler_isstring", 1, 1),
     ),
+    // `sys._jit.is_enabled()`: a method of the `sys._jit` namespace, not a
+    // module-level name, so the central table cannot declare it.
+    (
+        "sys._jit.is_enabled",
+        native_member_ret("_jit.is_enabled", 0, 0, hydro_ir::Type::Bool),
+    ),
 ];
 
 /// Resolves a [`SUPPLEMENTAL_FUNCTIONS`] entry by module and member name.
@@ -4558,6 +4564,20 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         // `platform.platform(aliased=..., terse=...)`: the binder has already
         // moved the two documented names into their positional slots.
         "platform" => platform_call(function, args),
+        // `faulthandler.enable(file=..., all_threads=...)`: the declared
+        // parameter names were already bound into their slots, so any name
+        // left here belongs to no parameter.
+        "faulthandler" => {
+            if let Some((name, _)) = keywords.first() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "faulthandler.{function}() got an unexpected keyword argument '{name}'"
+                    ),
+                );
+            }
+            faulthandler_call(function, args)
+        }
         _ => exc::raise_with_message(
             TYPE_ERROR,
             &format!("{module}.{function}() does not accept keyword arguments"),
@@ -5249,6 +5269,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
         "random" => random_call(function, args),
         "pathlib" => pathlib_call(function, args),
         "platform" => platform_call(function, args),
+        "faulthandler" => faulthandler_call(function, args),
         "statistics" => statistics_call(function, args),
         "argparse" => argparse::call(function, args),
         "_collections" | "collections" => match collections_repr_call(function, args) {
@@ -8046,8 +8067,13 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `sys.flags` and `sys.monitoring` are cached objects (their identity
         // is observable); `sys.meta_path` is the cached finder list.
         ("sys", "flags") => sys_flags(),
+        ("sys", "_jit") => sys_jit(),
         ("sys", "monitoring") => sys_monitoring(),
         ("sys", "meta_path") => sys_meta_path(),
+        // `asyncio.events._event_loop_policy`: no event-loop policy is
+        // installed (this runtime has one native loop and no pluggable
+        // policy), so the module-global handle is `None`.
+        ("asyncio.events", "_event_loop_policy") => NONE,
         ("os", "name") => {
             let name = if cfg!(windows) { "nt" } else { "posix" };
             value::str_from_bytes(name.as_bytes())
@@ -10675,6 +10701,37 @@ fn platform_uname() -> i64 {
     ])
 }
 
+/// Process-wide `faulthandler` enable state.
+///
+/// CPython installs fatal-signal handlers in `enable` and removes them in
+/// `disable`; Hydro has no fault-reporting handler to install, so the toggle
+/// records the requested state instead. It is real state: `is_enabled` reports
+/// what the last `enable`/`disable` call selected, which is the contract
+/// `test.support.disable_faulthandler` relies on when it saves and restores
+/// the setting around a subprocess check. No fault report is produced, because
+/// no handler runs.
+static FAULTHANDLER_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Dispatches a native `faulthandler` function.
+///
+/// `enable(file=..., all_threads=...)` accepts its documented arguments; with
+/// no handler installed they do not select a destination, and the call only
+/// arms the enabled state.
+fn faulthandler_call(function: &str, _args: &[i64]) -> i64 {
+    match function {
+        "enable" => {
+            FAULTHANDLER_ENABLED.store(true, Ordering::Release);
+            NONE
+        }
+        "disable" => {
+            FAULTHANDLER_ENABLED.store(false, Ordering::Release);
+            NONE
+        }
+        "is_enabled" => value::bool_value(FAULTHANDLER_ENABLED.load(Ordering::Acquire)),
+        _ => missing_attribute("faulthandler", function),
+    }
+}
+
 fn platform_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "system" => value::str_from_bytes(platform_system().as_bytes()),
@@ -10714,6 +10771,76 @@ fn platform_call(function: &str, args: &[i64]) -> i64 {
         }
         "python_compiler" => value::str_from_bytes(b"rustc"),
         "processor" => value::str_from_bytes(platform_processor().as_bytes()),
+        "architecture" => value::tuple_new(vec![
+            value::str_from_bytes(if usize::BITS == 64 {
+                b"64bit"
+            } else {
+                b"32bit"
+            }),
+            value::str_from_bytes(match std::env::consts::OS {
+                "windows" => b"WindowsPE",
+                "macos" => b"Mach-O",
+                _ => b"ELF",
+            }),
+        ]),
+        // Non-Android/iOS/macOS CPython returns the caller's defaults.
+        "android_ver" => value::namespace_new(vec![
+            ("release".to_string(), value::str_from_bytes(b"")),
+            ("api_level".to_string(), encode_int(0)),
+            ("manufacturer".to_string(), value::str_from_bytes(b"")),
+            ("model".to_string(), value::str_from_bytes(b"")),
+            ("device".to_string(), value::str_from_bytes(b"")),
+            ("is_emulator".to_string(), FALSE),
+        ]),
+        "ios_ver" => value::namespace_new(vec![
+            ("system".to_string(), value::str_from_bytes(b"")),
+            ("release".to_string(), value::str_from_bytes(b"")),
+            ("model".to_string(), value::str_from_bytes(b"")),
+            ("is_simulator".to_string(), FALSE),
+        ]),
+        "mac_ver" => value::tuple_new(vec![
+            value::str_from_bytes(b""),
+            value::tuple_new(vec![
+                value::str_from_bytes(b""),
+                value::str_from_bytes(b""),
+                value::str_from_bytes(b""),
+            ]),
+            value::str_from_bytes(b""),
+        ]),
+        "java_ver" => value::tuple_new(vec![
+            value::str_from_bytes(b""),
+            value::str_from_bytes(b""),
+            value::tuple_new(vec![
+                value::str_from_bytes(b""),
+                value::str_from_bytes(b""),
+                value::str_from_bytes(b""),
+            ]),
+            value::tuple_new(vec![
+                value::str_from_bytes(b""),
+                value::str_from_bytes(b""),
+                value::str_from_bytes(b""),
+            ]),
+        ]),
+        "libc_ver" => {
+            value::tuple_new(vec![value::str_from_bytes(b""), value::str_from_bytes(b"")])
+        }
+        "freedesktop_os_release" => value::dict_new(Vec::new()),
+        "system_alias" => {
+            let system = args
+                .first()
+                .and_then(|arg| value::as_str(*arg))
+                .unwrap_or(platform_system());
+            let release = args.get(1).copied().unwrap_or(NONE);
+            let version = args.get(2).copied().unwrap_or(NONE);
+            let alias = match system {
+                "SunOS" => "Solaris",
+                "win32" | "win16" => "Windows",
+                other => other,
+            };
+            value::tuple_new(vec![value::str_alloc(alias.to_string()), release, version])
+        }
+        "python_branch" | "python_revision" => value::str_from_bytes(b""),
+        "invalidate_caches" => NONE,
         // Non-Windows CPython returns None/False and an empty win32 version.
         "win32_edition" => NONE,
         "win32_is_iot" => FALSE,
@@ -13276,6 +13403,65 @@ fn time_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i
     }
 }
 
+/// `time.get_clock_info(name)`: the namespace CPython publishes for one
+/// clock: `implementation`, `monotonic`, `adjustable` and `resolution`.
+///
+/// The values describe this runtime's clocks. On Unix, wall time comes from
+/// `clock_gettime(CLOCK_REALTIME)` (adjustable), `monotonic`/`perf_counter`
+/// from `CLOCK_MONOTONIC`, process CPU time from `CLOCK_PROCESS_CPUTIME_ID`
+/// and thread CPU time from `CLOCK_THREAD_CPUTIME_ID`, all at the
+/// nanosecond resolution `clock_gettime` reports. An unknown name raises
+/// `ValueError`, like CPython's C implementation.
+fn time_get_clock_info(argument: i64) -> i64 {
+    let Some(name) = value::as_str(argument) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "get_clock_info() argument must be str, not {}",
+                value::type_name(argument)
+            ),
+        );
+    };
+    #[cfg(unix)]
+    let (implementation, resolution) = match name {
+        "time" | "real_time" => ("clock_gettime(CLOCK_REALTIME)", 1e-9),
+        "monotonic" | "perf_counter" => ("clock_gettime(CLOCK_MONOTONIC)", 1e-9),
+        "process_time" => ("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", 1e-9),
+        "thread_time" => ("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", 1e-9),
+        other => {
+            return exc::raise_with_message(VALUE_ERROR, &format!("unknown clock: {other}"));
+        }
+    };
+    #[cfg(not(unix))]
+    let (implementation, resolution) = match name {
+        "time" | "real_time" => ("GetSystemTimeAsFileTime()", 1e-7),
+        "monotonic" | "perf_counter" => ("QueryPerformanceCounter()", 1e-7),
+        "process_time" => ("GetProcessTimes()", 1e-7),
+        "thread_time" => ("GetThreadTimes()", 1e-7),
+        other => {
+            return exc::raise_with_message(VALUE_ERROR, &format!("unknown clock: {other}"));
+        }
+    };
+    // `time`/`real_time` follow the wall clock, which can jump; every other
+    // clock is monotonic and not adjustable.
+    let (monotonic, adjustable) = if matches!(name, "time" | "real_time") {
+        (false, true)
+    } else {
+        (true, false)
+    };
+    let start = heap::root_values(&[]);
+    let implementation = value::str_from_bytes(implementation.as_bytes());
+    heap::push_scoped_root(implementation);
+    let info = value::namespace_new(vec![
+        ("implementation".to_string(), implementation),
+        ("monotonic".to_string(), value::bool_value(monotonic)),
+        ("adjustable".to_string(), value::bool_value(adjustable)),
+        ("resolution".to_string(), value::float_new(resolution)),
+    ]);
+    heap::release_roots(start);
+    info
+}
+
 fn time_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "time" => value::float_new(wall_clock().as_secs_f64()),
@@ -13283,6 +13469,7 @@ fn time_call(function: &str, args: &[i64]) -> i64 {
         "time_ns" => wall_clock_nanos(),
         "perf_counter_ns" | "monotonic_ns" => monotonic_nanos(),
         "process_time" => time_process_time(),
+        "get_clock_info" => time_get_clock_info(args.first().copied().unwrap_or(NONE)),
         "localtime" => time_localtime(args),
         "gmtime" => time_gmtime(args),
         "mktime" => time_mktime(args),
@@ -13476,25 +13663,30 @@ pub(crate) fn spawn_thread(
     // thread (the collector proper waits on the GC registration table).
     heap::enter_thread();
     let (registered_tx, registered_rx) = std::sync::mpsc::channel::<()>();
-    let spawned = std::thread::Builder::new()
-        .name(format!("hydro-thread-{id}"))
-        .spawn(move || {
-            heap::register_thread(id, roots);
-            // Wake the spawner: the child is now visible to the collector
-            // with stack bounds and roots before it reaches its first
-            // safepoint.
-            let _ = registered_tx.send(());
-            heap::safepoint();
-            let _exit = ThreadExit { finished };
-            // SAFETY: `argv` outlives the call and `argc` matches its length; the callee
-            // reads `argc` values (NULL for zero arguments, which it never dereferences).
-            let _ = crate::builtins::call(function, argc, argv.as_ptr());
-            // An exception cannot cross the thread boundary: report it like
-            // an uncaught exception, as CPython's `_thread` does.
-            if exc::pending() {
-                let _ = exc::uncaught();
-            }
-        });
+    let mut builder = std::thread::Builder::new().name(format!("hydro-thread-{id}"));
+    // `threading.stack_size(size)` selects the stack size of every thread
+    // created after the call; `0` keeps the platform default.
+    let requested_stack = THREAD_STACK_SIZE.load(Ordering::Acquire);
+    if requested_stack > 0 {
+        builder = builder.stack_size(requested_stack as usize);
+    }
+    let spawned = builder.spawn(move || {
+        heap::register_thread(id, roots);
+        // Wake the spawner: the child is now visible to the collector
+        // with stack bounds and roots before it reaches its first
+        // safepoint.
+        let _ = registered_tx.send(());
+        heap::safepoint();
+        let _exit = ThreadExit { finished };
+        // SAFETY: `argv` outlives the call and `argc` matches its length; the callee
+        // reads `argc` values (NULL for zero arguments, which it never dereferences).
+        let _ = crate::builtins::call(function, argc, argv.as_ptr());
+        // An exception cannot cross the thread boundary: report it like
+        // an uncaught exception, as CPython's `_thread` does.
+        if exc::pending() {
+            let _ = exc::uncaught();
+        }
+    });
     match spawned {
         Ok(handle) => {
             // Wait until the child registered itself (and thereby installed
@@ -13810,8 +14002,50 @@ fn rich_status_call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
+/// Stack size requested for subsequently created threads, `0` for the
+/// platform default. `threading.stack_size(size)` sets it and reports the
+/// previous value; [`spawn_thread`] applies it to every new thread.
+static THREAD_STACK_SIZE: AtomicI64 = AtomicI64::new(0);
+
+/// Smallest stack size `threading.stack_size` accepts. `PTHREAD_STACK_MIN` is
+/// lower on Linux, but CPython documents 32 KiB as the smallest value that
+/// leaves room for the interpreter itself.
+const MIN_THREAD_STACK_SIZE: i64 = 32768;
+
+/// `threading.stack_size([size])`: read or set the stack size for new threads.
+///
+/// With no argument it returns the current setting (`0` = platform default).
+/// With one it validates the value — `0` or at least 32 KiB, CPython's rule —
+/// stores it, and returns the previous setting. [`spawn_thread`] passes the
+/// value to `std::thread::Builder::stack_size`, so the setting really applies
+/// to threads created afterwards.
+fn threading_stack_size(args: &[i64]) -> i64 {
+    let current = THREAD_STACK_SIZE.load(Ordering::Acquire);
+    let Some(&argument) = args.first() else {
+        return encode_int(current);
+    };
+    let Some(number) = value::to_bigint(argument) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(argument)
+            ),
+        );
+    };
+    let Some(size) = number.to_i64() else {
+        return exc::raise_with_message(OVERFLOW_ERROR, "Python int too large to convert to C int");
+    };
+    if size < 0 || (size != 0 && size < MIN_THREAD_STACK_SIZE) {
+        return exc::raise_with_message(VALUE_ERROR, "size must be positive");
+    }
+    THREAD_STACK_SIZE.store(size, Ordering::Release);
+    encode_int(current)
+}
+
 fn threading_call(function: &str, args: &[i64]) -> i64 {
     match function {
+        "stack_size" => threading_stack_size(args),
         "Thread" => {
             let target = match callable_argument("Thread()", optional(args, 0)) {
                 Ok(target) => target,
@@ -18365,6 +18599,60 @@ fn os_wnohang() -> i64 {
     }
 }
 
+/// `os.waitstatus_to_exitcode(status)`: the exit code encoded in a `waitpid`
+/// status — the exit status for a normal exit, `-signum` for a signal death.
+///
+/// A status that reports neither a normal exit nor a terminating signal (a
+/// stopped or continued child) raises `ValueError`, exactly as CPython's
+/// `WIFEXITED`/`WIFSIGNALED` check does; a negative or out-of-range status is
+/// rejected the same way.
+fn os_waitstatus_to_exitcode(args: &[i64]) -> i64 {
+    let argument = args.first().copied().unwrap_or(NONE);
+    let Some(number) = value::to_bigint(argument) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(argument)
+            ),
+        );
+    };
+    let Some(status) = number.to_i64() else {
+        return exc::raise_with_message(OVERFLOW_ERROR, "Python int too large to convert to C int");
+    };
+    if !(0..=i64::from(i32::MAX)).contains(&status) {
+        return exc::raise_with_message(VALUE_ERROR, "invalid wait status");
+    }
+    #[cfg(unix)]
+    let exitcode = {
+        let status = status as i32;
+        if libc::WIFEXITED(status) {
+            Some(i64::from(libc::WEXITSTATUS(status)))
+        } else if libc::WIFSIGNALED(status) {
+            Some(-i64::from(libc::WTERMSIG(status)))
+        } else {
+            None
+        }
+    };
+    // The POSIX wait-status layout (low seven bits: terminating signal, next
+    // byte: exit status) for targets without the `libc` macros.
+    #[cfg(not(unix))]
+    let exitcode = {
+        let signal = status & 0x7f;
+        if signal == 0 {
+            Some((status >> 8) & 0xff)
+        } else if signal != 0x7f {
+            Some(-signal)
+        } else {
+            None
+        }
+    };
+    match exitcode {
+        Some(exitcode) => encode_int(exitcode),
+        None => exc::raise_with_message(VALUE_ERROR, "invalid wait status"),
+    }
+}
+
 /// `os.system(command)`: runs the command through the C library shell and
 /// returns the raw `system(3)` wait status (CPython returns the same value).
 ///
@@ -19401,6 +19689,22 @@ fn os_path_relpath(args: &[i64]) -> i64 {
 /// its single `path` parameter has already been moved into the positional
 /// slot by the binder, so any remaining name is unknown.
 fn os_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i64 {
+    if function == "register_at_fork" {
+        for (name, _) in keywords {
+            match name.as_str() {
+                "before" | "after_in_child" | "after_in_parent" => {}
+                _ => {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!(
+                            "os.register_at_fork() got an unexpected keyword argument '{name}'"
+                        ),
+                    )
+                }
+            }
+        }
+        return NONE;
+    }
     // `os.lstat(path, *, dir_fd=None)` is the only os function whose spec
     // currently declares a keyword. The runtime accepts `dir_fd=None` (there
     // is no descriptor-relative lookup yet) and rejects unknown or non-None
@@ -20026,6 +20330,8 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         }
         // `os.kill(pid, sig)`: both parameters are positional-only integers.
         "kill" => os_kill(args),
+        // `os.waitstatus_to_exitcode(status)`: decode a `waitpid` status.
+        "waitstatus_to_exitcode" => os_waitstatus_to_exitcode(args),
         "_exit" => {
             let Some(code) = value::as_integer(args[0]) else {
                 return exc::raise_with_message(
@@ -20135,7 +20441,9 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "getloadavg" => os_getloadavg(),
         "uname" => os_uname(),
         "open" => os_open(args),
+        "dup" => os_dup(args),
         "dup2" => os_dup2(args),
+        "register_at_fork" => NONE,
         "get_terminal_size" => os_get_terminal_size(args),
         "putenv" => os_putenv(args),
         "unsetenv" => os_unsetenv(args),
@@ -21110,6 +21418,21 @@ fn os_open(args: &[i64]) -> i64 {
 }
 
 /// `os.dup2(fd, fd2)`: duplicates `fd` onto `fd2` and returns `fd2`.
+fn os_dup(args: &[i64]) -> i64 {
+    let Some(fd) = args.first().and_then(|arg| value::as_integer(*arg)) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "dup() argument must be a file descriptor (integer)",
+        );
+    };
+    // SAFETY: the descriptor is validated by the kernel.
+    let result = unsafe { libc::dup(fd as libc::c_int) };
+    if result < 0 {
+        return os_error_from_io("dup", std::io::Error::last_os_error(), None);
+    }
+    encode_int(i64::from(result))
+}
+
 fn os_dup2(args: &[i64]) -> i64 {
     let (Some(fd), Some(target)) = (value::as_integer(args[0]), value::as_integer(args[1])) else {
         return exc::raise_with_message(
@@ -21906,8 +22229,15 @@ fn sys_call(function: &str, args: &[i64]) -> i64 {
         "getdefaultencoding" | "getfilesystemencoding" => value::str_from_bytes(b"utf-8"),
         "getfilesystemencodeerrors" => value::str_from_bytes(b"surrogateescape"),
         // Hydro's int↔str conversions are unbounded, which CPython spells as
-        // `0` ("no limit") from `get_int_max_str_digits`.
-        "get_int_max_str_digits" => encode_int(0),
+        // `0`; a program that installs a limit reads back the value it set.
+        "get_int_max_str_digits" => encode_int(INT_MAX_STR_DIGITS.load(Ordering::Acquire)),
+        "set_int_max_str_digits" => sys_set_int_max_str_digits(args),
+        // No remote-debug protocol is compiled into this runtime, so no
+        // `-X remote_debug` configuration can be active.
+        "is_remote_debug_enabled" => FALSE,
+        "unraisablehook" => sys_unraisablehook(args),
+        // `sys._jit.is_enabled()`: the bytecode JIT is never running here.
+        "_jit.is_enabled" => FALSE,
         "audit" => sys_audit(args),
         "addaudithook" => sys_addaudithook(args),
         "_monitoring_register_callback" => sys_monitoring_register_callback(args),
@@ -22531,6 +22861,110 @@ fn sys_setrecursionlimit(args: &[i64]) -> i64 {
         );
     }
     RECURSION_LIMIT.store(limit, Ordering::Relaxed);
+    NONE
+}
+
+/// Process-wide `sys.set_int_max_str_digits` value.
+///
+/// `0` means "no limit", which is CPython's spelling for a disabled limit and
+/// the truthful default here: Hydro's int↔str conversions are unbounded.
+static INT_MAX_STR_DIGITS: AtomicI64 = AtomicI64::new(0);
+
+/// `sys.set_int_max_str_digits(maxdigits)`: validates and records the limit.
+///
+/// The accepted range is CPython's: `0` (no limit) or at least 640 decimal
+/// digits. The value layer does not consult the limit for its int↔str
+/// conversions, so the setting is recorded rather than enforced;
+/// `get_int_max_str_digits` reports it back, which keeps the save/restore
+/// sequences programs such as `test.support` use consistent.
+fn sys_set_int_max_str_digits(args: &[i64]) -> i64 {
+    let argument = args.first().copied().unwrap_or(NONE);
+    let Some(number) = value::to_bigint(argument) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(argument)
+            ),
+        );
+    };
+    let Some(maxdigits) = number.to_i64() else {
+        return exc::raise_with_message(OVERFLOW_ERROR, "Python int too large to convert to C int");
+    };
+    if maxdigits < 0 || (maxdigits != 0 && maxdigits < 640) {
+        return exc::raise_with_message(VALUE_ERROR, "maxdigits must be 0 or larger than 640");
+    }
+    INT_MAX_STR_DIGITS.store(maxdigits, Ordering::Release);
+    NONE
+}
+
+/// `sys._jit`: the JIT-control namespace.
+///
+/// CPython 3.14's `sys._jit` toggles the experimental bytecode JIT at runtime.
+/// Hydro compiles the whole program ahead of time and has no runtime JIT to
+/// toggle, so `is_enabled()` reports `False`. The namespace is cached, so
+/// repeated reads share identity like CPython's singleton.
+fn sys_jit() -> i64 {
+    const KEY: &str = "sys._jit";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let is_enabled = value::native_function_new("sys", "_jit.is_enabled", 0);
+    let roots = crate::heap::root_values(&[is_enabled]);
+    let jit = value::namespace_new(vec![("is_enabled".to_string(), is_enabled)]);
+    globals::registry_set(KEY, jit);
+    crate::heap::release_roots(roots);
+    jit
+}
+
+/// `sys.unraisablehook(unraisable)`: CPython's default unraisable-exception
+/// report.
+///
+/// The argument is an `UnraisableHookArgs`-shaped value: a namespace or dict
+/// carrying `exc_value`, `err_msg` and `object`. The report is written to
+/// stderr as `Exception ignored in: <context>`, followed by the exception text
+/// when one is attached — the shape CPython's hook produces.
+fn sys_unraisablehook(args: &[i64]) -> i64 {
+    let Some(&unraisable) = args.first() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "unraisablehook() missing required argument: 'unraisable'",
+        );
+    };
+    let field = |name: &str| unraisable_field(unraisable, name);
+    let context = match value::as_str(field("err_msg")) {
+        Some(message) if !message.is_empty() => message.to_string(),
+        _ => value::repr(field("object")),
+    };
+    use std::io::Write as _;
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    let _ = writeln!(stderr, "Exception ignored in: {context}");
+    let exception = field("exc_value");
+    if exception != NONE {
+        let _ = writeln!(stderr, "{}", value::to_string(exception));
+    }
+    let _ = stderr.flush();
+    NONE
+}
+
+/// Reads `name` from an `UnraisableHookArgs`-shaped namespace or dict.
+fn unraisable_field(unraisable: i64, name: &str) -> i64 {
+    if let Some(pairs) = value::as_namespace(unraisable) {
+        return pairs
+            .iter()
+            .find(|(key, _)| key.as_str() == name)
+            .map(|(_, item)| *item)
+            .unwrap_or(NONE);
+    }
+    if let Some(pairs) = value::as_dict(unraisable) {
+        if let Some((_, item)) = pairs
+            .iter()
+            .find(|(key, _)| value::as_str(*key) == Some(name))
+        {
+            return *item;
+        }
+    }
     NONE
 }
 
@@ -29514,6 +29948,187 @@ mod tests {
         let other = value::instance_new(value::object_class());
         assert_ne!(sentinel, other);
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn asyncio_events_submodule_exposes_the_policy_handle() {
+        exc::init();
+        // `import asyncio.events` then `asyncio.events._event_loop_policy`
+        // resolves through the same `sys.modules` entry.
+        let events = get("asyncio", "events");
+        assert_eq!(
+            value::as_module(events).map(|module| module.name()),
+            Some("asyncio.events")
+        );
+        assert_eq!(registry_lookup("asyncio.events"), Some(events));
+        // No event-loop policy is installed: this runtime has one native loop
+        // and no pluggable policy API.
+        assert_eq!(get("asyncio.events", "_event_loop_policy"), NONE);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn faulthandler_tracks_the_enabled_state() {
+        exc::init();
+        assert_eq!(call("faulthandler", "is_enabled", &[]), FALSE);
+        assert_eq!(call("faulthandler", "enable", &[]), NONE);
+        assert!(!exc::pending());
+        assert_eq!(call("faulthandler", "is_enabled", &[]), TRUE);
+        // `enable(file=..., all_threads=...)` binds CPython's keyword names.
+        assert_eq!(call("faulthandler", "disable", &[]), NONE);
+        assert_eq!(
+            call_kw(
+                "faulthandler",
+                "enable",
+                &[],
+                &[("file", NONE), ("all_threads", TRUE)]
+            ),
+            NONE
+        );
+        assert!(!exc::pending());
+        assert_eq!(call("faulthandler", "is_enabled", &[]), TRUE);
+        assert_eq!(call("faulthandler", "disable", &[]), NONE);
+        assert_eq!(call("faulthandler", "is_enabled", &[]), FALSE);
+    }
+
+    #[test]
+    fn sys_jit_and_remote_debug_describe_this_runtime() {
+        exc::init();
+        // No remote-debug protocol is compiled in, and no runtime JIT runs.
+        assert_eq!(call("sys", "is_remote_debug_enabled", &[]), FALSE);
+        let jit = get("sys", "_jit");
+        assert_eq!(get("sys", "_jit"), jit, "sys._jit identity is stable");
+        let is_enabled = namespace_value(jit, "is_enabled").expect("is_enabled");
+        assert_eq!(call_value(is_enabled, &[]), FALSE);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn sys_int_max_str_digits_validates_and_restores() {
+        exc::init();
+        // Hydro's conversions are unbounded, which is CPython's `0` spelling.
+        assert_eq!(as_int(call("sys", "get_int_max_str_digits", &[])), 0);
+        assert_eq!(call("sys", "set_int_max_str_digits", &[int(4300)]), NONE);
+        assert!(!exc::pending());
+        assert_eq!(as_int(call("sys", "get_int_max_str_digits", &[])), 4300);
+
+        // Below the documented minimum the value is rejected and unchanged.
+        exc::init();
+        assert_eq!(call("sys", "set_int_max_str_digits", &[int(639)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+        assert_eq!(as_int(call("sys", "get_int_max_str_digits", &[])), 4300);
+
+        // `0` disables the limit again.
+        exc::init();
+        assert_eq!(call("sys", "set_int_max_str_digits", &[int(0)]), NONE);
+        assert!(!exc::pending());
+        assert_eq!(as_int(call("sys", "get_int_max_str_digits", &[])), 0);
+    }
+
+    #[test]
+    fn sys_unraisablehook_is_writable_and_reports_the_value() {
+        exc::init();
+        let hook = get("sys", "unraisablehook");
+        assert_eq!(value::type_name(hook), "function");
+        // The default hook accepts an `UnraisableHookArgs`-shaped value.
+        let unraisable = value::namespace_new(vec![
+            ("exc_value".to_string(), NONE),
+            ("err_msg".to_string(), NONE),
+            ("object".to_string(), NONE),
+        ]);
+        let roots = crate::heap::root_values(&[unraisable]);
+        assert_eq!(call_value(hook, &[unraisable]), NONE);
+        assert!(!exc::pending());
+
+        // The attribute is writable: an assignment shadows the default and a
+        // deletion restores it.
+        let module = value::as_module(value::module_value("sys".to_string())).expect("sys module");
+        let replacement = value::native_function_new("sys", "excepthook", 3);
+        assert_eq!(module_set_attr(module, "unraisablehook", replacement), NONE);
+        assert_eq!(get("sys", "unraisablehook"), replacement);
+        assert_eq!(module_del_attr(module, "unraisablehook"), NONE);
+        let restored = get("sys", "unraisablehook");
+        assert_eq!(value::type_name(restored), "function");
+        assert_ne!(restored, replacement);
+        assert!(!exc::pending());
+        crate::heap::release_roots(roots);
+    }
+
+    #[test]
+    fn os_waitstatus_to_exitcode_decodes_and_rejects() {
+        exc::init();
+        // A normal exit status: the signal field is zero.
+        assert_eq!(
+            as_int(call("os", "waitstatus_to_exitcode", &[int(7 << 8)])),
+            7
+        );
+        // Killed by SIGKILL (9): a negative exit code.
+        assert_eq!(as_int(call("os", "waitstatus_to_exitcode", &[int(9)])), -9);
+        // A stopped child has no exit code; so has a negative status.
+        exc::init();
+        assert_eq!(call("os", "waitstatus_to_exitcode", &[int(0x137f)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::init();
+        assert_eq!(call("os", "waitstatus_to_exitcode", &[int(-1)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+    }
+
+    #[test]
+    fn time_get_clock_info_describes_the_platform_clocks() {
+        exc::init();
+        let info = call("time", "get_clock_info", &[string("perf_counter")]);
+        assert!(!exc::pending());
+        let implementation = namespace_value(info, "implementation")
+            .and_then(value::as_str)
+            .expect("implementation");
+        assert!(
+            implementation.contains("CLOCK_MONOTONIC")
+                || implementation.contains("QueryPerformanceCounter"),
+            "{implementation}"
+        );
+        assert_eq!(namespace_value(info, "monotonic"), Some(TRUE));
+        assert_eq!(namespace_value(info, "adjustable"), Some(FALSE));
+        let resolution = namespace_value(info, "resolution")
+            .and_then(value::as_float)
+            .expect("resolution");
+        assert!(resolution > 0.0 && resolution <= 1e-6, "{resolution}");
+
+        // `time` follows the wall clock, which is adjustable.
+        let wall = call("time", "get_clock_info", &[string("time")]);
+        assert_eq!(namespace_value(wall, "monotonic"), Some(FALSE));
+        assert_eq!(namespace_value(wall, "adjustable"), Some(TRUE));
+
+        // An unknown clock name is a ValueError, like CPython's C table.
+        exc::init();
+        assert_eq!(call("time", "get_clock_info", &[string("nope")]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert!(message().contains("unknown clock"));
+    }
+
+    #[test]
+    fn threading_stack_size_sets_and_restores() {
+        exc::init();
+        let original = as_int(call("threading", "stack_size", &[]));
+        // A valid size returns the previous one and becomes the new setting.
+        assert_eq!(
+            as_int(call("threading", "stack_size", &[int(1024 * 1024)])),
+            original
+        );
+        assert_eq!(as_int(call("threading", "stack_size", &[])), 1024 * 1024);
+        // Restore the previous value; the setting is process-wide.
+        assert_eq!(
+            as_int(call("threading", "stack_size", &[int(original)])),
+            1024 * 1024
+        );
+        assert_eq!(as_int(call("threading", "stack_size", &[])), original);
+
+        // Below 32 KiB is rejected and leaves the setting untouched.
+        exc::init();
+        assert_eq!(call("threading", "stack_size", &[int(1024)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+        assert_eq!(as_int(call("threading", "stack_size", &[])), original);
     }
 
     /// Extracts a `str` result, naming the surface that produced it when the

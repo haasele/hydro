@@ -5621,14 +5621,116 @@ fn lambda_defaults_lower_like_function_defaults() {
 }
 
 #[test]
-fn lambda_rejects_unsupported_parameter_forms() {
-    let source = "f = lambda *, x: x\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{source}: {diags:?}");
+fn lambda_bare_star_keyword_only_default() {
+    let source = "f = lambda *, file=None: file\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let lambda = function(&hir, "<lambda>");
+    assert_eq!(lambda.params.len(), 1);
+    assert_eq!(lambda.params[0].name, "file");
+    assert_eq!(lambda.params[0].kind, ParamKind::KwOnly);
+    assert_eq!(lambda.params[0].default, Some(Const::None));
+    // The bare star introduces no binding of its own.
+    assert_eq!(lambda.locals.len(), 1, "only the keyword-only parameter");
+}
+
+#[test]
+fn lambda_keyword_only_follows_positional_and_varargs() {
+    let source = "f = lambda x, *args, key=0: (x, args, key)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let lambda = function(&hir, "<lambda>");
+    let kinds: Vec<ParamKind> = lambda.params.iter().map(|param| param.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![ParamKind::Positional, ParamKind::VarArg, ParamKind::KwOnly,]
+    );
+    assert_eq!(lambda.params[2].name, "key");
+    assert_eq!(lambda.params[2].default, Some(Const::Int(0)));
+    assert!(lambda.locals.iter().any(|local| local.name == "key"));
+}
+
+#[test]
+fn lambda_keyword_only_default_reads_the_enclosing_scope() {
+    let source = "def outer(a):\n    return lambda *, y=a: y\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let outer = function(&hir, "outer");
+    let a = outer
+        .locals
+        .iter()
+        .position(|local| local.name == "a")
+        .expect("outer parameter a") as LocalId;
+    let lambda = function(&hir, "<lambda>");
+    assert_eq!(lambda.params[0].kind, ParamKind::KwOnly);
+    let Some(default) = &lambda.params[0].default_expr else {
+        panic!("the keyword-only default was dropped");
+    };
     assert!(
-        diags[0].message.contains("keyword-only"),
-        "{source}: {}",
-        diags[0].message
+        matches!(&default.kind, HExprKind::Local(local) if *local == a),
+        "expected a read of the enclosing parameter, got {:?}",
+        default.kind
+    );
+}
+
+#[test]
+fn lambda_keyword_only_call_binds_by_name() {
+    let source = "f = lambda *, key=1: key\nx = f(key=2)\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::CallKw { args, keywords, .. } = &assigned(&hir, "x").kind else {
+        panic!(
+            "expected a keyword call through the runtime binder, got {:?}",
+            assigned(&hir, "x").kind
+        );
+    };
+    assert!(args.is_empty(), "no positional operands: {args:?}");
+    assert_eq!(keywords.len(), 1);
+    assert_eq!(keywords[0].0, "key");
+    assert!(matches!(
+        keywords[0].1.kind,
+        HExprKind::Const(Const::Int(2))
+    ));
+}
+
+#[test]
+fn test_support_force_color_lambda_lowers_without_diagnostics() {
+    // `Lib/test/support/__init__.py`'s `force_color` wraps
+    // `_colorize.can_colorize` with this exact lambda: a bare star and a
+    // keyword-only default, next to a captured enclosing name.
+    let source = "\
+def force_color(color):
+    return lambda *, file=None: color
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        diags.iter().all(|diag| diag.code != codes::UNSUPPORTED),
+        "the lambda must not report HYD0002: {diags:?}"
+    );
+    let lambda = function(&hir, "<lambda>");
+    assert_eq!(lambda.capture_count, 1);
+    assert_eq!(lambda.params[0].name, "color");
+    assert_eq!(lambda.params.len(), 2, "the capture plus `file`");
+    assert_eq!(lambda.params[1].name, "file");
+    assert_eq!(lambda.params[1].kind, ParamKind::KwOnly);
+    assert_eq!(lambda.params[1].default, Some(Const::None));
+    // The body reads the captured `color`, so the value is materialised by
+    // the binder instead of staying a plain function reference.
+    let outer = function(&hir, "force_color");
+    let HStmtKind::Return(Some(value)) = &outer.body[0].kind else {
+        panic!("expected the returned lambda");
+    };
+    assert!(
+        matches!(
+            &value.kind,
+            HExprKind::Call {
+                callee: Callee::Function(_),
+                args,
+            } if args.len() == 1
+        ),
+        "expected the closure binder call, got {:?}",
+        value.kind
     );
 }
 
@@ -18559,6 +18661,416 @@ if sys.platform == 'win32':
 ";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
+}
+
+/// Every platform guard shape the frontend decides statically, plus the
+/// runtime shapes that must stay dynamic.
+#[test]
+fn host_platform_guard_shapes_are_static() {
+    let platform = host_sys_platform();
+    let name = host_os_name();
+    let fold = |source: String| {
+        let module = parse(&format!("if {source}:\n    pass\n"));
+        let ast::Stmt::If(s) = &module.body[0] else {
+            panic!("expected an if statement");
+        };
+        static_if_branch(&s.test, "mod")
+    };
+    // Equality in both directions.
+    assert_eq!(fold(format!("sys.platform == '{platform}'")), Some(true));
+    assert_eq!(fold(format!("'{platform}' == sys.platform")), Some(true));
+    assert_eq!(
+        fold("sys.platform != 'no-such-platform'".to_string()),
+        Some(true)
+    );
+    assert_eq!(
+        fold("'no-such-platform' == sys.platform".to_string()),
+        Some(false)
+    );
+    // Membership over a literal container.
+    assert_eq!(
+        fold(format!(
+            "sys.platform in ('no-such-platform', '{platform}')"
+        )),
+        Some(true)
+    );
+    assert_eq!(
+        fold(format!("sys.platform not in ('{platform}',)")),
+        Some(false)
+    );
+    assert_eq!(
+        fold("sys.platform in ['win32', 'cygwin']".to_string()),
+        Some(platform == "win32" || platform == "cygwin")
+    );
+    // Prefix/suffix tests, including the tuple form and negation.
+    assert_eq!(
+        fold("sys.platform.startswith('win')".to_string()),
+        Some(platform.starts_with("win"))
+    );
+    assert_eq!(
+        fold("not sys.platform.startswith('win')".to_string()),
+        Some(!platform.starts_with("win"))
+    );
+    assert_eq!(
+        fold("sys.platform.startswith(('win', 'cygwin'))".to_string()),
+        Some(platform.starts_with("win") || platform.starts_with("cygwin"))
+    );
+    assert_eq!(
+        fold("sys.platform.endswith('2')".to_string()),
+        Some(platform.ends_with('2'))
+    );
+    assert_eq!(fold(format!("os.name == '{name}'")), Some(true));
+    assert_eq!(fold("os.name == 'nt'".to_string()), Some(name == "nt"));
+    assert_eq!(fold("os.name != 'nt'".to_string()), Some(name != "nt"));
+    assert_eq!(
+        fold("os.name in ('nt', 'java')".to_string()),
+        Some(name == "nt" || name == "java")
+    );
+    // Nothing outside the two host constants is decided, even when the
+    // expression would happen to look platform-like.
+    assert_eq!(fold("platform == 'linux'".to_string()), None);
+    assert_eq!(fold("os.name == nt".to_string()), None);
+    assert_eq!(fold("sys.platform.lower() == 'win32'".to_string()), None);
+    assert_eq!(fold("sys.name == 'posix'".to_string()), None);
+    assert_eq!(fold("sys.platform".to_string()), None);
+    assert_eq!(fold("sys.platform.startswith(name)".to_string()), None);
+    // The module-name guard still works and is not confused with the host.
+    let module = parse("if __name__ == '__main__':\n    pass\n");
+    let ast::Stmt::If(entry) = &module.body[0] else {
+        panic!("expected an if statement");
+    };
+    assert_eq!(static_if_branch(&entry.test, "__main__"), Some(true));
+    assert_eq!(static_if_branch(&entry.test, "mod"), Some(false));
+}
+
+/// The integer literal `name` receives in the branch the compiler selected,
+/// following module-level `if` statements.
+fn folded_int(hir: &LHir, name: &str) -> Option<i64> {
+    fn walk(stmts: &[HStmt], locals: &[HLocal], name: &str) -> Option<i64> {
+        for stmt in stmts {
+            match &stmt.kind {
+                HStmtKind::Assign { target, value } => {
+                    let is_target = locals
+                        .get(*target as usize)
+                        .is_some_and(|local| local.name == name);
+                    if is_target {
+                        if let HExprKind::Const(Const::Int(value)) = &value.kind {
+                            return Some(*value);
+                        }
+                    }
+                }
+                HStmtKind::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    if let Some(value) = walk(then_body, locals, name) {
+                        return Some(value);
+                    }
+                    if let Some(value) = walk(else_body, locals, name) {
+                        return Some(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    walk(&hir.functions[0].body, &hir.functions[0].locals, name)
+}
+
+#[test]
+fn dead_platform_branch_imports_are_not_lowered() {
+    if cfg!(target_os = "windows") {
+        return;
+    }
+    // `test.support` keeps a Windows-only `_winapi` method behind this guard.
+    // The import was not collected, so lowering it would report a missing
+    // name for a branch the host never runs.
+    let source = "\
+import sys
+import os
+if sys.platform == 'win32':
+    import _winapi
+    value = _winapi.GetModuleFileName(0)
+elif os.name == 'nt':
+    import _winapi
+    value = _winapi.GetModuleFileName(0)
+else:
+    value = 1
+";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    // A false `startswith` guard protects its branch the same way.
+    let source = "\
+import sys
+if not sys.platform.startswith('win'):
+    value = 2
+else:
+    import _winapi
+    value = _winapi.GetModuleFileName(0)
+";
+    let hir = lower_ok(source);
+    assert_eq!(folded_int(&hir, "value"), Some(2));
+}
+
+/// True when `stmts` (or a nested block) evaluates a deferred import of
+/// `module`.
+fn has_deferred_import(stmts: &[HStmt], module: &str) -> bool {
+    fn expr(value: &HExpr, module: &str) -> bool {
+        match &value.kind {
+            HExprKind::DeferredImport { module: name, .. } => name == module,
+            HExprKind::IndirectCall { callee, args, .. } => {
+                expr(callee, module) || args.iter().any(|arg| expr(arg, module))
+            }
+            HExprKind::GetAttr { object, .. } => expr(object, module),
+            HExprKind::Bin { lhs, rhs, .. } => expr(lhs, module) || expr(rhs, module),
+            HExprKind::Un { operand, .. } => expr(operand, module),
+            _ => false,
+        }
+    }
+    stmts.iter().any(|stmt| match &stmt.kind {
+        HStmtKind::Expr(value) => expr(value, module),
+        HStmtKind::Assign { value, .. } | HStmtKind::GlobalSet { value, .. } => expr(value, module),
+        HStmtKind::Return(Some(value)) => expr(value, module),
+        HStmtKind::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            expr(cond, module)
+                || has_deferred_import(then_body, module)
+                || has_deferred_import(else_body, module)
+        }
+        HStmtKind::While {
+            cond,
+            body,
+            else_body,
+        } => {
+            expr(cond, module)
+                || has_deferred_import(body, module)
+                || has_deferred_import(else_body, module)
+        }
+        HStmtKind::ForEach {
+            iterable,
+            body,
+            else_body,
+            ..
+        } => {
+            expr(iterable, module)
+                || has_deferred_import(body, module)
+                || has_deferred_import(else_body, module)
+        }
+        HStmtKind::Try {
+            body,
+            handlers,
+            else_body,
+            finally_body,
+        } => {
+            has_deferred_import(body, module)
+                || handlers
+                    .iter()
+                    .any(|handler| has_deferred_import(&handler.body, module))
+                || has_deferred_import(else_body, module)
+                || has_deferred_import(finally_body, module)
+        }
+        _ => false,
+    })
+}
+
+#[test]
+fn dead_platform_branch_import_still_binds_a_live_name() {
+    if cfg!(target_os = "windows") {
+        return;
+    }
+    // CPython compiles both branches, so `import msvcrt` inside the dead
+    // Windows branch still binds `msvcrt` in the function.
+    // `test.support.os_helper` reads it from a `finally:` that only the dead
+    // branch arms (`old_modes` stays None), so the reference must compile.
+    // Nothing may be linked, and the dead branch keeps every other name it
+    // mentions unlowered: evaluating the binding would raise the import error
+    // rather than fabricate a module.
+    let source = "\
+import sys
+def check():
+    old_modes = None
+    if sys.platform == 'win32':
+        import msvcrt
+        msvcrt.CrtSetReportMode
+        old_modes = {}
+        broken = undefined_in_the_windows_branch
+    try:
+        count = 0
+    finally:
+        if old_modes is not None:
+            msvcrt.CrtSetReportMode(1, old_modes[1])
+    return count
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let check = hir
+        .functions
+        .iter()
+        .find(|function| function.name == "check")
+        .expect("check must be lowered");
+    assert!(
+        has_deferred_import(&check.body, "msvcrt"),
+        "the live `finally` read must resolve to a deferred import: {:?}",
+        check.body
+    );
+
+    // The same fold at module level binds the imported module name.
+    let source = "\
+import sys
+if sys.platform == 'win32':
+    import winreg
+    HKEY = winreg.HKEY_CURRENT_USER
+flag = None
+if flag is not None:
+    HKEY = winreg.HKEY_CURRENT_USER
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        has_deferred_import(&hir.functions[0].body, "winreg"),
+        "the live module-level read must resolve to a deferred import"
+    );
+}
+
+#[test]
+fn dead_platform_branch_in_a_class_body_is_not_lowered() {
+    if cfg!(target_os = "windows") {
+        return;
+    }
+    // The same guard inside a class body must not register the method or
+    // lower its body: the body's `_winapi` import was never collected.
+    let source = "\
+import sys
+import os
+class Symlink:
+    if sys.platform == 'win32':
+        def _platform_specific(self):
+            import _winapi
+            return _winapi.GetModuleFileName(0)
+    elif os.name == 'nt':
+        def _platform_specific(self):
+            import _winapi
+            return _winapi.GetModuleFileName(0)
+    else:
+        def _platform_specific(self):
+            return 1
+    def __enter__(self):
+        return self
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let mut specific = hir
+        .functions
+        .iter()
+        .filter(|function| function.name == "Symlink._platform_specific");
+    let function = specific.next().expect("the live method must be lowered");
+    assert!(
+        specific.next().is_none(),
+        "only the live branch may define the method: {:?}",
+        hir.functions
+            .iter()
+            .map(|function| function.name.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        function.body.iter().any(|stmt| matches!(
+            &stmt.kind,
+            HStmtKind::Return(Some(value))
+                if matches!(&value.kind, HExprKind::Const(Const::Int(1)))
+        )),
+        "the live branch must lower `return 1`"
+    );
+    // The dead branch binds nothing: its import is not in the IR at all.
+    assert!(
+        function
+            .body
+            .iter()
+            .all(|stmt| !matches!(&stmt.kind, HStmtKind::GlobalSet { .. })),
+        "a Windows-only import must not survive lowering"
+    );
+}
+
+#[test]
+fn dead_platform_branch_hides_undefined_names() {
+    let source = "\
+import sys
+if sys.platform == 'win32':
+    value = name_only_windows_defines
+else:
+    value = 1
+";
+    let hir = lower_ok(source);
+    assert_eq!(folded_int(&hir, "value"), Some(1));
+    // The live branch is still lowered and diagnosed normally.
+    let source = "\
+import sys
+if sys.platform != 'win32':
+    value = 2
+else:
+    value = name_only_windows_defines
+";
+    let hir = lower_ok(source);
+    assert_eq!(folded_int(&hir, "value"), Some(2));
+}
+
+#[test]
+fn elif_chains_fold_one_platform_link_at_a_time() {
+    let source = "\
+import sys
+import os
+if sys.platform == 'win32':
+    value = 1
+elif os.name == 'nt':
+    value = 2
+else:
+    value = 3
+";
+    let hir = lower_ok(source);
+    let expected = if host_sys_platform() == "win32" {
+        1
+    } else if host_os_name() == "nt" {
+        2
+    } else {
+        3
+    };
+    assert_eq!(folded_int(&hir, "value"), Some(expected));
+}
+
+#[test]
+fn runtime_variable_platform_comparison_stays_dynamic() {
+    // Only the two host constants are folded; a value that merely looks like
+    // `sys.platform` keeps both branches and a runtime condition.
+    let source = "\
+platform = 'win32'
+if platform == 'win32':
+    value = 1
+else:
+    value = 2
+";
+    let hir = lower_ok(source);
+    let statement = hir.functions[0]
+        .body
+        .iter()
+        .find_map(|stmt| match &stmt.kind {
+            HStmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => Some((cond, then_body, else_body)),
+            _ => None,
+        })
+        .expect("the dynamic if must survive lowering");
+    assert!(
+        !matches!(&statement.0.kind, HExprKind::Const(Const::Bool(_))),
+        "a runtime variable comparison must not fold: {:?}",
+        statement.0.kind
+    );
+    assert!(!statement.1.is_empty() && !statement.2.is_empty());
 }
 
 #[test]

@@ -233,6 +233,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             args.get(2).copied().unwrap_or(NONE),
             args.get(3).copied().unwrap_or(NONE),
         ),
+        // `types.coroutine(func)`.
+        "coroutine" => coroutine_decorator(args.first().copied().unwrap_or(NONE)),
         "get_original_bases" => get_original_bases(args.first().copied().unwrap_or(NONE)),
         "resolve_bases" => args.first().copied().unwrap_or(NONE),
         _ => exc::raise_with_message(
@@ -335,6 +337,17 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
         }
         return prepare_class(&bound);
     }
+    if function == "coroutine" {
+        // The generic binder already moved `func=` into the positional slot;
+        // a name left here belongs to no parameter of the decorator.
+        if let Some((name, _)) = keywords.first() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("coroutine() got an unexpected keyword argument '{name}'"),
+            );
+        }
+        return coroutine_decorator(args.first().copied().unwrap_or(NONE));
+    }
     if function != "DynamicClassAttribute" {
         return exc::raise_with_message(
             ATTRIBUTE_ERROR,
@@ -375,6 +388,30 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
     let fdel = slots[2].unwrap_or(NONE);
     let doc = slots[3].unwrap_or(NONE);
     new_dynamic_class_attribute(fget, fset, fdel, doc)
+}
+
+/// `types.coroutine(func)`: marks a generator function as an *iterable
+/// coroutine* and returns it.
+///
+/// CPython rewrites the function's code flags (`CO_ITERABLE_COROUTINE`).
+/// Hydro has no code objects, so the equivalent state is the runtime's
+/// coroutine-function marker — the same one `inspect.markcoroutinefunction`
+/// installs, which makes `inspect.iscoroutinefunction(func)` report `True`.
+/// The decorated value is the original function, as in CPython.
+///
+/// A callable that cannot carry function metadata (a native/builtin function)
+/// is returned unchanged instead of failing the decoration: CPython wraps such
+/// a callable in a generator adapter, and a pass-through is the behaviour the
+/// runtime can honour without a code object.
+fn coroutine_decorator(func: i64) -> i64 {
+    if !value::truthy(crate::builtins::callable(func)) {
+        return exc::raise_with_message(TYPE_ERROR, "types.coroutine() expects a callable");
+    }
+    crate::modules::inspect::mark_coroutine_function(func);
+    if exc::pending() {
+        exc::clear();
+    }
+    func
 }
 
 /// `types.get_original_bases(cls, /)`: the class's own `__orig_bases__` when
@@ -1535,6 +1572,30 @@ mod tests {
         assert_eq!(exc::pending_tag(), crate::exc::TYPE_ERROR as i64);
         assert!(value::to_string(exc::pending_value())
             .contains("Expected an instance of type, not 'NoneType'"));
+        exc::clear();
+    }
+
+    #[test]
+    fn coroutine_marks_the_function_and_rejects_non_callables() {
+        exc::init();
+        // A generator function receives the runtime's coroutine marker; the
+        // decorator returns the same function object, like CPython.
+        let function = value::function_new_with_flags(1, 0, "gen".to_string(), 0);
+        let roots = crate::heap::root_values(&[function]);
+        assert_eq!(call("coroutine", &[function]), function);
+        assert!(!exc::pending());
+        assert_eq!(
+            crate::modules::inspect::call("iscoroutinefunction", &[function]),
+            value::TRUE
+        );
+        assert!(!exc::pending());
+        crate::heap::release_roots(roots);
+
+        // A non-callable is rejected with CPython's message.
+        exc::init();
+        assert_eq!(call("coroutine", &[encode_int(3).unwrap_or(NONE)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert!(value::to_string(exc::pending_value()).contains("expects a callable"));
         exc::clear();
     }
 }

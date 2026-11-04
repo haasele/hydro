@@ -78,16 +78,16 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-10-31: **3091 tests run
-(3091 passed, 1 skipped)**; the per-crate breakdown below sums to 3091
+`cargo nextest run --workspace` on 2026-10-31: **3114 tests run
+(3114 passed, 1 skipped)**; the per-crate breakdown below sums to 3114
 (the skipped test is not included in the listed binaries):
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 1970 |
-| frontend | 885 |
+| runtime (unit + integration) | 1981 |
+| frontend | 896 |
 | codegen | 79 |
-| IR | 68 |
+| IR | 70 |
 | bindgen | 42 |
 | interpreter | 28 |
 | parser | 19 |
@@ -117,8 +117,11 @@ Other docs must link here instead of repeating the total.
   `_multiarray_umath` missing-`_NoValue` path; pandas AOT compilation now
   stops on missing `sqlite3.register_adapter`. The official test runner's
   shared import blockers (`platform.win32_is_iot`, `ctypes.windll`,
-  `subprocess._args_from_interpreter_flags`) are fixed; failures now cluster
-  on unreachable Windows-only imports such as `_winapi`. The
+  `subprocess._args_from_interpreter_flags`) are fixed, and `test.support`
+  now imports after platform-branch folding, dead-import bindings, lambda
+  keyword-only support and the missing harness APIs. The official suite has
+  not been rerun since; per-test blockers now include `unittest.mock`,
+  `tempfile.mktemp`, `binascii.Error` and `unittest.result`. The
   ABI inventory reports **0 missing required symbols** across 68 pinned
   extension modules. Pinned ecosystem report:
   `docs/ECOSYSTEM.md`.

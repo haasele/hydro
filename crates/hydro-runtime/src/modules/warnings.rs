@@ -15,6 +15,10 @@
 //! * `warn`, `warn_explicit`, `filterwarnings`, `simplefilter`,
 //!   `resetwarnings`, `showwarning`, `formatwarning`, plus the `filters`
 //!   snapshot list;
+//! * the private `_get_filters`/`_filters_mutated` filter-stack accessors that
+//!   CPython's `_warnings` accelerator provides: `_get_filters()` returns the
+//!   installed filter tuples and `_filters_mutated()` bumps the mutation
+//!   counter (and clears both once-registries) after an in-place edit;
 //! * `catch_warnings(...)` as a real context manager: entering snapshots the
 //!   filters, `record=True` installs an `always` filter and returns a list
 //!   that receives one `WarningMessage`-shaped object per emitted warning,
@@ -50,6 +54,12 @@
 //!   prefixes at the start of the text, which is the behaviour of the
 //!   `re.I`-compiled `re.match` CPython uses for the common patterns; full
 //!   regular expressions are not compiled here.
+//! * `_get_filters()` returns a snapshot of the filter stack, like the
+//!   `warnings.filters` list: the installed filters are a Rust `Vec`, not a
+//!   live Python list, so an in-place edit of the returned list
+//!   (`filters[:] = ...`) updates the snapshot only. `_filters_mutated()` still
+//!   bumps the version and clears the once-registries, so version-aware
+//!   callers observe the mutation.
 //! * `warnings.showwarning` is a native function, not a rebindable module
 //!   attribute (native modules have no writable attributes in Hydro).
 //!   `catch_warnings(record=True)` does not rebind it either: the recording
@@ -1437,6 +1447,16 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "resetwarnings" => resetwarnings(),
         "catch_warnings" => catch_warnings(args, &[]),
         "_deprecated" => deprecated(args, &[]),
+        // `_warnings._get_filters()` / `_warnings._filters_mutated()`: the
+        // private filter-stack accessors CPython exposes from the accelerator.
+        // `_get_filters` returns the installed filter tuples in the same shape
+        // as `warnings.filters`; a mutation bumps the counter that programs
+        // such as `test.support` use to know their snapshot is stale.
+        "_get_filters" => filters(),
+        "_filters_mutated" => {
+            state().mutated();
+            NONE
+        }
         "_catch_warnings_enter" => match args.first().copied() {
             Some(instance) => catch_warnings_enter(instance),
             None => type_error("__enter__() missing self"),
@@ -1843,5 +1863,47 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert!(value::to_string(exc::pending_value()).contains("category must be"));
         exc::clear();
+    }
+
+    #[test]
+    fn filter_accessors_report_and_mutate_the_stack() {
+        exc::init();
+        // Save the installed stack so the test leaves the process-wide state
+        // exactly as it found it.
+        let saved = filters();
+        let installed = value::as_list(call("_get_filters", &[])).expect("filter list");
+        assert!(!installed.is_empty(), "the default filters are installed");
+        for entry in installed {
+            // CPython's shape: (action, message, category, module, lineno).
+            assert_eq!(value::as_tuple(*entry).map(|items| items.len()), Some(5));
+        }
+        let before_len = installed.len();
+
+        // A filter installed by the program appears in the next snapshot.
+        assert_eq!(
+            simplefilter(&[value::str_alloc("always".to_string())]),
+            NONE
+        );
+        assert!(!exc::pending());
+        let updated = value::as_list(call("_get_filters", &[])).expect("filter list");
+        assert_eq!(updated.len(), before_len + 1);
+        let first = value::as_tuple(updated[0]).expect("filter tuple");
+        assert_eq!(value::as_str(first[0]), Some("always"));
+
+        // `_filters_mutated()` bumps the mutation counter programs compare and
+        // returns `None`.
+        let before = state().version;
+        assert_eq!(call("_filters_mutated", &[]), NONE);
+        assert!(!exc::pending());
+        assert_eq!(state().version, before.wrapping_add(1));
+
+        restore_filters(saved);
+        assert_eq!(
+            value::as_list(call("_get_filters", &[]))
+                .expect("filter list")
+                .len(),
+            before_len
+        );
+        assert!(!exc::pending());
     }
 }

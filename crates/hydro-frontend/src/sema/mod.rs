@@ -528,7 +528,10 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
 /// Static signatures of `bytes` methods. Byte-oriented arguments are byte
 /// strings; `decode` takes an optional string encoding.
 const BYTES_METHODS: &[(&str, MethodSig)] = &[
-    ("decode", MethodSig::new(0, 1, &[ArgKind::Str], Type::Str)),
+    (
+        "decode",
+        MethodSig::new(0, 2, &[ArgKind::Str, ArgKind::Str], Type::Str),
+    ),
     ("hex", MethodSig::new(0, 0, &[], Type::Str)),
     // `bytes.maketrans` is a static method: two buffer operands, receiver
     // ignored, and always a 256-byte table.

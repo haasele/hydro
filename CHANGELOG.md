@@ -29,6 +29,13 @@ initial state of the first runnable core.
   `win32_edition`/`win32_ver` fallbacks, runtime-conditional
   `ctypes.windll`/`oledll`, and the private
   `subprocess._args_from_interpreter_flags` helpers.
+- CPython test support now imports: statically folds `sys.platform`/`os.name`
+  guards (including dead-branch import bindings without linking), supports
+  keyword-only lambda parameters, and adds the missing harness surface
+  (`platform` variants, `faulthandler` state, `inspect` private helpers,
+  `os.dup`/`waitstatus_to_exitcode`/`register_at_fork`, `sys._jit`,
+  `time.get_clock_info`, `threading.stack_size`, `types.coroutine`,
+  `warnings._get_filters`, `asyncio.events`, `float.__getformat__`).
 - Ecosystem gate remains **9/13**: pydantic import/smoke pass; NumPy now stops
   on missing `_NoValue` after code-object metadata (`co_argcount`,
   `co_kwonlyargcount`, `co_varnames`, flags), DType/metatype, PARSE,

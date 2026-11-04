@@ -254,6 +254,10 @@ pub static TIME: ModuleSpec = ModuleSpec {
         // `mktime(t)`: the inverse of `localtime`, an epoch-seconds float for
         // a nine-field `struct_time` sequence.
         f("mktime", 1, 1, Type::Float),
+        // `get_clock_info(name)`: a namespace with `implementation`,
+        // `monotonic`, `adjustable` and `resolution` for one clock name. The
+        // name is positional-only in CPython.
+        f("get_clock_info", 1, 1, Type::Any),
         f("tzset", 0, 0, Type::None),
     ],
     constants: &[
@@ -347,6 +351,60 @@ pub static PLATFORM: ModuleSpec = ModuleSpec {
         f("python_build", 0, 0, Type::Tuple),
         f("python_compiler", 0, 0, Type::Str),
         f("processor", 0, 0, Type::Str),
+        kw(
+            "architecture",
+            0,
+            3,
+            Type::Tuple,
+            &["executable", "bits", "linkage"],
+        ),
+        kw(
+            "android_ver",
+            0,
+            6,
+            Type::Any,
+            &[
+                "release",
+                "api_level",
+                "manufacturer",
+                "model",
+                "device",
+                "is_emulator",
+            ],
+        ),
+        kw(
+            "ios_ver",
+            0,
+            4,
+            Type::Any,
+            &["system", "release", "model", "is_simulator"],
+        ),
+        kw(
+            "mac_ver",
+            0,
+            3,
+            Type::Tuple,
+            &["release", "versioninfo", "machine"],
+        ),
+        kw(
+            "java_ver",
+            0,
+            4,
+            Type::Tuple,
+            &["release", "vendor", "vminfo", "osinfo"],
+        ),
+        kw(
+            "libc_ver",
+            0,
+            3,
+            Type::Tuple,
+            &["executable", "lib", "version"],
+        ),
+        f("freedesktop_os_release", 0, 0, Type::Any),
+        f("system_alias", 3, 3, Type::Tuple),
+        f("python_branch", 0, 0, Type::Str),
+        f("python_revision", 0, 0, Type::Str),
+        f("invalidate_caches", 0, 0, Type::None),
         // Windows-only helpers return the non-Windows fallbacks: no edition,
         // not IoT, and four empty version fields.
         f("win32_edition", 0, 0, Type::Any),
@@ -566,6 +624,10 @@ pub static OS: ModuleSpec = ModuleSpec {
         kw("fspath", 1, 1, Type::Any, &["path"]),
         f("fork", 0, 0, Type::Int),
         f("waitpid", 2, 2, Type::Tuple),
+        // `waitstatus_to_exitcode(status)`: decodes a `waitpid` status into an
+        // exit code (negative for a signal). An invalid status raises
+        // `ValueError`, like CPython.
+        f("waitstatus_to_exitcode", 1, 1, Type::Int),
         // `os.kill(pid, sig)`: sends `sig` to `pid` (signal 0 only checks
         // whether the process exists). Both parameters are positional-only.
         f("kill", 2, 2, Type::None),
@@ -614,7 +676,9 @@ pub static OS: ModuleSpec = ModuleSpec {
         kw("get_terminal_size", 0, 1, Type::Any, &["fd"]),
         // `os.open(path, flags, mode=0o777)` returns the new descriptor.
         f("open", 2, 3, Type::Int),
+        f("dup", 1, 1, Type::Int),
         f("dup2", 2, 2, Type::Int),
+        kw_dynamic("register_at_fork", 0, usize::MAX, Type::None, &[]),
         // `os.putenv(name, value, /)` and `os.unsetenv(name, /)`: both are
         // C-level functions in CPython, so their arguments are positional-only
         // and may be str or bytes.
@@ -1363,6 +1427,11 @@ pub static THREADING: ModuleSpec = ModuleSpec {
         f("_threadbase_join", 1, 2, Type::None),
         f("_threadbase_is_alive", 1, 1, Type::Bool),
         f("_threadbase_run", 1, 1, Type::None),
+        // `stack_size([size])`: with no argument, the stack size used for
+        // threads created from now on (`0` means the platform default); with
+        // an argument, sets it and returns the previous value. `size` must be
+        // `0` or at least `PTHREAD_STACK_MIN`.
+        f("stack_size", 0, 1, Type::Int),
         // `threading.settrace(func)`: install the per-thread trace hook. It
         // exists for imports; Hydro has no trace callback machinery.
         f("settrace", 1, 1, Type::None),
@@ -1656,8 +1725,23 @@ pub static SYS: ModuleSpec = ModuleSpec {
         // Name of the filesystem error handler (`surrogateescape` on POSIX).
         f("getfilesystemencodeerrors", 0, 0, Type::Str),
         // Maximum number of decimal digits used when converting an int to
-        // text (`sys.set_int_max_str_digits`'s companion).
+        // text (`sys.set_int_max_str_digits`'s companion). Hydro's own
+        // conversions are unbounded, so the default is `0`; a program that
+        // saves/restores the limit (as `test.support` does) observes the value
+        // it set.
         f("get_int_max_str_digits", 0, 0, Type::Int),
+        // `sys.set_int_max_str_digits(maxdigits)`: `0` disables the limit,
+        // anything else must be at least 640 decimal digits.
+        f("set_int_max_str_digits", 1, 1, Type::None),
+        // `sys.is_remote_debug_enabled()`: PEP 768 remote debugging. Hydro has
+        // no attach/debugger-injection protocol, so no `-X remote_debug`
+        // configuration can be active and the predicate reports `False`.
+        f("is_remote_debug_enabled", 0, 0, Type::Bool),
+        // `sys.unraisablehook(unraisable)`: the default unraisable-exception
+        // reporter. The attribute is writable (programs save and restore it);
+        // this value writes CPython's "Exception ignored in:" report to
+        // stderr.
+        f("unraisablehook", 1, 1, Type::None),
         f("getswitchinterval", 0, 0, Type::Float),
         f("setswitchinterval", 1, 1, Type::None),
         // `settrace(function)` / `setprofile(function)`: install (or clear,
@@ -1740,6 +1824,10 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("path_hooks", Type::List),
         // `sys.flags`: the interpreter's command-line flag namespace.
         c("flags", Type::Any),
+        // `sys._jit`: the JIT-control namespace. Hydro compiles whole programs
+        // ahead of time and has no runtime bytecode JIT, so `_jit.is_enabled()`
+        // reports `False`.
+        c("_jit", Type::Any),
         // `sys.monitoring`/`sys.meta_path`: the monitor tool registry and the
         // ordered list of meta path finders.
         c("monitoring", Type::Any),
@@ -2570,6 +2658,10 @@ pub static ASYNCIO: ModuleSpec = ModuleSpec {
         // `from asyncio import coroutines` resolves the nested module; the
         // attribute value is the native submodule itself.
         c("coroutines", Type::Any),
+        // `import asyncio.events` / `asyncio.events._event_loop_policy`: the
+        // event-loop policy submodule. Hydro has one native event loop and no
+        // pluggable policy, so the module's only member reports `None`.
+        c("events", Type::Any),
     ],
 };
 
@@ -2583,6 +2675,20 @@ pub static ASYNCIO_COROUTINES: ModuleSpec = ModuleSpec {
     name: "asyncio.coroutines",
     functions: &[],
     constants: &[c("_is_coroutine", Type::Any)],
+};
+
+/// `asyncio.events`: the event-loop policy submodule.
+///
+/// CPython's `asyncio` implementation lives in this module; Hydro implements
+/// the event loop natively, so only the module-global policy handle is
+/// exposed. `_event_loop_policy` is `None` until a policy is installed, and
+/// this runtime has no pluggable policy API, so it always reads `None` —
+/// exactly what `test.support.maybe_get_event_loop_policy()` expects on an
+/// interpreter with no policy set.
+pub static ASYNCIO_EVENTS: ModuleSpec = ModuleSpec {
+    name: "asyncio.events",
+    functions: &[],
+    constants: &[c("_event_loop_policy", Type::Any)],
 };
 
 /// `errno`: POSIX error numbers and the `errorcode` reverse mapping.
@@ -3861,6 +3967,11 @@ pub static TYPES: ModuleSpec = ModuleSpec {
             &["name", "bases", "kwds"],
         ),
         f("resolve_bases", 1, 1, Type::Any),
+        // `coroutine(func)`: the decorator that marks a generator function as
+        // an iterable coroutine. Hydro has no code objects, so the equivalent
+        // is the runtime's coroutine-function marker; a callable that cannot
+        // carry it is returned unchanged.
+        kw("coroutine", 1, 1, Type::Any, &["func"]),
         // `MappingProxyType(mapping)`: the read-only wrapper constructor.
         f("MappingProxyType", 1, 1, Type::Any),
     ],
@@ -4698,6 +4809,11 @@ const WARNING_FUNCTIONS: &[FunctionSpec] = &[
         &["action", "category", "lineno", "append"],
     ),
     f("resetwarnings", 0, 0, Type::None),
+    // `_warnings._get_filters()`: the installed filter tuples (CPython's
+    // `warnings.filters` list). `_filters_mutated()` bumps the mutation
+    // counter programs compare to invalidate their cached filters.
+    f("_get_filters", 0, 0, Type::List),
+    f("_filters_mutated", 0, 0, Type::None),
     // Natives behind the `catch_warnings` instance.
     f("_catch_warnings_enter", 1, 1, Type::Any),
     f("_catch_warnings_exit", 4, 4, Type::None),
@@ -5714,6 +5830,11 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
         f("getabsfile", 1, 1, Type::Str),
         f("getcomments", 1, 1, Type::Any),
         f("getmro", 1, 1, Type::Tuple),
+        // CPython's internal helpers, used by `test.support` to walk a class
+        // MRO without invoking the descriptor protocol: the MRO tuple itself
+        // and the class namespace mapping.
+        f("_static_getmro", 1, 1, Type::Tuple),
+        f("_get_dunder_dict_of_class", 1, 1, Type::Dict),
         f("classify_class_attrs", 1, 1, Type::List),
         // `getclasstree(classes, unique=False)`.
         kw("getclasstree", 1, 2, Type::List, &["classes", "unique"]),
@@ -5759,6 +5880,10 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
         kw("getmodulename", 1, 1, Type::Any, &["path"]),
     ],
     constants: &[
+        // `inspect._sentinel`: the identity sentinel `find_name_in_mro` uses
+        // as its "no default supplied" marker, so `default is _sentinel`
+        // compares the same object across reads.
+        c("_sentinel", Type::Any),
         c("empty", Type::Any),
         c("_empty", Type::Any),
         c("Signature", Type::Any),
@@ -6808,11 +6933,21 @@ pub static _SYSCONFIG: ModuleSpec = ModuleSpec {
     constants: SYSCONFIG.constants,
 };
 
-/// `faulthandler`: registered so imports resolve. Hydro installs no signal
-/// handlers and has no fault-reporting API, so the module exposes no names.
+/// `faulthandler`: the fault-handler enable/disable surface.
+///
+/// Hydro installs no fatal-signal handlers of its own, so no handler runs on a
+/// fault. The enabled flag itself is real: `enable`/`disable` set it and
+/// `is_enabled` reports it, which is the sequence `test.support` saves and
+/// restores around a subprocess check.
 pub static FAULTHANDLER: ModuleSpec = ModuleSpec {
     name: "faulthandler",
-    functions: &[],
+    functions: &[
+        // `enable(file=sys.stderr, all_threads=True)`: `file` is a file object
+        // or an integer descriptor in CPython.
+        kw("enable", 0, 2, Type::None, &["file", "all_threads"]),
+        f("disable", 0, 0, Type::None),
+        f("is_enabled", 0, 0, Type::Bool),
+    ],
     constants: &[],
 };
 
@@ -9362,7 +9497,9 @@ mod tests {
         assert!(constant("_ssl", "CERT_REQUIRED").is_some());
         let name = "faulthandler";
         let spec = module(name).unwrap_or_else(|| panic!("{name}"));
-        assert!(spec.functions.is_empty(), "{name}");
+        assert!(function(name, "enable").is_some(), "{name}.enable");
+        assert!(function(name, "disable").is_some(), "{name}.disable");
+        assert!(function(name, "is_enabled").is_some(), "{name}.is_enabled");
         assert!(spec.constants.is_empty(), "{name}");
         // `_suggestions` now declares its real helper.
         let suggestions =
@@ -10520,5 +10657,43 @@ mod tests {
                 "_queue.{name} must reuse the queue table entry"
             );
         }
+    }
+
+    #[test]
+    fn test_support_compat_members_are_declared() {
+        // The `test.support` imports and attributes the runtime serves must
+        // resolve through the central table, otherwise the frontend reports
+        // `module '<x>' has no attribute '<y>'` while compiling the module.
+        for (module_name, member) in [
+            ("inspect", "_sentinel"),
+            ("inspect", "_static_getmro"),
+            ("inspect", "_get_dunder_dict_of_class"),
+            ("sys", "_jit"),
+            ("sys", "unraisablehook"),
+            ("sys", "is_remote_debug_enabled"),
+            ("sys", "set_int_max_str_digits"),
+            ("threading", "stack_size"),
+            ("time", "get_clock_info"),
+            ("types", "coroutine"),
+            ("warnings", "_filters_mutated"),
+            ("warnings", "_get_filters"),
+            ("asyncio", "events"),
+        ] {
+            assert!(
+                function(module_name, member).is_some() || constant(module_name, member).is_some(),
+                "{module_name}.{member} must be declared"
+            );
+        }
+        // `faulthandler`'s enable/disable/is_enabled state machine.
+        for member in ["enable", "disable", "is_enabled"] {
+            assert!(
+                function("faulthandler", member).is_some(),
+                "faulthandler.{member} must be declared"
+            );
+        }
+        // `os.waitstatus_to_exitcode(status)` and the nested policy module.
+        assert!(function("os", "waitstatus_to_exitcode").is_some());
+        assert!(module("asyncio.events").is_some());
+        assert!(constant("asyncio.events", "_event_loop_policy").is_some());
     }
 }
