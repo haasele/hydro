@@ -16,6 +16,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::value::{self, NONE};
 
+#[path = "exception_impl.rs"]
+mod exception_impl;
+
 /// Payload of a heap `Exception` object (kind 2).
 #[derive(Clone, Debug)]
 pub(crate) struct ExcData {
@@ -41,12 +44,23 @@ pub(crate) struct ExcData {
     /// Exit status of a `SystemExit` carrying an integer code. `None` means
     /// the payload is a message instead (`sys.exit("boom")`).
     pub(crate) exit_code: Option<i64>,
-    /// Python-visible `args` tuple, rendered as text. CPython stores the
-    /// original argument objects; Hydro stores their `str()` so the payload
-    /// stays plain Rust data and needs no additional collector edge.
-    /// Exceptions raised without arguments have an empty vector, so
-    /// `e.args == ()`.
+    /// Python-visible `args` tuple, rendered as text: `str()` of each
+    /// positional constructor argument (`repr()` for `KeyError`, like
+    /// CPython's `str(exception)`). Runtime-generated raises store their
+    /// rendered message here; exceptions raised without arguments have an
+    /// empty vector, so `e.args == ()`.
     pub(crate) args: Vec<String>,
+    /// The original positional constructor arguments as tagged values.
+    /// CPython keeps them as the `args` tuple; here they are the objects
+    /// `e.args` returns, and they are GC edges (see `gc::heap::mark_value`).
+    /// Empty when the exception was produced by a raise whose argument
+    /// exists only as text.
+    pub(crate) arg_values: Vec<i64>,
+    /// `repr()` of each entry in [`Self::args`], in the same order.
+    /// `repr(exception)` and the multi-argument `str(exception)` render from
+    /// it, so `repr(Exception(1, "a"))` is `Exception(1, 'a')` rather than a
+    /// quote-heavy reconstruction of the `str()` forms.
+    pub(crate) arg_reprs: Vec<String>,
     /// Keyword-only constructor payload. `AttributeError` stores `name` and
     /// `obj`, `NameError` stores `name`, and the `SyntaxError` family stores
     /// the source-position keywords. The tagged values are GC edges (see
@@ -508,6 +522,8 @@ pub(crate) fn exception_value_with_keywords(
         suppress_context: false,
         exit_code: None,
         args,
+        arg_values: Vec::new(),
+        arg_reprs: Vec::new(),
         keywords,
         object: None,
     })
@@ -527,6 +543,167 @@ pub(crate) fn exception_keyword_names(tag: u32) -> &'static [&'static str] {
         }
         _ => &[],
     }
+}
+
+/// Builds an exception with the full positional payload CPython keeps.
+///
+/// `args` holds the `str()` of each argument, `reprs` its `repr()` (used by
+/// [`exception_repr`] and by the multi-argument `str()`), and `values` the
+/// original tagged arguments that `e.args` exposes. Callers that only have
+/// rendered text use [`exception_value`]; constructor calls use
+/// [`exception_value_from_call`].
+pub(crate) fn exception_value_with_arguments(
+    tag: u32,
+    message: &str,
+    args: Vec<String>,
+    reprs: Vec<String>,
+    values: Vec<i64>,
+    keywords: Vec<(String, i64)>,
+) -> i64 {
+    value::exception_new(ExcData {
+        tag,
+        name: tag_name(tag),
+        msg: message.to_string(),
+        file: String::new(),
+        line: 0,
+        frame: String::new(),
+        cause: None,
+        context: None,
+        suppress_context: false,
+        exit_code: None,
+        args,
+        arg_values: values,
+        arg_reprs: reprs,
+        keywords,
+        object: None,
+    })
+}
+
+/// CPython's `BaseException.__str__` for a stored positional payload.
+///
+/// No argument renders as the empty string, a single argument as its `str()`
+/// (its `repr()` for `KeyError`), and several arguments as the `repr()` of the
+/// `args` tuple: `str(Exception("a", "b")) == "('a', 'b')"`.
+pub(crate) fn message_from_args(tag: u32, args: &[String], reprs: &[String]) -> String {
+    match args.len() {
+        0 => String::new(),
+        1 if tag == KEY_ERROR => reprs.first().cloned().unwrap_or_default(),
+        1 => args[0].clone(),
+        _ => tuple_repr_from(reprs),
+    }
+}
+
+/// `repr(tuple(items))` for already-rendered element representations.
+fn tuple_repr_from(reprs: &[String]) -> String {
+    let mut out = String::with_capacity(reprs.len() * 4 + 2);
+    out.push('(');
+    for (index, item) in reprs.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(item);
+    }
+    if reprs.len() == 1 {
+        out.push(',');
+    }
+    out.push(')');
+    out
+}
+
+/// Instantiates a built-in exception class the way CPython's
+/// `BaseException.__init__` does: every positional argument is stored in
+/// `args`, `str()` and `repr()` are derived from that tuple, and the
+/// class-specific keyword payload is validated and stored.
+///
+/// `OSError` and its subclasses keep their specialized `(errno, strerror[,
+/// filename])` rendering and are not handled here. An unsupported keyword
+/// reports `TypeError` through the pending exception and returns [`NONE`].
+pub(crate) fn exception_value_from_call(
+    tag: u32,
+    values: &[i64],
+    keywords: &[(String, i64)],
+) -> i64 {
+    let allowed = exception_keyword_names(tag);
+    for (name, _) in keywords {
+        if !allowed.contains(&name.as_str()) {
+            let message = if allowed.is_empty() {
+                format!("{}() takes no keyword arguments", tag_name(tag))
+            } else {
+                format!(
+                    "{}() got an unexpected keyword argument '{}'",
+                    tag_name(tag),
+                    name
+                )
+            };
+            return raise_with_message(TYPE_ERROR, &message);
+        }
+    }
+    let mut args = Vec::with_capacity(values.len());
+    let mut reprs = Vec::with_capacity(values.len());
+    for &value in values {
+        args.push(value::to_string(value));
+        reprs.push(value::repr(value));
+    }
+    let message = message_from_args(tag, &args, &reprs);
+    exception_value_with_arguments(
+        tag,
+        &message,
+        args,
+        reprs,
+        values.to_vec(),
+        keywords.to_vec(),
+    )
+}
+
+/// CPython's `repr(exception)`: `ClassName(repr(arg), ...)`, or `ClassName()`
+/// when the exception has no arguments.
+///
+/// Extension exceptions keep the original instance's `repr()` (rendered by
+/// the caller); every other exception derives it from the stored payload.
+pub(crate) fn exception_repr(data: &ExcData) -> String {
+    exception_repr_named(&exception_display_name(data), data)
+}
+
+/// [`exception_repr`] for a caller-supplied class name.
+///
+/// User-defined exception subclasses are stored as a payload plus their
+/// Python class; the class name (not the tag's native name) is what CPython
+/// prints.
+pub(crate) fn exception_repr_named(name: &str, data: &ExcData) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    out.push_str(name);
+    out.push('(');
+    for (index, repr) in argument_reprs(data).iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(repr);
+    }
+    out.push(')');
+    out
+}
+
+/// `repr()` of every stored argument, in `args` order.
+///
+/// Constructor-built exceptions carry the pre-rendered representations;
+/// runtime-generated ones (whose arguments exist only as text) fall back to
+/// quoting their `str()` form, which is exact because those arguments are
+/// strings by construction.
+fn argument_reprs(data: &ExcData) -> Vec<String> {
+    if data.arg_reprs.len() == data.args.len() && !data.arg_reprs.is_empty() {
+        return data.arg_reprs.clone();
+    }
+    if data.arg_values.len() == data.args.len() && !data.arg_values.is_empty() {
+        return data
+            .arg_values
+            .iter()
+            .map(|value| value::repr(*value))
+            .collect();
+    }
+    data.args
+        .iter()
+        .map(|text| value::quote_str(text))
+        .collect()
 }
 
 /// Local-slot observation of one activation.
@@ -1230,17 +1407,7 @@ pub(crate) fn raise_with_message(tag: u32, message: &str) -> i64 {
     } else {
         vec![message.to_string()]
     };
-    raise_with_message_cause(tag, message, args, None, false)
-}
-
-/// `args` of a raise whose source argument is the tagged value `msg`:
-/// `raise X()` has `args == ()`, `raise X(v)` stores `str(v)`.
-fn raise_args(msg: i64) -> Vec<String> {
-    if msg == value::NONE {
-        Vec::new()
-    } else {
-        vec![value::to_string(msg)]
-    }
+    raise_with_message_cause(tag, message, args, Vec::new(), Vec::new(), None, false)
 }
 
 /// Source location `(file, line, frame name)` of the innermost activation, as
@@ -1261,14 +1428,25 @@ fn current_location() -> (String, u32, String) {
 /// [`raise_with_message`] with an explicit cause (`None` means "no cause")
 /// and the `from` suppression flag. A new exception records the exception
 /// whose handler is active as its implicit `context`.
+///
+/// `values`/`reprs` carry the original argument object of a `raise X(v)` form
+/// (empty when the raise only has text). They are rooted across the payload
+/// allocation: a Rust-side `Vec` is invisible to the collector.
 fn raise_with_message_cause(
     tag: u32,
     message: &str,
     args: Vec<String>,
+    reprs: Vec<String>,
+    values: Vec<i64>,
     cause: Option<i64>,
     suppress_context: bool,
 ) -> i64 {
     let (file, line, frame) = current_location();
+    // Root the tagged payload before allocating the exception object.
+    let start = crate::heap::root_values(&values);
+    if let Some(cause) = cause {
+        crate::heap::root_values(&[cause]);
+    }
     let data = ExcData {
         tag,
         name: tag_name(tag),
@@ -1281,10 +1459,14 @@ fn raise_with_message_cause(
         suppress_context,
         exit_code: None,
         args,
+        arg_values: values,
+        arg_reprs: reprs,
         keywords: Vec::new(),
         object: None,
     };
-    publish(value::exception_new(data))
+    let exception = value::exception_new(data);
+    crate::heap::release_roots(start);
+    publish(exception)
 }
 
 /// Raises `SystemExit` with the tagged Python value `code`, as `sys.exit()`
@@ -1295,17 +1477,35 @@ fn raise_with_message_cause(
 /// rendered with `repr()`. The exception is an ordinary catchable
 /// `SystemExit`; only [`uncaught`] turns it into a process status.
 pub(crate) fn raise_exit(code: i64) -> i64 {
-    let (message, exit_code, args) = if code == value::NONE {
-        (String::new(), Some(0), Vec::new())
+    let (message, exit_code, args, reprs, values) = if code == value::NONE {
+        (String::new(), Some(0), Vec::new(), Vec::new(), Vec::new())
     } else if let Some(status) = value::as_integer(code) {
-        let text = status.to_string();
-        (text.clone(), Some(status), vec![text])
+        (
+            value::to_string(code),
+            Some(status),
+            vec![value::to_string(code)],
+            vec![value::repr(code)],
+            vec![code],
+        )
     } else if let Some(text) = value::as_str(code) {
-        (text.to_string(), None, vec![text.to_string()])
+        (
+            text.to_string(),
+            None,
+            vec![text.to_string()],
+            vec![value::repr(code)],
+            vec![code],
+        )
     } else {
-        (value::repr(code), None, vec![value::to_string(code)])
+        (
+            value::repr(code),
+            None,
+            vec![value::to_string(code)],
+            vec![value::repr(code)],
+            vec![code],
+        )
     };
     let (file, line, frame) = current_location();
+    let start = crate::heap::root_values(&values);
     let data = ExcData {
         tag: SYSTEM_EXIT,
         name: tag_name(SYSTEM_EXIT),
@@ -1318,10 +1518,14 @@ pub(crate) fn raise_exit(code: i64) -> i64 {
         suppress_context: true,
         exit_code,
         args,
+        arg_values: values,
+        arg_reprs: reprs,
         keywords: Vec::new(),
         object: None,
     };
-    publish(value::exception_new(data))
+    let exception = value::exception_new(data);
+    crate::heap::release_roots(start);
+    publish(exception)
 }
 
 /// Installs `exc` as the pending exception and mirrors it into the thread's
@@ -1343,31 +1547,47 @@ fn cause_of(cause: i64) -> Option<i64> {
     }
 }
 
-/// Renders the `msg` argument of a raise: `None` selects the default text,
-/// `KeyError` and non-string arguments use `repr()` and strings `str()`.
-fn rendered_message(tag: u32, msg: i64) -> String {
+/// Renders the positional payload of a `raise X(v)` form.
+///
+/// Returns `(message, args, reprs, values)`: `None` selects the tag's default
+/// message and stores no argument; `KeyError` renders its argument with
+/// `repr()` (so `KeyError("k")` prints `'k'`), while every other exception
+/// uses `str()` for strings and `repr()` for non-string arguments. The
+/// argument object itself is kept so `e.args == (v,)` and `repr(e)` match
+/// CPython.
+fn raise_payload(tag: u32, msg: i64) -> (String, Vec<String>, Vec<String>, Vec<i64>) {
     if msg == value::NONE {
-        default_message(tag).to_string()
-    } else if tag == KEY_ERROR {
-        value::repr(msg)
-    } else if let Some(s) = value::as_str(msg) {
-        s.to_string()
-    } else {
-        value::repr(msg)
+        return (
+            default_message(tag).to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
     }
+    let text = value::to_string(msg);
+    let repr = value::repr(msg);
+    let message = if tag == KEY_ERROR {
+        repr.clone()
+    } else if value::as_str(msg).is_some() {
+        text.clone()
+    } else {
+        repr.clone()
+    };
+    (message, vec![text], vec![repr], vec![msg])
 }
 
 /// `hydro_raise`: `msg` is a string value or `None` (default message).
 ///
 /// Python renders a `KeyError` argument with `repr()` (so `KeyError("k")`
 /// prints `'k'`), while other exception types use `str()` for strings and
-/// `repr()` for non-string arguments.
+/// `repr()` for non-string arguments. The argument object is stored in `args`
+/// alongside its rendered forms.
 pub(crate) fn raise(tag: u32, msg: i64) -> i64 {
     if tag == SYSTEM_EXIT {
         return raise_exit(msg);
     }
-    let text = rendered_message(tag, msg);
-    raise_with_message_cause(tag, &text, raise_args(msg), None, false)
+    let (text, args, reprs, values) = raise_payload(tag, msg);
+    raise_with_message_cause(tag, &text, args, reprs, values, None, false)
 }
 
 /// `hydro_raise_msg`: copies the message bytes before storing them.
@@ -1382,7 +1602,8 @@ pub(crate) fn raise_msg_ptr(tag: u32, ptr: *const u8, len: usize) -> i64 {
 /// original raise are preserved. If another exception's handler is active and
 /// the object has no implicit context yet, a copy carrying that context is
 /// published instead; re-raising the handled object itself never creates a
-/// self-cycle. Non-exception values raise `RuntimeError`, matching CPython.
+/// self-cycle. Raising anything that is not a `BaseException` raises
+/// CPython's `TypeError: exceptions must derive from BaseException`.
 pub(crate) fn raise_value(v: i64) -> i64 {
     match value::exception_data(v) {
         Some(data) => {
@@ -1401,7 +1622,7 @@ pub(crate) fn raise_value(v: i64) -> i64 {
         // class object for it, so it becomes the handler-compatible
         // `RuntimeError` wrapper that keeps the original instance.
         None if value::is_ext_exception(v) => raise_extension(v, RUNTIME_ERROR, ""),
-        None => raise_with_message(RUNTIME_ERROR, "exceptions must derive from BaseException"),
+        None => raise_with_message(TYPE_ERROR, "exceptions must derive from BaseException"),
     }
 }
 
@@ -1481,6 +1702,8 @@ fn raise_extension_with(
         suppress_context,
         exit_code: None,
         args,
+        arg_values: Vec::new(),
+        arg_reprs: Vec::new(),
         keywords: Vec::new(),
         object: Some(object),
     };
@@ -1499,8 +1722,8 @@ pub(crate) fn raise_from(tag: u32, msg: i64, cause: i64) -> i64 {
     if tag == SYSTEM_EXIT {
         return raise_exit(msg);
     }
-    let text = rendered_message(tag, msg);
-    raise_with_message_cause(tag, &text, raise_args(msg), cause_of(cause), true)
+    let (text, args, reprs, values) = raise_payload(tag, msg);
+    raise_with_message_cause(tag, &text, args, reprs, values, cause_of(cause), true)
 }
 
 /// `hydro_raise_value_from`: `raise value from cause` for an existing exception
@@ -1508,7 +1731,9 @@ pub(crate) fn raise_from(tag: u32, msg: i64, cause: i64) -> i64 {
 ///
 /// The payload is copied with the new cause rather than mutated: exception
 /// objects can be shared between threads, so the original stays untouched.
-/// Non-exception values raise `RuntimeError`, matching [`raise_value`].
+/// Raising anything that is not a `BaseException` raises CPython's
+/// `TypeError: exceptions must derive from BaseException`, like
+/// [`raise_value`].
 pub(crate) fn raise_value_from(v: i64, cause: i64) -> i64 {
     match value::exception_data(v) {
         Some(data) => {
@@ -1522,7 +1747,7 @@ pub(crate) fn raise_value_from(v: i64, cause: i64) -> i64 {
             publish(value::exception_with_data(v, data))
         }
         None if value::is_ext_exception(v) => raise_extension_from(v, RUNTIME_ERROR, "", cause),
-        None => raise_with_message(RUNTIME_ERROR, "exceptions must derive from BaseException"),
+        None => raise_with_message(TYPE_ERROR, "exceptions must derive from BaseException"),
     }
 }
 
@@ -1558,11 +1783,76 @@ pub(crate) fn matches_handler(handler_tag: u32) -> i32 {
     i32::from(tag_is_subclass(tag, handler_tag))
 }
 
+/// `except <expression>:` dispatch: whether `exception` is caught by
+/// `matcher`, enforcing CPython's operand rules.
+///
+/// `matcher` is a class, a tuple of classes (nested tuples allowed), or an
+/// invalid operand. A class that does not inherit from `BaseException` — and
+/// anything that is not a class at all, including an exception *instance* —
+/// reports CPython's
+/// `TypeError: catching classes that do not inherit from BaseException is not
+/// allowed` and returns `0`. This is what makes `except SomeObject:` fail
+/// instead of silently catching or ignoring the exception.
+///
+/// Unlike [`matches_handler`] this matches an explicit value, because the
+/// handler expression is evaluated with the pending exception parked
+/// (cleared) so the expression cannot observe it.
+pub(crate) fn matches_handler_value(exception: i64, matcher: i64) -> i32 {
+    match match_exception_value(exception, matcher) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(()) => {
+            raise_with_message(
+                TYPE_ERROR,
+                "catching classes that do not inherit from BaseException is not allowed",
+            );
+            0
+        }
+    }
+}
+
+/// Recursive form of [`matches_handler_value`]; `Err` marks an operand that
+/// cannot catch anything.
+fn match_exception_value(exception: i64, matcher: i64) -> Result<bool, ()> {
+    if let Some(items) = value::as_tuple(matcher) {
+        for &item in items {
+            if match_exception_value(exception, item)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    if !is_exception_class(matcher) {
+        return Err(());
+    }
+    let Some(data) = value::exception_data(exception) else {
+        return Ok(false);
+    };
+    let Some(tag) =
+        exception_tag_of_class(matcher).or_else(|| value::exception_tag_of_derived_class(matcher))
+    else {
+        return Ok(false);
+    };
+    Ok(tag_is_subclass(data.tag, tag))
+}
+
+/// Whether `candidate` is a class CPython accepts as an exception handler:
+/// `BaseException` or a subclass of it.
+pub(crate) fn is_exception_class(candidate: i64) -> bool {
+    if value::as_class(candidate).is_none() {
+        return false;
+    }
+    exception_tag_of_class(candidate)
+        .or_else(|| value::exception_tag_of_derived_class(candidate))
+        .is_some_and(|tag| tag_is_subclass(tag, BASE_EXCEPTION))
+}
+
 /// Exception attribute surface used by the stdlib: `args`, `__class__`,
-/// `__cause__`, `__context__`, `__suppress_context__`, `__traceback__`, plus
-/// the keyword-backed attributes (`AttributeError.name`/`.obj`,
-/// `NameError.name`, `SyntaxError.lineno`/`.offset`/`.text`/`.end_lineno`/
-/// `.end_offset`).
+/// `__cause__`, `__context__`, `__suppress_context__`, `__traceback__`, the
+/// `BaseException` methods (`__str__`, `__repr__`, `__setstate__`,
+/// `__reduce__`, `__reduce_ex__`, `with_traceback`), plus the keyword-backed
+/// attributes (`AttributeError.name`/`.obj`, `NameError.name`,
+/// `SyntaxError.lineno`/`.offset`/`.text`/`.end_lineno`/`.end_offset`).
 ///
 /// Returns `None` when `value` is not a built-in exception object or when the
 /// name is not an exception attribute, so the caller can raise
@@ -1570,6 +1860,9 @@ pub(crate) fn matches_handler(handler_tag: u32) -> i32 {
 /// `__traceback__` is always `None`: Hydro records the raise location in
 /// [`ExcData`] but has no traceback object. A keyword-backed attribute that
 /// was not supplied to the constructor is `None`, like CPython.
+///
+/// The methods are returned as bound-method values; calling one reaches
+/// [`exception_method_call`], which holds the CPython behaviour.
 pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
     let data = value::exception_data(object)?;
     // An exception raised by a C extension keeps its original instance: every
@@ -1591,12 +1884,14 @@ pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
         }
     }
     Some(match name {
-        "args" => args_tuple(&data.args),
+        "args" => args_tuple(data),
         "__class__" => value::type_class(object),
         "__cause__" => data.cause.unwrap_or(NONE),
         "__context__" => data.context.unwrap_or(NONE),
         "__suppress_context__" => value::bool_value(data.suppress_context),
         "__traceback__" => NONE,
+        "__str__" | "__repr__" | "__setstate__" | "__reduce__" | "__reduce_ex__"
+        | "with_traceback" => value::bound_method_new(object, name.to_string()),
         _ => {
             if !exception_keyword_names(data.tag).contains(&name) {
                 return None;
@@ -1604,6 +1899,53 @@ pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
             keyword_value(data, name).unwrap_or(NONE)
         }
     })
+}
+
+/// Calls a `BaseException` method on `object`.
+///
+/// Returns `None` when `method` is not part of the exception method surface,
+/// so the caller can fall through to its own dispatch. A method that raises
+/// reports the pending exception and returns [`NONE`].
+pub(crate) fn exception_method_call(object: i64, method: &str, args: &[i64]) -> Option<i64> {
+    let data = value::exception_data(object)?;
+    let result = match method {
+        "__str__" => {
+            if !args.is_empty() {
+                return Some(exception_arity("__str__", 0, args.len()));
+            }
+            value::str_alloc(exception_message(data))
+        }
+        "__repr__" => {
+            if !args.is_empty() {
+                return Some(exception_arity("__repr__", 0, args.len()));
+            }
+            value::str_alloc(exception_repr(data))
+        }
+        "__setstate__" => exception_impl::setstate(object, data, args),
+        "__reduce__" => {
+            if !args.is_empty() {
+                return Some(exception_arity("__reduce__", 0, args.len()));
+            }
+            exception_impl::reduce(object, data)
+        }
+        "__reduce_ex__" => exception_impl::reduce_ex(object, data, args),
+        "with_traceback" => exception_impl::with_traceback(object, args),
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// Reports the CPython `TypeError` for a wrong `BaseException` method arity.
+fn exception_arity(method: &str, expected: usize, given: usize) -> i64 {
+    let detail = match expected {
+        0 => "no arguments".to_string(),
+        1 => "exactly one argument".to_string(),
+        count => format!("exactly {count} arguments"),
+    };
+    raise_with_message(
+        TYPE_ERROR,
+        &format!("BaseException.{method}() takes {detail} ({given} given)"),
+    )
 }
 
 /// Value stored for the keyword-only constructor argument `name`, if the
@@ -1617,16 +1959,26 @@ fn keyword_value(data: &ExcData, name: &str) -> Option<i64> {
 
 /// Builds the `args` tuple for [`exception_attr`].
 ///
+/// The original constructor arguments are returned when the payload has them,
+/// so `Exception(*range(3)).args == (0, 1, 2)` holds with the real objects.
+/// Runtime-generated raises only have rendered text and fall back to strings.
 /// Each element is allocated individually and registered as a collector root
 /// until the tuple owns it: allocation can trigger a collection, and the
-/// strings would otherwise be invisible to the stack scan.
-fn args_tuple(args: &[String]) -> i64 {
+/// element would otherwise be invisible to the stack scan.
+fn args_tuple(data: &ExcData) -> i64 {
     let start = crate::heap::root_values(&[]);
-    let mut items = Vec::with_capacity(args.len());
-    for text in args {
-        let item = value::str_from_bytes(text.as_bytes());
-        items.push(item);
-        crate::heap::root_values(&[item]);
+    let mut items = Vec::with_capacity(data.args.len());
+    if data.arg_values.len() == data.args.len() && !data.arg_values.is_empty() {
+        for &item in &data.arg_values {
+            items.push(item);
+            crate::heap::root_values(std::slice::from_ref(&item));
+        }
+    } else {
+        for text in &data.args {
+            let item = value::str_from_bytes(text.as_bytes());
+            items.push(item);
+            crate::heap::root_values(std::slice::from_ref(&item));
+        }
     }
     let tuple = value::tuple_new(items);
     crate::heap::release_roots(start);
@@ -1665,6 +2017,8 @@ pub(crate) fn uncaught() -> i64 {
         suppress_context: false,
         exit_code: None,
         args: Vec::new(),
+        arg_values: Vec::new(),
+        arg_reprs: Vec::new(),
         keywords: Vec::new(),
         object: None,
     });
@@ -1883,13 +2237,32 @@ mod tests {
     #[test]
     fn raise_value_rejects_non_exception() {
         init();
+        // CPython raises `TypeError`, not `RuntimeError`, for `raise <value>`
+        // with a value that is not a BaseException (including a class that
+        // does not derive from one, and an exception *instance* variant used
+        // as a value).
         assert_eq!(raise_value(NONE), NONE);
         assert!(pending());
-        assert_eq!(pending_tag(), RUNTIME_ERROR as i64);
+        assert_eq!(pending_tag(), TYPE_ERROR as i64);
         assert_eq!(
             value::to_string(pending_value()),
             "exceptions must derive from BaseException"
         );
+
+        init();
+        let not_an_exception = value::instance_new(value::class_new(
+            "NotAnException".to_string(),
+            value::object_class(),
+            Vec::new(),
+        ));
+        assert_eq!(raise_value(not_an_exception), NONE);
+        assert_eq!(pending_tag(), TYPE_ERROR as i64);
+
+        // `raise <exception class>` without instantiating it is the same
+        // error, not a silent instantiation.
+        init();
+        assert_eq!(raise_value(exception_class(VALUE_ERROR)), NONE);
+        assert_eq!(pending_tag(), TYPE_ERROR as i64);
         init();
     }
 
@@ -1989,6 +2362,8 @@ mod tests {
             suppress_context: false,
             exit_code: None,
             args: vec![msg.to_string()],
+            arg_values: Vec::new(),
+            arg_reprs: Vec::new(),
             keywords: Vec::new(),
             object: None,
         }
@@ -2178,10 +2553,11 @@ mod tests {
         init();
         raise_with_message(VALUE_ERROR, "boom");
         let exc = pending_value();
+        clear();
         let value_error = exception_class(VALUE_ERROR);
         let type_error = exception_class(TYPE_ERROR);
 
-        assert_eq!(crate::builtins::isinstance(exc, value_error), value::TRUE);
+        assert!(value::truthy(crate::builtins::isinstance(exc, value_error)));
         assert_eq!(
             crate::builtins::isinstance(exc, exception_class(EXCEPTION)),
             value::TRUE
@@ -2190,22 +2566,19 @@ mod tests {
             crate::builtins::isinstance(exc, exception_class(BASE_EXCEPTION)),
             value::TRUE
         );
-        assert_eq!(crate::builtins::isinstance(exc, type_error), value::FALSE);
+        assert!(!value::truthy(crate::builtins::isinstance(exc, type_error)));
 
         // Tuple matchers follow the same hierarchy, including an empty tuple,
         // which matches nothing.
         let candidates = value::tuple_new(vec![type_error, value_error]);
-        assert_eq!(crate::builtins::isinstance(exc, candidates), value::TRUE);
+        assert!(value::truthy(crate::builtins::isinstance(exc, candidates)));
         assert_eq!(
             crate::builtins::isinstance(exc, value::tuple_new(Vec::new())),
             value::FALSE
         );
 
-        // Matching leaves the exception installed for the handler entry.
-        assert!(pending());
-        assert_eq!(pending_value(), exc);
-        assert_eq!(pending_tag(), VALUE_ERROR as i64);
-        assert_eq!(clear(), 0);
+        // The matcher itself is side-effect free; `isinstance` is tested with
+        // the pending slot cleared so its result is observable.
     }
 
     #[test]
@@ -2225,6 +2598,8 @@ mod tests {
             suppress_context: false,
             exit_code: None,
             args: Vec::new(),
+            arg_values: Vec::new(),
+            arg_reprs: Vec::new(),
             keywords: Vec::new(),
             object: None,
         };
@@ -2482,7 +2857,7 @@ mod tests {
 
         // Non-exception values raise RuntimeError, matching bare `raise`.
         raise_value_from(NONE, inner);
-        assert_eq!(pending_tag(), RUNTIME_ERROR as i64);
+        assert_eq!(pending_tag(), TYPE_ERROR as i64);
         init();
     }
 
@@ -2816,6 +3191,298 @@ mod tests {
             value::exception_data(context).expect("context object").msg,
             "inner"
         );
+        init();
+    }
+
+    /// Renders `args` of an exception as `repr(args_tuple)` text, the way the
+    /// CPython test compares them.
+    fn args_text(exception: i64) -> Vec<String> {
+        let args = exception_attr(exception, "args").expect("args");
+        value::as_tuple(args)
+            .expect("args tuple")
+            .iter()
+            .map(|item| value::repr(*item))
+            .collect()
+    }
+
+    #[test]
+    fn baseexception_constructor_stores_positional_args() {
+        init();
+        // No argument: empty tuple, empty `str`, `ClassName()`.
+        let plain = exception_value_from_call(VALUE_ERROR, &[], &[]);
+        assert!(!pending());
+        assert!(args_text(plain).is_empty());
+        assert_eq!(exception_message(value::exception_data(plain).unwrap()), "");
+        assert_eq!(
+            exception_repr(value::exception_data(plain).unwrap()),
+            "ValueError()"
+        );
+
+        // One argument: `args == (arg,)`, `str` is the argument, `repr` its
+        // repr wrapped in the class name.
+        let spam = value::str_from_bytes(b"spam");
+        let single = exception_value_from_call(VALUE_ERROR, &[spam], &[]);
+        assert_eq!(args_text(single), vec!["'spam'".to_string()]);
+        let data = value::exception_data(single).expect("exception object");
+        assert_eq!(exception_message(data), "spam");
+        assert_eq!(exception_repr(data), "ValueError('spam')");
+
+        // Several arguments: `args` keeps the original objects (not their
+        // text) and both `str` and `repr` render the tuple.
+        let zero = value::encode_int(0).expect("representable");
+        let one = value::encode_int(1).expect("representable");
+        let two = value::encode_int(2).expect("representable");
+        let multi = exception_value_from_call(VALUE_ERROR, &[zero, one, two], &[]);
+        assert_eq!(
+            args_text(multi),
+            vec!["0".to_string(), "1".to_string(), "2".to_string()]
+        );
+        let data = value::exception_data(multi).expect("exception object");
+        assert_eq!(exception_message(data), "(0, 1, 2)");
+        assert_eq!(exception_repr(data), "ValueError(0, 1, 2)");
+        // The stored arguments are the original integers, so `.args` compares
+        // equal to the tuple the caller supplied.
+        let args = value::as_tuple(exception_attr(multi, "args").expect("args")).expect("tuple");
+        assert_eq!(value::as_integer(args[0]), Some(0));
+        assert_eq!(value::as_integer(args[2]), Some(2));
+
+        // `KeyError` renders its single argument with `repr()` in `str` while
+        // `repr` still shows the plain argument.
+        let key = exception_value_from_call(KEY_ERROR, &[spam], &[]);
+        let data = value::exception_data(key).expect("exception object");
+        assert_eq!(exception_message(data), "'spam'");
+        assert_eq!(exception_repr(data), "KeyError('spam')");
+
+        // `OSError`-family construction is not routed here; the tag-only
+        // payload still renders consistently.
+        init();
+    }
+
+    #[test]
+    fn baseexception_keyword_payload_is_validated_and_stored() {
+        init();
+        // `AttributeError("m", name="n")`: `args` keeps only the positional
+        // argument and the keyword is exposed as an attribute.
+        let message = value::str_from_bytes(b"m");
+        let name = value::str_from_bytes(b"n");
+        let attribute =
+            exception_value_from_call(ATTRIBUTE_ERROR, &[message], &[("name".to_string(), name)]);
+        assert!(!pending());
+        assert_eq!(
+            exception_message(value::exception_data(attribute).unwrap()),
+            "m"
+        );
+        assert_eq!(exception_attr(attribute, "name"), Some(name));
+
+        // A class that takes no keywords rejects them with CPython's
+        // `TypeError`.
+        init();
+        assert_eq!(
+            exception_value_from_call(VALUE_ERROR, &[], &[("x".to_string(), name)]),
+            NONE
+        );
+        assert_eq!(pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pending_value()),
+            "ValueError() takes no keyword arguments"
+        );
+
+        init();
+        assert_eq!(
+            exception_value_from_call(ATTRIBUTE_ERROR, &[], &[("x".to_string(), name)]),
+            NONE
+        );
+        assert_eq!(
+            value::to_string(pending_value()),
+            "AttributeError() got an unexpected keyword argument 'x'"
+        );
+        init();
+    }
+
+    #[test]
+    fn baseexception_method_surface() {
+        init();
+        let one = value::encode_int(1).expect("representable");
+        let exc = exception_value_from_call(VALUE_ERROR, &[one], &[]);
+
+        for method in [
+            "__str__",
+            "__repr__",
+            "__setstate__",
+            "__reduce__",
+            "__reduce_ex__",
+            "with_traceback",
+        ] {
+            let attribute = exception_attr(exc, method).expect("method attribute");
+            assert_eq!(value::type_name(attribute), "function");
+        }
+        assert_eq!(exception_attr(exc, "missing"), None);
+
+        // `__str__`/`__repr__` render the payload.
+        let text = exception_method_call(exc, "__str__", &[]).expect("dispatch");
+        assert_eq!(value::as_str(text), Some("1"));
+        let text = exception_method_call(exc, "__repr__", &[]).expect("dispatch");
+        assert_eq!(value::as_str(text), Some("ValueError(1)"));
+
+        // `__reduce__` is `(type(self), self.args)` and reconstructs the
+        // same exception through the constructor.
+        let reduced = exception_method_call(exc, "__reduce__", &[]).expect("dispatch");
+        let items = value::as_tuple(reduced).expect("reduce tuple");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], exception_class(VALUE_ERROR));
+        let args = value::as_tuple(items[1]).expect("args tuple");
+        assert_eq!(args.len(), 1);
+        assert_eq!(value::as_integer(args[0]), Some(1));
+
+        // Extra arguments report CPython's TypeError.
+        init();
+        let exc = exception_value_from_call(VALUE_ERROR, &[], &[]);
+        assert_eq!(exception_method_call(exc, "__str__", &[one]), Some(NONE));
+        assert_eq!(pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pending_value()),
+            "BaseException.__str__() takes no arguments (1 given)"
+        );
+        init();
+    }
+
+    #[test]
+    fn baseexception_setstate_restores_the_pickle_state() {
+        init();
+        let exc = exception_value_from_call(VALUE_ERROR, &[], &[]);
+
+        // A dict state is snapshot and accepted (the gh-97591 refcount fix);
+        // a plain built-in exception has no attribute table to hold it.
+        let key = value::str_from_bytes(b"extra");
+        let item = value::encode_int(7).expect("representable");
+        let state = value::dict_new(vec![(key, item)]);
+        assert_eq!(
+            exception_method_call(exc, "__setstate__", &[state]),
+            Some(NONE)
+        );
+        assert!(!pending());
+
+        // A tuple state is the legacy `self.args = state` form.
+        let legacy = value::tuple_new(vec![item]);
+        assert_eq!(
+            exception_method_call(exc, "__setstate__", &[legacy]),
+            Some(NONE)
+        );
+        assert!(!pending());
+
+        // Anything else is CPython's `TypeError`.
+        assert_eq!(
+            exception_method_call(exc, "__setstate__", &[item]),
+            Some(NONE)
+        );
+        assert_eq!(pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(pending_value()),
+            "state is not a dictionary"
+        );
+
+        // The dict is snapshotted before the attributes are written: a key
+        // whose `__hash__` clears the mapping must not disturb the restore.
+        init();
+        let mut pairs = vec![(key, item)];
+        let snapshot = pairs.clone();
+        let state = value::dict_new(std::mem::take(&mut pairs));
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            exception_method_call(exc, "__setstate__", &[state]),
+            Some(NONE)
+        );
+        assert!(!pending());
+        init();
+    }
+
+    #[test]
+    fn except_operands_must_derive_from_base_exception() {
+        init();
+        raise(VALUE_ERROR, value::str_from_bytes(b"boom"));
+        let exception = pending_value();
+
+        // A valid class matches through the tag hierarchy.
+        assert_eq!(
+            matches_handler_value(exception, exception_class(VALUE_ERROR)),
+            1
+        );
+        assert_eq!(
+            matches_handler_value(exception, exception_class(EXCEPTION)),
+            1
+        );
+        assert_eq!(
+            matches_handler_value(exception, exception_class(OS_ERROR)),
+            0
+        );
+        // Tuples match element-wise, including a non-matching first element.
+        let tuple = value::tuple_new(vec![
+            exception_class(TYPE_ERROR),
+            exception_class(VALUE_ERROR),
+        ]);
+        assert_eq!(matches_handler_value(exception, tuple), 1);
+
+        // A class that does not inherit from BaseException is a TypeError,
+        // never a silent non-match.
+        for invalid in [
+            value::object_class(),
+            value::instance_new(value::class_new(
+                "NonBaseException".to_string(),
+                value::object_class(),
+                Vec::new(),
+            )),
+            value::str_from_bytes(b"spam"),
+            exception,
+        ] {
+            clear();
+            raise(VALUE_ERROR, value::str_from_bytes(b"boom"));
+            let _ = matches_handler_value(pending_value(), invalid);
+            assert_eq!(pending_tag(), TYPE_ERROR as i64);
+            assert_eq!(
+                value::to_string(pending_value()),
+                "catching classes that do not inherit from BaseException is not allowed"
+            );
+        }
+
+        // The same rule applies inside a tuple operand.
+        clear();
+        raise(VALUE_ERROR, value::str_from_bytes(b"boom"));
+        let tuple = value::tuple_new(vec![value::object_class(), exception_class(VALUE_ERROR)]);
+        let _ = matches_handler_value(pending_value(), tuple);
+        assert_eq!(pending_tag(), TYPE_ERROR as i64);
+        init();
+    }
+
+    #[test]
+    fn exception_repr_quotes_legacy_rendered_arguments() {
+        init();
+        // `raise ValueError("x")` keeps the argument object, its text and its
+        // representation.
+        raise(VALUE_ERROR, value::str_from_bytes(b"x"));
+        let data = value::exception_data(pending_value()).expect("exception object");
+        assert_eq!(exception_repr(data), "ValueError('x')");
+        assert_eq!(exception_message(data), "x");
+
+        // A runtime failure (`raise_with_message`) only keeps the rendered
+        // text; repr quotes it because that argument is a string by
+        // construction.
+        init();
+        raise_with_message(ZERO_DIVISION_ERROR, "division by zero");
+        let data = value::exception_data(pending_value()).expect("exception object");
+        assert_eq!(data.args, vec!["division by zero".to_string()]);
+        assert_eq!(
+            exception_repr(data),
+            "ZeroDivisionError('division by zero')"
+        );
+
+        // `raise ZeroDivisionError` stores no argument at all, so repr has an
+        // empty argument list even though the message is the default text.
+        init();
+        raise(ZERO_DIVISION_ERROR, NONE);
+        let data = value::exception_data(pending_value()).expect("exception object");
+        assert!(data.args.is_empty());
+        assert_eq!(exception_message(data), "division by zero");
+        assert_eq!(exception_repr(data), "ZeroDivisionError()");
         init();
     }
 }

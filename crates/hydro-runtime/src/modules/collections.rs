@@ -156,6 +156,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "Counter" => counter_new(args, &[]),
         "defaultdict" => defaultdict_construct(args, &[]),
         "namedtuple" => namedtuple(args),
+        "_count_elements" => count_elements(args),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'collections' has no attribute '{function}'"),
@@ -582,6 +583,12 @@ fn userdict_method(name: &str, args: &[i64]) -> i64 {
             }
         }
         "popitem" => {
+            // Native arity metadata is not enforced on method dispatch, so
+            // reject extra positional arguments here: `MutableMapping.popitem()`
+            // takes only `self`.
+            if args.len() > 1 {
+                return type_error("popitem() takes no arguments");
+            }
             // `MutableMapping.popitem()` pops the first key, unlike `dict`.
             let mut pairs = userdict_pairs(obj);
             if pairs.is_empty() {
@@ -2478,6 +2485,70 @@ fn counter_update_counts(obj: i64, source: i64, subtract: bool) -> bool {
     true
 }
 
+/// `collections._count_elements(mapping, iterable)`.
+///
+/// CPython's pure-Python fallback (`collections/__init__.py`) increments the
+/// count of every element in `iterable` through the mapping protocol and
+/// returns `None`. Plain `dict` and `Counter` (whose counts live in a private
+/// dict) are the mappings the stdlib passes; both are updated in place so
+/// insertion order is preserved.
+pub(crate) fn count_elements(args: &[i64]) -> i64 {
+    let mapping = args.first().copied().unwrap_or(NONE);
+    let iterable = args.get(1).copied().unwrap_or(NONE);
+    let target = (if is_counter_instance(mapping) {
+        counter_data(mapping)
+    } else {
+        None
+    })
+    .or_else(|| value::as_dict(mapping).map(|_| mapping));
+    let Some(target) = target else {
+        return type_error(&format!(
+            "_count_elements() argument 1 must be a mapping, not {}",
+            value::type_name(mapping)
+        ));
+    };
+    let iterator = iter::iter_of(iterable);
+    if exc::pending() {
+        return NONE;
+    }
+    let one = value::encode_int(1).unwrap_or(NONE);
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        if let Some(name) = container::unhashable_name(item) {
+            return type_error(&container::unhashable_message(name));
+        }
+        let current = value::as_dict(target)
+            .and_then(|pairs| counter_find(pairs, item))
+            .unwrap_or_else(counter_zero);
+        let next = ops::add(current, one);
+        if exc::pending() {
+            return NONE;
+        }
+        container::dict_set(target, item, next);
+        if exc::pending() {
+            return NONE;
+        }
+    }
+    NONE
+}
+
+/// Identity-stable native function for `collections._count_elements`.
+pub(crate) fn count_elements_function() -> i64 {
+    if let Some(cached) = globals::registry_get("collections._count_elements") {
+        return cached;
+    }
+    let function = value::native_function_new("collections", "_count_elements", 2);
+    globals::registry_set("collections._count_elements", function);
+    function
+}
+
 /// Whether count `v` is greater than zero; `None` means an exception.
 fn counter_positive(v: i64) -> Option<bool> {
     if let Some(count) = value::as_integer(v) {
@@ -4259,6 +4330,24 @@ mod userdict_tests {
     }
 
     #[test]
+    fn userdict_popitem_rejects_extra_arguments() {
+        exc::init();
+        let instance = construct(None);
+        method(instance, "__setitem__", &[text("a"), int(1)]);
+        method(instance, "popitem", &[int(42)]);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+
+        // The rejected call did not mutate the mapping.
+        assert_eq!(number(method(instance, "__len__", &[])), 1);
+        let popped = method(instance, "popitem", &[]);
+        let pair = value::as_tuple(popped).expect("popitem pair");
+        assert_eq!(string(pair[0]), "a");
+        assert_eq!(number(pair[1]), 1);
+        assert!(!exc::pending());
+    }
+
+    #[test]
     fn userdict_missing_keys_raise_key_error() {
         exc::init();
         let instance = construct(None);
@@ -4691,5 +4780,89 @@ mod namedtuple_tests {
         assert_eq!(invoke(tuple, "__eq__", &[same]), value::TRUE);
         assert_eq!(invoke(tuple, "__eq__", &[replaced]), value::FALSE);
         assert!(!exc::pending());
+    }
+}
+
+#[cfg(test)]
+mod count_elements_tests {
+    use super::*;
+
+    fn int(n: i64) -> i64 {
+        value::encode_int(n).expect("representable")
+    }
+
+    fn text(s: &str) -> i64 {
+        value::str_alloc(s.to_string())
+    }
+
+    fn count_of(pairs: &[(i64, i64)], key: i64) -> Option<i64> {
+        pairs
+            .iter()
+            .find(|(existing, _)| *existing == key)
+            .and_then(|(_, count)| value::as_integer(*count))
+    }
+
+    #[test]
+    fn counts_into_a_plain_dict() {
+        exc::init();
+        let mapping = value::dict_new(Vec::new());
+        let iterable = value::list_new(vec![int(1), int(1), int(2)]);
+        let result = call("_count_elements", &[mapping, iterable]);
+        assert_eq!(result, NONE);
+        assert!(!exc::pending(), "_count_elements raised");
+
+        let pairs = value::as_dict(mapping).expect("dict").to_vec();
+        assert_eq!(count_of(&pairs, int(1)), Some(2));
+        assert_eq!(count_of(&pairs, int(2)), Some(1));
+
+        // A second pass accumulates on top of the existing counts.
+        let iterable = value::list_new(vec![int(2)]);
+        call("_count_elements", &[mapping, iterable]);
+        let pairs = value::as_dict(mapping).expect("dict").to_vec();
+        assert_eq!(count_of(&pairs, int(1)), Some(2));
+        assert_eq!(count_of(&pairs, int(2)), Some(2));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn counts_into_a_counter() {
+        exc::init();
+        let counter = call("Counter", &[]);
+        assert!(!exc::pending(), "Counter() raised");
+        let iterable = value::list_new(vec![text("a"), text("a"), text("b")]);
+        let result = call("_count_elements", &[counter, iterable]);
+        assert_eq!(result, NONE);
+        assert!(!exc::pending(), "_count_elements raised");
+        assert_eq!(
+            value::as_integer(counter_count(counter, text("a"))),
+            Some(2)
+        );
+        assert_eq!(
+            value::as_integer(counter_count(counter, text("b"))),
+            Some(1)
+        );
+        assert_eq!(
+            value::as_integer(counter_count(counter, text("missing"))),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn rejects_non_mappings() {
+        exc::init();
+        call(
+            "_count_elements",
+            &[value::list_new(Vec::new()), value::list_new(Vec::new())],
+        );
+        assert!(exc::pending());
+        exc::clear();
+    }
+
+    #[test]
+    fn function_value_is_cached() {
+        exc::init();
+        let function = count_elements_function();
+        assert_eq!(function, count_elements_function());
+        assert!(value::as_function(function).is_some());
     }
 }

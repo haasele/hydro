@@ -3640,16 +3640,6 @@ fn instantiate_exception(tag: u32, argc: usize, argv: *const i64) -> i64 {
                 ),
             );
         }
-        if argc > 1 && !exc::is_os_error_tag(tag) {
-            return exc::raise_with_message(
-                TYPE_ERROR,
-                &format!(
-                    "{}() takes at most 1 argument ({} given)",
-                    exc::tag_name(tag),
-                    argc
-                ),
-            );
-        }
         // SAFETY: ABI contract: `argv` points at `argc` readable tagged values.
         unsafe { std::slice::from_raw_parts(argv, argc) }
     } else {
@@ -3667,18 +3657,21 @@ fn instantiate_exception(tag: u32, argc: usize, argv: *const i64) -> i64 {
 /// naming the class and keyword instead of being silently dropped, matching
 /// CPython's constructor.
 fn instantiate_exception_kw(tag: u32, args: &[i64], keywords: &[(String, i64)]) -> i64 {
-    if args.len() > 1 {
-        if exc::is_os_error_tag(tag) && args.len() <= 4 {
-            return os_error_value(tag, args, keywords);
-        }
+    if !exc::is_os_error_tag(tag) {
+        return exc::exception_value_from_call(tag, args, keywords);
+    }
+    if args.len() > 4 {
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
-                "{}() takes at most 1 argument ({} given)",
+                "{}() takes at most 4 arguments ({} given)",
                 exc::tag_name(tag),
                 args.len()
             ),
         );
+    }
+    if args.len() > 1 {
+        return os_error_value(tag, args, keywords);
     }
     let allowed = exc::exception_keyword_names(tag);
     for (name, _) in keywords {
@@ -3752,12 +3745,7 @@ fn derived_exception_payload(tag: u32, argc: usize, argv: *const i64) -> i64 {
     }
     // SAFETY: ABI contract: `argv` points at `argc` readable values.
     let values = unsafe { std::slice::from_raw_parts(argv, argc) };
-    let rendered: Vec<String> = values
-        .iter()
-        .map(|argument| value::to_string(*argument))
-        .collect();
-    let message = rendered.first().cloned().unwrap_or_default();
-    exc::exception_value(tag, &message, rendered)
+    exc::exception_value_from_call(tag, values, &[])
 }
 
 /// Constructs a TypedDict class call. TypedDict classes are annotation-only
@@ -3815,13 +3803,34 @@ fn scalar_constructor(kind: &str) -> Option<Builtin> {
 /// unwrap.
 pub(crate) fn scalar_instance_new(class: i64, argc: usize, argv: *const i64) -> Option<i64> {
     let (kind, native) = value::native_scalar_base(class)?;
-    let builtin = scalar_constructor(kind)?;
-    // `float()` accepts no argument (`float.__new__(cls)` is `0.0`), while
-    // `Builtin::Float` itself takes exactly one.
-    let payload = if kind == "float" && argc == 0 {
-        value::float_new(0.0)
+    let args: &[i64] = if argc == 0 {
+        &[]
     } else {
-        call_builtin(builtin, argc, argv)
+        if argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>() {
+            return Some(exc::raise_with_message(
+                TYPE_ERROR,
+                "scalar constructor received arguments without an argument buffer",
+            ));
+        }
+        // SAFETY: ABI contract: `argv` points at `argc` readable values.
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    };
+    // `complex` has no `Builtin` variant (it allocates an instance of the
+    // registered `builtins.complex` class); the same `__new__` contract
+    // applies, so a subclass instance carries the complex value as payload.
+    let payload = if kind == "complex" {
+        complex_new(args)
+    } else {
+        // `float()` accepts no argument (`float.__new__(cls)` is `0.0`), while
+        // `Builtin::Float` itself takes exactly one.
+        if kind == "float" && argc == 0 {
+            value::float_new(0.0)
+        } else {
+            {
+                let builtin = scalar_constructor(kind)?;
+                call_builtin(builtin, argc, argv)
+            }
+        }
     };
     if exc::pending() {
         return Some(NONE);
@@ -3846,20 +3855,402 @@ pub(crate) fn scalar_new_from_args(argc: usize, argv: *const i64) -> i64 {
     }
     // SAFETY: checked above for NULL; caller contract.
     let args = unsafe { std::slice::from_raw_parts(argv, argc) };
-    let class = args[0];
-    if value::as_class(class).is_none() {
+    // `cls` may be the class value or the builtin function value that names
+    // the same type (`int.__new__(int, 3)`), exactly like every other type
+    // operand in the runtime.
+    let Some(class) = new_class_operand(args[0]) else {
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
                 "scalar __new__() argument 1 must be a type, not '{}'",
-                value::type_name(class)
+                value::type_name(args[0])
             ),
         );
-    }
+    };
     match scalar_instance_new(class, argc - 1, args[1..].as_ptr()) {
         Some(result) => result,
         None => value::instance_new(class),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Native `__new__` slots of the builtin constructor types
+// ---------------------------------------------------------------------------
+//
+// CPython's builtin types are real type objects, so `tuple.__new__(cls, ...)`
+// is the allocation half of `type.__call__`: `cls` is the type to instantiate.
+// When it names the builtin itself the plain value is built; when it derives
+// from it, the instance carries that value as its contents and stays an
+// instance of the subclass (`unittest.mock`'s `_Call(tuple)` depends on it).
+//
+// The slots are function values with a full signature and a full-argv
+// trampoline, so the shared binder in [`call_kw`] fills defaults and keywords
+// before the constructor runs. `object.__new__` is the exception: it carries
+// no signature so `call_user_new` keeps treating it as the default allocation
+// path rather than a user-defined `__new__` hook.
+
+/// Builtin container whose `__new__` slot is being implemented.
+#[derive(Clone, Copy)]
+enum ContainerNew {
+    Tuple,
+    List,
+    Set,
+    Frozenset,
+}
+
+impl ContainerNew {
+    fn name(self) -> &'static str {
+        match self {
+            ContainerNew::Tuple => "tuple",
+            ContainerNew::List => "list",
+            ContainerNew::Set => "set",
+            ContainerNew::Frozenset => "frozenset",
+        }
+    }
+
+    fn builtin(self) -> Builtin {
+        match self {
+            ContainerNew::Tuple => Builtin::Tuple,
+            ContainerNew::List => Builtin::List,
+            ContainerNew::Set => Builtin::Set,
+            ContainerNew::Frozenset => Builtin::Frozenset,
+        }
+    }
+}
+
+/// Resolves the `cls` operand of a builtin `__new__` slot.
+///
+/// Both spellings of a type are accepted: the class value (`Sub`, `type(x)`)
+/// and the builtin function value source code names (`tuple`, `int`), exactly
+/// like every other type operand in the runtime.
+fn new_class_operand(cls: i64) -> Option<i64> {
+    if value::as_class(cls).is_some() {
+        Some(cls)
+    } else {
+        value::builtin_type_class(cls)
+    }
+}
+
+/// Allocates a subclass instance carrying `payload` as its builtin contents.
+fn payload_instance(class: i64, payload: i64) -> i64 {
+    let roots = crate::heap::root_values(std::slice::from_ref(&payload));
+    let instance = value::instance_new(class);
+    value::instance_set_container_payload(instance, payload);
+    crate::heap::release_roots(roots);
+    instance
+}
+
+/// Diagnostic for `X.__new__(cls, ...)` with a `cls` outside `X`'s hierarchy.
+fn new_class_error(name: &str, cls: i64) -> i64 {
+    match value::class_display_name(cls) {
+        Some(cls_name) => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{name}.__new__({cls_name}): {cls_name} is not a subtype of {name}"),
+        ),
+        None => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{name}.__new__() argument 1 must be a type, not '{}'",
+                value::type_name(cls)
+            ),
+        ),
+    }
+}
+
+/// `tuple.__new__(cls, iterable=())` and the same slot on `list`, `set` and
+/// `frozenset`.
+fn container_new_value(kind: ContainerNew, cls: i64, iterable: i64) -> i64 {
+    let Some(class) = new_class_operand(cls) else {
+        return new_class_error(kind.name(), cls);
+    };
+    let native = value::native_class(kind.name());
+    if class != native && !value::class_mro(class).contains(&native) {
+        return new_class_error(kind.name(), cls);
+    }
+    let arguments = [iterable];
+    let payload = call_builtin(kind.builtin(), 1, arguments.as_ptr());
+    if exc::pending() {
+        return NONE;
+    }
+    if class == native {
+        return payload;
+    }
+    payload_instance(class, payload)
+}
+
+extern "C" fn tuple_new_entry(argv: *const i64) -> i64 {
+    // SAFETY: the slot's signature declares exactly `(cls, iterable)`; the
+    // binder in `call_kw` supplies both slots.
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    container_new_value(ContainerNew::Tuple, args[0], args[1])
+}
+
+extern "C" fn list_new_entry(argv: *const i64) -> i64 {
+    // SAFETY: see `tuple_new_entry`.
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    container_new_value(ContainerNew::List, args[0], args[1])
+}
+
+extern "C" fn set_new_entry(argv: *const i64) -> i64 {
+    // SAFETY: see `tuple_new_entry`.
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    container_new_value(ContainerNew::Set, args[0], args[1])
+}
+
+extern "C" fn frozenset_new_entry(argv: *const i64) -> i64 {
+    // SAFETY: see `tuple_new_entry`.
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    container_new_value(ContainerNew::Frozenset, args[0], args[1])
+}
+
+/// `dict.__new__(cls, *args, **kwargs)`: the plain mapping, or a native `dict`
+/// subclass instance seeded into the mapping storage it owns.
+extern "C" fn dict_new_entry(argv: *const i64) -> i64 {
+    // SAFETY: the slot's signature is `(cls, *args, **kwargs)`, so the binder
+    // supplies exactly three slots (the vararg list and the keyword dict).
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    let cls = args[0];
+    let Some(class) = new_class_operand(cls) else {
+        return new_class_error("dict", cls);
+    };
+    let native = value::dict_class();
+    if class != native && !value::is_native_dict_subclass(class) {
+        return new_class_error("dict", cls);
+    }
+    let positionals: Vec<i64> = value::as_list(args[1])
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    if positionals.len() > 1 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "dict expected at most 1 argument, got {}",
+                positionals.len()
+            ),
+        );
+    }
+    let mut keyword_pairs: Vec<(String, i64)> = Vec::new();
+    if let Some(pairs) = value::as_dict(args[2]) {
+        for (key, item) in pairs {
+            if let Some(name) = value::as_str(*key) {
+                keyword_pairs.push((name.to_string(), *item));
+            }
+        }
+    }
+    let built = dict_build(positionals.first().copied(), &keyword_pairs);
+    if exc::pending() {
+        return NONE;
+    }
+    if class == native {
+        return built;
+    }
+    // A native `dict` subclass keeps its mapping in the reserved instance
+    // storage `native_dict_data` owns; copy the built mapping into it.
+    let roots = crate::heap::root_values(std::slice::from_ref(&built));
+    let instance = value::instance_new(class);
+    let storage = value::native_dict_data(instance, true);
+    crate::heap::release_roots(roots);
+    let Some(storage) = storage else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "dict.__new__() could not allocate mapping storage",
+        );
+    };
+    let pairs = value::as_dict(built)
+        .map(|pairs| pairs.to_vec())
+        .unwrap_or_default();
+    let pairs_source: Vec<i64> = pairs.iter().flat_map(|(key, item)| [*key, *item]).collect();
+    let roots = crate::heap::root_values(&pairs_source);
+    for (key, item) in pairs {
+        container::dict_set(storage, key, item);
+        if exc::pending() {
+            break;
+        }
+    }
+    crate::heap::release_roots(roots);
+    instance
+}
+
+/// `object.__new__(cls)`: an uninitialized instance of `cls`.
+///
+/// CPython accepts exactly one argument, the type to instantiate.
+extern "C" fn object_new_entry(argv: *const i64) -> i64 {
+    // SAFETY: a varargs wrapper always receives the tagged argument count in
+    // its first slot.
+    let count = value::as_integer(unsafe { *argv }).unwrap_or(0);
+    if count != 1 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "object.__new__() takes exactly one argument (the type to instantiate)",
+        );
+    }
+    // SAFETY: `count == 1`, so one argument follows the count slot.
+    let cls = unsafe { *argv.add(1) };
+    let Some(class) = new_class_operand(cls) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "object.__new__() argument must be a type, not '{}'",
+                value::type_name(cls)
+            ),
+        );
+    };
+    value::instance_new(class)
+}
+
+/// `complex.__new__(cls, real=0, imag=0)`.
+extern "C" fn complex_new_entry(argv: *const i64) -> i64 {
+    // SAFETY: the slot's signature is `(cls, real, imag)`; the binder supplies
+    // three slots, with `None` where an argument was omitted.
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    let cls = args[0];
+    let Some(class) = new_class_operand(cls) else {
+        return new_class_error("complex", cls);
+    };
+    let native = value::native_class("complex");
+    if class != native && !value::class_mro(class).contains(&native) {
+        return new_class_error("complex", cls);
+    }
+    // Omitted defaults are `None` slots: `complex()`, `complex(real)` and
+    // `complex(real, imag)` are three distinct builtin calls.
+    let mut operands = 2;
+    while operands > 0 && args[operands] == NONE {
+        operands -= 1;
+    }
+    let slots = [args[1], args[2]];
+    let payload = complex_new(&slots[..operands]);
+    if exc::pending() {
+        return NONE;
+    }
+    if class == native {
+        return payload;
+    }
+    let roots = crate::heap::root_values(std::slice::from_ref(&payload));
+    let instance = value::instance_new(class);
+    value::instance_set_scalar_payload(instance, payload);
+    crate::heap::release_roots(roots);
+    instance
+}
+
+/// The `__new__` slot function value of a builtin constructor type.
+///
+/// `kind` is the builtin's Python name (`tuple`, `list`, `set`, `frozenset`,
+/// `dict`, `object`, `complex`). `None` for every other name, so the native
+/// classes can install the slot selectively.
+pub(crate) fn builtin_new_function(kind: &str) -> Option<i64> {
+    if kind == "object" {
+        // No signature: `call_user_new` skips native allocators that carry no
+        // parameter metadata, which keeps ordinary class construction on its
+        // default path.
+        return Some(value::function_new_with_flags(
+            object_new_entry as *const () as usize,
+            1,
+            "object.__new__".to_string(),
+            value::FUNCTION_FLAG_VARARGS,
+        ));
+    }
+    // `tuple.__new__(cls, iterable=())`: the empty-tuple default is a real
+    // value, so an omitted argument is distinguishable from `None`.
+    let empty = value::tuple_new(Vec::new());
+    let roots = crate::heap::root_values(std::slice::from_ref(&empty));
+    let zero = value::encode_int(0).unwrap_or(NONE);
+    let positional = |name: &str| value::ParamMeta {
+        name: name.to_string(),
+        kind: ParamKind::PosOnly,
+        default: None,
+    };
+    let params: Vec<value::ParamMeta> = match kind {
+        "tuple" | "list" | "set" | "frozenset" => vec![
+            positional("cls"),
+            value::ParamMeta {
+                name: "iterable".to_string(),
+                kind: ParamKind::PosOnly,
+                default: Some(empty),
+            },
+        ],
+        "dict" => vec![
+            positional("cls"),
+            value::ParamMeta {
+                name: "args".to_string(),
+                kind: ParamKind::VarArg,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "kwargs".to_string(),
+                kind: ParamKind::KwArg,
+                default: None,
+            },
+        ],
+        "complex" => vec![
+            positional("cls"),
+            value::ParamMeta {
+                name: "real".to_string(),
+                kind: ParamKind::PosOnly,
+                default: Some(zero),
+            },
+            value::ParamMeta {
+                name: "imag".to_string(),
+                kind: ParamKind::PosOnly,
+                default: Some(zero),
+            },
+        ],
+        _ => {
+            crate::heap::release_roots(roots);
+            return None;
+        }
+    };
+    let entry = match kind {
+        "tuple" => tuple_new_entry as *const () as usize,
+        "list" => list_new_entry as *const () as usize,
+        "set" => set_new_entry as *const () as usize,
+        "frozenset" => frozenset_new_entry as *const () as usize,
+        "dict" => dict_new_entry as *const () as usize,
+        _ => complex_new_entry as *const () as usize,
+    };
+    let function = value::function_new_with_flags(0, usize::MAX, format!("{kind}.__new__"), 0);
+    value::function_set_signature(function, params);
+    value::function_set_full_entry(function, entry);
+    crate::heap::release_roots(roots);
+    Some(function)
+}
+
+/// `types.CodeType.__init__(self, /, *args, **kwargs)`: code objects are
+/// immutable, so the slot accepts the field arguments and stores nothing.
+///
+/// The parameter metadata is what `inspect.signature(partial(CodeType.__init__,
+/// None))` in `unittest.mock` reads (`_CODE_SIG`); `partial` binds `self`, so
+/// the reported signature is `(*args, **kwargs)`.
+pub(crate) fn code_init_function() -> i64 {
+    let function = value::function_new_with_flags(0, usize::MAX, "code.__init__".to_string(), 0);
+    value::function_set_signature(
+        function,
+        vec![
+            value::ParamMeta {
+                name: "self".to_string(),
+                kind: ParamKind::PosOnly,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "args".to_string(),
+                kind: ParamKind::VarArg,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "kwargs".to_string(),
+                kind: ParamKind::KwArg,
+                default: None,
+            },
+        ],
+    );
+    value::function_set_full_entry(function, code_init_entry as *const () as usize);
+    function
+}
+
+extern "C" fn code_init_entry(_argv: *const i64) -> i64 {
+    // Code objects are immutable: the field arguments are validated by the
+    // signature binder and deliberately not stored anywhere. Returning `None`
+    // is CPython's `__init__` return value.
+    NONE
 }
 
 /// Runs a compiled `__new__` override for a class call.
@@ -3875,6 +4266,13 @@ pub(crate) fn scalar_new_from_args(argc: usize, argv: *const i64) -> i64 {
 fn call_user_new(class: i64, args: &[i64], keywords: &[(String, i64)]) -> Option<i64> {
     let (_kind, new) = value::class_member(class, "__new__")?;
     if value::function_signature(new).is_empty() || value::function_full_entry(new) == 0 {
+        return None;
+    }
+    // The native constructor slots installed on the cached builtin classes
+    // (`tuple.__new__`, `dict.__new__`, ...) are the default allocators, not
+    // user hooks: a plain `Sub(args)` class call keeps its ordinary allocation
+    // path (scalar payloads, native dict storage, plain instances).
+    if value::class_lookup_owner(class, "__new__").is_some_and(value::is_cached_type_class) {
         return None;
     }
     // `__new__` is implicitly a static method: the class is the first
@@ -7077,7 +7475,12 @@ pub(crate) fn format_builtin(value: i64, spec: i64, conversion: u8) -> i64 {
 /// `isinstance(FileNotFoundError(), OSError)` are true, and every Hydro value
 /// (including exception objects) is an instance of the cached `object` class.
 pub(crate) fn isinstance(value: i64, target: i64) -> i64 {
-    match type_check(value, target) {
+    let result = type_check(value, target);
+    // A metaclass `__instancecheck__` that raised keeps its own exception.
+    if exc::pending() {
+        return NONE;
+    }
+    match result {
         Some(result) => value::bool_value(result),
         None => exc::raise_with_message(
             TYPE_ERROR,
@@ -7094,7 +7497,12 @@ pub(crate) fn isinstance(value: i64, target: i64) -> i64 {
 /// user-defined classes, and treats every class as a subclass of the cached
 /// `object` class. Non-class arguments raise `TypeError`, matching CPython.
 pub(crate) fn issubclass(subclass: i64, class: i64) -> i64 {
-    match subclass_check(subclass, class) {
+    let checked = subclass_check(subclass, class);
+    // A metaclass `__subclasscheck__` that raised keeps its own exception.
+    if exc::pending() {
+        return NONE;
+    }
+    match checked {
         Ok(result) => value::bool_value(result),
         Err(SubclassError::Subclass) => {
             exc::raise_with_message(TYPE_ERROR, "issubclass() arg 1 must be a class")
@@ -7110,6 +7518,79 @@ pub(crate) fn issubclass(subclass: i64, class: i64) -> i64 {
 enum SubclassError {
     Subclass,
     Class,
+}
+
+thread_local! {
+    /// Nesting depth of metaclass type-check hooks. A hook that calls
+    /// `isinstance`/`issubclass` again — `ABCMeta`'s native hooks delegate
+    /// back to the builtin, and a user hook calls `super().__subclasscheck__`,
+    /// which resolves to the native `type` slot — must see the default answer
+    /// instead of re-entering itself.
+    static TYPE_CHECK_HOOK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Decrements [`TYPE_CHECK_HOOK_DEPTH`] when dropped, including on unwind and
+/// on an early return from a raising hook.
+struct TypeCheckHookGuard;
+
+impl Drop for TypeCheckHookGuard {
+    fn drop(&mut self) {
+        TYPE_CHECK_HOOK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Runs the metaclass `__subclasscheck__`/`__instancecheck__` hook of `class`.
+///
+/// CPython's `issubclass`/`isinstance` dispatch through
+/// `type(class).__subclasscheck__` and `type(class).__instancecheck__`, so a
+/// metaclass (`test_typechecks.py`'s `ABC`) decides for the classes it builds.
+/// The native `type` default is skipped — it is this very function — and so is
+/// a nested call from inside a hook.
+///
+/// Returns `None` when the class has no custom hook; a raising hook leaves its
+/// exception pending and also yields `None`.
+fn metaclass_type_hook(class: i64, name: &str, operand: i64) -> Option<bool> {
+    value::as_class(class)?;
+    let metaclass = value::class_metaclass(class);
+    if metaclass == NONE || value::is_type_class(metaclass) {
+        return None;
+    }
+    // `__subclasscheck__`/`__instancecheck__` inherited unchanged from the
+    // native `type` class is the default check, not an override.
+    let owner = value::class_lookup_owner(metaclass, name)?;
+    if value::is_type_class(owner) {
+        return None;
+    }
+    let function = match value::class_lookup(metaclass, name)? {
+        value::ClassEntry::Method(_, function) => function,
+        value::ClassEntry::Attr(item) if value::as_function(item).is_some() => item,
+        value::ClassEntry::Attr(_) => return None,
+    };
+    // `abc.ABCMeta`'s slots delegate straight back to these builtin checks, so
+    // running them would only repeat the default answer.
+    if matches!(
+        value::function_native_name(function),
+        Some("ABCMeta.__instancecheck__" | "ABCMeta.__subclasscheck__")
+    ) {
+        return None;
+    }
+    if TYPE_CHECK_HOOK_DEPTH.with(|depth| depth.get()) > 0 {
+        return None;
+    }
+    // Reading the slot on the class binds it to the class, exactly like the
+    // direct `Cls.__subclasscheck__(obj)` spelling.
+    let hook = methods::getattr(class, name.as_ptr(), name.len());
+    if exc::pending() {
+        return None;
+    }
+    TYPE_CHECK_HOOK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let _guard = TypeCheckHookGuard;
+    let args = [operand];
+    let result = call(hook, 1, args.as_ptr());
+    if exc::pending() {
+        return None;
+    }
+    Some(value::truthy(result))
 }
 
 /// Tri-state check for `issubclass`, with the offending argument on failure.
@@ -7139,6 +7620,11 @@ fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
             }
         }
         return Ok(false);
+    }
+    // A metaclass `__subclasscheck__` decides for its classes before the
+    // default hierarchy walk (CPython's `issubclass` dispatches through it).
+    if let Some(result) = metaclass_type_hook(class, "__subclasscheck__", subclass) {
+        return Ok(result);
     }
     // An extension class handle (NumPy's scalar types such as `numpy.float64`
     // and its abstract `numpy.signedinteger`, ...) answers through the
@@ -7269,6 +7755,12 @@ fn type_check(value: i64, target: i64) -> Option<bool> {
         return Some(result == value::bool_value(true));
     }
     if value::as_class(target).is_some() {
+        // A metaclass `__instancecheck__` decides for its classes before the
+        // default hierarchy walk (CPython's `isinstance` dispatches through
+        // it); `test_typechecks.py`'s `ABC` relies on it.
+        if let Some(result) = metaclass_type_hook(target, "__instancecheck__", value) {
+            return Some(result);
+        }
         return Some(instance_of(value, target));
     }
     if let Some(function) = value::as_function(target) {
@@ -7594,6 +8086,11 @@ pub(crate) fn slice_class() -> i64 {
 }
 
 pub(crate) fn is_complex_instance(v: i64) -> bool {
+    // A `complex` subclass instance carries the built complex value as its
+    // scalar payload (`complex.__new__(Sub, 1, 2)`).
+    if let Some(payload) = value::scalar_payload(v) {
+        return is_complex_instance(payload);
+    }
     // The ordinary numeric path must not build a registry key and take the
     // globals RwLock for a tagged int. Only real instances can match.
     let Some(class) = value::instance_class_value(v) else {
@@ -7623,6 +8120,8 @@ fn numeric_f64(v: i64) -> Option<f64> {
 
 /// `(real, imag)` of a complex value or any numeric value.
 pub(crate) fn complex_components(v: i64) -> Option<(f64, f64)> {
+    // Subclass instances store the complex value they wrap as payload.
+    let v = value::scalar_payload(v).unwrap_or(v);
     if is_complex_instance(v) {
         let real = value::instance_attr(v, "real").and_then(value::as_float);
         let imag = value::instance_attr(v, "imag").and_then(value::as_float);
@@ -8029,6 +8528,219 @@ mod tests {
         let items = value::as_tuple(result).expect("probe returns a tuple");
         assert_eq!(items, &[int(5), int(9)]);
         exc::clear();
+    }
+
+    /// `class Sub(tuple): pass` over the cached native `tuple` class.
+    fn tuple_subclass(name: &str) -> i64 {
+        let native = value::builtin_type_class(value::builtin_function_new(Builtin::Tuple))
+            .expect("tuple names a native class");
+        value::class_new_multi(name.to_string(), vec![native], NONE, Vec::new(), Vec::new())
+    }
+
+    /// Reads `X.__new__` for the builtin type spelling `spelling`.
+    fn new_slot(spelling: i64) -> i64 {
+        let slot = methods::getattr(spelling, b"__new__".as_ptr(), "__new__".len());
+        assert!(!exc::pending(), "{}", pending_message());
+        slot
+    }
+
+    #[test]
+    fn builtin_new_constructs_the_plain_value() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        let pair = value::tuple_new(vec![int(1), int(2)]);
+
+        // `tuple.__new__(tuple, (1, 2)) == (1, 2)`.
+        let tuple_spelling = value::builtin_function_new(Builtin::Tuple);
+        let arguments = [tuple_spelling, pair];
+        let tuple = call(new_slot(tuple_spelling), 2, arguments.as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            value::as_tuple(tuple).map(|items| items.to_vec()),
+            Some(vec![int(1), int(2)])
+        );
+
+        // `list.__new__(list, (1, 2))` copies into a fresh list.
+        let list_spelling = value::builtin_function_new(Builtin::List);
+        let arguments = [list_spelling, pair];
+        let list = call(new_slot(list_spelling), 2, arguments.as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            value::as_list(list).map(|items| items.to_vec()),
+            Some(vec![int(1), int(2)])
+        );
+
+        // `set.__new__(set, (1, 2))` and the frozenset spelling.
+        for spelling in [
+            value::builtin_function_new(Builtin::Set),
+            value::builtin_function_new(Builtin::Frozenset),
+        ] {
+            let arguments = [spelling, pair];
+            let built = call(new_slot(spelling), 2, arguments.as_ptr());
+            assert!(!exc::pending(), "{}", pending_message());
+            assert_eq!(value::as_set(built).map(|items| items.len()), Some(2));
+        }
+
+        // `dict.__new__(dict)` is an empty mapping; `dict.__new__(dict, d)`
+        // copies it.
+        let dict_spelling = value::builtin_function_new(Builtin::Dict);
+        let empty = call(new_slot(dict_spelling), 1, [dict_spelling].as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::as_dict(empty).map(|pairs| pairs.len()), Some(0));
+
+        // `int.__new__(int, 3)` returns the plain integer.
+        let int_spelling = value::builtin_function_new(Builtin::Int);
+        let arguments = [int_spelling, int(3)];
+        assert_eq!(
+            as_int(call(new_slot(int_spelling), 2, arguments.as_ptr())),
+            3
+        );
+        assert!(!exc::pending(), "{}", pending_message());
+    }
+
+    #[test]
+    fn builtin_new_allocates_subclass_instances() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        let subclass = tuple_subclass("ProbeTuple");
+        let pair = value::tuple_new(vec![int(1), int(2)]);
+        let tuple_spelling = value::builtin_function_new(Builtin::Tuple);
+        let slot = new_slot(tuple_spelling);
+
+        // `tuple.__new__(Sub, (1, 2))` is a `Sub` that behaves as that tuple.
+        let arguments = [subclass, pair];
+        let instance = call(slot, 2, arguments.as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::type_class(instance), subclass);
+        assert_eq!(isinstance(instance, subclass), TRUE);
+        assert_eq!(
+            value::as_tuple(instance).map(|items| items.to_vec()),
+            Some(vec![int(1), int(2)])
+        );
+        assert_eq!(as_int(len(instance)), 2);
+
+        // Attribute lookup still belongs to the subclass instance.
+        value::instance_setattr(instance, "marker".to_string(), int(9));
+        assert_eq!(value::instance_attr(instance, "marker"), Some(int(9)));
+    }
+
+    #[test]
+    fn object_new_allocates_uninitialized_instances() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        let slot = value::class_lookup(value::object_class(), "__new__")
+            .map(|entry| match entry {
+                value::ClassEntry::Method(_, function) => function,
+                value::ClassEntry::Attr(item) => item,
+            })
+            .expect("object carries __new__");
+
+        let first = call(slot, 1, [value::object_class()].as_ptr());
+        let second = call(slot, 1, [value::object_class()].as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_ne!(first, second);
+
+        // Extra arguments are rejected like CPython.
+        let _ = call(slot, 2, [value::object_class(), int(1)].as_ptr());
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn complex_new_builds_complex_values() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        let complex_class = value::native_class("complex");
+        // The class namespace carries the full-signature constructor slot.
+        let slot = match value::class_lookup(complex_class, "__new__") {
+            Some(value::ClassEntry::Method(_, function)) => function,
+            Some(value::ClassEntry::Attr(item)) => item,
+            None => panic!("complex carries __new__"),
+        };
+        let arguments = [complex_class, int(1), int(2)];
+        let value = call(slot, 3, arguments.as_ptr());
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(complex_components(value), Some((1.0, 2.0)));
+    }
+
+    #[test]
+    fn builtin_type_spellings_answer_the_class_protocol() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        let int_spelling = value::builtin_function_new(Builtin::Int);
+
+        // `int.mro()` and `int.__mro__` report the native hierarchy.
+        let mro_method = methods::getattr(int_spelling, b"mro".as_ptr(), "mro".len());
+        assert!(!exc::pending(), "{}", pending_message());
+        let mro = call(mro_method, 0, std::ptr::null());
+        assert!(!exc::pending(), "{}", pending_message());
+        let names: Vec<String> = value::as_list(mro)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|class| value::class_display_name(*class).map(str::to_string))
+            .collect();
+        assert_eq!(names.first().map(String::as_str), Some("int"));
+        assert_eq!(names.last().map(String::as_str), Some("object"));
+
+        let mro_value = methods::getattr(int_spelling, b"__mro__".as_ptr(), "__mro__".len());
+        assert_eq!(
+            value::as_tuple(mro_value).map(|items| items.to_vec()),
+            value::as_tuple(value::tuple_new(value::class_mro(value::native_class(
+                "int"
+            ))))
+            .map(|items| items.to_vec())
+        );
+
+        let bases = methods::getattr(int_spelling, b"__bases__".as_ptr(), "__bases__".len());
+        assert_eq!(
+            value::as_tuple(bases).map(|items| items.to_vec()),
+            Some(vec![value::object_class()])
+        );
+        let base = methods::getattr(int_spelling, b"__base__".as_ptr(), "__base__".len());
+        assert_eq!(base, value::object_class());
+    }
+
+    #[test]
+    fn metaclass_type_hooks_decide_for_their_classes() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+
+        // `class Meta(type): def __subclasscheck__(cls, sub): return True`
+        // (a standalone function with the two receiver arguments).
+        extern "C" fn returns_true(_argv: *const i64) -> i64 {
+            TRUE
+        }
+        let hook = value::function_new(
+            returns_true as *const () as usize,
+            2,
+            "__subclasscheck__".to_string(),
+        );
+        let type_builtin = value::builtin_function_new(Builtin::Type);
+        let meta = value::class_new_multi(
+            "Meta".to_string(),
+            vec![type_builtin],
+            NONE,
+            vec![("__subclasscheck__".to_string(), hook, MethodKind::Normal)],
+            Vec::new(),
+        );
+        let class = value::class_new_multi(
+            "Integer".to_string(),
+            Vec::new(),
+            meta,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // `issubclass(float, Integer)` consults the metaclass hook, which
+        // answers `True` for every operand.
+        let float_spelling = value::builtin_function_new(Builtin::Float);
+        assert_eq!(issubclass(float_spelling, class), TRUE);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(
+            issubclass(value::builtin_function_new(Builtin::Int), class),
+            TRUE
+        );
+        assert!(!exc::pending(), "{}", pending_message());
     }
 
     #[test]
@@ -9740,13 +10452,13 @@ mod tests {
             "('boom',)"
         );
 
-        // Multiple arguments are rejected explicitly rather than truncated.
+        // CPython accepts any number of positional constructor arguments.
         let two = [string("a"), string("b")];
-        assert_eq!(call(value_error, 2, two.as_ptr()), NONE);
-        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        let multiple = call(value_error, 2, two.as_ptr());
+        assert!(!exc::pending());
         assert_eq!(
-            pending_message(),
-            "ValueError() takes at most 1 argument (2 given)"
+            rendered(getattr_builtin(multiple, string("args"))),
+            "('a', 'b')"
         );
         exc::init();
     }

@@ -150,6 +150,7 @@ fn register_runtime_symbols(builder: &mut JITBuilder) {
         hydro_raise_from,
         hydro_raise_value_from,
         hydro_exc_matches,
+        hydro_exc_matches_value,
         hydro_uncaught,
         hydro_runtime_init,
         hydro_register_function,

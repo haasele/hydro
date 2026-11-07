@@ -153,6 +153,7 @@ pub static MODULES: &[&ModuleSpec] = &[
     &ERRNO,
     &UNITTEST,
     &UNITTEST_UTIL,
+    &UNITTEST_RESULT,
     &PYTEST,
     &BINASCII,
     &BASE64,

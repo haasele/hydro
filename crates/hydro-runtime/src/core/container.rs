@@ -1995,6 +1995,12 @@ pub(crate) fn equals(a: i64, b: i64) -> bool {
     equals_depth(a, b, 0)
 }
 
+/// Maximum nesting of user-`__eq__` dispatches in one comparison.
+///
+/// A Python-level `__eq__` re-enters [`equals`] with a fresh container depth,
+/// so the recursion budget of [`equals_depth`] cannot bound it and the native
+/// call stack would overflow; an unconverged comparison is reported as unequal
+/// instead.
 const MAX_EQ_DEPTH: usize = 64;
 
 thread_local! {
@@ -2040,7 +2046,12 @@ fn equals_depth(a: i64, b: i64, depth: usize) -> bool {
             // An integer outside `i64` yields no `Num`; fall through so the
             // exact BigInt comparison below can still run.
             if value::as_bigint(a).is_none() && value::as_bigint(b).is_none() {
-                return false;
+                // `complex` has no `Num` view, and a user class instance has
+                // no numeric view at all; both define equality through
+                // `__eq__` (complex compares against int/float numerically).
+                // Dispatch exactly like a direct `==`, where the builtin
+                // numeric pairing above would otherwise hide the method.
+                return instance_equality(a, b).unwrap_or(false);
             }
         }
         (None, None) => {}
@@ -2124,9 +2135,17 @@ fn equals_depth(a: i64, b: i64, depth: usize) -> bool {
     if a == b {
         return true;
     }
-    if depth >= MAX_EQ_DEPTH {
-        // Self-referential containers: treat unconverged comparison as unequal
-        // instead of overflowing the stack.
+    if depth >= crate::modules::recursion_limit().min(128) {
+        // CPython follows nested containers to its recursion limit and raises
+        // `RecursionError` there; the native loop is charged the same budget so
+        // a deeply nested (or cyclic, non-converging) comparison reports the
+        // error instead of overflowing the native stack.
+        if !exc::pending() {
+            exc::raise_with_message(
+                exc::RECURSION_ERROR,
+                "maximum recursion depth exceeded in comparison",
+            );
+        }
         return false;
     }
     // A builtin type's two runtime spellings — the cached native class
@@ -2335,6 +2354,49 @@ mod tests {
             value::to_string(exc::pending_value()),
             "unhashable type: 'list'"
         );
+    }
+
+    #[test]
+    fn deep_container_comparison_raises_recursion_error() {
+        exc::init();
+        let marker = crate::heap::root_values(&[]);
+        let mut left = value::list_new(Vec::new());
+        let mut right = value::list_new(Vec::new());
+        // Far past the default limit: CPython reports `RecursionError` here.
+        for _ in 0..1500 {
+            left = value::list_new(vec![left]);
+            right = value::list_new(vec![right]);
+            crate::heap::push_scoped_root(left);
+            crate::heap::push_scoped_root(right);
+        }
+        assert!(!equals(left, right));
+        crate::heap::release_roots(marker);
+        assert!(exc::pending());
+        assert_eq!(exc::pending_tag(), crate::exc::RECURSION_ERROR as i64);
+    }
+
+    #[test]
+    fn shallow_equality_and_cyclic_identity_are_unchanged() {
+        exc::init();
+        assert!(equals(
+            list(&[int(1), string("a")]),
+            list(&[int(1), string("a")])
+        ));
+        assert!(!equals(list(&[int(1)]), list(&[int(2)])));
+        assert!(!exc::pending());
+
+        // A self-referential container compares equal to itself through the
+        // identity shortcut, before the recursion budget is charged.
+        let marker = crate::heap::root_values(&[]);
+        let cyclic = value::list_new(Vec::new());
+        crate::heap::push_scoped_root(cyclic);
+        if let Some(mut items) = value::list_items_mut(cyclic) {
+            items.push(cyclic);
+            crate::heap::write_barrier_edge(cyclic, cyclic);
+        }
+        assert!(equals(cyclic, cyclic));
+        crate::heap::release_roots(marker);
+        assert!(!exc::pending());
     }
 
     #[test]
@@ -3242,6 +3304,22 @@ mod tests {
             value::instance_new(bare),
             value::instance_new(bare)
         ));
+        assert!(!crate::exc::pending());
+    }
+
+    /// `complex` has no `Num` view, so nested equality must consult its
+    /// `__eq__` instead of bailing out as a numeric mismatch
+    /// (test_compare's `2 in [2.0, 2, 2+0j]` family).
+    #[test]
+    fn complex_compares_numerically_inside_containers() {
+        exc::init();
+        let complex_two = crate::builtins::build_complex(2.0, 0.0);
+        assert!(equals(int(2), complex_two));
+        assert!(equals(complex_two, int(2)));
+        assert!(equals(value::float_new(2.0), complex_two));
+        assert!(equals(list(&[int(2)]), list(&[complex_two])));
+        assert!(equals(tuple(&[int(2)]), tuple(&[complex_two])));
+        assert!(!equals(list(&[int(3)]), list(&[complex_two])));
         assert!(!crate::exc::pending());
     }
 }

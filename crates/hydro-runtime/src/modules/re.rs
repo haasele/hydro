@@ -247,6 +247,7 @@ fn compile_source(source: &str, flags: i64) -> Result<Regex, i64> {
     if flags & VERBOSE != 0 {
         normalized = escape_verbose_class_chars(&normalized);
     }
+    normalized = rewrite_atomic_groups(&normalized);
     let build = |pattern: &str| {
         RegexBuilder::new(pattern)
             .case_insensitive(flags & IGNORECASE != 0)
@@ -440,6 +441,7 @@ fn compile_bytes_text(pattern: &str, flags: i64) -> Result<regex_bytes::Regex, i
     if flags & VERBOSE != 0 {
         normalized = escape_verbose_class_chars(&normalized);
     }
+    normalized = rewrite_atomic_groups(&normalized);
     let build = |pattern: &str| {
         regex_bytes::RegexBuilder::new(pattern)
             .case_insensitive(flags & IGNORECASE != 0)
@@ -497,6 +499,70 @@ fn strip_lookarounds(source: &str) -> String {
             }
         }
         out.push(chars[index]);
+        index += 1;
+    }
+    out
+}
+
+/// Rewrites atomic groups `(?>...)` as non-capturing groups `(?:...)`.
+///
+/// The `regex` crate rejects `(?>` (it parses `>` as an unknown flag), so the
+/// group's atomicity is **not** enforced: this is a compatibility rewrite,
+/// not a faithful one. CPython 3.14's `fnmatch.translate` wraps only
+/// `.*?fixed` star segments in atomic groups, and committing each segment to
+/// its earliest occurrence cannot change whether the whole pattern matches
+/// (every following remainder starts with `.*` or `.*?` and can skip
+/// anything), so translated shell patterns still match identically. A
+/// hand-written pattern whose alternatives depend on conditional commitment
+/// may behave differently. Escapes and character classes are respected, so a
+/// literal `(?>` inside `\(` or `[...]` is left alone.
+fn rewrite_atomic_groups(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut in_class = false;
+    let mut class_started = false;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            if in_class {
+                class_started = true;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '\\' {
+            out.push(ch);
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if in_class {
+            if ch == ']' && class_started {
+                in_class = false;
+            } else if !class_started && ch != '^' {
+                class_started = true;
+            }
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+            class_started = false;
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '(' && chars.get(index + 1) == Some(&'?') && chars.get(index + 2) == Some(&'>') {
+            out.push_str("(?:");
+            index += 3;
+            continue;
+        }
+        out.push(ch);
         index += 1;
     }
     out
@@ -1919,6 +1985,18 @@ mod tests {
         crate::builtins::call(pattern_class, 1, [text("a")].as_ptr());
         assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
         exc::init();
+    }
+
+    #[test]
+    fn atomic_groups_compile_as_non_capturing_groups() {
+        exc::init();
+        // CPython 3.14's `fnmatch.translate` emits atomic groups; the engine
+        // has no atomic groups, so they compile as plain groups.
+        let compiled = call("compile", &[text(r"(?s:(?>.*?a).*a)\z")]);
+        assert!(!exc::pending());
+        assert!(value::as_match(call("match", &[compiled, text("aa")])).is_some());
+        assert_eq!(call("match", &[compiled, text("ab")]), NONE);
+        assert!(!exc::pending());
     }
 
     fn bytes_value(raw: &[u8]) -> i64 {

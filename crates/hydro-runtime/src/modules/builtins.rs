@@ -733,6 +733,9 @@ fn exception_tag(name: &str) -> Option<u32> {
         "MemoryError" => exc::MEMORY_ERROR,
         "ModuleNotFoundError" => exc::MODULE_NOT_FOUND_ERROR,
         "NameError" => exc::NAME_ERROR,
+        // Hydro has no distinct tag for this NameError subclass yet; the
+        // name must still resolve and inherit NameError for tests.
+        "UnboundLocalError" => exc::NAME_ERROR,
         "NotADirectoryError" => exc::NOT_A_DIRECTORY_ERROR,
         "NotImplementedError" => exc::NOT_IMPLEMENTED_ERROR,
         "OSError" => exc::OS_ERROR,

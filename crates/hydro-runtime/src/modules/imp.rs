@@ -14,9 +14,21 @@
 //! the sense that these modules are provided by the runtime itself.
 
 use hydro_ir::{stdlib, PYTHON_ABI_TAG};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::exc::{self, IMPORT_ERROR, NOT_IMPLEMENTED_ERROR, TYPE_ERROR};
 use crate::value::{self, FALSE, NONE};
+
+static FROZEN_OVERRIDE: AtomicI64 = AtomicI64::new(-1);
+static MULTI_INTERP_OVERRIDE: AtomicI64 = AtomicI64::new(-1);
+
+fn override_state(state: &AtomicI64, args: &[i64]) -> i64 {
+    let value = args
+        .first()
+        .and_then(|arg| value::as_integer(*arg))
+        .unwrap_or(-1);
+    value::encode_int(state.swap(value, Ordering::SeqCst)).unwrap_or(NONE)
+}
 
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -56,6 +68,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             NOT_IMPLEMENTED_ERROR,
             "_imp._fix_co_filename() is not supported: Hydro has no code object",
         ),
+        "_override_frozen_modules_for_tests" => override_state(&FROZEN_OVERRIDE, args),
+        "_override_multi_interp_extensions_check" => override_state(&MULTI_INTERP_OVERRIDE, args),
         "source_hash" => exc::raise_with_message(
             NOT_IMPLEMENTED_ERROR,
             "_imp.source_hash() is not supported: Hydro has no code object",

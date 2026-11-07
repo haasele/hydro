@@ -1514,34 +1514,163 @@ fn cmp_big(a: BigOperand, b: BigOperand) -> Option<Ordering> {
 // Comparisons
 // -------------------------------------------------------------------------
 
-/// User-class rich comparisons. `__eq__`/`__ne__` also fall back to the
-/// reflected method, matching Python's budgeted method lookup for this slice.
+/// How one class namespace supplies a rich-comparison dunder.
+enum RichMethod {
+    /// The class (and its non-`object` ancestors) does not provide it, or the
+    /// only provider is `object`, whose identity defaults are modelled by
+    /// [`instance_comparison`]'s final fallback instead.
+    Missing,
+    /// The name is bound to a non-callable value (`__eq__ = None`). CPython's
+    /// slot wrapper still calls it, so the operator raises `TypeError`
+    /// instead of quietly falling through to the reflected operand.
+    Blocked(i64),
+    /// A method, or a function assigned at runtime (`C.__eq__ = fn`), which
+    /// binds like a class-body method.
+    Callable,
+}
+
+/// Resolves a rich-comparison dunder on `instance`'s type, bypassing the
+/// instance dictionary like CPython's slot lookup.
+fn rich_method(instance: i64, name: &str) -> RichMethod {
+    let Some(state) = value::as_instance(instance) else {
+        return RichMethod::Missing;
+    };
+    let class = state.class;
+    match value::class_lookup_owner(class, name) {
+        // `object.__eq__`/`object.__ne__` return NotImplemented in CPython;
+        // Hydro implements their identity result directly, so treat them as
+        // absent and keep the final identity fallback here.
+        None => RichMethod::Missing,
+        Some(owner) if value::is_object_class(owner) => RichMethod::Missing,
+        Some(_) => match value::class_lookup(class, name) {
+            Some(value::ClassEntry::Method(..)) => RichMethod::Callable,
+            Some(value::ClassEntry::Attr(entry)) if value::as_function(entry).is_some() => {
+                RichMethod::Callable
+            }
+            Some(value::ClassEntry::Attr(entry)) => RichMethod::Blocked(entry),
+            None => RichMethod::Missing,
+        },
+    }
+}
+
+fn not_callable(entry: i64) -> i64 {
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!("'{}' object is not callable", value::type_name(entry)),
+    )
+}
+
+/// Calls one rich-comparison dunder on `instance` with `other` as its second
+/// argument. Returns `NOT_IMPLEMENTED` when the class provides no opinion.
+fn call_rich_method(instance: i64, name: &str, other: i64) -> i64 {
+    match rich_method(instance, name) {
+        RichMethod::Missing => value::NOT_IMPLEMENTED,
+        RichMethod::Blocked(entry) => not_callable(entry),
+        RichMethod::Callable => instance_method_call(instance, name, &[instance, other])
+            .unwrap_or(value::NOT_IMPLEMENTED),
+    }
+}
+
+/// One operand's attempt at a rich comparison. `op` is the operation that
+/// operand sees, so the reflected operand receives the swapped operation.
+///
+/// `!=` is the only operator with a default that delegates: when `__ne__` is
+/// inherited (not overridden) it calls `__eq__` and negates its result, but
+/// only when `__eq__` produced a value. An overridden `__ne__` that returns
+/// `NotImplemented` ends the attempt, exactly like CPython.
+fn rich_compare_method(instance: i64, other: i64, op: u32) -> i64 {
+    if op != OP_NE {
+        return call_rich_method(instance, comparison_method_name(op), other);
+    }
+    match rich_method(instance, "__ne__") {
+        RichMethod::Callable => call_rich_method(instance, "__ne__", other),
+        RichMethod::Blocked(entry) => not_callable(entry),
+        RichMethod::Missing => {
+            let equal = call_rich_method(instance, "__eq__", other);
+            if exc::pending() || equal == value::NOT_IMPLEMENTED {
+                equal
+            } else {
+                value::bool_value(!value::truthy(equal))
+            }
+        }
+    }
+}
+
+fn comparison_method_name(op: u32) -> &'static str {
+    match op {
+        OP_EQ => "__eq__",
+        OP_NE => "__ne__",
+        OP_LT => "__lt__",
+        OP_LE => "__le__",
+        OP_GT => "__gt__",
+        _ => "__ge__",
+    }
+}
+
+/// Operator seen by the reflected operand (`a < b` asks `b.__gt__(a)`).
+fn swapped_comparison(op: u32) -> u32 {
+    match op {
+        OP_LT => OP_GT,
+        OP_LE => OP_GE,
+        OP_GT => OP_LT,
+        OP_GE => OP_LE,
+        other => other,
+    }
+}
+
+/// User-class rich comparisons with CPython's dispatch order.
+///
+/// When one operand's type is a strict subclass of the other's, the subclass
+/// method is tried first (with the swapped operator); then the left operand's
+/// method; then, unless the subclass was already tried, the right operand's
+/// reflected method. A method returning `NotImplemented` falls through, and a
+/// total miss returns `None` so [`compare`] keeps its numeric/container paths
+/// and final identity (equality) or `TypeError` (ordering) result.
 ///
 /// Also used by [`crate::container::equals`], so a user class defines the
 /// equality of its instances even when they sit inside tuples/lists/dicts.
 pub(crate) fn instance_comparison(op: u32, a: i64, b: i64) -> Option<i64> {
-    let (method, reflected, invert) = match op {
-        OP_EQ => ("__eq__", "__eq__", false),
-        OP_NE => ("__eq__", "__eq__", true),
-        OP_LT => ("__lt__", "__gt__", false),
-        OP_LE => ("__le__", "__ge__", false),
-        OP_GT => ("__gt__", "__lt__", false),
-        OP_GE => ("__ge__", "__le__", false),
+    match op {
+        OP_EQ | OP_NE | OP_LT | OP_LE | OP_GT | OP_GE => {}
         _ => return None,
-    };
-    let result = instance_method_call(a, method, &[a, b])
-        .or_else(|| instance_method_call(b, reflected, &[b, a]))?;
+    }
+    let a_class = value::as_instance(a).map(|state| state.class);
+    let b_class = value::as_instance(b).map(|state| state.class);
+    if a_class.is_none() && b_class.is_none() {
+        return None;
+    }
+    let reflected = swapped_comparison(op);
+    let mut checked_reverse = false;
+    // CPython: a strict subclass on the right is asked first.
+    if let (Some(left), Some(right)) = (a_class, b_class) {
+        if left != right && value::is_subclass_of(right, left) {
+            checked_reverse = true;
+            let result = rich_compare_method(b, a, reflected);
+            if exc::pending() {
+                return Some(result);
+            }
+            if result != value::NOT_IMPLEMENTED {
+                return Some(value::bool_value(value::truthy(result)));
+            }
+        }
+    }
+    let result = rich_compare_method(a, b, op);
     if exc::pending() {
         return Some(result);
     }
-    if result == value::NOT_IMPLEMENTED {
-        return None;
+    if result != value::NOT_IMPLEMENTED {
+        return Some(value::bool_value(value::truthy(result)));
     }
-    if invert {
-        Some(value::bool_value(!value::truthy(result)))
-    } else {
-        Some(value::bool_value(value::truthy(result)))
+    if !checked_reverse {
+        let result = rich_compare_method(b, a, reflected);
+        if exc::pending() {
+            return Some(result);
+        }
+        if result != value::NOT_IMPLEMENTED {
+            return Some(value::bool_value(value::truthy(result)));
+        }
     }
+    None
 }
 
 fn compare(op: u32, a: i64, b: i64) -> i64 {
@@ -2034,6 +2163,264 @@ mod tests {
             pending_message(),
             "'<' not supported between instances of 'int' and 'str'"
         );
+    }
+
+    /// Call log shared by the rich-dispatch tests (test_compare's
+    /// `test_ne_high_priority`/`test_ne_low_priority`).
+    fn method_log() -> &'static std::sync::Mutex<Vec<&'static str>> {
+        static LOG: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+        &LOG
+    }
+
+    fn record_call(name: &'static str) {
+        method_log().lock().expect("method log").push(name);
+    }
+
+    fn method(entry: extern "C" fn(*const i64) -> i64, name: &str) -> i64 {
+        value::function_new(entry as *const () as usize, 2, name.to_string())
+    }
+
+    extern "C" fn log_left_eq(_argv: *const i64) -> i64 {
+        record_call("Left.__eq__");
+        value::NOT_IMPLEMENTED
+    }
+
+    extern "C" fn log_right_eq(_argv: *const i64) -> i64 {
+        record_call("Right.__eq__");
+        value::NOT_IMPLEMENTED
+    }
+
+    extern "C" fn log_right_ne(_argv: *const i64) -> i64 {
+        record_call("Right.__ne__");
+        value::NOT_IMPLEMENTED
+    }
+
+    extern "C" fn log_base_eq(_argv: *const i64) -> i64 {
+        record_call("Base.__eq__");
+        value::NOT_IMPLEMENTED
+    }
+
+    extern "C" fn log_derived_eq(_argv: *const i64) -> i64 {
+        record_call("Derived.__eq__");
+        value::NOT_IMPLEMENTED
+    }
+
+    extern "C" fn log_derived_ne(_argv: *const i64) -> i64 {
+        record_call("Derived.__ne__");
+        value::NOT_IMPLEMENTED
+    }
+
+    extern "C" fn bool_true_eq(_argv: *const i64) -> i64 {
+        TRUE
+    }
+
+    /// CPython's `!=` order: an overridden `__ne__` is used directly (no
+    /// negation of `__eq__`), otherwise the inherited default calls `__eq__`
+    /// and negates it, and a subclass on the right is asked first.
+    #[test]
+    fn ne_matches_cpython_method_priority() {
+        exc::init();
+        method_log().lock().expect("method log").clear();
+        let left = value::class_new(
+            "Left".to_string(),
+            NONE,
+            vec![("__eq__".to_string(), method(log_left_eq, "__eq__"))],
+        );
+        let right = value::class_new(
+            "Right".to_string(),
+            NONE,
+            vec![
+                ("__eq__".to_string(), method(log_right_eq, "__eq__")),
+                ("__ne__".to_string(), method(log_right_ne, "__ne__")),
+            ],
+        );
+        // `object.__ne__` delegates to `Left.__eq__`, which declines; the
+        // reflected `Right.__ne__` is tried only after that.
+        assert_eq!(
+            binop(OP_NE, value::instance_new(left), value::instance_new(right)),
+            TRUE
+        );
+        assert_eq!(
+            *method_log().lock().expect("method log"),
+            ["Left.__eq__", "Right.__ne__"]
+        );
+
+        method_log().lock().expect("method log").clear();
+        let base = value::class_new(
+            "Base".to_string(),
+            NONE,
+            vec![("__eq__".to_string(), method(log_base_eq, "__eq__"))],
+        );
+        let derived = value::class_new(
+            "Derived".to_string(),
+            base,
+            vec![
+                ("__eq__".to_string(), method(log_derived_eq, "__eq__")),
+                ("__ne__".to_string(), method(log_derived_ne, "__ne__")),
+            ],
+        );
+        // The subclass on the right is asked first; the base's inherited
+        // `__ne__` then falls back to its `__eq__`.
+        assert_eq!(
+            binop(
+                OP_NE,
+                value::instance_new(base),
+                value::instance_new(derived)
+            ),
+            TRUE
+        );
+        assert_eq!(
+            *method_log().lock().expect("method log"),
+            ["Derived.__ne__", "Base.__eq__"]
+        );
+    }
+
+    /// A `NotImplemented` from the left method must reach the reflected
+    /// method instead of ending the comparison.
+    #[test]
+    fn equality_falls_through_not_implemented_to_reflected_method() {
+        exc::init();
+        let left = value::class_new(
+            "Left".to_string(),
+            NONE,
+            vec![("__eq__".to_string(), method(log_left_eq, "__eq__"))],
+        );
+        let right = value::class_new(
+            "Right".to_string(),
+            NONE,
+            vec![("__eq__".to_string(), method(bool_true_eq, "__eq__"))],
+        );
+        assert_eq!(
+            binop(OP_EQ, value::instance_new(left), value::instance_new(right)),
+            TRUE
+        );
+    }
+
+    /// `object`'s identity default is not an opinion: `object() == x` still
+    /// consults `x.__eq__` (test_compare's `test_issue_1393`).
+    #[test]
+    fn object_default_equality_defers_to_the_reflected_method() {
+        exc::init();
+        let always = value::class_new(
+            "AlwaysEq".to_string(),
+            NONE,
+            vec![("__eq__".to_string(), method(bool_true_eq, "__eq__"))],
+        );
+        let plain = value::instance_new(value::object_class());
+        let with_eq = value::instance_new(always);
+        assert_eq!(binop(OP_EQ, plain, with_eq), TRUE);
+        assert_eq!(binop(OP_EQ, with_eq, plain), TRUE);
+        assert_eq!(binop(OP_NE, plain, with_eq), FALSE);
+    }
+
+    /// A strict subclass on the right wins the dispatch for `==` and for
+    /// ordering (test_binop's `test_comparison_orders`).
+    #[test]
+    fn subclass_reflected_method_runs_before_the_base() {
+        extern "C" fn base_false(_argv: *const i64) -> i64 {
+            FALSE
+        }
+        extern "C" fn derived_true(_argv: *const i64) -> i64 {
+            TRUE
+        }
+        exc::init();
+        let base = value::class_new(
+            "Base".to_string(),
+            NONE,
+            vec![
+                ("__eq__".to_string(), method(base_false, "__eq__")),
+                ("__lt__".to_string(), method(base_false, "__lt__")),
+            ],
+        );
+        let derived = value::class_new(
+            "Derived".to_string(),
+            base,
+            vec![
+                ("__eq__".to_string(), method(derived_true, "__eq__")),
+                ("__gt__".to_string(), method(derived_true, "__gt__")),
+            ],
+        );
+        let base_value = value::instance_new(base);
+        let derived_value = value::instance_new(derived);
+        assert_eq!(binop(OP_EQ, base_value, derived_value), TRUE);
+        assert_eq!(binop(OP_EQ, derived_value, base_value), TRUE);
+        // `Base() < Derived()` asks `Derived.__gt__` first.
+        assert_eq!(binop(OP_LT, base_value, derived_value), TRUE);
+    }
+
+    /// `__eq__ = None` is still invoked by the slot wrapper, so the operator
+    /// raises `TypeError` instead of falling back (test_binop's
+    /// `test_fallback_rmethod_blocking`).
+    #[test]
+    fn noncallable_comparison_method_raises_type_error() {
+        exc::init();
+        let blocked = value::class_new_full(
+            "Blocked".to_string(),
+            NONE,
+            Vec::new(),
+            vec![("__eq__".to_string(), NONE)],
+        );
+        assert_eq!(binop(OP_EQ, value::instance_new(blocked), int(1)), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(pending_message(), "'NoneType' object is not callable");
+    }
+
+    /// An overridden `__ne__` decides `!=`; only the inherited default
+    /// negates `__eq__`.
+    #[test]
+    fn explicit_ne_is_not_replaced_by_negated_eq() {
+        extern "C" fn ne_true(_argv: *const i64) -> i64 {
+            TRUE
+        }
+        exc::init();
+        let both = value::class_new(
+            "Both".to_string(),
+            NONE,
+            vec![
+                ("__eq__".to_string(), method(bool_true_eq, "__eq__")),
+                ("__ne__".to_string(), method(ne_true, "__ne__")),
+            ],
+        );
+        assert_eq!(
+            binop(OP_NE, value::instance_new(both), value::instance_new(both)),
+            TRUE
+        );
+        let only_eq = value::class_new(
+            "OnlyEq".to_string(),
+            NONE,
+            vec![("__eq__".to_string(), method(bool_true_eq, "__eq__"))],
+        );
+        assert_eq!(
+            binop(
+                OP_NE,
+                value::instance_new(only_eq),
+                value::instance_new(only_eq)
+            ),
+            FALSE
+        );
+    }
+
+    /// `2 == 2+0j` (and a `Fraction` value, which the runtime spells as its
+    /// IEEE quotient) go through the numeric protocols, not identity.
+    #[test]
+    fn numeric_cross_type_equality_includes_complex_and_fraction() {
+        exc::init();
+        let two = int(2);
+        let complex_two = builtins::build_complex(2.0, 0.0);
+        assert_eq!(binop(OP_EQ, two, complex_two), TRUE);
+        assert_eq!(binop(OP_EQ, complex_two, two), TRUE);
+        assert_eq!(binop(OP_NE, two, complex_two), FALSE);
+        assert_eq!(binop(OP_EQ, value::float_new(2.0), complex_two), TRUE);
+        assert!(!exc::pending());
+
+        let fraction = crate::modules::fractions::call("Fraction", &[int(2), int(1)]);
+        assert!(!exc::pending());
+        assert_eq!(binop(OP_EQ, two, fraction), TRUE);
+        assert_eq!(binop(OP_NE, two, fraction), FALSE);
+
+        // Ordering against complex stays undefined.
+        binop(OP_LT, two, complex_two);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! Only the file-oriented subset is implemented: `which`,
 //! `get_terminal_size`, `copyfile`, `copyfileobj`, `copy`, `copy2`, `rmtree`
-//! and `move`.
+//! and `move`, plus `copymode`/`copystat` for metadata-only copies.
 //! Path arguments are strings or `pathlib.Path` objects; every other type is
 //! rejected with `TypeError`, and filesystem failures surface as `OSError`
 //! with Python's `[Errno N] message: 'path'` rendering. `copyfileobj` instead
@@ -551,6 +551,107 @@ fn copymode(args: &[i64]) -> i64 {
     }
 }
 
+/// Whether `path` itself (not its target) is a symbolic link.
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Applies `metadata`'s access/modification times to `path`.
+///
+/// `follow == false` updates a symlink itself, which only `utimensat` with
+/// `AT_SYMLINK_NOFOLLOW` can do. The path form is used (not a file handle) so
+/// a destination the caller cannot open for reading still gets its times set.
+#[cfg(unix)]
+fn set_path_times(metadata: &fs::Metadata, path: &Path, follow: bool) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let target = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let times = [
+        libc::timespec {
+            tv_sec: metadata.atime() as libc::time_t,
+            tv_nsec: metadata.atime_nsec() as _,
+        },
+        libc::timespec {
+            tv_sec: metadata.mtime() as libc::time_t,
+            tv_nsec: metadata.mtime_nsec() as _,
+        },
+    ];
+    let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+    // SAFETY: `target` is a NUL-terminated path and `times` holds exactly the
+    // two entries `utimensat` reads; both live for the call.
+    let status = unsafe { libc::utimensat(libc::AT_FDCWD, target.as_ptr(), times.as_ptr(), flags) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Non-Unix fallback: the std handle is the only time-setting entry point and
+/// it always follows symlinks, so a link's own times are left alone.
+#[cfg(not(unix))]
+fn set_path_times(metadata: &fs::Metadata, path: &Path, follow: bool) -> io::Result<()> {
+    if !follow {
+        return Ok(());
+    }
+    let accessed = metadata.accessed()?;
+    let modified = metadata.modified()?;
+    let file = fs::File::open(path)?;
+    file.set_times(
+        fs::FileTimes::new()
+            .set_accessed(accessed)
+            .set_modified(modified),
+    )
+}
+
+/// `shutil.copystat(src, dst, *, follow_symlinks=True)`: copy the permission
+/// bits and the access/modification times, leaving the contents alone.
+///
+/// Like CPython, symlinks are followed unless `follow_symlinks` is false *and*
+/// both names are links themselves. Times are applied before the mode so a
+/// read-only source mode cannot block the timestamp update.
+fn copystat(args: &[i64]) -> i64 {
+    let source = match required_path(args, 0, "copystat", "src") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let destination = match required_path(args, 1, "copystat", "dst") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let follow_symlinks = match args.get(2).copied() {
+        None | Some(NONE) => true,
+        Some(argument) => value::truthy(argument),
+    };
+    let source_path = Path::new(&source);
+    let destination_path = Path::new(&destination);
+    let follow = follow_symlinks || !(is_symlink(source_path) && is_symlink(destination_path));
+    let metadata = match if follow {
+        fs::metadata(source_path)
+    } else {
+        fs::symlink_metadata(source_path)
+    } {
+        Ok(metadata) => metadata,
+        Err(error) => return io_error(error, source_path),
+    };
+    if let Err(error) = set_path_times(&metadata, destination_path, follow) {
+        return io_error(error, destination_path);
+    }
+    if !follow {
+        // `lchmod` does not exist on Linux, so a symlink's own mode cannot be
+        // set; CPython warns and continues in the same situation. The times
+        // above still land on the link.
+        return NONE;
+    }
+    match fs::set_permissions(destination_path, metadata.permissions()) {
+        Ok(()) => NONE,
+        Err(error) => io_error(error, destination_path),
+    }
+}
+
 /// `shutil.copyfile(src, dst)`.
 fn copyfile(args: &[i64]) -> i64 {
     let source = match required_path(args, 0, "copyfile", "src") {
@@ -743,6 +844,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "get_terminal_size" => get_terminal_size(args),
         "copyfile" => copyfile(args),
         "copymode" => copymode(args),
+        "copystat" => copystat(args),
         "copyfileobj" => copyfileobj(args),
         "copy" => copy_entry(args, "copy", false),
         "copy2" => copy_entry(args, "copy2", true),
@@ -1126,6 +1228,145 @@ mod tests {
             ATTRIBUTE_ERROR as i64
         );
 
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Stamps a path with whole-second access/modification times.
+    fn stamp(path: &Path, seconds: u64) {
+        let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for stamping")
+            .set_times(fs::FileTimes::new().set_accessed(when).set_modified(when))
+            .expect("stamp times");
+    }
+
+    #[test]
+    fn copystat_copies_mode_and_times() {
+        let root = temp_root("copystat");
+        let source = root.join("source.txt");
+        let destination = root.join("destination.txt");
+        fs::write(&source, b"source").expect("write source");
+        fs::write(&destination, b"destination").expect("write destination");
+        #[cfg(unix)]
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).expect("chmod source");
+        stamp(&source, 1_000_000);
+        stamp(&destination, 2_000_000);
+
+        let source_arg = text(&source.to_string_lossy());
+        let destination_arg = text(&destination.to_string_lossy());
+        assert_eq!(call("copystat", &[source_arg, destination_arg]), NONE);
+        assert!(!exc::pending(), "copystat raised");
+
+        let source_meta = fs::metadata(&source).expect("source metadata");
+        let destination_meta = fs::metadata(&destination).expect("destination metadata");
+        assert_eq!(
+            destination_meta.modified().expect("destination mtime"),
+            source_meta.modified().expect("source mtime")
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            destination_meta.permissions().mode() & 0o777,
+            source_meta.permissions().mode() & 0o777
+        );
+        // Contents are untouched.
+        assert_eq!(
+            fs::read(&destination).expect("read destination"),
+            b"destination"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copystat_applies_directory_mode() {
+        let root = temp_root("copystat-dir");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir(&source).expect("create source");
+        fs::create_dir(&destination).expect("create destination");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o750)).expect("chmod source");
+
+        let source_arg = text(&source.to_string_lossy());
+        let destination_arg = text(&destination.to_string_lossy());
+        assert_eq!(call("copystat", &[source_arg, destination_arg]), NONE);
+        assert!(!exc::pending(), "copystat on directories raised");
+        let mode = fs::metadata(&destination)
+            .expect("destination metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o750);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copystat_with_both_links_leaves_the_targets_alone() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root("copystat-links");
+        let source = root.join("source.txt");
+        let destination = root.join("destination.txt");
+        fs::write(&source, b"source").expect("write source");
+        fs::write(&destination, b"destination").expect("write destination");
+        stamp(&source, 1_000_000);
+        stamp(&destination, 2_000_000);
+        let source_link = root.join("source_link");
+        let destination_link = root.join("destination_link");
+        symlink(&source, &source_link).expect("create source link");
+        symlink(&destination, &destination_link).expect("create destination link");
+
+        let before = fs::metadata(&destination)
+            .expect("destination metadata")
+            .modified()
+            .expect("destination mtime");
+        let source_arg = text(&source_link.to_string_lossy());
+        let destination_arg = text(&destination_link.to_string_lossy());
+        assert_eq!(
+            call("copystat", &[source_arg, destination_arg, value::FALSE]),
+            NONE
+        );
+        assert!(!exc::pending(), "copystat on a link pair raised");
+        // `follow_symlinks=False` did not follow: the destination keeps its
+        // own timestamps. The link itself carries the copied times.
+        let after = fs::metadata(&destination)
+            .expect("destination metadata")
+            .modified()
+            .expect("destination mtime");
+        assert_eq!(before, after);
+
+        // Following is still the default, so a link pair is followed unless
+        // explicitly disabled.
+        let source_arg = text(&source_link.to_string_lossy());
+        let destination_arg = text(&destination_link.to_string_lossy());
+        assert_eq!(call("copystat", &[source_arg, destination_arg]), NONE);
+        assert!(!exc::pending(), "copystat follow raised");
+        assert_eq!(
+            fs::metadata(&destination)
+                .expect("destination metadata")
+                .modified()
+                .expect("destination mtime"),
+            fs::metadata(&source)
+                .expect("source metadata")
+                .modified()
+                .expect("source mtime")
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn copystat_reports_a_missing_source() {
+        let root = temp_root("copystat-missing");
+        let missing = root.join("absent.txt");
+        let destination = root.join("destination.txt");
+        fs::write(&destination, b"x").expect("write destination");
+        let missing_arg = text(&missing.to_string_lossy());
+        let destination_arg = text(&destination.to_string_lossy());
+        assert_eq!(
+            error_tag(call("copystat", &[missing_arg, destination_arg])),
+            OS_ERROR as i64
+        );
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

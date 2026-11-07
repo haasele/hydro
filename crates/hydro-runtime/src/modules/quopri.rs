@@ -12,6 +12,12 @@
 //!
 //! Decoding drops soft line breaks, expands `=XX`, keeps a `=` that does not
 //! introduce a valid escape, and maps `_` back to a space in header mode.
+//!
+//! `b2a_qp(data, quotetabs=False, istext=True, header=False)` and
+//! `a2b_qp(data, header=False)` are the byte-level codec entry points CPython
+//! re-exports from `binascii` (`quopri.b2a_qp`/`quopri.a2b_qp`). `istext=False`
+//! encodes CR/LF too, for binary payloads that must survive line-ending
+//! conversion.
 
 use std::borrow::Cow;
 
@@ -41,11 +47,14 @@ fn hex_value(byte: u8) -> u8 {
     }
 }
 
-/// `binascii.b2a_qp(data, quotetabs, istext=True, header)`.
+/// `binascii.b2a_qp(data, quotetabs, istext, header)`.
 ///
 /// CPython first sizes the output and then fills it; a single pass produces
-/// the same bytes because the two passes make identical decisions.
-fn b2a_qp(data: &[u8], quotetabs: bool, header: bool) -> Vec<u8> {
+/// the same bytes because the two passes make identical decisions. With
+/// `istext` false the CR/LF bytes are encoded too (and no line-ending
+/// protection applies), which is what `quopri.b2a_qp(data, istext=False)`
+/// exposes for binary payloads.
+pub(crate) fn b2a_qp(data: &[u8], quotetabs: bool, istext: bool, header: bool) -> Vec<u8> {
     // CPython normalises every line ending to the style of the first one.
     let crlf = data
         .iter()
@@ -65,6 +74,7 @@ fn b2a_qp(data: &[u8], quotetabs: bool, header: bool) -> Vec<u8> {
                     || data[at + 1] == b'\n'
                     || data[at + 1] == b'\r'
                     || data[at + 1] == 0))
+            || (!istext && (byte == b'\r' || byte == b'\n'))
             || ((byte == b'\t' || byte == b' ') && at + 1 == data.len())
             || (byte < 33
                 && byte != b'\r'
@@ -83,7 +93,9 @@ fn b2a_qp(data: &[u8], quotetabs: bool, header: bool) -> Vec<u8> {
             push_hex(&mut out, byte);
             at += 1;
             line_len += 3;
-        } else if byte == b'\n' || (at + 1 < data.len() && byte == b'\r' && data[at + 1] == b'\n') {
+        } else if istext
+            && (byte == b'\n' || (at + 1 < data.len() && byte == b'\r' && data[at + 1] == b'\n'))
+        {
             line_len = 0;
             // RFC 1521: whitespace at the end of a line is always encoded.
             if let Some(&last) = out.last() {
@@ -212,7 +224,41 @@ fn encodestring(args: &[i64]) -> i64 {
     };
     let quotetabs = flag(args.get(1));
     let header = flag(args.get(2));
-    value::bytes_new(b2a_qp(data, quotetabs, header))
+    value::bytes_new(b2a_qp(data, quotetabs, true, header))
+}
+
+/// `b2a_qp(data, quotetabs=False, istext=True, header=False)`.
+///
+/// The byte-level encoder CPython's `quopri` re-exports from `binascii`. A
+/// padded `None` in the `istext` slot (a compiled keyword call that skipped
+/// it) selects the documented `True` default.
+fn b2a_qp_value(args: &[i64]) -> i64 {
+    let Some(&data) = args.first() else {
+        return type_error("b2a_qp() missing required argument 'data'");
+    };
+    let data = match encoded_input(data) {
+        Ok(data) => data,
+        Err(error) => return error,
+    };
+    let quotetabs = flag(args.get(1));
+    let istext = match args.get(2).copied() {
+        None | Some(NONE) => true,
+        Some(argument) => value::truthy(argument),
+    };
+    let header = flag(args.get(3));
+    value::bytes_new(b2a_qp(data, quotetabs, istext, header))
+}
+
+/// `a2b_qp(data, header=False)`.
+fn a2b_qp_value(args: &[i64]) -> i64 {
+    let Some(&data) = args.first() else {
+        return type_error("a2b_qp() missing required argument 'data'");
+    };
+    let data = match decoded_input(data) {
+        Ok(data) => data,
+        Err(error) => return error,
+    };
+    value::bytes_new(a2b_qp(&data, flag(args.get(1))))
 }
 
 /// `decodestring(data, header=False)`.
@@ -266,7 +312,7 @@ fn encode_file(args: &[i64]) -> i64 {
     };
     write_all(
         output,
-        b2a_qp(&data, value::truthy(quotetabs), flag(args.get(3))),
+        b2a_qp(&data, value::truthy(quotetabs), true, flag(args.get(3))),
     )
 }
 
@@ -292,6 +338,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         "encodestring" => encodestring(args),
         "decodestring" => decodestring(args),
+        "b2a_qp" => b2a_qp_value(args),
+        "a2b_qp" => a2b_qp_value(args),
         "encode" => encode_file(args),
         "decode" => decode_file(args),
         _ => exc::raise_with_message(
@@ -463,6 +511,72 @@ mod tests {
 
         assert_eq!(call("unknown", &[]), NONE);
         assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn b2a_qp_exposes_the_binascii_flags() {
+        exc::init();
+        // text_mode keeps line endings literal.
+        assert_eq!(result(call("b2a_qp", &[bytes(b"a\nb")])), expect(b"a\nb"));
+        // A padded None in the istext slot selects the documented default.
+        assert_eq!(
+            result(call("b2a_qp", &[bytes(b"a\nb"), value::FALSE, NONE])),
+            expect(b"a\nb")
+        );
+        // istext=False encodes CR and LF for binary payloads.
+        assert_eq!(
+            result(call(
+                "b2a_qp",
+                &[bytes(b"a\r\nb"), value::FALSE, value::FALSE]
+            )),
+            expect(b"a=0D=0Ab")
+        );
+        // quotetabs encodes embedded spaces and tabs.
+        assert_eq!(
+            result(call("b2a_qp", &[bytes(b"a b\tc"), value::TRUE])),
+            expect(b"a=20b=09c")
+        );
+        // header encodes spaces as underscores and a real underscore too.
+        let header = |data: &[u8]| {
+            call(
+                "b2a_qp",
+                &[bytes(data), value::FALSE, value::TRUE, value::TRUE],
+            )
+        };
+        assert_eq!(result(header(b"a b\tc")), expect(b"a_b\tc"));
+        assert_eq!(result(header(b"a_b")), expect(b"a=5Fb"));
+        // Long lines get a soft break exactly like binascii.
+        let encoded = result(call("b2a_qp", &[bytes(&[b'x'; 80])]));
+        assert_eq!(encoded.len(), 82);
+        assert_eq!(encoded.get(75..77), Some(&b"=\n"[..]));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn a2b_qp_is_the_byte_level_decoder() {
+        exc::init();
+        assert_eq!(result(call("a2b_qp", &[bytes(b"a=0Ab")])), expect(b"a\nb"));
+        assert_eq!(
+            result(call("a2b_qp", &[bytes(b"a=0D=0Ab")])),
+            expect(b"a\r\nb")
+        );
+        assert_eq!(
+            result(call("a2b_qp", &[bytes(b"hello_world"), value::TRUE])),
+            expect(b"hello world")
+        );
+        // Like `decodestring`, an ASCII str is accepted.
+        let text = value::str_alloc("a=20b".to_string());
+        assert_eq!(result(call("a2b_qp", &[text])), expect(b"a b"));
+        assert!(!exc::pending());
+
+        // Encoding still requires a bytes-like object.
+        assert_eq!(result(call("b2a_qp", &[bytes(b"x")])), expect(b"x"));
+        assert_eq!(call("b2a_qp", &[text]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+        assert_eq!(call("b2a_qp", &[]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         exc::clear();
     }
 

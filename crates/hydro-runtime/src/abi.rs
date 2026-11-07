@@ -1795,6 +1795,21 @@ pub extern "C" fn hydro_exc_matches(handler_tag: u32) -> i32 {
     exc::matches_handler(handler_tag)
 }
 
+/// Handler dispatch for a dynamic `except <expression>:` arm: `1` when
+/// `exception` is caught by `matcher`, `0` otherwise.
+///
+/// `matcher` is the handler expression evaluated in source order, so it is a
+/// class, a tuple of classes, or an invalid operand. CPython rejects an
+/// operand that is not a class inheriting from `BaseException` (including an
+/// exception instance) with `TypeError: catching classes that do not inherit
+/// from BaseException is not allowed`; the pending exception is set and `0` is
+/// returned. The caller must keep `exception` rooted and restore it as the
+/// pending exception only when this function did not raise.
+#[no_mangle]
+pub extern "C" fn hydro_exc_matches_value(exception: i64, matcher: i64) -> i32 {
+    exc::matches_handler_value(exception, matcher)
+}
+
 #[no_mangle]
 pub extern "C" fn hydro_uncaught() -> i64 {
     exc::uncaught()

@@ -1,11 +1,12 @@
 //! `subprocess`: process spawning and simple pipe capture.
 //!
-//! The module covers the benchmark-facing subset: [`run`], [`check_output`]
-//! and a native `Popen` object with `wait`/`poll`/`terminate`/`kill`. There is
-//! no `shell=True`, no `communicate()` and no file-object redirection; the
-//! stream selectors accept `None`, `PIPE`, `DEVNULL` and (for `stderr`)
-//! `STDOUT`. `Popen(..., start_new_session=True)` really calls `setsid(2)` in
-//! the child.
+//! The module covers the benchmark-facing subset: [`run`], [`check_output`],
+//! `call` and a native `Popen` object with `wait`/`poll`/`terminate`/`kill`.
+//! `call` returns the child's exit status and accepts `shell=True`, which
+//! routes the command through `/bin/sh -c` like CPython on POSIX. There is no
+//! `communicate()` and no file-object redirection; the stream selectors accept
+//! `None`, `PIPE`, `DEVNULL` and (for `stderr`) `STDOUT`.
+//! `Popen(..., start_new_session=True)` really calls `setsid(2)` in the child.
 //!
 //! `Popen` accepts CPython's `stdin`/`stdout`/`stderr`, `text`, `encoding`,
 //! `errors`, `close_fds`, `start_new_session`, `cwd`, `env` and `preexec_fn`
@@ -42,8 +43,8 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR,
-    TYPE_ERROR, VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, EXCEPTION, NOT_IMPLEMENTED_ERROR, OS_ERROR, OVERFLOW_ERROR,
+    RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::value::{self, NONE};
@@ -799,6 +800,150 @@ fn check_output(args: &[i64]) -> i64 {
 }
 
 // -------------------------------------------------------------------------
+// call
+// -------------------------------------------------------------------------
+
+/// `subprocess.call(args, *, stdin=None, stdout=None, stderr=None,
+/// shell=False, timeout=None, cwd=None, env=None, text=False)`: run the
+/// command and return its exit status (negative when a signal terminated it).
+///
+/// This is `Popen(...).wait()` with no object kept: the child runs to
+/// completion, its streams are drained (and discarded) as `run` does, and the
+/// plan's timeout kills the child and reports the runtime's timeout error.
+/// `shell=True` prepends `/bin/sh -c`, exactly the POSIX argument vector
+/// CPython builds.
+fn call_command(args: &[i64]) -> i64 {
+    let args_argument = argument(args, 0);
+    let mut argv = match command_args(args_argument) {
+        Ok(argv) => argv,
+        Err(error) => return error,
+    };
+    if flag(argument(args, 4)) {
+        let mut command = vec!["/bin/sh".to_string(), "-c".to_string()];
+        command.append(&mut argv);
+        argv = command;
+    }
+    let stdin = match output_mode(argument(args, 1), "stdin") {
+        Ok(mode) => mode,
+        Err(error) => return error,
+    };
+    let stdout = match output_mode(argument(args, 2), "stdout") {
+        Ok(mode) => mode,
+        Err(error) => return error,
+    };
+    let stderr = match stream_mode(argument(args, 3), "stderr") {
+        Ok(mode) => mode,
+        Err(error) => return error,
+    };
+    let timeout = match duration_option(argument(args, 5), "timeout") {
+        Ok(timeout) => timeout,
+        Err(error) => return error,
+    };
+    let cwd = match path_option(argument(args, 6), "cwd") {
+        Ok(cwd) => cwd,
+        Err(error) => return error,
+    };
+    let env = match env_option(argument(args, 7)) {
+        Ok(env) => env,
+        Err(error) => return error,
+    };
+    let plan = Plan {
+        args: argv,
+        stdin,
+        input: None,
+        stdout,
+        stderr,
+        cwd,
+        timeout,
+        env,
+    };
+    let captured = match execute(&plan) {
+        Ok(captured) => captured,
+        Err(error) => return error,
+    };
+    int_value(returncode(captured.status))
+}
+
+/// `subprocess.check_call(args, *, stdin=None, stdout=None, stderr=None,
+/// shell=False, timeout=None, cwd=None, env=None, text=False)`: run the
+/// command through [`call_command`] and return `0`, or raise
+/// `CalledProcessError(returncode, cmd, output=None, stderr=None)` for a
+/// non-zero exit status.
+fn check_call(args: &[i64]) -> i64 {
+    // Resolve the command text before running: the exception payload needs it,
+    // and a malformed `args` must fail exactly like `call` does.
+    let args_argument = argument(args, 0);
+    let mut command = match command_args(args_argument) {
+        Ok(argv) => argv,
+        Err(error) => return error,
+    };
+    if flag(argument(args, 4)) {
+        let mut shell_command = vec!["/bin/sh".to_string(), "-c".to_string()];
+        shell_command.append(&mut command);
+        command = shell_command;
+    }
+    let status = call_command(args);
+    if exc::pending() {
+        return status;
+    }
+    let Some(code) = value::as_integer(status) else {
+        return status;
+    };
+    if code == 0 {
+        return int_value(0);
+    }
+    raise_called_process_error(code, command)
+}
+
+/// `subprocess.CalledProcessError`: the exception class `check_call` raises.
+///
+/// A real `Exception` subclass so `except subprocess.CalledProcessError` and
+/// `isinstance` see it; the module attribute is wired by the central spec.
+pub(crate) fn called_process_error_class() -> i64 {
+    const KEY: &str = "subprocess.CalledProcessError.class";
+    if let Some(class) = crate::core::globals::registry_get(KEY) {
+        return class;
+    }
+    let class = value::class_new(
+        "CalledProcessError".to_string(),
+        exc::exception_class(EXCEPTION),
+        Vec::new(),
+    );
+    let roots = heap::root_values(std::slice::from_ref(&class));
+    crate::core::globals::registry_set(KEY, class);
+    heap::release_roots(roots);
+    class
+}
+
+/// Builds and raises `CalledProcessError(code, command)`.
+///
+/// The `output` and `stderr` attributes are `None` because `check_call` does
+/// not capture streams (matching CPython's `call`-based implementation).
+fn raise_called_process_error(code: i64, command: Vec<String>) -> i64 {
+    let message = format!(
+        "Command '{}' returned non-zero exit status {}.",
+        command_repr(&command),
+        code
+    );
+    let plain = exc::exception_value(EXCEPTION, &message, vec![message.clone()]);
+    let Some(data) = value::exception_clone(plain) else {
+        return NONE;
+    };
+    let class = called_process_error_class();
+    let instance = value::exc_instance_new(class, data);
+    let returncode = int_value(code);
+    let cmd = value::list_new(command.into_iter().map(value::str_alloc).collect());
+    let roots = heap::root_values(&[instance, returncode, cmd]);
+    value::instance_setattr(instance, "returncode".to_string(), returncode);
+    value::instance_setattr(instance, "cmd".to_string(), cmd);
+    value::instance_setattr(instance, "output".to_string(), NONE);
+    value::instance_setattr(instance, "stderr".to_string(), NONE);
+    let result = exc::raise_value(instance);
+    heap::release_roots(roots);
+    result
+}
+
+// -------------------------------------------------------------------------
 // Popen
 // -------------------------------------------------------------------------
 
@@ -1177,6 +1322,11 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         "run" => run(args),
         "check_output" => check_output(args),
+        "check_call" => check_call(args),
+        "call" => call_command(args),
+        // CPython's `_cleanup()` runs internal bookkeeping after a fork; Hydro
+        // keeps no such state, so it is a documented no-op.
+        "_cleanup" => NONE,
         "_args_from_interpreter_flags" | "_optim_args_from_interpreter_flags" => {
             value::list_new(Vec::new())
         }
@@ -1819,5 +1969,176 @@ mod tests {
         );
         assert!(!exc::pending(), "Popen(preexec_fn=None) failed");
         let _ = wait_bounded(process);
+    }
+
+    #[test]
+    fn call_returns_the_exit_status() {
+        exc::init();
+        assert_eq!(call("call", &[seq(&["/bin/sh", "-c", "exit 0"])]), int(0));
+        assert_eq!(call("call", &[seq(&["/bin/sh", "-c", "exit 3"])]), int(3));
+        assert!(!exc::pending(), "call raised");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn call_reports_negative_signal_status() {
+        exc::init();
+        // SIGKILL is uncatchable, so the status is exactly `-SIGKILL`.
+        let status = call("call", &[seq(&["/bin/sh", "-c", "kill -KILL $$"])]);
+        assert!(!exc::pending(), "call raised");
+        assert_eq!(value::as_integer(status), Some(-i64::from(libc::SIGKILL)));
+    }
+
+    #[test]
+    fn check_call_returns_zero_or_raises_called_process_error() {
+        exc::init();
+        let ok = call("check_call", &[seq(&["/bin/sh", "-c", "exit 0"])]);
+        assert!(!exc::pending(), "check_call raised on success");
+        assert_eq!(value::as_integer(ok), Some(0));
+
+        let failed = call("check_call", &[seq(&["/bin/sh", "-c", "exit 7"])]);
+        assert_eq!(failed, NONE);
+        let error = exc::pending_value();
+        assert_eq!(
+            value::instance_class_value(error),
+            Some(called_process_error_class())
+        );
+        assert_eq!(
+            value::instance_attr(error, "returncode").and_then(value::as_integer),
+            Some(7)
+        );
+        let command = value::instance_attr(error, "cmd").expect("cmd");
+        let words = value::as_list(command).expect("cmd list");
+        assert_eq!(
+            words
+                .iter()
+                .map(|word| value::as_str(*word).unwrap_or(""))
+                .collect::<Vec<_>>(),
+            vec!["/bin/sh", "-c", "exit 7"]
+        );
+        assert_eq!(value::instance_attr(error, "output"), Some(NONE));
+        assert_eq!(value::instance_attr(error, "stderr"), Some(NONE));
+        assert_eq!(
+            value::exception_data(error).map(|data| data.msg.as_str()),
+            Some("Command '['/bin/sh', '-c', 'exit 7']' returned non-zero exit status 7.")
+        );
+        exc::clear();
+
+        // `shell=True` routes through `/bin/sh -c` like `call`.
+        let failed = call(
+            "check_call",
+            &[text("exit 3"), NONE, NONE, NONE, value::TRUE],
+        );
+        assert_eq!(failed, NONE);
+        let command = value::instance_attr(exc::pending_value(), "cmd").expect("cmd");
+        assert_eq!(
+            value::as_list(command)
+                .expect("cmd list")
+                .iter()
+                .map(|word| value::as_str(*word).unwrap_or(""))
+                .collect::<Vec<_>>(),
+            vec!["/bin/sh", "-c", "exit 3"]
+        );
+        exc::clear();
+    }
+
+    #[test]
+    fn cleanup_is_a_noop() {
+        exc::init();
+        assert_eq!(call("_cleanup", &[]), NONE);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn call_runs_through_the_shell() {
+        exc::init();
+        // A string command is handed to `sh -c`.
+        let status = call("call", &[text("exit 4"), NONE, NONE, NONE, value::TRUE]);
+        assert!(!exc::pending(), "shell call raised");
+        assert_eq!(value::as_integer(status), Some(4));
+
+        // A sequence command keeps its arguments after the `-c` script.
+        let status = call(
+            "call",
+            &[seq(&["echo", "hi"]), NONE, NONE, NONE, value::TRUE],
+        );
+        assert!(!exc::pending(), "shell list call raised");
+        assert_eq!(value::as_integer(status), Some(0));
+    }
+
+    #[test]
+    fn call_drains_piped_streams() {
+        exc::init();
+        let status = call(
+            "call",
+            &[
+                seq(&["/bin/sh", "-c", "echo out; echo err 1>&2"]),
+                NONE,
+                int(PIPE),
+                int(STDOUT),
+            ],
+        );
+        assert!(!exc::pending(), "piped call raised");
+        assert_eq!(value::as_integer(status), Some(0));
+
+        // DEVNULL for both streams spawns normally too.
+        let status = call(
+            "call",
+            &[
+                seq(&["/bin/echo", "hi"]),
+                int(DEVNULL),
+                int(DEVNULL),
+                int(DEVNULL),
+            ],
+        );
+        assert!(!exc::pending(), "devnull call raised");
+        assert_eq!(value::as_integer(status), Some(0));
+    }
+
+    #[test]
+    fn call_honours_env() {
+        exc::init();
+        let env = value::dict_new(vec![(text("HYDRO_CALL_ENV"), text("yes"))]);
+        let status = call(
+            "call",
+            &[
+                seq(&["/bin/sh", "-c", "test \"$HYDRO_CALL_ENV\" = yes"]),
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                NONE,
+                env,
+            ],
+        );
+        assert!(!exc::pending(), "env call raised");
+        assert_eq!(value::as_integer(status), Some(0));
+    }
+
+    #[test]
+    fn call_validates_its_arguments() {
+        exc::init();
+        // Missing `args`.
+        assert_eq!(call("call", &[]), NONE);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        clear_error();
+
+        // `stdin` must not select STDOUT.
+        assert_eq!(call("call", &[seq(&["/bin/true"]), int(STDOUT)]), NONE);
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        clear_error();
+
+        // A cwd that does not exist surfaces as the spawn OSError.
+        let missing = text("/hydro-nonexistent-call-cwd");
+        assert_eq!(
+            call(
+                "call",
+                &[seq(&["/bin/true"]), NONE, NONE, NONE, NONE, NONE, missing,],
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), i64::from(OS_ERROR));
+        clear_error();
     }
 }

@@ -7,13 +7,18 @@
 //!
 //! Every user subclass of the native `TestCase` is registered when the class is
 //! created (see `value::class_new`), so `unittest.main()` can discover and run
-//! the tests without importing a Python `unittest` package.
+//! the tests without importing a Python `unittest` package. Discovery starts
+//! from the selected module's namespace, like CPython's `loadTestsFromModule`,
+//! and a module-level `load_tests` hook replaces it, exactly as CPython's
+//! protocol specifies.
 //!
 //! Result accounting is real: [`run_main`] and `TestCase.run(result)` report
 //! success, failure, error, skip, expected failure and unexpected success into
 //! the caller's result object, using the same `add*` methods CPython calls.
 
 use std::sync::{LazyLock, Mutex, MutexGuard};
+
+use hydro_ir::ParamKind;
 
 use crate::builtins;
 use crate::container;
@@ -27,6 +32,9 @@ use crate::value::{self, FALSE, NONE, TRUE};
 
 /// Hidden native method that identifies a `TestCase`-derived class.
 const CASE_MARKER: &str = "__unittest_case__";
+
+/// Module name the entry unit's class bodies record in `__module__`.
+const MAIN_MODULE: &str = "__main__";
 
 /// Default result / runner cache key prefixes.
 const TEST_CASE_KEY: &str = "unittest.TestCase.class";
@@ -87,6 +95,342 @@ fn cached_class(
     heap::release_roots(class_roots);
     heap::release_roots(function_roots);
     class
+}
+
+// -------------------------------------------------------------------------
+// Assertion signatures
+// -------------------------------------------------------------------------
+
+/// One declared parameter of a native `TestCase` assertion: CPython's public
+/// name, how it binds, and whether the slot has a default. Every optional slot
+/// defaults to `None`, which the assertion implementations already read as
+/// "not supplied" (the same value an omitted positional argument has always
+/// carried).
+type AssertionParam = (&'static str, ParamKind, Option<i64>);
+
+/// Turns the table's `required`/`optional` marker into the literal default the
+/// shared binder fills an omitted slot with. (`expr` fragments cannot appear
+/// inside a repeated tuple without a trailing separator, so the two legal
+/// defaults are spelled as keywords.)
+macro_rules! default_slot {
+    (required) => {
+        None
+    };
+    (optional) => {
+        Some(NONE)
+    };
+}
+
+/// Declares the native assertion signatures together with their uniform
+/// full-argv trampolines.
+///
+/// A native method binds keyword arguments only when its function value carries
+/// both a [`value::ParamMeta`] signature and a full-argv entry (the shape
+/// documented for `value::call_instance_dunder`): the shared method binder in
+/// `core::methods` fills one slot per declared parameter — receiver first,
+/// positionals in order, named arguments matched by parameter name, declared
+/// defaults for the rest — and then calls the entry with that slot vector.
+/// The trampoline therefore receives exactly `params.len()` values in
+/// declaration order, which is the layout the assertion implementations
+/// already expect (`self` at index 0 and `msg`/`places`/`delta` in their
+/// documented places).
+macro_rules! signed_assertions {
+    ($($entry:ident: $method:literal [$(($name:literal, $kind:ident, $default:ident)),* $(,)?]),* $(,)?) => {
+        $(
+            extern "C" fn $entry(arguments: *const i64) -> i64 {
+                const PARAMS: &[AssertionParam] =
+                    &[$(($name, ParamKind::$kind, default_slot!($default))),*];
+                // SAFETY: the shared binder materialises exactly one slot per
+                // declared parameter, in declaration order.
+                let slots = unsafe { std::slice::from_raw_parts(arguments, PARAMS.len()) };
+                assertion_slots($method, slots)
+            }
+        )*
+
+        /// Attaches every declared signature and full-argv entry to `class`.
+        ///
+        /// The assertions have two owners: this module's `TestCase` method
+        /// table and the deprecated `fail*` aliases installed by
+        /// [`crate::modules::unittest_assertions::install`]. Both are class
+        /// attributes, so the function values are looked up by name instead of
+        /// being taken from a table.
+        fn install_assertion_signatures(class: i64) {
+            $(
+                let params: &[AssertionParam] =
+                    &[$(($name, ParamKind::$kind, default_slot!($default))),*];
+                sign_assertion(class, $method, $entry as *const () as usize, params);
+            )*
+        }
+    };
+}
+
+signed_assertions! {
+    assert_equal_entry: "assertEqual" [
+        ("self", Positional, required),
+        ("first", Positional, required),
+        ("second", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_not_equal_entry: "assertNotEqual" [
+        ("self", Positional, required),
+        ("first", Positional, required),
+        ("second", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_true_entry: "assertTrue" [
+        ("self", Positional, required),
+        ("expr", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_false_entry: "assertFalse" [
+        ("self", Positional, required),
+        ("expr", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_is_entry: "assertIs" [
+        ("self", Positional, required),
+        ("expr1", Positional, required),
+        ("expr2", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_is_not_entry: "assertIsNot" [
+        ("self", Positional, required),
+        ("expr1", Positional, required),
+        ("expr2", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_is_none_entry: "assertIsNone" [
+        ("self", Positional, required),
+        ("obj", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_is_not_none_entry: "assertIsNotNone" [
+        ("self", Positional, required),
+        ("obj", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_in_entry: "assertIn" [
+        ("self", Positional, required),
+        ("member", Positional, required),
+        ("container", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_not_in_entry: "assertNotIn" [
+        ("self", Positional, required),
+        ("member", Positional, required),
+        ("container", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_is_instance_entry: "assertIsInstance" [
+        ("self", Positional, required),
+        ("obj", Positional, required),
+        ("cls", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_not_is_instance_entry: "assertNotIsInstance" [
+        ("self", Positional, required),
+        ("obj", Positional, required),
+        ("cls", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_greater_entry: "assertGreater" [
+        ("self", Positional, required),
+        ("a", Positional, required),
+        ("b", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_greater_equal_entry: "assertGreaterEqual" [
+        ("self", Positional, required),
+        ("a", Positional, required),
+        ("b", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_less_entry: "assertLess" [
+        ("self", Positional, required),
+        ("a", Positional, required),
+        ("b", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_less_equal_entry: "assertLessEqual" [
+        ("self", Positional, required),
+        ("a", Positional, required),
+        ("b", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_almost_equal_entry: "assertAlmostEqual" [
+        ("self", Positional, required),
+        ("first", Positional, required),
+        ("second", Positional, required),
+        ("places", Positional, optional),
+        ("msg", Positional, optional),
+        ("delta", Positional, optional),
+    ],
+    assert_not_almost_equal_entry: "assertNotAlmostEqual" [
+        ("self", Positional, required),
+        ("first", Positional, required),
+        ("second", Positional, required),
+        ("places", Positional, optional),
+        ("msg", Positional, optional),
+        ("delta", Positional, optional),
+    ],
+    assert_regex_entry: "assertRegex" [
+        ("self", Positional, required),
+        ("text", Positional, required),
+        ("expected_regex", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_not_regex_entry: "assertNotRegex" [
+        ("self", Positional, required),
+        ("text", Positional, required),
+        ("unexpected_regex", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_count_equal_entry: "assertCountEqual" [
+        ("self", Positional, required),
+        ("first", Positional, required),
+        ("second", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_sequence_equal_entry: "assertSequenceEqual" [
+        ("self", Positional, required),
+        ("seq1", Positional, required),
+        ("seq2", Positional, required),
+        ("msg", Positional, optional),
+        ("seq_type", Positional, optional),
+    ],
+    assert_list_equal_entry: "assertListEqual" [
+        ("self", Positional, required),
+        ("list1", Positional, required),
+        ("list2", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_tuple_equal_entry: "assertTupleEqual" [
+        ("self", Positional, required),
+        ("tuple1", Positional, required),
+        ("tuple2", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_set_equal_entry: "assertSetEqual" [
+        ("self", Positional, required),
+        ("set1", Positional, required),
+        ("set2", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_dict_equal_entry: "assertDictEqual" [
+        ("self", Positional, required),
+        ("d1", Positional, required),
+        ("d2", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_multi_line_equal_entry: "assertMultiLineEqual" [
+        ("self", Positional, required),
+        ("first", Positional, required),
+        ("second", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_has_attr_entry: "assertHasAttr" [
+        ("self", Positional, required),
+        ("obj", Positional, required),
+        ("name", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    assert_not_has_attr_entry: "assertNotHasAttr" [
+        ("self", Positional, required),
+        ("obj", Positional, required),
+        ("name", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    fail_entry: "fail" [
+        ("self", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    // Deprecated `fail*` spellings, implemented by `unittest_assertions`.
+    fail_if_entry: "failIf" [
+        ("self", Positional, required),
+        ("expr", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    fail_unless_entry: "failUnless" [
+        ("self", Positional, required),
+        ("expr", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    fail_if_equal_entry: "failIfEqual" [
+        ("self", Positional, required),
+        ("first", Positional, required),
+        ("second", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    fail_unless_equal_entry: "failUnlessEqual" [
+        ("self", Positional, required),
+        ("first", Positional, required),
+        ("second", Positional, required),
+        ("msg", Positional, optional),
+    ],
+    fail_if_almost_equal_entry: "failIfAlmostEqual" [
+        ("self", Positional, required),
+        ("first", Positional, required),
+        ("second", Positional, required),
+        ("places", Positional, optional),
+        ("msg", Positional, optional),
+        ("delta", Positional, optional),
+    ],
+    fail_unless_almost_equal_entry: "failUnlessAlmostEqual" [
+        ("self", Positional, required),
+        ("first", Positional, required),
+        ("second", Positional, required),
+        ("places", Positional, optional),
+        ("msg", Positional, optional),
+        ("delta", Positional, optional),
+    ],
+}
+
+/// Pieces the shared binder's slot vector back into the assertion's owner.
+///
+/// The core assertions are dispatched by [`test_case_method`]; the deprecated
+/// `fail*` aliases are owned by [`crate::modules::unittest_assertions`] and
+/// accept the same positional layout after their own binding step.
+fn assertion_slots(method: &str, slots: &[i64]) -> i64 {
+    // The slot values were produced by the binder in native memory; keep them
+    // visible to the collector for the duration of the assertion.
+    let roots = heap::root_values(slots);
+    let result = match method {
+        "failIf"
+        | "failUnless"
+        | "failIfEqual"
+        | "failUnlessEqual"
+        | "failIfAlmostEqual"
+        | "failUnlessAlmostEqual" => {
+            match crate::modules::unittest_assertions::call(method, slots) {
+                Some(result) => result,
+                None => missing_method("TestCase", method),
+            }
+        }
+        _ => test_case_method(method, slots),
+    };
+    heap::release_roots(roots);
+    result
+}
+
+/// Stores `params` as the signature of `class`'s `method` attribute and points
+/// its full-argv entry at `entry`.
+fn sign_assertion(class: i64, method: &str, entry: usize, params: &[AssertionParam]) {
+    let Some(attribute) = value::class_lookup(class, method) else {
+        return;
+    };
+    let function = match attribute {
+        value::ClassEntry::Method(_, function) | value::ClassEntry::Attr(function) => function,
+    };
+    let signature = params
+        .iter()
+        .map(|(name, kind, default)| value::ParamMeta {
+            name: (*name).to_string(),
+            kind: *kind,
+            default: *default,
+        })
+        .collect();
+    value::function_set_signature(function, signature);
+    value::function_set_full_entry(function, entry);
 }
 
 /// Builds a fresh native `TestCase` class.
@@ -165,6 +509,14 @@ pub(crate) fn test_case() -> i64 {
         "failUnless".to_string(),
         value::native_function_new("unittest", "TestCase.assertTrue", 3),
     );
+    crate::modules::unittest_assertions::install(class);
+    // Native assertion methods bind keyword arguments only with real
+    // parameter metadata plus a full-argv entry: `self.assertEqual(a, b,
+    // msg=...)`, `assertAlmostEqual(..., places=..., delta=...)` and the rest
+    // of the CPython signature would otherwise be rejected as an unexpected
+    // keyword by the shared method binder. This runs after `install` so the
+    // deprecated `fail*` aliases it (re)assigns are signed too.
+    install_assertion_signatures(class);
     class
 }
 
@@ -318,7 +670,7 @@ fn raises_context_class() -> i64 {
 /// Dispatches a native `unittest` function.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "main" => run_main(),
+        "main" => call_main(args, &[]),
         "expectedFailure" => decorator_expected_failure(args),
         "skip" => skip(args),
         "skipIf" => skip_if(args, false),
@@ -336,7 +688,15 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "_assert_in" => test_case_method("assertIn", args),
         "_assert_has_attr" => test_case_method("assertHasAttr", args),
         "_fail" => test_case_method("fail", args),
-        _ => dispatch(function, args),
+        // Assertion methods that live in their own native module (the
+        // `assertIsSubclass`/`assertWarns`/`assertAlmostEqual` families). The
+        // table is dynamic, so these are never declared as static spec
+        // functions; an unknown name still reports the module-level
+        // `AttributeError` below.
+        _ => match crate::modules::unittest_assertions::call(function, args) {
+            Some(result) => result,
+            None => dispatch(function, args),
+        },
     }
 }
 
@@ -353,20 +713,43 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>
             call_args.push(dictionary);
             dispatch(function, &call_args)
         }
+        // `unittest.main(module=...)` names the module whose tests run; the
+        // argument is also accepted positionally through `call`.
+        "main" => call_main(args, &keywords),
         // Constructors and runners keep their declared positional slots; the
         // remaining names are accepted and ignored exactly like CPython's
         // compatibility keyword arguments.
-        "main"
-        | "TestResult.__init__"
+        "TestResult.__init__"
         | "TextTestRunner.__init__"
         | "TextTestRunner.run"
         | "TestProgram.__init__"
         | "TestLoader.__init__" => call(function, args),
         _ => {
-            if keywords.is_empty() {
+            // Dynamic assertion methods (`assertWarns`, `assertIsSubclass`,
+            // ...) live in their own module; only names the table does not
+            // know fall through to the keyword validation below.
+            if let Some(result) =
+                crate::modules::unittest_assertions::call_kw(function, args, keywords.clone())
+            {
+                return result;
+            }
+            // Existing assertions (`assertEqual`, `assertTrue`, ...) take
+            // `msg` as their final positional argument. New assertions were
+            // handled above; for the existing table, bind `msg=` into that
+            // slot and dispatch.
+            let mut remaining = keywords.clone();
+            if let Some(index) = remaining.iter().position(|(name, _)| name == "msg") {
+                let (_, msg) = remaining.remove(index);
+                if remaining.is_empty() && function.starts_with("TestCase.") {
+                    let mut call_args = args.to_vec();
+                    call_args.push(msg);
+                    return dispatch(function, &call_args);
+                }
+            }
+            if remaining.is_empty() {
                 dispatch(function, args)
             } else {
-                let name = keywords[0].0.clone();
+                let name = remaining[0].0.clone();
                 exc::raise_with_message(
                     TYPE_ERROR,
                     &format!("unittest.{function}() got an unexpected keyword argument '{name}'"),
@@ -1224,7 +1607,7 @@ fn assert_raises(args: &[i64], with_regex: bool) -> i64 {
         (args.get(2).copied().unwrap_or(NONE), None)
     };
     if callable != NONE {
-        let call_args = if with_regex { &args[4..] } else { &args[2..] };
+        let call_args = if with_regex { &args[4..] } else { &args[3..] };
         let (positional, keywords) = split_call_kwargs(call_args);
         if keywords.is_empty() {
             builtins::call(callable, positional.len(), positional.as_ptr());
@@ -1706,7 +2089,18 @@ fn loader_method(method: &str, args: &[i64]) -> i64 {
             let name = state.name.clone();
             let dictionary = crate::modules::module_dict(&name);
             let tests = load_module_tests(dictionary, test_case());
-            make_suite(tests)
+            let suite = make_suite(tests);
+            // CPython's `loadTestsFromModule` delegates to the module's
+            // `load_tests` hook and returns the suite that hook produces.
+            match load_tests_hook(&name) {
+                Some(hook) => {
+                    let roots = heap::root_values(&[suite]);
+                    let returned = call_load_tests(hook, suite);
+                    heap::release_roots(roots);
+                    returned
+                }
+                None => suite,
+            }
         }
         "loadTestsFromNames" | "loadTestsFromName" => {
             // Resolve names that denote a registered test class; anything else
@@ -1809,7 +2203,7 @@ fn make_suite(tests: Vec<i64>) -> i64 {
 fn program_method(method: &str, _args: &[i64]) -> i64 {
     match method {
         "__init__" | "runTests" => {
-            run_main();
+            run_main(MAIN_MODULE);
             NONE
         }
         "parseArgs" => NONE,
@@ -2271,13 +2665,179 @@ fn class_name(class: i64) -> String {
         .unwrap_or_else(|| "TestCase".to_string())
 }
 
-/// Runs every registered test class' `test*` methods against one fresh
-/// `TestResult`, printing a summary and raising on failure.
-fn run_main() -> i64 {
-    let classes = registry().clone();
-    let result = new_test_result();
-    call_method(result, "startTestRun", &[]);
-    for class in classes {
+/// `unittest.main(...)`: run the tests the selected module defines.
+///
+/// CPython dispatches to `TestProgram(module=module)`, whose loader walks the
+/// module's dictionary. The first positional argument is `module`; the keyword
+/// spelling is also accepted (the spec entry is `kw_dynamic`).
+fn call_main(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let Some(module) = main_module(args, keywords) else {
+        // `main_module` already raised for an unusable argument.
+        return NONE;
+    };
+    run_main(&module)
+}
+
+/// Resolves `unittest.main`'s `module` argument to a module name.
+///
+/// `None` (the default, or omitted) selects the entry unit. A string names the
+/// module directly, exactly like CPython's `__import__` path, and a module
+/// object contributes its `__name__`. Anything else is a `TypeError`.
+fn main_module(args: &[i64], keywords: &[(String, i64)]) -> Option<String> {
+    let target = keywords
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "module")
+        .map(|(_, target)| *target)
+        .or_else(|| args.first().copied())
+        .unwrap_or(NONE);
+    if target == NONE {
+        return Some(MAIN_MODULE.to_string());
+    }
+    if let Some(name) = value::as_str(target) {
+        return Some(name.to_string());
+    }
+    if let Some(state) = value::as_module(target) {
+        if !state.name.is_empty() {
+            return Some(state.name.clone());
+        }
+        return Some(MAIN_MODULE.to_string());
+    }
+    exc::raise_with_message(
+        TYPE_ERROR,
+        "unittest.main() module argument must be a module or a string",
+    );
+    None
+}
+
+/// The module name a class body recorded in `__module__`.
+///
+/// The class statement publishes `__module__` next to `__qualname__`, so a
+/// class defined in an imported helper (`test.support.mapping_tests`) carries
+/// that dotted name while the entry unit's classes carry `__main__`. A class
+/// built through the native APIs (or through `type()` without an explicit
+/// `__module__`) records nothing; the caller treats it as an entry-unit class.
+fn class_module(class: i64) -> Option<String> {
+    let Some(value::ClassEntry::Attr(module)) = value::class_own_lookup(class, "__module__") else {
+        return None;
+    };
+    value::as_str(module).map(str::to_string)
+}
+
+/// Test classes `unittest.main(module=...)` should execute.
+///
+/// CPython's `loadTestsFromModule` walks `dir(module)` and keeps every
+/// `TestCase` subclass it finds there: classes the module imported by name are
+/// run, while abstract helpers that merely live in an imported module are not
+/// part of the namespace. The runtime mirrors a compiled module's namespace
+/// into its global store, so that store is the scan source; `globals::entries`
+/// walks names alphabetically, the order `dir(module)` yields.
+///
+/// The entry unit is the exception: it publishes only the globals its own
+/// functions read (nothing imports it, see `Lowerer::set_mirror_all_globals`),
+/// so its class statements are absent from that store. The class registry
+/// records every `TestCase` subclass in creation order, so the classes whose
+/// class body recorded this module in `__module__` are appended from there. A
+/// class without any recorded module stays in the entry unit's run, so a
+/// natively built class never silently disappears.
+fn module_test_classes(module: &str) -> Vec<i64> {
+    let case = test_case();
+    let mut classes: Vec<i64> = Vec::new();
+    let mut push = |class: i64| {
+        if class != case && !classes.contains(&class) && value::is_subclass_of(class, case) {
+            classes.push(class);
+        }
+    };
+    // Namespace order: the `dir(module)` scan CPython performs.
+    for (_, item) in globals::entries(module) {
+        push(item);
+    }
+    // Entry-unit fallback: creation order, the source definition order for the
+    // class statements the store does not carry.
+    let registered = registry().clone();
+    for class in registered {
+        if class_module(class).as_deref().unwrap_or(MAIN_MODULE) == module {
+            push(class);
+        }
+    }
+    classes
+}
+
+/// The selected module's `load_tests` hook, when it defines one.
+///
+/// CPython's `loadTestsFromModule` delegates to this hook and runs the suite it
+/// returns; `load_tests = None` is CPython's documented "no hook" value.
+fn load_tests_hook(module: &str) -> Option<i64> {
+    match globals::lookup(module, "load_tests") {
+        Some(hook) if hook != NONE => Some(hook),
+        _ => None,
+    }
+}
+
+/// The module's standard tests shaped like CPython's loader output: one suite
+/// per `TestCase` subclass, collected into a module suite.
+fn standard_suite(classes: &[i64]) -> i64 {
+    let marker = heap::root_values(&[]);
+    let mut suites = Vec::with_capacity(classes.len());
+    for &class in classes {
+        let tests = load_class_tests(class);
+        if exc::pending() {
+            break;
+        }
+        let suite = make_suite(tests);
+        heap::push_scoped_root(suite);
+        suites.push(suite);
+    }
+    let suite = make_suite(suites);
+    heap::release_roots(marker);
+    suite
+}
+
+/// Calls a module's `load_tests(loader, tests, pattern)` hook.
+///
+/// The loader is `unittest.defaultTestLoader`, matching CPython's
+/// `TestProgram`, and `pattern` is `None` because the runner is not
+/// discovering files. A non-callable hook raises `TypeError` here.
+fn call_load_tests(hook: i64, standard: i64) -> i64 {
+    let loader = default_test_loader();
+    let arguments = [loader, standard, NONE];
+    let roots = heap::root_values(&arguments);
+    let returned = builtins::call(hook, arguments.len(), arguments.as_ptr());
+    heap::release_roots(roots);
+    returned
+}
+
+/// CPython's `load_tests` protocol: run the suite the hook returns instead of
+/// the module's standard tests.
+///
+/// The returned value is executed as a suite element, so a hook returning
+/// `None` (or any other value that is not a test) reports CPython's
+/// `TypeError` instead of a false "Ran 0 test(s)" pass. A pending exception
+/// left by the hook or by the returned suite aborts the run.
+fn run_load_tests(hook: i64, classes: &[i64], result: i64) {
+    let standard = standard_suite(classes);
+    if exc::pending() {
+        return;
+    }
+    let marker = heap::root_values(&[standard]);
+    let returned = call_load_tests(hook, standard);
+    heap::push_scoped_root(returned);
+    if exc::pending() {
+        heap::release_roots(marker);
+        return;
+    }
+    let suite = make_suite(vec![returned]);
+    heap::push_scoped_root(suite);
+    call_method(suite, "run", &[result]);
+    heap::release_roots(marker);
+}
+
+/// Runs `classes`' `test*` methods against `result` in discovery order.
+///
+/// Returns `false` when a test raised out of the receiver's own `run` (a
+/// result object that failed), which aborts the run.
+fn run_test_classes(classes: &[i64], result: i64) -> bool {
+    for &class in classes {
         for name in test_method_names(class) {
             let argument = value::str_alloc(name.clone());
             let roots = heap::root_values(&[argument]);
@@ -2296,7 +2856,7 @@ fn run_main() -> i64 {
             test_case_run(&[instance, result]);
             if exc::pending() {
                 // A result object that raised aborts the run.
-                return NONE;
+                return false;
             }
             if value::instance_attr(result, "shouldStop").is_some_and(value::truthy) {
                 break;
@@ -2305,6 +2865,27 @@ fn run_main() -> i64 {
         if value::instance_attr(result, "shouldStop").is_some_and(value::truthy) {
             break;
         }
+    }
+    true
+}
+
+/// Runs the test classes `module` defines: one fresh `TestResult`, a printed
+/// summary, and a raised assertion on failure.
+fn run_main(module: &str) -> i64 {
+    let classes = module_test_classes(module);
+    let result = new_test_result();
+    call_method(result, "startTestRun", &[]);
+    // A module that defines `load_tests` runs exactly what that hook returns,
+    // like CPython's `loadTestsFromModule`.
+    let completed = match load_tests_hook(module) {
+        Some(hook) => {
+            run_load_tests(hook, &classes, result);
+            !exc::pending()
+        }
+        None => run_test_classes(&classes, result),
+    };
+    if !completed {
+        return NONE;
     }
     call_method(result, "stopTestRun", &[]);
 
@@ -2661,6 +3242,182 @@ mod tests {
         assert_eq!(result_list_len(result, "errors"), 0);
         assert_eq!(result_integer(result, "testsRun"), Some(2));
         assert!(!exc::pending());
+        reset();
+    }
+
+    #[test]
+    fn main_module_argument_selects_the_entry_unit() {
+        exc::init();
+        // No argument and an explicit `None` both mean the entry unit.
+        assert_eq!(main_module(&[], &[]).as_deref(), Some(MAIN_MODULE));
+        assert_eq!(main_module(&[NONE], &[]).as_deref(), Some(MAIN_MODULE));
+        let named = value::str_alloc("pkg.tests".to_string());
+        assert_eq!(main_module(&[named], &[]).as_deref(), Some("pkg.tests"));
+        assert_eq!(
+            main_module(&[], &[("module".to_string(), named)]).as_deref(),
+            Some("pkg.tests")
+        );
+        let module = value::module_value("pkg.mod".to_string());
+        assert_eq!(main_module(&[module], &[]).as_deref(), Some("pkg.mod"));
+        assert!(!exc::pending());
+
+        // A non-module, non-string argument is a `TypeError`, like CPython's
+        // `module.__dict__` access.
+        assert_eq!(main_module(&[TRUE], &[]), None);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::clear();
+    }
+
+    #[test]
+    fn main_scan_merges_module_namespace_and_registry() {
+        reset();
+        exc::init();
+        let case = test_case();
+        // Entry-unit class: the sparse `__main__` store does not carry it, so
+        // only the class registry can supply it.
+        let defined = value::class_new_full(
+            "DefinedCase".to_string(),
+            case,
+            Vec::new(),
+            vec![(
+                "__module__".to_string(),
+                value::str_alloc(MAIN_MODULE.to_string()),
+            )],
+        );
+        // A class imported by name into the module namespace: CPython's
+        // `dir(module)` scan runs it even though its class body records
+        // another module.
+        let imported = value::class_new_full(
+            "ImportedCase".to_string(),
+            case,
+            Vec::new(),
+            vec![(
+                "__module__".to_string(),
+                value::str_alloc("test.mapping_tests".to_string()),
+            )],
+        );
+        // A native registration with no `__module__` stays in the entry unit's
+        // run, so no class silently disappears.
+        let native = value::class_new("NativeCase".to_string(), case, Vec::new());
+        // Defined in the helper module but never bound in `__main__`.
+        let elsewhere = value::class_new_full(
+            "ElsewhereCase".to_string(),
+            case,
+            Vec::new(),
+            vec![(
+                "__module__".to_string(),
+                value::str_alloc("test.mapping_tests".to_string()),
+            )],
+        );
+
+        globals::set(MAIN_MODULE, "ImportedCase", imported);
+        let selected = module_test_classes(MAIN_MODULE);
+        assert!(selected.contains(&defined));
+        assert!(selected.contains(&imported));
+        assert!(selected.contains(&native));
+        assert!(!selected.contains(&elsewhere));
+        // The namespace scan runs first; the registry supplies the rest.
+        let imported_at = selected.iter().position(|class| *class == imported);
+        let defined_at = selected.iter().position(|class| *class == defined);
+        assert!(
+            matches!((imported_at, defined_at), (Some(imported_at), Some(defined_at)) if imported_at < defined_at)
+        );
+
+        // An explicit module selection uses the same scan: the helper's own
+        // classes are visible, the entry unit's are not.
+        let helpers = module_test_classes("test.mapping_tests");
+        assert!(helpers.contains(&imported));
+        assert!(helpers.contains(&elsewhere));
+        assert!(!helpers.contains(&defined));
+        assert!(!helpers.contains(&native));
+
+        globals::delete_value(MAIN_MODULE, "ImportedCase");
+        assert!(!exc::pending());
+        reset();
+    }
+
+    #[test]
+    fn load_tests_hook_ignores_missing_and_none_entries() {
+        exc::init();
+        let module = "unittest.load_tests_probe";
+        assert_eq!(load_tests_hook(module), None);
+        // CPython documents `load_tests = None` as "no hook".
+        globals::set(module, "load_tests", NONE);
+        assert_eq!(load_tests_hook(module), None);
+        let hook = value::native_function_new("unittest", "_case_marker", 3);
+        globals::set(module, "load_tests", hook);
+        assert_eq!(load_tests_hook(module), Some(hook));
+        globals::delete_value(module, "load_tests");
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn load_tests_returning_none_cannot_pass_silently() {
+        exc::init();
+        let module = "unittest.load_tests_none";
+        // `_case_marker` accepts the hook's three arguments and returns None,
+        // which CPython's runner then fails to call.
+        let hook = value::native_function_new("unittest", "_case_marker", 3);
+        globals::set(module, "load_tests", hook);
+        assert_eq!(run_main(module), NONE);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::clear();
+        globals::delete_value(module, "load_tests");
+    }
+
+    #[test]
+    fn load_tests_result_replaces_the_standard_tests() {
+        reset();
+        exc::init();
+        let module = "unittest.load_tests_replace";
+        // Standard discovery would run this failing test.
+        let standard = value::class_new(
+            "StandardProbe".to_string(),
+            test_case(),
+            vec![(
+                "test_bad".to_string(),
+                value::native_function_new("unittest", "_fail", 2),
+            )],
+        );
+        value::class_set_attr(
+            standard,
+            "__module__".to_string(),
+            value::str_alloc(module.to_string()),
+        );
+        // `_identity` returns the loader argument, a value that is not a test:
+        // running it raises `TypeError` instead of reporting the standard
+        // class' assertion failure, which proves the hook's result ran.
+        let hook = value::native_function_new("unittest", "_identity", 3);
+        globals::set(module, "load_tests", hook);
+        assert_eq!(run_main(module), NONE);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::clear();
+        globals::delete_value(module, "load_tests");
+        reset();
+    }
+
+    #[test]
+    fn standard_run_reports_failures_without_a_hook() {
+        reset();
+        exc::init();
+        let module = "unittest.standard_probe";
+        let standard = value::class_new(
+            "StandardOnly".to_string(),
+            test_case(),
+            vec![(
+                "test_bad".to_string(),
+                value::native_function_new("unittest", "_fail", 2),
+            )],
+        );
+        value::class_set_attr(
+            standard,
+            "__module__".to_string(),
+            value::str_alloc(module.to_string()),
+        );
+        assert_eq!(run_main(module), NONE);
+        assert_eq!(exc::pending_tag(), i64::from(ASSERTION_ERROR));
+        assert!(value::to_string(exc::pending_value()).contains("1 test(s) failed"));
+        exc::clear();
         reset();
     }
 }

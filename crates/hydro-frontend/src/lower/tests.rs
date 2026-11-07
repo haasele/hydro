@@ -4426,6 +4426,173 @@ fn method_call_lowers_to_method_call() {
 }
 
 #[test]
+fn builtin_type_protocol_new_lowers_to_an_attribute_call() {
+    // `tuple.__new__(cls, iterable)` is the type object's allocation slot, not
+    // a documented `tuple` method: the call has to read the attribute through
+    // the runtime getter (`value::function_attribute`) and call the resulting
+    // function value, which is how `unittest.mock`'s `_Call.__new__` builds a
+    // tuple subclass instance.
+    let source = "x = tuple.__new__(tuple, (1, 2))\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::IndirectCall { callee, args, star } = &assigned(&hir, "x").kind else {
+        panic!(
+            "expected an indirect call, got {:?}",
+            assigned(&hir, "x").kind
+        );
+    };
+    assert!(star.is_none());
+    let HExprKind::GetAttr { object, name } = &callee.kind else {
+        panic!(
+            "expected an attribute read as the callee, got {:?}",
+            callee.kind
+        );
+    };
+    assert_eq!(name, "__new__");
+    assert!(matches!(
+        &object.kind,
+        HExprKind::BuiltinRef(Builtin::Tuple)
+    ));
+    assert_eq!(args.len(), 2);
+    assert!(matches!(
+        &args[0].kind,
+        HExprKind::BuiltinRef(Builtin::Tuple)
+    ));
+    assert!(matches!(&args[1].kind, HExprKind::Tuple(_)));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn builtin_type_protocol_new_keeps_a_subclass_receiver() {
+    let source = "\
+class Sub(tuple):
+    pass
+x = tuple.__new__(Sub, (1,))
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::IndirectCall { callee, args, .. } = &assigned(&hir, "x").kind else {
+        panic!(
+            "expected an indirect call, got {:?}",
+            assigned(&hir, "x").kind
+        );
+    };
+    let HExprKind::GetAttr { object, name } = &callee.kind else {
+        panic!(
+            "expected an attribute read as the callee, got {:?}",
+            callee.kind
+        );
+    };
+    assert_eq!(name, "__new__");
+    assert!(matches!(
+        &object.kind,
+        HExprKind::BuiltinRef(Builtin::Tuple)
+    ));
+    assert_eq!(args.len(), 2);
+    // The subclass is passed as the class operand the slot allocates.
+    assert!(!matches!(
+        &args[0].kind,
+        HExprKind::BuiltinRef(Builtin::Tuple)
+    ));
+    assert!(matches!(&args[1].kind, HExprKind::Tuple(_)));
+}
+
+#[test]
+fn builtin_type_protocol_mro_lowers_to_an_attribute_call() {
+    let source = "x = int.mro()\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::IndirectCall { callee, args, star } = &assigned(&hir, "x").kind else {
+        panic!(
+            "expected an indirect call, got {:?}",
+            assigned(&hir, "x").kind
+        );
+    };
+    assert!(star.is_none());
+    let HExprKind::GetAttr { object, name } = &callee.kind else {
+        panic!(
+            "expected an attribute read as the callee, got {:?}",
+            callee.kind
+        );
+    };
+    assert_eq!(name, "mro");
+    assert!(matches!(&object.kind, HExprKind::BuiltinRef(Builtin::Int)));
+    assert!(args.is_empty());
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn builtin_type_class_protocol_reads_lower_to_getattr() {
+    // `__mro__`/`__bases__`/`__base__` are reads, not calls: they stay plain
+    // attribute reads on the builtin type value, answered by the runtime
+    // getter through `value::function_attribute`.
+    let source = "\
+mro = int.__mro__
+bases = int.__bases__
+base = int.__base__
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    for (name, attribute) in [
+        ("mro", "__mro__"),
+        ("bases", "__bases__"),
+        ("base", "__base__"),
+    ] {
+        let HExprKind::GetAttr { object, name } = &assigned(&hir, name).kind else {
+            panic!("expected an attribute read for {attribute}");
+        };
+        assert_eq!(name, attribute);
+        assert!(matches!(&object.kind, HExprKind::BuiltinRef(Builtin::Int)));
+    }
+}
+
+#[test]
+fn known_builtin_type_methods_keep_the_method_call_path() {
+    // The documented methods stay on the static builtin method dispatch: only
+    // the class protocol moves to the runtime attribute getter.
+    let source = "x = int.bit_length(7)\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::MethodCall {
+        object,
+        method,
+        args,
+        ..
+    } = &assigned(&hir, "x").kind
+    else {
+        panic!("expected a method call, got {:?}", assigned(&hir, "x").kind);
+    };
+    assert_eq!(method, "bit_length");
+    assert!(matches!(&object.kind, HExprKind::BuiltinRef(Builtin::Int)));
+    assert_eq!(args.len(), 1);
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
+fn statically_typed_type_methods_keep_the_method_call_path() {
+    // `type.mro(...)` is in the builtin class-method table
+    // (`sema::builtin_class_method_result`), which types the result as a list:
+    // the class-protocol exemption must not move it to the dynamic getter.
+    let source = "x = type.mro(int)\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::MethodCall {
+        object,
+        method,
+        args,
+        ..
+    } = &assigned(&hir, "x").kind
+    else {
+        panic!("expected a method call, got {:?}", assigned(&hir, "x").kind);
+    };
+    assert_eq!(method, "mro");
+    assert!(matches!(&object.kind, HExprKind::BuiltinRef(Builtin::Type)));
+    assert_eq!(args.len(), 1);
+    assert!(matches!(&args[0].kind, HExprKind::BuiltinRef(Builtin::Int)));
+    assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
+}
+
+#[test]
 fn builtin_names_lower_to_builtin_refs() {
     let source = "f = int\nx = f('42')\n";
     let (hir, mut infer, diags) = lower_source(source, &parse(source));
@@ -6817,9 +6984,9 @@ fn native_constructor_keywords_are_reordered() {
         (module.as_str(), function.as_str()),
         ("threading", "Thread")
     );
-    // `Thread(target=None, args=(), name=None, *, daemon=None)`: all four
-    // parameter slots are positional after the keyword reordering.
-    assert_eq!(args.len(), 4);
+    // `Thread(target=None, args=(), name=None, *, daemon=None, kwargs=None)`:
+    // all five parameter slots are positional after the keyword reordering.
+    assert_eq!(args.len(), 5);
     assert!(matches!(args[1].kind, HExprKind::Tuple { .. }));
     assert!(matches!(&args[2].kind, HExprKind::Const(Const::Str(s)) if s == "w"));
     assert!(matches!(args[3].kind, HExprKind::Const(Const::None)));
@@ -6835,8 +7002,8 @@ fn imported_native_constructor_keywords_are_reordered() {
     let HExprKind::ModuleCall { args, .. } = &value.kind else {
         panic!("expected a module call");
     };
-    // `target` plus the filled `args`, `name` and `daemon` slots.
-    assert_eq!(args.len(), 4);
+    // `target` plus the filled `args`, `name`, `daemon` and `kwargs` slots.
+    assert_eq!(args.len(), 5);
     assert!(matches!(args[1].kind, HExprKind::Const(Const::None)));
     assert!(matches!(args[2].kind, HExprKind::Const(Const::None)));
     assert!(matches!(args[3].kind, HExprKind::Const(Const::None)));

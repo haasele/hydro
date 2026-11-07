@@ -4305,6 +4305,52 @@ pub(crate) fn instance_set_scalar_payload(instance: i64, payload: i64) {
     instance_setattr(instance, SCALAR_PAYLOAD_ATTR.to_string(), payload);
 }
 
+/// Installs the native container payload of a builtin-container subclass
+/// instance (`class T(tuple)`, `class L(list)`, ...).
+///
+/// The payload is the real builtin value the instance owns, so
+/// `tuple.__new__(T, (1, 2))` produces a `T` that `len`, indexing, iteration,
+/// comparison and `tuple.__new__` see as that tuple while `type(x)`,
+/// `isinstance` and attribute lookup stay `T`.
+pub(crate) fn instance_set_container_payload(instance: i64, payload: i64) {
+    instance_setattr(instance, CONTAINER_PAYLOAD_ATTR.to_string(), payload);
+}
+
+/// Native container payload of a builtin-container subclass instance.
+///
+/// The payload lives in a reserved NUL-prefixed instance attribute, invisible
+/// to `__dict__` and traced by the collector like any other instance edge.
+/// `None` for every value that does not carry one.
+pub(crate) fn container_payload(v: i64) -> Option<i64> {
+    if !is_heap(v) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted (collector frees only
+    // unreachable objects).
+    let obj = unsafe { as_obj(v) }?;
+    if obj.kind != KIND_INSTANCE {
+        return None;
+    }
+    instance_attr(v, CONTAINER_PAYLOAD_ATTR)
+}
+
+/// Container payload of `v` when it is a builtin-container subclass instance
+/// whose payload is a heap object of `kind`.
+///
+/// Validating the payload kind keeps the `as_*` views total: a malformed or
+/// reassigned reserved attribute can never make one container view hand out
+/// another container's memory.
+fn container_payload_of(v: i64, kind: u32) -> Option<i64> {
+    let payload = container_payload(v)?;
+    if !is_heap(payload) {
+        return None;
+    }
+    // SAFETY: heap tag checked; object rooted (collector frees only
+    // unreachable objects).
+    let obj = unsafe { as_obj(payload) }?;
+    (obj.kind == kind).then_some(payload)
+}
+
 /// The native scalar builtin `class` derives from, if any.
 ///
 /// The nearest marked native scalar ancestor decides, so `class B(bool)` is a
@@ -4320,7 +4366,9 @@ pub(crate) fn native_scalar_base(class: i64) -> Option<(&'static str, i64)> {
             continue;
         }
         return match state.name.as_str() {
-            name @ ("bool" | "int" | "float" | "str" | "bytes") => Some((name, ancestor)),
+            name @ ("bool" | "int" | "float" | "str" | "bytes" | "complex") => {
+                Some((name, ancestor))
+            }
             _ => None,
         };
     }
@@ -4376,7 +4424,9 @@ pub(crate) fn as_list(v: i64) -> Option<&'static [i64]> {
     // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_LIST {
-        return None;
+        // A builtin-container subclass instance (`class L(list)`) owns a real
+        // list as its payload; its contents are that list's.
+        return container_payload_of(v, KIND_LIST).and_then(as_list);
     }
     match obj.data_ref() {
         ObjDataRef::List(items) => Some(items.as_slice()),
@@ -4411,7 +4461,9 @@ pub(crate) fn as_tuple(v: i64) -> Option<&'static [i64]> {
     // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_TUPLE {
-        return None;
+        // `class T(tuple)` (unittest.mock's `_Call`): the instance behaves as
+        // the tuple it carries, exactly like CPython's `tuple` subtype.
+        return container_payload_of(v, KIND_TUPLE).and_then(as_tuple);
     }
     match obj.data_ref() {
         ObjDataRef::Tuple(items) => Some(items.as_slice()),
@@ -4426,7 +4478,8 @@ pub(crate) fn as_set(v: i64) -> Option<&'static [i64]> {
     // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
     let obj = unsafe { as_obj(v) }?;
     if obj.kind != KIND_SET {
-        return None;
+        // A `set`/`frozenset` subclass instance behaves as the set it carries.
+        return container_payload_of(v, KIND_SET).and_then(as_set);
     }
     match obj.data_ref() {
         ObjDataRef::Set(items) => Some(items.as_slice()),
@@ -4946,6 +4999,8 @@ fn lock_container(v: i64, kind: u32) -> Option<GraphGuard> {
 /// documented for the `_thread` module. The guard does hold the collector's
 /// graph lock, so a concurrent marking pass never reads a payload mid-update.
 pub(crate) fn list_items_mut(v: i64) -> Option<ContainerGuard<Vec<i64>>> {
+    // A `list` subclass instance mutates the list it owns.
+    let v = container_payload_of(v, KIND_LIST).unwrap_or(v);
     let graph = lock_container(v, KIND_LIST)?;
     // SAFETY: heap tag/kind checked; value owned by the executing program (see contract).
     let obj: &'static mut HydroObj = unsafe { &mut *((v & !TAG_MASK) as *mut HydroObj) };
@@ -4968,6 +5023,8 @@ pub(crate) fn dict_pairs_mut(v: i64) -> Option<ContainerGuard<DictData>> {
 
 /// Returns exclusive access to a set's elements. See [`list_items_mut`].
 pub(crate) fn set_items_mut(v: i64) -> Option<ContainerGuard<Vec<i64>>> {
+    // A `set`/`frozenset` subclass instance mutates the set it owns.
+    let v = container_payload_of(v, KIND_SET).unwrap_or(v);
     let graph = lock_container(v, KIND_SET)?;
     // SAFETY: see `list_items_mut`.
     let obj: &'static mut HydroObj = unsafe { &mut *((v & !TAG_MASK) as *mut HydroObj) };
@@ -5560,6 +5617,16 @@ pub(crate) fn builtin_type_class(v: i64) -> Option<i64> {
             module: "builtins",
             name,
         } => {
+            // `object` and `complex` have no `Builtin` variant (they are
+            // served by the `builtins` module dispatcher), but they still name
+            // real cached classes: `object.__new__`, `issubclass(int, object)`
+            // and `isinstance(1, complex)` need the spelling to resolve.
+            if *name == "object" {
+                return Some(object_class());
+            }
+            if *name == "complex" {
+                return Some(native_class("complex"));
+            }
             let builtin = hydro_ir::Builtin::from_name(name)?;
             is_builtin_type(&builtin).then(|| native_class(builtin.name()))
         }
@@ -6317,7 +6384,11 @@ fn allocate_class(
     );
     // A subclass of the native unittest `TestCase` joins the test registry so
     // `unittest.main()` can discover and run it.
-    if base != NONE && class_method(base, "__unittest_case__").is_some() {
+    if class_mro(class)
+        .iter()
+        .skip(1)
+        .any(|&base| class_method(base, "__unittest_case__").is_some())
+    {
         crate::modules::unittest::register(class);
     }
     // `Test*` classes with `test*` methods join the pytest registry; the
@@ -7346,7 +7417,15 @@ pub(crate) fn function_annotations(function: i64) -> Option<i64> {
 }
 
 /// Reads `name` from a function's attribute dictionary.
+///
+/// Builtin type spellings (`int`, `tuple`, `dict`, `object`, ...) additionally
+/// answer the class protocol CPython's type objects provide: `__new__` is the
+/// native constructor slot and `mro`/`__mro__`/`__bases__`/`__base__` describe
+/// the type the spelling names.
 pub(crate) fn function_attribute(function: i64, name: &str) -> Option<i64> {
+    if let Some(attribute) = builtin_type_spelling_attribute(function, name) {
+        return Some(attribute);
+    }
     let dictionary = as_function(function)?.metadata.lock().dict;
     if dictionary == NONE {
         return None;
@@ -7354,6 +7433,33 @@ pub(crate) fn function_attribute(function: i64, name: &str) -> Option<i64> {
     as_dict(dictionary)?
         .iter()
         .find_map(|(key, item)| (as_str(*key) == Some(name)).then_some(*item))
+}
+
+/// Class-protocol attributes of a builtin type spelling.
+///
+/// A builtin type name is a callable function value, while `type(x)` and class
+/// statements use the cached native class of the same name. CPython has one
+/// type object doing both jobs, so the spelling has to answer the class
+/// protocol too: `int.mro()`, `int.__mro__`, `int.__bases__`, `int.__base__`
+/// and `int.__new__` (`tuple.__new__(cls, iterable)` in `unittest.mock`).
+fn builtin_type_spelling_attribute(v: i64, name: &str) -> Option<i64> {
+    let native = builtin_type_class(v)?;
+    match name {
+        // The native class's own `__new__` slot: the constructor that
+        // allocates either the plain builtin value or a subclass instance.
+        "__new__" => match class_own_lookup(native, "__new__")? {
+            ClassEntry::Method(_, function) => Some(function),
+            ClassEntry::Attr(item) if as_function(item).is_some() => Some(item),
+            ClassEntry::Attr(_) => None,
+        },
+        // `mro()` binds the native class, so the metaclass slot runs over the
+        // type the spelling names (`int.mro()` is `[int, object]`).
+        "mro" => Some(bound_method_new(native, name.to_string())),
+        "__mro__" => Some(tuple_new(class_mro(native))),
+        "__bases__" => Some(tuple_new(as_class(native)?.bases.clone())),
+        "__base__" => Some(as_class(native)?.bases.first().copied().unwrap_or(NONE)),
+        _ => None,
+    }
 }
 
 /// Snapshot of the attribute names stored in a function's `__dict__`.
@@ -7916,6 +8022,11 @@ pub(crate) fn native_class(name: &str) -> i64 {
         "list" | "set" | "frozenset" | "tuple" | "bytearray" | "range" | "memoryview"
     ) {
         container_native_class(name)
+    } else if name == "code" {
+        // `types.CodeType` is a real class in CPython, and `unittest.mock`
+        // reads `CodeType.__init__` (through `inspect.signature`) and
+        // `dir(CodeType)` to build fake code objects.
+        code_native_class()
     } else if name == "partial" {
         class_new_multi(
             "partial".to_string(),
@@ -7959,6 +8070,9 @@ const DICT_METHODS_CLASS_NAME: &str = "__hydro_dict_methods__";
 /// Marker attribute of the private class, so a user class that happens to use
 /// the same name is never mistaken for it.
 const DICT_METHODS_MARKER: &str = "\u{0}hydro_dict_methods";
+/// Reserved instance attribute holding the native container payload of a
+/// `tuple`/`list`/`set`/`frozenset` subclass instance.
+const CONTAINER_PAYLOAD_ATTR: &str = "\u{0}hydro_container_payload";
 /// Reserved instance attribute holding the native scalar payload of an
 /// `int`/`str`/`bytes`/`float`/`bool` subclass instance.
 const SCALAR_PAYLOAD_ATTR: &str = "\u{0}hydro_scalar_payload";
@@ -8190,6 +8304,14 @@ fn dict_native_class() -> i64 {
         let start = crate::heap::root_values(std::slice::from_ref(&function));
         roots_start.get_or_insert(start);
     }
+    // `dict.__new__(cls, *args, **kwargs)`: the native allocation slot. A
+    // native `dict` subclass instance is allocated together with the mapping
+    // storage it owns; the plain `dict` class returns the mapping itself.
+    if let Some(new) = crate::core::builtins::builtin_new_function("dict") {
+        methods.push(("__new__".to_string(), new, MethodKind::Staticmethod));
+        let start = crate::heap::root_values(std::slice::from_ref(&new));
+        roots_start.get_or_insert(start);
+    }
     let class = class_new_full(
         "dict".to_string(),
         NONE,
@@ -8207,17 +8329,22 @@ fn dict_native_class() -> i64 {
 /// dispatch through the existing scalar builtins, so the values they return
 /// keep normal Hydro scalar semantics.
 fn scalar_native_class(name: &str) -> i64 {
+    // `complex` has no two-argument `__scalar_new__` spec, so it carries the
+    // full-signature constructor slot instead (`complex.__new__(cls, real,
+    // imag)`); every other scalar keeps the shared `__scalar_new__` entry.
+    let new_slot = if name == "complex" {
+        crate::core::builtins::builtin_new_function("complex")
+            .unwrap_or_else(|| native_function_new("builtins", "__scalar_new__", usize::MAX))
+    } else {
+        native_function_new("builtins", "__scalar_new__", usize::MAX)
+    };
     let methods = vec![
         (
             "__format__".to_string(),
             native_function_new("builtins", "__scalar_format__", usize::MAX),
             MethodKind::Normal,
         ),
-        (
-            "__new__".to_string(),
-            native_function_new("builtins", "__scalar_new__", usize::MAX),
-            MethodKind::Staticmethod,
-        ),
+        ("__new__".to_string(), new_slot, MethodKind::Staticmethod),
         (
             "__repr__".to_string(),
             native_function_new("builtins", "__scalar_repr__", usize::MAX),
@@ -8257,13 +8384,71 @@ fn container_native_class(name: &str) -> i64 {
         1,
         "copy".to_string(),
     );
-    class_new_multi(
+    // `tuple.__new__(cls, iterable)`, `list.__new__(...)`: the native
+    // allocation slot that also builds subclass instances carrying the
+    // builtin contents (`unittest.mock`'s `_Call(tuple)`).
+    let mut methods = vec![("copy".to_string(), copy, MethodKind::Normal)];
+    let mut roots_source = vec![copy];
+    if let Some(new) = crate::core::builtins::builtin_new_function(name) {
+        roots_source.push(new);
+        methods.push(("__new__".to_string(), new, MethodKind::Staticmethod));
+    }
+    let root = crate::heap::root_values(&roots_source);
+    let class = class_new_multi(
         name.to_string(),
         vec![object_class()],
         NONE,
-        vec![("copy".to_string(), copy, MethodKind::Normal)],
+        methods,
         Vec::new(),
-    )
+    );
+    crate::heap::release_roots(root);
+    class
+}
+
+/// Field names CPython's code objects expose, in `dir()` order.
+///
+/// `unittest.mock`'s `AsyncMockMixin` derives its fake `__code__` from
+/// `dir(CodeType)` and then assigns these fields, so the class namespace has
+/// to list them: a `spec_set` mock rejects every name it cannot find.
+const CODE_ATTRIBUTES: &[&str] = &[
+    "co_argcount",
+    "co_cellvars",
+    "co_code",
+    "co_consts",
+    "co_exceptiontable",
+    "co_filename",
+    "co_firstlineno",
+    "co_flags",
+    "co_freevars",
+    "co_kwonlyargcount",
+    "co_lines",
+    "co_linetable",
+    "co_name",
+    "co_names",
+    "co_nlocals",
+    "co_positions",
+    "co_posonlyargcount",
+    "co_qualname",
+    "co_stacksize",
+    "co_varnames",
+];
+
+/// Native `code` class (`types.CodeType`).
+///
+/// Code objects are their own runtime kind, so the class is a type record: it
+/// carries the field names for `dir()`/`spec_set` and the `__init__` slot whose
+/// signature `inspect.signature(partial(CodeType.__init__, None))` reports.
+fn code_native_class() -> i64 {
+    let init = crate::core::builtins::code_init_function();
+    let root = crate::heap::root_values(std::slice::from_ref(&init));
+    let methods = vec![("__init__".to_string(), init, MethodKind::Normal)];
+    let attrs = CODE_ATTRIBUTES
+        .iter()
+        .map(|name| ((*name).to_string(), NONE))
+        .collect();
+    let class = class_new_full("code".to_string(), NONE, methods, attrs);
+    crate::heap::release_roots(root);
+    class
 }
 
 /// Native `object` class with the universal dunder surface CPython's
@@ -8272,8 +8457,12 @@ fn container_native_class(name: &str) -> i64 {
 fn object_native_class() -> i64 {
     let methods = vec![
         (
+            // `object.__new__(cls)`: an uninitialized instance of `cls`, with
+            // CPython's exact-one-argument rule. It is a plain allocator with
+            // no signature, so class construction keeps its default path.
             "__new__".to_string(),
-            native_function_new("builtins", "__object_new__", usize::MAX),
+            crate::core::builtins::builtin_new_function("object")
+                .unwrap_or_else(|| native_function_new("builtins", "__object_new__", usize::MAX)),
             MethodKind::Staticmethod,
         ),
         (
@@ -8902,23 +9091,7 @@ pub(crate) fn exc_instance_repr(state: &ExcInstanceState) -> String {
     let name = class_display_name(state.class)
         .map(str::to_string)
         .unwrap_or_else(|| state.data.name.to_string());
-    let mut out = String::with_capacity(name.len() + 2);
-    out.push_str(&name);
-    out.push('(');
-    if state.data.args.is_empty() {
-        if !state.data.msg.is_empty() {
-            out.push_str(&quote_str(&state.data.msg));
-        }
-    } else {
-        for (index, argument) in state.data.args.iter().enumerate() {
-            if index > 0 {
-                out.push_str(", ");
-            }
-            out.push_str(&quote_str(argument));
-        }
-    }
-    out.push(')');
-    out
+    crate::exc::exception_repr_named(&name, &state.data)
 }
 
 /// `repr` of a built-in descriptor value.
@@ -8934,7 +9107,7 @@ pub(crate) fn descriptor_repr(state: &DescriptorState) -> String {
     } else if let Some(name) = class_display_name(state.target) {
         format!("<class '{name}'>")
     } else {
-        repr_depth(state.target, 0)
+        repr_depth(state.target)
     };
     format!("<{}({})>", state.kind.type_name(), inner)
 }
@@ -8958,6 +9131,9 @@ fn fiber_repr(state: &crate::fiber::FiberState) -> String {
 /// Containers use Python's `repr` (which equals `str` for lists/dicts/tuples):
 /// `[1, 'a']`, `{'k': 1}`, `(1, 'a')`.
 pub(crate) fn to_string(v: i64) -> String {
+    let Some(_budget) = ReprDepthGuard::enter() else {
+        return "...".to_string();
+    };
     if is_int(v) {
         return (v >> 3).to_string();
     }
@@ -9014,8 +9190,8 @@ pub(crate) fn to_string(v: i64) -> String {
                 ObjDataRef::List(_)
                 | ObjDataRef::Dict(_)
                 | ObjDataRef::Tuple(_)
-                | ObjDataRef::Set(_) => repr_depth(v, 0),
-                ObjDataRef::Range { .. } => repr_depth(v, 0),
+                | ObjDataRef::Set(_) => repr_depth(v),
+                ObjDataRef::Range { .. } => repr_depth(v),
                 ObjDataRef::Function(function) => format!("<function {}>", function.name),
                 ObjDataRef::Lock(_) => "<lock object>".to_string(),
                 ObjDataRef::Iter(_) => "<iterator>".to_string(),
@@ -9072,8 +9248,8 @@ pub(crate) fn to_string(v: i64) -> String {
                     Some(prog) => format!("ArgumentParser(prog='{prog}')"),
                     None => "ArgumentParser(prog='program')".to_string(),
                 },
-                ObjDataRef::Namespace(_) => repr_depth(v, 0),
-                ObjDataRef::DefaultDict(_) => repr_depth(v, 0),
+                ObjDataRef::Namespace(_) => repr_depth(v),
+                ObjDataRef::DefaultDict(_) => repr_depth(v),
                 ObjDataRef::Pattern(state) => format!("re.compile({})", quote_str(&state.source)),
                 ObjDataRef::Match(state) => {
                     format!("<re.Match object; pattern={}>", quote_str(&state.pattern))
@@ -9104,7 +9280,7 @@ pub(crate) fn to_string(v: i64) -> String {
                         // `__repr__` used to recurse until the stack overflowed
                         // here. Apply CPython's slot behaviour instead.
                         if function_native_name(function) == Some("__object_str__") {
-                            return repr_depth(v, 0);
+                            return repr_depth(v);
                         }
                         let result = call_instance_dunder(v, function);
                         if !crate::exc::pending() {
@@ -9117,7 +9293,7 @@ pub(crate) fn to_string(v: i64) -> String {
                         // f`, how `enum.py` installs the mixed-in type's slot).
                         if as_function(item).is_some() {
                             if function_native_name(item) == Some("__object_str__") {
-                                return repr_depth(v, 0);
+                                return repr_depth(v);
                             }
                             let result = crate::core::methods::call(
                                 v,
@@ -9148,8 +9324,8 @@ pub(crate) fn to_string(v: i64) -> String {
                 ObjDataRef::Module(state) => format!("<module '{}'>", state.name),
                 ObjDataRef::StdStream(stream) => format!("<tea.{}>", stream.name()),
                 ObjDataRef::Cell(value) => to_string(value),
-                ObjDataRef::Frame(_) => repr_depth(v, 0),
-                ObjDataRef::Code(_) => repr_depth(v, 0),
+                ObjDataRef::Frame(_) => repr_depth(v),
+                ObjDataRef::Code(_) => repr_depth(v),
             };
         }
     }
@@ -9159,20 +9335,66 @@ pub(crate) fn to_string(v: i64) -> String {
 /// Python `repr()` of a value. Used for container elements and `KeyError`
 /// messages; top-level strings are quoted here.
 pub(crate) fn repr(v: i64) -> String {
-    repr_depth(v, 0)
+    repr_depth(v)
 }
 
-/// Maximum container nesting rendered before falling back to `...`. Guards
-/// against self-referential lists/dicts (possible via item assignment)
-/// overflowing the stack.
-const MAX_REPR_DEPTH: usize = 64;
+// Nesting of `repr` rendering in flight on this thread.
+//
+// CPython bounds a `repr` by `sys.getrecursionlimit()` and reports
+// `RecursionError` past it, so the native renderer charges one unit per level
+// against the same limit. The counter has to be thread-local and outlive one
+// call: a `repr` that crosses a user `__repr__`/`__str__` (a `UserList` holding
+// another `UserList`) re-enters the renderer from Python, and only the outer
+// frames still on the stack bound that recursion.
+thread_local! {
+    static REPR_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One level of the per-thread `repr` recursion budget.
+///
+/// Dropping the guard releases the level, so every normal return — including
+/// the placeholder rendered after a `RecursionError` — restores the budget.
+struct ReprDepthGuard;
+
+impl ReprDepthGuard {
+    /// Charges one level. `None` means the recursion limit is reached: a
+    /// `RecursionError` is left pending and the caller renders `...`.
+    fn enter() -> Option<ReprDepthGuard> {
+        let depth = REPR_DEPTH.with(|cell| {
+            let next = cell.get() + 1;
+            cell.set(next);
+            next
+        });
+        // Rust renderer frames are much larger than CPython's; cap the native
+        // recursion well below the Python limit so a deep graph raises
+        // RecursionError instead of overflowing the host stack.
+        if depth <= crate::modules::recursion_limit().min(128) {
+            return Some(ReprDepthGuard);
+        }
+        REPR_DEPTH.with(|cell| cell.set(depth - 1));
+        if !crate::exc::pending() {
+            crate::exc::raise_with_message(
+                crate::exc::RECURSION_ERROR,
+                "maximum recursion depth exceeded while getting the repr of an object",
+            );
+        }
+        None
+    }
+}
+
+impl Drop for ReprDepthGuard {
+    fn drop(&mut self) {
+        REPR_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+    }
+}
 
 // Heap objects currently being rendered by `repr_depth` on this thread.
 //
-// A depth limit alone is insufficient for the cyclic graphs Python permits
-// through item assignment: a 24-node graph rendered to depth 64 can expand
-// exponentially. The active set turns a back-edge into the conventional
-// `...` marker immediately.
+// The recursion budget alone is insufficient for the cyclic graphs Python
+// permits through item assignment: a 24-node graph rendered to depth 1000 can
+// expand exponentially, and a cycle would run into the limit and raise
+// `RecursionError` instead of printing the conventional `...` marker. The
+// active set turns a back-edge into `...` immediately.
 thread_local! {
     static REPR_ACTIVE: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -9243,10 +9465,13 @@ fn factory_repr(factory: i64) -> String {
             _ => format!("<function {}>", function.name),
         };
     }
-    repr_depth(factory, 0)
+    repr_depth(factory)
 }
 
-fn repr_depth(v: i64, depth: usize) -> String {
+fn repr_depth(v: i64) -> String {
+    let Some(_budget) = ReprDepthGuard::enter() else {
+        return "...".to_string();
+    };
     if let Some(state) = as_ext_object(v) {
         // The extension owns `__repr__`; a raising implementation leaves its
         // exception pending and yields the conventional address rendering.
@@ -9257,6 +9482,11 @@ fn repr_depth(v: i64, depth: usize) -> String {
     if let Some(object) = exception_data(v).and_then(|data| data.object) {
         let object = ext_object_pointer(object).unwrap_or(std::ptr::null_mut());
         return crate::capi::object_repr(object);
+    }
+    if let Some(data) = exception_data(v) {
+        if data.object.is_none() && as_exc_instance(v).is_none() {
+            return crate::exc::exception_repr(data);
+        }
     }
     if let Some(s) = as_str(v) {
         return quote_str(s);
@@ -9314,12 +9544,37 @@ fn repr_depth(v: i64, depth: usize) -> String {
     }
     if let Some(state) = as_instance(v) {
         let class = state.class;
+        // A Python class deriving from `BaseException` keeps its own class
+        // name in `repr`, even though the exception core's native `__repr__`
+        // is inherited.
+        if crate::exc::is_exception_class(class) {
+            let args = instance_attr(v, "args").or_else(|| crate::exc::exception_attr(v, "args"));
+            let items = args.and_then(|args| {
+                as_tuple(args)
+                    .map(|items| items.to_vec())
+                    .or_else(|| as_list(args).map(|items| items.to_vec()))
+            });
+            if let Some(items) = items {
+                let name = class_display_name(class).unwrap_or("Exception");
+                let mut out = String::with_capacity(name.len() + 2);
+                out.push_str(name);
+                out.push('(');
+                for (index, argument) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&repr_depth(*argument));
+                }
+                out.push(')');
+                return out;
+            }
+        }
         if let Some(payload) = scalar_payload(v) {
             if let Some(ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
                 class_lookup(class, "__repr__")
             {
                 if function_native_name(function) == Some("__scalar_repr__") {
-                    return repr_depth(payload, depth);
+                    return repr_depth(payload);
                 }
             }
         }
@@ -9363,12 +9618,17 @@ fn repr_depth(v: i64, depth: usize) -> String {
     if let Some(state) = as_fiber(v) {
         return fiber_repr(state);
     }
-    if depth >= MAX_REPR_DEPTH {
-        return "...".to_string();
-    }
     let (repr_guard, fresh) = ReprGuard::enter(v);
     if !fresh {
-        return "...".to_string();
+        return if as_list(v).is_some() {
+            "[...]".to_string()
+        } else if as_tuple(v).is_some() {
+            "(...)".to_string()
+        } else if as_dict(v).is_some() || as_set(v).is_some() {
+            "{...}".to_string()
+        } else {
+            "...".to_string()
+        };
     }
     let _repr_guard = repr_guard;
     if let Some(items) = as_list(v) {
@@ -9377,7 +9637,7 @@ fn repr_depth(v: i64, depth: usize) -> String {
             if index > 0 {
                 out.push_str(", ");
             }
-            out.push_str(&repr_depth(*item, depth + 1));
+            out.push_str(&repr_depth(*item));
         }
         out.push(']');
         return out;
@@ -9388,7 +9648,7 @@ fn repr_depth(v: i64, depth: usize) -> String {
             if index > 0 {
                 out.push_str(", ");
             }
-            out.push_str(&repr_depth(*item, depth + 1));
+            out.push_str(&repr_depth(*item));
         }
         if items.len() == 1 {
             out.push(',');
@@ -9405,7 +9665,7 @@ fn repr_depth(v: i64, depth: usize) -> String {
             if index > 0 {
                 out.push_str(", ");
             }
-            out.push_str(&repr_depth(*item, depth + 1));
+            out.push_str(&repr_depth(*item));
         }
         out.push('}');
         return out;
@@ -9418,7 +9678,7 @@ fn repr_depth(v: i64, depth: usize) -> String {
             }
             out.push_str(name);
             out.push('=');
-            out.push_str(&repr_depth(*item, depth + 1));
+            out.push_str(&repr_depth(*item));
         }
         out.push(')');
         return out;
@@ -9429,9 +9689,9 @@ fn repr_depth(v: i64, depth: usize) -> String {
             if index > 0 {
                 out.push_str(", ");
             }
-            out.push_str(&repr_depth(*key, depth + 1));
+            out.push_str(&repr_depth(*key));
             out.push_str(": ");
-            out.push_str(&repr_depth(*item, depth + 1));
+            out.push_str(&repr_depth(*item));
         }
         out.push_str("})");
         return out;
@@ -9455,9 +9715,9 @@ fn repr_depth(v: i64, depth: usize) -> String {
             if index > 0 {
                 out.push_str(", ");
             }
-            out.push_str(&repr_depth(*key, depth + 1));
+            out.push_str(&repr_depth(*key));
             out.push_str(": ");
-            out.push_str(&repr_depth(*value, depth + 1));
+            out.push_str(&repr_depth(*value));
         }
         out.push('}');
         return out;
@@ -9686,6 +9946,51 @@ mod tests {
 
         let nested = list_new(vec![list_new(vec![one, encode_int(2).unwrap()]), dict]);
         assert_eq!(to_string(nested), "[[1, 2], {'k': 1}]");
+    }
+
+    #[test]
+    fn deeply_nested_repr_raises_recursion_error() {
+        crate::exc::init();
+        let marker = crate::heap::root_values(&[]);
+        let mut nested = list_new(Vec::new());
+        // Far past the default limit, like CPython's `test_repr_deep`.
+        for _ in 0..1500 {
+            nested = list_new(vec![nested]);
+            crate::heap::push_scoped_root(nested);
+        }
+        let rendered = repr(nested);
+        crate::heap::release_roots(marker);
+        assert!(rendered.starts_with('['));
+        assert!(crate::exc::pending());
+        assert_eq!(
+            crate::exc::pending_tag(),
+            crate::exc::RECURSION_ERROR as i64
+        );
+    }
+
+    #[test]
+    fn shallow_repr_stays_below_the_recursion_limit() {
+        crate::exc::init();
+        let one = encode_int(1).unwrap();
+        let nested = list_new(vec![list_new(vec![one])]);
+        assert_eq!(repr(nested), "[[1]]");
+        assert_eq!(to_string(nested), "[[1]]");
+        assert!(!crate::exc::pending());
+    }
+
+    #[test]
+    fn cyclic_repr_elides_instead_of_raising() {
+        crate::exc::init();
+        let marker = crate::heap::root_values(&[]);
+        let cyclic = list_new(Vec::new());
+        crate::heap::push_scoped_root(cyclic);
+        if let Some(mut items) = list_items_mut(cyclic) {
+            items.push(cyclic);
+            crate::heap::write_barrier_edge(cyclic, cyclic);
+        }
+        assert_eq!(repr(cyclic), "[[...]]");
+        assert!(!crate::exc::pending());
+        crate::heap::release_roots(marker);
     }
 
     #[test]

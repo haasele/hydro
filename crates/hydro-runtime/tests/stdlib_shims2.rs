@@ -566,8 +566,9 @@ fn gc_reports_the_real_collector() {
         }
         assert_error_tag(NOT_IMPLEMENTED_ERROR);
     }
-    module_get("gc", "garbage");
-    assert_error_tag(ATTRIBUTE_ERROR);
+    let garbage = module_get("gc", "garbage");
+    assert_no_error();
+    assert_eq!(hydro_len(garbage), 0);
 }
 
 // -------------------------------------------------------------------------

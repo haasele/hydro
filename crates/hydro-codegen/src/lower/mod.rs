@@ -273,6 +273,9 @@ struct Runtime {
     raise_from: FuncId,
     raise_value_from: FuncId,
     exc_matches: FuncId,
+    /// `except <expr>:` value matcher: (exception, matcher) -> i32, with
+    /// CPython's `TypeError` for operands that cannot catch.
+    exc_matches_value: FuncId,
     uncaught: FuncId,
     runtime_init: FuncId,
     register_function: FuncId,
@@ -765,6 +768,13 @@ impl Runtime {
             // `except BaseException`; returns 1 when the pending exception
             // matches the encoded hierarchy kind.
             exc_matches: declare_runtime(module, "hydro_exc_matches", &[i32t], Some(i32t))?,
+            // Dynamic `except <expr>:` matcher: (exception, matcher) -> i32.
+            exc_matches_value: declare_runtime(
+                module,
+                "hydro_exc_matches_value",
+                &[i64t, i64t],
+                Some(i32t),
+            )?,
             uncaught: declare_runtime(module, "hydro_uncaught", &[], Some(i64t))?,
             runtime_init: declare_runtime(module, "hydro_runtime_init", &[], None)?,
             register_function: declare_runtime(
@@ -4310,14 +4320,19 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     // expression only when an exception reaches it, so the
                     // matcher runs here, in source order. The pending flag
                     // marks the exception being dispatched, so it is cleared
-                    // while the matcher and `isinstance` run (otherwise their
-                    // own runtime checks would mistake it for a fresh
-                    // failure); the parked value is restored before branching
-                    // so the remaining arms and the handler entry still see
-                    // it. Matching goes through the runtime `isinstance`
-                    // builtin, which walks the same CPython hierarchy as
-                    // `hydro_exc_matches` (including user-defined exception
-                    // classes and tuples); codegen keeps no second tag table.
+                    // while the matcher runs (otherwise its own runtime checks
+                    // would mistake it for a fresh failure); the parked value
+                    // is restored before branching so the remaining arms and
+                    // the handler entry still see it.
+                    //
+                    // Matching goes through `hydro_exc_matches_value`, which
+                    // walks the same CPython hierarchy as `hydro_exc_matches`
+                    // and rejects operands that cannot catch
+                    // (`except SomeObject:`, `except "spam":`, or an exception
+                    // *instance*) with CPython's `TypeError`. A matcher that
+                    // raises replaces the exception being dispatched: the
+                    // parked value is not restored, so the error propagates to
+                    // the enclosing target instead of being swallowed.
                     (None, Some(expr)) => {
                         let value_id = self.runtime.exc_value;
                         let exception = self.call_rt(value_id, &[])?;
@@ -4326,13 +4341,34 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                         let clear_id = self.runtime.exc_clear;
                         self.call_rt(clear_id, &[])?;
                         let matcher = self.lower_expr(expr)?;
+                        // A matcher expression that raised (an undefined
+                        // name, a failing call) replaces the exception being
+                        // dispatched; propagate it unchanged.
+                        let pending_id = self.runtime.exc_pending;
+                        let pending = self.call_rt(pending_id, &[])?;
+                        let eval_failed = self.builder.ins().icmp_imm(IntCC::NotEqual, pending, 0);
+                        let match_block = self.builder.create_block();
+                        self.builder
+                            .ins()
+                            .brif(eval_failed, unmatched, &[], match_block, &[]);
+                        self.switch_to(match_block);
                         let exception = self.builder.use_var(parked);
-                        let caught =
-                            self.lower_builtins_direct("isinstance", &[exception, matcher])?;
-                        let matches = self.truthy_cond(caught)?;
+                        let matcher_id = self.runtime.exc_matches_value;
+                        let caught = self.call_rt(matcher_id, &[exception, matcher])?;
+                        let matches = self.builder.ins().icmp_imm(IntCC::NotEqual, caught, 0);
+                        let pending = self.call_rt(pending_id, &[])?;
+                        let failed = self.builder.ins().icmp_imm(IntCC::NotEqual, pending, 0);
+                        let restore = self.builder.create_block();
+                        let dispatch = self.builder.create_block();
+                        self.builder
+                            .ins()
+                            .brif(failed, unmatched, &[], restore, &[]);
+                        self.switch_to(restore);
                         let exception = self.builder.use_var(parked);
                         let raise_id = self.runtime.raise_value;
                         self.call_rt(raise_id, &[exception])?;
+                        self.jump(dispatch);
+                        self.switch_to(dispatch);
                         self.builder
                             .ins()
                             .brif(matches, handler_block, &[], next_handler, &[]);
@@ -10664,11 +10700,11 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_except_matchers_lower_through_isinstance() {
+    fn dynamic_except_matchers_use_the_value_matcher() {
         // `except (ValueError, TypeError):` as an expression and
         // `except <runtime value>:`: the matcher is evaluated when the arm is
-        // reached and matched with the runtime `isinstance` builtin, so the
-        // generated code calls `hydro_module_call` instead of the tag matcher.
+        // reached and matched with the runtime value matcher, so the generated
+        // code calls `hydro_exc_matches_value` instead of the tag matcher.
         let matcher = Expr::new(ExprKind::ExceptionClass(ExcKind::ValueError), Type::Any, 2);
         let program = Program {
             source_name: "test.py".to_string(),
@@ -10713,8 +10749,8 @@ mod tests {
             "a dynamic matcher must not fall back to the static tag table"
         );
         assert!(
-            runtime_call_sites(&object, "hydro_module_call") > 0,
-            "the matcher must dispatch the runtime isinstance builtin"
+            runtime_call_sites(&object, "hydro_exc_matches_value") > 0,
+            "the matcher must dispatch the runtime value matcher"
         );
         for symbol in ["hydro_exc_value", "hydro_exc_clear", "hydro_raise_value"] {
             assert!(
@@ -10807,8 +10843,8 @@ mod tests {
             "the static arms keep the tag matcher"
         );
         assert!(
-            runtime_call_sites(&object, "hydro_module_call") > 0,
-            "the call matcher still dispatches isinstance"
+            runtime_call_sites(&object, "hydro_exc_matches_value") > 0,
+            "the call matcher dispatches the value matcher"
         );
     }
 

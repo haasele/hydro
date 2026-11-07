@@ -235,6 +235,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         ),
         // `types.coroutine(func)`.
         "coroutine" => coroutine_decorator(args.first().copied().unwrap_or(NONE)),
+        "new_class" => new_class(args, &[]),
         "get_original_bases" => get_original_bases(args.first().copied().unwrap_or(NONE)),
         "resolve_bases" => args.first().copied().unwrap_or(NONE),
         _ => exc::raise_with_message(
@@ -271,9 +272,212 @@ fn prepare_class(args: &[i64]) -> i64 {
     value::tuple_new(vec![metaclass, namespace, kwds])
 }
 
+/// Parameter names of `types.new_class` in declaration order.
+const NEW_CLASS_PARAMS: [&str; 4] = ["name", "bases", "kwds", "exec_body"];
+
+/// `types.new_class(name, bases=(), kwds=None, exec_body=None)`: dynamic class
+/// creation through the metaclass protocol.
+///
+/// `kwds` is copied rather than mutated (CPython also leaves the caller's
+/// mapping untouched), `metaclass` is popped from it, `exec_body` fills the
+/// namespace dict *before* the class exists, and the remaining keywords are
+/// forwarded to the metaclass.
+///
+/// A metaclass that is a class runs Hydro's class-creation protocol
+/// (`__prepare__`/`__new__`/`__init__`). A plain callable metaclass — CPython
+/// allows one, e.g. `metaclass=some_function` — is invoked directly as
+/// `meta(name, bases, ns, **kwds)` and its return value is handed back.
+pub(crate) fn new_class(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if args.len() > NEW_CLASS_PARAMS.len() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "new_class() takes at most 4 arguments ({} given)",
+                args.len()
+            ),
+        );
+    }
+    let mut slots = [NONE; NEW_CLASS_PARAMS.len()];
+    for (index, argument) in args.iter().enumerate() {
+        slots[index] = *argument;
+    }
+    for (name, item) in keywords {
+        let Some(index) = NEW_CLASS_PARAMS.iter().position(|param| param == name) else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("new_class() got an unexpected keyword argument '{name}'"),
+            );
+        };
+        if slots[index] != NONE {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("new_class() got multiple values for argument '{name}'"),
+            );
+        }
+        slots[index] = *item;
+    }
+    new_class_impl(slots[0], slots[1], slots[2], slots[3])
+}
+
+/// Identity-stable native function for `types.new_class`.
+///
+/// `module_get_named` normally allocates a fresh native function per access;
+/// repeated reads of `types.new_class` are observable (`is` comparisons in
+/// generic-model code), so the value is cached in the globals registry.
+pub(crate) fn new_class_function() -> i64 {
+    if let Some(cached) = globals::registry_get("types.new_class") {
+        return cached;
+    }
+    let function = value::native_function_new("types", "new_class", NEW_CLASS_PARAMS.len());
+    globals::registry_set("types.new_class", function);
+    function
+}
+
+fn new_class_impl(name: i64, bases: i64, kwds: i64, exec_body: i64) -> i64 {
+    let Some(name_text) = value::as_str(name) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "new_class() argument 1 must be str, not {}",
+                value::type_name(name)
+            ),
+        );
+    };
+    let name_text = name_text.to_string();
+    let bases: Vec<i64> = if bases == NONE {
+        Vec::new()
+    } else if let Some(items) = value::as_tuple(bases) {
+        items.to_vec()
+    } else if let Some(items) = value::as_list(bases) {
+        // CPython's `resolve_bases` converts the iterable to a list, so a
+        // list argument is accepted here even though `type()` itself is
+        // strict about tuples.
+        items.to_vec()
+    } else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "new_class() argument 2 must be a tuple, not {}",
+                value::type_name(bases)
+            ),
+        );
+    };
+    let kwd_pairs: Vec<(i64, i64)> = if kwds == NONE {
+        Vec::new()
+    } else if let Some(pairs) = value::as_dict(kwds) {
+        pairs.to_vec()
+    } else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "new_class() argument 'kwds' must be a mapping, not {}",
+                value::type_name(kwds)
+            ),
+        );
+    };
+    let mut metaclass = NONE;
+    let mut forwarded: Vec<(String, i64)> = Vec::with_capacity(kwd_pairs.len());
+    for (key, item) in kwd_pairs {
+        let Some(key_text) = value::as_str(key) else {
+            return exc::raise_with_message(TYPE_ERROR, "keywords must be strings");
+        };
+        if key_text == "metaclass" {
+            metaclass = item;
+        } else {
+            forwarded.push((key_text.to_string(), item));
+        }
+    }
+    if metaclass != NONE {
+        // `metaclass=type` may arrive as the builtin `type` spelling.
+        metaclass = value::normalize_class_base(metaclass);
+    }
+    // Without an explicit metaclass the class allocator derives it from the
+    // (PEP 560-resolved) bases, which is exactly `type(bases[0])` for ordinary
+    // classes and `type` for an empty base list.
+
+    // CPython builds the namespace (through `__prepare__`) before running
+    // `exec_body`; the class allocator below runs `__prepare__` and then adds
+    // these entries, which is observationally equivalent for the namespace
+    // contents.
+    let namespace = value::dict_new(Vec::new());
+    let namespace_root = heap::root_values(std::slice::from_ref(&namespace));
+    if exec_body != NONE {
+        let _ = crate::builtins::call(exec_body, 1, &namespace as *const i64);
+        if exc::pending() {
+            heap::release_roots(namespace_root);
+            return NONE;
+        }
+    }
+    let entries: Vec<(i64, i64)> = value::as_dict(namespace)
+        .map(|pairs| pairs.to_vec())
+        .unwrap_or_default();
+
+    // `NONE` means "no explicit metaclass": the allocator resolves it from the
+    // bases, so that is still the class-creation path.
+    if metaclass == NONE || value::as_class(metaclass).is_some() {
+        let mut methods: Vec<(String, i64, MethodKind)> = Vec::with_capacity(entries.len());
+        let mut attrs: Vec<(String, i64)> = Vec::with_capacity(entries.len());
+        for (key, item) in entries {
+            let Some(attr) = value::as_str(key) else {
+                heap::release_roots(namespace_root);
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "new_class() namespace keys must be strings",
+                );
+            };
+            if value::as_function(item).is_some() {
+                methods.push((attr.to_string(), item, MethodKind::Normal));
+            } else {
+                attrs.push((attr.to_string(), item));
+            }
+        }
+        let created =
+            value::class_new_multi_kw(name_text, bases, metaclass, methods, attrs, &forwarded);
+        heap::release_roots(namespace_root);
+        return created;
+    }
+
+    if !value::truthy(crate::builtins::callable(metaclass)) {
+        heap::release_roots(namespace_root);
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "new_class() metaclass must be a class or callable, not {}",
+                value::type_name(metaclass)
+            ),
+        );
+    }
+    // Non-class metaclass: call it exactly like CPython's
+    // `meta(name, resolved_bases, ns, **kwds)`.
+    let name_value = value::str_alloc(name_text);
+    let bases_value = value::tuple_new(bases);
+    let call_args = [name_value, bases_value, namespace];
+    let mut pair_args: Vec<i64> = Vec::with_capacity(forwarded.len() * 2);
+    for (key, item) in &forwarded {
+        pair_args.push(value::str_alloc(key.clone()));
+        pair_args.push(*item);
+    }
+    let mut keep = call_args.to_vec();
+    keep.extend_from_slice(&pair_args);
+    let roots = heap::root_values(&keep);
+    let result = crate::builtins::call_kw(
+        metaclass,
+        call_args.len(),
+        call_args.as_ptr(),
+        forwarded.len(),
+        pair_args.as_ptr(),
+    );
+    heap::release_roots(roots);
+    heap::release_roots(namespace_root);
+    result
+}
+
 /// Keyword-aware `types` dispatch: `DynamicClassAttribute` accepts the four
 /// CPython parameter names.
 pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if function == "new_class" {
+        return new_class(args, keywords);
+    }
     if function == "SimpleNamespace" {
         if args.len() > 1 {
             return exc::raise_with_message(
@@ -1271,6 +1475,138 @@ mod tests {
             Some("function")
         );
         assert_eq!(function_type_class(), second);
+    }
+
+    extern "C" fn body_writes_attributes(argv: *const i64) -> i64 {
+        // SAFETY: the wrapper calling convention passes the namespace dict as
+        // the single argument.
+        let namespace = unsafe { *argv };
+        for (name, number) in [("x", 0i64), ("y", 1)] {
+            let key = value::str_alloc(name.to_string());
+            let item = value::encode_int(number).expect("tagged int");
+            let roots = crate::heap::root_values(&[key, item]);
+            crate::container::dict_set(namespace, key, item);
+            crate::heap::release_roots(roots);
+        }
+        NONE
+    }
+
+    extern "C" fn body_writes_method(argv: *const i64) -> i64 {
+        // SAFETY: see [`body_writes_attributes`].
+        let namespace = unsafe { *argv };
+        let key = value::str_alloc("f".to_string());
+        let method = value::native_function_new("types", "_new_class_test_method", 0);
+        let roots = crate::heap::root_values(&[key, method]);
+        crate::container::dict_set(namespace, key, method);
+        crate::heap::release_roots(roots);
+        NONE
+    }
+
+    extern "C" fn returns_seven(_argv: *const i64) -> i64 {
+        value::encode_int(7).expect("tagged int")
+    }
+
+    #[test]
+    fn new_class_defaults_create_an_empty_class() {
+        exc::init();
+        let class = new_class(&[text("C")], &[]);
+        assert!(!exc::pending(), "new_class raised");
+        assert_eq!(as_class(class).map(|state| state.name.as_str()), Some("C"));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn new_class_runs_exec_body_before_creation() {
+        exc::init();
+        let bases = value::tuple_new(Vec::new());
+        let kwds = value::dict_new(Vec::new());
+        let body = value::function_new(
+            body_writes_attributes as *const () as usize,
+            1,
+            "body".to_string(),
+        );
+        let class = new_class(&[text("C"), bases, kwds, body], &[]);
+        assert!(!exc::pending(), "new_class raised");
+        let state = as_class(class).expect("class value");
+        assert_eq!(state.name, "C");
+        // Both namespace entries were installed before the class existed.
+        match value::class_own_lookup(class, "x") {
+            Some(value::ClassEntry::Attr(item)) => {
+                assert_eq!(value::as_integer(item), Some(0))
+            }
+            _ => panic!("exec_body attribute x is missing"),
+        }
+        match value::class_own_lookup(class, "y") {
+            Some(value::ClassEntry::Attr(item)) => {
+                assert_eq!(value::as_integer(item), Some(1))
+            }
+            _ => panic!("exec_body attribute y is missing"),
+        }
+
+        // A function placed in the namespace becomes a bound method.
+        let kwds = value::dict_new(Vec::new());
+        let body = value::function_new(
+            body_writes_method as *const () as usize,
+            1,
+            "body".to_string(),
+        );
+        let class = new_class(&[text("D"), value::tuple_new(Vec::new()), kwds, body], &[]);
+        assert!(!exc::pending(), "new_class raised");
+        assert!(matches!(
+            value::class_own_lookup(class, "f"),
+            Some(value::ClassEntry::Method(MethodKind::Normal, _))
+        ));
+    }
+
+    #[test]
+    fn new_class_honors_metaclass_from_kwds_without_mutating_it() {
+        exc::init();
+        let meta = value::class_new("Meta".to_string(), value::native_type_class(), Vec::new());
+        let kwds = value::dict_new(vec![(text("metaclass"), meta)]);
+        let class = new_class(&[text("C"), value::tuple_new(Vec::new()), kwds], &[]);
+        assert!(!exc::pending(), "new_class raised");
+        assert_eq!(as_class(class).map(|state| state.name.as_str()), Some("C"));
+        assert_eq!(value::class_metaclass(class), meta);
+        // `kwds` is copied, never mutated (CPython's `dict(kwds)`).
+        assert_eq!(value::as_dict(kwds).map(|pairs| pairs.len()), Some(1));
+
+        // A non-class callable metaclass is called directly.
+        let factory = value::function_new(
+            returns_seven as *const () as usize,
+            3,
+            "factory".to_string(),
+        );
+        let kwds = value::dict_new(vec![(text("metaclass"), factory)]);
+        let result = new_class(&[text("C"), value::tuple_new(Vec::new()), kwds], &[]);
+        assert!(!exc::pending(), "callable metaclass raised");
+        assert_eq!(value::as_integer(result), Some(7));
+    }
+
+    #[test]
+    fn new_class_rejects_invalid_bases_and_kwds() {
+        exc::init();
+        new_class(&[text("C"), text("not bases")], &[]);
+        assert!(exc::pending());
+        exc::clear();
+
+        new_class(
+            &[text("C"), value::tuple_new(Vec::new()), text("not kwds")],
+            &[],
+        );
+        assert!(exc::pending());
+        exc::clear();
+
+        new_class(&[value::encode_int(1).unwrap()], &[]);
+        assert!(exc::pending());
+        exc::clear();
+    }
+
+    #[test]
+    fn new_class_function_value_is_cached() {
+        exc::init();
+        let function = new_class_function();
+        assert_eq!(function, new_class_function());
+        assert!(value::as_function(function).is_some());
     }
 
     #[test]

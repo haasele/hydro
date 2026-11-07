@@ -407,9 +407,31 @@ impl MethodSig {
     }
 }
 
+/// Static signatures of the instance methods of integer values. `bool`
+/// inherits the whole surface; `__index__` is what `test_index` calls on
+/// literals (`6 .__index__()`, `True.__index__()`).
+const INT_METHODS: &[(&str, MethodSig)] = &[
+    ("bit_length", MethodSig::new(0, 0, &[], Type::Int)),
+    (
+        "to_bytes",
+        MethodSig::new(
+            1,
+            3,
+            &[ArgKind::Int, ArgKind::Str, ArgKind::Str],
+            Type::Bytes,
+        ),
+    ),
+    // The `__index__` protocol on integers answers the exact int value (and
+    // the plain int `1`/`0` for `True`/`False`).
+    ("__index__", MethodSig::new(0, 0, &[], Type::Int)),
+];
+
 const STR_METHODS: &[(&str, MethodSig)] = &[
     ("upper", MethodSig::new(0, 0, &[], Type::Str)),
     ("lower", MethodSig::new(0, 0, &[], Type::Str)),
+    // `casefold()` is the caseless-comparison fold; it takes no arguments and
+    // always returns a string.
+    ("casefold", MethodSig::new(0, 0, &[], Type::Str)),
     (
         "strip",
         MethodSig::new(0, 1, &[ArgKind::StrOrNone], Type::Str),
@@ -621,7 +643,12 @@ const LIST_METHODS: &[(&str, MethodSig)] = &[
     ("reverse", MethodSig::new(0, 0, &[], Type::None)),
     ("copy", MethodSig::new(0, 0, &[], Type::List)),
     ("count", MethodSig::new(1, 1, &[ArgKind::Any], Type::Int)),
-    ("index", MethodSig::new(1, 1, &[ArgKind::Any], Type::Int)),
+    (
+        // `list.index(value, start=0, stop=len)`; the bounds are slice
+        // indices, clipped to the list like a slice.
+        "index",
+        MethodSig::new(1, 3, &[ArgKind::Any, ArgKind::Int, ArgKind::Int], Type::Int),
+    ),
 ];
 
 const DICT_METHODS: &[(&str, MethodSig)] = &[
@@ -640,6 +667,9 @@ const DICT_METHODS: &[(&str, MethodSig)] = &[
         "pop",
         MethodSig::new(1, 2, &[ArgKind::Any, ArgKind::Any], Type::Any),
     ),
+    // `popitem()` takes no arguments and returns the removed `(key, value)`
+    // pair, so a literal `d.popitem()` keeps a tuple-typed result.
+    ("popitem", MethodSig::new(0, 0, &[], Type::Tuple)),
     (
         "update",
         MethodSig::new(1, 1, &[ArgKind::MappingOrPairs], Type::None),
@@ -833,6 +863,10 @@ fn builtin_class_method_result(builtin: Builtin, method: &str) -> Option<Type> {
         (Builtin::Int, "from_bytes") => Type::Int,
         (Builtin::Int, "to_bytes") => Type::Bytes,
         (Builtin::Int, "bit_length") => Type::Int,
+        // `int.__index__(value)` is the `__index__` protocol on the type; it
+        // answers an exact int (never a bool), so `operator.index`-style code
+        // keeps arithmetic on the result statically typed.
+        (Builtin::Int, "__index__") => Type::Int,
         (Builtin::Str, "maketrans") => Type::Dict,
         (Builtin::Bytes, "fromhex") => Type::Bytes,
         (Builtin::Bytes, "maketrans") => Type::Bytes,
@@ -1355,9 +1389,7 @@ impl<'a> Checker<'a> {
         let inferred_return = matches!(f.ret_ty, Ty::Var(_));
         let mut has_value = false;
         let mut has_bare = false;
-        for stmt in &f.body {
-            self.check_stmt(stmt, f, &mut has_value, &mut has_bare);
-        }
+        self.check_stmts(&f.body, f, &mut has_value, &mut has_bare);
 
         if f.is_module {
             return;
@@ -1485,6 +1517,14 @@ impl<'a> Checker<'a> {
         )
     }
 
+    /// Check a statement list, applying the narrowing each `assert`
+    /// establishes to the statements that follow it.
+    ///
+    /// `assert cond` either raises or guarantees `cond` for the rest of the
+    /// block, so it narrows exactly like the true branch of `if cond:`. The
+    /// facts are scoped to the list: an assert inside an `if`, `try` or loop
+    /// body is undone when that block ends, because the statements after it
+    /// may run on a path that skipped the block.
     fn check_stmts(
         &mut self,
         stmts: &[HStmt],
@@ -1492,8 +1532,31 @@ impl<'a> Checker<'a> {
         has_value: &mut bool,
         has_bare: &mut bool,
     ) {
+        let mut saved: Vec<(LocalId, Option<Ty>)> = Vec::new();
         for stmt in stmts {
             self.check_stmt(stmt, f, has_value, has_bare);
+            if let HStmtKind::Assert { test, .. } = &stmt.kind {
+                let mut facts = Vec::new();
+                self.narrow_facts(test, f, true, &mut facts);
+                for (id, ty) in facts {
+                    let previous = self.narrow.insert(id, ty);
+                    if !saved.iter().any(|(saved_id, _)| *saved_id == id) {
+                        saved.push((id, previous));
+                    }
+                }
+            }
+        }
+        // Undo in reverse: a statement list may mention the same local in
+        // several asserts, and the earliest save is the state to restore.
+        for (id, previous) in saved.into_iter().rev() {
+            match previous {
+                Some(ty) => {
+                    self.narrow.insert(id, ty);
+                }
+                None => {
+                    self.narrow.remove(&id);
+                }
+            }
         }
     }
 
@@ -1584,6 +1647,15 @@ impl<'a> Checker<'a> {
                 if self.inf.resolve(f.locals[local as usize].ty) == Ty::Concrete(Type::None) {
                     out.push((local, Ty::Concrete(Type::Any)));
                 }
+            }
+            // `assert x` / `if x:` guarantees a stored value is not one of the
+            // falsy shapes the model knows. The only such shape is `None`, so
+            // the local becomes dynamic (non-None) instead of keeping `None`.
+            HExprKind::Local(id)
+                if truthy
+                    && self.inf.resolve(f.locals[*id as usize].ty) == Ty::Concrete(Type::None) =>
+            {
+                out.push((*id, Ty::Concrete(Type::Any)));
             }
             _ => {}
         }
@@ -3207,6 +3279,7 @@ impl<'a> Checker<'a> {
             Ty::Var(_) | Ty::Concrete(Type::Any) => Type::Any,
             Ty::Concrete(receiver) => {
                 let table = match receiver {
+                    Type::Int | Type::Bool => INT_METHODS,
                     Type::Str => STR_METHODS,
                     Type::Bytes => BYTES_METHODS,
                     Type::List => LIST_METHODS,
@@ -5731,6 +5804,58 @@ fn emit_comp_clauses(clauses: &[HCompClause], inf: &mut Infer) -> Vec<CompClause
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod assert_narrowing_tests {
+    /// `assert M is not None` narrows an `M = None` local for the statements
+    /// that follow it in the same block. `http/cookies.py` assigns through a
+    /// morsel it created earlier exactly this way, so the assignment must
+    /// typecheck (it gates `test_copyreg`, `test_pickletools` and
+    /// `test_xpickle`, which import that module).
+    #[test]
+    fn assert_is_not_none_allows_item_assignment() {
+        let source = r#"
+def apply(parsed, items):
+    M = None
+    for tp, key, value in items:
+        if tp:
+            assert M is not None
+            M[key] = value
+        else:
+            M = parsed
+"#;
+        assert!(
+            crate::check_source(source, "assert_narrow.py").is_ok(),
+            "the assert must narrow the None local"
+        );
+    }
+
+    /// The narrowing is what makes the assignment valid: without the assert
+    /// the receiver is still statically `None` and the assignment is rejected.
+    #[test]
+    fn without_the_assert_the_none_receiver_still_fails() {
+        let source = r#"
+def apply(items):
+    M = None
+    for tp, key, value in items:
+        M[key] = value
+"#;
+        assert!(crate::check_source(source, "assert_narrow_missing.py").is_err());
+    }
+
+    /// A bare `assert M` also establishes that the stored value is not the
+    /// falsy `None` the model tracks.
+    #[test]
+    fn assert_of_a_none_local_narrows_to_a_dynamic_value() {
+        let source = r#"
+def apply():
+    M = None
+    assert M
+    M["k"] = 1
+"#;
+        assert!(crate::check_source(source, "assert_truthy.py").is_ok());
+    }
 }
 
 #[cfg(test)]

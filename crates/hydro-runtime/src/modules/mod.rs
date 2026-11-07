@@ -119,6 +119,7 @@ pub(crate) mod types;
 pub(crate) mod typing;
 pub(crate) mod unicodedata;
 pub(crate) mod unittest;
+pub(crate) mod unittest_assertions;
 pub(crate) mod warnings;
 pub(crate) mod weakref;
 pub(crate) mod zlib_mod;
@@ -370,6 +371,21 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
             max_args: 3,
             ret: hydro_ir::Type::None,
             params: &["self", "name", "doc"],
+            dynamic_keywords: false,
+        },
+    ),
+    // `types.CodeType.__init__`: CPython exposes it as a wrapper descriptor.
+    // `unittest/mock.py` inspects it at import time; the callable itself is a
+    // native no-op (`builtins_dispatch`), so the spec exists only to give
+    // `inspect.signature` a parameter list.
+    (
+        "builtins.__code_init__",
+        stdlib::FunctionSpec {
+            name: "__code_init__",
+            min_args: 1,
+            max_args: 1,
+            ret: hydro_ir::Type::None,
+            params: &["self"],
             dynamic_keywords: false,
         },
     ),
@@ -1927,6 +1943,18 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         "pickle.Unpickler.load",
         native_member("Unpickler.load", 1, 1),
     ),
+    (
+        "pickle.PickleBuffer.raw",
+        native_member("PickleBuffer.raw", 1, 1),
+    ),
+    (
+        "pickle.PickleBuffer.release",
+        native_member("PickleBuffer.release", 1, 1),
+    ),
+    (
+        "pickle.PickleBuffer.__bytes__",
+        native_member("PickleBuffer.__bytes__", 1, 1),
+    ),
     // `_curses.window` native method bodies. Every method takes the receiver
     // plus its own positional arguments, so the shared supplemental spec is
     // variadic above `self`.
@@ -2862,6 +2890,159 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         native_keyword_member("TestCase.fail", 1, 2, &["self", "msg"]),
     ),
     (
+        "unittest.TestCase.assertIsSubclass",
+        native_keyword_member(
+            "TestCase.assertIsSubclass",
+            3,
+            4,
+            &["self", "cls", "superclass", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertNotIsSubclass",
+        native_keyword_member(
+            "TestCase.assertNotIsSubclass",
+            3,
+            4,
+            &["self", "cls", "superclass", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertWarns",
+        native_dynamic_member(
+            "TestCase.assertWarns",
+            2,
+            usize::MAX,
+            &["self", "expected_warning"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertWarnsRegex",
+        native_dynamic_member(
+            "TestCase.assertWarnsRegex",
+            3,
+            usize::MAX,
+            &["self", "expected_warning", "expected_regex"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertLogs",
+        native_keyword_member("TestCase.assertLogs", 1, 3, &["self", "logger", "level"]),
+    ),
+    (
+        "unittest.TestCase.assertNoLogs",
+        native_keyword_member("TestCase.assertNoLogs", 1, 3, &["self", "logger", "level"]),
+    ),
+    (
+        "unittest.TestCase.assertStartsWith",
+        native_keyword_member(
+            "TestCase.assertStartsWith",
+            3,
+            4,
+            &["self", "s", "prefix", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertNotStartsWith",
+        native_keyword_member(
+            "TestCase.assertNotStartsWith",
+            3,
+            4,
+            &["self", "s", "prefix", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertEndsWith",
+        native_keyword_member(
+            "TestCase.assertEndsWith",
+            3,
+            4,
+            &["self", "s", "suffix", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.assertNotEndsWith",
+        native_keyword_member(
+            "TestCase.assertNotEndsWith",
+            3,
+            4,
+            &["self", "s", "suffix", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.failIf",
+        native_keyword_member("TestCase.failIf", 2, 3, &["self", "expr", "msg"]),
+    ),
+    (
+        "unittest.TestCase.failUnless",
+        native_keyword_member("TestCase.failUnless", 2, 3, &["self", "expr", "msg"]),
+    ),
+    (
+        "unittest.TestCase.failIfEqual",
+        native_keyword_member(
+            "TestCase.failIfEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.failUnlessEqual",
+        native_keyword_member(
+            "TestCase.failUnlessEqual",
+            3,
+            4,
+            &["self", "first", "second", "msg"],
+        ),
+    ),
+    (
+        "unittest.TestCase.failIfAlmostEqual",
+        native_keyword_member(
+            "TestCase.failIfAlmostEqual",
+            3,
+            6,
+            &["self", "first", "second", "places", "msg", "delta"],
+        ),
+    ),
+    (
+        "unittest.TestCase.failUnlessAlmostEqual",
+        native_keyword_member(
+            "TestCase.failUnlessAlmostEqual",
+            3,
+            6,
+            &["self", "first", "second", "places", "msg", "delta"],
+        ),
+    ),
+    (
+        "unittest.TestCase.failUnlessRaises",
+        native_dynamic_member(
+            "TestCase.failUnlessRaises",
+            2,
+            usize::MAX,
+            &["self", "expected_exception"],
+        ),
+    ),
+    (
+        "unittest._AssertWarnsContext.__enter__",
+        native_member("_AssertWarnsContext.__enter__", 1, 1),
+    ),
+    (
+        "unittest._AssertWarnsContext.__exit__",
+        native_member("_AssertWarnsContext.__exit__", 4, 4),
+    ),
+    (
+        "unittest._AssertLogsContext.__enter__",
+        native_member("_AssertLogsContext.__enter__", 1, 1),
+    ),
+    (
+        "unittest._AssertLogsContext.__exit__",
+        native_member("_AssertLogsContext.__exit__", 4, 4),
+    ),
+    (
+        "unittest._CapturingHandler.handle",
+        native_member("_CapturingHandler.handle", 2, 2),
+    ),
+    (
         "unittest.TestResult.__init__",
         native_dynamic_member(
             "TestResult.__init__",
@@ -3178,10 +3359,28 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         native_member("Random.uniform", 3, 3),
     ),
     (
+        "random.Random.gauss",
+        native_dynamic_member("Random.gauss", 1, 3, &["self", "mu", "sigma"]),
+    ),
+    (
+        "random.Random.normalvariate",
+        native_dynamic_member("Random.normalvariate", 1, 3, &["self", "mu", "sigma"]),
+    ),
+    (
         "random.Random.shuffle",
         native_member("Random.shuffle", 2, 2),
     ),
     ("random.Random.sample", native_member("Random.sample", 3, 3)),
+    // `choices(population, weights=None, *, ...)` reaches the wrapper with the
+    // receiver plus the two positional slots.
+    (
+        "random.Random.choices",
+        native_member("Random.choices", 2, 3),
+    ),
+    (
+        "random.Random.randbytes",
+        native_member("Random.randbytes", 2, 2),
+    ),
     // The `random.SystemRandom` proxy carries the same method surface, bound
     // to the OS-backed generator (`secrets` reads these off the instance).
     (
@@ -3224,6 +3423,14 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         native_member("SystemRandom.uniform", 3, 3),
     ),
     (
+        "random.SystemRandom.gauss",
+        native_dynamic_member("SystemRandom.gauss", 1, 3, &["self", "mu", "sigma"]),
+    ),
+    (
+        "random.SystemRandom.normalvariate",
+        native_dynamic_member("SystemRandom.normalvariate", 1, 3, &["self", "mu", "sigma"]),
+    ),
+    (
         "random.SystemRandom.shuffle",
         native_member("SystemRandom.shuffle", 2, 2),
     ),
@@ -3238,6 +3445,10 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
     (
         "random.SystemRandom.randbytes",
         native_member("SystemRandom.randbytes", 2, 2),
+    ),
+    (
+        "random.SystemRandom.choices",
+        native_member("SystemRandom.choices", 2, 3),
     ),
     // `re._compiler`'s functions, reached as module attributes of the
     // deprecated `sre_compile` facade. They dispatch through `re`'s table.
@@ -3638,6 +3849,9 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     // `errno` attributes are platform-defined names resolved on demand; the
     // static spec table cannot enumerate them.
     if module == "errno" {
+        if let Some(value) = errno::constant_value(name) {
+            return value;
+        }
         return errno::lookup(name);
     }
     if module == "unittest" {
@@ -3655,6 +3869,13 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
             // cached class keeps `except unittest.SkipTest` working for user
             // subclasses such as `test.support.ResourceDenied`.
             "SkipTest" => return exc::exception_class(exc::SKIPPED),
+            // `unittest.mock` is the vendored CPython `unittest/mock.py`
+            // compiled ahead of time. It is a normal compiled module in
+            // `sys.modules`, but the native parent package has no
+            // `__path__`, so the attribute is resolved through the registry
+            // rather than by the nested-spec lookup below. Reading it never
+            // creates a second module value.
+            "mock" => return module_value_by_name("unittest.mock"),
             _ => {}
         }
     }
@@ -3746,6 +3967,9 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
             "UserString" => return collections::userstring_class(),
             "deque" => return collections_placeholder_class("deque"),
             "ChainMap" => return collections_placeholder_class("ChainMap"),
+            // `_count_elements` is a cached native function value; calls go
+            // through `collections::call` (and `call_kw` for keyword calls).
+            "_count_elements" => return collections::count_elements_function(),
             _ => {}
         }
     }
@@ -3796,6 +4020,12 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if let Some(class) = types::class_value(module, name) {
         return class;
     }
+    // `types.new_class` keeps one cached native function value so identity
+    // holds across reads and the generic keyword binder reaches the real
+    // implementation (`types::call`).
+    if module == "types" && name == "new_class" {
+        return types::new_class_function();
+    }
     // `types.FunctionType` is a class in CPython but is declared as a
     // constructor function for call lowering. Return the cached class (also
     // callable) so `is` holds across `types`/`_types`.
@@ -3829,6 +4059,9 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
         return class;
     }
     if let Some(class) = inspect::class_value(module, name) {
+        return class;
+    }
+    if let Some(class) = binascii::class_value(module, name) {
         return class;
     }
     if let Some(class) = socket::class_value(module, name) {
@@ -3884,6 +4117,11 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if module == "pickle" && name == "_Unpickler" {
         return pickle_unpickler_base_class();
     }
+    // `pickle.PickleBuffer` is a class in CPython; the spec declares it as a
+    // constructor so `PickleBuffer(...)` lowers as a module call.
+    if module == "pickle" && name == "PickleBuffer" {
+        return pickle_buffer_class();
+    }
     // `random.Random` is a class in CPython: callers read its methods from the
     // class value (`Random.getrandbits`) and only then instantiate it. The
     // runtime value is a cached proxy instance whose class carries those
@@ -3905,6 +4143,16 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     // class-level attribute access need a type, not a function.
     if module == "threading" && name == "Barrier" {
         return barrier_class();
+    }
+    // `threading.Semaphore`/`BoundedSemaphore` are classes in CPython. The
+    // spec declares them as constructors so module calls lower there, but the
+    // value itself must be the cached class: `type(sem)`, `isinstance(...)`
+    // and the `_value` property need a type.
+    if module == "threading" && name == "Semaphore" {
+        return semaphore_class(false);
+    }
+    if module == "threading" && name == "BoundedSemaphore" {
+        return semaphore_class(true);
     }
     // `pickle`'s three exception classes are part of its `__all__` and are
     // raised by CPython's implementation; expose the real subclass chain
@@ -4504,10 +4752,37 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
         "binascii" => binascii::call_kw(function, args, &keywords),
         "os" => os_call_kw(function, args, keywords),
         "os.path" => os_path_call_kw(function, args, &keywords),
-        // `random.Random.__call__(seed=...)` through the proxy value.
-        "random" => random_call(function, args),
+        // `random.Random.__call__(seed=...)` through the proxy value. The
+        // spec's named parameters were already bound into their slots; a name
+        // left over belongs to no signature -- except `choices`'s
+        // keyword-only `cum_weights`/`k`.
+        "random" => {
+            if function == "choices" {
+                return random_choices_keywords(args, &keywords);
+            }
+            if let Some((name, _)) = keywords.first() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("{function}() got an unexpected keyword argument '{name}'"),
+                );
+            }
+            random_call(function, args)
+        }
         "itertools" => itertools_call_kw(function, args, keywords),
         "time" => time_call_kw(function, args, keywords),
+        // `threading.Thread(..., kwargs=...)`, `Semaphore(value=...)` and the
+        // semaphore methods declare named parameters, which the generic
+        // binder already moved into their slots. Any name left over belongs
+        // to no signature.
+        "threading" => {
+            if let Some((name, _)) = keywords.first() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("{function}() got an unexpected keyword argument '{name}'"),
+                );
+            }
+            threading_call(function, args)
+        }
         // `textwrap`'s `wrap`/`fill`/`shorten`/`TextWrapper` take the
         // `TextWrapper` keyword set (`width`, `initial_indent`, ...).
         "textwrap" => textwrap::call_kw(function, args, &keywords),
@@ -5124,6 +5399,11 @@ fn itertools_groupby(args: &[i64]) -> i64 {
 /// `builtins` positional dispatch plus the runtime-only shape `format(value)`
 /// (CPython's `format_spec` defaults to the empty string).
 fn builtins_dispatch(function: &str, args: &[i64]) -> i64 {
+    // `types.CodeType.__init__` (the wrapper descriptor mock.py inspects):
+    // code objects are immutable, so the initializer is a no-op.
+    if function == "__code_init__" {
+        return NONE;
+    }
     if function == "format" && args.len() == 1 {
         let argv = [args[0], value::str_from_bytes(b"")];
         return crate::builtins::call_builtin(hydro_ir::Builtin::Format, 2, argv.as_ptr());
@@ -5297,6 +5577,7 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
             None => unittest::call(function, args),
         },
         "unittest.util" => unittest::util_call(function, args),
+        "unittest.result" => unittest_result_call(function, args),
         "pytest" => pytest::call(function, args),
         "binascii" => binascii::call(function, args),
         "base64" => base64::call(function, args),
@@ -5391,6 +5672,64 @@ pub(crate) fn unittest_test_suite_class() -> i64 {
     heap::release_roots(class_roots);
     heap::release_roots(method_roots);
     class
+}
+
+/// Dispatches the native surface of the `unittest.result` submodule.
+///
+/// The three result/runner classes are re-exported constants (see
+/// [`constant_value`]), so only CPython's `failfast` decorator needs a call
+/// path here.
+fn unittest_result_call(function: &str, args: &[i64]) -> i64 {
+    match function {
+        "failfast" => unittest_result_failfast(args),
+        "_failfast_apply" => unittest_result_failfast_apply(args),
+        _ => missing_attribute("unittest.result", function),
+    }
+}
+
+/// `failfast(method)`: CPython's `unittest.result.failfast` decorator.
+///
+/// Hydro has no runtime function factory, so the wrapper is a
+/// `functools.partial` of [`unittest_result_failfast_apply`] carrying the
+/// decorated callable. The observable contract is CPython's: when the
+/// receiver's `failfast` attribute is truthy the result is stopped before the
+/// decorated method runs, and the method's result is forwarded.
+fn unittest_result_failfast(args: &[i64]) -> i64 {
+    let Some(&method) = args.first() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "failfast() missing 1 required positional argument: 'method'",
+        );
+    };
+    let apply = value::native_function_new("unittest.result", "_failfast_apply", usize::MAX);
+    value::partial_new(apply, vec![method])
+}
+
+/// The body of the `failfast` wrapper: `apply(method, self, *args)`.
+fn unittest_result_failfast_apply(args: &[i64]) -> i64 {
+    let (Some(&method), Some(&receiver)) = (args.first(), args.get(1)) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "failfast wrapper missing the decorated method",
+        );
+    };
+    // CPython reads `getattr(self, 'failfast', False)`: a missing attribute
+    // means "not fail-fast", never an error.
+    let flag = crate::methods::getattr(receiver, "failfast".as_ptr(), 8);
+    if exc::pending() {
+        exc::clear();
+    } else if value::truthy(flag) {
+        let stop = crate::methods::getattr(receiver, "stop".as_ptr(), 4);
+        if exc::pending() {
+            return NONE;
+        }
+        crate::builtins::call(stop, 0, std::ptr::null());
+        if exc::pending() {
+            return NONE;
+        }
+    }
+    let rest = &args[1..];
+    crate::builtins::call(method, rest.len(), rest.as_ptr())
 }
 
 /// Dispatches the native methods of `unittest.TestSuite`.
@@ -7796,6 +8135,9 @@ fn os_path_constant(name: &str) -> Option<i64> {
         "extsep" => value::str_from_bytes(b"."),
         "curdir" => value::str_from_bytes(b"."),
         "pardir" => value::str_from_bytes(b".."),
+        // POSIX filenames are byte strings decoded as UTF-8 with
+        // `surrogateescape`, so arbitrary Unicode names are supported.
+        "supports_unicode_filenames" => value::TRUE,
         // CPython 3.14's `os.path.ALLOW_MISSING`: a unique sentinel that
         // `pathlib` passes to distinguish "argument omitted" from an explicit
         // `None`. It is a cached instance so identity comparisons hold across
@@ -7968,13 +8310,31 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `codecs.CodecInfo`: the tuple-like registry entry `encodings` builds
         // with `CodecInfo(*entry)` and checks with `isinstance`.
         ("codecs" | "_codecs", "CodecInfo") => codecs_codecinfo_class(),
-        // `unittest` declares its two classes as spec constants; they are
+        // `unittest` declares its classes as spec constants; they are
         // constructor values over native classes, not module functions.
         ("unittest", name) => match name {
             "TestCase" => unittest::test_case(),
-            "TestSuite" => unittest_test_suite_class(),
+            "TestSuite" | "BaseTestSuite" => unittest_test_suite_class(),
+            "TestResult" => unittest::test_result_class(),
+            "TextTestResult" => unittest::text_test_result_class(),
+            "TextTestRunner" => unittest::text_test_runner_class(),
+            "TestLoader" => unittest::test_loader_class(),
+            "TestProgram" => unittest::test_program_class(),
+            "defaultTestLoader" => unittest::default_test_loader(),
+            "mock" => module_value_by_name("unittest.mock"),
             _ => missing_attribute("unittest", name),
         },
+        // `unittest.result` re-exports the native result/runner classes, so
+        // the submodule and the parent package share one class object per
+        // name. `failfast` is a function and is dispatched by
+        // [`unittest_result_call`].
+        ("unittest.result", name) => match name {
+            "TestResult" => unittest::test_result_class(),
+            "TextTestResult" => unittest::text_test_result_class(),
+            "TextTestRunner" => unittest::text_test_runner_class(),
+            _ => missing_attribute("unittest.result", name),
+        },
+        ("gc", name) => gc::constant(name),
         ("types", name) => types::constant(name),
         ("json", "JSONDecodeError") => crate::exc::exception_class(crate::exc::VALUE_ERROR),
         ("annotationlib", name) => annotationlib::constant(name),
@@ -8049,6 +8409,9 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `i64::MAX` does not fit into the 61-bit tagged integer; the
         // documented value is `2^60 - 1` (`value::MAX_INT`).
         ("sys", "maxsize") => encode_int(value::MAX_INT),
+        // `sys.maxunicode`: the maximum Unicode code point in a strict UTF-8
+        // build, `0x10FFFF`.
+        ("sys", "maxunicode") => encode_int(0x10FFFF),
         // Last uncaught exception (`sys.last_exc`/`last_type`/`last_value`/
         // `last_traceback`). CPython sets these only while an interactive
         // interpreter reports an exception; Hydro compiles and runs whole
@@ -8057,13 +8420,14 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `last_exc` behind `hasattr` and follows the same "no last
         // traceback" path it takes in CPython script mode.
         ("sys", "last_exc" | "last_type" | "last_value" | "last_traceback") => NONE,
-        // Fresh native streams over the standard descriptors on every
-        // resolution; `__std*__` are the original streams, which this runtime
-        // never rebinds, so both spellings resolve alike. They hold no Hydro
-        // children, so no rooting is required.
-        ("sys", "stdin") | ("sys", "__stdin__") => value::std_stream_new(0),
-        ("sys", "stdout") | ("sys", "__stdout__") => value::std_stream_new(1),
-        ("sys", "stderr") | ("sys", "__stderr__") => value::std_stream_new(2),
+        // Stable native streams over the standard descriptors; `__std*__` are
+        // the original streams, which this runtime never rebinds, so both
+        // spellings resolve alike. The values are cached because CPython's
+        // `sys.stdout`/`sys.stderr` are stable objects (`contextlib` compares
+        // the restored stream with the original).
+        ("sys", "stdin") | ("sys", "__stdin__") => std_stream_constant(0),
+        ("sys", "stdout") | ("sys", "__stdout__") => std_stream_constant(1),
+        ("sys", "stderr") | ("sys", "__stderr__") => std_stream_constant(2),
         // `sys.flags` and `sys.monitoring` are cached objects (their identity
         // is observable); `sys.meta_path` is the cached finder list.
         ("sys", "flags") => sys_flags(),
@@ -8181,6 +8545,9 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `threading.BrokenBarrierError` subclasses `RuntimeError` and is
         // raised by `Barrier.wait` when the barrier breaks.
         ("threading", "BrokenBarrierError") => broken_barrier_class(),
+        // `threading._dangling`: the identity-stable list of live thread
+        // objects (`list(threading._dangling)` walks it).
+        ("threading", "_dangling") => threading_dangling(),
         // Help formatters are marker classes; `ArgumentParser` reads the
         // class name to select layout details. `SUPPRESS` is CPython's
         // sentinel string.
@@ -8199,7 +8566,11 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("asyncio", "CancelledError") => exc::exception_class(exc::CANCELLED_ERROR),
         ("asyncio.coroutines", "_is_coroutine") => asyncio::coroutines_constant("_is_coroutine")
             .unwrap_or_else(|| missing_attribute("asyncio.coroutines", "_is_coroutine")),
-        ("socket" | "_socket", name) => socket::constant(module, name),
+        ("socket" | "_socket", name) => match name {
+            // `socket.has_ipv6` is a build-time flag, not an integer option.
+            "has_ipv6" => value::bool_value(socket::has_ipv6()),
+            _ => socket::constant(module, name),
+        },
         ("select", name) => select::constant(name),
         ("getopt", name) => getopt::constant(name),
         ("selectors", name) => select::selectors_constant(name),
@@ -8207,6 +8578,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("subprocess", "PIPE") => encode_int(subprocess::PIPE),
         ("subprocess", "STDOUT") => encode_int(subprocess::STDOUT),
         ("subprocess", "DEVNULL") => encode_int(subprocess::DEVNULL),
+        ("subprocess", "CalledProcessError") => subprocess::called_process_error_class(),
         ("keyword", "kwlist") => keyword::kwlist(),
         ("keyword", "softkwlist") => keyword::softkwlist(),
         ("stat" | "_stat", name) => stat::constant(name),
@@ -8235,6 +8607,12 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("_opcode", name) => opcode::constant(name),
         ("_weakref" | "weakref", name) => weakref::constant(name),
         ("warnings" | "_warnings", name) => warnings::constant(name),
+        // `http.client`'s exception classes (`urllib.request` and the test
+        // suite catch `RemoteDisconnected` by identity).
+        ("http.client", name) => http::constant(name),
+        // `tempfile.__file__`/`_TemporaryFileWrapper` are runtime values.
+        ("tempfile", name) => tempfile::constant(name),
+        ("binascii", "Error") => binascii::error_class(),
         ("marshal", name) => marshal::constant(name),
         // `importlib`'s nested modules are real native modules; expose the
         // exact `sys.modules` entry so identity holds.
@@ -8260,6 +8638,9 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("collections" | "_collections", name) => collections::constant(name),
         ("site", name) => site::constant(name),
         ("ctypes" | "_ctypes", name) => ctypes::constant(name),
+        // The C locale defines no alternative digit symbols, so
+        // `locale.ALT_DIGITS` is the empty list.
+        ("locale", "ALT_DIGITS") => value::list_new(Vec::new()),
         ("locale", name) => locale::constant(name),
         ("pwd", name) => pwd::constant(name).unwrap_or_else(|| missing_attribute("pwd", name)),
         ("grp", name) => grp::constant(name).unwrap_or_else(|| missing_attribute("grp", name)),
@@ -8459,6 +8840,16 @@ pub(crate) fn contextlib_class_value(module: &str, name: &str) -> Option<i64> {
         "AbstractAsyncContextManager" => Some(abstract_manager_class(true)),
         // Real class returned by `contextmanager(func)`.
         "_GeneratorContextManager" => Some(context_manager_class()),
+        // The remaining context managers are classes in CPython: the module
+        // values support `isinstance`, subclassing and attribute reads, while
+        // module calls dispatch through `contextlib_call` and construct the
+        // same instances.
+        "suppress" => Some(suppress_class()),
+        "nullcontext" => Some(nullcontext_class()),
+        "closing" => Some(closing_class()),
+        "ContextDecorator" => Some(contextdecorator_class()),
+        "redirect_stdout" => Some(redirect_class(true)),
+        "redirect_stderr" => Some(redirect_class(false)),
         _ => None,
     }
 }
@@ -8568,6 +8959,327 @@ fn abstract_manager_subclasshook(args: &[i64], asynchronous: bool) -> i64 {
     }
 }
 
+/// Cached `contextlib.suppress` class. The constructor stores the accepted
+/// exception classes in `_exceptions`; `__exit__` suppresses the block
+/// exception when the raised type derives from any of them.
+fn suppress_class() -> i64 {
+    const KEY: &str = "contextlib.suppress.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let enter = value::native_function_new("contextlib", "_suppress_enter", 1);
+    let exit = value::native_function_new("contextlib", "_suppress_exit", 4);
+    let methods = vec![
+        ("__enter__".to_string(), enter),
+        ("__exit__".to_string(), exit),
+    ];
+    let method_roots = heap::root_values(&[enter, exit]);
+    let class = value::class_new("suppress".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// `contextlib.suppress(*exceptions)`: a reusable manager holding the
+/// accepted classes. `__enter__` returns `None`, like CPython.
+fn suppress_new(args: &[i64]) -> i64 {
+    let class = suppress_class();
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance]);
+    let exceptions = value::tuple_new(args.to_vec());
+    let exception_roots = heap::root_values(&[exceptions]);
+    value::instance_setattr(instance, "_exceptions".to_string(), exceptions);
+    heap::release_roots(exception_roots);
+    heap::release_roots(roots);
+    instance
+}
+
+/// `suppress.__exit__(exc_type, exc, tb)`: `True` when the block exception's
+/// type is one of the stored classes (or a subclass), `False` otherwise.
+fn suppress_exit(manager: i64, exc_type: i64) -> i64 {
+    if exc_type == NONE {
+        return FALSE;
+    }
+    let Some(exceptions) = value::instance_attr(manager, "_exceptions") else {
+        return FALSE;
+    };
+    let Some(classes) = value::as_tuple(exceptions) else {
+        return FALSE;
+    };
+    let suppressed = classes
+        .iter()
+        .any(|&class| value::is_subclass_of(exc_type, class));
+    value::bool_value(suppressed)
+}
+
+/// Cached `contextlib.nullcontext` class. `__enter__` returns `enter_result`
+/// (read back from the instance, so one manager is reusable) and `__exit__`
+/// returns `False`, which keeps exceptions propagating.
+fn nullcontext_class() -> i64 {
+    const KEY: &str = "contextlib.nullcontext.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let enter = value::native_function_new("contextlib", "_nullcontext_enter", 1);
+    let exit = value::native_function_new("contextlib", "_nullcontext_exit", 4);
+    let methods = vec![
+        ("__enter__".to_string(), enter),
+        ("__exit__".to_string(), exit),
+    ];
+    let method_roots = heap::root_values(&[enter, exit]);
+    let class = value::class_new("nullcontext".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// `contextlib.nullcontext(enter_result=None)`.
+fn nullcontext_new(enter_result: i64) -> i64 {
+    let class = nullcontext_class();
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance, enter_result]);
+    value::instance_setattr(instance, "enter_result".to_string(), enter_result);
+    heap::release_roots(roots);
+    instance
+}
+
+/// Cached `redirect_stdout`/`redirect_stderr` class. The manager keeps a
+/// stack of previous targets in `_old_targets`, so one instance is both
+/// reusable and re-entrant, matching CPython's `_RedirectStream`.
+fn redirect_class(stdout: bool) -> i64 {
+    let key = if stdout {
+        "contextlib.redirect_stdout.class"
+    } else {
+        "contextlib.redirect_stderr.class"
+    };
+    if let Some(cached) = globals::registry_get(key) {
+        return cached;
+    }
+    let (class_name, enter_name, exit_name) = if stdout {
+        (
+            "redirect_stdout",
+            "_redirect_stdout_enter",
+            "_redirect_stdout_exit",
+        )
+    } else {
+        (
+            "redirect_stderr",
+            "_redirect_stderr_enter",
+            "_redirect_stderr_exit",
+        )
+    };
+    let enter = value::native_function_new("contextlib", enter_name, 1);
+    let exit = value::native_function_new("contextlib", exit_name, 4);
+    let methods = vec![
+        ("__enter__".to_string(), enter),
+        ("__exit__".to_string(), exit),
+    ];
+    let method_roots = heap::root_values(&[enter, exit]);
+    let class = value::class_new(class_name.to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(key, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// `redirect_stdout(new_target)` / `redirect_stderr(new_target)`. Constructing
+/// the manager never rebinds the stream; only `__enter__` does.
+fn redirect_new(stdout: bool, new_target: i64) -> i64 {
+    let class = redirect_class(stdout);
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance, new_target]);
+    let old_targets = value::list_new(Vec::new());
+    let list_roots = heap::root_values(&[old_targets]);
+    value::instance_setattr(instance, "_new_target".to_string(), new_target);
+    value::instance_setattr(instance, "_old_targets".to_string(), old_targets);
+    heap::release_roots(list_roots);
+    heap::release_roots(roots);
+    instance
+}
+
+/// `_RedirectStream.__enter__`: save the live `sys.<stream>` value on the
+/// instance's stack, rebind the module attribute and return the new target.
+fn redirect_enter(manager: i64, stream: &str) -> i64 {
+    let previous = module_get_by_name("sys", stream);
+    let new_target = value::instance_attr(manager, "_new_target").unwrap_or(NONE);
+    let roots = heap::root_values(&[manager, previous, new_target]);
+    if let Some(old_targets) = value::instance_attr(manager, "_old_targets") {
+        let _ = container::list_append(old_targets, previous);
+    }
+    set_sys_stream(stream, new_target);
+    heap::release_roots(roots);
+    new_target
+}
+
+/// `_RedirectStream.__exit__`: restore the most recent saved target and
+/// report `False`, so the block exception keeps propagating.
+fn redirect_exit(manager: i64, stream: &str) -> i64 {
+    let previous = value::instance_attr(manager, "_old_targets")
+        .and_then(|old_targets| {
+            let mut items = value::list_items_mut(old_targets)?;
+            items.pop()
+        })
+        .unwrap_or(NONE);
+    let roots = heap::root_values(&[previous]);
+    set_sys_stream(stream, previous);
+    heap::release_roots(roots);
+    FALSE
+}
+
+/// Rebinds one of `sys`'s standard streams through the module override table,
+/// which is what `module.name` reads resolve first.
+fn set_sys_stream(stream: &str, target: i64) {
+    globals::set_attribute_override("sys", stream, target);
+    if let Some(dict) = cached_module_dict("sys") {
+        insert_namespace_entry(dict, stream, target);
+    }
+}
+
+/// Shared `sys.stdin`/`stdout`/`stderr` value.
+///
+/// CPython's standard streams are stable objects: repeated reads return the
+/// same stream, which `contextlib.redirect_stdout` relies on when it compares
+/// the restored target with the original one.
+fn std_stream_constant(fd: i64) -> i64 {
+    let key = match fd {
+        0 => "sys.stdin.stream",
+        1 => "sys.stdout.stream",
+        _ => "sys.stderr.stream",
+    };
+    if let Some(cached) = globals::registry_get(key) {
+        return cached;
+    }
+    let stream = value::std_stream_new(fd as i32);
+    globals::registry_set(key, stream);
+    stream
+}
+
+/// Cached `contextlib.ContextDecorator` base class. Subclasses provide
+/// `__enter__`/`__exit__`; `__call__` wraps a function in `with self:` and
+/// `_recreate_cm` is the per-call hook (CPython returns `self`).
+fn contextdecorator_class() -> i64 {
+    const KEY: &str = "contextlib.ContextDecorator.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let call = value::native_function_new("contextlib", "_contextdecorator_call", 2);
+    let recreate = value::native_function_new("contextlib", "_contextdecorator_recreate_cm", 1);
+    let methods = vec![
+        ("__call__".to_string(), call),
+        ("_recreate_cm".to_string(), recreate),
+    ];
+    let method_roots = heap::root_values(&[call, recreate]);
+    let class = value::class_new("ContextDecorator".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// `ContextDecorator.__call__(func)`: a wrapper that runs `func` inside the
+/// manager. The bound `(manager, func)` pair reaches
+/// `_contextdecorator_invoke`, which keeps the call-site keywords for `func`.
+fn contextdecorator_call(args: &[i64]) -> i64 {
+    let (Some(&manager), Some(&function)) = (args.first(), args.get(1)) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "contextlib.ContextDecorator.__call__() missing the decorated function",
+        );
+    };
+    let wrapper = value::native_function_new("contextlib", "_contextdecorator_invoke", usize::MAX);
+    let roots = heap::root_values(&[manager, function, wrapper]);
+    let result = value::partial_new(wrapper, vec![manager, function]);
+    heap::release_roots(roots);
+    result
+}
+
+/// Body of the wrapper `ContextDecorator.__call__` returns: enter the
+/// manager's `_recreate_cm()`, call the decorated function, then exit with
+/// the in-flight exception (if any), re-raising it unless the exit suppresses
+/// it.
+fn contextdecorator_invoke(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let (Some(&context), Some(&function)) = (args.first(), args.get(1)) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "contextlib._contextdecorator_invoke() missing the decorated function",
+        );
+    };
+    let positional = args.get(2..).unwrap_or(&[]);
+    let roots = heap::root_values(&[context, function]);
+    let manager =
+        crate::core::methods::call(context, b"_recreate_cm".as_ptr(), 12, 0, std::ptr::null());
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let manager_roots = heap::root_values(&[manager]);
+    let entered =
+        crate::core::methods::call(manager, b"__enter__".as_ptr(), 9, 0, std::ptr::null());
+    if exc::pending() {
+        heap::release_roots(manager_roots);
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let entered_roots = heap::root_values(&[entered]);
+    let result = if keywords.is_empty() {
+        crate::core::builtins::call(function, positional.len(), positional.as_ptr())
+    } else {
+        let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+        let mut keyword_values: Vec<i64> = positional.to_vec();
+        for (name, keyword) in keywords {
+            pairs.push(value::str_alloc(name.clone()));
+            pairs.push(*keyword);
+            keyword_values.push(*keyword);
+        }
+        let keyword_roots = heap::root_values(&keyword_values);
+        let result = crate::core::builtins::call_kw(
+            function,
+            positional.len(),
+            positional.as_ptr(),
+            keywords.len(),
+            pairs.as_ptr(),
+        );
+        heap::release_roots(keyword_roots);
+        result
+    };
+    heap::release_roots(entered_roots);
+    if !exc::pending() {
+        let details = [NONE, NONE, NONE];
+        let _ = crate::core::methods::call(manager, b"__exit__".as_ptr(), 8, 3, details.as_ptr());
+        heap::release_roots(manager_roots);
+        heap::release_roots(roots);
+        return if exc::pending() { NONE } else { result };
+    }
+    let tag = exc::pending_tag();
+    let error = exc::pending_value();
+    let _ = exc::clear();
+    let error_roots = heap::root_values(&[error]);
+    let details = [exc::exception_class(tag as u32), error, NONE];
+    let outcome = crate::core::methods::call(manager, b"__exit__".as_ptr(), 8, 3, details.as_ptr());
+    if exc::pending() {
+        heap::release_roots(error_roots);
+        heap::release_roots(manager_roots);
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let suppressed = value::truthy(outcome);
+    let raised = if suppressed {
+        NONE
+    } else {
+        exc::raise_value(error)
+    };
+    heap::release_roots(error_roots);
+    heap::release_roots(manager_roots);
+    heap::release_roots(roots);
+    raised
+}
+
 /// `contextlib.nullcontext(enter_result=None)`: CPython's no-op context
 /// manager as a native class instance. `__enter__` returns `enter_result`
 /// (read back from the instance, so the same manager can be reused) and
@@ -8589,39 +9301,22 @@ fn abstract_manager_subclasshook(args: &[i64], asynchronous: bool) -> i64 {
 /// context managers; their helpers live below.
 fn contextlib_call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "suppress" => {
-            let methods = vec![
-                (
-                    "__enter__".to_string(),
-                    value::native_function_new("contextlib", "_suppress_enter", 1),
-                ),
-                (
-                    "__exit__".to_string(),
-                    value::native_function_new("contextlib", "_suppress_exit", 4),
-                ),
-            ];
-            let class = value::class_new("suppress".to_string(), NONE, methods);
-            let _ = args;
-            value::instance_new(class)
-        }
-        "_suppress_enter" | "_suppress_exit" => NONE,
-        "nullcontext" => {
-            let methods = vec![
-                (
-                    "__enter__".to_string(),
-                    value::native_function_new("contextlib", "_nullcontext_enter", 1),
-                ),
-                (
-                    "__exit__".to_string(),
-                    value::native_function_new("contextlib", "_nullcontext_exit", 4),
-                ),
-            ];
-            let class = value::class_new("nullcontext".to_string(), NONE, methods);
-            let instance = value::instance_new(class);
-            let enter_result = args.first().copied().unwrap_or(NONE);
-            value::instance_setattr(instance, "enter_result".to_string(), enter_result);
-            instance
-        }
+        "suppress" => suppress_new(args),
+        "_suppress_enter" => NONE,
+        "_suppress_exit" => suppress_exit(args[0], args[1]),
+        "nullcontext" => nullcontext_new(args.first().copied().unwrap_or(NONE)),
+        // `redirect_stdout(new_target)`/`redirect_stderr(new_target)`: the
+        // constructor only records the target; `__enter__` rebinds the stream.
+        "redirect_stdout" => redirect_new(true, args[0]),
+        "redirect_stderr" => redirect_new(false, args[0]),
+        "_redirect_stdout_enter" => redirect_enter(args[0], "stdout"),
+        "_redirect_stdout_exit" => redirect_exit(args[0], "stdout"),
+        "_redirect_stderr_enter" => redirect_enter(args[0], "stderr"),
+        "_redirect_stderr_exit" => redirect_exit(args[0], "stderr"),
+        "ContextDecorator" => value::instance_new(contextdecorator_class()),
+        "_contextdecorator_call" => contextdecorator_call(args),
+        "_contextdecorator_recreate_cm" => args.first().copied().unwrap_or(NONE),
+        "_contextdecorator_invoke" => contextdecorator_invoke(args, &[]),
         "_nullcontext_enter" => value::instance_attr(args[0], "enter_result").unwrap_or(NONE),
         // Returning false keeps the exception raised by the block.
         "_nullcontext_exit" => value::bool_value(false),
@@ -8684,6 +9379,9 @@ fn contextlib_call(function: &str, args: &[i64]) -> i64 {
 /// `_exitstack_callback` keeps them for the registered callback.
 fn contextlib_call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     match function {
+        // The wrapper `ContextDecorator.__call__` returns forwards every
+        // call-site keyword to the decorated function.
+        "_contextdecorator_invoke" => contextdecorator_invoke(args, keywords),
         "_contextmanager_call" => match args.split_first() {
             Some((&decorated, rest)) => contextmanager_wrap(decorated, rest, keywords),
             None => exc::raise_with_message(
@@ -8697,10 +9395,18 @@ fn contextlib_call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
             Some((&stack, rest)) => exitstack_callback(stack, rest, keywords),
             None => missing_attribute("contextlib", function),
         },
-        _ => exc::raise_with_message(
-            TYPE_ERROR,
-            &format!("contextlib.{function}() does not accept keyword arguments"),
-        ),
+        // The generic binder already moved declared parameter names into their
+        // positional slots (`nullcontext(enter_result=...)`), so a call with no
+        // remaining names dispatches positionally.
+        _ => {
+            if keywords.is_empty() {
+                return contextlib_call(function, args);
+            }
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("contextlib.{function}() does not accept keyword arguments"),
+            )
+        }
     }
 }
 
@@ -10011,6 +10717,57 @@ fn random_uniform(rng: &value::RandomState, args: &[i64]) -> i64 {
     value::float_new(low + (high - low) * rng.next_f64())
 }
 
+/// Optional `mu`/`sigma` argument: omitted (or keyword-padded `None`) uses
+/// CPython's default; anything else follows the number protocol.
+fn random_normal_argument(args: &[i64], index: usize, default: f64) -> Result<f64, i64> {
+    match args.get(index).copied() {
+        None | Some(NONE) => Ok(default),
+        Some(argument) => number(argument),
+    }
+}
+
+/// `random.gauss(mu=0.0, sigma=1.0)`: Box-Muller (Lambert Meertens' corrected
+/// form). `x` and `1 - y` are the two uniforms; `cos(2*pi*x)` times the
+/// radial factor is a standard normal draw scaled by `sigma`.
+fn random_gauss(rng: &value::RandomState, args: &[i64]) -> i64 {
+    let mu = match random_normal_argument(args, 0, 0.0) {
+        Ok(mu) => mu,
+        Err(err) => return err,
+    };
+    let sigma = match random_normal_argument(args, 1, 1.0) {
+        Ok(sigma) => sigma,
+        Err(err) => return err,
+    };
+    let x2pi = rng.next_f64() * std::f64::consts::TAU;
+    let g2rad = (-2.0 * (1.0 - rng.next_f64()).ln()).sqrt();
+    let z = x2pi.cos() * g2rad;
+    value::float_new(mu + z * sigma)
+}
+
+/// `random.normalvariate(mu=0.0, sigma=1.0)`: the Kinderman-Monahan ratio of
+/// uniforms method, the same generator CPython uses.
+fn random_normalvariate(rng: &value::RandomState, args: &[i64]) -> i64 {
+    let mu = match random_normal_argument(args, 0, 0.0) {
+        Ok(mu) => mu,
+        Err(err) => return err,
+    };
+    let sigma = match random_normal_argument(args, 1, 1.0) {
+        Ok(sigma) => sigma,
+        Err(err) => return err,
+    };
+    // CPython's `NV_MAGICCONST = 4 * exp(-0.5) / sqrt(2)`.
+    const NV_MAGICCONST: f64 = 1.715_527_769_921_413_5;
+    loop {
+        let u1 = rng.next_f64();
+        let u2 = 1.0 - rng.next_f64();
+        let z = NV_MAGICCONST * (u1 - 0.5) / u2;
+        let zz = z * z / 4.0;
+        if zz <= -u2.ln() {
+            return value::float_new(mu + z * sigma);
+        }
+    }
+}
+
 /// Mirrors `ops::MAX_BIGINT_BITS` (8 Mibit, ~1 MiB of magnitude) so a random
 /// draw cannot allocate integers the rest of the runtime refuses to produce.
 const MAX_GETRANDBITS: i64 = 1 << 23;
@@ -10123,6 +10880,332 @@ fn random_sample(rng: &value::RandomState, args: &[i64]) -> i64 {
     result
 }
 
+/// Population backing `choices`: the sequences CPython can index.
+///
+/// `range` stays lazy so a huge population never materialises; only the `k`
+/// selected elements are produced.
+enum ChoicesSource {
+    Values(Vec<i64>),
+    Chars(Vec<char>),
+    Range { start: i64, step: i64, len: usize },
+}
+
+impl ChoicesSource {
+    fn len(&self) -> usize {
+        match self {
+            ChoicesSource::Values(items) => items.len(),
+            ChoicesSource::Chars(chars) => chars.len(),
+            ChoicesSource::Range { len, .. } => *len,
+        }
+    }
+
+    fn get(&self, index: usize) -> i64 {
+        match self {
+            ChoicesSource::Values(items) => items[index],
+            ChoicesSource::Chars(chars) => value::str_alloc(chars[index].to_string()),
+            ChoicesSource::Range { start, step, .. } => {
+                let offset = i128::from(*start) + i128::from(*step) * index as i128;
+                match i64::try_from(offset) {
+                    Ok(number) => encode_int(number),
+                    Err(_) => value::bigint_new(BigInt::from(offset)),
+                }
+            }
+        }
+    }
+}
+
+/// `len(population)`-compatible conversion for `choices`. Non-sequences raise
+/// CPython's `TypeError` from `len()`.
+fn choices_source(population: i64) -> Result<ChoicesSource, i64> {
+    if let Some(items) = value::as_list(population) {
+        return Ok(ChoicesSource::Values(items.to_vec()));
+    }
+    if let Some(items) = value::as_tuple(population) {
+        return Ok(ChoicesSource::Values(items.to_vec()));
+    }
+    if let Some(text) = value::as_str(population) {
+        return Ok(ChoicesSource::Chars(text.chars().collect()));
+    }
+    if let Some(bytes) = value::as_bytes(population) {
+        return Ok(ChoicesSource::Values(
+            bytes
+                .iter()
+                .map(|byte| encode_int(i64::from(*byte)))
+                .collect(),
+        ));
+    }
+    if let Some((start, stop, step)) = value::as_range(population) {
+        let (start, stop, step) = (i128::from(start), i128::from(stop), i128::from(step));
+        let len = if step > 0 {
+            if start >= stop {
+                0
+            } else {
+                (stop - start + step - 1) / step
+            }
+        } else if step < 0 {
+            if start <= stop {
+                0
+            } else {
+                (start - stop + (-step) - 1) / (-step)
+            }
+        } else {
+            return Err(exc::raise_with_message(
+                VALUE_ERROR,
+                "range() arg 3 must not be zero",
+            ));
+        };
+        let len = usize::try_from(len).unwrap_or(usize::MAX);
+        return Ok(ChoicesSource::Range {
+            start: i64::try_from(start).unwrap_or(0),
+            step: i64::try_from(step).unwrap_or(1),
+            len,
+        });
+    }
+    Err(random_type_error(&format!(
+        "object of type '{}' has no len()",
+        value::type_name(population)
+    )))
+}
+
+/// One numeric weight (`int`, `bool`, `float` or a `Fraction`, which this
+/// runtime stores as a float value).
+fn choices_weight(item: i64) -> Result<f64, i64> {
+    if let Some(number) = value::as_float(item) {
+        return Ok(number);
+    }
+    if let Some(number) = value::as_integer(item) {
+        return Ok(number as f64);
+    }
+    Err(random_type_error(&format!(
+        "'{}' object cannot be interpreted as a number",
+        value::type_name(item)
+    )))
+}
+
+/// Materialises an iterable of weights, rejecting non-numerics with `TypeError`.
+fn choices_weights(source: i64) -> Result<Vec<f64>, i64> {
+    if let Some(items) = value::as_list(source) {
+        return items.iter().map(|&item| choices_weight(item)).collect();
+    }
+    if let Some(items) = value::as_tuple(source) {
+        return items.iter().map(|&item| choices_weight(item)).collect();
+    }
+    if let Some((start, stop, step)) = value::as_range(source) {
+        let mut out = Vec::new();
+        let mut current = i128::from(start);
+        let (stop, step) = (i128::from(stop), i128::from(step));
+        while (step > 0 && current < stop) || (step < 0 && current > stop) {
+            let Ok(number) = i64::try_from(current) else {
+                return Err(exc::raise_with_message(
+                    OVERFLOW_ERROR,
+                    "weight exceeds the supported range",
+                ));
+            };
+            out.push(number as f64);
+            current += step;
+        }
+        return Ok(out);
+    }
+    let iterator = iter::iter_new(source);
+    if exc::pending() {
+        let _ = exc::clear();
+        return Err(random_type_error(&format!(
+            "'{}' object is not iterable",
+            value::type_name(source)
+        )));
+    }
+    let mut out = Vec::new();
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return Err(NONE);
+        }
+        if status == 0 {
+            break;
+        }
+        out.push(choices_weight(item)?);
+    }
+    Ok(out)
+}
+
+/// `operator.index`-style conversion for `k`: exact integers pass, objects go
+/// through `__index__`, floats and other types raise `TypeError`.
+fn choices_count(value: i64) -> Result<i64, i64> {
+    if let Some(count) = value::as_integer(value) {
+        return Ok(count);
+    }
+    let index = crate::core::methods::call(value, b"__index__".as_ptr(), 9, 0, std::ptr::null());
+    if exc::pending() {
+        if exc::pending_tag() == ATTRIBUTE_ERROR as i64 {
+            let _ = exc::clear();
+        } else {
+            let error = exc::pending_value();
+            let _ = exc::clear();
+            return Err(exc::raise_value(error));
+        }
+    } else if let Some(count) = value::as_integer(index) {
+        return Ok(count);
+    }
+    Err(random_type_error(&format!(
+        "'{}' object cannot be interpreted as an integer",
+        value::type_name(value)
+    )))
+}
+
+/// Index of `x` in the non-decreasing `cumulative` weights over `[0, hi)`,
+/// like `bisect.bisect_right(cumulative, x, 0, hi)`.
+fn choices_bisect(cumulative: &[f64], x: f64, hi: usize) -> usize {
+    let mut low = 0usize;
+    let mut high = hi;
+    while low < high {
+        let middle = (low + high) / 2;
+        if x < cumulative[middle] {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    low
+}
+
+/// `choices(population, weights=None, *, cum_weights=None, k=1)`.
+///
+/// `weights` are accumulated into cumulative totals; `cum_weights` are used
+/// as given. Both must match the population length and have a finite positive
+/// total, which is what CPython validates before drawing.
+fn random_choices(
+    rng: &value::RandomState,
+    population: i64,
+    weights: i64,
+    cum_weights: i64,
+    k: i64,
+) -> i64 {
+    let source = match choices_source(population) {
+        Ok(source) => source,
+        Err(err) => return err,
+    };
+    let count = match choices_count(k) {
+        Ok(count) => count,
+        Err(err) => return err,
+    };
+    let len = source.len();
+    if len == 0 {
+        return exc::raise_with_message(INDEX_ERROR, "Cannot choose from an empty sequence");
+    }
+    let cumulative = if cum_weights != NONE {
+        if weights != NONE {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "Cannot specify both weights and cumulative weights",
+            );
+        }
+        match choices_weights(cum_weights) {
+            Ok(values) => values,
+            Err(err) => return err,
+        }
+    } else if weights != NONE {
+        match choices_weights(weights) {
+            Ok(values) => {
+                let mut running = 0.0f64;
+                values
+                    .into_iter()
+                    .map(|weight| {
+                        running += weight;
+                        running
+                    })
+                    .collect()
+            }
+            Err(err) => return err,
+        }
+    } else {
+        // Uniform choice: `population[floor(random() * n)]`, clamped so a
+        // float rounding at 1.0 cannot index past the end.
+        let result = value::list_new(Vec::new());
+        let roots = heap::root_values(&[result]);
+        for _ in 0..count.max(0) {
+            let mut index = (rng.next_f64() * len as f64) as usize;
+            if index >= len {
+                index = len - 1;
+            }
+            let item = source.get(index);
+            let item_roots = heap::root_values(&[item]);
+            container::list_append(result, item);
+            heap::release_roots(item_roots);
+        }
+        heap::release_roots(roots);
+        return result;
+    };
+    if cumulative.len() != len {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "The number of weights does not match the population",
+        );
+    }
+    let total = cumulative[cumulative.len() - 1];
+    if !total.is_finite() {
+        return exc::raise_with_message(VALUE_ERROR, "Total of weights must be finite");
+    }
+    if total <= 0.0 {
+        return exc::raise_with_message(VALUE_ERROR, "Total of weights must be greater than zero");
+    }
+    let result = value::list_new(Vec::new());
+    let roots = heap::root_values(&[result]);
+    for _ in 0..count.max(0) {
+        let mut x = rng.next_f64() * total;
+        // Subnormal weights can round the product up to the total; clamping
+        // keeps the search inside the population like CPython's `hi = n - 1`.
+        if x >= total {
+            x = total;
+        }
+        let index = choices_bisect(&cumulative, x, len - 1);
+        let item = source.get(index.min(len - 1));
+        let item_roots = heap::root_values(&[item]);
+        container::list_append(result, item);
+        heap::release_roots(item_roots);
+    }
+    heap::release_roots(roots);
+    result
+}
+
+/// Keyword-aware `choices`: the generic binder filled `population`/`weights`
+/// into their positional slots and left the keyword-only names here.
+fn random_choices_keywords(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let population = args.first().copied().unwrap_or(NONE);
+    let weights = args.get(1).copied().unwrap_or(NONE);
+    let mut cum_weights = NONE;
+    let mut cum_supplied = false;
+    let mut k = encode_int(1);
+    for (name, item) in keywords {
+        match name.as_str() {
+            "cum_weights" => {
+                if cum_supplied {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "choices() got multiple values for argument 'cum_weights'",
+                    );
+                }
+                cum_weights = *item;
+                cum_supplied = true;
+            }
+            "k" => k = *item,
+            "population" | "weights" => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("choices() got multiple values for argument '{name}'"),
+                )
+            }
+            other => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("choices() got an unexpected keyword argument '{other}'"),
+                )
+            }
+        }
+    }
+    random_choices(&GLOBAL_RANDOM, population, weights, cum_weights, k)
+}
+
 /// Shared implementation of the module-level functions and `Random` methods.
 /// `seed` without an argument and `seed(None)` reseed from entropy; a
 /// `SystemRandom` receiver ignores every seed.
@@ -10147,9 +11230,22 @@ fn random_operation(rng: &value::RandomState, function: &str, args: &[i64]) -> i
         "randrange" => random_randrange(rng, args),
         "choice" => random_choice(rng, args[0]),
         "uniform" => random_uniform(rng, args),
+        "gauss" => random_gauss(rng, args),
+        "normalvariate" => random_normalvariate(rng, args),
         "shuffle" => random_shuffle(rng, args[0]),
         "getrandbits" => random_getrandbits(rng, args[0]),
         "sample" => random_sample(rng, args),
+        // `choices(population, weights=None, *, cum_weights=None, k=1)`: the
+        // keyword-only slots are `None` on the positional path.
+        "choices" => random_choices(
+            rng,
+            args[0],
+            args.get(1).copied().unwrap_or(NONE),
+            NONE,
+            encode_int(1),
+        ),
+        // `randbytes(n)`.
+        "randbytes" => system_randbytes(rng, args.first().copied().unwrap_or(NONE)),
         _ => missing_attribute("random", function),
     }
 }
@@ -10177,7 +11273,7 @@ fn random_system_proxy() -> i64 {
     if let Some(cached) = globals::registry_get(KEY) {
         return cached;
     }
-    let names: [(&str, &'static str); 12] = [
+    let names: [(&str, &'static str); 15] = [
         ("__call__", "SystemRandom.__call__"),
         ("getrandbits", "SystemRandom.getrandbits"),
         ("random", "SystemRandom.random"),
@@ -10186,10 +11282,13 @@ fn random_system_proxy() -> i64 {
         ("randrange", "SystemRandom.randrange"),
         ("choice", "SystemRandom.choice"),
         ("uniform", "SystemRandom.uniform"),
+        ("gauss", "SystemRandom.gauss"),
+        ("normalvariate", "SystemRandom.normalvariate"),
         ("shuffle", "SystemRandom.shuffle"),
         ("sample", "SystemRandom.sample"),
         ("_randbelow", "SystemRandom._randbelow"),
         ("randbytes", "SystemRandom.randbytes"),
+        ("choices", "SystemRandom.choices"),
     ];
     let methods: Vec<(String, i64)> = names
         .iter()
@@ -10271,7 +11370,7 @@ fn random_class_proxy() -> i64 {
     }
     // `native_function_new` stores `&'static str`, so the qualified names are
     // a fixed table rather than formatted per call.
-    let names: [(&str, &'static str); 10] = [
+    let names: [(&str, &'static str); 14] = [
         ("__call__", "Random.__call__"),
         ("getrandbits", "Random.getrandbits"),
         ("random", "Random.random"),
@@ -10280,8 +11379,12 @@ fn random_class_proxy() -> i64 {
         ("randrange", "Random.randrange"),
         ("choice", "Random.choice"),
         ("uniform", "Random.uniform"),
+        ("gauss", "Random.gauss"),
+        ("normalvariate", "Random.normalvariate"),
         ("shuffle", "Random.shuffle"),
         ("sample", "Random.sample"),
+        ("choices", "Random.choices"),
+        ("randbytes", "Random.randbytes"),
     ];
     let methods: Vec<(String, i64)> = names
         .iter()
@@ -10315,9 +11418,13 @@ fn random_global_method(method: &str, args: &[i64]) -> i64 {
         "randrange" => (1, 3),
         "choice" => (1, 1),
         "uniform" => (2, 2),
+        "gauss" => (0, 2),
+        "normalvariate" => (0, 2),
         "shuffle" => (1, 1),
         "getrandbits" => (1, 1),
         "sample" => (2, 2),
+        "choices" => (1, 2),
+        "randbytes" => (1, 1),
         _ => return missing_attribute("random.Random", method),
     };
     if let Some(err) = check_random_arity(method, args.len(), min, max) {
@@ -10364,7 +11471,7 @@ fn random_call(function: &str, args: &[i64]) -> i64 {
             "randbytes" => system_randbytes(rng, method_args.first().copied().unwrap_or(NONE)),
             "_randbelow" => system_randbelow(rng, method_args.first().copied().unwrap_or(NONE)),
             "getrandbits" | "random" | "seed" | "randint" | "randrange" | "choice" | "uniform"
-            | "shuffle" | "sample" => {
+            | "gauss" | "normalvariate" | "shuffle" | "sample" | "choices" => {
                 if let Some(err) = check_random_arity(
                     method,
                     method_args.len(),
@@ -10375,9 +11482,11 @@ fn random_call(function: &str, args: &[i64]) -> i64 {
                         "randrange" => 1,
                         "choice" => 1,
                         "uniform" => 2,
+                        "gauss" | "normalvariate" => 0,
                         "shuffle" => 1,
                         "getrandbits" => 1,
                         "sample" => 2,
+                        "choices" => 1,
                         _ => 0,
                     },
                     match method {
@@ -10387,9 +11496,11 @@ fn random_call(function: &str, args: &[i64]) -> i64 {
                         "randrange" => 3,
                         "choice" => 1,
                         "uniform" => 2,
+                        "gauss" | "normalvariate" => 2,
                         "shuffle" => 1,
                         "getrandbits" => 1,
                         "sample" => 2,
+                        "choices" => 2,
                         _ => 0,
                     },
                 ) {
@@ -10440,6 +11551,8 @@ pub(crate) fn random_method(obj: i64, method: &str, args: &[i64]) -> i64 {
         "randrange" => (1, 3),
         "choice" => (1, 1),
         "uniform" => (2, 2),
+        "gauss" => (0, 2),
+        "normalvariate" => (0, 2),
         "shuffle" => (1, 1),
         "getrandbits" => (1, 1),
         "sample" => (2, 2),
@@ -11160,6 +12273,75 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
             Ok(x) => value::float_new(x.abs()),
             Err(err) => err,
         },
+        // `ldexp(x, i)`: `x * 2**i`, computed by the C `ldexp` so the
+        // rounding and subnormal results match CPython. The exponent must be
+        // an integer; magnitudes beyond `C int` saturate the way CPython
+        // handles arbitrary-sized Python ints.
+        "ldexp" => {
+            let x = match number(args[0]) {
+                Ok(x) => x,
+                Err(err) => return err,
+            };
+            if let Some(exponent) = value::as_integer(args[1]) {
+                if x == 0.0 || !x.is_finite() {
+                    return value::float_new(x);
+                }
+                if exponent > i64::from(i32::MAX) {
+                    return range_error();
+                }
+                if exponent < i64::from(i32::MIN) {
+                    return value::float_new(0.0_f64.copysign(x));
+                }
+                let result = if exponent > 5_000 {
+                    f64::INFINITY
+                } else if exponent < -5_000 {
+                    0.0_f64.copysign(x)
+                } else {
+                    x * 2f64.powi(exponent as i32)
+                };
+                return if result.is_infinite() && x.is_finite() {
+                    range_error()
+                } else {
+                    value::float_new(result)
+                };
+            }
+            let Some(exponent) = value::to_bigint(args[1]) else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "Expected an int as second argument to ldexp.",
+                );
+            };
+            // Zeros, infinities and NaNs come back unchanged regardless of
+            // the exponent (CPython checks this before the range tests).
+            if x == 0.0 || !x.is_finite() {
+                return value::float_new(x);
+            }
+            if exponent > BigInt::from(i32::MAX) {
+                return range_error();
+            }
+            if exponent < BigInt::from(i32::MIN) {
+                return value::float_new(0.0_f64.copysign(x));
+            }
+            let exponent = exponent.to_i32().unwrap_or(0);
+            // Outside this window `2**n` is certainly 0 or infinite for a
+            // binary64, so the scale is applied without calling `powi` with
+            // an extreme exponent.
+            let result = if exponent > 5_000 {
+                f64::INFINITY
+            } else if exponent < -5_000 {
+                0.0_f64.copysign(x)
+            } else {
+                // `2f64.powi(n)` is exact for every in-range power of two, so
+                // the multiplication rounds exactly like `ldexp` (a power-of-
+                // two scale never introduces an intermediate rounding error).
+                x * 2f64.powi(exponent)
+            };
+            if result.is_infinite() && x.is_finite() {
+                range_error()
+            } else {
+                value::float_new(result)
+            }
+        }
         // `modf(x)`: the fractional and integral parts, both floats and both
         // carrying the sign of `x`. C's `modf` maps infinities to `(±0.0,
         // ±inf)` and NaN to `(nan, nan)`; Rust's `fract` would turn an
@@ -11818,6 +13000,10 @@ fn operator_call(function: &str, args: &[i64]) -> i64 {
         "index" => return operator_index(args[0]),
         "_compare_digest" => return operator_compare_digest(args[0], args[1]),
         "length_hint" => return operator_length_hint(args),
+        // `operator.contains(a, b)` is `b in a`; `operator.countOf(a, b)`
+        // counts the items equal to `b`.
+        "contains" => return operator_contains(args[0], args[1]),
+        "countOf" => return operator_count_of(args[0], args[1]),
         // The subscript protocols, exactly as the `[]` syntax performs them.
         "getitem" => return container::subscript(args[0], args[1]),
         "setitem" => return container::subscript_set(args[0], args[1], args[2]),
@@ -11895,6 +13081,86 @@ fn operator_length_hint(args: &[i64]) -> i64 {
                 value::type_name(result)
             ),
         ),
+    }
+}
+
+/// Types whose containment the `in` operator implements natively (mapping
+/// key lookup, set membership, substring search, range arithmetic, ...).
+fn operator_native_containment(value_arg: i64) -> bool {
+    value::as_list(value_arg).is_some()
+        || value::as_tuple(value_arg).is_some()
+        || value::as_dict(value_arg).is_some()
+        || value::as_defaultdict(value_arg).is_some()
+        || value::as_str(value_arg).is_some()
+        || value::as_bytes(value_arg).is_some()
+        || value::as_memoryview(value_arg).is_some()
+        || value::as_dict_view(value_arg).is_some()
+        || value::as_set(value_arg).is_some()
+        || value::as_range(value_arg).is_some()
+}
+
+/// `operator.contains(a, b)`: `b in a`. Builtin containers and objects that
+/// define `__contains__` use the `in` operator directly; anything else falls
+/// back to CPython's `_PySequence_IterSearch`, which iterates and compares
+/// with identity-or-equality.
+fn operator_contains(haystack: i64, needle: i64) -> i64 {
+    if operator_native_containment(haystack) {
+        return ops::binop(ops::OP_IN, needle, haystack);
+    }
+    if value::as_instance(haystack).is_some() {
+        let defines_contains = value::instance_class_value(haystack)
+            .and_then(|class| value::class_lookup(class, "__contains__"))
+            .is_some();
+        if defines_contains {
+            return ops::binop(ops::OP_IN, needle, haystack);
+        }
+    }
+    let iterator = iter::iter_new(haystack);
+    if exc::pending() {
+        return NONE;
+    }
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return NONE;
+        }
+        if status == 0 {
+            return value::FALSE;
+        }
+        if container::equals(item, needle) {
+            return value::TRUE;
+        }
+        if exc::pending() {
+            return NONE;
+        }
+    }
+}
+
+/// `operator.countOf(a, b)`: counts the items in `a` that are `b` by identity
+/// or equality, matching CPython's `PySequence_Count` (which is why repeated
+/// NaN objects and equal-but-distinct dicts are counted).
+fn operator_count_of(iterable: i64, needle: i64) -> i64 {
+    let iterator = iter::iter_new(iterable);
+    if exc::pending() {
+        return NONE;
+    }
+    let mut count: i64 = 0;
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return NONE;
+        }
+        if status == 0 {
+            return ops::int_result(count);
+        }
+        if item == needle || container::equals(item, needle) {
+            count = count.saturating_add(1);
+        }
+        if exc::pending() {
+            return NONE;
+        }
     }
 }
 
@@ -13574,6 +14840,8 @@ fn thread_call(function: &str, args: &[i64]) -> i64 {
         "allocate_lock" => value::lock_new(),
         // The reentrant lock is the same real object `threading.RLock` uses.
         "RLock" => value::lock_new_reentrant(),
+        // `_count()`: the number of live threads.
+        "_count" => encode_int(crate::heap::active_threads() as i64),
         _ => missing_attribute("_thread", function),
     }
 }
@@ -14047,9 +15315,16 @@ fn threading_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "stack_size" => threading_stack_size(args),
         "Thread" => {
-            let target = match callable_argument("Thread()", optional(args, 0)) {
-                Ok(target) => target,
-                Err(err) => return err,
+            let target_arg = optional(args, 0);
+            // `Thread()` (or an explicit `target=None`) runs an empty body,
+            // exactly like CPython's default `run`.
+            let mut target = if target_arg == NONE {
+                value::native_function_new("threading", "_thread_noop", 0)
+            } else {
+                match callable_argument("Thread()", target_arg) {
+                    Ok(target) => target,
+                    Err(err) => return err,
+                }
             };
             let argv = match argument_sequence("Thread()", optional(args, 1)) {
                 Ok(argv) => argv,
@@ -14070,11 +15345,58 @@ fn threading_call(function: &str, args: &[i64]) -> i64 {
                 NONE => current_thread_daemon(),
                 flag => value::truthy(flag),
             };
+            // `kwargs` binds by name and is merged onto the target call:
+            // binding it as a partial keeps the native thread's positional
+            // argument list and makes `target(*args, **kwargs)` exact.
+            let kwargs_arg = optional(args, 4);
+            if kwargs_arg != NONE {
+                let Some(pairs) = value::as_dict(kwargs_arg) else {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!(
+                            "Thread() argument 'kwargs' must be a dict, not {}",
+                            value::type_name(kwargs_arg)
+                        ),
+                    );
+                };
+                let mut keywords = Vec::with_capacity(pairs.len());
+                for &(key, item) in pairs {
+                    let Some(keyword) = value::as_str(key) else {
+                        return exc::raise_with_message(TYPE_ERROR, "keywords must be strings");
+                    };
+                    keywords.push((keyword.to_string(), item));
+                }
+                let mut roots_source = Vec::with_capacity(2 + keywords.len());
+                roots_source.push(target);
+                roots_source.push(kwargs_arg);
+                roots_source.extend(keywords.iter().map(|(_, item)| *item));
+                let roots = heap::root_values(&roots_source);
+                target = value::partial_new_with_keywords(target, Vec::new(), keywords);
+                heap::release_roots(roots);
+            }
             value::thread_new_with_daemon(target, argv, name, daemon)
         }
         "Lock" => value::lock_new(),
         "RLock" => value::lock_new_reentrant(),
         "Event" | "Condition" => value::event_new(),
+        // `Semaphore`/`BoundedSemaphore` are class values (see
+        // `semaphore_class`), so a module call constructs through the class
+        // and runs the native `__init__`.
+        "Semaphore" => crate::builtins::call(semaphore_class(false), args.len(), args.as_ptr()),
+        "BoundedSemaphore" => {
+            crate::builtins::call(semaphore_class(true), args.len(), args.as_ptr())
+        }
+        "_semaphore_init" => semaphore_init(args, false),
+        "_semaphore_bounded_init" => semaphore_init(args, true),
+        "_semaphore_acquire" => semaphore_acquire(args),
+        "_semaphore_release" => semaphore_release(args),
+        "_semaphore_enter" => semaphore_enter(args),
+        "_semaphore_exit" => semaphore_exit(args),
+        "_semaphore_value" => semaphore_value(args),
+        "_semaphore_initial" => semaphore_initial(args),
+        "_semaphore_repr" => semaphore_repr(args),
+        "_thread_noop" => NONE,
+        "excepthook" | "__excepthook__" => threading_excepthook(args),
         // `Barrier` is a class value (see `barrier_class`), so a module call
         // constructs through the class and runs the native `__init__`.
         "Barrier" => crate::builtins::call(barrier_class(), args.len(), args.as_ptr()),
@@ -14672,6 +15994,466 @@ fn barrier_broken(args: &[i64]) -> i64 {
     }
 }
 
+// threading.Semaphore
+
+/// Counter and wakeup condition of a `threading.Semaphore`.
+///
+/// The value lives in Rust memory (not on the heap) and is shared by every
+/// thread that holds the instance; the condition variable parks waiters for
+/// the collector through `heap::blocking_enter`/`blocking_leave`. `initial`
+/// is `Some` only for `BoundedSemaphore`, whose `release` may not take the
+/// counter above that value.
+struct SemaphoreState {
+    value: Mutex<i64>,
+    changed: Condvar,
+    initial: Option<i64>,
+}
+
+impl SemaphoreState {
+    fn lock(&self) -> MutexGuard<'_, i64> {
+        self.value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn current(&self) -> i64 {
+        *self.lock()
+    }
+}
+
+/// Identifier source for entries of [`semaphore_table`].
+fn semaphore_ids() -> &'static AtomicU64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    &NEXT
+}
+
+/// Rust-side state of every live semaphore, keyed by the id stored on the
+/// instance. Only plain data is held here, so the map never needs collector
+/// tracing.
+fn semaphore_table() -> &'static Mutex<HashMap<u64, Arc<SemaphoreState>>> {
+    static TABLE: LazyLock<Mutex<HashMap<u64, Arc<SemaphoreState>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    &TABLE
+}
+
+fn semaphore_register(state: SemaphoreState) -> i64 {
+    let id = semaphore_ids().fetch_add(1, Ordering::Relaxed);
+    semaphore_table()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(id, Arc::new(state));
+    encode_int(id as i64)
+}
+
+/// Looks up the state of `instance` from the id `__init__` stored on it.
+fn semaphore_state(instance: i64) -> Option<Arc<SemaphoreState>> {
+    let id = value::as_integer(value::instance_attr(instance, "_hydro_semaphore_id")?)?;
+    let id = u64::try_from(id).ok()?;
+    semaphore_table()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&id)
+        .cloned()
+}
+
+fn semaphore_native(name: &'static str, arity: usize) -> i64 {
+    value::native_function_new("threading", name, arity)
+}
+
+/// The cached `threading.Semaphore`/`BoundedSemaphore` class.
+///
+/// The class carries the native methods, the `_value` property and (for the
+/// bounded flavour) `_initial_value`, so `type(sem)`, `isinstance` and
+/// attribute reads behave like CPython. Construction runs the native
+/// `__init__`, which registers the shared counter.
+fn semaphore_class(bounded: bool) -> i64 {
+    let key = if bounded {
+        "threading.BoundedSemaphore.class"
+    } else {
+        "threading.Semaphore.class"
+    };
+    if let Some(cached) = globals::registry_get(key) {
+        return cached;
+    }
+    let init_name = if bounded {
+        "_semaphore_bounded_init"
+    } else {
+        "_semaphore_init"
+    };
+    let methods = vec![
+        (
+            "__init__".to_string(),
+            semaphore_native(init_name, 2),
+            hydro_ir::MethodKind::Normal,
+        ),
+        (
+            "acquire".to_string(),
+            semaphore_native("_semaphore_acquire", 3),
+            hydro_ir::MethodKind::Normal,
+        ),
+        (
+            "release".to_string(),
+            semaphore_native("_semaphore_release", 2),
+            hydro_ir::MethodKind::Normal,
+        ),
+        (
+            "__enter__".to_string(),
+            semaphore_native("_semaphore_enter", 1),
+            hydro_ir::MethodKind::Normal,
+        ),
+        (
+            "__exit__".to_string(),
+            semaphore_native("_semaphore_exit", 4),
+            hydro_ir::MethodKind::Normal,
+        ),
+        (
+            "__repr__".to_string(),
+            semaphore_native("_semaphore_repr", 1),
+            hydro_ir::MethodKind::Normal,
+        ),
+    ];
+    let value_getter = semaphore_native("_semaphore_value", 1);
+    let initial_getter = semaphore_native("_semaphore_initial", 1);
+    let mut roots: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    roots.push(value_getter);
+    roots.push(initial_getter);
+    let function_roots = heap::root_values(&roots);
+    let mut attrs = vec![(
+        "_value".to_string(),
+        value::property_new(value_getter, NONE, NONE),
+    )];
+    if bounded {
+        attrs.push((
+            "_initial_value".to_string(),
+            value::property_new(initial_getter, NONE, NONE),
+        ));
+    }
+    let descriptors: Vec<i64> = attrs.iter().map(|(_, descriptor)| *descriptor).collect();
+    let descriptor_roots = heap::root_values(&descriptors);
+    let name = if bounded {
+        "BoundedSemaphore"
+    } else {
+        "Semaphore"
+    };
+    let class = value::class_new_full(name.to_string(), NONE, methods, attrs);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(key, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(descriptor_roots);
+    heap::release_roots(function_roots);
+    class
+}
+
+/// `Semaphore.__init__(value=1)` / `BoundedSemaphore.__init__(value=1)`.
+fn semaphore_init(args: &[i64], bounded: bool) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Semaphore.__init__() missing self");
+    };
+    let value = match args.get(1).copied() {
+        None | Some(NONE) => 1,
+        Some(argument) => match value::as_integer(argument) {
+            Some(value) => value,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        value::type_name(argument)
+                    ),
+                )
+            }
+        },
+    };
+    if value < 0 {
+        return exc::raise_with_message(VALUE_ERROR, "semaphore initial value must be >= 0");
+    }
+    // Re-initialising an existing semaphore discards its old state.
+    if let Some(old) = value::instance_attr(instance, "_hydro_semaphore_id")
+        .and_then(value::as_integer)
+        .and_then(|old| u64::try_from(old).ok())
+    {
+        semaphore_table()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&old);
+    }
+    let id = semaphore_register(SemaphoreState {
+        value: Mutex::new(value),
+        changed: Condvar::new(),
+        initial: if bounded { Some(value) } else { None },
+    });
+    value::instance_setattr(instance, "_hydro_semaphore_id".to_string(), id);
+    NONE
+}
+
+/// Numeric timeout argument, clamped like `Condition.wait` (negative and NaN
+/// mean "already expired"; the upper clamp keeps `Instant` arithmetic safe).
+fn semaphore_timeout(arg: i64) -> Result<Duration, i64> {
+    let seconds = value::as_float(arg).or_else(|| value::as_integer(arg).map(|n| n as f64));
+    let Some(seconds) = seconds else {
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "timeout must be a float or int, not {}",
+                value::type_name(arg)
+            ),
+        ));
+    };
+    let seconds = if seconds.is_nan() {
+        0.0
+    } else {
+        seconds.clamp(0.0, 10.0 * 365.0 * 86_400.0)
+    };
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+/// Non-allocating wait step, run between `blocking_enter`/`blocking_leave`.
+fn semaphore_acquire_step(
+    state: &SemaphoreState,
+    blocking: bool,
+    timeout: Option<Duration>,
+) -> bool {
+    let mut value = state.lock();
+    if *value > 0 {
+        *value -= 1;
+        return true;
+    }
+    if !blocking {
+        return false;
+    }
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    loop {
+        match deadline {
+            None => {
+                value = state
+                    .changed
+                    .wait(value)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                let (guard, _) = state
+                    .changed
+                    .wait_timeout(value, deadline - now)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                value = guard;
+            }
+        }
+        if *value > 0 {
+            *value -= 1;
+            return true;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return false;
+        }
+    }
+}
+
+/// `Semaphore.acquire(blocking=True, timeout=None)`.
+fn semaphore_acquire(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Semaphore.acquire() missing self");
+    };
+    let Some(state) = semaphore_state(instance) else {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "Semaphore is not initialised: construct it through threading.Semaphore()",
+        );
+    };
+    // Keyword binding pads omitted slots with `None`, which is also the
+    // default for both parameters.
+    let blocking = match args.get(1).copied() {
+        None | Some(NONE) => true,
+        Some(argument) => value::truthy(argument),
+    };
+    let timeout = match args.get(2).copied() {
+        None | Some(NONE) => None,
+        Some(argument) => match semaphore_timeout(argument) {
+            Ok(timeout) => Some(timeout),
+            Err(err) => return err,
+        },
+    };
+    if !blocking && timeout.is_some() {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "can't specify timeout for non-blocking acquire",
+        );
+    }
+    heap::blocking_enter();
+    let acquired = semaphore_acquire_step(&state, blocking, timeout);
+    heap::blocking_leave();
+    value::bool_value(acquired)
+}
+
+/// `Semaphore.release(n=1)`.
+fn semaphore_release(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Semaphore.release() missing self");
+    };
+    let n = match args.get(1).copied() {
+        None | Some(NONE) => 1,
+        Some(argument) => match value::as_integer(argument) {
+            Some(n) => n,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        value::type_name(argument)
+                    ),
+                )
+            }
+        },
+    };
+    if n < 1 {
+        return exc::raise_with_message(VALUE_ERROR, "n must be one or more");
+    }
+    let Some(state) = semaphore_state(instance) else {
+        return exc::raise_with_message(ATTRIBUTE_ERROR, "Semaphore has no state");
+    };
+    let mut value = state.lock();
+    if let Some(initial) = state.initial {
+        match value.checked_add(n) {
+            Some(updated) if updated <= initial => *value = updated,
+            _ => {
+                drop(value);
+                return exc::raise_with_message(VALUE_ERROR, "Semaphore released too many times");
+            }
+        }
+    } else {
+        match value.checked_add(n) {
+            Some(updated) => *value = updated,
+            None => {
+                drop(value);
+                return exc::raise_with_message(OVERFLOW_ERROR, "semaphore value overflow");
+            }
+        }
+    }
+    state.changed.notify_all();
+    NONE
+}
+
+/// `Semaphore.__enter__`: the blocking acquire, returning `True`.
+fn semaphore_enter(args: &[i64]) -> i64 {
+    match args.first() {
+        Some(instance) => semaphore_acquire(&[*instance]),
+        None => exc::raise_with_message(TYPE_ERROR, "Semaphore.__enter__() missing self"),
+    }
+}
+
+/// `Semaphore.__exit__`: releases once; the exception (if any) propagates.
+fn semaphore_exit(args: &[i64]) -> i64 {
+    match args.first() {
+        Some(instance) => semaphore_release(&[*instance]),
+        None => exc::raise_with_message(TYPE_ERROR, "Semaphore.__exit__() missing self"),
+    }
+}
+
+/// `Semaphore._value` property.
+fn semaphore_value(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Semaphore._value missing self");
+    };
+    match semaphore_state(instance) {
+        Some(state) => ops::int_result(state.current()),
+        None => exc::raise_with_message(ATTRIBUTE_ERROR, "Semaphore has no state"),
+    }
+}
+
+/// `BoundedSemaphore._initial_value` property.
+fn semaphore_initial(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Semaphore._initial_value missing self");
+    };
+    match semaphore_state(instance) {
+        Some(state) => ops::int_result(state.initial.unwrap_or(0)),
+        None => exc::raise_with_message(ATTRIBUTE_ERROR, "Semaphore has no state"),
+    }
+}
+
+/// `Semaphore.__repr__`: `<threading.Semaphore at 0x...: value=N>` (and
+/// `value=N/initial` for the bounded flavour).
+fn semaphore_repr(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "Semaphore.__repr__ missing self");
+    };
+    let Some(state) = semaphore_state(instance) else {
+        return exc::raise_with_message(ATTRIBUTE_ERROR, "Semaphore has no state");
+    };
+    let current = state.current();
+    let address = (instance & !value::TAG_MASK) as usize;
+    let text = match state.initial {
+        Some(initial) => {
+            format!("<threading.BoundedSemaphore at {address:#x}: value={current}/{initial}>")
+        }
+        None => format!("<threading.Semaphore at {address:#x}: value={current}>"),
+    };
+    value::str_alloc(text)
+}
+
+// threading.excepthook / threading._dangling
+
+/// `threading.excepthook(args)`: the default worker-exception reporter.
+///
+/// `args` is an `ExceptHookArgs` sequence (or the equivalent namespace). Only
+/// the first three fields — `exc_type`, `exc_value`, `exc_traceback` — reach
+/// the shared exception printer; `thread` selects the "Exception in thread"
+/// heading in CPython and is not re-rendered here.
+fn threading_excepthook(args: &[i64]) -> i64 {
+    let Some(&hook_args) = args.first() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "excepthook() missing required argument 'args' (pos 1)",
+        );
+    };
+    let mut fields = [NONE; 3];
+    if let Some(items) = value::as_tuple(hook_args).or_else(|| value::as_list(hook_args)) {
+        for (slot, item) in fields.iter_mut().zip(items.iter()) {
+            *slot = *item;
+        }
+    } else if let Some(pairs) = value::as_namespace(hook_args) {
+        for (name, item) in pairs {
+            match name.as_str() {
+                "exc_type" => fields[0] = *item,
+                "exc_value" => fields[1] = *item,
+                "exc_traceback" => fields[2] = *item,
+                _ => {}
+            }
+        }
+    } else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "excepthook() argument must be ExceptHookArgs, not {}",
+                value::type_name(hook_args)
+            ),
+        );
+    }
+    if fields[0] == NONE && fields[1] == NONE {
+        return NONE;
+    }
+    exc::excepthook(fields[0], fields[1], fields[2])
+}
+
+/// `threading._dangling`: a list holding the main thread, the object
+/// introspection code iterates. CPython uses a weak set; Hydro has no weak
+/// references, so the list is identity-stable and grows no further.
+fn threading_dangling() -> i64 {
+    const KEY: &str = "threading._dangling";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let main = threading_thread_for_ident(1);
+    let roots = heap::root_values(&[main]);
+    let list = value::list_new(vec![main]);
+    globals::registry_set(KEY, list);
+    heap::release_roots(roots);
+    list
+}
+
 fn queue_call(function: &str, args: &[i64]) -> i64 {
     match function {
         "Queue" => match maxsize_argument(optional(args, 0)) {
@@ -15084,7 +16866,126 @@ fn pickle_call(function: &str, args: &[i64]) -> i64 {
         "Unpickler.load" => pickle_unpickler_load(args),
         "Unpickler.find_class" => pickle_unpickler_find_class(args),
         "Unpickler.persistent_load" => pickle_unpickler_persistent_load(args),
+        // `PickleBuffer(buffer)` and its buffer-export surface.
+        "PickleBuffer" => pickle_buffer_new(args[0]),
+        "PickleBuffer.raw" => pickle_buffer_raw(args[0]),
+        "PickleBuffer.release" => pickle_buffer_release(args[0]),
+        "PickleBuffer.__bytes__" => pickle_buffer_bytes(args[0]),
         _ => missing_attribute("pickle", function),
+    }
+}
+
+/// Cached `pickle.PickleBuffer` class.
+///
+/// CPython's `PickleBuffer` wraps a bytes-like object for out-of-band
+/// buffers. This runtime has no PEP 688 `__buffer__` export from arbitrary
+/// objects, so the wrapper keeps its source object, hands out a real
+/// `memoryview` from `raw()` and forbids further exports after `release()`.
+fn pickle_buffer_class() -> i64 {
+    const KEY: &str = "pickle.PickleBuffer.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let raw = value::native_function_new("pickle", "PickleBuffer.raw", 1);
+    let release = value::native_function_new("pickle", "PickleBuffer.release", 1);
+    let to_bytes = value::native_function_new("pickle", "PickleBuffer.__bytes__", 1);
+    let methods = vec![
+        ("raw".to_string(), raw),
+        ("release".to_string(), release),
+        ("__bytes__".to_string(), to_bytes),
+    ];
+    let method_roots = heap::root_values(&[raw, release, to_bytes]);
+    let class = value::class_new("PickleBuffer".to_string(), NONE, methods);
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// `pickle.PickleBuffer(buffer)`: `buffer` must be an object this runtime can
+/// read as bytes-like (`bytes`, `bytearray` or a `memoryview`), matching the
+/// constructor's `TypeError` for anything else.
+fn pickle_buffer_new(source: i64) -> i64 {
+    let supported = value::as_memoryview(source).is_some()
+        || value::as_bytearray(source).is_some()
+        || value::as_bytes(source).is_some();
+    if !supported {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "a bytes-like object is required, not '{}'",
+                value::type_name(source)
+            ),
+        );
+    }
+    let class = pickle_buffer_class();
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance, source]);
+    value::instance_setattr(instance, "_buffer".to_string(), source);
+    value::instance_setattr(instance, "_released".to_string(), FALSE);
+    heap::release_roots(roots);
+    instance
+}
+
+/// Whether `release()` already ran on the wrapper.
+fn pickle_buffer_released(wrapper: i64) -> bool {
+    value::instance_attr(wrapper, "_released").is_some_and(value::truthy)
+}
+
+/// `PickleBuffer.raw()`: a live `memoryview` over the wrapped object.
+fn pickle_buffer_raw(wrapper: i64) -> i64 {
+    if pickle_buffer_released(wrapper) {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "operation forbidden on released PickleBuffer object",
+        );
+    }
+    let Some(source) = value::instance_attr(wrapper, "_buffer") else {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "'PickleBuffer' object has no attribute 'raw'",
+        );
+    };
+    if let Some(view) = value::as_memoryview(source) {
+        if view.released {
+            return exc::raise_with_message(VALUE_ERROR, value::MEMORYVIEW_RELEASED);
+        }
+        return value::memoryview_abi(view.buffer);
+    }
+    value::memoryview_abi(source)
+}
+
+/// `PickleBuffer.release()`: idempotent; later `raw()` calls raise
+/// `ValueError("operation forbidden on released PickleBuffer object")`.
+fn pickle_buffer_release(wrapper: i64) -> i64 {
+    value::instance_setattr(wrapper, "_released".to_string(), TRUE);
+    NONE
+}
+
+/// `PickleBuffer.__bytes__()`: the wrapped bytes.
+fn pickle_buffer_bytes(wrapper: i64) -> i64 {
+    if pickle_buffer_released(wrapper) {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "operation forbidden on released PickleBuffer object",
+        );
+    }
+    let Some(source) = value::instance_attr(wrapper, "_buffer") else {
+        return NONE;
+    };
+    if let Some(view) = value::as_memoryview(source) {
+        return match value::memoryview_bytes(view) {
+            Ok(bytes) => value::bytes_new(bytes),
+            Err(message) => exc::raise_with_message(VALUE_ERROR, message),
+        };
+    }
+    match value::as_bytes(source) {
+        Some(bytes) => value::bytes_new(bytes.to_vec()),
+        None => exc::raise_with_message(
+            VALUE_ERROR,
+            "operation forbidden on released PickleBuffer object",
+        ),
     }
 }
 
@@ -18706,7 +20607,7 @@ fn os_fsencode(args: &[i64]) -> i64 {
         return value::bytes_new(bytes.to_vec());
     }
     if let Some(text) = value::as_str(path) {
-        return value::bytes_new(text.as_bytes().to_vec());
+        return value::bytes_new(crate::modules::codecs::fsencode(text));
     }
     exc::raise_with_message(TYPE_ERROR, "fsencode() argument must be a path string")
 }
@@ -18728,20 +20629,7 @@ fn os_fsdecode(args: &[i64]) -> i64 {
     let Some(bytes) = value::as_bytes(path) else {
         return exc::raise_with_message(TYPE_ERROR, "fsdecode() argument must be a path string");
     };
-    match std::str::from_utf8(bytes) {
-        Ok(text) => value::str_alloc(text.to_string()),
-        Err(error) => {
-            let position = error.valid_up_to();
-            let byte = bytes.get(position).copied().unwrap_or(0);
-            exc::raise_with_message(
-                exc::UNICODE_DECODE_ERROR,
-                &format!(
-                    "'utf-8' codec can't decode byte 0x{byte:02x} in position {position}: \
-                     invalid data (surrogateescape output cannot be represented)"
-                ),
-            )
-        }
-    }
+    value::str_alloc(crate::modules::codecs::fsdecode(bytes))
 }
 
 /// `os.getuid`/`geteuid`/`getgid`/`getegid`: the process credentials.
@@ -20443,6 +22331,7 @@ fn os_call(function: &str, args: &[i64]) -> i64 {
         "open" => os_open(args),
         "dup" => os_dup(args),
         "dup2" => os_dup2(args),
+        "pipe" => os_pipe(),
         "register_at_fork" => NONE,
         "get_terminal_size" => os_get_terminal_size(args),
         "putenv" => os_putenv(args),
@@ -21446,6 +23335,44 @@ fn os_dup2(args: &[i64]) -> i64 {
         return os_error_from_io("dup2", std::io::Error::last_os_error(), None);
     }
     encode_int(i64::from(result))
+}
+
+/// `os.pipe()`: creates a pipe and returns `(read_fd, write_fd)`.
+///
+/// The descriptors are close-on-exec on platforms that offer `pipe2(2)`,
+/// matching CPython 3.14's `os.pipe()` contract; otherwise `pipe(2)` plus
+/// `fcntl(FD_CLOEXEC)` provides the same flags.
+fn os_pipe() -> i64 {
+    let mut fds = [0 as libc::c_int; 2];
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: `fds` is a valid two-element array and O_CLOEXEC is a plain flag.
+    let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    // SAFETY: `fds` is a valid two-element array.
+    let result = {
+        let created = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if created == 0 {
+            for fd in fds {
+                // SAFETY: the descriptors were just created by `pipe`.
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            }
+        }
+        created
+    };
+    if result != 0 {
+        return os_error_from_io("pipe", std::io::Error::last_os_error(), None);
+    }
+    let read_end = encode_int(i64::from(fds[0]));
+    let write_end = encode_int(i64::from(fds[1]));
+    if exc::pending() {
+        // SAFETY: both descriptors were created above and nothing escaped.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return NONE;
+    }
+    value::tuple_new(vec![read_end, write_end])
 }
 
 /// Raises `OSError` in CPython's `[Errno N] message[: 'path']` form and
@@ -31724,7 +33651,7 @@ mod tests {
         assert!(!exc::pending());
         assert_eq!(method(suppress, "__enter__", &[]), NONE);
         // `None` is falsy: the manager never suppresses the block exception.
-        assert_eq!(method(suppress, "__exit__", &[NONE, NONE, NONE]), NONE);
+        assert_eq!(method(suppress, "__exit__", &[NONE, NONE, NONE]), FALSE);
     }
 
     // Generator bodies for the `contextmanager` tests. A generator function
@@ -33550,11 +35477,15 @@ mod tests {
             Some(&b"raw"[..])
         );
         exc::init();
-        assert_eq!(
-            call("os", "fsdecode", &[value::bytes_new(vec![0xff])]),
-            NONE
+        let surrogate = call("os", "fsdecode", &[value::bytes_new(vec![0xff])]);
+        assert!(!exc::pending());
+        assert_eq!(value::as_str(surrogate), Some("\u{fffd}"));
+        let roundtrip = call(
+            "os",
+            "fsencode",
+            &[value::str_alloc("\u{fffd}".to_string())],
         );
-        assert_eq!(exc::pending_tag(), crate::exc::UNICODE_DECODE_ERROR as i64);
+        assert_eq!(value::as_bytes(roundtrip), Some(&[0xff][..]));
         exc::init();
         assert_eq!(call("os", "system", &[int(1)]), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
@@ -35899,5 +37830,266 @@ mod tests {
         assert_eq!(as_int(method(alias, "get_nowait", &[])), 7);
         heap::release_roots(alias_roots);
         heap::release_roots(roots);
+    }
+
+    #[test]
+    fn random_gauss_and_normalvariate_are_seeded_draws() {
+        // The same seed produces the same draw on independent generators (the
+        // module-level generator is shared, so the test uses instances).
+        let first = call("random", "Random", &[int(12345)]);
+        let gauss = as_float(method(first, "gauss", &[]));
+        assert!(gauss.is_finite());
+        let second = call("random", "Random", &[int(12345)]);
+        assert_eq!(as_float(method(second, "gauss", &[])), gauss);
+        let normal = as_float(method(first, "normalvariate", &[]));
+        assert!(normal.is_finite());
+
+        // Both defaults and keyword binding reach `mu`/`sigma`; a zero sigma
+        // pins the result to `mu`.
+        assert!(value::as_float(call("random", "normalvariate", &[])).is_some());
+        assert_eq!(
+            as_float(call_kw(
+                "random",
+                "gauss",
+                &[],
+                &[
+                    ("mu", value::float_new(2.0)),
+                    ("sigma", value::float_new(0.0)),
+                ],
+            )),
+            2.0
+        );
+        assert_eq!(
+            as_float(call(
+                "random",
+                "gauss",
+                &[value::float_new(10.0), value::float_new(0.0)]
+            )),
+            10.0
+        );
+        assert_eq!(
+            as_float(call(
+                "random",
+                "normalvariate",
+                &[value::float_new(10.0), value::float_new(0.0)]
+            )),
+            10.0
+        );
+
+        // The Random proxy exposes the same draws.
+        let rng = call("random", "Random", &[int(9)]);
+        assert_eq!(
+            as_float(method(
+                rng,
+                "normalvariate",
+                &[value::float_new(5.0), value::float_new(0.0)]
+            )),
+            5.0
+        );
+        assert!(value::as_float(method(rng, "gauss", &[])).is_some());
+        assert!(value::as_instance(get("random", "Random")).is_some());
+    }
+
+    #[test]
+    fn math_ldexp_scales_by_powers_of_two() {
+        let ldexp =
+            |x: f64, exponent: i64| call("math", "ldexp", &[value::float_new(x), int(exponent)]);
+        assert_eq!(as_float(ldexp(1.0, 3)), 8.0);
+        assert_eq!(as_float(ldexp(-1.0, 1)), -2.0);
+        assert_eq!(as_float(ldexp(1.0, -1000000)), 0.0);
+        assert!(as_float(ldexp(-1.0, -1000000)).is_sign_negative());
+        assert!(as_float(ldexp(f64::INFINITY, 30)).is_infinite());
+        assert!(as_float(ldexp(f64::NAN, 0)).is_nan());
+
+        assert_eq!(ldexp(1.0, 1000000), NONE);
+        assert_eq!(exc::pending_tag(), exc::OVERFLOW_ERROR as i64);
+        exc::clear();
+        assert_eq!(
+            call(
+                "math",
+                "ldexp",
+                &[value::float_new(2.0), value::float_new(1.1)]
+            ),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn platform_constants_and_sequence_helpers() {
+        assert_eq!(get("os.path", "supports_unicode_filenames"), TRUE);
+        assert_eq!(as_int(get("sys", "maxunicode")), 0x10FFFF);
+        assert!(value::as_list(get("locale", "ALT_DIGITS")).is_some_and(|digits| digits.is_empty()));
+
+        let values = value::list_new(vec![int(1), int(2), int(1), int(3), int(1)]);
+        assert_eq!(call("operator", "contains", &[values, int(3)]), TRUE);
+        assert_eq!(call("operator", "contains", &[values, int(9)]), FALSE);
+        assert_eq!(as_int(call("operator", "countOf", &[values, int(1)])), 3);
+        assert_eq!(as_int(call("operator", "countOf", &[values, int(9)])), 0);
+
+        // Identity-or-equality: repeated NaN objects and equal dicts count.
+        let nan = value::float_new(f64::NAN);
+        let nans = value::list_new(vec![nan, nan, int(21)]);
+        assert_eq!(as_int(call("operator", "countOf", &[nans, nan])), 2);
+        let dicts = value::list_new(vec![
+            value::dict_new(Vec::new()),
+            int(1),
+            value::dict_new(Vec::new()),
+        ]);
+        assert_eq!(
+            as_int(call(
+                "operator",
+                "countOf",
+                &[dicts, value::dict_new(Vec::new())]
+            )),
+            2
+        );
+
+        // Generic iterables fall back to iteration, and non-iterables raise.
+        let iterable = iter::iter_new(value::list_new(vec![int(4), int(5)]));
+        assert_eq!(call("operator", "contains", &[iterable, int(5)]), TRUE);
+        assert_eq!(call("operator", "contains", &[int(3), int(3)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn semaphores_count_and_validate_releases() {
+        let sem = call("threading", "Semaphore", &[int(2)]);
+        assert!(value::as_instance(sem).is_some());
+        assert_eq!(method(sem, "acquire", &[]), TRUE);
+        assert_eq!(method(sem, "acquire", &[]), TRUE);
+        assert_eq!(method(sem, "acquire", &[FALSE]), FALSE);
+        assert_eq!(as_int(attribute(sem, "_value")), 0);
+        assert_eq!(method(sem, "release", &[]), NONE);
+        assert_eq!(as_int(attribute(sem, "_value")), 1);
+
+        // Context-manager protocol: enter acquires, exit releases.
+        assert_eq!(method(sem, "__enter__", &[]), TRUE);
+        assert_eq!(as_int(attribute(sem, "_value")), 0);
+        assert_eq!(method(sem, "__exit__", &[NONE, NONE, NONE]), NONE);
+        assert_eq!(as_int(attribute(sem, "_value")), 1);
+
+        // A timeout is rejected when the acquire is non-blocking.
+        assert_eq!(
+            method(sem, "acquire", &[FALSE, value::float_new(1.0)]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+
+        // The initial value must be non-negative, and keyword construction
+        // binds `value`.
+        assert_eq!(call("threading", "Semaphore", &[int(-1)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+        let keyword = call_kw("threading", "Semaphore", &[], &[("value", int(3))]);
+        assert_eq!(as_int(attribute(keyword, "_value")), 3);
+
+        // A bounded semaphore refuses releases past its initial value.
+        let bounded = call("threading", "BoundedSemaphore", &[int(1)]);
+        assert_eq!(as_int(attribute(bounded, "_value")), 1);
+        assert_eq!(as_int(attribute(bounded, "_initial_value")), 1);
+        assert_eq!(method(bounded, "release", &[]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "Semaphore released too many times");
+        exc::clear();
+        assert_eq!(method(bounded, "acquire", &[]), TRUE);
+        assert_eq!(method(bounded, "release", &[int(1)]), NONE);
+        assert_eq!(as_int(attribute(bounded, "_value")), 1);
+        assert_eq!(method(bounded, "release", &[int(0)]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+
+        // `type()`/repr keep the class identity and the live counter.
+        let repr = value::repr(sem);
+        assert!(repr.starts_with("<threading.Semaphore at "), "{repr}");
+        assert!(repr.ends_with("value=1>"), "{repr}");
+    }
+
+    #[test]
+    fn thread_construction_supports_kwargs_and_hooks() {
+        // `Thread()` with no target is valid and carries the no-op body.
+        let thread = call("threading", "Thread", &[]);
+        assert!(value::as_thread(thread).is_some());
+
+        // `kwargs` binds and becomes a partial over the (no-op) target.
+        let kwargs = value::dict_new(vec![(string("x"), int(1))]);
+        let keyword_thread = call_kw("threading", "Thread", &[], &[("kwargs", kwargs)]);
+        assert!(value::as_thread(keyword_thread).is_some());
+        assert_eq!(
+            call_kw("threading", "Thread", &[], &[("kwargs", int(1))]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+
+        // The introspection/hook surface exists and is callable.
+        assert!(value::as_list(get("threading", "_dangling")).is_some());
+        assert!(value::as_function(get("threading", "excepthook")).is_some());
+        assert!(value::as_function(get("threading", "__excepthook__")).is_some());
+        assert_eq!(
+            call(
+                "threading",
+                "excepthook",
+                &[value::tuple_new(vec![NONE, NONE, NONE])]
+            ),
+            NONE
+        );
+    }
+
+    #[test]
+    fn codecs_unregister_error_matches_cpython_314() {
+        let handler = call("_codecs", "lookup_error", &[string("ignore")]);
+        assert_eq!(
+            call(
+                "_codecs",
+                "register_error",
+                &[string("test.gap_handler"), handler]
+            ),
+            NONE
+        );
+        assert_eq!(
+            call("_codecs", "lookup_error", &[string("test.gap_handler")]),
+            handler
+        );
+        assert_eq!(
+            call(
+                "_codecs",
+                "_unregister_error",
+                &[string("test.gap_handler")]
+            ),
+            TRUE
+        );
+        assert_eq!(
+            call("_codecs", "lookup_error", &[string("test.gap_handler")]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), exc::LOOKUP_ERROR as i64);
+        exc::clear();
+
+        // Unknown custom names report `False`, built-ins and non-str raise.
+        assert_eq!(
+            call(
+                "_codecs",
+                "_unregister_error",
+                &[string("test.unknown_handler")]
+            ),
+            FALSE
+        );
+        assert_eq!(
+            call("_codecs", "_unregister_error", &[string("strict")]),
+            NONE
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "cannot un-register built-in error handler 'strict'"
+        );
+        exc::clear();
+        assert_eq!(call("_codecs", "_unregister_error", &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
     }
 }

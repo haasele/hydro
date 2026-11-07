@@ -12,6 +12,18 @@ use crate::container;
 use crate::exc::{self, ATTRIBUTE_ERROR};
 use crate::value::{self, NONE};
 
+/// `ECONNRESET`/`EINPROGRESS` track the host platform through libc on Unix;
+/// the rest of the table is the Linux (asm-generic) numbering.
+#[cfg(unix)]
+const ECONNRESET_CODE: i32 = libc::ECONNRESET;
+#[cfg(not(unix))]
+const ECONNRESET_CODE: i32 = 104;
+
+#[cfg(unix)]
+const EINPROGRESS_CODE: i32 = libc::EINPROGRESS;
+#[cfg(not(unix))]
+const EINPROGRESS_CODE: i32 = 115;
+
 /// `(name, value)` pairs in the order used by `errorcode` and `__dict__`.
 const TABLE: &[(&str, i32)] = &[
     ("E2BIG", 7),
@@ -37,7 +49,7 @@ const TABLE: &[(&str, i32)] = &[
     ("ECOMM", 70),
     ("ECONNABORTED", 103),
     ("ECONNREFUSED", 111),
-    ("ECONNRESET", 104),
+    ("ECONNRESET", ECONNRESET_CODE),
     ("EDEADLK", 35),
     ("EDEADLOCK", 35),
     ("EDESTADDRREQ", 89),
@@ -53,7 +65,7 @@ const TABLE: &[(&str, i32)] = &[
     ("EHWPOISON", 133),
     ("EIDRM", 43),
     ("EILSEQ", 84),
-    ("EINPROGRESS", 115),
+    ("EINPROGRESS", EINPROGRESS_CODE),
     ("EINTR", 4),
     ("EINVAL", 22),
     ("EIO", 5),
@@ -171,6 +183,11 @@ fn constant(name: &str) -> Option<i32> {
         .map(|(_, raw)| *raw)
 }
 
+/// Tagged value of a table constant, for module-attribute wiring.
+pub(crate) fn constant_value(name: &str) -> Option<i64> {
+    constant(name).map(int_value)
+}
+
 /// `errno.errorcode`: value -> first name with that value.
 ///
 /// The dict is filled incrementally: it is the only owner of the strings
@@ -234,6 +251,20 @@ mod tests {
         assert_eq!(lookup("ENOENT"), code(2));
         assert_eq!(lookup("EWOULDBLOCK"), code(11));
         assert_eq!(lookup("EXFULL"), code(54));
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn socket_constants_match_libc() {
+        exc::init();
+        #[cfg(unix)]
+        {
+            assert_eq!(lookup("ECONNRESET"), code(libc::ECONNRESET));
+            assert_eq!(lookup("EINPROGRESS"), code(libc::EINPROGRESS));
+        }
+        assert_eq!(constant_value("ECONNRESET"), Some(code(ECONNRESET_CODE)));
+        assert_eq!(constant_value("EINPROGRESS"), Some(code(EINPROGRESS_CODE)));
+        assert_eq!(constant_value("NOPE"), None);
         assert!(!exc::pending());
     }
 

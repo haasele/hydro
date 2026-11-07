@@ -21,8 +21,10 @@
 //!   counter (and clears both once-registries) after an in-place edit;
 //! * `catch_warnings(...)` as a real context manager: entering snapshots the
 //!   filters, `record=True` installs an `always` filter and returns a list
-//!   that receives one `WarningMessage`-shaped object per emitted warning,
-//!   and exiting restores the snapshot (nested managers are independent);
+//!   that receives one real `WarningMessage` (`warnings.WarningMessage`, the
+//!   cached native class with CPython's constructor, `_WARNING_DETAILS`,
+//!   `__str__` and `__repr__`) per emitted warning, and exiting restores the
+//!   snapshot (nested managers are independent);
 //! * the private `_deprecated` helper used by `annotationlib` (and the rest
 //!   of the 3.14 standard library): it validates its required arguments,
 //!   formats the removal message and emits a `DeprecationWarning`;
@@ -562,13 +564,13 @@ fn raw_emit(
     }
 }
 
-/// Appends one `WarningMessage`-shaped object to a recording list.
+/// Appends one `WarningMessage` to a recording list.
 ///
 /// The message attribute is the `Warning` instance (`category(text)`), the
 /// same object CPython passes to `showwarning`; `category` keeps the class the
-/// caller supplied. Everything remains inspectable as attributes, which is
-/// what `numpy.testing` and `warnings.catch_warnings(record=True)` consumers
-/// read.
+/// caller supplied. The wrapper is built by calling the real
+/// [`warning_message_class`], so its `__init__` stores every field (including
+/// `_category_name`) exactly as CPython's Python-level class does.
 fn record_warning(
     target: &RecordTarget,
     text: &str,
@@ -577,42 +579,279 @@ fn record_warning(
     filename: &str,
     lineno: i64,
 ) -> i64 {
-    // The warning instance and the wrapper class are both fresh allocations;
-    // root the parts while the class and instance attributes are created.
+    // The warning instance and the filename are fresh allocations; root the
+    // parts while the class call binds and stores them.
     let message = exc::exception_value(tag, text, vec![text.to_string()]);
-    let warning = value::instance_new(warning_message_class());
-    let category_name = value::class_display_name(category).unwrap_or("Warning");
-    let fields = [
-        ("message".to_string(), message),
-        ("category".to_string(), category),
-        (
-            "filename".to_string(),
-            value::str_alloc(filename.to_string()),
-        ),
-        ("lineno".to_string(), ops::int_result(lineno)),
-        ("file".to_string(), NONE),
-        ("line".to_string(), NONE),
-        ("source".to_string(), NONE),
-        (
-            "_category_name".to_string(),
-            value::str_alloc(category_name.to_string()),
-        ),
-    ];
-    let roots = heap::root_values(&[message, warning, category, fields[2].1, fields[3].1]);
-    for (name, item) in fields {
-        value::instance_setattr(warning, name, item);
+    let filename_value = value::str_alloc(filename.to_string());
+    let roots = heap::root_values(&[message, category, filename_value]);
+    let warning = warning_message_new(
+        message,
+        category,
+        filename_value,
+        ops::int_result(lineno),
+        NONE,
+        NONE,
+        NONE,
+    );
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
     }
+    let warning_roots = heap::root_values(&[warning]);
     container::list_append(target.list, warning);
+    heap::release_roots(warning_roots);
     heap::release_roots(roots);
     NONE
 }
 
-/// The `WarningMessage` wrapper class recorded in a list.
+/// Constructs `WarningMessage(message, category, filename, lineno, file, line,
+/// source)` through the class value.
 ///
-/// A fresh empty class is enough: every field is a per-instance attribute and
-/// consumers only read them.
-fn warning_message_class() -> i64 {
-    value::class_new("WarningMessage".to_string(), NONE, Vec::new())
+/// Going through [`crate::builtins::call`] runs the native `__init__` with the
+/// same argument binding Python code sees, so the constructor's defaults and
+/// signature errors match CPython. The arguments are native-stack values, so
+/// they are rooted for the duration of the call.
+pub(crate) fn warning_message_new(
+    message: i64,
+    category: i64,
+    filename: i64,
+    lineno: i64,
+    file: i64,
+    line: i64,
+    source: i64,
+) -> i64 {
+    let class = warning_message_class();
+    let argv = [message, category, filename, lineno, file, line, source];
+    let roots = heap::root_values(&argv);
+    let instance = crate::builtins::call(class, argv.len(), argv.as_ptr());
+    heap::release_roots(roots);
+    instance
+}
+
+/// CPython's `WarningMessage._WARNING_DETAILS` field order.
+const WARNING_MESSAGE_DETAILS: [&str; 7] = [
+    "message", "category", "filename", "lineno", "file", "line", "source",
+];
+
+/// The `warnings.WarningMessage` class recorded by
+/// `catch_warnings(record=True)`.
+///
+/// CPython defines it in `Lib/_py_warnings.py`; Hydro materialises the same
+/// class natively so recorded entries can be `isinstance`-checked and user
+/// code can construct one directly. The constructor is CPython's
+/// `(message, category, filename, lineno, file=None, line=None, source=None)`,
+/// every argument becomes a same-named attribute, `_category_name` caches
+/// `category.__name__`, and `__str__`/`__repr__` render the same text.
+pub(crate) fn warning_message_class() -> i64 {
+    const KEY: &str = "warnings.WarningMessage";
+    if let Some(cached) = crate::core::globals::registry_get(KEY) {
+        return cached;
+    }
+    // Every value below lives only on the Rust stack until it is owned by the
+    // class, so each allocation is rooted under one mark.
+    let mark = heap::root_values(&[]);
+    let mut details_items = Vec::with_capacity(WARNING_MESSAGE_DETAILS.len());
+    for detail in WARNING_MESSAGE_DETAILS {
+        let item = value::str_alloc(detail.to_string());
+        heap::push_scoped_root(item);
+        details_items.push(item);
+    }
+    let details = value::tuple_new(details_items);
+    heap::root_values(&[details]);
+    let init = native_method(
+        "WarningMessage.__init__",
+        warning_message_init_entry,
+        vec![
+            value::ParamMeta {
+                name: "self".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "message".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "category".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "filename".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "lineno".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "file".to_string(),
+                kind: ParamKind::Positional,
+                default: Some(NONE),
+            },
+            value::ParamMeta {
+                name: "line".to_string(),
+                kind: ParamKind::Positional,
+                default: Some(NONE),
+            },
+            value::ParamMeta {
+                name: "source".to_string(),
+                kind: ParamKind::Positional,
+                default: Some(NONE),
+            },
+        ],
+    );
+    let as_str = native_method(
+        "WarningMessage.__str__",
+        warning_message_str_entry,
+        vec![value::ParamMeta {
+            name: "self".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        }],
+    );
+    let as_repr = native_method(
+        "WarningMessage.__repr__",
+        warning_message_repr_entry,
+        vec![value::ParamMeta {
+            name: "self".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        }],
+    );
+    heap::root_values(&[init, as_str, as_repr]);
+    let class = value::class_new_full(
+        "WarningMessage".to_string(),
+        NONE,
+        vec![
+            ("__init__".to_string(), init, hydro_ir::MethodKind::Normal),
+            ("__str__".to_string(), as_str, hydro_ir::MethodKind::Normal),
+            (
+                "__repr__".to_string(),
+                as_repr,
+                hydro_ir::MethodKind::Normal,
+            ),
+        ],
+        vec![("_WARNING_DETAILS".to_string(), details)],
+    );
+    if class == NONE {
+        heap::release_roots(mark);
+        return class;
+    }
+    heap::root_values(&[class]);
+    crate::core::globals::registry_set(KEY, class);
+    heap::release_roots(mark);
+    class
+}
+
+extern "C" fn warning_message_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes
+    // `(self, message, category, filename, lineno, file, line, source)`.
+    warning_message_init(
+        unsafe { *argv },
+        unsafe { *argv.add(1) },
+        unsafe { *argv.add(2) },
+        unsafe { *argv.add(3) },
+        unsafe { *argv.add(4) },
+        unsafe { *argv.add(5) },
+        unsafe { *argv.add(6) },
+        unsafe { *argv.add(7) },
+    )
+}
+
+extern "C" fn warning_message_str_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self)`.
+    warning_message_str(unsafe { *argv })
+}
+
+extern "C" fn warning_message_repr_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self)`.
+    warning_message_repr(unsafe { *argv })
+}
+
+/// `WarningMessage.__init__`: store the seven fields plus `_category_name`.
+///
+/// CPython performs no validation here; the arguments are assigned verbatim,
+/// and `category.__name__` is read once (so `category=None` yields
+/// `_category_name=None`).
+#[allow(clippy::too_many_arguments)]
+fn warning_message_init(
+    instance: i64,
+    message: i64,
+    category: i64,
+    filename: i64,
+    lineno: i64,
+    file: i64,
+    line: i64,
+    source: i64,
+) -> i64 {
+    let arguments = [
+        instance, message, category, filename, lineno, file, line, source,
+    ];
+    let roots = heap::root_values(&arguments);
+    value::instance_setattr(instance, "message".to_string(), message);
+    value::instance_setattr(instance, "category".to_string(), category);
+    value::instance_setattr(instance, "filename".to_string(), filename);
+    value::instance_setattr(instance, "lineno".to_string(), lineno);
+    value::instance_setattr(instance, "file".to_string(), file);
+    value::instance_setattr(instance, "line".to_string(), line);
+    value::instance_setattr(instance, "source".to_string(), source);
+    // CPython assigns the seven fields first and only then evaluates
+    // `category.__name__ if category else None`.
+    let category_name = if value::truthy(category) {
+        match value::class_display_name(category) {
+            Some(name) => value::str_alloc(name.to_string()),
+            // A non-class truthy category has no `__name__`; let the real
+            // attribute lookup raise CPython's `AttributeError`.
+            None => methods::getattr(category, b"__name__".as_ptr(), "__name__".len()),
+        }
+    } else {
+        NONE
+    };
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let category_name_roots = heap::root_values(&[category_name]);
+    value::instance_setattr(instance, "_category_name".to_string(), category_name);
+    heap::release_roots(category_name_roots);
+    heap::release_roots(roots);
+    NONE
+}
+
+/// `WarningMessage.__str__`, byte-for-byte CPython's format string.
+fn warning_message_str(instance: i64) -> i64 {
+    let roots = heap::root_values(&[instance]);
+    let message = value::instance_attr(instance, "message").unwrap_or(NONE);
+    let category_name = value::instance_attr(instance, "_category_name").unwrap_or(NONE);
+    let filename = value::instance_attr(instance, "filename").unwrap_or(NONE);
+    let lineno = value::instance_attr(instance, "lineno").unwrap_or(NONE);
+    let line = value::instance_attr(instance, "line").unwrap_or(NONE);
+    let rendered = format!(
+        "{{message : {}, category : {}, filename : {}, lineno : {}, line : {}}}",
+        value::repr(message),
+        value::repr(category_name),
+        value::repr(filename),
+        value::to_string(lineno),
+        value::repr(line),
+    );
+    heap::release_roots(roots);
+    value::str_alloc(rendered)
+}
+
+/// `WarningMessage.__repr__`: `f'<{type(self).__qualname__} {self}>'`.
+fn warning_message_repr(instance: i64) -> i64 {
+    let class = value::instance_class_value(instance).unwrap_or(NONE);
+    let qualname = value::class_qualname(class).unwrap_or("WarningMessage");
+    let text = warning_message_str(instance);
+    if exc::pending() {
+        return NONE;
+    }
+    let rendered = format!("<{qualname} {}>", value::as_str(text).unwrap_or(""));
+    value::str_alloc(rendered)
 }
 
 /// Records the warning in the caller-supplied registry dict (CPython's
@@ -1704,6 +1943,7 @@ pub(crate) fn constant(name: &str) -> i64 {
         "deprecated" => deprecated_class(),
         "_DEPRECATED_MSG" => value::str_alloc(DEPRECATED_MSG.to_string()),
         "EncodingWarning" => encoding_warning_class(),
+        "WarningMessage" => warning_message_class(),
         _ => attribute_error(name),
     }
 }

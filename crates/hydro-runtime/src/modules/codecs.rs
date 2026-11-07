@@ -16,13 +16,27 @@
 //! `utf_8_*`/`ascii_*`/`latin_1_*` functions; `encode`/`decode` themselves
 //! take the encoding name and route to the same engines.
 //!
-//! The error-handler registry stores callables. `strict`, `ignore` and
-//! `replace` are built in (and can be overridden by `register_error`, as in
-//! CPython). During decoding, a registered handler is called with a
-//! `UnicodeDecodeError` object and must return `(replacement_str, new_pos)`.
-//! Hydro's exception objects expose `args` rather than `.object/.start/.end`,
-//! so the error object carries `(encoding, object_repr, start, end, reason)`
-//! as its args tuple.
+//! The error-handler registry stores callables. `strict`, `ignore`,
+//! `replace` and `surrogateescape` are built in (and can be overridden by
+//! `register_error`, as in CPython). During decoding, a registered handler is
+//! called with a `UnicodeDecodeError` object and must return
+//! `(replacement_str, new_pos)`. Hydro's exception objects expose `args`
+//! rather than `.object/.start/.end`, so the error object carries
+//! `(encoding, object_repr, start, end, reason)` as its args tuple. Encoding
+//! handlers accept either a `str` (encoded with the target codec, the shape
+//! the runtime's own handlers use) or a `bytes` replacement, which is
+//! appended verbatim as CPython's encoder protocol specifies.
+//!
+//! `surrogateescape` (PEP 383) needs one representation note. Hydro strings
+//! are UTF-8, so the lone surrogates U+DC80..U+DCFF CPython produces cannot
+//! exist in a runtime string, and the lexer already maps every `\udcXX`
+//! escape to U+FFFD. The codec therefore uses
+//! [`SURROGATE_ESCAPE_STAND_IN`] (U+FFFD) as the stand-in for a lone
+//! surrogate: every undecodable byte becomes that character (so
+//! `b'\xff'.decode('utf-8', 'surrogateescape')` equals the `'\udcff'` literal,
+//! both being U+FFFD here), and encoding the stand-in emits `0xff` again. The
+//! stand-in cannot distinguish two different undecodable bytes, which is the
+//! same lossy limit the rest of the runtime documents for lone surrogates.
 //!
 //! `escape_encode`/`escape_decode` implement CPython's `unicode_escape`
 //! subset used by the `codecs` module.
@@ -50,7 +64,32 @@ enum ErrorMode {
     Strict,
     Ignore,
     Replace,
+    /// PEP 383: undecodable bytes become a stand-in for their lone surrogate
+    /// and the stand-in encodes back to the byte.
+    SurrogateEscape,
     Custom(i64),
+}
+
+/// The runtime's stand-in for a lone surrogate produced by `surrogateescape`.
+///
+/// Hydro strings are UTF-8, so U+DC80..U+DCFF cannot be stored and the lexer
+/// already turns every surrogate escape into U+FFFD. `surrogateescape`
+/// decodes each rejected byte to this character and encodes it back to
+/// [`SURROGATE_ESCAPE_BYTE`]. A genuine U+FFFD is therefore not
+/// distinguishable from an escaped byte under this handler.
+const SURROGATE_ESCAPE_STAND_IN: char = '\u{FFFD}';
+
+/// The byte [`SURROGATE_ESCAPE_STAND_IN`] stands for: CPython's surrogate for
+/// `0xff`, the undecodable byte `test.support.os_helper` relies on.
+const SURROGATE_ESCAPE_BYTE: u8 = 0xff;
+
+/// The byte a `surrogateescape` stand-in encodes back to, if `character` is
+/// that stand-in.
+///
+/// A real lone surrogate can never reach this function: Hydro's `char` is a
+/// Unicode scalar value, so U+DC80..U+DCFF do not exist in a runtime string.
+fn surrogate_escape_byte(character: char) -> Option<u8> {
+    (character == SURROGATE_ESCAPE_STAND_IN).then_some(SURROGATE_ESCAPE_BYTE)
 }
 
 /// The codecs the runtime implements natively.
@@ -123,10 +162,12 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "register" => register(args),
         "unregister" => unregister(args),
         "register_error" => register_error(args),
+        "_unregister_error" => unregister_error(args),
         "lookup_error" => lookup_error(args),
         "strict_errors" => strict_errors(args),
         "ignore_errors" => ignore_errors(args),
         "replace_errors" => replace_errors(args),
+        "surrogateescape_errors" => surrogateescape_errors(args),
         _ => exc::raise_with_message(
             exc::ATTRIBUTE_ERROR,
             &format!("module '_codecs' has no attribute '{function}'"),
@@ -217,6 +258,7 @@ fn error_mode(name: &str) -> Result<ErrorMode, i64> {
         "strict" => Ok(ErrorMode::Strict),
         "ignore" => Ok(ErrorMode::Ignore),
         "replace" => Ok(ErrorMode::Replace),
+        "surrogateescape" => Ok(ErrorMode::SurrogateEscape),
         _ => Err(lookup_error_message(&format!(
             "unknown error handler name '{name}'"
         ))),
@@ -294,9 +336,33 @@ fn decode(args: &[i64]) -> i64 {
 /// report the runs they cannot represent.
 fn encode_text(text: &str, codec: Codec, mode: &ErrorMode) -> Result<Vec<u8>, i64> {
     match codec {
-        Codec::Utf8 => Ok(text.as_bytes().to_vec()),
+        Codec::Utf8 => encode_utf8_text(text, mode),
         Codec::Ascii | Codec::Latin1 => encode_single_byte(text, codec, mode),
     }
+}
+
+/// Encodes `text` as UTF-8.
+///
+/// Every Unicode scalar value is representable in UTF-8, so `strict`,
+/// `ignore` and `replace` all produce the plain bytes. `surrogateescape` is
+/// the exception: the runtime's stand-in for a lone surrogate
+/// ([`SURROGATE_ESCAPE_STAND_IN`]) is written back as
+/// [`SURROGATE_ESCAPE_BYTE`] instead of its own UTF-8 encoding.
+fn encode_utf8_text(text: &str, mode: &ErrorMode) -> Result<Vec<u8>, i64> {
+    if !matches!(mode, ErrorMode::SurrogateEscape) {
+        return Ok(text.as_bytes().to_vec());
+    }
+    let mut out = Vec::with_capacity(text.len());
+    for character in text.chars() {
+        match surrogate_escape_byte(character) {
+            Some(byte) => out.push(byte),
+            None => {
+                let mut buffer = [0u8; 4];
+                out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Decodes `data` with `codec`, applying `mode` to bytes the codec rejects.
@@ -307,6 +373,36 @@ fn decode_bytes(data: &[u8], codec: Codec, mode: &ErrorMode) -> Result<String, i
         // Latin-1 is a total mapping: every byte is U+0000..U+00FF, so no
         // error handler can ever be consulted.
         Codec::Latin1 => Ok(data.iter().map(|&byte| byte as char).collect()),
+    }
+}
+
+// Filesystem names (`os.fsdecode`/`os.fsencode`)
+
+/// Decodes a filesystem name the way POSIX `os.fsdecode` does.
+///
+/// The filesystem encoding is UTF-8 under `surrogateescape`, which accepts
+/// every byte sequence. Undecodable bytes become the runtime's surrogate
+/// stand-in ([`SURROGATE_ESCAPE_STAND_IN`]); see the module docs for the
+/// documented limit that a stand-in cannot be distinguished from a genuine
+/// U+FFFD.
+pub(crate) fn fsdecode(data: &[u8]) -> String {
+    match decode_utf8(data, &ErrorMode::SurrogateEscape, true) {
+        Ok((text, _)) => text,
+        // `surrogateescape` rejects nothing, so this arm cannot be reached;
+        // keep the helper infallible for its `os` callers.
+        Err(_) => String::new(),
+    }
+}
+
+/// Encodes a filesystem name the way POSIX `os.fsencode` does.
+///
+/// The filesystem encoding is UTF-8 under `surrogateescape`, so the runtime's
+/// surrogate stand-in is written back as [`SURROGATE_ESCAPE_BYTE`].
+pub(crate) fn fsencode(text: &str) -> Vec<u8> {
+    match encode_utf8_text(text, &ErrorMode::SurrogateEscape) {
+        Ok(bytes) => bytes,
+        // `encode_utf8_text` never fails; keep the helper infallible.
+        Err(_) => text.as_bytes().to_vec(),
     }
 }
 
@@ -439,6 +535,14 @@ fn decode_utf8(data: &[u8], mode: &ErrorMode, final_: bool) -> Result<(String, u
                 match error.error_len() {
                     None => {
                         if final_ {
+                            // `surrogateescape` accepts a truncated sequence:
+                            // every remaining byte is escaped.
+                            if let ErrorMode::SurrogateEscape = mode {
+                                for _ in &data[start..] {
+                                    out.push(SURROGATE_ESCAPE_STAND_IN);
+                                }
+                                return Ok((out, data.len()));
+                            }
                             return Err(unicode_decode_error(
                                 Codec::Utf8,
                                 data,
@@ -469,6 +573,14 @@ fn decode_utf8(data: &[u8], mode: &ErrorMode, final_: bool) -> Result<(String, u
                                 out.push('\u{FFFD}');
                                 offset = end;
                             }
+                            ErrorMode::SurrogateEscape => {
+                                // One stand-in per rejected byte, like
+                                // CPython's per-byte surrogate escape.
+                                for _ in &data[start..end] {
+                                    out.push(SURROGATE_ESCAPE_STAND_IN);
+                                }
+                                offset = end;
+                            }
                             ErrorMode::Custom(handler) => {
                                 let exception =
                                     decode_exception_value(Codec::Utf8, data, start, end, reason);
@@ -496,7 +608,7 @@ fn decode_utf8(data: &[u8], mode: &ErrorMode, final_: bool) -> Result<(String, u
     }
 }
 
-/// Strict/ignore/replace/custom-handler ASCII decoding.
+/// Strict/ignore/replace/surrogateescape/custom-handler ASCII decoding.
 ///
 /// CPython reports every rejected byte on its own, so the error span is
 /// always one byte wide. Latin-1 never reaches this path.
@@ -519,6 +631,7 @@ fn decode_ascii(data: &[u8], mode: &ErrorMode) -> Result<String, i64> {
             }
             ErrorMode::Ignore => {}
             ErrorMode::Replace => out.push('\u{FFFD}'),
+            ErrorMode::SurrogateEscape => out.push(SURROGATE_ESCAPE_STAND_IN),
             ErrorMode::Custom(handler) => {
                 let exception = decode_exception_value(Codec::Ascii, data, start, end, REASON);
                 let result = core_builtins::call(*handler, 1, [exception].as_ptr());
@@ -554,7 +667,9 @@ fn characters_from(text: &str, index: usize) -> impl Iterator<Item = (usize, cha
 /// Consecutive unrepresentable characters share one error span, matching
 /// CPython's report. The strict/ignore/replace modes stream without an index
 /// buffer; a custom handler can request an arbitrary resume position, so the
-/// iterator is rebuilt from that character index.
+/// iterator is rebuilt from that character index. `surrogateescape` examines
+/// each character on its own: the runtime's surrogate stand-in becomes its
+/// byte and anything else unrepresentable raises.
 fn encode_single_byte(text: &str, codec: Codec, mode: &ErrorMode) -> Result<Vec<u8>, i64> {
     debug_assert_ne!(codec, Codec::Utf8);
     let limit = codec.limit();
@@ -572,14 +687,24 @@ fn encode_single_byte(text: &str, codec: Codec, mode: &ErrorMode) -> Result<Vec<
             continue;
         }
         let mut end = start + 1;
-        while let Some(&(index, next)) = characters.peek() {
-            if (next as u32) <= limit {
-                break;
+        // `surrogateescape` treats every unrepresentable character on its
+        // own, so it must not lump the adjacent run into one error span.
+        if !matches!(mode, ErrorMode::SurrogateEscape) {
+            while let Some(&(index, next)) = characters.peek() {
+                if (next as u32) <= limit {
+                    break;
+                }
+                end = index + 1;
+                characters.next();
             }
-            end = index + 1;
-            characters.next();
         }
         match mode {
+            ErrorMode::SurrogateEscape => match surrogate_escape_byte(character) {
+                Some(byte) => out.push(byte),
+                None => {
+                    return Err(unicode_encode_error(codec, text, start, end, &reason));
+                }
+            },
             ErrorMode::Strict => {
                 return Err(unicode_encode_error(codec, text, start, end, &reason));
             }
@@ -594,22 +719,27 @@ fn encode_single_byte(text: &str, codec: Codec, mode: &ErrorMode) -> Result<Vec<
                 if exc::pending() {
                     return Err(result);
                 }
-                let (replacement, position) = error_handler_result(result)?;
+                let (replacement, position) = encode_handler_result(result)?;
                 if position <= start as i64 || position > character_count as i64 {
                     return Err(exc::raise_with_message(
                         VALUE_ERROR,
                         &format!("error handler returned invalid position {position}"),
                     ));
                 }
-                // The replacement is encoded with the same codec; a character
-                // it cannot represent raises for the original span, like
-                // CPython.
-                for replacement_character in replacement.chars() {
-                    let replacement_code = replacement_character as u32;
-                    if replacement_code > limit {
-                        return Err(unicode_encode_error(codec, text, start, end, &reason));
+                match replacement {
+                    EncodeReplacement::Bytes(bytes) => out.extend_from_slice(bytes),
+                    EncodeReplacement::Text(replacement_text) => {
+                        // A text replacement is encoded with the same codec; a
+                        // character it cannot represent raises for the original
+                        // span, like CPython.
+                        for replacement_character in replacement_text.chars() {
+                            let replacement_code = replacement_character as u32;
+                            if replacement_code > limit {
+                                return Err(unicode_encode_error(codec, text, start, end, &reason));
+                            }
+                            out.push(replacement_code as u8);
+                        }
                     }
-                    out.push(replacement_code as u8);
                 }
                 characters = characters_from(text, position as usize).peekable();
             }
@@ -726,6 +856,46 @@ fn error_handler_result(result: i64) -> Result<(&'static str, i64), i64> {
     }
     let Some(replacement) = value::as_str(items[0]) else {
         return Err(type_error("error handler replacement must be a str"));
+    };
+    let Some(position) = value::as_integer(items[1]) else {
+        return Err(type_error("error handler position must be an int"));
+    };
+    Ok((replacement, position))
+}
+
+/// The replacement of an encode error handler.
+enum EncodeReplacement {
+    /// Text encoded with the target codec (the shape the runtime's own
+    /// handlers return).
+    Text(&'static str),
+    /// Raw bytes appended verbatim, as CPython's encoder protocol specifies.
+    Bytes(&'static [u8]),
+}
+
+/// Validates an encode handler result: `(replacement: str | bytes,
+/// new_position: int)`.
+///
+/// CPython's encoder handlers return bytes; accepting a `str` as well keeps
+/// the handlers written against this runtime working.
+fn encode_handler_result(result: i64) -> Result<(EncodeReplacement, i64), i64> {
+    let Some(items) = value::as_tuple(result) else {
+        return Err(type_error(
+            "error handler must return a tuple of (str or bytes, int)",
+        ));
+    };
+    if items.len() != 2 {
+        return Err(type_error(
+            "error handler must return a tuple of (str or bytes, int)",
+        ));
+    }
+    let replacement = if let Some(text) = value::as_str(items[0]) {
+        EncodeReplacement::Text(text)
+    } else if let Some(bytes) = value::as_bytes(items[0]) {
+        EncodeReplacement::Bytes(bytes)
+    } else {
+        return Err(type_error(
+            "error handler replacement must be a str or bytes",
+        ));
     };
     let Some(position) = value::as_integer(items[1]) else {
         return Err(type_error("error handler position must be an int"));
@@ -1035,6 +1205,53 @@ fn register_error(args: &[i64]) -> i64 {
     NONE
 }
 
+/// `_codecs._unregister_error(errors)`: removes a custom error handler.
+///
+/// CPython 3.14 semantics: built-in handler names raise `ValueError` (they
+/// cannot be unregistered), a custom name returns `True` when removed and
+/// `False` when no handler was registered under it.
+fn unregister_error(args: &[i64]) -> i64 {
+    const BUILTIN: [&str; 8] = [
+        "strict",
+        "ignore",
+        "replace",
+        "xmlcharrefreplace",
+        "backslashreplace",
+        "namereplace",
+        "surrogatepass",
+        "surrogateescape",
+    ];
+    let name = match value::as_str(args[0]) {
+        Some(name) => name.to_string(),
+        None => {
+            return type_error(&format!(
+                "_unregister_error() argument 1 must be str, not {}",
+                value::type_name(args[0])
+            ))
+        }
+    };
+    if BUILTIN.contains(&name.as_str()) {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            &format!("cannot un-register built-in error handler '{name}'"),
+        );
+    }
+    let removed = ERROR_HANDLERS.with(|handlers| {
+        let mut handlers = handlers.borrow_mut();
+        match handlers
+            .iter()
+            .rposition(|(registered, _)| registered == &name)
+        {
+            Some(index) => {
+                handlers.remove(index);
+                true
+            }
+            None => false,
+        }
+    });
+    value::bool_value(removed)
+}
+
 fn lookup_error(args: &[i64]) -> i64 {
     let name = match value::as_str(args[0]) {
         Some(name) => name,
@@ -1060,6 +1277,7 @@ fn builtin_error_handler(name: &str) -> Option<i64> {
         "strict" => "_codecs.strict_errors",
         "ignore" => "_codecs.ignore_errors",
         "replace" => "_codecs.replace_errors",
+        "surrogateescape" => "_codecs.surrogateescape_errors",
         _ => return None,
     };
     if let Some(cached) = globals::registry_get(cache_key) {
@@ -1070,12 +1288,13 @@ fn builtin_error_handler(name: &str) -> Option<i64> {
     Some(function)
 }
 
-/// `native_function_new` stores `&'static str` names. The three handler names
+/// `native_function_new` stores `&'static str` names. The four handler names
 /// are fixed, so interning them once is enough.
 fn leak_handler_name(name: &str) -> &'static str {
     match name {
         "strict" => "strict_errors",
         "ignore" => "ignore_errors",
+        "surrogateescape" => "surrogateescape_errors",
         _ => "replace_errors",
     }
 }
@@ -1134,6 +1353,76 @@ fn replace_errors(args: &[i64]) -> i64 {
     let replacement = value::str_alloc(replacement_text.to_string());
     let position = ops::int_result(end);
     value::tuple_new(vec![replacement, position])
+}
+
+/// Extracts the `start` position from a `UnicodeDecodeError`/
+/// `UnicodeEncodeError` created by this module (`args[2]`).
+fn error_handler_start(exception: i64) -> Result<i64, i64> {
+    let Some(data) = value::exception_data(exception) else {
+        return Err(type_error(
+            "error handler expects a UnicodeDecodeError or UnicodeEncodeError",
+        ));
+    };
+    let Some(text) = data.args.get(2) else {
+        return Err(type_error(
+            "error handler expects a Unicode error with start/end args",
+        ));
+    };
+    text.parse::<i64>()
+        .map_err(|_| type_error("error handler expects a Unicode error with start/end args"))
+}
+
+/// `surrogateescape_errors(exception)`: the PEP 383 handler returned by
+/// `lookup_error('surrogateescape')`.
+///
+/// Decoding fails only for bytes that cannot be represented, and Hydro's
+/// strings are UTF-8, so every byte of the rejected span becomes the
+/// [`SURROGATE_ESCAPE_STAND_IN`] the lexer already uses for surrogate
+/// escapes. Encoding maps the stand-in back to
+/// [`SURROGATE_ESCAPE_BYTE`] and re-raises for a character outside it, which
+/// mirrors CPython's re-raise for characters outside U+DC80..U+DCFF.
+fn surrogateescape_errors(args: &[i64]) -> i64 {
+    let Some(data) = value::exception_data(args[0]) else {
+        return type_error(
+            "surrogateescape_errors() argument must be a UnicodeDecodeError \
+             or UnicodeEncodeError",
+        );
+    };
+    let tag = data.tag;
+    let start = match error_handler_start(args[0]) {
+        Ok(start) => start,
+        Err(error) => return error,
+    };
+    let end = match error_handler_end(args[0]) {
+        Ok(end) => end,
+        Err(error) => return error,
+    };
+    let count = (end - start).max(0) as usize;
+    if tag == UNICODE_DECODE_ERROR {
+        let replacement = value::str_alloc(SURROGATE_ESCAPE_STAND_IN.to_string().repeat(count));
+        return value::tuple_new(vec![replacement, ops::int_result(end)]);
+    }
+    if tag == UNICODE_ENCODE_ERROR {
+        // Encode errors carry the source text in `args[1]`, so the rejected
+        // characters are recoverable. Collect the replacement bytes before
+        // allocating anything (the exception payload borrow ends there).
+        let Some(text) = data.args.get(1) else {
+            return type_error("error handler expects a Unicode error with start/end args");
+        };
+        let mut bytes = Vec::with_capacity(count);
+        for character in text.chars().skip(start.max(0) as usize).take(count) {
+            match surrogate_escape_byte(character) {
+                Some(byte) => bytes.push(byte),
+                None => return exc::raise_value(args[0]),
+            }
+        }
+        let encoded = value::bytes_new(bytes);
+        return value::tuple_new(vec![encoded, ops::int_result(end)]);
+    }
+    type_error(
+        "surrogateescape_errors() argument must be a UnicodeDecodeError \
+         or UnicodeEncodeError",
+    )
 }
 
 #[cfg(test)]
@@ -1353,5 +1642,159 @@ mod tests {
             bytes_of(call("encode", &[text("aé"), text("ascii"), text("mine")])),
             b"a"
         );
+    }
+
+    #[test]
+    fn surrogateescape_decodes_undecodable_bytes_without_raising() {
+        let _guard = init();
+        let decoded = call(
+            "decode",
+            &[bytes(b"f\x80o\xff"), text("utf-8"), text("surrogateescape")],
+        );
+        assert!(!exc::pending());
+        assert_eq!(str_of(decoded), "f\u{fffd}o\u{fffd}");
+        // The CPython assertion `b'\xff'.decode(...) == '\udcff'` holds
+        // because this runtime's `'\udcff'` literal is U+FFFD.
+        assert_eq!(str_of(decoded).chars().last(), Some('\u{FFFD}'));
+
+        // Every byte in 0x80..=0xff becomes one stand-in (one per byte).
+        let invalid: Vec<u8> = (0x80..=0xff).collect();
+        let decoded = call(
+            "decode",
+            &[bytes(&invalid), text("utf-8"), text("surrogateescape")],
+        );
+        assert_eq!(str_of(decoded).chars().count(), invalid.len());
+        assert!(str_of(decoded).chars().all(|c| c == '\u{FFFD}'));
+
+        // A surrogate encoded as UTF-8 is escaped byte by byte.
+        let decoded = call(
+            "decode",
+            &[
+                bytes(b"\xed\xb0\x80"),
+                text("utf-8"),
+                text("surrogateescape"),
+            ],
+        );
+        assert_eq!(str_of(decoded), "\u{fffd}\u{fffd}\u{fffd}");
+
+        // ASCII takes the same per-byte path.
+        let decoded = call(
+            "decode",
+            &[bytes(b"a\xffb"), text("ascii"), text("surrogateescape")],
+        );
+        assert_eq!(str_of(decoded), "a\u{fffd}b");
+    }
+
+    #[test]
+    fn surrogateescape_encodes_the_stand_in_back_to_its_byte() {
+        let _guard = init();
+        let input: &[u8] = b"a\xffb";
+        for codec in ["utf-8", "ascii"] {
+            let decoded = call(
+                "decode",
+                &[bytes(input), text(codec), text("surrogateescape")],
+            );
+            assert!(!exc::pending(), "{codec}");
+            assert_eq!(str_of(decoded), "a\u{fffd}b", "{codec}");
+            let encoded = call("encode", &[decoded, text(codec), text("surrogateescape")]);
+            assert!(!exc::pending(), "{codec}");
+            assert_eq!(bytes_of(encoded), input, "{codec}");
+        }
+
+        // Latin-1 decodes every byte, so the handler only applies when
+        // encoding: the stand-in still stands for 0xff.
+        let decoded = call(
+            "decode",
+            &[bytes(input), text("latin-1"), text("surrogateescape")],
+        );
+        assert_eq!(str_of(decoded), "aÿb");
+        let encoded = call(
+            "encode",
+            &[text("a\u{fffd}b"), text("latin-1"), text("surrogateescape")],
+        );
+        assert_eq!(bytes_of(encoded), input);
+
+        // The exact acceptance case: one 0xff byte round-trips.
+        let decoded = call(
+            "decode",
+            &[bytes(&[0xff]), text("utf-8"), text("surrogateescape")],
+        );
+        assert_eq!(str_of(decoded), "\u{fffd}");
+        let encoded = call("encode", &[decoded, text("utf-8"), text("surrogateescape")]);
+        assert_eq!(bytes_of(encoded), vec![0xff]);
+
+        // A truncated multi-byte sequence is escaped byte by byte too.
+        let decoded = call(
+            "decode",
+            &[
+                bytes(b"\xf0\x90\x80"),
+                text("utf-8"),
+                text("surrogateescape"),
+            ],
+        );
+        assert_eq!(str_of(decoded), "\u{fffd}\u{fffd}\u{fffd}");
+    }
+
+    #[test]
+    fn surrogateescape_leaves_valid_multibyte_text_alone() {
+        let _guard = init();
+        let decoded = call(
+            "decode",
+            &[
+                bytes("é€".as_bytes()),
+                text("utf-8"),
+                text("surrogateescape"),
+            ],
+        );
+        assert_eq!(str_of(decoded), "é€");
+        let encoded = call("encode", &[decoded, text("utf-8"), text("surrogateescape")]);
+        assert_eq!(bytes_of(encoded), "é€".as_bytes());
+    }
+
+    #[test]
+    fn surrogateescape_rejects_other_unrepresentable_characters() {
+        let _guard = init();
+        call(
+            "encode",
+            &[text("€"), text("ascii"), text("surrogateescape")],
+        );
+        assert_eq!(exc::pending_tag(), i64::from(UNICODE_ENCODE_ERROR));
+        exc::clear();
+        call(
+            "encode",
+            &[text("€"), text("latin-1"), text("surrogateescape")],
+        );
+        assert_eq!(exc::pending_tag(), i64::from(UNICODE_ENCODE_ERROR));
+        exc::clear();
+    }
+
+    #[test]
+    fn lookup_error_exposes_the_surrogateescape_handler() {
+        let _guard = init();
+        let handler = call("lookup_error", &[text("surrogateescape")]);
+        assert!(!exc::pending());
+        assert!(value::truthy(core_builtins::callable(handler)));
+
+        let decoded = call(
+            "decode",
+            &[bytes(b"a\xffb"), text("utf-8"), text("surrogateescape")],
+        );
+        assert_eq!(str_of(decoded), "a\u{fffd}b");
+        let decoded = call(
+            "decode",
+            &[bytes(b"\xff"), text("ascii"), text("surrogateescape")],
+        );
+        assert_eq!(str_of(decoded), "\u{fffd}");
+        let encoded = call("encode", &[decoded, text("ascii"), text("surrogateescape")]);
+        assert_eq!(bytes_of(encoded), b"\xff");
+    }
+
+    #[test]
+    fn filesystem_helpers_use_utf8_with_surrogateescape() {
+        let _guard = init();
+        assert_eq!(fsdecode(b"plain"), "plain");
+        assert_eq!(fsencode("plain"), b"plain");
+        assert_eq!(fsdecode(b"name-\xff"), "name-\u{fffd}");
+        assert_eq!(fsencode("name-\u{fffd}"), b"name-\xff");
     }
 }

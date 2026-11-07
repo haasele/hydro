@@ -15,7 +15,9 @@
 //! All functions accept `bytes` only and no input can panic; every failure
 //! reports a pending `ValueError`/`TypeError` and returns `None`.
 
+use crate::core::globals;
 use crate::exc::{self, ATTRIBUTE_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::heap;
 use crate::value::{self, NONE};
 
 /// Lowercase hex digits used by `hexlify`/`b2a_hex`.
@@ -60,8 +62,48 @@ pub(crate) fn type_error(message: &str) -> i64 {
     exc::raise_with_message(TYPE_ERROR, message)
 }
 
+/// `binascii.Error`: the conversion-failure class.
+///
+/// CPython raises `binascii.Error` (a `ValueError` subclass) from every
+/// conversion helper, and the stdlib catches it as `binascii.Error`; the
+/// class is cached so `binascii.Error is _binascii.Error` and repeated reads
+/// share identity.
+pub(crate) fn error_class() -> i64 {
+    if let Some(class) = globals::registry_get("binascii.Error") {
+        return class;
+    }
+    let base = exc::exception_class(VALUE_ERROR);
+    let class = value::class_new("Error".to_string(), base, Vec::new());
+    globals::registry_set("binascii.Error", class);
+    class
+}
+
+/// Class-valued module attributes for attribute wiring.
+///
+/// `binascii.Error` and `_binascii.Error` are the same class, exactly as in
+/// CPython (the accelerator module re-exports the pure-Python module's names).
+pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
+    if matches!(module, "binascii" | "_binascii") && name == "Error" {
+        return Some(error_class());
+    }
+    None
+}
+
+/// Raises `binascii.Error(message)`.
+///
+/// The instance keeps the Python class identity, so `except binascii.Error`
+/// (and the native `ValueError` ancestry) both catch the failure, while the
+/// pending tag still reports `VALUE_ERROR` for the runtime's own checks.
 fn value_error(message: &str) -> i64 {
-    exc::raise_with_message(VALUE_ERROR, message)
+    let class = error_class();
+    let argument = value::str_alloc(message.to_string());
+    let roots = heap::root_values(std::slice::from_ref(&argument));
+    let instance = crate::builtins::call(class, 1, &argument as *const i64);
+    heap::release_roots(roots);
+    if exc::pending() {
+        return instance;
+    }
+    exc::raise_value(instance)
 }
 
 /// Copies a `bytes` argument, so the buffer stays valid across allocations.
@@ -578,6 +620,32 @@ mod tests {
 
     fn number(tagged: i64) -> i64 {
         value::as_integer(tagged).expect("integer result")
+    }
+
+    #[test]
+    fn error_class_is_a_cached_value_error_subclass() {
+        exc::init();
+        let class = error_class();
+        assert_eq!(class, error_class(), "Error class must be cached");
+        assert_eq!(class_value("binascii", "Error"), Some(class));
+        assert_eq!(class_value("_binascii", "Error"), Some(class));
+        assert_eq!(class_value("binascii", "hexlify"), None);
+        let value_error = exc::exception_class(VALUE_ERROR);
+        assert!(value::is_subclass_of(class, value_error));
+        assert_eq!(
+            value::as_class(class).map(|state| state.name.as_str()),
+            Some("Error")
+        );
+
+        // Every conversion failure raises an instance of that class.
+        call("unhexlify", &[bytes(b"abc")]);
+        assert!(exc::pending());
+        assert_eq!(
+            value::as_exc_instance(exc::pending_value()).map(|state| state.class),
+            Some(class)
+        );
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
     }
 
     #[test]

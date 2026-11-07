@@ -11,12 +11,15 @@
 //! The default timer is backed by [`std::time::Instant`], so results are
 //! monotonic durations in seconds. `default_timer()` reports seconds since
 //! the process's first timing call.
+//!
+//! `reindent(src, indent)` is CPython's statement re-indentation helper: it
+//! prefixes every line after the first with `indent` spaces.
 
 use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::builtins;
-use crate::exc::{self, ATTRIBUTE_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::exc::{self, ATTRIBUTE_ERROR, MEMORY_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::value::{self, NONE};
 
 /// CPython's default loop count for `timeit()`.
@@ -40,6 +43,54 @@ fn type_error(message: &str) -> i64 {
     exc::raise_with_message(TYPE_ERROR, message)
 }
 
+/// Ceiling for a materialised indentation. CPython would try the whole
+/// multiplication and raise `MemoryError` when the allocator refuses; the
+/// fixed bound keeps a hostile count from aborting the process first.
+const MAX_INDENT: i64 = 1 << 26;
+
+/// `reindent(src, indent)`: prefix every line after the first with `indent`
+/// spaces, i.e. CPython's `src.replace("\n", "\n" + " " * indent)`.
+///
+/// A negative count behaves like zero, exactly as `" " * negative` does.
+pub(crate) fn reindent_text(source: &str, indent: i64) -> String {
+    if indent <= 0 {
+        return source.to_string();
+    }
+    let padding = " ".repeat(indent as usize);
+    source.replace('\n', &format!("\n{padding}"))
+}
+
+/// `reindent(src, indent)` with CPython's argument checks. A missing `indent`
+/// is treated as zero; the compiled call form always supplies the slot.
+fn reindent(args: &[i64]) -> i64 {
+    let Some(&source) = args.first() else {
+        return type_error("reindent() missing required argument 'source' (pos 1)");
+    };
+    let Some(source) = value::as_str(source) else {
+        return type_error(&format!(
+            "reindent() argument 'source' must be str, not {}",
+            value::type_name(source)
+        ));
+    };
+    let indent = match args.get(1).copied() {
+        None => 0,
+        Some(argument) => match value::as_integer(argument) {
+            Some(number) => number,
+            // CPython's message for `" " * <non-int>`.
+            None => {
+                return type_error(&format!(
+                    "can't multiply sequence by non-int of type '{}'",
+                    value::type_name(argument)
+                ))
+            }
+        },
+    };
+    if indent > MAX_INDENT {
+        return exc::raise_with_message(MEMORY_ERROR, "reindent() indent is too large");
+    }
+    value::str_alloc(reindent_text(source, indent))
+}
+
 /// Dispatches a native `timeit` function.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -50,6 +101,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "_timer_autorange" => timer_autorange(args),
         "timeit" => module_timeit(args),
         "repeat" => module_repeat(args),
+        "reindent" => reindent(args),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'timeit' has no attribute '{function}'"),
@@ -509,6 +561,37 @@ mod tests {
         let results = call("repeat", &[stmt, NONE, NONE, number(2), number(1)]);
         assert!(!exc::pending());
         assert_eq!(value::as_list(results).expect("list").len(), 2);
+    }
+
+    #[test]
+    fn reindent_matches_cpython() {
+        exc::init();
+        let check = |source: &str, indent: i64, expected: &str| {
+            let result = call("reindent", &[text(source), number(indent)]);
+            assert!(!exc::pending(), "reindent raised");
+            assert_eq!(value::as_str(result), Some(expected));
+        };
+        // CPython's own test_timeit cases.
+        check("", 0, "");
+        check("", 4, "");
+        check("pass", 0, "pass");
+        check("pass", 4, "pass");
+        check("\n\n", 0, "\n\n");
+        check("\n\n", 4, "\n    \n    ");
+        check("print()\npass\nbreak", 0, "print()\npass\nbreak");
+        check("print()\npass\nbreak", 4, "print()\n    pass\n    break");
+        // A negative count behaves like `" " * -n`.
+        check("a\nb", -3, "a\nb");
+
+        // `indent` must be an integer and `src` a str.
+        let result = call("reindent", &[text("a"), text("4")]);
+        assert_eq!(result, NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+        let result = call("reindent", &[number(1), number(0)]);
+        assert_eq!(result, NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
     }
 
     #[test]

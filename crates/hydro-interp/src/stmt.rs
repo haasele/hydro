@@ -791,53 +791,40 @@ impl Interp {
     /// exception parked and reports whether it catches that exception.
     ///
     /// The pending flag marks the exception being dispatched, so it is cleared
-    /// while the matcher and `isinstance` run (their own runtime checks would
-    /// otherwise mistake it for a fresh failure). The parked value is restored
-    /// before returning so the remaining arms and the handler entry still see
-    /// it. The value is checked with the runtime `isinstance` builtin, so the
-    /// CPython hierarchy, user-defined exception classes and tuples of classes
-    /// resolve exactly like a source-level `isinstance(exc, <expr>)`; the
-    /// interpreter keeps no exception table of its own. A matcher that raises
-    /// propagates that exception (it replaces the one being dispatched, as in
-    /// CPython) and the original is not restored.
+    /// while the matcher runs (its own runtime checks would otherwise mistake
+    /// it for a fresh failure). The parked value is restored before returning
+    /// so the remaining arms and the handler entry still see it. The matcher
+    /// is applied by [`abi::hydro_exc_matches_value`], which walks the CPython
+    /// hierarchy, accepts user-defined exception classes and tuples of them,
+    /// and reports CPython's `TypeError` for operands that cannot catch (a
+    /// non-class, an exception instance, or a class that does not inherit from
+    /// `BaseException`); the interpreter keeps no exception table of its own.
+    /// A matcher that raises propagates that exception (it replaces the one
+    /// being dispatched, as in CPython) and the original is not restored.
     fn matches_exc_expr(&mut self, expr: &Expr) -> Result<bool, Signal> {
         let mark = self.scratch_mark();
         let exception = abi::hydro_exc_value();
         self.scratch_push(exception);
         abi::hydro_exc_clear();
-        let handler_type = match self.eval(expr) {
+        let matcher = match self.eval(expr) {
             Ok(value) => value,
             Err(signal) => {
                 self.scratch_release(mark);
                 return Err(signal);
             }
         };
-        self.scratch_push(handler_type);
-        let (ptr, len) = bytes(hydro_ir::Builtin::Isinstance.name());
-        let function = abi::hydro_builtin_function(ptr, len);
-        let function = match self.check(function) {
-            Ok(value) => value,
-            Err(signal) => {
-                self.scratch_release(mark);
-                return Err(signal);
-            }
-        };
-        self.scratch_push(function);
-        let args = [exception, handler_type];
-        let token = abi::hydro_gc_scope_push(args.as_ptr(), args.len());
-        let result = abi::hydro_call(function, args.len(), args.as_ptr());
-        abi::hydro_gc_scope_pop(token);
-        let result = self.check(result);
-        let matched = match result {
-            Ok(value) => Ok(self.truthy(value)),
-            Err(signal) => Err(signal),
-        };
-        if matched.is_ok() {
-            // Restore the pending exception for the remaining arms and the
-            // handler entry; it is still rooted by the scratch region.
-            abi::hydro_raise_value(exception);
+        self.scratch_push(matcher);
+        let caught = abi::hydro_exc_matches_value(exception, matcher);
+        if abi::hydro_exc_pending() != 0 {
+            // The operand cannot catch; its `TypeError` replaces the
+            // exception being dispatched.
+            self.scratch_release(mark);
+            return Err(Signal::Raise);
         }
+        // Restore the pending exception for the remaining arms and the
+        // handler entry; it is still rooted by the scratch region.
+        abi::hydro_raise_value(exception);
         self.scratch_release(mark);
-        matched
+        Ok(caught != 0)
     }
 }

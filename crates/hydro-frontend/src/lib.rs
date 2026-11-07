@@ -1725,6 +1725,25 @@ impl ModuleLoader {
                         }
                     };
                     if hydro_ir::stdlib::module(&module_name).is_some() {
+                        // `from unittest import mock`: `mock` is not a native
+                        // table entry but a vendored pure-Python submodule of
+                        // a native package. Link its compiled unit so the
+                        // module value exists in `sys.modules` before the
+                        // binding is read. Every other member of a native
+                        // module is a spec constant/function and needs no unit.
+                        if let Some(full) = vendored_native_member(&module_name, &s.names) {
+                            self.resolve_import(
+                                source,
+                                display,
+                                package,
+                                importer_dir,
+                                root,
+                                &full,
+                                s.range,
+                                scan,
+                                conditional,
+                            );
+                        }
                         continue;
                     }
                     if deferred {
@@ -2671,6 +2690,40 @@ fn preloadable_body_stmt(stmt: &ast::Stmt, name: &str) -> bool {
     }
 }
 
+/// Pure-Python submodules of *native* packages that Hydro vendors in its own
+/// `stdlib/` tree under a flat file name.
+///
+/// `unittest` is implemented natively: it has no package directory and no
+/// `__path__`, so `unittest.mock` cannot be found by the ordinary
+/// `root/unittest/mock.py` lookup even though Hydro ships the module as
+/// `stdlib/mock.py`. The map is deliberately closed — only names Hydro
+/// actually vendors are listed — so an unrelated `pkg.sub` import keeps
+/// failing instead of silently borrowing an unrelated flat file. The returned
+/// package is the import package the compiled unit records (`unittest`), which
+/// is also what makes `unittest.mock` a submodule attribute of the native
+/// parent at run time.
+fn vendored_native_submodule(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "unittest.mock" => Some(("mock.py", "unittest")),
+        _ => None,
+    }
+}
+
+/// The vendored native-package submodule named by `from <module> import ...`,
+/// if any alias names one.
+///
+/// `from unittest import mock` must link `unittest.mock`; the plain module
+/// attribute (`unittest.mock`) is served by the native parent instead.
+fn vendored_native_member(module: &str, names: &[ast::Alias]) -> Option<String> {
+    names.iter().find_map(|alias| {
+        if alias.name.as_str() == "*" {
+            return None;
+        }
+        let full = format!("{module}.{}", alias.name);
+        vendored_native_submodule(&full).map(|_| full)
+    })
+}
+
 /// Resolves `name` on the module search path.
 ///
 /// Returns the package ancestors and the module itself in order, so the loader
@@ -2678,9 +2731,48 @@ fn preloadable_body_stmt(stmt: &ast::Stmt, name: &str) -> bool {
 /// `__init__.py`) are valid package segments: a real module or package found
 /// later on the search path wins over a namespace portion, matching CPython's
 /// `PathFinder`.
+/// Pure-Python modules Hydro vendors to override their CPython counterparts.
+fn vendored_stdlib_module(name: &str) -> bool {
+    matches!(
+        name,
+        "enum" | "turtle" | "symtable" | "_symtable" | "tracemalloc" | "_tracemalloc"
+    )
+}
+
 fn resolve_module(roots: &[PathBuf], name: &str) -> Option<Vec<ResolvedModule>> {
     if name.is_empty() || name.split('.').any(|part| part.is_empty()) {
         return None;
+    }
+    // A vendored submodule of a native package has no parent directory on the
+    // search path; resolve it directly from the bundled `stdlib/` tree.
+    if let Some((file, package)) = vendored_native_submodule(name) {
+        if let Some(root) = bundled_stdlib_root() {
+            let path = root.join(file);
+            if path.is_file() {
+                return Some(vec![ResolvedModule {
+                    path,
+                    name: name.to_string(),
+                    package: package.to_string(),
+                    root: root.to_path_buf(),
+                    namespace: false,
+                }]);
+            }
+        }
+    }
+    // Hydro vendors a few pure-Python compatibility modules in `stdlib/`.
+    // They must win even when the entry module lives inside the CPython `Lib`
+    // tree (the official-test runner), where that tree is also `module_root`
+    // and would otherwise shadow the vendored adaptation.
+    if vendored_stdlib_module(name) {
+        if let Some(root) = bundled_stdlib_root() {
+            let parts: Vec<&str> = name.split('.').collect();
+            if let Some(mut chain) = resolve_module_in(root, &parts) {
+                for module in &mut chain {
+                    module.root = root.to_path_buf();
+                }
+                return Some(chain);
+            }
+        }
     }
     let parts: Vec<&str> = name.split('.').collect();
     let mut namespace = None;

@@ -34,6 +34,7 @@ const LAZY_INIT: &str = "_lazy_init";
 const LAZY_CREATE_MODULE: &str = "_lazy_create_module";
 const LAZY_EXEC_MODULE: &str = "_lazy_exec_module";
 const CACHE_FROM_SOURCE: &str = "cache_from_source";
+const SOURCE_FROM_CACHE: &str = "source_from_cache";
 const SOURCE_HASH: &str = "source_hash";
 
 /// Dispatches a native `importlib.util` function. Arity is enforced by the
@@ -48,6 +49,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "resolve_name" => resolve_name(args),
         "decode_source" => decode_source(args),
         CACHE_FROM_SOURCE => cache_from_source(args),
+        SOURCE_FROM_CACHE => source_from_cache(args),
         SOURCE_HASH => source_hash(args),
         LAZY_INIT => lazy_init(args),
         LAZY_CREATE_MODULE => lazy_create_module(args),
@@ -181,6 +183,75 @@ fn cache_from_source(args: &[i64]) -> i64 {
 /// The first bytecode suffix (`BYTECODE_SUFFIXES[0]`) without allocating the
 /// module's list.
 const BYTECODE_SUFFIX: &str = ".pyc";
+
+/// The first source suffix (`SOURCE_SUFFIXES[0]`).
+const SOURCE_SUFFIX: &str = ".py";
+
+/// `source_from_cache(path)`: the source path a PEP 3147/488 cache path was
+/// compiled from.
+///
+/// The `.pyc` file does not need to exist. The path must follow the cache
+/// layout — a bottom-level `__pycache__` directory holding a filename with two
+/// or three dots (`<stem>.<tag>.pyc`, optionally `<stem>.<tag>.opt-<level>.pyc`)
+/// — and anything else raises the `ValueError` CPython reports. `sys.pycache_
+/// prefix` and `sys.implementation.cache_tag` are always available here, so
+/// the `NotImplementedError` branches cannot occur.
+fn source_from_cache(args: &[i64]) -> i64 {
+    let path_arg = args.first().copied().unwrap_or(NONE);
+    let Some(path) = value::as_str(path_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "expected str, bytes or os.PathLike object, not {}",
+                value::type_name(path_arg)
+            ),
+        );
+    };
+    let (head, filename) = split_tail(path);
+    let (pycache_dir, pycache) = match head.rfind('/') {
+        Some(index) => (&head[..index], &head[index + 1..]),
+        None => ("", head),
+    };
+    if pycache != "__pycache__" {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            &format!("__pycache__ not bottom-level directory in '{path}'"),
+        );
+    }
+    let dot_count = filename.bytes().filter(|&byte| byte == b'.').count();
+    if dot_count != 2 && dot_count != 3 {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            &format!("expected only 2 or 3 dots in '{filename}'"),
+        );
+    }
+    if dot_count == 3 {
+        // `<stem>.<tag>.<optimization>.pyc`: the optimization component is
+        // `opt-<level>`, always the second-to-last dotted field.
+        let mut fields = filename.rsplitn(3, '.');
+        fields.next(); // ".pyc"
+        let optimization = fields.next().unwrap_or("");
+        let Some(level) = optimization.strip_prefix("opt-") else {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                "optimization portion of filename does not start with 'opt-'",
+            );
+        };
+        if level.is_empty() || !level.chars().all(char::is_alphanumeric) {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("optimization level '{optimization}' is not an alphanumeric value"),
+            );
+        }
+    }
+    let stem = filename.split('.').next().unwrap_or("");
+    let source = if pycache_dir.is_empty() {
+        format!("{stem}{SOURCE_SUFFIX}")
+    } else {
+        format!("{pycache_dir}/{stem}{SOURCE_SUFFIX}")
+    };
+    value::str_alloc(source)
+}
 
 /// `os.path.split` for a `str` path: the last component and its directory.
 fn split_tail(path: &str) -> (&str, &str) {
@@ -1254,6 +1325,60 @@ mod tests {
         // A non-path argument reports CPython's `os.fspath` error.
         exc::clear();
         call(CACHE_FROM_SOURCE, &[crate::ops::int_result(1)]);
+        assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
+        exc::clear();
+    }
+
+    #[test]
+    fn source_from_cache_inverts_cpython_layout() {
+        exc::init();
+        let cases = [
+            ("/tmp/__pycache__/a.cpython-314.pyc", Some("/tmp/a.py")),
+            ("__pycache__/a.cpython-314.pyc", Some("a.py")),
+            (
+                "/tmp/pkg/__pycache__/__init__.cpython-314.opt-2.pyc",
+                Some("/tmp/pkg/__init__.py"),
+            ),
+            // A `.pyc` directly outside `__pycache__` is not a cache path.
+            ("/tmp/a.pyc", None),
+            // Wrong number of dots.
+            ("/tmp/__pycache__/a.pyc", None),
+            ("/tmp/__pycache__/a.b.c.d.pyc", None),
+            // The optimization field must be `opt-<alnum>`.
+            (
+                "/tmp/__pycache__/a.cpython-314.opt-1.pyc",
+                Some("/tmp/a.py"),
+            ),
+            ("/tmp/__pycache__/a.cpython-314.opt-x-y.pyc", None),
+            ("/tmp/__pycache__/a.cpython-314.opt.pyc", None),
+            ("/tmp/__pycache__/a.cpython-314.foo-1.pyc", None),
+        ];
+        for (path, expected) in cases {
+            exc::clear();
+            let source = call(SOURCE_FROM_CACHE, &[text(path)]);
+            match expected {
+                Some(expected) => {
+                    assert!(
+                        !exc::pending(),
+                        "{path}: {}",
+                        value::to_string(exc::pending_value())
+                    );
+                    assert_eq!(value::as_str(source), Some(expected), "{path}");
+                }
+                None => {
+                    assert_eq!(
+                        exc::pending_tag(),
+                        i64::from(VALUE_ERROR),
+                        "{path} must be rejected"
+                    );
+                }
+            }
+        }
+        exc::clear();
+
+        // A non-string path is a `TypeError` like CPython's `os.fspath`.
+        let result = call(SOURCE_FROM_CACHE, &[crate::ops::int_result(1)]);
+        assert_eq!(result, NONE);
         assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
         exc::clear();
     }

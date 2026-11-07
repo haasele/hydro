@@ -1,10 +1,16 @@
 //! `fnmatch`: Unix shell-style wildcard matching.
 //!
-//! Linux is case-sensitive, so `fnmatch` and `fnmatchcase` are the same
-//! operation here. Patterns support `*`, `?`, `[seq]`, `[!seq]` and a
-//! backslash escape for the next character. Matching is iterative with a
-//! single backtracking point (the most recent `*`), so ordinary inputs run in
-//! `O(len(name) * len(pattern))` time and never recurse.
+//! The translation and matching rules follow CPython 3.14's `Lib/fnmatch.py`:
+//!
+//! * A backslash is an ordinary character. There is no escape for wildcards.
+//! * `*` and `?` translate to `.*` and `.`, with interior stars rendered as
+//!   atomic `(?>.*?fixed)` groups so matching stays linear.
+//! * `[...]` is translated as a regular-expression character class, using
+//!   CPython's chunking rules for ranges and `re.escape` for every literal.
+//! * [`translate`] ends with `\z`, not `\Z`.
+//!
+//! Matching uses the same class bodies as [`translate`], so wildcard behavior
+//! and the emitted regular expression cannot disagree.
 
 use crate::container;
 use crate::exc::{self, ATTRIBUTE_ERROR, TYPE_ERROR};
@@ -18,59 +24,227 @@ enum ClassItem {
     Range(char, char),
 }
 
-/// A parsed `[...]` bracket expression.
+/// A `[...]` bracket expression parsed with regular-expression class rules.
 struct ClassBody {
     negated: bool,
     items: Vec<ClassItem>,
-    /// Index just past the closing `]`.
+}
+
+/// The meaning of a scanned `[...]` bracket expression.
+enum Bracket {
+    /// No closing `]`: CPython emits the `[` as a literal.
+    Unterminated,
+    /// `(?!)`: an empty range never matches.
+    Never,
+    /// `.`: a negated empty range matches any character.
+    Any,
+    /// A real character class: its regex text and its parsed form.
+    Class { text: String, body: ClassBody },
+}
+
+struct BracketScan {
+    outcome: Bracket,
+    /// Index just past the closing `]` (or just past the `[` when
+    /// unterminated).
     end: usize,
 }
 
+/// One element of a pattern, as used by the matcher.
+enum Token {
+    Star,
+    Any,
+    Literal(char),
+    Class(ClassBody),
+    Never,
+}
+
+impl Token {
+    fn is_star(&self) -> bool {
+        matches!(self, Token::Star)
+    }
+}
+
 /// Parses a bracket expression starting at `start` (which must index `[`).
-/// Returns `None` when the bracket is unterminated; CPython then treats the
-/// `[` as an ordinary character.
-fn parse_class(pattern: &[char], start: usize) -> Option<ClassBody> {
+fn scan_bracket(pattern: &[char], start: usize) -> BracketScan {
     let length = pattern.len();
-    let mut index = start + 1;
+    let mut close = start + 1;
+    if close < length && pattern[close] == '!' {
+        close += 1;
+    }
+    if close < length && pattern[close] == ']' {
+        close += 1;
+    }
+    while close < length && pattern[close] != ']' {
+        close += 1;
+    }
+    if close >= length {
+        return BracketScan {
+            outcome: Bracket::Unterminated,
+            end: start + 1,
+        };
+    }
+
+    let inner = start + 1;
+    let mut stuff: Vec<char> = pattern[inner..close].to_vec();
+    if !stuff.contains(&'-') {
+        // No ranges: only backslashes need doubling.
+        let mut escaped = Vec::with_capacity(stuff.len() * 2);
+        for ch in stuff {
+            if ch == '\\' {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+        stuff = escaped;
+    } else {
+        // Split the body into range chunks exactly like CPython: each hyphen
+        // is a range separator and three characters are skipped afterwards.
+        let mut chunks: Vec<Vec<char>> = Vec::new();
+        let mut chunk_start = inner;
+        let mut scan = if pattern[inner] == '!' {
+            inner + 2
+        } else {
+            inner + 1
+        };
+        loop {
+            if scan >= close {
+                break;
+            }
+            match pattern[scan..close].iter().position(|&ch| ch == '-') {
+                Some(offset) => {
+                    let hyphen = scan + offset;
+                    chunks.push(pattern[chunk_start..hyphen].to_vec());
+                    chunk_start = hyphen + 1;
+                    scan = hyphen + 3;
+                }
+                None => break,
+            }
+        }
+        let tail = pattern[chunk_start..close].to_vec();
+        if tail.is_empty() {
+            // `[a-]`: the trailing hyphen belongs to the previous chunk.
+            if let Some(chunk) = chunks.last_mut() {
+                chunk.push('-');
+            }
+        } else {
+            chunks.push(tail);
+        }
+        // A range whose upper bound is below its lower bound is empty; drop it
+        // the way CPython does, merging the neighbours.
+        let mut index = chunks.len();
+        while index >= 2 {
+            index -= 1;
+            if chunks[index - 1].is_empty() || chunks[index].is_empty() {
+                continue;
+            }
+            let lower = chunks[index - 1][chunks[index - 1].len() - 1];
+            let upper = chunks[index][0];
+            if lower > upper {
+                let mut merged = chunks[index - 1][..chunks[index - 1].len() - 1].to_vec();
+                merged.extend_from_slice(&chunks[index][1..]);
+                chunks[index - 1] = merged;
+                chunks.remove(index);
+            }
+        }
+        // Join the chunks with the (unescaped) range hyphens; every hyphen
+        // *inside* a chunk is a literal and must be escaped.
+        let mut joined = Vec::new();
+        for (position, chunk) in chunks.iter().enumerate() {
+            if position > 0 {
+                joined.push('-');
+            }
+            for &ch in chunk {
+                match ch {
+                    '\\' => {
+                        joined.push('\\');
+                        joined.push('\\');
+                    }
+                    '-' => {
+                        joined.push('\\');
+                        joined.push('-');
+                    }
+                    _ => joined.push(ch),
+                }
+            }
+        }
+        stuff = joined;
+    }
+
+    let end = close + 1;
+    if stuff.is_empty() {
+        return BracketScan {
+            outcome: Bracket::Never,
+            end,
+        };
+    }
+    if stuff.len() == 1 && stuff[0] == '!' {
+        return BracketScan {
+            outcome: Bracket::Any,
+            end,
+        };
+    }
+
+    // Escape set operations so `&&`, `~~` and `||` stay literal.
+    let mut escaped = Vec::with_capacity(stuff.len() + 4);
+    for &ch in &stuff {
+        if matches!(ch, '&' | '~' | '|') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    let body_chars: Vec<char> = if escaped[0] == '!' {
+        let mut body = Vec::with_capacity(escaped.len());
+        body.push('^');
+        body.extend_from_slice(&escaped[1..]);
+        body
+    } else if escaped[0] == '^' || escaped[0] == '[' {
+        let mut body = Vec::with_capacity(escaped.len() + 1);
+        body.push('\\');
+        body.extend_from_slice(&escaped);
+        body
+    } else {
+        escaped
+    };
+
+    let text = format!("[{}]", body_chars.iter().copied().collect::<String>());
+    let body = parse_class_body(&body_chars);
+    BracketScan {
+        outcome: Bracket::Class { text, body },
+        end,
+    }
+}
+
+/// Reads one character inside a regex class body, honouring `\` escapes.
+fn class_atom(body: &[char], index: usize) -> (char, usize) {
+    if body[index] == '\\' && index + 1 < body.len() {
+        (body[index + 1], index + 2)
+    } else {
+        (body[index], index + 1)
+    }
+}
+
+/// Parses a regex class body (the text between `[` and `]`) into ranges.
+fn parse_class_body(body: &[char]) -> ClassBody {
     let mut negated = false;
-    if index < length && pattern[index] == '!' {
+    let mut index = 0;
+    if !body.is_empty() && body[0] == '^' {
         negated = true;
-        index += 1;
+        index = 1;
     }
     let mut items = Vec::new();
-    let mut first = true;
-    while index < length {
-        // A `]` closes the class unless it is the first member (`[]]`).
-        if pattern[index] == ']' && !first {
-            return Some(ClassBody {
-                negated,
-                items,
-                end: index + 1,
-            });
-        }
-        first = false;
-        let (low, next) = class_char(pattern, index);
+    while index < body.len() {
+        let (low, next) = class_atom(body, index);
         index = next;
-        // `a-z` is a range; a trailing or leading `-` is literal.
-        if index + 1 < length && pattern[index] == '-' && pattern[index + 1] != ']' {
-            let (high, after) = class_char(pattern, index + 1);
+        // `-` forms a range only when a character follows it.
+        if index + 1 < body.len() && body[index] == '-' {
+            let (high, after) = class_atom(body, index + 1);
             items.push(ClassItem::Range(low, high));
             index = after;
         } else {
             items.push(ClassItem::Char(low));
         }
     }
-    None
-}
-
-/// Reads one character inside a bracket expression, honouring a backslash
-/// escape. A trailing backslash stands for itself.
-fn class_char(pattern: &[char], index: usize) -> (char, usize) {
-    if pattern[index] == '\\' && index + 1 < pattern.len() {
-        (pattern[index + 1], index + 2)
-    } else {
-        (pattern[index], index + 1)
-    }
+    ClassBody { negated, items }
 }
 
 fn class_matches(body: &ClassBody, ch: char) -> bool {
@@ -84,53 +258,77 @@ fn class_matches(body: &ClassBody, ch: char) -> bool {
     matched
 }
 
-/// Matches one non-`*` token at `index`. Returns the next pattern index on a
-/// match, or `None` when the token does not match `ch`.
-fn match_token(ch: char, pattern: &[char], index: usize) -> Option<usize> {
-    match pattern[index] {
-        '?' => Some(index + 1),
-        '[' => match parse_class(pattern, index) {
-            Some(body) => {
-                if class_matches(&body, ch) {
-                    Some(body.end)
-                } else {
-                    None
+/// Builds the matcher's token list for `pattern`.
+fn tokenize(pattern: &[char]) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < pattern.len() {
+        match pattern[index] {
+            '*' => {
+                while index < pattern.len() && pattern[index] == '*' {
+                    index += 1;
+                }
+                tokens.push(Token::Star);
+            }
+            '?' => {
+                tokens.push(Token::Any);
+                index += 1;
+            }
+            '[' => {
+                let scan = scan_bracket(pattern, index);
+                match scan.outcome {
+                    Bracket::Unterminated => {
+                        tokens.push(Token::Literal('['));
+                        index += 1;
+                    }
+                    Bracket::Never => {
+                        tokens.push(Token::Never);
+                        index = scan.end;
+                    }
+                    Bracket::Any => {
+                        tokens.push(Token::Any);
+                        index = scan.end;
+                    }
+                    Bracket::Class { body, .. } => {
+                        tokens.push(Token::Class(body));
+                        index = scan.end;
+                    }
                 }
             }
-            // Unterminated bracket: `[` is a literal.
-            None => (ch == '[').then_some(index + 1),
-        },
-        '\\' => {
-            if index + 1 < pattern.len() {
-                (ch == pattern[index + 1]).then_some(index + 2)
-            } else {
-                (ch == '\\').then_some(index + 1)
+            literal => {
+                tokens.push(Token::Literal(literal));
+                index += 1;
             }
         }
-        literal => (ch == literal).then_some(index + 1),
+    }
+    tokens
+}
+
+fn token_matches(token: &Token, ch: char) -> bool {
+    match token {
+        Token::Literal(expected) => *expected == ch,
+        Token::Any => true,
+        Token::Class(body) => class_matches(body, ch),
+        Token::Never | Token::Star => false,
     }
 }
 
-/// Glob match over character slices.
-fn glob_match(name: &[char], pattern: &[char]) -> bool {
+/// Glob match over character slices, with a single backtracking point (the
+/// most recent `*`), so ordinary inputs run in `O(len(name) * len(pattern))`
+/// time and never recurse.
+fn glob_match(name: &[char], tokens: &[Token]) -> bool {
     let (mut ni, mut pi) = (0, 0);
-    // Position just past the most recent `*`, and how much of `name` it has
-    // consumed. On a dead end, give the star one more character and retry.
     let mut star: Option<(usize, usize)> = None;
     while ni < name.len() {
-        if pi < pattern.len() && pattern[pi] == '*' {
-            while pi < pattern.len() && pattern[pi] == '*' {
-                pi += 1;
-            }
+        if pi < tokens.len() && tokens[pi].is_star() {
+            pi += 1;
             star = Some((pi, ni));
             continue;
         }
-        if pi < pattern.len() {
-            if let Some(next) = match_token(name[ni], pattern, pi) {
-                ni += 1;
-                pi = next;
-                continue;
-            }
+        if pi < tokens.len() && token_matches(&tokens[pi], name[ni]) {
+            ni += 1;
+            pi += 1;
+            continue;
         }
         match star {
             Some((star_pi, consumed)) if consumed < name.len() => {
@@ -141,20 +339,30 @@ fn glob_match(name: &[char], pattern: &[char]) -> bool {
             _ => return false,
         }
     }
-    while pi < pattern.len() && pattern[pi] == '*' {
+    while pi < tokens.len() && tokens[pi].is_star() {
         pi += 1;
     }
-    pi == pattern.len()
+    pi == tokens.len()
 }
 
-/// Characters of a `str` (one entry per Unicode scalar) or `bytes`
-/// (ISO-8859-1, matching CPython's bytes patterns).
-fn text_chars(raw: i64, argument: &str) -> Result<Vec<char>, i64> {
+/// Whether the value is a `str` (as opposed to bytes-like).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Domain {
+    Str,
+    Bytes,
+}
+
+/// Characters of a `str` (one entry per Unicode scalar) or bytes-like value
+/// (ISO-8859-1, matching CPython's bytes patterns), plus its domain.
+fn text_chars(raw: i64, argument: &str) -> Result<(Vec<char>, Domain), i64> {
     if let Some(text) = value::as_str(raw) {
-        return Ok(text.chars().collect());
+        return Ok((text.chars().collect(), Domain::Str));
     }
     if let Some(bytes) = value::as_bytes(raw) {
-        return Ok(bytes.iter().map(|&byte| byte as char).collect());
+        return Ok((
+            bytes.iter().map(|&byte| byte as char).collect(),
+            Domain::Bytes,
+        ));
     }
     Err(exc::raise_with_message(
         TYPE_ERROR,
@@ -163,6 +371,14 @@ fn text_chars(raw: i64, argument: &str) -> Result<Vec<char>, i64> {
             value::type_name(raw)
         ),
     ))
+}
+
+fn domain_mismatch(pattern: Domain) -> i64 {
+    let message = match pattern {
+        Domain::Str => "cannot use a string pattern on a bytes-like object",
+        Domain::Bytes => "cannot use a bytes pattern on a string-like object",
+    };
+    exc::raise_with_message(TYPE_ERROR, message)
 }
 
 fn arity(function: &str, expected: usize, given: usize) -> i64 {
@@ -201,10 +417,11 @@ fn collect_names(names: i64) -> Result<Vec<i64>, i64> {
 }
 
 fn filter(names: i64, pattern: i64, keep_matches: bool) -> i64 {
-    let pattern = match text_chars(pattern, "pat") {
-        Ok(chars) => chars,
+    let (pattern, pattern_domain) = match text_chars(pattern, "pat") {
+        Ok(value) => value,
         Err(error) => return error,
     };
+    let tokens = tokenize(&pattern);
     let values = match collect_names(names) {
         Ok(values) => values,
         Err(error) => return error,
@@ -212,19 +429,23 @@ fn filter(names: i64, pattern: i64, keep_matches: bool) -> i64 {
     let mut result = Vec::new();
     for value in values {
         let chars = match text_chars(value, "name") {
-            Ok(chars) => chars,
+            Ok((chars, domain)) => {
+                if domain != pattern_domain {
+                    return domain_mismatch(pattern_domain);
+                }
+                chars
+            }
             Err(error) => return error,
         };
-        if glob_match(&chars, &pattern) == keep_matches {
+        if glob_match(&chars, &tokens) == keep_matches {
             result.push(value);
         }
     }
     value::list_new(result)
 }
 
-/// Escapes one literal for a regular expression, following CPython's
-/// `re.escape` set.
-fn escape_literal(out: &mut String, ch: char) {
+/// `re.escape` for one character: CPython 3.14 escapes exactly this set.
+fn re_escape_char(ch: char) -> String {
     if matches!(
         ch,
         '(' | ')'
@@ -251,101 +472,10 @@ fn escape_literal(out: &mut String, ch: char) {
             | '\u{0b}'
             | '\u{0c}'
     ) {
-        out.push('\\');
+        format!("\\{ch}")
+    } else {
+        ch.to_string()
     }
-    out.push(ch);
-}
-
-/// Escapes one character inside a bracket expression. `first` allows a
-/// leading `]` to be written literally, as CPython does.
-fn escape_class_char(out: &mut String, ch: char, first: bool) {
-    match ch {
-        '\\' => out.push_str("\\\\"),
-        '[' => out.push_str("\\["),
-        ']' if first => out.push(']'),
-        ']' => out.push_str("\\]"),
-        '-' => out.push_str("\\-"),
-        '^' => out.push_str("\\^"),
-        '&' | '~' | '|' => {
-            out.push('\\');
-            out.push(ch);
-        }
-        _ => out.push(ch),
-    }
-}
-
-/// Renders a parsed bracket expression as regex text.
-fn translate_class(body: &ClassBody) -> String {
-    if body.items.is_empty() {
-        // Empty strict range never matches; a negated empty range matches any
-        // character, exactly like CPython.
-        return if body.negated {
-            ".".to_string()
-        } else {
-            "(?!)".to_string()
-        };
-    }
-    let mut out = String::from("[");
-    if body.negated {
-        out.push('^');
-    }
-    for (position, item) in body.items.iter().enumerate() {
-        match *item {
-            ClassItem::Char(ch) => escape_class_char(&mut out, ch, position == 0),
-            ClassItem::Range(low, high) => {
-                escape_class_char(&mut out, low, false);
-                out.push('-');
-                escape_class_char(&mut out, high, false);
-            }
-        }
-    }
-    out.push(']');
-    out
-}
-
-/// `fnmatch.translate`: shell pattern to an anchored, dot-all regex string.
-fn translate(pattern: &[char]) -> String {
-    let mut out = String::from("(?s:");
-    let mut index = 0;
-    while index < pattern.len() {
-        match pattern[index] {
-            '*' => {
-                out.push_str(".*");
-                while index < pattern.len() && pattern[index] == '*' {
-                    index += 1;
-                }
-            }
-            '?' => {
-                out.push('.');
-                index += 1;
-            }
-            '[' => match parse_class(pattern, index) {
-                Some(body) => {
-                    out.push_str(&translate_class(&body));
-                    index = body.end;
-                }
-                None => {
-                    escape_literal(&mut out, '[');
-                    index += 1;
-                }
-            },
-            '\\' => {
-                if index + 1 < pattern.len() {
-                    escape_literal(&mut out, pattern[index + 1]);
-                    index += 2;
-                } else {
-                    escape_literal(&mut out, '\\');
-                    index += 1;
-                }
-            }
-            literal => {
-                escape_literal(&mut out, literal);
-                index += 1;
-            }
-        }
-    }
-    out.push_str(")\\Z");
-    out
 }
 
 /// `fnmatch._translate(pat, star, question_mark)`: the two-wildcard
@@ -353,8 +483,7 @@ fn translate(pattern: &[char]) -> String {
 ///
 /// Returns `(fragments, star_indices)`: every literal character and wildcard
 /// becomes one regex fragment, `star_indices` records the fragment index of
-/// each (compressed) `*`. The class handling reuses [`parse_class`] /
-/// [`translate_class`], so bracket expressions match CPython's rendering.
+/// each (compressed) `*`.
 fn translate_parts(pattern: &[char], star: &str, question_mark: &str) -> (Vec<String>, Vec<i64>) {
     let mut fragments: Vec<String> = Vec::new();
     let mut star_indices: Vec<i64> = Vec::new();
@@ -372,16 +501,27 @@ fn translate_parts(pattern: &[char], star: &str, question_mark: &str) -> (Vec<St
                 fragments.push(question_mark.to_string());
                 index += 1;
             }
-            '[' => match parse_class(pattern, index) {
-                Some(body) => {
-                    fragments.push(translate_class(&body));
-                    index = body.end;
+            '[' => {
+                let scan = scan_bracket(pattern, index);
+                match scan.outcome {
+                    Bracket::Unterminated => {
+                        fragments.push(re_escape_char('['));
+                        index += 1;
+                    }
+                    Bracket::Never => {
+                        fragments.push("(?!)".to_string());
+                        index = scan.end;
+                    }
+                    Bracket::Any => {
+                        fragments.push(".".to_string());
+                        index = scan.end;
+                    }
+                    Bracket::Class { text, .. } => {
+                        fragments.push(text);
+                        index = scan.end;
+                    }
                 }
-                None => {
-                    fragments.push(re_escape_char('['));
-                    index += 1;
-                }
-            },
+            }
             literal => {
                 fragments.push(re_escape_char(literal));
                 index += 1;
@@ -391,34 +531,31 @@ fn translate_parts(pattern: &[char], star: &str, question_mark: &str) -> (Vec<St
     (fragments, star_indices)
 }
 
-/// `re.escape` for one character (Python 3.7+ set).
-fn re_escape_char(ch: char) -> String {
-    if ch.is_whitespace()
-        || matches!(
-            ch,
-            '\\' | '.'
-                | '^'
-                | '$'
-                | '*'
-                | '+'
-                | '?'
-                | '('
-                | ')'
-                | '['
-                | ']'
-                | '{'
-                | '}'
-                | '|'
-                | '-'
-                | '&'
-                | '~'
-                | '#'
-        )
-    {
-        format!("\\{ch}")
-    } else {
-        ch.to_string()
+/// `fnmatch._join_translated_parts`: joins fragments, turning interior
+/// `* fixed` pairs into atomic lazy groups and the final star into `.*`.
+fn join_translated_parts(parts: &[String], star_indices: &[i64]) -> String {
+    if star_indices.is_empty() {
+        return format!("(?s:{})\\z", parts.concat());
     }
+    let first = star_indices[0] as usize;
+    let mut buffer: Vec<String> = parts[..first].to_vec();
+    let mut index = first + 1;
+    for &star in &star_indices[1..] {
+        let star = star as usize;
+        buffer.push("(?>.*?".to_string());
+        buffer.extend(parts[index..star].iter().cloned());
+        buffer.push(")".to_string());
+        index = star + 1;
+    }
+    buffer.push(".*".to_string());
+    buffer.extend(parts[index..].iter().cloned());
+    format!("(?s:{})\\z", buffer.concat())
+}
+
+/// `fnmatch.translate`: shell pattern to an anchored, dot-all regex string.
+fn translate(pattern: &[char]) -> String {
+    let (parts, star_indices) = translate_parts(pattern, "*", ".");
+    join_translated_parts(&parts, &star_indices)
 }
 
 /// Module-level dispatch for `fnmatch`.
@@ -428,15 +565,18 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             if args.len() != 2 {
                 return arity(function, 2, args.len());
             }
-            let name = match text_chars(args[0], "name") {
-                Ok(chars) => chars,
+            let (name, name_domain) = match text_chars(args[0], "name") {
+                Ok(value) => value,
                 Err(error) => return error,
             };
-            let pattern = match text_chars(args[1], "pat") {
-                Ok(chars) => chars,
+            let (pattern, pattern_domain) = match text_chars(args[1], "pat") {
+                Ok(value) => value,
                 Err(error) => return error,
             };
-            value::bool_value(glob_match(&name, &pattern))
+            if name_domain != pattern_domain {
+                return domain_mismatch(pattern_domain);
+            }
+            value::bool_value(glob_match(&name, &tokenize(&pattern)))
         }
         "filter" | "filterfalse" => {
             if args.len() != 2 {
@@ -448,20 +588,35 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             if args.len() != 1 {
                 return arity(function, 1, args.len());
             }
-            let pattern = match text_chars(args[0], "pat") {
-                Ok(chars) => chars,
-                Err(error) => return error,
+            let text = match value::as_str(args[0]) {
+                Some(text) => text,
+                None => {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!(
+                            "translate() argument must be str, not {}",
+                            value::type_name(args[0])
+                        ),
+                    )
+                }
             };
+            let pattern: Vec<char> = text.chars().collect();
             value::str_alloc(translate(&pattern))
         }
         "_translate" => {
             if args.len() != 3 {
                 return arity(function, 3, args.len());
             }
-            let pattern = match text_chars(args[0], "pat") {
-                Ok(chars) => chars,
-                Err(error) => return error,
+            let text = match value::as_str(args[0]) {
+                Some(text) => text,
+                None => {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("pat must be str, not {}", value::type_name(args[0])),
+                    )
+                }
             };
+            let pattern: Vec<char> = text.chars().collect();
             let star = match value::as_str(args[1]) {
                 Some(text) => text.to_string(),
                 None => {
@@ -538,9 +693,14 @@ mod tests {
         assert!(matches("", "*"));
         assert!(!matches("abc", "a?"));
         assert!(!matches("abc", "b*"));
-        assert!(matches("a*b", "a\\*b"));
-        assert!(!matches("axb", "a\\*b"));
-        assert!(matches("a\\b", "a\\\\b"));
+        // A backslash is an ordinary character, not an escape.
+        assert!(!matches("a*b", "a\\*b"));
+        assert!(matches("a\\b", "a\\*b"));
+        assert!(matches("a\\xb", "a\\*b"));
+        assert!(!matches("a\\b", "a\\\\b"));
+        assert!(matches("a\\\\b", "a\\\\b"));
+        assert!(!matches("*", "\\*"));
+        assert!(matches("\\x", "\\*"));
         assert!(matches("abc", "a[bc]c"));
     }
 
@@ -567,15 +727,16 @@ mod tests {
 
     #[test]
     fn translate_has_cpython_shape() {
-        assert_eq!(translated("*.py"), r"(?s:.*\.py)\Z");
-        assert_eq!(translated("a?c"), r"(?s:a.c)\Z");
-        assert_eq!(translated("[a-c]"), r"(?s:[a-c])\Z");
-        assert_eq!(translated("[!a]"), r"(?s:[^a])\Z");
-        assert_eq!(translated("[[]"), r"(?s:[\[])\Z");
-        assert_eq!(translated("[]]"), r"(?s:[]])\Z");
-        assert_eq!(translated("a.b"), r"(?s:a\.b)\Z");
-        assert_eq!(translated("a\\*b"), r"(?s:a\*b)\Z");
-        assert_eq!(translated(""), r"(?s:)\Z");
+        assert_eq!(translated("*.py"), r"(?s:.*\.py)\z");
+        assert_eq!(translated("a?c"), r"(?s:a.c)\z");
+        assert_eq!(translated("[a-c]"), r"(?s:[a-c])\z");
+        assert_eq!(translated("[!a]"), r"(?s:[^a])\z");
+        assert_eq!(translated("[[]"), r"(?s:[\[])\z");
+        assert_eq!(translated("[]]"), r"(?s:[]])\z");
+        assert_eq!(translated("a.b"), r"(?s:a\.b)\z");
+        assert_eq!(translated("a\\*b"), r"(?s:a\\.*b)\z");
+        assert_eq!(translated("**a*a****a"), r"(?s:(?>.*?a)(?>.*?a).*a)\z");
+        assert_eq!(translated(""), r"(?s:)\z");
     }
 
     #[test]
@@ -591,6 +752,30 @@ mod tests {
         let items = value::as_list(dropped).expect("list").to_vec();
         assert_eq!(items.len(), 1);
         assert_eq!(value::as_str(items[0]), Some("b.txt"));
+    }
+
+    #[test]
+    fn filter_does_not_treat_backslash_as_a_separator() {
+        let names = value::list_new(vec![text("usr/bin"), text("usr"), text("usr\\lib")]);
+        let kept = call("filter", &[names, text("usr\\*")]);
+        let items = value::as_list(kept).expect("list").to_vec();
+        assert_eq!(items.len(), 1);
+        assert_eq!(value::as_str(items[0]), Some("usr\\lib"));
+        let dropped = call("filterfalse", &[names, text("usr/*")]);
+        let items = value::as_list(dropped).expect("list").to_vec();
+        assert_eq!(items.len(), 2);
+        assert_eq!(value::as_str(items[0]), Some("usr"));
+        assert_eq!(value::as_str(items[1]), Some("usr\\lib"));
+    }
+
+    #[test]
+    fn mixed_str_and_bytes_raise_type_error() {
+        exc::init();
+        let names = value::list_new(vec![text("test")]);
+        let bytes_pattern = value::bytes_new(b"*".to_vec());
+        assert_eq!(call("filter", &[names, bytes_pattern]), NONE);
+        assert!(exc::pending());
+        exc::clear();
     }
 
     #[test]

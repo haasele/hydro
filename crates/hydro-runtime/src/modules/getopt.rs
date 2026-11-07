@@ -72,7 +72,10 @@ fn getopt_error(message: &str, opt: &str) -> i64 {
     let opt_value = value::str_alloc(opt.to_string());
     let class = getopt_error_class();
     let roots = heap::root_values(&[msg, opt_value, class]);
-    let argv = [msg, opt_value];
+    // `BaseException` now renders multiple args as a tuple; CPython's
+    // `GetoptError.__str__` returns `.msg`, so pass the message alone and keep
+    // `.opt` as the structured attribute.
+    let argv = [msg];
     let instance = crate::builtins::call(class, argv.len(), argv.as_ptr());
     if exc::pending() {
         heap::release_roots(roots);

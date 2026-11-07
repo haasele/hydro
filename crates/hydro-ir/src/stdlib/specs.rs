@@ -24,6 +24,10 @@ pub static MATH: ModuleSpec = ModuleSpec {
         f("log10", 1, 1, Type::Float),
         f("log2", 1, 1, Type::Float),
         f("pow", 2, 2, Type::Float),
+        // `ldexp(x, i)`: `x * 2**i`. The exponent is a C `int` slot in
+        // CPython (positional-only), and both arguments are validated by the
+        // runtime before the scale is applied.
+        f("ldexp", 2, 2, Type::Float),
         f("floor", 1, 1, Type::Int),
         f("ceil", 1, 1, Type::Int),
         f("trunc", 1, 1, Type::Int),
@@ -191,6 +195,12 @@ const OPERATOR_FUNCTIONS: &[FunctionSpec] = &[
     f("truth", 1, 1, Type::Bool),
     // `operator.index(a)`: `a.__index__()`, or `a` itself for exact integers.
     f("index", 1, 1, Type::Int),
+    // `operator.contains(a, b)`: the membership test `b in a` (note the
+    // reversed operands).
+    f("contains", 2, 2, Type::Bool),
+    // `operator.countOf(a, b)`: the number of items in `a` that are `b` by
+    // identity or equality.
+    f("countOf", 2, 2, Type::Int),
     // `operator.getitem(a, b)`: the subscript `a[b]`.
     f("getitem", 2, 2, Type::Any),
     // `operator.setitem(a, b, v)`: the assignment `a[b] = v`, returning `None`.
@@ -283,6 +293,9 @@ pub static THREAD: ModuleSpec = ModuleSpec {
         f("allocate_lock", 0, 0, Type::Any),
         // `_thread.RLock`: the reentrant lock class used by `threading`.
         f("RLock", 0, 0, Type::Any),
+        // `_count()`: the number of live threads (`test.support.threading_helper`
+        // polls it while waiting for workers to exit).
+        f("_count", 0, 0, Type::Int),
     ],
     constants: &[],
 };
@@ -296,9 +309,20 @@ pub static RANDOM: ModuleSpec = ModuleSpec {
         f("randrange", 1, 3, Type::Int),
         f("choice", 1, 1, Type::Any),
         f("uniform", 2, 2, Type::Float),
+        // `gauss(mu=0.0, sigma=1.0)`/`normalvariate(mu=0.0, sigma=1.0)`: draws
+        // from a normal distribution using the module generator.
+        kw("gauss", 0, 2, Type::Float, &["mu", "sigma"]),
+        kw("normalvariate", 0, 2, Type::Float, &["mu", "sigma"]),
         f("shuffle", 1, 1, Type::None),
         // `random.sample(population, k)`: `k` distinct elements as a list.
         f("sample", 2, 2, Type::List),
+        // `choices(population, weights=None, *, cum_weights=None, k=1)`: `k`
+        // draws with replacement. `cum_weights` and `k` are keyword-only, so
+        // only their names are declared and the runtime reads them from the
+        // keyword payload.
+        kw_dynamic("choices", 1, 2, Type::List, &["population", "weights"]),
+        // `randbytes(n)`: `n` random bytes.
+        f("randbytes", 1, 1, Type::Bytes),
         // `getrandbits(k)`: a non-negative random int with `k` bits drawn from
         // the global SplitMix64 generator.
         f("getrandbits", 1, 1, Type::Int),
@@ -593,6 +617,9 @@ pub static OS_PATH: ModuleSpec = ModuleSpec {
         c("extsep", Type::Str),
         c("curdir", Type::Str),
         c("pardir", Type::Str),
+        // `os.path.supports_unicode_filenames`: this POSIX runtime passes
+        // filenames through as UTF-8, so the predicate holds.
+        c("supports_unicode_filenames", Type::Bool),
         // CPython 3.14's `os.path.ALLOW_MISSING` sentinel: a unique instance
         // used to distinguish "argument omitted" from an explicit `None`.
         c("ALLOW_MISSING", Type::Any),
@@ -678,6 +705,8 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("open", 2, 3, Type::Int),
         f("dup", 1, 1, Type::Int),
         f("dup2", 2, 2, Type::Int),
+        // `os.pipe()`: the `(read_fd, write_fd)` pair.
+        f("pipe", 0, 0, Type::Tuple),
         kw_dynamic("register_at_fork", 0, usize::MAX, Type::None, &[]),
         // `os.putenv(name, value, /)` and `os.unsetenv(name, /)`: both are
         // C-level functions in CPython, so their arguments are positional-only
@@ -1382,19 +1411,57 @@ pub static CMATH: ModuleSpec = ModuleSpec {
 pub static THREADING: ModuleSpec = ModuleSpec {
     name: "threading",
     functions: &[
-        // `Thread(target=None, args=(), name=None, *, daemon=None)`: the
-        // runtime applies Hydro's reduced slot layout, with `daemon` last as
-        // the keyword-only parameter CPython 3.14 spells after `name`.
+        // `Thread(group=None, target=None, name=None, args=(), kwargs=None,
+        // *, daemon=None, context=None)`: Hydro uses a reduced slot layout
+        // (`target`, `args`, `name`, `daemon`, `kwargs`) so existing callers
+        // keep their positional order while `kwargs` can be bound by name and
+        // merged onto the target invocation. Every slot defaults to `None`,
+        // so `Thread()` is valid.
         kw(
             "Thread",
-            1,
-            4,
+            0,
+            5,
             Type::Any,
-            &["target", "args", "name", "daemon"],
+            &["target", "args", "name", "daemon", "kwargs"],
         ),
         f("Lock", 0, 0, Type::Any),
         f("RLock", 0, 0, Type::Any),
         f("Event", 0, 0, Type::Any),
+        // `Semaphore(value=1)`/`BoundedSemaphore(value=1)`: the value is the
+        // cached class, while module calls lower here and construct through
+        // it. The `_semaphore_*` entries are the class's native method bodies
+        // and property getters.
+        kw("Semaphore", 0, 1, Type::Any, &["value"]),
+        kw("BoundedSemaphore", 0, 1, Type::Any, &["value"]),
+        kw_dynamic("_semaphore_init", 1, 2, Type::None, &["self", "value"]),
+        kw_dynamic(
+            "_semaphore_bounded_init",
+            1,
+            2,
+            Type::None,
+            &["self", "value"],
+        ),
+        kw_dynamic(
+            "_semaphore_acquire",
+            1,
+            3,
+            Type::Bool,
+            &["self", "blocking", "timeout"],
+        ),
+        kw_dynamic("_semaphore_release", 1, 2, Type::None, &["self", "n"]),
+        f("_semaphore_enter", 1, 1, Type::Bool),
+        f("_semaphore_exit", 1, 4, Type::None),
+        f("_semaphore_value", 1, 1, Type::Int),
+        f("_semaphore_initial", 1, 1, Type::Int),
+        f("_semaphore_repr", 1, 1, Type::Str),
+        // `Thread()` with no target runs an empty body, exactly like the
+        // no-op `run` CPython installs when `target is None`.
+        f("_thread_noop", 0, 0, Type::None),
+        // `threading.excepthook(args)` and its saved original: the callable
+        // hook invoked for an uncaught worker exception. The default reports
+        // through the runtime's exception printer.
+        f("excepthook", 1, 1, Type::None),
+        f("__excepthook__", 1, 1, Type::None),
         // `Barrier(parties, action=None, timeout=None)`: the value is the
         // cached class, while module calls lower here and construct through
         // it. The `_barrier_*` entries are the class's native method bodies
@@ -1441,6 +1508,10 @@ pub static THREADING: ModuleSpec = ModuleSpec {
         c("local", Type::Any),
         // `Barrier.wait` raises this when the barrier times out or is aborted.
         c("BrokenBarrierError", Type::Any),
+        // `threading._dangling`: the live `Thread` objects CPython keeps in a
+        // weak set for introspection. Hydro exposes a list holding the main
+        // thread, which is what `list(threading._dangling)` iterates.
+        c("_dangling", Type::List),
     ],
 };
 
@@ -1584,6 +1655,10 @@ pub static PICKLE: ModuleSpec = ModuleSpec {
         // rebuilds a little-endian two's-complement integer. `bytes` is a
         // keyword-only compatibility slot.
         f("decode_long", 1, 2, Type::Any),
+        // `PickleBuffer(buffer)`: the out-of-band buffer wrapper. The runtime
+        // value is a real class carrying `raw`/`release`; the module call
+        // constructs it (there is no PEP 688 buffer protocol export yet).
+        f("PickleBuffer", 1, 1, Type::Any),
     ],
     constants: &[
         // `pickle.DEFAULT_PROTOCOL`: the protocol `dump`/`dumps` use when none
@@ -1798,6 +1873,9 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("hydro_version", Type::Str),
         c("hydro_version_info", Type::Tuple),
         c("maxsize", Type::Int),
+        // `sys.maxunicode`: the largest Unicode code point (strict UTF-8
+        // build), `0x10FFFF`.
+        c("maxunicode", Type::Int),
         // Native text streams over the standard descriptors (`read`,
         // `readline`, `write`, `flush`, `isatty`, `fileno`). The static type
         // is dynamic because Hydro has no stream class hierarchy.
@@ -2281,6 +2359,9 @@ pub static COLLECTIONS: ModuleSpec = ModuleSpec {
         // initialises the mapping; CPython rejects a third with "dict expected
         // at most 1 argument".
         kw_dynamic("defaultdict", 0, 2, Type::Any, &[]),
+        // `_count_elements(mapping, iterable)`: the C helper `Counter`
+        // update() uses to tally an iterable in one pass.
+        f("_count_elements", 2, 2, Type::Any),
         // `OrderedDict(iterable_or_mapping=(), /, **kwargs)`: the parameter is
         // positional-only in CPython, so the keywords are data keys and the
         // dynamic-keyword flag preserves them.
@@ -2322,6 +2403,8 @@ const SOCKET_FUNCTIONS: &[FunctionSpec] = &[
     // The runtime binds these keyword names itself, so the spec keeps the
     // parameter list empty (the frontend still validates the arity).
     kw_dynamic("socket", 0, 3, Type::Any, &[]),
+    f("getdefaulttimeout", 0, 0, Type::Any),
+    f("setdefaulttimeout", 1, 1, Type::Any),
     kw_dynamic(
         "create_connection",
         1,
@@ -2397,6 +2480,8 @@ const SOCKET_CONSTANTS: &[ConstantSpec] = &[
     c("MSG_WAITALL", Type::Int),
     c("MSG_NOSIGNAL", Type::Int),
     c("SocketType", Type::Any),
+    // `socket.has_ipv6`: CPython exposes the build-time IPv6 support flag.
+    c("has_ipv6", Type::Bool),
     // `socket._GLOBAL_DEFAULT_TIMEOUT`: the sentinel socket wrappers treat as
     // "use the global default".
     c("_GLOBAL_DEFAULT_TIMEOUT", Type::Any),
@@ -2714,6 +2799,14 @@ pub static ERRNO: ModuleSpec = ModuleSpec {
         c("EPIPE", Type::Int),
         c("ESPIPE", Type::Int),
         c("ECONNREFUSED", Type::Int),
+        c("EADDRINUSE", Type::Int),
+        c("EADDRNOTAVAIL", Type::Int),
+        c("EAFNOSUPPORT", Type::Int),
+        c("EHOSTUNREACH", Type::Int),
+        c("ENETUNREACH", Type::Int),
+        c("ENETDOWN", Type::Int),
+        c("ECONNRESET", Type::Int),
+        c("EINPROGRESS", Type::Int),
         c("ENOTCONN", Type::Int),
         c("ETIMEDOUT", Type::Int),
         c("EAGAIN", Type::Int),
@@ -2774,8 +2867,31 @@ pub static UNITTEST: ModuleSpec = ModuleSpec {
         c("TestProgram", Type::Any),
         c("defaultTestLoader", Type::Any),
         c("SkipTest", Type::Any),
-        // The nested native module.
+        // Nested modules. `util` and `result` are native submodules; `mock` is
+        // the vendored CPython `unittest/mock.py` compiled ahead of time under
+        // its dotted name even though the native parent has no `__path__`.
         c("util", Type::Any),
+        c("result", Type::Any),
+        c("mock", Type::Any),
+    ],
+};
+
+/// `unittest.result`: the result/runner classes `unittest` exposes from its
+/// `result.py`/`runner.py` modules.
+///
+/// Hydro implements `TestResult`, `TextTestResult` and `TextTestRunner`
+/// natively (see `modules::unittest`), so the submodule re-exports those
+/// class values and the `failfast` decorator instead of loading CPython's
+/// `Lib/unittest/result.py`. `from unittest.result import TestResult` and
+/// `unittest.result.TestResult` therefore observe the same class object as
+/// `unittest.TestResult`.
+pub static UNITTEST_RESULT: ModuleSpec = ModuleSpec {
+    name: "unittest.result",
+    functions: &[f("failfast", 1, 1, Type::Any)],
+    constants: &[
+        c("TestResult", Type::Any),
+        c("TextTestResult", Type::Any),
+        c("TextTestRunner", Type::Any),
     ],
 };
 
@@ -3061,7 +3177,10 @@ pub static BINASCII: ModuleSpec = ModuleSpec {
         f("a2b_uu", 1, 1, Type::Bytes),
         kw("b2a_uu", 1, 2, Type::Bytes, &["data", "backtick"]),
     ],
-    constants: &[],
+    constants: &[
+        // `binascii.Error` is the exception the codec helpers raise.
+        c("Error", Type::Any),
+    ],
 };
 
 /// `base64`: RFC 4648 encodings plus the legacy uuencode-style helpers.
@@ -3112,6 +3231,14 @@ pub static QUOPRI: ModuleSpec = ModuleSpec {
             &["input", "output", "quotetabs", "header"],
         ),
         kw("decode", 2, 3, Type::None, &["input", "output", "header"]),
+        kw(
+            "b2a_qp",
+            1,
+            4,
+            Type::Bytes,
+            &["data", "quotetabs", "istext", "header"],
+        ),
+        kw("a2b_qp", 1, 2, Type::Bytes, &["data", "header"]),
     ],
     constants: &[],
 };
@@ -3228,6 +3355,27 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
         // flags, so the default environment needs no regenerated arguments.
         f("_args_from_interpreter_flags", 0, 0, Type::List),
         f("_optim_args_from_interpreter_flags", 0, 0, Type::List),
+        kw(
+            "check_call",
+            1,
+            9,
+            Type::Int,
+            &[
+                "args", "stdin", "stdout", "stderr", "shell", "timeout", "cwd", "env", "text",
+            ],
+        ),
+        f("_cleanup", 0, 0, Type::None),
+        // `call(*popenargs, timeout=None, **kwargs)` runs the command and
+        // returns its exit status; the accepted names mirror `run`'s.
+        kw(
+            "call",
+            1,
+            9,
+            Type::Int,
+            &[
+                "args", "stdin", "stdout", "stderr", "shell", "timeout", "cwd", "env", "text",
+            ],
+        ),
         // `Popen(args, cwd=None, stdout=None, stderr=None, text=None,
         // env=None, close_fds=True, start_new_session=False, stdin=None,
         // encoding=None, errors=None, preexec_fn=None)`: the trailing names
@@ -3263,6 +3411,7 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
         f("_popen_kill", 1, 1, Type::None),
     ],
     constants: &[
+        c("CalledProcessError", Type::Any),
         c("PIPE", Type::Int),
         c("STDOUT", Type::Int),
         c("DEVNULL", Type::Int),
@@ -3277,6 +3426,9 @@ pub static TMPFILE: ModuleSpec = ModuleSpec {
     name: "tempfile",
     functions: &[
         f("gettempdir", 0, 0, Type::Str),
+        // `mktemp(suffix='', prefix='tmp', dir=None)`: CPython's
+        // deprecated insecure name generator.
+        kw("mktemp", 0, 3, Type::Str, &["suffix", "prefix", "dir"]),
         kw("mkdtemp", 0, 3, Type::Str, &["suffix", "prefix", "dir"]),
         // `mkstemp(suffix=None, prefix=None, dir=None, text=False)`: an open
         // descriptor plus the path.
@@ -3321,7 +3473,13 @@ pub static TMPFILE: ModuleSpec = ModuleSpec {
             ],
         ),
     ],
-    constants: &[],
+    constants: &[
+        // `tempfile._TemporaryFileWrapper`: the class `NamedTemporaryFile`
+        // returns; tests use it as an `isinstance` target.
+        c("_TemporaryFileWrapper", Type::Any),
+        // Native module source path; tests inspect it.
+        c("__file__", Type::Str),
+    ],
 };
 
 /// `shutil`: high-level file operations.
@@ -3340,6 +3498,13 @@ pub static SHUTIL: ModuleSpec = ModuleSpec {
         kw("rmtree", 1, 2, Type::None, &["path", "ignore_errors"]),
         kw("move", 2, 2, Type::Str, &["src", "dst"]),
         f("copymode", 2, 2, Type::None),
+        kw(
+            "copystat",
+            2,
+            3,
+            Type::None,
+            &["src", "dst", "follow_symlinks"],
+        ),
     ],
     constants: &[],
 };
@@ -3483,6 +3648,8 @@ pub static TIMEIT: ModuleSpec = ModuleSpec {
         f("_timer_timeit", 1, 2, Type::Float),
         f("_timer_repeat", 1, 3, Type::List),
         f("_timer_autorange", 1, 2, Type::Tuple),
+        // `reindent(src, indent)`: strips common leading whitespace.
+        f("reindent", 2, 2, Type::Str),
     ],
     constants: &[],
 };
@@ -3927,6 +4094,10 @@ pub static TYPES: ModuleSpec = ModuleSpec {
     name: "types",
     functions: &[
         kw_dynamic("SimpleNamespace", 0, 1, Type::Any, &[]),
+        // `new_class(name, bases=(), kwds=None, exec_body=None)`: the
+        // functional class factory; every trailing argument is optional and
+        // `kwds`/`exec_body` keep their keyword spellings.
+        kw_dynamic("new_class", 1, 4, Type::Any, &[]),
         // `FunctionType(code, globals, name=None, argdefs=None, closure=None,
         // kwdefaults=None)` builds a callable from code metadata. Declared as
         // a function so calls lower as a module call; the runtime still
@@ -4303,6 +4474,7 @@ pub static IMPORTLIB: ModuleSpec = ModuleSpec {
 pub static IMPORTLIB_UTIL: ModuleSpec = ModuleSpec {
     name: "importlib.util",
     functions: &[
+        f("source_from_cache", 1, 1, Type::Str),
         kw("find_spec", 1, 2, Type::Any, &["name", "package"]),
         kw(
             "spec_from_file_location",
@@ -4506,6 +4678,23 @@ pub static CONTEXTLIB: ModuleSpec = ModuleSpec {
         f("suppress", 0, usize::MAX, Type::Any),
         kw("nullcontext", 0, 1, Type::Any, &["enter_result"]),
         f("contextmanager", 1, 1, Type::Any),
+        // `redirect_stdout(new_target)` / `redirect_stderr(new_target)`: the
+        // `_RedirectStream` managers that rebind `sys.stdout`/`sys.stderr` for
+        // the duration of the block and restore the previous target on exit.
+        f("redirect_stdout", 1, 1, Type::Any),
+        f("redirect_stderr", 1, 1, Type::Any),
+        // `ContextDecorator`: the base class whose `__call__` wraps a function
+        // in `with self:`; `_recreate_cm` is CPython's per-call hook.
+        f("ContextDecorator", 0, 0, Type::Any),
+        f("_redirect_stdout_enter", 1, 1, Type::Any),
+        f("_redirect_stdout_exit", 4, 4, Type::Bool),
+        f("_redirect_stderr_enter", 1, 1, Type::Any),
+        f("_redirect_stderr_exit", 4, 4, Type::Bool),
+        f("_contextdecorator_call", 2, 2, Type::Any),
+        f("_contextdecorator_recreate_cm", 1, 1, Type::Any),
+        // `_contextdecorator_invoke(context, func, *args, **kwargs)` forwards
+        // every call-site keyword to the decorated function.
+        kw_dynamic("_contextdecorator_invoke", 2, usize::MAX, Type::Any, &[]),
         // The native methods of the three context-manager classes; the
         // runtime values carry these names, so the central table must know
         // their arities. `_contextmanager_call` receives the decorated
@@ -4566,6 +4755,7 @@ pub static _COLLECTIONS: ModuleSpec = ModuleSpec {
         kw_dynamic("defaultdict", 0, 2, Type::Any, &[]),
         kw_dynamic("OrderedDict", 0, 1, Type::Any, &[]),
         kw_dynamic("Counter", 0, 1, Type::Any, &[]),
+        f("_count_elements", 2, 2, Type::Any),
     ],
     constants: &[],
 };
@@ -4588,6 +4778,10 @@ pub static _CODECS: ModuleSpec = ModuleSpec {
         f("register", 1, 1, Type::None),
         f("unregister", 1, 1, Type::None),
         f("register_error", 2, 2, Type::None),
+        // `_unregister_error(errors)`: removes a custom error handler and
+        // reports whether one was registered. CPython 3.14 rejects built-in
+        // handler names with `ValueError`.
+        f("_unregister_error", 1, 1, Type::Bool),
         f("lookup_error", 1, 1, Type::Any),
         // The handler functions returned by `lookup_error` for the built-in
         // names; exposed so native function values stay dispatchable.
@@ -4676,6 +4870,8 @@ pub static _IMP: ModuleSpec = ModuleSpec {
         f("exec_dynamic", 1, 1, Type::Any),
         f("_fix_co_filename", 2, 3, Type::None),
         f("source_hash", 2, 2, Type::Int),
+        f("_override_frozen_modules_for_tests", 1, 1, Type::Int),
+        f("_override_multi_interp_extensions_check", 1, 1, Type::Int),
     ],
     constants: &[],
 };
@@ -4853,6 +5049,7 @@ pub static WARNINGS: ModuleSpec = ModuleSpec {
         c("deprecated", Type::Any),
         c("_DEPRECATED_MSG", Type::Str),
         c("EncodingWarning", Type::Any),
+        c("WarningMessage", Type::Any),
     ],
 };
 
@@ -5073,6 +5270,7 @@ pub static COLLECTIONS_ABC: ModuleSpec = ModuleSpec {
 pub static GC: ModuleSpec = ModuleSpec {
     name: "gc",
     functions: &[
+        f("is_tracked", 1, 1, Type::Bool),
         kw("collect", 0, 1, Type::Int, &["generation"]),
         f("isenabled", 0, 0, Type::Bool),
         f("enable", 0, 0, Type::None),
@@ -5089,7 +5287,10 @@ pub static GC: ModuleSpec = ModuleSpec {
         // the name is declared so imports and attribute reads resolve.
         f("get_referrers", 0, usize::MAX, Type::List),
     ],
-    constants: &[],
+    constants: &[
+        // `gc.garbage`: the list of uncollectable objects.
+        c("garbage", Type::List),
+    ],
 };
 
 /// `atexit`: LIFO shutdown callbacks.
@@ -5334,6 +5535,9 @@ pub static LOCALE: ModuleSpec = ModuleSpec {
         c("LC_ALL", Type::Int),
         c("Error", Type::Any),
         c("CHAR_MAX", Type::Int),
+        // `locale.ALT_DIGITS`: the locale-specific alternative digit symbols.
+        // The C locale defines none, so the list is empty.
+        c("ALT_DIGITS", Type::List),
     ],
 };
 
@@ -5712,7 +5916,99 @@ pub static HTTP: ModuleSpec = ModuleSpec {
 pub static HTTP_CLIENT: ModuleSpec = ModuleSpec {
     name: "http.client",
     functions: &[],
-    constants: &[],
+    constants: &[
+        // The exception classes `http.client` defines; `urllib.request` and
+        // the test suite catch them by identity.
+        c("HTTPException", Type::Any),
+        c("RemoteDisconnected", Type::Any),
+        c("HTTPConnection", Type::Any),
+        c("HTTPSConnection", Type::Any),
+        c("HTTPResponse", Type::Any),
+        c("HTTPMessage", Type::Any),
+        c("responses", Type::Any),
+        c("parse_headers", Type::Any),
+        c("__all__", Type::Any),
+        c("HTTP_PORT", Type::Any),
+        c("HTTPS_PORT", Type::Any),
+        c("_MAXHEADERS", Type::Any),
+        c("_MAXLINE", Type::Any),
+        c("_MAXINTERIMRESPONSES", Type::Any),
+        c("_UNKNOWN", Type::Any),
+        c("_CS_IDLE", Type::Any),
+        c("_CS_REQ_STARTED", Type::Any),
+        c("_CS_REQ_SENT", Type::Any),
+        c("NotConnected", Type::Any),
+        c("InvalidURL", Type::Any),
+        c("UnknownProtocol", Type::Any),
+        c("UnknownTransferEncoding", Type::Any),
+        c("UnimplementedFileMode", Type::Any),
+        c("IncompleteRead", Type::Any),
+        c("ImproperConnectionState", Type::Any),
+        c("CannotSendRequest", Type::Any),
+        c("CannotSendHeader", Type::Any),
+        c("ResponseNotReady", Type::Any),
+        c("BadStatusLine", Type::Any),
+        c("LineTooLong", Type::Any),
+        c("error", Type::Any),
+        c("CONTINUE", Type::Any),
+        c("SWITCHING_PROTOCOLS", Type::Any),
+        c("PROCESSING", Type::Any),
+        c("OK", Type::Any),
+        c("CREATED", Type::Any),
+        c("ACCEPTED", Type::Any),
+        c("NON_AUTHORITATIVE_INFORMATION", Type::Any),
+        c("NO_CONTENT", Type::Any),
+        c("RESET_CONTENT", Type::Any),
+        c("PARTIAL_CONTENT", Type::Any),
+        c("MULTI_STATUS", Type::Any),
+        c("MOVED_PERMANENTLY", Type::Any),
+        c("FOUND", Type::Any),
+        c("SEE_OTHER", Type::Any),
+        c("NOT_MODIFIED", Type::Any),
+        c("USE_PROXY", Type::Any),
+        c("TEMPORARY_REDIRECT", Type::Any),
+        c("PERMANENT_REDIRECT", Type::Any),
+        c("BAD_REQUEST", Type::Any),
+        c("UNAUTHORIZED", Type::Any),
+        c("PAYMENT_REQUIRED", Type::Any),
+        c("FORBIDDEN", Type::Any),
+        c("NOT_FOUND", Type::Any),
+        c("METHOD_NOT_ALLOWED", Type::Any),
+        c("NOT_ACCEPTABLE", Type::Any),
+        c("PROXY_AUTHENTICATION_REQUIRED", Type::Any),
+        c("REQUEST_TIMEOUT", Type::Any),
+        c("CONFLICT", Type::Any),
+        c("GONE", Type::Any),
+        c("LENGTH_REQUIRED", Type::Any),
+        c("PRECONDITION_FAILED", Type::Any),
+        c("REQUEST_ENTITY_TOO_LARGE", Type::Any),
+        c("REQUEST_URI_TOO_LONG", Type::Any),
+        c("UNSUPPORTED_MEDIA_TYPE", Type::Any),
+        c("REQUESTED_RANGE_NOT_SATISFIABLE", Type::Any),
+        c("EXPECTATION_FAILED", Type::Any),
+        c("IM_A_TEAPOT", Type::Any),
+        c("MISDIRECTED_REQUEST", Type::Any),
+        c("UNPROCESSABLE_ENTITY", Type::Any),
+        c("LOCKED", Type::Any),
+        c("FAILED_DEPENDENCY", Type::Any),
+        c("TOO_EARLY", Type::Any),
+        c("UPGRADE_REQUIRED", Type::Any),
+        c("PRECONDITION_REQUIRED", Type::Any),
+        c("TOO_MANY_REQUESTS", Type::Any),
+        c("REQUEST_HEADER_FIELDS_TOO_LARGE", Type::Any),
+        c("UNAVAILABLE_FOR_LEGAL_REASONS", Type::Any),
+        c("INTERNAL_SERVER_ERROR", Type::Any),
+        c("NOT_IMPLEMENTED", Type::Any),
+        c("BAD_GATEWAY", Type::Any),
+        c("SERVICE_UNAVAILABLE", Type::Any),
+        c("GATEWAY_TIMEOUT", Type::Any),
+        c("HTTP_VERSION_NOT_SUPPORTED", Type::Any),
+        c("VARIANT_ALSO_NEGOTIATES", Type::Any),
+        c("INSUFFICIENT_STORAGE", Type::Any),
+        c("LOOP_DETECTED", Type::Any),
+        c("NOT_EXTENDED", Type::Any),
+        c("NETWORK_AUTHENTICATION_REQUIRED", Type::Any),
+    ],
 };
 
 /// `http.server`: the classes `pydoc.serve` builds on.
@@ -5731,6 +6027,9 @@ pub static HTTP_SERVER: ModuleSpec = ModuleSpec {
         c("BaseHTTPRequestHandler", Type::Any),
         c("HTTPServer", Type::Any),
         c("ThreadingHTTPServer", Type::Any),
+        c("HTTPSServer", Type::Any),
+        c("SimpleHTTPRequestHandler", Type::Any),
+        c("CGIHTTPRequestHandler", Type::Any),
     ],
 };
 
@@ -8340,8 +8639,11 @@ mod tests {
             assert_eq!((spec.min_args, spec.max_args, spec.ret), (min, max, ret));
         }
         let thread = function("threading", "Thread").expect("threading.Thread");
-        assert_eq!((thread.min_args, thread.max_args), (1, 4));
-        assert_eq!(thread.params, &["target", "args", "name", "daemon"][..]);
+        assert_eq!((thread.min_args, thread.max_args), (0, 5));
+        assert_eq!(
+            thread.params,
+            &["target", "args", "name", "daemon", "kwargs"][..]
+        );
         assert_eq!(
             crate::stdlib::module("builtins")
                 .expect("builtins spec")
@@ -10695,5 +10997,82 @@ mod tests {
         assert!(function("os", "waitstatus_to_exitcode").is_some());
         assert!(module("asyncio.events").is_some());
         assert!(constant("asyncio.events", "_event_loop_policy").is_some());
+    }
+
+    #[test]
+    fn misc_central_gap_specs_are_declared() {
+        // Distribution draws and the float scaling helper.
+        for name in ["gauss", "normalvariate"] {
+            let spec = function("random", name).expect(name);
+            assert_eq!((spec.min_args, spec.max_args), (0, 2), "random.{name}");
+            assert_eq!(spec.params, &["mu", "sigma"][..]);
+            assert_eq!(spec.ret, Type::Float);
+        }
+        let ldexp = function("math", "ldexp").expect("math.ldexp");
+        assert_eq!((ldexp.min_args, ldexp.max_args), (2, 2));
+        assert_eq!(ldexp.ret, Type::Float);
+
+        // Sequence helpers.
+        for name in ["contains", "countOf"] {
+            let spec = function("operator", name).expect(name);
+            assert_eq!((spec.min_args, spec.max_args), (2, 2), "operator.{name}");
+        }
+        assert_eq!(function("operator", "contains").unwrap().ret, Type::Bool);
+        assert_eq!(function("operator", "countOf").unwrap().ret, Type::Int);
+        assert!(function("_operator", "contains").is_some());
+        assert!(function("_operator", "countOf").is_some());
+
+        // Constants.
+        assert_eq!(
+            constant("os.path", "supports_unicode_filenames")
+                .expect("supports_unicode_filenames")
+                .ty,
+            Type::Bool
+        );
+        assert_eq!(
+            constant("sys", "maxunicode").expect("maxunicode").ty,
+            Type::Int
+        );
+        assert_eq!(
+            constant("locale", "ALT_DIGITS").expect("ALT_DIGITS").ty,
+            Type::List
+        );
+
+        // The semaphore classes and their native method bodies.
+        for name in ["Semaphore", "BoundedSemaphore"] {
+            let spec = function("threading", name).expect(name);
+            assert_eq!((spec.min_args, spec.max_args), (0, 1), "threading.{name}");
+            assert_eq!(spec.params, &["value"][..]);
+        }
+        for (name, max_args) in [
+            ("_semaphore_init", 2),
+            ("_semaphore_bounded_init", 2),
+            ("_semaphore_acquire", 3),
+            ("_semaphore_release", 2),
+            ("_semaphore_enter", 1),
+            ("_semaphore_exit", 4),
+            ("_semaphore_value", 1),
+            ("_semaphore_initial", 1),
+            ("_semaphore_repr", 1),
+        ] {
+            let spec = function("threading", name).expect(name);
+            assert_eq!(spec.max_args, max_args, "threading.{name}");
+            assert_eq!(spec.min_args, 1, "threading.{name} keeps self required");
+        }
+        assert!(function("threading", "excepthook").is_some());
+        assert!(function("threading", "__excepthook__").is_some());
+        assert_eq!(constant("threading", "_dangling").unwrap().ty, Type::List);
+        // `Thread` now binds the full reduced slot layout, including kwargs.
+        let thread = function("threading", "Thread").expect("threading.Thread");
+        assert_eq!((thread.min_args, thread.max_args), (0, 5));
+        assert_eq!(
+            thread.params,
+            &["target", "args", "name", "daemon", "kwargs"][..]
+        );
+
+        // The error-handler registry removal hook.
+        let unregister = function("_codecs", "_unregister_error").expect("_unregister_error");
+        assert_eq!((unregister.min_args, unregister.max_args), (1, 1));
+        assert_eq!(unregister.ret, Type::Bool);
     }
 }

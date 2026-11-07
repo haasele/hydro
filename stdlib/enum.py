@@ -279,7 +279,7 @@ class _proto_member:
                 )
         if native_object_new:
             enum_member = object.__new__(enum_class)
-        elif not enum_class._use_args_:
+        elif not enum_class._use_args_ and enum_class._new_member_ in (object.__new__, Enum.__new__):
             enum_member = enum_class._new_member_(enum_class)
         else:
             enum_member = enum_class._new_member_(enum_class, *args)

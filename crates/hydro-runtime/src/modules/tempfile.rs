@@ -1,10 +1,22 @@
 //! `tempfile`: temporary files and directories.
 //!
-//! The implemented subset is `gettempdir()`, `mkdtemp()`,
-//! `TemporaryDirectory` and `NamedTemporaryFile`. Unique names are derived
-//! from the process id and a process-global counter, which is enough to keep
-//! concurrent callers (and parallel tests) apart without pulling in a
-//! random-number dependency.
+//! The implemented subset is `gettempdir()`, `mkdtemp()`, `mkstemp()`,
+//! `mktemp()`, `TemporaryDirectory` and `NamedTemporaryFile`. Unique names
+//! are derived from the process id and a process-global counter, which is
+//! enough to keep concurrent callers (and parallel tests) apart without
+//! pulling in a random-number dependency.
+//!
+//! `mktemp()` is the deprecated name-only helper: it returns a name that does
+//! not exist yet without creating the file. `__file__` reports the Python
+//! source path of the module, which the stdlib tests use to locate the
+//! interpreter's library directory.
+//!
+//! `_TemporaryFileWrapper` mirrors CPython's wrapper class: it stores the
+//! wrapped `file`, the `name` it was created under and the `delete` /
+//! `delete_on_close` policy, delegates every other attribute to the file
+//! (`__getattr__`), and deletes the file on `close()` when the policy asks
+//! for it. It is a real class value, so `urllib.response.addbase` can
+//! subclass it.
 //!
 //! `TemporaryDirectory` is a native class instance: the constructor allocates
 //! the directory and stores its path in the `name` attribute, while
@@ -26,13 +38,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 
-use crate::core::globals;
+use hydro_ir::{MethodKind, ParamKind};
+
+use crate::core::{globals, iter, methods};
 use crate::exc::{self, ATTRIBUTE_ERROR, OS_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::heap;
-use crate::value::{self, FALSE, NONE, TRUE};
+use crate::value::{self, ParamMeta, FALSE, NONE, TRUE};
 
 /// Source of unique name components within one process.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Attempts `mktemp()` makes before reporting exhaustion, matching CPython's
+/// `TMP_MAX`.
+const MKTEMP_ATTEMPTS: usize = 10_000;
 
 /// Resolved temporary directory, computed once like CPython.
 static TEMP_DIR: LazyLock<String> = LazyLock::new(|| {
@@ -218,6 +236,42 @@ fn mkstemp(args: &[i64]) -> i64 {
         io::Error::new(io::ErrorKind::AlreadyExists, "too many temporary files"),
         &base,
     )
+}
+
+/// `tempfile.mktemp(suffix='', prefix='tmp', dir=None)`: the deprecated
+/// name-only helper.
+///
+/// The name is chosen from the same process-wide counter `mkstemp` uses and
+/// is checked against the filesystem (`symlink_metadata` also reports a
+/// dangling link, so an uncreatable name is never returned), but the file is
+/// left for the caller to create — which is exactly why CPython deprecates
+/// the function.
+fn mktemp(args: &[i64]) -> i64 {
+    let suffix = match optional_path(args, 0, "mktemp", "suffix") {
+        Ok(value) => value.unwrap_or_default(),
+        Err(error) => return error,
+    };
+    let prefix = match optional_path(args, 1, "mktemp", "prefix") {
+        Ok(value) => value.unwrap_or_else(|| "tmp".to_string()),
+        Err(error) => return error,
+    };
+    let dir = match optional_path(args, 2, "mktemp", "dir") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let base = match dir.as_deref() {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(TEMP_DIR.as_str()),
+    };
+    for _ in 0..MKTEMP_ATTEMPTS {
+        let candidate = base.join(format!("{prefix}{}{suffix}", unique_component()));
+        if fs::symlink_metadata(&candidate).is_err() {
+            return value::str_alloc(candidate.to_string_lossy().into_owned());
+        }
+    }
+    // CPython raises `FileExistsError(EEXIST, "No usable temporary filename
+    // found")`; Hydro's exception registry has the `OSError` spelling.
+    exc::raise_with_message(OS_ERROR, "[Errno 17] No usable temporary filename found")
 }
 
 /// Removes `path` recursively, tolerating an already-missing path.
@@ -468,6 +522,13 @@ fn close_wrapped(instance: i64) {
     if let Some(file) = value::instance_attr(instance, "file") {
         if let Some(file) = value::as_file(file) {
             file.close();
+        } else {
+            // A file-like object (`io.StringIO`, a socket makefile wrapper, a
+            // user class): close it through its own protocol, exactly like
+            // CPython's `self.file.close()` in `_TemporaryFileCloser`.
+            let roots = heap::root_values(&[instance, file]);
+            let _ = methods::call(file, b"close".as_ptr(), 5, 0, std::ptr::null());
+            heap::release_roots(roots);
         }
     }
     let roots = heap::root_values(&[instance]);
@@ -483,11 +544,12 @@ fn is_named_wrapper(instance: i64) -> bool {
 
 /// Installs the stream methods on a wrapper as bound methods of `.file`.
 ///
-/// Hydro has no instance `__getattr__`, and new native method names would need
-/// central-spec entries that this module does not own. Binding the real file
-/// methods on the instance gives the same delegation CPython performs through
-/// `_TemporaryFileWrapper.__getattr__` and keeps the receiver (`file`) alive
-/// through the traced instance attribute table.
+/// A compiled `wrapper.read(...)` lowers to a direct method call, which
+/// resolves through the class table and the instance dictionary but not
+/// through `__getattr__`; binding the real file methods on the instance gives
+/// the same delegation CPython performs through
+/// `_TemporaryFileWrapper.__getattr__` for those calls and keeps the receiver
+/// (`file`) alive through the traced instance attribute table.
 fn install_stream_methods(instance: i64, file: i64) {
     for name in [
         "read",
@@ -678,10 +740,379 @@ fn new_named_temporary_file(args: &[i64]) -> i64 {
     instance
 }
 
+// -------------------------------------------------------------------------
+// _TemporaryFileWrapper
+// -------------------------------------------------------------------------
+
+/// Wraps a native entry point as a class-method value.
+///
+/// `_TemporaryFileWrapper`'s methods are not module-level `tempfile`
+/// functions, so the central spec table cannot declare them; a raw wrapper
+/// carries its own entry point, which the class method binder invokes
+/// directly.
+fn wrapper_method(entry: extern "C" fn(*const i64) -> i64, arity: usize, name: &str) -> i64 {
+    value::function_new(entry as *const () as usize, arity, name.to_string())
+}
+
+/// The wrapped file object of a `_TemporaryFileWrapper` instance.
+fn wrapped_file(instance: i64) -> Option<i64> {
+    value::instance_attr(instance, "file")
+}
+
+/// `_TemporaryFileWrapper.__init__(self, file, name, delete=True,
+/// delete_on_close=True)`: stores the wrapped file and the deletion policy.
+///
+/// The signature is real (not just an arity) because
+/// `urllib.response.addbase.__init__` forwards `delete=False` as a keyword
+/// through `super().__init__(...)`; the method binder resolves it here.
+extern "C" fn wrapper_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes the five signature slots.
+    let args = unsafe { std::slice::from_raw_parts(argv, 5) };
+    let (instance, file, name) = (args[0], args[1], args[2]);
+    let roots = heap::root_values(args);
+    value::instance_setattr(instance, "file".to_string(), file);
+    value::instance_setattr(instance, "name".to_string(), name);
+    value::instance_setattr(
+        instance,
+        "delete".to_string(),
+        value::bool_value(value::truthy(args[3])),
+    );
+    value::instance_setattr(
+        instance,
+        "delete_on_close".to_string(),
+        value::bool_value(value::truthy(args[4])),
+    );
+    value::instance_setattr(instance, "_close_called".to_string(), FALSE);
+    value::instance_setattr(instance, "_cleanup_called".to_string(), FALSE);
+    // Compiled method calls do not consult `__getattr__`, so the wrapped
+    // file's stream methods are bound on the instance the same way
+    // `NamedTemporaryFile` does it.
+    install_stream_methods(instance, file);
+    heap::release_roots(roots);
+    NONE
+}
+
+/// `_TemporaryFileWrapper.__getattr__(name)`: delegates to the wrapped file
+/// and caches non-numeric results, exactly like CPython's wrapper.
+extern "C" fn wrapper_getattr_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, name)`.
+    let instance = unsafe { *argv };
+    let name_value = unsafe { *argv.add(1) };
+    let Some(name) = value::as_str(name_value) else {
+        return exc::raise_with_message(TYPE_ERROR, "attribute name must be string");
+    };
+    let name = name.to_string();
+    let Some(file) = wrapped_file(instance) else {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("'_TemporaryFileWrapper' object has no attribute '{name}'"),
+        );
+    };
+    let roots = heap::root_values(&[instance, file]);
+    let result = methods::getattr(file, name.as_ptr(), name.len());
+    // CPython caches everything but integers (`closed` and friends must stay
+    // live views of the file).
+    if !exc::pending() && value::as_integer(result).is_none() {
+        let result_roots = heap::root_values(&[result]);
+        value::instance_setattr(instance, name, result);
+        heap::release_roots(result_roots);
+    }
+    heap::release_roots(roots);
+    result
+}
+
+/// `_TemporaryFileWrapper.__enter__()`: enters the wrapped file and returns
+/// the wrapper, which is the object CPython's overridden context manager
+/// binds to the `as` target.
+extern "C" fn wrapper_enter_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self`.
+    let instance = unsafe { *argv };
+    let Some(file) = wrapped_file(instance) else {
+        return NONE;
+    };
+    let roots = heap::root_values(&[instance, file]);
+    let _ = methods::call(file, b"__enter__".as_ptr(), 9, 0, std::ptr::null());
+    heap::release_roots(roots);
+    if exc::pending() {
+        return NONE;
+    }
+    instance
+}
+
+/// `_TemporaryFileWrapper.__exit__(exc, value, tb)`: exits the wrapped file,
+/// then closes and deletes the temporary file according to `delete`.
+extern "C" fn wrapper_exit_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `(self, exc, value, tb)`.
+    let instance = unsafe { *argv };
+    let exit_args = [unsafe { *argv.add(1) }, unsafe { *argv.add(2) }, unsafe {
+        *argv.add(3)
+    }];
+    let Some(file) = wrapped_file(instance) else {
+        return NONE;
+    };
+    let roots = heap::root_values(&[instance, file]);
+    let result = methods::call(
+        file,
+        b"__exit__".as_ptr(),
+        8,
+        exit_args.len(),
+        exit_args.as_ptr(),
+    );
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let result_roots = heap::root_values(&[result]);
+    let _ = wrapper_cleanup(instance);
+    // CPython returns what the wrapped file's `__exit__` returned; a cleanup
+    // failure replaces it.
+    let outcome = if exc::pending() { NONE } else { result };
+    heap::release_roots(result_roots);
+    heap::release_roots(roots);
+    outcome
+}
+
+/// `_TemporaryFileWrapper.__iter__()`: iterates the wrapped file.
+extern "C" fn wrapper_iter_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self`.
+    let instance = unsafe { *argv };
+    let Some(file) = wrapped_file(instance) else {
+        return NONE;
+    };
+    let roots = heap::root_values(&[instance, file]);
+    let result = iter::iter_new(file);
+    heap::release_roots(roots);
+    result
+}
+
+/// `_TemporaryFileWrapper.__next__()`: the next line of the wrapped file.
+extern "C" fn wrapper_next_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self`.
+    let instance = unsafe { *argv };
+    let Some(file) = wrapped_file(instance) else {
+        return NONE;
+    };
+    let roots = heap::root_values(&[instance, file]);
+    let iterator = iter::iter_new(file);
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let iterator_roots = heap::root_values(&[iterator]);
+    let result = iter::next_value(iterator, NONE, false);
+    heap::release_roots(iterator_roots);
+    heap::release_roots(roots);
+    result
+}
+
+/// `_TemporaryFileWrapper.closed`: the wrapped file's live closed flag.
+extern "C" fn wrapper_closed_entry(argv: *const i64) -> i64 {
+    // SAFETY: a property getter receives the instance.
+    let instance = unsafe { *argv };
+    let Some(file) = wrapped_file(instance) else {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            "'_TemporaryFileWrapper' object has no attribute 'file'",
+        );
+    };
+    let roots = heap::root_values(&[file]);
+    let result = methods::getattr(file, b"closed".as_ptr(), 6);
+    heap::release_roots(roots);
+    result
+}
+
+/// `_TemporaryFileWrapper.close()`: closes the file and, when both `delete`
+/// and `delete_on_close` are set, unlinks it now.
+extern "C" fn wrapper_close_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self`.
+    let instance = unsafe { *argv };
+    let roots = heap::root_values(&[instance]);
+    let result = wrapper_close(instance);
+    heap::release_roots(roots);
+    result
+}
+
+/// Closes the wrapped file once; deletes it when `delete_on_close` allows it.
+fn wrapper_close(instance: i64) -> i64 {
+    if flag(instance, "_close_called") {
+        return NONE;
+    }
+    set_flag(instance, "_close_called", true);
+    close_wrapped(instance);
+    if flag(instance, "delete") && flag(instance, "delete_on_close") {
+        return wrapper_cleanup(instance);
+    }
+    NONE
+}
+
+/// `_TemporaryFileCloser.cleanup()`: close the file once and unlink it when
+/// `delete` allows it, tolerating an already-missing path.
+fn wrapper_cleanup(instance: i64) -> i64 {
+    if flag(instance, "_cleanup_called") {
+        return NONE;
+    }
+    set_flag(instance, "_cleanup_called", true);
+    if !flag(instance, "_close_called") {
+        set_flag(instance, "_close_called", true);
+        close_wrapped(instance);
+    }
+    if !flag(instance, "delete") {
+        return NONE;
+    }
+    let name = value::instance_attr(instance, "name").unwrap_or(NONE);
+    let Some(path) = value::as_path_like(name) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "_TemporaryFileWrapper.name must be str or pathlib.Path, not {}",
+                value::type_name(name)
+            ),
+        );
+    };
+    let path = path.to_string();
+    match unlink_if_present(&path) {
+        Ok(()) => NONE,
+        Err(error) => io_error(error, Path::new(&path)),
+    }
+}
+
+/// Builds the cached native `_TemporaryFileWrapper` class.
+///
+/// A real class value (not a constructor function) so
+/// `urllib.response.addbase` can subclass it and `isinstance` works. The
+/// methods carry their own entry points because none of their names exist in
+/// the central `tempfile` spec.
+fn temporary_file_wrapper_class() -> i64 {
+    const KEY: &str = "tempfile._TemporaryFileWrapper.class";
+    if let Some(class) = globals::registry_get(KEY) {
+        return class;
+    }
+    // `__init__` needs real parameter metadata: `super().__init__(fp, name,
+    // delete=False)` in the urllib response classes binds `delete` by name.
+    let init = value::native_function_new("tempfile", "_TemporaryFileWrapper.__init__", usize::MAX);
+    value::function_set_signature(
+        init,
+        vec![
+            ParamMeta {
+                name: "self".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            ParamMeta {
+                name: "file".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            ParamMeta {
+                name: "name".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            ParamMeta {
+                name: "delete".to_string(),
+                kind: ParamKind::Positional,
+                default: Some(TRUE),
+            },
+            ParamMeta {
+                name: "delete_on_close".to_string(),
+                kind: ParamKind::Positional,
+                default: Some(TRUE),
+            },
+        ],
+    );
+    value::function_set_full_entry(init, wrapper_init_entry as *const () as usize);
+
+    let methods = vec![
+        ("__init__".to_string(), init, MethodKind::Normal),
+        (
+            "__getattr__".to_string(),
+            wrapper_method(wrapper_getattr_entry, 2, "__getattr__"),
+            MethodKind::Normal,
+        ),
+        (
+            "__enter__".to_string(),
+            wrapper_method(wrapper_enter_entry, 1, "__enter__"),
+            MethodKind::Normal,
+        ),
+        (
+            "__exit__".to_string(),
+            wrapper_method(wrapper_exit_entry, 4, "__exit__"),
+            MethodKind::Normal,
+        ),
+        (
+            "__iter__".to_string(),
+            wrapper_method(wrapper_iter_entry, 1, "__iter__"),
+            MethodKind::Normal,
+        ),
+        (
+            "__next__".to_string(),
+            wrapper_method(wrapper_next_entry, 1, "__next__"),
+            MethodKind::Normal,
+        ),
+        (
+            "close".to_string(),
+            wrapper_method(wrapper_close_entry, 1, "close"),
+            MethodKind::Normal,
+        ),
+    ];
+    let closed = value::property_new(
+        wrapper_method(wrapper_closed_entry, 1, "closed"),
+        NONE,
+        NONE,
+    );
+    let attrs = vec![("closed".to_string(), closed)];
+    // The method and property values live in plain Rust memory while the
+    // class is built, so root them before the class allocation can collect.
+    let mut live = Vec::with_capacity(methods.len() + 1);
+    live.push(init);
+    live.extend(methods.iter().map(|(_, function, _)| *function));
+    live.push(closed);
+    let roots = heap::root_values(&live);
+    let class = value::class_new_full("_TemporaryFileWrapper".to_string(), NONE, methods, attrs);
+    let class_roots = heap::root_values(&[class]);
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    class
+}
+
+/// Source path reported by `tempfile.__file__`.
+///
+/// Hydro implements `tempfile` natively, but CPython's module is a Python
+/// module: the standard library tree backing this interpreter is where its
+/// source lives, and the stdlib tests derive that directory from this value.
+/// `HYDRO_STDLIB` names the tree when an installation supplies one; the
+/// vendored tree is the fallback root. `"tempfile.py"` is the last resort for
+/// a build with no visible tree at all.
+fn module_file() -> String {
+    let root = match std::env::var_os("HYDRO_STDLIB") {
+        Some(stdlib) if !stdlib.is_empty() => PathBuf::from(stdlib),
+        _ => match crate::modules::bundled_stdlib_root() {
+            Some(root) => root.to_path_buf(),
+            None => return "tempfile.py".to_string(),
+        },
+    };
+    root.join("tempfile.py").to_string_lossy().into_owned()
+}
+
+/// Module attributes that are not functions: the module's source path and the
+/// `_TemporaryFileWrapper` class.
+pub(crate) fn constant(name: &str) -> i64 {
+    match name {
+        "__file__" => value::str_alloc(module_file()),
+        "_TemporaryFileWrapper" => temporary_file_wrapper_class(),
+        _ => exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("module 'tempfile' has no attribute '{name}'"),
+        ),
+    }
+}
+
 /// Dispatches a native `tempfile` function or method.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         "gettempdir" => gettempdir(),
+        "mktemp" => mktemp(args),
         "mkdtemp" => mkdtemp(args),
         "mkstemp" => mkstemp(args),
         "TemporaryDirectory" => new_temporary_directory(args),
@@ -1012,5 +1443,157 @@ mod tests {
         assert_eq!(call("named_temporary_file", &[]), NONE);
         assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
         exc::clear();
+    }
+
+    #[test]
+    fn mktemp_returns_a_unique_name_without_creating_it() {
+        let first = call("mktemp", &[]);
+        let second = call("mktemp", &[]);
+        assert_clean(first);
+        assert_clean(second);
+        let first = value::as_str(first).expect("str").to_string();
+        let second = value::as_str(second).expect("str").to_string();
+        assert_ne!(first, second);
+        assert!(
+            !Path::new(&first).exists(),
+            "mktemp must not create the file"
+        );
+        assert!(!Path::new(&second).exists());
+
+        let named = call("mktemp", &[text(".sock"), text("hydro-mktemp-")]);
+        assert_clean(named);
+        let named = value::as_str(named).expect("str").to_string();
+        let file_name = Path::new(&named)
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(file_name.starts_with("hydro-mktemp-"));
+        assert!(file_name.ends_with(".sock"));
+        assert!(!Path::new(&named).exists());
+    }
+
+    #[test]
+    fn module_file_reports_a_python_source_path() {
+        let path = value::as_str(constant("__file__"))
+            .expect("str")
+            .to_string();
+        assert!(path.ends_with("tempfile.py"), "{path}");
+    }
+
+    /// Builds a `_TemporaryFileWrapper` through the real class call path, so
+    /// construction, `__init__` binding and the property are exercised.
+    fn wrapper_instance(file: i64, name: &str, delete: bool, delete_on_close: bool) -> i64 {
+        let class = temporary_file_wrapper_class();
+        let args = [
+            file,
+            text(name),
+            if delete { TRUE } else { FALSE },
+            if delete_on_close { TRUE } else { FALSE },
+        ];
+        let instance = crate::core::builtins::call(class, args.len(), args.as_ptr());
+        assert_clean(instance);
+        instance
+    }
+
+    fn open_wrapped_file(path: &str, mode: &str) -> i64 {
+        let args = [text(path), text(mode), NONE, NONE, NONE, NONE, NONE, NONE];
+        let file = crate::modules::io_open(&args);
+        assert_clean(file);
+        file
+    }
+
+    fn temp_path(prefix: &str) -> String {
+        create_temp_file(prefix, ".tmp", None)
+            .expect("temporary file")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn closed_flag(instance: i64) -> i64 {
+        crate::core::methods::getattr(instance, b"closed".as_ptr(), 6)
+    }
+
+    #[test]
+    fn temporary_file_wrapper_deletes_on_close() {
+        exc::init();
+        let path = temp_path("hydro-wrapper-");
+        let file = open_wrapped_file(&path, "w+b");
+        let instance = wrapper_instance(file, &path, true, true);
+        assert_eq!(
+            value::instance_class_name(instance),
+            Some("_TemporaryFileWrapper")
+        );
+        assert_eq!(
+            value::as_str(attribute(instance, "name")),
+            Some(path.as_str())
+        );
+        assert_eq!(attribute(instance, "delete"), TRUE);
+        assert_eq!(attribute(instance, "delete_on_close"), TRUE);
+        // `closed` is a live property over the wrapped file.
+        assert_eq!(closed_flag(instance), FALSE);
+
+        assert_eq!(method(instance, "close", &[]), NONE);
+        assert!(!exc::pending());
+        assert!(!Path::new(&path).exists(), "close deletes the file");
+        assert!(value::as_file(file).expect("file").closed());
+        assert_eq!(closed_flag(instance), TRUE);
+        // Closing again is a no-op.
+        assert_eq!(method(instance, "close", &[]), NONE);
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn temporary_file_wrapper_delete_on_close_false_unlinks_on_exit() {
+        exc::init();
+        let path = temp_path("hydro-wrapper-exit-");
+        let file = open_wrapped_file(&path, "w+b");
+        let instance = wrapper_instance(file, &path, true, false);
+        assert_eq!(method(instance, "close", &[]), NONE);
+        assert!(!exc::pending());
+        assert!(Path::new(&path).is_file(), "close keeps the file");
+        assert_eq!(method(instance, "__exit__", &[NONE, NONE, NONE]), NONE);
+        assert!(!exc::pending());
+        assert!(!Path::new(&path).exists(), "exit deletes the file");
+    }
+
+    #[test]
+    fn temporary_file_wrapper_delete_false_keeps_the_file() {
+        exc::init();
+        let path = temp_path("hydro-wrapper-keep-");
+        let file = open_wrapped_file(&path, "w+b");
+        let instance = wrapper_instance(file, &path, false, true);
+        assert_eq!(attribute(instance, "delete"), FALSE);
+        assert_eq!(method(instance, "__exit__", &[NONE, NONE, NONE]), NONE);
+        assert!(!exc::pending());
+        assert!(Path::new(&path).is_file());
+        fs::remove_file(&path).expect("cleanup test file");
+    }
+
+    #[test]
+    fn temporary_file_wrapper_delegates_attributes_and_methods() {
+        exc::init();
+        let path = temp_path("hydro-wrapper-delegate-");
+        let file = open_wrapped_file(&path, "w");
+        let instance = wrapper_instance(file, &path, false, true);
+
+        // `name` is the wrapper's own attribute; `mode` falls through
+        // `__getattr__` to the wrapped file and is cached on the instance.
+        assert_eq!(
+            value::as_str(attribute(instance, "name")),
+            Some(path.as_str())
+        );
+        let mode = crate::core::methods::getattr(instance, b"mode".as_ptr(), 4);
+        assert!(!exc::pending());
+        assert!(value::as_str(mode).is_some());
+        assert!(value::instance_attr(instance, "mode").is_some());
+
+        // Stream methods are bound on the instance for compiled calls.
+        let written = method(instance, "write", &[text("payload")]);
+        assert_eq!(value::as_integer(written), Some(7));
+        assert!(!exc::pending());
+        assert_eq!(method(instance, "__exit__", &[NONE, NONE, NONE]), NONE);
+        assert!(!exc::pending());
+        fs::remove_file(&path).expect("cleanup test file");
     }
 }

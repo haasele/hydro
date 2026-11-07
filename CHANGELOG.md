@@ -8,6 +8,31 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — `__class__`
+
+- Every value answers `__class__` with exactly `type(value)`: plain instances,
+  builtin-container subclasses (`class T(tuple)`), exceptions, class objects,
+  native instances and builtin type spellings (`int.__class__` is `type`, not
+  `function`). Assigning `obj.__class__` rebinds a heap instance in place when
+  both classes share the same `__slots__`/`__dict__` layout, and reports
+  CPython's `TypeError` otherwise (non-class target, static native class, class
+  object, layout mismatch); `del obj.__class__` raises `can't delete __class__
+  attribute` instead of `AttributeError`.
+
+### Compatibility — BaseException semantics
+
+- Built-in exceptions now follow CPython's `BaseException` contract: the
+  constructor keeps every positional argument as the real `args` tuple
+  (`Exception(*range(3)).args == (0, 1, 2)`), `str()` is the single argument's
+  text or the `repr()` of the tuple, and `repr()` is `ClassName(repr(arg),
+  ...)`. The method surface (`__str__`, `__repr__`, `__setstate__`,
+  `__reduce__`, `__reduce_ex__`, `with_traceback`) is exposed on exception
+  objects, and `raise`/`except` reject non-`BaseException` operands with
+  CPython's `TypeError` (`exceptions must derive from BaseException`,
+  `catching classes that do not inherit from BaseException is not allowed`),
+  including in dynamic `except <expression>:` arms through
+  `hydro_exc_matches_value`.
+
 ### Compatibility — 2026-10-31 CPython compatibility program
 
 - Stdlib import matrix reached **288/297** with **288/288** modules CPython
@@ -15,7 +40,10 @@ initial state of the first runnable core.
   platform modules. Added Hydro-native `turtle`, `symtable`/`_symtable` and
   `tracemalloc`/`_tracemalloc`, plus native `http.server`, and loaded pinned
   C extensions through derived `lib-dynload`/`HYDRO_EXTENSION_PATH` roots.
-- Official `Lib/test` differential baseline rose from 6/398 to **9/398**
+- Official `Lib/test` differential baseline rose from 9/398 to **22/398**
+  harness exit-code passes after `unittest.mock`/`result`, test-registration,
+  contextlib/os.pipe/random/pickle-buffer, HTTP exception, recursion and
+  hashlib keyword work.
   (`test_colorsys`, `test_errno`, `test_int_literal`, `test_longexp`,
   `test_openpty`, `test_unary`); 330 `hydro_fail`, 62 `expected_fail`.
 - Package initializers split at `from . import sub` when the submodule reads a

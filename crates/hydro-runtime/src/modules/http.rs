@@ -1,3 +1,4 @@
+#![allow(dead_code)] // HTTPConnection helpers are staged for the connection class.
 //! `http`: a native HTTP/1.1 server with a static-response fast path.
 //!
 //! `http.serve(port, routes, handler, max_connections)` binds one or more
@@ -101,6 +102,16 @@
 //! rejected by closing the connection, as the contract requires no chunked
 //! request bodies. Connection errors, malformed requests and handler failures
 //! close only that connection; the listening socket keeps running.
+//!
+//! ## `http.client` exceptions
+//!
+//! [`http_exception_class`] and [`remote_disconnected_class`] expose the two
+//! exception types CPython defines in `http/client.py` as cached native
+//! classes: `HTTPException(Exception)` and
+//! `RemoteDisconnected(ConnectionResetError, HTTPException)`. They are real
+//! exception payloads, so `str`, `.args`, `isinstance` and `except` all behave
+//! like the Python-level declarations; the module surface (`http.client`) is
+//! wired by the module registry.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -110,7 +121,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::exc::{self, ATTRIBUTE_ERROR, OS_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::exc::{
+    self, ATTRIBUTE_ERROR, CONNECTION_RESET_ERROR, EXCEPTION, OS_ERROR, TYPE_ERROR, VALUE_ERROR,
+};
 use crate::heap;
 use crate::value::{self, NONE};
 
@@ -362,6 +375,107 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'http' has no attribute '{function}'"),
+        ),
+    }
+}
+
+/// `http.client.HTTPException`: the base class of every `http.client` error.
+///
+/// CPython declares it as `class HTTPException(Exception)`, so an instance
+/// carries a real exception payload (`.args`, `str(e)`), `isinstance(e,
+/// Exception)` holds, and `except http.client.HTTPException:` catches it.
+/// Cached so every read and subclass shares one class identity.
+pub(crate) fn http_exception_class() -> i64 {
+    const KEY: &str = "http.client.HTTPException";
+    if let Some(cached) = crate::core::globals::registry_get(KEY) {
+        return cached;
+    }
+    let base = exc::exception_class(EXCEPTION);
+    // `base` and the class only live on the Rust stack while the class is
+    // built, so root them until the registry entry owns the result.
+    let roots = heap::root_values(&[base]);
+    let class = value::class_new_full("HTTPException".to_string(), base, Vec::new(), Vec::new());
+    if class == NONE {
+        heap::release_roots(roots);
+        return class;
+    }
+    heap::push_scoped_root(class);
+    crate::core::globals::registry_set(KEY, class);
+    heap::release_roots(roots);
+    class
+}
+
+/// `http.client.RemoteDisconnected(ConnectionResetError, HTTPException)`.
+///
+/// The multiple-bases form is CPython's declaration, so
+/// `isinstance(e, ConnectionResetError)`, `isinstance(e, OSError)`,
+/// `isinstance(e, HTTPException)` and `isinstance(e, Exception)` all hold. The
+/// exception payload takes the first native ancestor's tag
+/// (`ConnectionResetError`), which keeps `str(e)` and `except OSError:` exact.
+pub(crate) fn remote_disconnected_class() -> i64 {
+    const KEY: &str = "http.client.RemoteDisconnected";
+    if let Some(cached) = crate::core::globals::registry_get(KEY) {
+        return cached;
+    }
+    let connection_reset = exc::exception_class(CONNECTION_RESET_ERROR);
+    let http_exception = http_exception_class();
+    let roots = heap::root_values(&[connection_reset, http_exception]);
+    let class = value::class_new_multi(
+        "RemoteDisconnected".to_string(),
+        vec![connection_reset, http_exception],
+        NONE,
+        Vec::new(),
+        Vec::new(),
+    );
+    if class == NONE {
+        heap::release_roots(roots);
+        return class;
+    }
+    heap::push_scoped_root(class);
+    crate::core::globals::registry_set(KEY, class);
+    heap::release_roots(roots);
+    class
+}
+
+/// Materialises an `http.client` constant.
+///
+/// The module-registry wiring for `http.client` dispatches attribute reads
+/// here, mirroring [`crate::modules::warnings::constant`]. `HTTPConnection`,
+/// `HTTPSConnection`, `HTTPResponse`, `HTTPMessage` and `parse_headers` are
+/// not implemented yet; every name below is a real value.
+pub(crate) fn constant(name: &str) -> i64 {
+    if let Some(code) = status_constant(name) {
+        return client_integer(code);
+    }
+    match name {
+        "HTTPException" | "error" => http_exception_class(),
+        "RemoteDisconnected" => remote_disconnected_class(),
+        "InvalidURL" => invalid_url_class(),
+        "NotConnected" => not_connected_class(),
+        "UnknownProtocol" => unknown_protocol_class(),
+        "UnknownTransferEncoding" => unknown_transfer_encoding_class(),
+        "UnimplementedFileMode" => unimplemented_file_mode_class(),
+        "ImproperConnectionState" => improper_connection_state_class(),
+        "CannotSendRequest" => cannot_send_request_class(),
+        "CannotSendHeader" => cannot_send_header_class(),
+        "ResponseNotReady" => response_not_ready_class(),
+        "BadStatusLine" => bad_status_line_class(),
+        "LineTooLong" => line_too_long_class(),
+        "IncompleteRead" => incomplete_read_class(),
+        "responses" => responses_dict(),
+        "__all__" => client_all(),
+        "HTTP_PORT" => client_integer(80),
+        "HTTPS_PORT" => client_integer(443),
+        "_MAXHEADERS" => client_integer(CLIENT_MAXHEADERS as i64),
+        "_MAXLINE" => client_integer(CLIENT_MAXLINE),
+        "_MAXINTERIMRESPONSES" => client_integer(CLIENT_MAXINTERIM as i64),
+        "_UNKNOWN" => client_text("UNKNOWN"),
+        "_CS_IDLE" => client_text(CS_IDLE),
+        "_CS_REQ_STARTED" => client_text(CS_REQ_STARTED),
+        "_CS_REQ_SENT" => client_text(CS_REQ_SENT),
+        _ => exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("module 'http.client' has no attribute '{name}'"),
         ),
     }
 }
@@ -1361,6 +1475,625 @@ fn is_callable(candidate: i64) -> bool {
         || value::as_ext_object(candidate).is_some()
         || value::as_instance(candidate)
             .is_some_and(|instance| value::class_lookup(instance.class, "__call__").is_some())
+}
+
+// -------------------------------------------------------------------------
+// `http.client`
+// -------------------------------------------------------------------------
+//
+// The client surface mirrors `Lib/http/client.py`. Hydro's native `socket`
+// exposes `recv`/`sendall` but no `makefile`, so `HTTPResponse` reads through
+// a real file object when the socket provides one (the test suite's fakes and
+// `io.BytesIO`) and buffers `recv` bytes itself otherwise. Every class is a
+// cached native class value, so `isinstance`, subclassing and identity all
+// behave like the Python declarations.
+
+/// `_MAXLINE`: the longest status/header/chunk line accepted.
+const CLIENT_MAXLINE: i64 = 65536;
+/// `_MAXHEADERS`: response headers (and trailers) accepted.
+const CLIENT_MAXHEADERS: usize = 100;
+/// `_MAXINTERIMRESPONSES`: 1xx responses skipped before the final one.
+const CLIENT_MAXINTERIM: usize = 100;
+
+/// Connection states, spelled like `_CS_IDLE` and friends.
+const CS_IDLE: &str = "Idle";
+const CS_REQ_STARTED: &str = "Request-started";
+const CS_REQ_SENT: &str = "Request-sent";
+
+/// `(CONSTANT, code, phrase)` for every `HTTPStatus` member.
+const STATUS_CODES: &[(&str, i64, &str)] = &[
+    ("CONTINUE", 100, "Continue"),
+    ("SWITCHING_PROTOCOLS", 101, "Switching Protocols"),
+    ("PROCESSING", 102, "Processing"),
+    ("EARLY_HINTS", 103, "Early Hints"),
+    ("OK", 200, "OK"),
+    ("CREATED", 201, "Created"),
+    ("ACCEPTED", 202, "Accepted"),
+    (
+        "NON_AUTHORITATIVE_INFORMATION",
+        203,
+        "Non Authoritative Information",
+    ),
+    ("NO_CONTENT", 204, "No Content"),
+    ("RESET_CONTENT", 205, "Reset Content"),
+    ("PARTIAL_CONTENT", 206, "Partial Content"),
+    ("MULTI_STATUS", 207, "Multi-Status"),
+    ("ALREADY_REPORTED", 208, "Already Reported"),
+    ("IM_USED", 226, "IM Used"),
+    ("MULTIPLE_CHOICES", 300, "Multiple Choices"),
+    ("MOVED_PERMANENTLY", 301, "Moved Permanently"),
+    ("FOUND", 302, "Found"),
+    ("SEE_OTHER", 303, "See Other"),
+    ("NOT_MODIFIED", 304, "Not Modified"),
+    ("USE_PROXY", 305, "Use Proxy"),
+    ("TEMPORARY_REDIRECT", 307, "Temporary Redirect"),
+    ("PERMANENT_REDIRECT", 308, "Permanent Redirect"),
+    ("BAD_REQUEST", 400, "Bad Request"),
+    ("UNAUTHORIZED", 401, "Unauthorized"),
+    ("PAYMENT_REQUIRED", 402, "Payment Required"),
+    ("FORBIDDEN", 403, "Forbidden"),
+    ("NOT_FOUND", 404, "Not Found"),
+    ("METHOD_NOT_ALLOWED", 405, "Method Not Allowed"),
+    ("NOT_ACCEPTABLE", 406, "Not Acceptable"),
+    (
+        "PROXY_AUTHENTICATION_REQUIRED",
+        407,
+        "Proxy Authentication Required",
+    ),
+    ("REQUEST_TIMEOUT", 408, "Request Timeout"),
+    ("CONFLICT", 409, "Conflict"),
+    ("GONE", 410, "Gone"),
+    ("LENGTH_REQUIRED", 411, "Length Required"),
+    ("PRECONDITION_FAILED", 412, "Precondition Failed"),
+    ("REQUEST_ENTITY_TOO_LARGE", 413, "Request Entity Too Large"),
+    ("REQUEST_URI_TOO_LONG", 414, "Request-URI Too Long"),
+    ("UNSUPPORTED_MEDIA_TYPE", 415, "Unsupported Media Type"),
+    (
+        "REQUESTED_RANGE_NOT_SATISFIABLE",
+        416,
+        "Requested Range Not Satisfiable",
+    ),
+    ("EXPECTATION_FAILED", 417, "Expectation Failed"),
+    ("IM_A_TEAPOT", 418, "I'm a Teapot"),
+    ("MISDIRECTED_REQUEST", 421, "Misdirected Request"),
+    ("UNPROCESSABLE_ENTITY", 422, "Unprocessable Entity"),
+    ("LOCKED", 423, "Locked"),
+    ("FAILED_DEPENDENCY", 424, "Failed Dependency"),
+    ("TOO_EARLY", 425, "Too Early"),
+    ("UPGRADE_REQUIRED", 426, "Upgrade Required"),
+    ("PRECONDITION_REQUIRED", 428, "Precondition Required"),
+    ("TOO_MANY_REQUESTS", 429, "Too Many Requests"),
+    (
+        "REQUEST_HEADER_FIELDS_TOO_LARGE",
+        431,
+        "Request Header Fields Too Large",
+    ),
+    (
+        "UNAVAILABLE_FOR_LEGAL_REASONS",
+        451,
+        "Unavailable For Legal Reasons",
+    ),
+    ("INTERNAL_SERVER_ERROR", 500, "Internal Server Error"),
+    ("NOT_IMPLEMENTED", 501, "Not Implemented"),
+    ("BAD_GATEWAY", 502, "Bad Gateway"),
+    ("SERVICE_UNAVAILABLE", 503, "Service Unavailable"),
+    ("GATEWAY_TIMEOUT", 504, "Gateway Timeout"),
+    (
+        "HTTP_VERSION_NOT_SUPPORTED",
+        505,
+        "HTTP Version Not Supported",
+    ),
+    ("VARIANT_ALSO_NEGOTIATES", 506, "Variant Also Negotiates"),
+    ("INSUFFICIENT_STORAGE", 507, "Insufficient Storage"),
+    ("LOOP_DETECTED", 508, "Loop Detected"),
+    ("NOT_EXTENDED", 510, "Not Extended"),
+    (
+        "NETWORK_AUTHENTICATION_REQUIRED",
+        511,
+        "Network Authentication Required",
+    ),
+];
+
+fn client_text(content: &str) -> i64 {
+    value::str_alloc(content.to_string())
+}
+
+fn client_integer(number: i64) -> i64 {
+    value::encode_int(number).unwrap_or(NONE)
+}
+
+fn client_bool(flag: bool) -> i64 {
+    value::bool_value(flag)
+}
+
+fn client_type_error(message: &str) -> i64 {
+    exc::raise_with_message(TYPE_ERROR, message)
+}
+
+/// Instance attribute, then the class attribute the instance inherits.
+fn client_attribute(instance: i64, name: &str) -> i64 {
+    if let Some(item) = value::instance_attr(instance, name) {
+        return item;
+    }
+    let Some(class) = value::instance_class_value(instance) else {
+        return NONE;
+    };
+    match value::class_lookup(class, name) {
+        Some(value::ClassEntry::Attr(item)) => item,
+        _ => NONE,
+    }
+}
+
+fn client_set(instance: i64, name: &str, item: i64) {
+    value::instance_setattr(instance, name.to_string(), item);
+}
+
+/// Calls `obj.name(args...)` with the receiver and every argument rooted.
+fn client_invoke(obj: i64, name: &str, args: &[i64]) -> i64 {
+    let mut values: Vec<i64> = Vec::with_capacity(args.len() + 1);
+    values.push(obj);
+    values.extend_from_slice(args);
+    let roots = heap::root_values(&values);
+    let result = crate::methods::call(obj, name.as_ptr(), name.len(), args.len(), args.as_ptr());
+    heap::release_roots(roots);
+    result
+}
+
+/// Whether `obj` exposes a callable attribute `name`.
+fn client_has(obj: i64, name: &str) -> bool {
+    if value::instance_attr(obj, name).is_some() {
+        return true;
+    }
+    let Some(class) = value::instance_class_value(obj) else {
+        return false;
+    };
+    value::class_lookup(class, name).is_some()
+}
+
+fn client_param(name: &str, kind: hydro_ir::ParamKind, default: Option<i64>) -> value::ParamMeta {
+    value::ParamMeta {
+        name: name.to_string(),
+        kind,
+        default,
+    }
+}
+
+fn client_positional(name: &str) -> value::ParamMeta {
+    client_param(name, hydro_ir::ParamKind::Positional, None)
+}
+
+fn client_optional(name: &str, default: i64) -> value::ParamMeta {
+    client_param(name, hydro_ir::ParamKind::Positional, Some(default))
+}
+
+/// Builds a native method value whose trampoline is `entry`.
+fn client_method(
+    name: &'static str,
+    entry: extern "C" fn(*const i64) -> i64,
+    params: Vec<value::ParamMeta>,
+) -> i64 {
+    let arity = if params.iter().any(|item| {
+        matches!(
+            item.kind,
+            hydro_ir::ParamKind::VarArg | hydro_ir::ParamKind::KwArg
+        )
+    }) {
+        usize::MAX
+    } else {
+        params.len()
+    };
+    let function = value::native_function_new("http", name, arity);
+    value::function_set_signature(function, params);
+    value::function_set_full_entry(function, entry as *const () as usize);
+    function
+}
+
+type ClientDefinition = (
+    &'static str,
+    Vec<value::ParamMeta>,
+    extern "C" fn(*const i64) -> i64,
+);
+
+/// Builds (or returns) a cached class with `__module__` set to `http.client`.
+fn client_class(
+    key: &str,
+    name: &str,
+    base: i64,
+    definitions: Vec<ClientDefinition>,
+    attrs: Vec<(&str, i64)>,
+) -> i64 {
+    if let Some(cached) = crate::core::globals::registry_get(key) {
+        return cached;
+    }
+    let mut methods: Vec<(String, i64, hydro_ir::MethodKind)> =
+        Vec::with_capacity(definitions.len());
+    let mut functions: Vec<i64> = Vec::with_capacity(definitions.len());
+    for (method_name, params, entry) in definitions {
+        let function = client_method(method_name, entry, params);
+        functions.push(function);
+        methods.push((
+            method_name.to_string(),
+            function,
+            hydro_ir::MethodKind::Normal,
+        ));
+    }
+    let module = client_text("http.client");
+    let mut class_attrs: Vec<(String, i64)> = attrs
+        .iter()
+        .map(|(attr_name, item)| (attr_name.to_string(), *item))
+        .collect();
+    class_attrs.push(("__module__".to_string(), module));
+    let mut roots: Vec<i64> = functions.clone();
+    roots.push(module);
+    roots.extend(attrs.iter().map(|(_, item)| *item));
+    let root = heap::root_values(&roots);
+    let class = value::class_new_full(name.to_string(), base, methods, class_attrs);
+    if class != NONE {
+        crate::core::globals::registry_set(key, class);
+    }
+    heap::release_roots(root);
+    class
+}
+
+fn client_exception_subclass(key: &str, name: &str, base: i64) -> i64 {
+    if let Some(cached) = crate::core::globals::registry_get(key) {
+        return cached;
+    }
+    let module = client_text("http.client");
+    let root = heap::root_values(&[base, module]);
+    let class = value::class_new_full(
+        name.to_string(),
+        base,
+        Vec::new(),
+        vec![("__module__".to_string(), module)],
+    );
+    if class != NONE {
+        crate::core::globals::registry_set(key, class);
+    }
+    heap::release_roots(root);
+    class
+}
+
+fn invalid_url_class() -> i64 {
+    client_exception_subclass(
+        "http.client.InvalidURL",
+        "InvalidURL",
+        http_exception_class(),
+    )
+}
+
+fn not_connected_class() -> i64 {
+    client_exception_subclass(
+        "http.client.NotConnected",
+        "NotConnected",
+        http_exception_class(),
+    )
+}
+
+fn unknown_protocol_class() -> i64 {
+    client_exception_subclass(
+        "http.client.UnknownProtocol",
+        "UnknownProtocol",
+        http_exception_class(),
+    )
+}
+
+fn unknown_transfer_encoding_class() -> i64 {
+    client_exception_subclass(
+        "http.client.UnknownTransferEncoding",
+        "UnknownTransferEncoding",
+        http_exception_class(),
+    )
+}
+
+fn unimplemented_file_mode_class() -> i64 {
+    client_exception_subclass(
+        "http.client.UnimplementedFileMode",
+        "UnimplementedFileMode",
+        http_exception_class(),
+    )
+}
+
+fn improper_connection_state_class() -> i64 {
+    client_exception_subclass(
+        "http.client.ImproperConnectionState",
+        "ImproperConnectionState",
+        http_exception_class(),
+    )
+}
+
+fn cannot_send_request_class() -> i64 {
+    client_exception_subclass(
+        "http.client.CannotSendRequest",
+        "CannotSendRequest",
+        improper_connection_state_class(),
+    )
+}
+
+fn cannot_send_header_class() -> i64 {
+    client_exception_subclass(
+        "http.client.CannotSendHeader",
+        "CannotSendHeader",
+        improper_connection_state_class(),
+    )
+}
+
+fn response_not_ready_class() -> i64 {
+    client_exception_subclass(
+        "http.client.ResponseNotReady",
+        "ResponseNotReady",
+        improper_connection_state_class(),
+    )
+}
+
+fn bad_status_line_class() -> i64 {
+    client_exception_subclass(
+        "http.client.BadStatusLine",
+        "BadStatusLine",
+        http_exception_class(),
+    )
+}
+
+fn line_too_long_class() -> i64 {
+    client_exception_subclass(
+        "http.client.LineTooLong",
+        "LineTooLong",
+        http_exception_class(),
+    )
+}
+
+fn incomplete_read_class() -> i64 {
+    client_exception_subclass(
+        "http.client.IncompleteRead",
+        "IncompleteRead",
+        http_exception_class(),
+    )
+}
+
+/// Builds an exception instance of `class` carrying the pre-rendered
+/// `repr`/`str` text CPython would produce.
+///
+/// `values` keeps the original tagged arguments for `.args`.
+fn client_exception_instance(class: i64, tag: u32, display: &str, values: Vec<i64>) -> i64 {
+    // The tagged arguments and the class only live on the Rust stack while
+    // the instance is allocated, so they are registered as roots first.
+    let mut roots: Vec<i64> = values.clone();
+    roots.push(class);
+    let root = heap::root_values(&roots);
+    let data = crate::exc::ExcData {
+        tag,
+        name: crate::exc::tag_name(tag),
+        msg: display.to_string(),
+        file: String::new(),
+        line: 0,
+        frame: String::new(),
+        cause: None,
+        context: None,
+        suppress_context: false,
+        exit_code: None,
+        args: vec![display.to_string()],
+        arg_values: values,
+        arg_reprs: vec![display.to_string()],
+        keywords: Vec::new(),
+        object: None,
+    };
+    let instance = value::exc_instance_new(class, data);
+    heap::release_roots(root);
+    instance
+}
+
+fn client_raise(class: i64, display: &str) -> i64 {
+    let instance = client_exception_instance(class, EXCEPTION, display, Vec::new());
+    if exc::pending() {
+        return NONE;
+    }
+    exc::raise_value(instance)
+}
+
+/// Raises `class(message)` with `repr`/`str` of the message quoted once.
+fn client_raise_message(class: i64, message: &str) -> i64 {
+    let argument = client_text(message);
+    let root = heap::root_values(std::slice::from_ref(&argument));
+    let display = value::repr(argument);
+    let instance = client_exception_instance(class, EXCEPTION, &display, vec![argument]);
+    heap::release_roots(root);
+    if exc::pending() {
+        return NONE;
+    }
+    exc::raise_value(instance)
+}
+
+fn raise_bad_status_line(line: &str) -> i64 {
+    let argument = client_text(line);
+    let root = heap::root_values(std::slice::from_ref(&argument));
+    let line_text = if line.is_empty() {
+        client_text(&value::repr(argument))
+    } else {
+        argument
+    };
+    let line_root = heap::root_values(std::slice::from_ref(&line_text));
+    let display = value::repr(line_text);
+    let instance = client_exception_instance(
+        bad_status_line_class(),
+        EXCEPTION,
+        &display,
+        vec![line_text],
+    );
+    heap::release_roots(line_root);
+    heap::release_roots(root);
+    if exc::pending() {
+        return NONE;
+    }
+    exc::raise_value(instance)
+}
+
+fn raise_line_too_long(line_type: &str) -> i64 {
+    client_raise_message(
+        line_too_long_class(),
+        &format!("got more than {CLIENT_MAXLINE} bytes when reading {line_type}"),
+    )
+}
+
+fn raise_incomplete_read(partial: &[u8], expected: Option<usize>) -> i64 {
+    let display = match expected {
+        Some(missing) => format!(
+            "IncompleteRead({} bytes read, {} more expected)",
+            partial.len(),
+            missing
+        ),
+        None => format!("IncompleteRead({} bytes read)", partial.len()),
+    };
+    let partial_value = value::bytes_new(partial.to_vec());
+    let instance = client_exception_instance(
+        incomplete_read_class(),
+        EXCEPTION,
+        &display,
+        vec![partial_value],
+    );
+    if exc::pending() {
+        return NONE;
+    }
+    let expected_value = match expected {
+        Some(missing) => client_integer(missing as i64),
+        None => NONE,
+    };
+    client_set(instance, "partial", partial_value);
+    client_set(instance, "expected", expected_value);
+    exc::raise_value(instance)
+}
+
+fn raise_response_not_ready(state: i64) -> i64 {
+    let class = response_not_ready_class();
+    let display = value::repr(state);
+    let instance = client_exception_instance(class, EXCEPTION, &display, vec![state]);
+    if exc::pending() {
+        return NONE;
+    }
+    exc::raise_value(instance)
+}
+
+fn raise_cannot_send_request(state: i64) -> i64 {
+    let class = cannot_send_request_class();
+    let display = value::repr(state);
+    let instance = client_exception_instance(class, EXCEPTION, &display, vec![state]);
+    if exc::pending() {
+        return NONE;
+    }
+    exc::raise_value(instance)
+}
+
+fn raise_cannot_send_header() -> i64 {
+    client_raise(cannot_send_header_class(), "CannotSendHeader()")
+}
+
+fn raise_not_connected() -> i64 {
+    client_raise(not_connected_class(), "NotConnected()")
+}
+
+fn raise_remote_disconnected(message: &str) -> i64 {
+    let class = remote_disconnected_class();
+    let argument = client_text(message);
+    let display = value::repr(argument);
+    let instance =
+        client_exception_instance(class, CONNECTION_RESET_ERROR, &display, vec![argument]);
+    if exc::pending() {
+        return NONE;
+    }
+    exc::raise_value(instance)
+}
+
+fn status_constant(name: &str) -> Option<i64> {
+    STATUS_CODES
+        .iter()
+        .find(|(constant, _, _)| *constant == name)
+        .map(|(_, code, _)| *code)
+}
+
+fn responses_dict() -> i64 {
+    const KEY: &str = "http.client.responses";
+    if let Some(cached) = crate::core::globals::registry_get(KEY) {
+        return cached;
+    }
+    let mut roots: Vec<i64> = Vec::with_capacity(STATUS_CODES.len());
+    let mut pairs: Vec<(i64, i64)> = Vec::with_capacity(STATUS_CODES.len());
+    for (_, code, phrase) in STATUS_CODES {
+        let phrase_value = client_text(phrase);
+        roots.push(phrase_value);
+        pairs.push((client_integer(*code), phrase_value));
+    }
+    let root = heap::root_values(&roots);
+    let mapping = value::dict_new(pairs);
+    crate::core::globals::registry_set(KEY, mapping);
+    heap::release_roots(root);
+    mapping
+}
+
+fn client_all() -> i64 {
+    const NAMES: &[&str] = &[
+        "HTTPResponse",
+        "HTTPConnection",
+        "HTTPException",
+        "NotConnected",
+        "UnknownProtocol",
+        "UnknownTransferEncoding",
+        "UnimplementedFileMode",
+        "IncompleteRead",
+        "InvalidURL",
+        "ImproperConnectionState",
+        "CannotSendRequest",
+        "CannotSendHeader",
+        "ResponseNotReady",
+        "BadStatusLine",
+        "LineTooLong",
+        "RemoteDisconnected",
+        "error",
+        "responses",
+        "HTTPSConnection",
+    ];
+    let mut values = Vec::with_capacity(NAMES.len());
+    for name in NAMES {
+        values.push(client_text(name));
+    }
+    let root = heap::root_values(&values);
+    let list = value::list_new(values);
+    heap::release_roots(root);
+    list
+}
+
+/// latin-1 decoding, the encoding of HTTP status lines and headers.
+fn latin1_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| *byte as char).collect()
+}
+
+/// latin-1 encoding; a code point above 0xFF raises `UnicodeEncodeError`.
+fn latin1_bytes(content: &str, name: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(content.len());
+    for character in content.chars() {
+        let code = character as u32;
+        if code > 0xFF {
+            let message = format!(
+                "'latin-1' codec can't encode character in position: {name} is not valid Latin-1"
+            );
+            exc::raise_with_message(exc::UNICODE_ENCODE_ERROR, &message);
+            return None;
+        }
+        out.push(code as u8);
+    }
+    Some(out)
+}
+
+fn split_whitespace_max(content: &str, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = content.trim_start();
+    while !rest.is_empty() && out.len() + 1 < limit {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        out.push(rest[..end].to_string());
+        rest = rest[end..].trim_start();
+    }
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+    out
 }
 
 #[cfg(test)]

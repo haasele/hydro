@@ -1545,6 +1545,75 @@ fn truthy(arg: i64) -> bool {
     value::truthy(arg)
 }
 
+/// The keyword-only names every digest constructor declares after `data`.
+const CONSTRUCTOR_TAIL_KEYWORDS: [&str; 2] = ["usedforsecurity", "string"];
+
+/// The `data`/`usedforsecurity`/`string` tail shared by every digest
+/// constructor: `(data=b'', *, usedforsecurity=True, string=None)`.
+///
+/// `usedforsecurity` only tells OpenSSL whether a digest blocked by the
+/// security policy may still be constructed; every algorithm here is
+/// implemented natively, so the flag is accepted (and its truthiness forced,
+/// like `bool()`) but never selects an algorithm. `string` is the deprecated
+/// alias CPython 3.14 still accepts for `data`.
+///
+/// The checks run in the generated clinic wrapper's order so the error a caller
+/// sees matches CPython: positional arity, then keyword names and the
+/// positional/`data` duplicate, then the truthiness of `usedforsecurity`, then
+/// the `data`/`string` conflict.
+///
+/// `max_positional` is the constructor's positional slot count (`data` is at
+/// `data_index`), and `extra_keywords` are the parameter names the caller binds
+/// itself, so unknown-name detection covers the whole signature.
+fn take_constructor_data(
+    args: &[i64],
+    keywords: &mut Vec<(String, i64)>,
+    data_index: usize,
+    max_positional: usize,
+    extra_keywords: &[&str],
+    function: &str,
+) -> Result<Option<i64>, i64> {
+    if args.len() > max_positional {
+        let plural = if max_positional == 1 { "" } else { "s" };
+        return Err(type_error(&format!(
+            "{function}() takes at most {max_positional} positional argument{plural} ({} given)",
+            args.len()
+        )));
+    }
+    let positional = args.get(data_index).copied().filter(|value| *value != NONE);
+    for (name, _) in keywords.iter() {
+        if name == "data" {
+            if positional.is_some() {
+                return Err(type_error(&format!(
+                    "argument for {function}() given by name ('data') and position ({})",
+                    data_index + 1
+                )));
+            }
+        } else if !CONSTRUCTOR_TAIL_KEYWORDS.contains(&name.as_str())
+            && !extra_keywords.contains(&name.as_str())
+        {
+            return Err(type_error(&format!(
+                "{function}() got an unexpected keyword argument '{name}'"
+            )));
+        }
+    }
+    if let Some(flag) = take_kw(keywords, "usedforsecurity") {
+        let _ = truthy(flag);
+        if exc::pending() {
+            return Err(NONE);
+        }
+    }
+    let data = take_kw(keywords, "data");
+    let alias = take_kw(keywords, "string");
+    if alias.is_some() && (data.is_some() || positional.is_some()) {
+        return Err(type_error(
+            "'data' and 'string' are mutually exclusive and support for 'string' \
+             keyword parameter is slated for removal in a future version.",
+        ));
+    }
+    Ok(data.or(positional).or(alias))
+}
+
 // -------------------------------------------------------------------------
 // Class and instance construction
 // -------------------------------------------------------------------------
@@ -1716,22 +1785,14 @@ fn construct_plain(
     function: &str,
     data_index: usize,
 ) -> i64 {
-    // The SHA-3/SHAKE constructors take at most the single `data` positional
-    // argument; CPython rejects a second one instead of ignoring it.
-    if algo.is_keccak() && args.len() > data_index + 1 {
-        return type_error(&format!(
-            "{function}() takes at most 1 positional argument ({} given)",
-            args.len() - data_index
-        ));
-    }
-    let data = match take(args, keywords, data_index, "data") {
-        Ok(data) => data,
-        Err(err) => return err,
-    };
-    let _ = take_kw(keywords, "usedforsecurity");
-    if let Some(err) = extra_keyword(keywords, function) {
-        return err;
-    }
+    // Every one of these constructors declares the single `data` positional
+    // slot; CPython rejects a second positional argument instead of ignoring
+    // it.
+    let data =
+        match take_constructor_data(args, keywords, data_index, data_index + 1, &[], function) {
+            Ok(data) => data,
+            Err(err) => return err,
+        };
     let data = match data {
         Some(value_arg) => match hash_bytes(value_arg) {
             Ok(data) => data,
@@ -1744,8 +1805,29 @@ fn construct_plain(
     make_hash(state)
 }
 
-/// Reads the keyword-only BLAKE2 parameters in CPython's declaration order and
-/// validates them before constructing the state.
+/// BLAKE2's constructor parameters after `data`, in CPython's declaration
+/// order. They are keyword-only in CPython's signature and keep their
+/// positional slots here.
+const BLAKE_PARAMETERS: [&str; 11] = [
+    "digest_size",
+    "key",
+    "salt",
+    "person",
+    "fanout",
+    "depth",
+    "leaf_size",
+    "node_offset",
+    "node_depth",
+    "inner_size",
+    "last_node",
+];
+
+/// `data` plus the eleven BLAKE2 parameters: the constructor's positional
+/// block, counted from the start of its argument list.
+const BLAKE_CONSTRUCTOR_SLOTS: usize = 12;
+
+/// Binds the BLAKE2 parameters in CPython's declaration order and validates
+/// them before constructing the state.
 #[allow(clippy::too_many_arguments)]
 fn construct_blake(
     algo: Algo,
@@ -1754,7 +1836,14 @@ fn construct_blake(
     function: &str,
     offset: usize,
 ) -> i64 {
-    let data = match take(args, keywords, offset, "data") {
+    let data = match take_constructor_data(
+        args,
+        keywords,
+        offset,
+        offset + BLAKE_CONSTRUCTOR_SLOTS,
+        &BLAKE_PARAMETERS,
+        function,
+    ) {
         Ok(data) => data,
         Err(err) => return err,
     };
@@ -1802,10 +1891,6 @@ fn construct_blake(
         Ok(value_arg) => value_arg.map(truthy).unwrap_or(false),
         Err(err) => return err,
     };
-    let _ = take_kw(keywords, "usedforsecurity");
-    if let Some(err) = extra_keyword(keywords, function) {
-        return err;
-    }
 
     let blake_b = algo == Algo::Blake2b;
     let max_digest = algo.digest_size();
@@ -1914,6 +1999,14 @@ fn construct(algo: Algo, args: &[i64], keywords: &mut Vec<(String, i64)>) -> i64
 }
 
 fn new_call(args: &[i64], keywords: &mut Vec<(String, i64)>) -> i64 {
+    // `name` is the positional slot the runtime binder cannot fill (the
+    // compiler stores it as the first argument), so its duplicate is detected
+    // here with the clinic wrapper's wording.
+    if args.first().copied().is_some_and(|value| value != NONE)
+        && keywords.iter().any(|(key, _)| key == "name")
+    {
+        return type_error("argument for new() given by name ('name') and position (1)");
+    }
     let name = match take(args, keywords, 0, "name") {
         Ok(Some(name)) => name,
         Ok(None) => return type_error("new() missing required argument 'name' (pos 1)"),
@@ -3506,6 +3599,155 @@ c6d5c277c110ef86c959ed63e6ecaaaceaaff38019a43264ae06acf73b9550b1"
 
         let name = text("blake2s");
         let bad = call_kw("new", &[name], &[("bogus".to_string(), value::TRUE)]);
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+    }
+
+    /// `usedforsecurity` is keyword-only metadata on every digest constructor:
+    /// any object is accepted (CPython's `bool` converter takes truthiness of
+    /// anything) and the selected algorithm never changes.
+    #[test]
+    fn usedforsecurity_keyword_is_ignored() {
+        exc::init();
+        let data = bytes(b"abc");
+        let md5_abc = "900150983cd24fb0d6963f7d28e17f72";
+        let sha256_abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        for flag in [value::TRUE, value::FALSE, bytes(b"yes")] {
+            let hash = call_kw(
+                "new",
+                &[text("sha256"), data],
+                &[("usedforsecurity".to_string(), flag)],
+            );
+            assert!(!exc::pending());
+            assert_eq!(
+                value::as_str(call("hashlib.hexdigest", &[hash])).unwrap(),
+                sha256_abc
+            );
+
+            for function in ["md5", "openssl_md5", "blake2b"] {
+                let module = if function == "openssl_md5" {
+                    "_hashlib"
+                } else {
+                    "hashlib"
+                };
+                let hash = call_named_kw(
+                    module,
+                    function,
+                    &[data],
+                    &[("usedforsecurity".to_string(), flag)],
+                );
+                assert!(!exc::pending(), "{function}");
+                let digest = value::as_str(call("hashlib.hexdigest", &[hash])).unwrap();
+                match function {
+                    "md5" | "openssl_md5" => assert_eq!(digest, md5_abc),
+                    _ => assert_eq!(
+                        digest,
+                        "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1\
+7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// `string` is CPython 3.14's deprecated alias for `data`; giving both is
+    /// an error, and the alias never reaches the data converter twice.
+    #[test]
+    fn string_keyword_is_a_data_alias() {
+        exc::init();
+        let sha256_abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let hash = call_kw("sha256", &[], &[("string".to_string(), bytes(b"abc"))]);
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_str(call("hashlib.hexdigest", &[hash])).unwrap(),
+            sha256_abc
+        );
+
+        let hash = call_kw(
+            "new",
+            &[text("sha256")],
+            &[("string".to_string(), bytes(b"abc"))],
+        );
+        assert!(!exc::pending());
+        assert_eq!(
+            value::as_str(call("hashlib.hexdigest", &[hash])).unwrap(),
+            sha256_abc
+        );
+
+        let bad = call_kw(
+            "new",
+            &[text("sha256")],
+            &[
+                ("data".to_string(), bytes(b"abc")),
+                ("string".to_string(), bytes(b"def")),
+            ],
+        );
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+
+        let bad = call_kw(
+            "sha256",
+            &[bytes(b"abc")],
+            &[("string".to_string(), bytes(b"def"))],
+        );
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+    }
+
+    /// The constructor tail is bound at runtime with CPython's clinic
+    /// precedence: positional arity, then duplicate/unknown keywords, then the
+    /// `data`/`string` conflict.
+    #[test]
+    fn constructor_tail_binding_errors() {
+        exc::init();
+        // A second positional argument is rejected instead of ignored.
+        let bad = call("md5", &[bytes(b"abc"), bytes(b"def")]);
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+
+        let bad = call("new", &[text("sha256"), bytes(b"abc"), bytes(b"def")]);
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+
+        let bad = call("blake2b", &[bytes(b"abc"), bytes(b"def")]);
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+
+        // `data` given by name and by position.
+        let bad = call_kw(
+            "sha256",
+            &[bytes(b"abc")],
+            &[("data".to_string(), bytes(b"def"))],
+        );
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+
+        let bad = call_kw(
+            "new",
+            &[text("md5"), bytes(b"abc")],
+            &[("data".to_string(), bytes(b"def"))],
+        );
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+
+        // Unknown keyword names are reported even next to a valid tail name,
+        // and `name` follows the same collision rule.
+        let bad = call_kw(
+            "sha256",
+            &[],
+            &[
+                ("string".to_string(), bytes(b"abc")),
+                ("bogus".to_string(), value::TRUE),
+            ],
+        );
+        assert_eq!(clear_error(), TYPE_ERROR);
+        assert_eq!(bad, NONE);
+
+        let bad = call_kw(
+            "new",
+            &[text("md5")],
+            &[("name".to_string(), text("sha256"))],
+        );
         assert_eq!(clear_error(), TYPE_ERROR);
         assert_eq!(bad, NONE);
     }

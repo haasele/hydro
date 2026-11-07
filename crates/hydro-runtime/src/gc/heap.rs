@@ -3709,6 +3709,10 @@ unsafe fn trace(addr: usize) {
                     if let Some(object) = state.data.object {
                         mark_value(object);
                     }
+                    // `args` keeps the original constructor arguments.
+                    for &value in &state.data.arg_values {
+                        mark_value(value);
+                    }
                     for &(_, value) in attrs.iter() {
                         mark_value(value);
                     }
@@ -3848,6 +3852,11 @@ unsafe fn trace(addr: usize) {
                         mark_value(context);
                     }
                     for &(_, value) in &exception.keywords {
+                        mark_value(value);
+                    }
+                    // `args` keeps the original constructor arguments as
+                    // tagged values (see `exc::ExcData::arg_values`).
+                    for &value in &exception.arg_values {
                         mark_value(value);
                     }
                     // The original extension exception instance is a GC edge

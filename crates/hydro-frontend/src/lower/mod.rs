@@ -4245,6 +4245,12 @@ impl<'a> Lowerer<'a> {
     /// the function object, and a plain module-level `def` is otherwise only
     /// compiled into the function table with no statement that could create
     /// them. CPython's `def` stores the function in `globals()` as well.
+    ///
+    /// `load_tests` is mirrored even in an entry unit: `unittest.main()` calls
+    /// the module's hook through the runtime global table
+    /// (`TestLoader.loadTestsFromModule` semantics), and the test files that
+    /// define one (for example `test_datetime.py`) build their whole suite
+    /// inside it, so the hook would otherwise be unreachable.
     fn mirror_module_function(
         &mut self,
         start: usize,
@@ -4253,7 +4259,7 @@ impl<'a> Lowerer<'a> {
         fs: &mut FuncState,
         body: &mut Vec<HStmt>,
     ) {
-        if !self.mirror_all_globals && decl.type_params.is_empty() {
+        if !self.mirror_all_globals && decl.type_params.is_empty() && decl.name != "load_tests" {
             return;
         }
         let Some(&fid) = def_ids.get(&start) else {
@@ -18374,16 +18380,12 @@ impl<'a> Lowerer<'a> {
                         col,
                     );
                 }
+                // Every remaining attribute is a runtime read: the receiver
+                // decides how the name resolves (`value::function_attribute`
+                // for a builtin type spelling's class protocol, the class or
+                // instance namespace otherwise).
                 let object = self.expr(&a.value, fs);
-                HExpr {
-                    kind: HExprKind::GetAttr {
-                        object: Box::new(object),
-                        name: a.attr.to_string(),
-                    },
-                    ty: self.infer.fresh(),
-                    line,
-                    col,
-                }
+                self.getattr_expr(object, a.attr.as_str(), line, col)
             }
             ast::Expr::Subscript(s) => {
                 if let ast::Expr::Slice(sl) = &*s.slice {
@@ -20229,6 +20231,23 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Lowers `object.name` as a runtime attribute read.
+    ///
+    /// The runtime resolves the attribute by receiver kind, so a builtin type
+    /// name reaches its class-protocol attributes (`__new__`, `mro`,
+    /// `__mro__`, ...) through `value::function_attribute`.
+    fn getattr_expr(&mut self, object: HExpr, name: &str, line: u32, col: u32) -> HExpr {
+        HExpr {
+            kind: HExprKind::GetAttr {
+                object: Box::new(object),
+                name: name.to_string(),
+            },
+            ty: self.infer.fresh(),
+            line,
+            col,
+        }
+    }
+
     fn call_expr(
         &mut self,
         call: &ast::ExprCall,
@@ -20474,6 +20493,14 @@ impl<'a> Lowerer<'a> {
                     && self.resolve_deferred_import(&call.func, fs).is_none()
                 {
                     let object = self.expr(&attr.value, fs);
+                    // `tuple.__new__` and the rest of the builtin type's class
+                    // protocol are served by the runtime attribute getter, not
+                    // by the method tables: read the function value and call
+                    // it through the general starred-call ABI.
+                    if is_builtin_type_protocol_read(&object, attr.attr.as_str()) {
+                        let callee = self.getattr_expr(object, attr.attr.as_str(), line, col);
+                        return self.lower_dynamic_callee_call(callee, call, fs, line, col);
+                    }
                     let Some((args, star, keywords, double_star)) = self.call_operands(call, fs)
                     else {
                         return self.error_expr(call.range);
@@ -20549,6 +20576,33 @@ impl<'a> Lowerer<'a> {
                     };
                 }
                 let object = self.expr(&attr.value, fs);
+                // A builtin type name is a callable function value at runtime;
+                // its class protocol (`tuple.__new__`, `int.mro`, ...) is
+                // reachable only through the attribute getter
+                // (`value::function_attribute`), so the call binds the read
+                // function value instead of dispatching a method name.
+                if is_builtin_type_protocol_read(&object, attr.attr.as_str()) {
+                    let callee = self.getattr_expr(object, attr.attr.as_str(), line, col);
+                    if !call.keywords.is_empty() {
+                        let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                            return self.error_expr(call.range);
+                        };
+                        return result;
+                    }
+                    let Some(args) = self.plain_call_args(call, fs) else {
+                        return self.error_expr(call.range);
+                    };
+                    return HExpr {
+                        kind: HExprKind::IndirectCall {
+                            callee: Box::new(callee),
+                            args,
+                            star: None,
+                        },
+                        ty: self.infer.fresh(),
+                        line,
+                        col,
+                    };
+                }
                 let Some((args, star, keywords, double_star)) = self.call_operands(call, fs) else {
                     return self.error_expr(call.range);
                 };
@@ -23356,6 +23410,92 @@ fn builtin_by_name(name: &str) -> Option<Builtin> {
 /// defaults to `None`.
 fn is_attribute_only_builtin(name: &str) -> bool {
     matches!(name, "setattr" | "delattr" | "pow")
+}
+
+/// Whether `builtin` names a Python type object (`int`, `tuple`, `type`, ...)
+/// rather than a plain builtin function.
+///
+/// Mirrors the runtime's `value::is_builtin_type` and the frontend's
+/// `is_builtin_class_value`: these spellings are real type objects at runtime,
+/// so their class protocol has to stay reachable.
+fn is_builtin_type_spelling(builtin: Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Int
+            | Builtin::Float
+            | Builtin::Bool
+            | Builtin::Str
+            | Builtin::Bytes
+            | Builtin::ByteArray
+            | Builtin::List
+            | Builtin::Tuple
+            | Builtin::Dict
+            | Builtin::Set
+            | Builtin::Frozenset
+            | Builtin::Range
+            | Builtin::MemoryView
+            | Builtin::Type
+    )
+}
+
+/// Class-protocol attributes of a builtin type name.
+///
+/// The builtin method dispatch behind `obj.method(...)` knows the documented
+/// instance methods (`tuple.count`, `int.bit_length`) and must keep serving
+/// them. A builtin type is also a type object, whose own protocol
+/// (`tuple.__new__`, `int.mro`, `int.__mro__`, `int.__bases__`, ...) lives in
+/// the runtime attribute getter (`core::methods::getattr_named`, which hands
+/// the class-protocol slots to `value::function_attribute`) and is not part of
+/// the method tables. These are the only names exempted from the method-call
+/// path, and only when the static table does not already answer them (see
+/// [`is_static_builtin_class_method`]); every other unknown attribute keeps
+/// reporting `AttributeError`, so a typo is still diagnosed.
+fn is_builtin_class_protocol_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "__new__"
+            | "__init__"
+            | "mro"
+            | "__mro__"
+            | "__bases__"
+            | "__base__"
+            | "__name__"
+            | "__qualname__"
+            | "__module__"
+            | "__doc__"
+    )
+}
+
+/// Whether the statically typed builtin class-method table already answers
+/// `builtin.name`.
+///
+/// `sema::builtin_class_method_result` is the table behind
+/// `obj.method(...)` on a builtin type value and gives the call its concrete
+/// result type (`type.mro` is a list, `type.__new__` is dynamic). Those
+/// entries keep the static `MethodCall` path; only the protocol names the
+/// table does not know (`tuple.__new__`, `int.mro`, ...) move to the runtime
+/// attribute getter. This is the intersection of that table with
+/// [`is_builtin_class_protocol_attribute`].
+fn is_static_builtin_class_method(builtin: Builtin, name: &str) -> bool {
+    matches!((builtin, name), (Builtin::Type, "mro" | "__new__"))
+}
+
+/// Whether `object.name` reads a class-protocol attribute of a builtin type
+/// name that the builtin method tables do not know.
+///
+/// Such a read is answered by the runtime attribute getter, while
+/// `MethodCall` dispatches through the builtin method tables and reports
+/// `'function' object has no attribute '__new__'`. Lowering the call to a
+/// `GetAttr` of the function value keeps the runtime value getter
+/// authoritative.
+fn is_builtin_type_protocol_read(object: &HExpr, name: &str) -> bool {
+    is_builtin_class_protocol_attribute(name)
+        && matches!(
+            &object.kind,
+            HExprKind::BuiltinRef(builtin)
+                if is_builtin_type_spelling(*builtin)
+                    && !is_static_builtin_class_method(*builtin, name)
+        )
 }
 
 /// One `namespace[name] = value` store used while building a dynamic class

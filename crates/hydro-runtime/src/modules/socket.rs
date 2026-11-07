@@ -44,13 +44,14 @@
 //! Host lookup covers `gethostname`, `gethostbyname`, `getaddrinfo` and
 //! `getfqdn`; the last one reverse-resolves the name it is given (the local
 //! host name when the argument is empty), so it reports the resolver's
-//! canonical name instead of echoing its argument.
+//! canonical name instead of echoing its argument. `has_ipv6` reports whether
+//! the platform can create IPv6 sockets, probed the first time it is read.
 
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
 };
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -91,6 +92,20 @@ const SOL_SOCKET: i64 = 1;
 const SHUT_RD: i64 = 0;
 const SHUT_WR: i64 = 1;
 const SHUT_RDWR: i64 = 2;
+
+/// Whether this platform's socket layer supports IPv6, probed once.
+///
+/// CPython publishes `has_ipv6` from its build configuration; Hydro probes
+/// the capability instead of assuming it, so a kernel built or configured
+/// without IPv6 reports `False` and `socket.has_ipv6`-guarded tests skip
+/// truthfully.
+static HAS_IPV6: LazyLock<bool> =
+    LazyLock::new(|| UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))).is_ok());
+
+/// `socket.has_ipv6`: whether the platform's socket layer supports IPv6.
+pub(crate) fn has_ipv6() -> bool {
+    *HAS_IPV6
+}
 
 /// TLS verification modes, mirroring `ssl.CERT_*`.
 const CERT_NONE: i64 = 0;
@@ -963,6 +978,51 @@ fn connect_stream_from(
     ))
 }
 
+static DEFAULT_TIMEOUT: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+fn default_timeout() -> Option<Duration> {
+    (*DEFAULT_TIMEOUT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()))
+    .map(|seconds| Duration::from_secs_f64(seconds.max(0.0)))
+}
+
+fn getdefaulttimeout() -> i64 {
+    match *DEFAULT_TIMEOUT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+    {
+        None => NONE,
+        Some(seconds) => value::float_new(seconds),
+    }
+}
+
+fn setdefaulttimeout(args: &[i64]) -> i64 {
+    let previous = getdefaulttimeout();
+    let Some(&value_arg) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "setdefaulttimeout() missing argument");
+    };
+    if value_arg == NONE {
+        *DEFAULT_TIMEOUT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        return previous;
+    }
+    let Some(seconds) = value::as_float(value_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "setdefaulttimeout() argument must be a float or None",
+        );
+    };
+    if seconds < 0.0 {
+        return exc::raise_with_message(VALUE_ERROR, "Timeout value out of range");
+    }
+    *DEFAULT_TIMEOUT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(seconds);
+    previous
+}
+
 /// Progress view of `socket()` validation.
 fn construct_kind(family: i64, sock_type: i64, proto: i64, timeout: Option<Duration>) -> i64 {
     let base_type = sock_type & 0xF;
@@ -1012,7 +1072,11 @@ fn construct(args: &[i64]) -> i64 {
     // `SOCK_NONBLOCK`/`SOCK_CLOEXEC` may be OR-ed into the type; the runtime
     // only models the non-blocking bit, as a zero timeout.
     let nonblock = raw_type & 0o4000 != 0;
-    let timeout = nonblock.then_some(Duration::ZERO);
+    let timeout = if nonblock {
+        Some(Duration::ZERO)
+    } else {
+        default_timeout()
+    };
     construct_kind(family, raw_type, proto, timeout)
 }
 
@@ -1525,6 +1589,8 @@ fn inet_ntop(args: &[i64]) -> i64 {
 pub(crate) fn call(module: &str, function: &str, args: &[i64]) -> i64 {
     match function {
         "socket" => construct(args),
+        "getdefaulttimeout" => getdefaulttimeout(),
+        "setdefaulttimeout" => setdefaulttimeout(args),
         "create_connection" => create_connection(args),
         "create_server" => create_server(args),
         "gethostname" => value::str_alloc(gethostname()),
@@ -1660,6 +1726,9 @@ fn global_default_timeout() -> i64 {
 pub(crate) fn constant(module: &str, name: &str) -> i64 {
     match name {
         "_GLOBAL_DEFAULT_TIMEOUT" => global_default_timeout(),
+        // `socket.has_ipv6`: platform IPv6 capability, the same flag the
+        // stdlib tests guard their IPv6 cases with.
+        "has_ipv6" => value::bool_value(has_ipv6()),
         "AF_UNSPEC" => encode_int(AF_UNSPEC),
         "AF_UNIX" => encode_int(AF_UNIX),
         "AF_INET" => encode_int(AF_INET),

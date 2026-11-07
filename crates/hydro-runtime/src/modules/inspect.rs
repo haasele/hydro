@@ -37,10 +37,21 @@
 //!   `annotation_format` parameters are accepted but have nothing to evaluate.
 //! * **Function and class values carry no `__module__`, `__code__` or
 //!   `__qualname__` provenance.** `getmodule` answers for modules, native
-//!   module functions and builtins (the `builtins` module) and returns `None`
-//!   for user functions/classes instead of guessing. `getfile` answers for
-//!   modules through their `__file__` global and raises a precise `TypeError`
-//!   for function/class values.
+//!   module functions, builtins (the `builtins` module) and Python functions
+//!   whose owning module is discoverable from the runtime global store (a
+//!   module-level binding, a class namespace, or an assigned `__module__`),
+//!   returning the same module object `sys.modules` holds so identity-based
+//!   callers such as `doctest.DocTestFinder` work. It returns `None` when no
+//!   owner is reachable. `getfile` answers for modules through their
+//!   `__file__` global and raises a precise `TypeError` for function/class
+//!   values.
+//! * **`__globals__` is recovered, not stored.** CPython keeps a pointer to
+//!   the defining module's namespace on every function; Hydro values do not,
+//!   so `function.__globals__` is resolved against the global store on
+//!   access and returns the module's live `module.__dict__` mapping. A Python
+//!   function whose owner is unreachable reports an empty namespace instead
+//!   of raising; native functions, builtins and `functools.partial` keep
+//!   CPython's `AttributeError`.
 //! * **`mappingproxy` is not representable.** `Signature.parameters` returns a
 //!   fresh `dict`: insertion order is preserved, but mutating it does not
 //!   mutate the signature.
@@ -68,6 +79,7 @@ use crate::exc::{
 };
 use crate::heap;
 use crate::iter;
+use crate::methods;
 use crate::modules::importlib_machinery;
 use crate::value::{self, ClassEntry, DescriptorKind, FunctionBody, ParamMeta, FALSE, NONE, TRUE};
 
@@ -2715,6 +2727,7 @@ fn function_static_attribute(obj: i64, name: &str) -> Option<i64> {
         "__doc__" => Some(value::function_doc(obj)),
         "__module__" => value::function_module(obj),
         "__annotations__" => value::function_annotations(obj),
+        "__globals__" => methods::function_globals_or_empty(obj),
         "__dict__" => {
             if value::function_has_attributes(obj) {
                 value::function_dict(obj)
@@ -2965,14 +2978,12 @@ fn getmodulename_impl(path: i64) -> i64 {
 
 fn getmodule_impl(obj: i64) -> i64 {
     if let Some(module) = value::as_module(obj) {
-        return value::module_value(module.name().to_string());
+        return super::module_value_by_name(module.name());
     }
     if let Some(function) = value::as_function(obj) {
         match &function.body {
-            FunctionBody::Native { module, .. } => {
-                return value::module_value((*module).to_string())
-            }
-            FunctionBody::Builtin(_) => return value::module_value("builtins".to_string()),
+            FunctionBody::Native { module, .. } => return super::module_value_by_name(module),
+            FunctionBody::Builtin(_) => return super::module_value_by_name("builtins"),
             FunctionBody::Partial { function, .. } => return getmodule_impl(*function),
             FunctionBody::BoundMethod { .. } => {
                 if let Some((_, target)) = resolved_method(obj) {
@@ -2981,6 +2992,22 @@ fn getmodule_impl(obj: i64) -> i64 {
             }
             _ => {}
         }
+        // A Python function belongs to the module that owns its `__globals__`;
+        // recovering it is what lets `doctest.DocTestFinder._from_module`
+        // decide whether the function is part of the module under test.
+        return match methods::function_owner_module(obj) {
+            Some(module) => super::registry_lookup(&module).unwrap_or(NONE),
+            None => NONE,
+        };
+    }
+    if value::as_class(obj).is_some() {
+        // CPython's `inspect.getmodule` answers from `__module__` for classes
+        // and returns the registered module object, or `None` when that name
+        // is not in `sys.modules`.
+        return match static_attribute(obj, "__module__").and_then(value::as_str) {
+            Some(module) => super::registry_lookup(module).unwrap_or(NONE),
+            None => NONE,
+        };
     }
     NONE
 }
@@ -3924,7 +3951,6 @@ pub(crate) fn function_spec(name: &str) -> Option<&'static hydro_ir::stdlib::Fun
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::methods;
 
     fn number(value_in: i64) -> i64 {
         value::as_integer(value_in).expect("integer")
@@ -4609,6 +4635,69 @@ mod tests {
             value::as_module(call("getmodule", &[cleandoc])).map(|state| state.name().to_string()),
             Some("inspect".to_string())
         );
+    }
+
+    /// `inspect.getmodule` and `__globals__` recover a Python function's owner
+    /// so `doctest.DocTestFinder` can decide module membership without
+    /// `'function' object has no attribute '__globals__'`.
+    #[test]
+    fn getmodule_tracks_python_function_owner() {
+        exc::init();
+        let module_name = "inspect_test_function_owner";
+        let function = user_function("probe", Vec::new(), 0);
+        globals::set(module_name, "probe", function);
+
+        let module = call("getmodule", &[function]);
+        assert!(!exc::pending(), "getmodule raised");
+        assert_eq!(
+            value::as_module(module).map(|state| state.name().to_string()),
+            Some(module_name.to_string())
+        );
+        // The module object must be the one `sys.modules` holds: doctest
+        // compares with `is`, so a freshly allocated module value would not do.
+        assert_eq!(
+            module,
+            crate::modules::registry_lookup(module_name).expect("registered")
+        );
+        // The recovered namespace is the same live mapping as `module.__dict__`.
+        assert_eq!(
+            attr(function, "__globals__"),
+            crate::modules::module_dict(module_name)
+        );
+        assert_eq!(
+            call("getattr_static", &[function, text("__globals__")]),
+            crate::modules::module_dict(module_name)
+        );
+
+        // A method is not bound in module globals; its owner is found through
+        // the class namespace and the class's `__module__`.
+        let method = user_function("method", Vec::new(), 0);
+        crate::heap::add_global_root(method);
+        let class = value::class_new_full(
+            "Probe".to_string(),
+            NONE,
+            vec![("method".to_string(), method, MethodKind::Normal)],
+            vec![("__module__".to_string(), text(module_name))],
+        );
+        globals::set(module_name, "Probe", class);
+        assert_eq!(
+            value::as_module(call("getmodule", &[method])).map(|state| state.name().to_string()),
+            Some(module_name.to_string())
+        );
+        assert_eq!(
+            attr(method, "__globals__"),
+            crate::modules::module_dict(module_name)
+        );
+
+        // Classes answer from `__module__`; a function with no reachable owner
+        // reports `None` instead of guessing.
+        assert_eq!(
+            value::as_module(call("getmodule", &[class])).map(|state| state.name().to_string()),
+            Some(module_name.to_string())
+        );
+        let lone = user_function("lone", Vec::new(), 0);
+        assert_eq!(call("getmodule", &[lone]), NONE);
+        assert!(!exc::pending());
     }
 
     #[test]

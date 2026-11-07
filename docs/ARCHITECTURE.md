@@ -284,6 +284,7 @@ i64  hydro_raise_value(i64 exc);
 i64  hydro_raise_from(uint32_t tag, i64 msg, i64 cause);
 i64  hydro_raise_value_from(i64 exc, i64 cause);
 int  hydro_exc_matches(uint32_t handler_tag);
+int  hydro_exc_matches_value(i64 exc, i64 matcher);
 i64  hydro_uncaught(void);
 void hydro_runtime_init(void);
 void hydro_register_function(const uint8_t* name, size_t name_len,
@@ -354,7 +355,12 @@ runtime): `ArithmeticError` catches `ZeroDivisionError`/`OverflowError`/
 `GeneratorExit`, `CancelledError`, `BaseExceptionGroup`). An unknown pending
 tag matches only `BaseException`/`Exception`, and an unknown handler tag never
 matches. Both the interpreter and codegen delegate this decision to
-`hydro_exc_matches`; there is no second hierarchy table.
+`hydro_exc_matches`; there is no second hierarchy table. A dynamic arm
+(`except <expression>:`) evaluates its matcher and delegates to
+`hydro_exc_matches_value`, which walks the same chain for a class or a tuple
+of classes and reports CPython's `TypeError: catching classes that do not
+inherit from BaseException is not allowed` for any other operand (a non-class,
+an exception instance, or a class outside the hierarchy).
 
 `raise`/`except` resolve tags from names directly. An unqualified exception
 name used as a value lowers to `hydro_exception_class(tag)`, which returns one
@@ -363,10 +369,13 @@ parent, so `issubclass(SyntaxError, Exception)` holds and `isinstance(e,
 OSError)` is true for a `FileNotFoundError` object. `issubclass` is a
 source-level two-argument builtin. `isinstance(x, object)` is true for every
 Hydro value. Explicit causes are stored on the exception and traced by the GC.
-An exception object exposes `args` (the rendered raise arguments),
-`__class__`, `__cause__`, `__context__`, `__suppress_context__` and
-`__traceback__` (always `None`: Hydro records the raise location but has no
-traceback object).
+An exception object exposes `args` (the positional constructor arguments,
+stored as the real objects, with `str(exception)` and `repr(exception)`
+derived from them exactly like `BaseException`), `__class__`, `__cause__`,
+`__context__`, `__suppress_context__`, `__traceback__` (always `None`: Hydro
+records the raise location but has no traceback object) and the
+`BaseException` methods `__str__`, `__repr__`, `__setstate__`, `__reduce__`,
+`__reduce_ex__` and `with_traceback`.
 
 **User exception classes are a documented limitation.** `class ReprError(
 Exception): ...` creates an ordinary class (its instances are class
@@ -543,8 +552,10 @@ class identity survived (value-form raises).
   an instance and calls `__init__` (via the class/base chain) with the
   receiver selected by the method kind. Methods are resolved dynamically via
   `hydro_method` by receiver type and class chain; attributes via
-  `hydro_getattr`/`hydro_setattr`. Instances expose `__class__`; classes expose
-  their frozen attributes and `__name__`. Zero-argument
+  `hydro_getattr`/`hydro_setattr`. Every value exposes `__class__` (`type(v)`);
+  assigning `obj.__class__` rebinds a heap instance when both classes share
+  the same `__slots__`/`__dict__` layout and otherwise raises CPython's
+  `TypeError`. Classes expose their frozen attributes and `__name__`. Zero-argument
   `super().__init__(...)` calls the next initializer in the C3 MRO.
   Metaclasses, `__prepare__`, `__set_name__`, class-header keywords, multiple
   bases and the general descriptor protocol are implemented; some user

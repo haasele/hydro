@@ -78,16 +78,16 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-10-31: **3114 tests run
-(3114 passed, 1 skipped)**; the per-crate breakdown below sums to 3114
+`cargo nextest run --workspace` on 2026-10-31: **3221 tests run
+(3221 passed, 1 skipped)**; the per-crate breakdown below sums to 3222
 (the skipped test is not included in the listed binaries):
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 1981 |
-| frontend | 896 |
+| runtime (unit + integration) | 2078 |
+| frontend | 905 |
 | codegen | 79 |
-| IR | 70 |
+| IR | 71 |
 | bindgen | 42 |
 | interpreter | 28 |
 | parser | 19 |
@@ -106,12 +106,10 @@ Other docs must link here instead of repeating the total.
   harness now sets `HYDRO_STDLIB` to the pinned CPython `Lib` tree; the earlier
   159 count used the toolchain's default subset. Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
-- **Official suite:** **9/398 passing** (`test_colorsys.py`, `test_compiler_assemble.py`,
-  `test_compiler_codegen.py`, `test_errno.py`, `test_file_eintr.py`,
-  `test_int_literal.py`, `test_longexp.py`, `test_openpty.py`, `test_unary.py`),
-  330 `hydro_fail`, 62 `expected_fail` (CPython also fails), 0 timeouts; full
-  differential run took 894.3 s. Manifest `tests/compat/cpython-3.14.9.json`
-  records the six observed passes.
+- **Official suite:** **22/398 harness passes** (CPython and Hydro both exit 0);
+  several entries still execute 0 tests because imported harness modules fail,
+  recorded in `docs/CPYTHON_TESTS.md`. The 2026-11-08 full run has 314
+  `hydro_fail`, 60 `expected_fail`, 2 `cpython_fail`.
 - **Ecosystem:** **9/13 cases pass** under JIT and AOT. Pydantic 2.14.1,
   pydantic-core, python-dateutil, six, typing-extensions,
   typing-inspection, annotated-types and tzdata pass. NumPy 2.5 stops on the
