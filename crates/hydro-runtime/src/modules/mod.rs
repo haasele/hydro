@@ -8613,6 +8613,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `tempfile.__file__`/`_TemporaryFileWrapper` are runtime values.
         ("tempfile", name) => tempfile::constant(name),
         ("binascii", "Error") => binascii::error_class(),
+        ("base64", name) => base64::constant(name),
         ("marshal", name) => marshal::constant(name),
         // `importlib`'s nested modules are real native modules; expose the
         // exact `sys.modules` entry so identity holds.

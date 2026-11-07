@@ -64,6 +64,11 @@ initial state of the first runnable core.
   `os.dup`/`waitstatus_to_exitcode`/`register_at_fork`, `sys._jit`,
   `time.get_clock_info`, `threading.stack_size`, `types.coroutine`,
   `warnings._get_filters`, `asyncio.events`, `float.__getformat__`).
+- Base64 now covers the full CPython 3.14 codec surface (standard/urlsafe,
+  base16/32/32hex/85, Ascii85, Z85, encodebytes); tempfile gains SpooledTemporaryFile,
+  bytes return inference, candidate-name hooks and TemporaryDirectory options;
+  http.client gains HTTPConnection/HTTPResponse/HTTPMessage and request round-trip
+  plumbing on top of the exception surface.
 - Ecosystem gate remains **9/13**: pydantic import/smoke pass; NumPy now stops
   on missing `_NoValue` after code-object metadata (`co_argcount`,
   `co_kwonlyargcount`, `co_varnames`, flags), DType/metatype, PARSE,

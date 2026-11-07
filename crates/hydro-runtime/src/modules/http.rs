@@ -125,6 +125,7 @@ use crate::exc::{
     self, ATTRIBUTE_ERROR, CONNECTION_RESET_ERROR, EXCEPTION, OS_ERROR, TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
+use crate::modules::socket;
 use crate::value::{self, NONE};
 
 /// Largest request head (request line plus headers) we buffer.
@@ -372,6 +373,12 @@ fn spawn_loop(server: Server, index: usize) -> io::Result<()> {
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         "serve" => serve(args),
+        // `http.client.parse_headers(fp)` is a module function, so its value is
+        // a native function bound to this module's dispatch.
+        "client_parse_headers" => match args {
+            [fp] => parse_headers_from_fp(*fp),
+            _ => type_error("parse_headers() takes 1 argument"),
+        },
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'http' has no attribute '{function}'"),
@@ -440,9 +447,7 @@ pub(crate) fn remote_disconnected_class() -> i64 {
 /// Materialises an `http.client` constant.
 ///
 /// The module-registry wiring for `http.client` dispatches attribute reads
-/// here, mirroring [`crate::modules::warnings::constant`]. `HTTPConnection`,
-/// `HTTPSConnection`, `HTTPResponse`, `HTTPMessage` and `parse_headers` are
-/// not implemented yet; every name below is a real value.
+/// here, mirroring [`crate::modules::warnings::constant`].
 pub(crate) fn constant(name: &str) -> i64 {
     if let Some(code) = status_constant(name) {
         return client_integer(code);
@@ -462,6 +467,21 @@ pub(crate) fn constant(name: &str) -> i64 {
         "BadStatusLine" => bad_status_line_class(),
         "LineTooLong" => line_too_long_class(),
         "IncompleteRead" => incomplete_read_class(),
+        "HTTPMessage" => message_class(),
+        "HTTPResponse" => response_class(),
+        "HTTPConnection" => connection_class(),
+        "HTTPSConnection" => https_connection_class(),
+        "parse_headers" => {
+            // The function value carries its trampoline directly, so it works
+            // even though `http.client` has no module-call dispatch arm.
+            let function = value::native_function_new("http", "client_parse_headers", 1);
+            value::function_set_signature(function, vec![client_positional("fp")]);
+            value::function_set_full_entry(
+                function,
+                client_parse_headers_entry as *const () as usize,
+            );
+            function
+        }
         "responses" => responses_dict(),
         "__all__" => client_all(),
         "HTTP_PORT" => client_integer(80),
@@ -1644,10 +1664,31 @@ fn client_has(obj: i64, name: &str) -> bool {
     if value::instance_attr(obj, name).is_some() {
         return true;
     }
-    let Some(class) = value::instance_class_value(obj) else {
-        return false;
-    };
-    value::class_lookup(class, name).is_some()
+    if let Some(class) = value::instance_class_value(obj) {
+        if value::class_lookup(class, name).is_some() {
+            return true;
+        }
+    }
+    // Native streams (`io.BytesIO`, open files) are not instances: their
+    // surface is the fixed `io` method set.
+    if value::as_file(obj).is_some() {
+        return matches!(
+            name,
+            "read"
+                | "readline"
+                | "readlines"
+                | "readinto"
+                | "read1"
+                | "peek"
+                | "close"
+                | "flush"
+                | "fileno"
+                | "seek"
+                | "tell"
+                | "write"
+        );
+    }
+    false
 }
 
 fn client_param(name: &str, kind: hydro_ir::ParamKind, default: Option<i64>) -> value::ParamMeta {
@@ -2096,6 +2137,3296 @@ fn split_whitespace_max(content: &str, limit: usize) -> Vec<String> {
     out
 }
 
+// -------------------------------------------------------------------------
+// `HTTPMessage`: the case-insensitive header container
+// -------------------------------------------------------------------------
+
+/// Instance header store: `_names`/`_values` are parallel lists.
+extern "C" fn message_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let names = value::list_new(Vec::new());
+    let values = value::list_new(Vec::new());
+    let inner = heap::root_values(&[names, values]);
+    client_set(instance, "_names", names);
+    client_set(instance, "_values", values);
+    heap::release_roots(inner);
+    heap::release_roots(root);
+    NONE
+}
+
+/// Header names are compared case-insensitively; `bytes` names decode as
+/// latin-1, matching `email.message.Message`.
+fn header_key(item: i64) -> Option<String> {
+    match value::as_str(item) {
+        Some(name) => Some(name.to_string()),
+        None => value::as_bytes(item).map(latin1_string),
+    }
+}
+
+fn message_matches(name: i64, wanted: &str) -> bool {
+    header_key(name).is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+}
+
+fn message_pair(msg: i64, index: usize) -> (i64, i64) {
+    let names = client_attribute(msg, "_names");
+    let values = client_attribute(msg, "_values");
+    let name = value::as_list(names)
+        .and_then(|items| items.get(index).copied())
+        .unwrap_or(NONE);
+    let value = value::as_list(values)
+        .and_then(|items| items.get(index).copied())
+        .unwrap_or(NONE);
+    (name, value)
+}
+
+fn message_len(msg: i64) -> usize {
+    let names = client_attribute(msg, "_names");
+    value::as_list(names).map(|items| items.len()).unwrap_or(0)
+}
+
+fn message_find(msg: i64, key: &str) -> Option<usize> {
+    for index in 0..message_len(msg) {
+        let (name, _) = message_pair(msg, index);
+        if message_matches(name, key) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn message_get_first(msg: i64, key: &str) -> Option<i64> {
+    message_find(msg, key).map(|index| message_pair(msg, index).1)
+}
+
+fn message_get_all_values(msg: i64, key: &str) -> Option<Vec<i64>> {
+    let mut out = Vec::new();
+    for index in 0..message_len(msg) {
+        let (name, item) = message_pair(msg, index);
+        if message_matches(name, key) {
+            out.push(item);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn message_get_text(msg: i64, key: &str) -> Option<String> {
+    message_get_first(msg, key).and_then(|item| {
+        value::as_str(item)
+            .map(str::to_string)
+            .or_else(|| value::as_bytes(item).map(latin1_string))
+    })
+}
+
+fn message_push(msg: i64, name: i64, item: i64) {
+    let names = client_attribute(msg, "_names");
+    let values = client_attribute(msg, "_values");
+    let root = heap::root_values(&[names, values, name, item]);
+    crate::container::list_append(names, name);
+    crate::container::list_append(values, item);
+    heap::release_roots(root);
+}
+
+extern "C" fn message_getitem_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, name).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let instance = args[0];
+    let root = heap::root_values(&[instance, args[1]]);
+    let Some(key) = header_key(args[1]) else {
+        heap::release_roots(root);
+        return client_type_error("header name must be str");
+    };
+    let result = message_get_first(instance, &key).unwrap_or(NONE);
+    if result == NONE {
+        let class = exc::exception_class(exc::KEY_ERROR);
+        let display = value::repr(args[1]);
+        let raised = client_exception_instance(class, exc::KEY_ERROR, &display, vec![args[1]]);
+        heap::release_roots(root);
+        return exc::raise_value(raised);
+    }
+    heap::release_roots(root);
+    result
+}
+
+extern "C" fn message_get_entry(argv: *const i64) -> i64 {
+    // SAFETY: three declared parameter slots (self, name, failobj).
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    let Some(key) = header_key(args[1]) else {
+        return client_type_error("header name must be str");
+    };
+    message_get_first(args[0], &key).unwrap_or(args[2])
+}
+
+/// Shared implementation of `get`/`getheader`: first value or `failobj`.
+extern "C" fn message_getheader_entry(argv: *const i64) -> i64 {
+    message_get_entry(argv)
+}
+
+extern "C" fn message_get_all_entry(argv: *const i64) -> i64 {
+    // SAFETY: three declared parameter slots (self, name, failobj).
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    let instance = args[0];
+    let root = heap::root_values(&[instance, args[1], args[2]]);
+    let Some(key) = header_key(args[1]) else {
+        heap::release_roots(root);
+        return client_type_error("header name must be str");
+    };
+    let Some(items) = message_get_all_values(instance, &key) else {
+        heap::release_roots(root);
+        return args[2];
+    };
+    let list = value::list_new(items);
+    heap::release_roots(root);
+    list
+}
+
+/// Rewrites one `_values` entry (the native list surface has no
+/// `__setitem__` dispatch, so the list is rebuilt in place).
+fn message_store_value(msg: i64, index: usize, item: i64) {
+    let values = client_attribute(msg, "_values");
+    let Some(snapshot) = value::as_list(values).map(|items| items.to_vec()) else {
+        return;
+    };
+    let mut roots: Vec<i64> = snapshot.clone();
+    roots.push(item);
+    roots.push(values);
+    let root = heap::root_values(&roots);
+    client_invoke(values, "clear", &[]);
+    for (position, existing) in snapshot.iter().enumerate() {
+        let selected = if position == index { item } else { *existing };
+        client_invoke(values, "append", &[selected]);
+    }
+    heap::release_roots(root);
+}
+
+/// Removes the given indexes from `_names`/`_values`.
+fn message_remove_indexes(msg: i64, indexes: &[usize]) {
+    for target in [
+        client_attribute(msg, "_names"),
+        client_attribute(msg, "_values"),
+    ] {
+        let Some(snapshot) = value::as_list(target).map(|items| items.to_vec()) else {
+            continue;
+        };
+        let mut roots: Vec<i64> = snapshot.clone();
+        roots.push(target);
+        let root = heap::root_values(&roots);
+        client_invoke(target, "clear", &[]);
+        for (position, existing) in snapshot.iter().enumerate() {
+            if !indexes.contains(&position) {
+                client_invoke(target, "append", &[*existing]);
+            }
+        }
+        heap::release_roots(root);
+    }
+}
+
+extern "C" fn message_setitem_entry(argv: *const i64) -> i64 {
+    // SAFETY: three declared parameter slots (self, name, value).
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    let instance = args[0];
+    let root = heap::root_values(&[instance, args[1], args[2]]);
+    let Some(key) = header_key(args[1]) else {
+        heap::release_roots(root);
+        return client_type_error("header name must be str");
+    };
+    match message_find(instance, &key) {
+        Some(index) => message_store_value(instance, index, args[2]),
+        None => message_push(instance, args[1], args[2]),
+    }
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn message_delitem_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, name).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let instance = args[0];
+    let root = heap::root_values(&[instance, args[1]]);
+    let Some(key) = header_key(args[1]) else {
+        heap::release_roots(root);
+        return client_type_error("header name must be str");
+    };
+    let mut indexes: Vec<usize> = Vec::new();
+    for index in 0..message_len(instance) {
+        let (name, _) = message_pair(instance, index);
+        if message_matches(name, &key) {
+            indexes.push(index);
+        }
+    }
+    if indexes.is_empty() {
+        let class = exc::exception_class(exc::KEY_ERROR);
+        let display = value::repr(args[1]);
+        let raised = client_exception_instance(class, exc::KEY_ERROR, &display, vec![args[1]]);
+        heap::release_roots(root);
+        return exc::raise_value(raised);
+    }
+    message_remove_indexes(instance, &indexes);
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn message_contains_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, name).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let Some(key) = header_key(args[1]) else {
+        return client_bool(false);
+    };
+    client_bool(message_find(args[0], &key).is_some())
+}
+
+extern "C" fn message_len_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    client_integer(message_len(instance) as i64)
+}
+
+extern "C" fn message_keys_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let mut items = Vec::with_capacity(message_len(instance));
+    for index in 0..message_len(instance) {
+        items.push(message_pair(instance, index).0);
+    }
+    let list = value::list_new(items);
+    heap::release_roots(root);
+    list
+}
+
+extern "C" fn message_values_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let mut items = Vec::with_capacity(message_len(instance));
+    for index in 0..message_len(instance) {
+        items.push(message_pair(instance, index).1);
+    }
+    let list = value::list_new(items);
+    heap::release_roots(root);
+    list
+}
+
+extern "C" fn message_items_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let count = message_len(instance);
+    let mut tuples = Vec::with_capacity(count);
+    for index in 0..count {
+        let (name, item) = message_pair(instance, index);
+        let inner = heap::root_values(&[name, item]);
+        tuples.push(value::tuple_new(vec![name, item]));
+        heap::release_roots(inner);
+    }
+    let list = value::list_new(tuples);
+    heap::release_roots(root);
+    list
+}
+
+extern "C" fn message_iter_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let names = client_attribute(instance, "_names");
+    let copy = value::as_list(names)
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    let list = value::list_new(copy);
+    let list_root = heap::root_values(std::slice::from_ref(&list));
+    let iterator = crate::iter::iter_of(list);
+    heap::release_roots(list_root);
+    heap::release_roots(root);
+    iterator
+}
+
+extern "C" fn message_add_header_entry(argv: *const i64) -> i64 {
+    // SAFETY: three declared parameter slots (self, name, value).
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    let root = heap::root_values(&[args[0], args[1], args[2]]);
+    message_push(args[0], args[1], args[2]);
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn message_replace_header_entry(argv: *const i64) -> i64 {
+    // SAFETY: three declared parameter slots (self, name, value).
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    let instance = args[0];
+    let root = heap::root_values(&[instance, args[1], args[2]]);
+    let Some(key) = header_key(args[1]) else {
+        heap::release_roots(root);
+        return client_type_error("header name must be str");
+    };
+    match message_find(instance, &key) {
+        Some(index) => {
+            message_store_value(instance, index, args[2]);
+            heap::release_roots(root);
+            NONE
+        }
+        None => {
+            let class = exc::exception_class(exc::KEY_ERROR);
+            let display = value::repr(args[1]);
+            let raised = client_exception_instance(class, exc::KEY_ERROR, &display, vec![args[1]]);
+            heap::release_roots(root);
+            exc::raise_value(raised)
+        }
+    }
+}
+
+extern "C" fn message_str_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let mut out = String::new();
+    for index in 0..message_len(instance) {
+        let (name, item) = message_pair(instance, index);
+        out.push_str(&value::to_string(name));
+        out.push_str(": ");
+        out.push_str(&value::to_string(item));
+        out.push('\n');
+    }
+    let rendered = client_text(&out);
+    heap::release_roots(root);
+    rendered
+}
+
+extern "C" fn message_repr_entry(_argv: *const i64) -> i64 {
+    client_text("<http.client.HTTPMessage object>")
+}
+
+fn message_class() -> i64 {
+    let self_only = || vec![client_positional("self")];
+    client_class(
+        "http.client.HTTPMessage",
+        "HTTPMessage",
+        NONE,
+        vec![
+            ("__init__", self_only(), message_init_entry),
+            (
+                "__getitem__",
+                vec![client_positional("self"), client_positional("name")],
+                message_getitem_entry,
+            ),
+            (
+                "__setitem__",
+                vec![
+                    client_positional("self"),
+                    client_positional("name"),
+                    client_positional("value"),
+                ],
+                message_setitem_entry,
+            ),
+            (
+                "__delitem__",
+                vec![client_positional("self"), client_positional("name")],
+                message_delitem_entry,
+            ),
+            (
+                "__contains__",
+                vec![client_positional("self"), client_positional("name")],
+                message_contains_entry,
+            ),
+            ("__len__", self_only(), message_len_entry),
+            ("__iter__", self_only(), message_iter_entry),
+            ("__str__", self_only(), message_str_entry),
+            ("__repr__", self_only(), message_repr_entry),
+            (
+                "get",
+                vec![
+                    client_positional("self"),
+                    client_positional("name"),
+                    client_optional("failobj", NONE),
+                ],
+                message_get_entry,
+            ),
+            (
+                "getheader",
+                vec![
+                    client_positional("self"),
+                    client_positional("name"),
+                    client_optional("failobj", NONE),
+                ],
+                message_getheader_entry,
+            ),
+            (
+                "get_all",
+                vec![
+                    client_positional("self"),
+                    client_positional("name"),
+                    client_optional("failobj", NONE),
+                ],
+                message_get_all_entry,
+            ),
+            ("keys", self_only(), message_keys_entry),
+            ("values", self_only(), message_values_entry),
+            ("items", self_only(), message_items_entry),
+            (
+                "add_header",
+                vec![
+                    client_positional("self"),
+                    client_positional("name"),
+                    client_positional("value"),
+                ],
+                message_add_header_entry,
+            ),
+            (
+                "replace_header",
+                vec![
+                    client_positional("self"),
+                    client_positional("name"),
+                    client_positional("value"),
+                ],
+                message_replace_header_entry,
+            ),
+        ],
+        Vec::new(),
+    )
+}
+
+/// Parses header lines into `(name, value)` pairs, unfolding continuation
+/// lines with `\n` the way `email.parser` keeps them.
+fn parse_header_lines(lines: &[Vec<u8>]) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for line in lines {
+        let text_line = latin1_string(trim_line_end(line));
+        if text_line.is_empty() {
+            continue;
+        }
+        let first = text_line.as_bytes().first().copied().unwrap_or(0);
+        if first == b' ' || first == b'\t' {
+            if let Some(last) = pairs.last_mut() {
+                last.1.push('\n');
+                last.1.push_str(&text_line);
+            }
+            continue;
+        }
+        let Some((name, value_in)) = text_line.split_once(':') else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        pairs.push((name.to_string(), value_in.trim().to_string()));
+    }
+    pairs
+}
+
+fn message_from_pairs(pairs: &[(String, String)]) -> i64 {
+    let class = message_class();
+    let root = heap::root_values(std::slice::from_ref(&class));
+    let message = crate::builtins::call(class, 0, std::ptr::null());
+    if exc::pending() || message == NONE {
+        heap::release_roots(root);
+        return message;
+    }
+    let message_root = heap::root_values(std::slice::from_ref(&message));
+    let names = client_attribute(message, "_names");
+    let values = client_attribute(message, "_values");
+    let list_root = heap::root_values(&[names, values]);
+    for (name, value) in pairs {
+        let name_value = client_text(name);
+        let value_value = client_text(value);
+        let inner = heap::root_values(&[name_value, value_value]);
+        crate::container::list_append(names, name_value);
+        crate::container::list_append(values, value_value);
+        heap::release_roots(inner);
+    }
+    heap::release_roots(list_root);
+    heap::release_roots(message_root);
+    heap::release_roots(root);
+    message
+}
+
+fn trim_line_end(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    if end > 0 && line[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && line[end - 1] == b'\r' {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+/// Reads header lines from any file object, bounded by `_MAXLINE`/`_MAXHEADERS`.
+fn collect_header_lines<F>(mut next_line: F) -> Option<Vec<Vec<u8>>>
+where
+    F: FnMut() -> Option<Vec<u8>>,
+{
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let line = next_line()?;
+        if line.len() as i64 > CLIENT_MAXLINE {
+            raise_line_too_long("header line");
+            return None;
+        }
+        let terminator = line.is_empty() || line == b"\r\n" || line == b"\n";
+        lines.push(line);
+        if terminator {
+            break;
+        }
+        if lines.len() > CLIENT_MAXHEADERS {
+            client_raise_message(
+                http_exception_class(),
+                &format!("got more than {CLIENT_MAXHEADERS} headers"),
+            );
+            return None;
+        }
+    }
+    Some(lines)
+}
+
+/// `http.client.parse_headers(fp)`: parse the head at `fp`'s cursor.
+fn parse_headers_from_fp(fp: i64) -> i64 {
+    let lines = collect_header_lines(|| {
+        let result = client_invoke(fp, "readline", &[client_integer(CLIENT_MAXLINE + 1)]);
+        if exc::pending() {
+            return None;
+        }
+        Some(
+            value::as_bytes(result)
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default(),
+        )
+    });
+    let Some(lines) = lines else {
+        return NONE;
+    };
+    let pairs = parse_header_lines(&lines);
+    message_from_pairs(&pairs)
+}
+
+/// Native entry for the module-level `parse_headers(fp, _class=HTTPMessage)`.
+extern "C" fn client_parse_headers_entry(argv: *const i64) -> i64 {
+    // SAFETY: one argument slot (the file object).
+    let fp = unsafe { *argv };
+    parse_headers_from_fp(fp)
+}
+
+// -------------------------------------------------------------------------
+// `HTTPResponse`
+// -------------------------------------------------------------------------
+
+/// Reads up to `limit` bytes through the response's file object or socket.
+fn response_read_some(instance: i64, amount: usize) -> Option<Vec<u8>> {
+    if value::truthy(client_attribute(instance, "raw")) {
+        let mut out = response_pending_take(instance);
+        if out.len() >= amount {
+            let rest = out.split_off(amount);
+            response_pending_store(instance, &rest);
+            return Some(out);
+        }
+        let need = amount - out.len();
+        let sock = client_attribute(instance, "sock");
+        if sock == NONE {
+            return Some(out);
+        }
+        let result = client_invoke(sock, "recv", &[client_integer(need as i64)]);
+        if exc::pending() {
+            return None;
+        }
+        out.extend_from_slice(value::as_bytes(result).unwrap_or_default());
+        Some(out)
+    } else {
+        let fp = client_attribute(instance, "fp");
+        if fp == NONE {
+            return Some(Vec::new());
+        }
+        let result = client_invoke(fp, "read", &[client_integer(amount as i64)]);
+        if exc::pending() {
+            return None;
+        }
+        Some(
+            value::as_bytes(result)
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default(),
+        )
+    }
+}
+
+fn response_read_all(instance: i64) -> Option<Vec<u8>> {
+    if value::truthy(client_attribute(instance, "raw")) {
+        let mut out = response_pending_take(instance);
+        loop {
+            let sock = client_attribute(instance, "sock");
+            if sock == NONE {
+                break;
+            }
+            let result = client_invoke(sock, "recv", &[client_integer(65536)]);
+            if exc::pending() {
+                return None;
+            }
+            let chunk = value::as_bytes(result)
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default();
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Some(out)
+    } else {
+        let fp = client_attribute(instance, "fp");
+        if fp == NONE {
+            return Some(Vec::new());
+        }
+        let result = client_invoke(fp, "read", &[]);
+        if exc::pending() {
+            return None;
+        }
+        Some(
+            value::as_bytes(result)
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default(),
+        )
+    }
+}
+
+/// Reads exactly `amount` bytes or raises `IncompleteRead`.
+fn response_safe_read(instance: i64, amount: usize) -> Option<Vec<u8>> {
+    let mut data: Vec<u8> = Vec::with_capacity(amount.min(1 << 20));
+    while data.len() < amount {
+        let want = (amount - data.len()).min(1 << 20);
+        let chunk = response_read_some(instance, want)?;
+        if chunk.is_empty() {
+            break;
+        }
+        data.extend_from_slice(&chunk);
+    }
+    if data.len() < amount {
+        let missing = amount - data.len();
+        raise_incomplete_read(&data, Some(missing));
+        return None;
+    }
+    Some(data)
+}
+
+fn response_pending_view(instance: i64) -> Vec<u8> {
+    let pending = client_attribute(instance, "_pending");
+    value::as_bytes(pending)
+        .map(|bytes| bytes.to_vec())
+        .unwrap_or_default()
+}
+
+fn response_pending_take(instance: i64) -> Vec<u8> {
+    let bytes = response_pending_view(instance);
+    if !bytes.is_empty() {
+        client_set(instance, "_pending", value::bytes_new(Vec::new()));
+    }
+    bytes
+}
+
+fn response_pending_store(instance: i64, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    client_set(instance, "_pending", value::bytes_new(bytes.to_vec()));
+}
+
+/// `readline` against the raw socket or the file object.
+fn response_readline_raw(instance: i64, limit: i64) -> Option<Vec<u8>> {
+    let mut out = response_pending_take(instance);
+    loop {
+        if let Some(index) = out.iter().position(|byte| *byte == b'\n') {
+            if limit < 0 || (index as i64) < limit {
+                let rest = out.split_off(index + 1);
+                response_pending_store(instance, &rest);
+                return Some(out);
+            }
+            break;
+        }
+        if limit >= 0 && out.len() as i64 >= limit {
+            break;
+        }
+        let want = if limit >= 0 {
+            (limit - out.len() as i64).clamp(1, 65536)
+        } else {
+            65536
+        };
+        let sock = client_attribute(instance, "sock");
+        if sock == NONE {
+            break;
+        }
+        let result = client_invoke(sock, "recv", &[client_integer(want)]);
+        if exc::pending() {
+            return None;
+        }
+        let chunk = value::as_bytes(result)
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default();
+        if chunk.is_empty() {
+            break;
+        }
+        out.extend_from_slice(&chunk);
+    }
+    if limit >= 0 && out.len() as i64 > limit {
+        let rest = out.split_off(limit as usize);
+        response_pending_store(instance, &rest);
+    }
+    Some(out)
+}
+
+fn response_readline_any(instance: i64, limit: i64) -> Option<Vec<u8>> {
+    if value::truthy(client_attribute(instance, "raw")) {
+        return response_readline_raw(instance, limit);
+    }
+    let fp = client_attribute(instance, "fp");
+    if fp == NONE {
+        return Some(Vec::new());
+    }
+    let result = client_invoke(fp, "readline", &[client_integer(limit)]);
+    if exc::pending() {
+        return None;
+    }
+    Some(
+        value::as_bytes(result)
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default(),
+    )
+}
+
+/// Fills the pending buffer up to `limit` bytes without consuming them.
+fn response_peek_raw(instance: i64, limit: usize) -> Option<Vec<u8>> {
+    let mut data = response_pending_view(instance);
+    while data.len() < limit {
+        let sock = client_attribute(instance, "sock");
+        if sock == NONE {
+            break;
+        }
+        let want = (limit - data.len()).min(65536);
+        let result = client_invoke(sock, "recv", &[client_integer(want as i64)]);
+        if exc::pending() {
+            return None;
+        }
+        let chunk = value::as_bytes(result)
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default();
+        if chunk.is_empty() {
+            break;
+        }
+        data.extend_from_slice(&chunk);
+    }
+    response_pending_store(instance, &data);
+    Some(data)
+}
+
+fn response_conn_closed(instance: i64) -> bool {
+    value::truthy(client_attribute(instance, "_conn_closed"))
+}
+
+fn response_close_conn(instance: i64) -> i64 {
+    if response_conn_closed(instance) {
+        return NONE;
+    }
+    client_set(instance, "_conn_closed", client_bool(true));
+    let fp = client_attribute(instance, "fp");
+    if fp != NONE {
+        client_set(instance, "fp", NONE);
+        client_invoke(fp, "close", &[]);
+    }
+    // Raw mode has no file object to close: when the connection handed the
+    // socket over (close-delimited response), the response owns it now.
+    if value::truthy(client_attribute(instance, "_owns_sock")) {
+        let sock = client_attribute(instance, "sock");
+        if sock != NONE {
+            client_set(instance, "sock", NONE);
+            let root = heap::root_values(std::slice::from_ref(&sock));
+            client_invoke(sock, "close", &[]);
+            heap::release_roots(root);
+        }
+    }
+    NONE
+}
+
+/// Writes one debug line to `sys.stdout` (honouring `redirect_stdout`).
+fn client_debug_line(line: &str) {
+    let stdout = super::module_get_by_name("sys", "stdout");
+    if stdout == NONE {
+        return;
+    }
+    let payload = client_text(line);
+    let root = heap::root_values(&[stdout, payload]);
+    client_invoke(stdout, "write", &[payload]);
+    heap::release_roots(root);
+    if exc::pending() {
+        exc::clear();
+    }
+}
+
+/// `_read_status()` -> `(version, status, reason)`, raising on a bad line.
+fn response_read_status(instance: i64) -> Option<(String, i64, String)> {
+    let line_bytes = response_readline_any(instance, CLIENT_MAXLINE + 1)?;
+    if line_bytes.len() as i64 > CLIENT_MAXLINE {
+        raise_line_too_long("status line");
+        return None;
+    }
+    let line = latin1_string(&line_bytes);
+    if value::as_integer(client_attribute(instance, "debuglevel")).unwrap_or(0) > 0 {
+        client_debug_line(&format!("reply: {}\n", value::repr(client_text(&line))));
+    }
+    if line.is_empty() {
+        raise_remote_disconnected("Remote end closed connection without response");
+        return None;
+    }
+    let trimmed = latin1_string(trim_line_end(&line_bytes));
+    let words = split_whitespace_max(&trimmed, 3);
+    let version = words.first().cloned().unwrap_or_default();
+    let status_text = words.get(1).cloned().unwrap_or_default();
+    let reason = words.get(2).cloned().unwrap_or_default();
+    let valid_status = status_text.parse::<i64>().ok();
+    if !version.starts_with("HTTP/")
+        || !valid_status.is_some_and(|code| (100..=999).contains(&code))
+    {
+        response_close_conn(instance);
+        raise_bad_status_line(&trimmed);
+        return None;
+    }
+    Some((version, valid_status.unwrap_or(0), reason))
+}
+
+fn response_check_close(instance: i64, headers: i64) -> bool {
+    let connection = message_get_text(headers, "connection").map(|text| text.to_lowercase());
+    let version = value::as_integer(client_attribute(instance, "version")).unwrap_or(0);
+    if version == 11 {
+        return connection.is_some_and(|text| text.contains("close"));
+    }
+    if message_get_first(headers, "keep-alive").is_some() {
+        return false;
+    }
+    if connection.is_some_and(|text| text.contains("keep-alive")) {
+        return false;
+    }
+    if message_get_text(headers, "proxy-connection")
+        .is_some_and(|text| text.to_lowercase().contains("keep-alive"))
+    {
+        return false;
+    }
+    true
+}
+
+extern "C" fn response_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: five declared parameter slots (self, sock, debuglevel, method, url).
+    let args = unsafe { std::slice::from_raw_parts(argv, 5) };
+    let instance = args[0];
+    let sock = args[1];
+    let root = heap::root_values(&[instance, sock, args[2], args[3], args[4]]);
+    let has_makefile = client_has(sock, "makefile");
+    let (fp, raw) = if has_makefile {
+        let fp = client_invoke(sock, "makefile", &[client_text("rb")]);
+        if exc::pending() {
+            heap::release_roots(root);
+            return NONE;
+        }
+        (fp, false)
+    } else {
+        (NONE, true)
+    };
+    let inner = heap::root_values(&[fp]);
+    client_set(instance, "sock", sock);
+    client_set(instance, "fp", fp);
+    client_set(instance, "raw", client_bool(raw));
+    client_set(instance, "_pending", value::bytes_new(Vec::new()));
+    client_set(instance, "_line_pending", value::bytes_new(Vec::new()));
+    client_set(instance, "debuglevel", args[2]);
+    client_set(instance, "_method", args[3]);
+    client_set(instance, "url", args[4]);
+    client_set(instance, "headers", NONE);
+    client_set(instance, "msg", NONE);
+    client_set(instance, "version", client_text("UNKNOWN"));
+    client_set(instance, "status", client_text("UNKNOWN"));
+    client_set(instance, "reason", client_text("UNKNOWN"));
+    client_set(instance, "chunked", client_bool(false));
+    client_set(instance, "chunk_left", NONE);
+    client_set(instance, "length", NONE);
+    client_set(instance, "will_close", client_bool(false));
+    client_set(instance, "_conn_closed", client_bool(false));
+    client_set(instance, "closed", client_bool(false));
+    // A raw-mode response shares the connection's socket; the connection
+    // transfers ownership when the response is close-delimited.
+    client_set(instance, "_owns_sock", client_bool(false));
+    heap::release_roots(inner);
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn response_begin_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    if client_attribute(instance, "headers") != NONE {
+        heap::release_roots(root);
+        return NONE;
+    }
+    let mut final_status: Option<(String, i64, String)> = None;
+    let mut interim = 0usize;
+    while interim < CLIENT_MAXINTERIM {
+        let Some(status) = response_read_status(instance) else {
+            heap::release_roots(root);
+            return NONE;
+        };
+        if status.1 != 100 {
+            final_status = Some(status);
+            break;
+        }
+        if collect_header_lines(|| response_readline_any(instance, CLIENT_MAXLINE + 1)).is_none() {
+            heap::release_roots(root);
+            return NONE;
+        }
+        interim += 1;
+    }
+    let Some((version, status, reason)) = final_status else {
+        client_raise_message(
+            http_exception_class(),
+            &format!("got more than {CLIENT_MAXINTERIM} interim responses"),
+        );
+        heap::release_roots(root);
+        return NONE;
+    };
+    let status_value = client_integer(status);
+    client_set(instance, "code", status_value);
+    client_set(instance, "status", status_value);
+    client_set(instance, "reason", client_text(reason.trim()));
+    let version_number = if version == "HTTP/1.0" || version == "HTTP/0.9" {
+        10
+    } else if version.starts_with("HTTP/1.") {
+        11
+    } else {
+        client_raise_message(unknown_protocol_class(), &version);
+        heap::release_roots(root);
+        return NONE;
+    };
+    client_set(instance, "version", client_integer(version_number));
+
+    let Some(lines) = collect_header_lines(|| response_readline_any(instance, CLIENT_MAXLINE + 1))
+    else {
+        heap::release_roots(root);
+        return NONE;
+    };
+    let pairs = parse_header_lines(&lines);
+    let headers = message_from_pairs(&pairs);
+    if exc::pending() {
+        heap::release_roots(root);
+        return NONE;
+    }
+    let headers_root = heap::root_values(std::slice::from_ref(&headers));
+    client_set(instance, "headers", headers);
+    client_set(instance, "msg", headers);
+    if value::as_integer(client_attribute(instance, "debuglevel")).unwrap_or(0) > 0 {
+        for (name, value) in &pairs {
+            client_debug_line(&format!("header: {name}: {value}\n"));
+        }
+    }
+
+    let transfer_encoding = message_get_text(headers, "transfer-encoding");
+    let chunked = transfer_encoding
+        .map(|text| text.to_lowercase().trim() == "chunked")
+        .unwrap_or(false);
+    client_set(instance, "chunked", client_bool(chunked));
+    client_set(instance, "chunk_left", NONE);
+    let will_close = response_check_close(instance, headers);
+    client_set(instance, "will_close", client_bool(will_close));
+
+    let mut length: Option<i64> = None;
+    if !chunked {
+        if let Some(text) = message_get_text(headers, "content-length") {
+            if let Ok(parsed) = text.trim().parse::<i64>() {
+                if parsed >= 0 {
+                    length = Some(parsed);
+                }
+            }
+        }
+    }
+    let method = client_attribute(instance, "_method");
+    let is_head = value::as_str(method) == Some("HEAD");
+    if status == 204 || status == 304 || (100..200).contains(&status) || is_head {
+        length = Some(0);
+    }
+    client_set(
+        instance,
+        "length",
+        match length {
+            Some(number) => client_integer(number),
+            None => NONE,
+        },
+    );
+    if !will_close && !chunked && length.is_none() {
+        client_set(instance, "will_close", client_bool(true));
+    }
+    heap::release_roots(headers_root);
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn response_read_status_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let Some((version, status, reason)) = response_read_status(instance) else {
+        heap::release_roots(root);
+        return NONE;
+    };
+    let tuple = value::tuple_new(vec![
+        client_text(&version),
+        client_integer(status),
+        client_text(&reason),
+    ]);
+    heap::release_roots(root);
+    tuple
+}
+
+extern "C" fn response_close_conn_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    response_close_conn(instance)
+}
+
+extern "C" fn response_isclosed_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    client_bool(response_conn_closed(instance))
+}
+
+extern "C" fn response_close_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    client_set(instance, "closed", client_bool(true));
+    response_close_conn(instance);
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn response_enter_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+
+    unsafe { *argv }
+}
+
+extern "C" fn response_exit_entry(_argv: *const i64) -> i64 {
+    NONE
+}
+
+extern "C" fn response_readable_entry(_argv: *const i64) -> i64 {
+    client_bool(true)
+}
+
+extern "C" fn response_flush_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let fp = client_attribute(instance, "fp");
+    if fp != NONE {
+        let root = heap::root_values(&[fp]);
+        client_invoke(fp, "flush", &[]);
+        heap::release_roots(root);
+    }
+    NONE
+}
+
+extern "C" fn response_fileno_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let target = if value::truthy(client_attribute(instance, "raw")) {
+        client_attribute(instance, "sock")
+    } else {
+        client_attribute(instance, "fp")
+    };
+    if target == NONE {
+        return client_type_error("fileno() called on a closed response");
+    }
+    let root = heap::root_values(&[target]);
+    let result = client_invoke(target, "fileno", &[]);
+    heap::release_roots(root);
+    result
+}
+
+/// Reads `amt` bytes (`None` = unbounded) honouring the response framing.
+fn response_read_body(instance: i64, amt: i64) -> i64 {
+    if response_conn_closed(instance) {
+        return value::bytes_new(Vec::new());
+    }
+    let method = client_attribute(instance, "_method");
+    if value::as_str(method) == Some("HEAD") {
+        response_close_conn(instance);
+        return value::bytes_new(Vec::new());
+    }
+    let chunked = value::truthy(client_attribute(instance, "chunked"));
+    let length = client_attribute(instance, "length");
+    let numeric = if amt == NONE {
+        None
+    } else {
+        value::as_integer(amt)
+    };
+    match numeric {
+        Some(amount) if amount >= 0 => {
+            let data = if chunked {
+                response_read_chunked(instance, Some(amount as usize))
+            } else {
+                response_bounded_read(instance, amount as usize)
+            };
+            match data {
+                Some(data) => value::bytes_new(data),
+                None => NONE,
+            }
+        }
+        _ => {
+            if chunked {
+                return match response_read_chunked(instance, None) {
+                    Some(data) => value::bytes_new(data),
+                    None => NONE,
+                };
+            }
+            if let Some(limit) = value::as_integer(length) {
+                if limit == 0 {
+                    response_close_conn(instance);
+                    return value::bytes_new(Vec::new());
+                }
+                let data = match response_safe_read(instance, limit as usize) {
+                    Some(data) => data,
+                    None => {
+                        response_close_conn(instance);
+                        return NONE;
+                    }
+                };
+                client_set(instance, "length", client_integer(0));
+                response_close_conn(instance);
+                return value::bytes_new(data);
+            }
+            let data = match response_read_all(instance) {
+                Some(data) => data,
+                None => return NONE,
+            };
+            response_close_conn(instance);
+            value::bytes_new(data)
+        }
+    }
+}
+
+/// Bounded read that clips to `Content-Length` and closes at the end.
+fn response_bounded_read(instance: i64, want: usize) -> Option<Vec<u8>> {
+    let length = client_attribute(instance, "length");
+    let mut amount = want;
+    if let Some(limit) = value::as_integer(length) {
+        if amount as i64 > limit {
+            amount = limit.max(0) as usize;
+        }
+    }
+    let data = response_read_some(instance, amount)?;
+    if data.is_empty() && amount > 0 {
+        response_close_conn(instance);
+    } else if let Some(limit) = value::as_integer(length) {
+        let remaining = (limit - data.len() as i64).max(0);
+        client_set(instance, "length", client_integer(remaining));
+        if remaining == 0 {
+            response_close_conn(instance);
+        }
+    }
+    Some(data)
+}
+
+extern "C" fn response_read_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, amt).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let root = heap::root_values(&[args[0]]);
+    let result = response_read_body(args[0], args[1]);
+    heap::release_roots(root);
+    result
+}
+
+/// Writable length of a `bytearray` or `memoryview` buffer.
+fn response_writable_len(buffer: i64) -> Option<usize> {
+    if let Some(bytes) = value::as_bytearray(buffer) {
+        return Some(bytes.len());
+    }
+    if let Some(state) = value::as_memoryview(buffer) {
+        if state.released || state.readonly {
+            return None;
+        }
+        return Some(state.len());
+    }
+    None
+}
+
+/// Copies `data` into a writable buffer, returning the byte count.
+fn response_write_buffer(buffer: i64, data: &[u8]) -> usize {
+    if let Some(bytes) = value::bytearray_bytes_mut(buffer) {
+        let count = data.len().min(bytes.len());
+        bytes[..count].copy_from_slice(&data[..count]);
+        return count;
+    }
+    let Some(state) = value::as_memoryview(buffer) else {
+        return 0;
+    };
+    if state.released || state.readonly {
+        return 0;
+    }
+    let count = state.len().min(data.len());
+    let offset = state.offset as isize;
+    let stride = state.stride;
+    let exporter = state.buffer;
+    let Some(bytes) = value::bytearray_bytes_mut(exporter) else {
+        return 0;
+    };
+    let mut written = 0;
+    #[allow(clippy::needless_range_loop)]
+    for index in 0..count {
+        let at = offset + stride * index as isize;
+        if at < 0 {
+            break;
+        }
+        let at = at as usize;
+        if at >= bytes.len() {
+            break;
+        }
+        bytes[at] = data[index];
+        written += 1;
+    }
+    written
+}
+
+extern "C" fn response_readinto_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, buffer).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let instance = args[0];
+    let buffer = args[1];
+    let root = heap::root_values(&[instance, buffer]);
+    if response_conn_closed(instance) {
+        heap::release_roots(root);
+        return client_integer(0);
+    }
+    if value::as_str(client_attribute(instance, "_method")) == Some("HEAD") {
+        response_close_conn(instance);
+        heap::release_roots(root);
+        return client_integer(0);
+    }
+    let Some(capacity) = response_writable_len(buffer) else {
+        heap::release_roots(root);
+        return client_type_error(&format!(
+            "readinto() argument must be a writable bytes-like object, not '{}'",
+            value::type_name(buffer)
+        ));
+    };
+    if capacity == 0 {
+        heap::release_roots(root);
+        return client_integer(0);
+    }
+    let data = if value::truthy(client_attribute(instance, "chunked")) {
+        response_read_chunked(instance, Some(capacity))
+    } else {
+        response_bounded_read(instance, capacity)
+    };
+    let Some(data) = data else {
+        heap::release_roots(root);
+        return NONE;
+    };
+    let written = response_write_buffer(buffer, &data);
+    heap::release_roots(root);
+    client_integer(written as i64)
+}
+
+/// `readline(limit)`: length-clipped, `\n`-terminated, closes at the end.
+fn response_readline_body(instance: i64, limit: i64) -> i64 {
+    if response_conn_closed(instance) {
+        return value::bytes_new(Vec::new());
+    }
+    if value::as_str(client_attribute(instance, "_method")) == Some("HEAD") {
+        return value::bytes_new(Vec::new());
+    }
+    if value::truthy(client_attribute(instance, "chunked")) {
+        return response_readline_chunked(instance, limit);
+    }
+    let length = client_attribute(instance, "length");
+    let mut effective = limit;
+    if let Some(limit_value) = value::as_integer(length) {
+        if effective < 0 || effective > limit_value {
+            effective = limit_value;
+        }
+    }
+    let Some(data) = response_readline_any(instance, effective) else {
+        return NONE;
+    };
+    if data.is_empty() && effective != 0 {
+        response_close_conn(instance);
+    } else if let Some(limit_value) = value::as_integer(length) {
+        let remaining = (limit_value - data.len() as i64).max(0);
+        client_set(instance, "length", client_integer(remaining));
+        if remaining == 0 {
+            response_close_conn(instance);
+        }
+    }
+    value::bytes_new(data)
+}
+
+extern "C" fn response_readline_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, limit).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let root = heap::root_values(&[args[0]]);
+    let limit = value::as_integer(args[1]).unwrap_or(-1);
+    let result = response_readline_body(args[0], limit);
+    heap::release_roots(root);
+    result
+}
+
+extern "C" fn response_readlines_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, hint).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let instance = args[0];
+    let hint = value::as_integer(args[1]).unwrap_or(-1);
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let mut items: Vec<i64> = Vec::new();
+    let mut total = 0i64;
+    loop {
+        let line = response_readline_body(instance, -1);
+        if exc::pending() {
+            heap::release_roots(root);
+            return NONE;
+        }
+        let Some(bytes) = value::as_bytes(line) else {
+            break;
+        };
+        if bytes.is_empty() {
+            break;
+        }
+        total += bytes.len() as i64;
+        items.push(line);
+        if hint > 0 && total >= hint {
+            break;
+        }
+    }
+    let list = value::list_new(items);
+    heap::release_roots(root);
+    list
+}
+
+/// `read1(n)`: at most one underlying read.
+fn response_read1_body(instance: i64, n: i64) -> i64 {
+    if response_conn_closed(instance) {
+        return value::bytes_new(Vec::new());
+    }
+    if value::as_str(client_attribute(instance, "_method")) == Some("HEAD") {
+        return value::bytes_new(Vec::new());
+    }
+    let chunked = value::truthy(client_attribute(instance, "chunked"));
+    if chunked {
+        return response_read1_chunked(instance, n);
+    }
+    let mut amount: Option<usize> = if n < 0 { None } else { Some(n as usize) };
+    let length = client_attribute(instance, "length");
+    if let Some(limit) = value::as_integer(length) {
+        match amount {
+            Some(value) if (value as i64) > limit => amount = Some(limit.max(0) as usize),
+            None => amount = Some(limit.max(0) as usize),
+            _ => {}
+        }
+    }
+    let data = match amount {
+        Some(want) => response_read_some(instance, want),
+        None => response_read_all(instance),
+    };
+    let Some(data) = data else {
+        return NONE;
+    };
+    let requested = n != 0;
+    if data.is_empty() && requested {
+        response_close_conn(instance);
+    } else if let Some(limit) = value::as_integer(length) {
+        let remaining = (limit - data.len() as i64).max(0);
+        client_set(instance, "length", client_integer(remaining));
+        if remaining == 0 {
+            response_close_conn(instance);
+        }
+    }
+    value::bytes_new(data)
+}
+
+extern "C" fn response_read1_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, n).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let root = heap::root_values(&[args[0]]);
+    let n = value::as_integer(args[1]).unwrap_or(-1);
+    let result = response_read1_body(args[0], n);
+    heap::release_roots(root);
+    result
+}
+
+extern "C" fn response_peek_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, n).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let instance = args[0];
+    if response_conn_closed(instance) {
+        return value::bytes_new(Vec::new());
+    }
+    if value::as_str(client_attribute(instance, "_method")) == Some("HEAD") {
+        return value::bytes_new(Vec::new());
+    }
+    let n = value::as_integer(args[1]).unwrap_or(-1);
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let fp = client_attribute(instance, "fp");
+    let raw = value::truthy(client_attribute(instance, "raw"));
+    if value::truthy(client_attribute(instance, "chunked")) {
+        let result = match chunked_next_size(instance) {
+            Some(left) if left > 0 => {
+                let limit = if n < 0 {
+                    65536
+                } else {
+                    (n as usize).min(left as usize)
+                };
+                let data = if raw || fp == NONE {
+                    match response_peek_raw(instance, limit) {
+                        Some(data) => data,
+                        None => {
+                            heap::release_roots(root);
+                            return NONE;
+                        }
+                    }
+                } else if client_has(fp, "peek") {
+                    let peeked = client_invoke(fp, "peek", &[client_integer(left)]);
+                    if exc::pending() {
+                        heap::release_roots(root);
+                        return NONE;
+                    }
+                    let mut data = value::as_bytes(peeked)
+                        .map(|bytes| bytes.to_vec())
+                        .unwrap_or_default();
+                    data.truncate(limit);
+                    data
+                } else {
+                    Vec::new()
+                };
+                let shown = if n < 0 {
+                    data
+                } else {
+                    data.into_iter().take(n as usize).collect()
+                };
+                value::bytes_new(shown)
+            }
+            _ => value::bytes_new(Vec::new()),
+        };
+        heap::release_roots(root);
+        return result;
+    }
+    let data = if value::truthy(client_attribute(instance, "raw")) || fp == NONE {
+        let limit = if n < 0 { 65536 } else { n as usize };
+        match response_peek_raw(instance, limit) {
+            Some(data) => data,
+            None => {
+                heap::release_roots(root);
+                return NONE;
+            }
+        }
+    } else if client_has(fp, "peek") {
+        let result = client_invoke(fp, "peek", &[client_integer(n)]);
+        if exc::pending() {
+            heap::release_roots(root);
+            return NONE;
+        }
+        value::as_bytes(result)
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let shown = if n < 0 {
+        data
+    } else {
+        data.into_iter().take(n as usize).collect()
+    };
+    let result = value::bytes_new(shown);
+    heap::release_roots(root);
+    result
+}
+
+extern "C" fn response_getheader_entry(argv: *const i64) -> i64 {
+    // SAFETY: three declared parameter slots (self, name, default).
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    let instance = args[0];
+    let root = heap::root_values(&[instance, args[1], args[2]]);
+    let headers = client_attribute(instance, "headers");
+    if headers == NONE {
+        heap::release_roots(root);
+        return client_raise(response_not_ready_class(), "ResponseNotReady()");
+    }
+    let Some(key) = header_key(args[1]) else {
+        heap::release_roots(root);
+        return client_type_error("header name must be str");
+    };
+    let Some(values) = message_get_all_values(headers, &key) else {
+        heap::release_roots(root);
+        return args[2];
+    };
+    let mut parts: Vec<String> = Vec::with_capacity(values.len());
+    for item in values {
+        if let Some(text) = value::as_str(item) {
+            parts.push(text.to_string());
+        } else if let Some(bytes) = value::as_bytes(item) {
+            parts.push(latin1_string(bytes));
+        }
+    }
+    let joined = client_text(&parts.join(", "));
+    heap::release_roots(root);
+    joined
+}
+
+extern "C" fn response_getheaders_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let headers = client_attribute(instance, "headers");
+    if headers == NONE {
+        heap::release_roots(root);
+        return client_raise(response_not_ready_class(), "ResponseNotReady()");
+    }
+    let result = client_invoke(headers, "items", &[]);
+    heap::release_roots(root);
+    result
+}
+
+extern "C" fn response_info_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    client_attribute(instance, "headers")
+}
+
+extern "C" fn response_geturl_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    client_attribute(instance, "url")
+}
+
+extern "C" fn response_getcode_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    client_attribute(instance, "status")
+}
+
+/// Next positive chunk size; `-1` marks the end of the body.
+fn chunked_next_size(instance: i64) -> Option<i64> {
+    let current = value::as_integer(client_attribute(instance, "chunk_left")).unwrap_or(-1);
+    if current > 0 {
+        return Some(current);
+    }
+    if current == 0 {
+        let _ = response_safe_read(instance, 2)?;
+    }
+    let line = response_readline_any(instance, CLIENT_MAXLINE + 1)?;
+    if line.len() as i64 > CLIENT_MAXLINE {
+        raise_line_too_long("chunk size");
+        return None;
+    }
+    let raw = latin1_string(trim_line_end(&line));
+    let size_text = raw.split(';').next().unwrap_or("").trim();
+    let size = match i64::from_str_radix(size_text, 16) {
+        Ok(size) => size,
+        Err(_) => {
+            response_close_conn(instance);
+            raise_incomplete_read(&[], None);
+            return None;
+        }
+    };
+    if size == 0 {
+        discard_trailer(instance)?;
+        response_close_conn(instance);
+        client_set(instance, "chunk_left", NONE);
+        return Some(-1);
+    }
+    client_set(instance, "chunk_left", client_integer(size));
+    Some(size)
+}
+
+fn discard_trailer(instance: i64) -> Option<()> {
+    let mut count = 0usize;
+    loop {
+        let line = response_readline_any(instance, CLIENT_MAXLINE + 1)?;
+        if line.len() as i64 > CLIENT_MAXLINE {
+            raise_line_too_long("trailer line");
+            return None;
+        }
+        if line.is_empty() || line == b"\r\n" || line == b"\n" {
+            return Some(());
+        }
+        count += 1;
+        if count > CLIENT_MAXHEADERS {
+            client_raise_message(
+                http_exception_class(),
+                &format!("got more than {CLIENT_MAXHEADERS} trailers"),
+            );
+            return None;
+        }
+    }
+}
+
+fn response_read_chunked(instance: i64, amt: Option<usize>) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut remaining = amt;
+    loop {
+        let left = chunked_next_size(instance)?;
+        if left < 0 {
+            break;
+        }
+        match remaining {
+            Some(0) => break,
+            Some(want) if (want as i64) <= left => {
+                let data = response_safe_read(instance, want)?;
+                out.extend_from_slice(&data);
+                client_set(instance, "chunk_left", client_integer(left - want as i64));
+                remaining = Some(0);
+            }
+            Some(want) => {
+                let data = response_safe_read(instance, left as usize)?;
+                out.extend_from_slice(&data);
+                client_set(instance, "chunk_left", client_integer(0));
+                remaining = Some(want - left as usize);
+            }
+            None => {
+                let data = response_safe_read(instance, left as usize)?;
+                out.extend_from_slice(&data);
+                client_set(instance, "chunk_left", client_integer(0));
+            }
+        }
+    }
+    Some(out)
+}
+
+fn response_read1_chunked(instance: i64, n: i64) -> i64 {
+    let Some(left) = chunked_next_size(instance) else {
+        return NONE;
+    };
+    if left < 0 || n == 0 {
+        return value::bytes_new(Vec::new());
+    }
+    let want = if n < 0 || n > left { left } else { n };
+    let Some(data) = response_read_some(instance, want as usize) else {
+        return NONE;
+    };
+    if data.is_empty() {
+        raise_incomplete_read(&[], None);
+        return NONE;
+    }
+    client_set(
+        instance,
+        "chunk_left",
+        client_integer(left - data.len() as i64),
+    );
+    value::bytes_new(data)
+}
+
+/// Chunked `readline`: decodes chunks until a `\n`, buffering the remainder.
+fn response_readline_chunked(instance: i64, limit: i64) -> i64 {
+    let pending_value = client_attribute(instance, "_line_pending");
+    let mut pending = value::as_bytes(pending_value)
+        .map(|bytes| bytes.to_vec())
+        .unwrap_or_default();
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    loop {
+        if let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
+            if limit < 0 || (index as i64) < limit {
+                let rest = pending.split_off(index + 1);
+                client_set(instance, "_line_pending", value::bytes_new(rest));
+                let line = value::bytes_new(pending);
+                heap::release_roots(root);
+                return line;
+            }
+            break;
+        }
+        if limit >= 0 && pending.len() as i64 >= limit {
+            break;
+        }
+        let Some(chunk) = response_read_chunked(instance, Some(8192)) else {
+            heap::release_roots(root);
+            return NONE;
+        };
+        if chunk.is_empty() {
+            break;
+        }
+        pending.extend_from_slice(&chunk);
+    }
+    if limit >= 0 && pending.len() as i64 > limit {
+        let rest = pending.split_off(limit as usize);
+        client_set(instance, "_line_pending", value::bytes_new(rest));
+    } else {
+        client_set(instance, "_line_pending", value::bytes_new(Vec::new()));
+    }
+    let line = value::bytes_new(pending);
+    heap::release_roots(root);
+    line
+}
+
+fn response_class() -> i64 {
+    let self_only = || vec![client_positional("self")];
+    client_class(
+        "http.client.HTTPResponse",
+        "HTTPResponse",
+        NONE,
+        vec![
+            (
+                "__init__",
+                vec![
+                    client_positional("self"),
+                    client_positional("sock"),
+                    client_optional("debuglevel", client_integer(0)),
+                    client_optional("method", NONE),
+                    client_optional("url", NONE),
+                ],
+                response_init_entry,
+            ),
+            ("begin", self_only(), response_begin_entry),
+            (
+                "read",
+                vec![client_positional("self"), client_optional("amt", NONE)],
+                response_read_entry,
+            ),
+            (
+                "read1",
+                vec![
+                    client_positional("self"),
+                    client_optional("n", client_integer(-1)),
+                ],
+                response_read1_entry,
+            ),
+            (
+                "readinto",
+                vec![client_positional("self"), client_positional("b")],
+                response_readinto_entry,
+            ),
+            (
+                "readline",
+                vec![
+                    client_positional("self"),
+                    client_optional("limit", client_integer(-1)),
+                ],
+                response_readline_entry,
+            ),
+            (
+                "readlines",
+                vec![
+                    client_positional("self"),
+                    client_optional("hint", client_integer(-1)),
+                ],
+                response_readlines_entry,
+            ),
+            (
+                "peek",
+                vec![
+                    client_positional("self"),
+                    client_optional("n", client_integer(-1)),
+                ],
+                response_peek_entry,
+            ),
+            (
+                "getheader",
+                vec![
+                    client_positional("self"),
+                    client_positional("name"),
+                    client_optional("default", NONE),
+                ],
+                response_getheader_entry,
+            ),
+            ("getheaders", self_only(), response_getheaders_entry),
+            ("info", self_only(), response_info_entry),
+            ("geturl", self_only(), response_geturl_entry),
+            ("getcode", self_only(), response_getcode_entry),
+            ("isclosed", self_only(), response_isclosed_entry),
+            ("close", self_only(), response_close_entry),
+            ("fileno", self_only(), response_fileno_entry),
+            ("flush", self_only(), response_flush_entry),
+            ("readable", self_only(), response_readable_entry),
+            ("_read_status", self_only(), response_read_status_entry),
+            ("_close_conn", self_only(), response_close_conn_entry),
+            ("__enter__", self_only(), response_enter_entry),
+            (
+                "__exit__",
+                vec![
+                    client_positional("self"),
+                    client_optional("exc_type", NONE),
+                    client_optional("exc_value", NONE),
+                    client_optional("traceback", NONE),
+                ],
+                response_exit_entry,
+            ),
+        ],
+        Vec::new(),
+    )
+}
+
+// -------------------------------------------------------------------------
+// `HTTPConnection`
+// -------------------------------------------------------------------------
+
+/// Parses `host[:port]` exactly like `_get_hostport`, raising `InvalidURL`
+/// on a non-numeric port.
+fn connection_host_port(host: i64, port: i64, default_port: i64) -> Option<(String, i64)> {
+    let Some(mut host_text) = value::as_str(host).map(str::to_string) else {
+        exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!(
+                "'{}' object has no attribute 'rfind'",
+                value::type_name(host)
+            ),
+        );
+        return None;
+    };
+    let port_number = if port == NONE {
+        let colon = host_text.rfind(':').map(|index| index as i64).unwrap_or(-1);
+        let bracket = host_text.rfind(']').map(|index| index as i64).unwrap_or(-1);
+        if colon > bracket {
+            let tail = host_text[(colon + 1) as usize..].to_string();
+            let parsed = tail.parse::<i64>();
+            match parsed {
+                Ok(number) => {
+                    host_text.truncate(colon as usize);
+                    number
+                }
+                Err(_) => {
+                    if tail.is_empty() {
+                        host_text.truncate(colon as usize);
+                        default_port
+                    } else {
+                        client_raise_message(
+                            invalid_url_class(),
+                            &format!("nonnumeric port: '{tail}'"),
+                        );
+                        return None;
+                    }
+                }
+            }
+        } else {
+            default_port
+        }
+    } else {
+        match value::as_integer(port) {
+            Some(number) => number,
+            None => {
+                client_type_error("port must be an integer");
+                return None;
+            }
+        }
+    };
+    if host_text.starts_with('[') && host_text.ends_with(']') && host_text.len() >= 2 {
+        host_text = host_text[1..host_text.len() - 1].to_string();
+    }
+    if !(0..=65535).contains(&port_number) {
+        client_raise_message(
+            invalid_url_class(),
+            &format!("nonnumeric port: '{port_number}'"),
+        );
+        return None;
+    }
+    Some((host_text, port_number))
+}
+
+/// Rejects control characters in a host, like `_validate_host`.
+fn connection_validate_host_text(host: &str) -> Option<()> {
+    if let Some(character) = host
+        .chars()
+        .find(|character| (*character as u32) <= 0x20 || (*character as u32) == 0x7f)
+    {
+        client_raise_message(
+            invalid_url_class(),
+            &format!(
+                "URL can't contain control characters. {host:?} (found at least {character:?})"
+            ),
+        );
+        return None;
+    }
+    Some(())
+}
+
+fn connection_init_impl(
+    instance: i64,
+    host: i64,
+    port: i64,
+    timeout: i64,
+    source_address: i64,
+    blocksize: i64,
+) -> i64 {
+    let root = heap::root_values(&[instance, host, port, timeout, source_address, blocksize]);
+    client_set(instance, "timeout", timeout);
+    client_set(instance, "source_address", source_address);
+    client_set(instance, "blocksize", blocksize);
+    client_set(instance, "sock", NONE);
+    let buffer = value::list_new(Vec::new());
+    let inner = heap::root_values(&[buffer]);
+    client_set(instance, "_buffer", buffer);
+    client_set(instance, "_response", NONE);
+    let state = client_text(CS_IDLE);
+    client_set(instance, "_state", state);
+    client_set(instance, "_method", NONE);
+    client_set(instance, "_tunnel_host", NONE);
+    client_set(instance, "_tunnel_port", NONE);
+    let tunnel_headers = value::dict_new(Vec::new());
+    client_set(instance, "_tunnel_headers", tunnel_headers);
+    client_set(instance, "_raw_proxy_headers", NONE);
+    let create = value::native_function_new("socket", "create_connection", 2);
+    client_set(instance, "_create_connection", create);
+    heap::release_roots(inner);
+    let default_port = value::as_integer(client_attribute(instance, "default_port")).unwrap_or(80);
+    let Some((host_text, port_number)) = connection_host_port(host, port, default_port) else {
+        heap::release_roots(root);
+        return NONE;
+    };
+    if connection_validate_host_text(&host_text).is_none() {
+        heap::release_roots(root);
+        return NONE;
+    }
+    let host_value = client_text(&host_text);
+    client_set(instance, "host", host_value);
+    client_set(instance, "port", client_integer(port_number));
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn connection_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: six declared parameter slots (self, host, port, timeout,
+    // source_address, blocksize).
+    let args = unsafe { std::slice::from_raw_parts(argv, 6) };
+    connection_init_impl(args[0], args[1], args[2], args[3], args[4], args[5])
+}
+
+extern "C" fn https_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: seven declared parameter slots (self, host, port, timeout,
+    // source_address, context, blocksize).
+    let args = unsafe { std::slice::from_raw_parts(argv, 7) };
+    let instance = args[0];
+    connection_init_impl(instance, args[1], args[2], args[3], args[4], args[6]);
+    if exc::pending() {
+        return NONE;
+    }
+    let context = if args[5] == NONE {
+        let created = socket::ssl_call("_create_default_https_context", &[]);
+        if exc::pending() {
+            return NONE;
+        }
+        created
+    } else {
+        args[5]
+    };
+    let root = heap::root_values(&[instance, context]);
+    client_set(instance, "_context", context);
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn connection_get_hostport_entry(argv: *const i64) -> i64 {
+    // SAFETY: three declared parameter slots (self, host, port).
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    let instance = args[0];
+    let default_port = value::as_integer(client_attribute(instance, "default_port")).unwrap_or(80);
+    let root = heap::root_values(&[instance]);
+    let Some((host_text, port_number)) = connection_host_port(args[1], args[2], default_port)
+    else {
+        heap::release_roots(root);
+        return NONE;
+    };
+    let tuple = value::tuple_new(vec![client_text(&host_text), client_integer(port_number)]);
+    heap::release_roots(root);
+    tuple
+}
+
+extern "C" fn connection_validate_host_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, host).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    let Some(host) = value::as_str(args[1]) else {
+        return client_type_error("host must be str");
+    };
+    match connection_validate_host_text(host) {
+        Some(()) => NONE,
+        None => NONE,
+    }
+}
+
+/// Best-effort `TCP_NODELAY` on the connected socket.
+fn connection_set_nodelay(sock: i64) {
+    if sock == NONE {
+        return;
+    }
+    let level = client_integer(libc::IPPROTO_TCP as i64);
+    let option = client_integer(libc::TCP_NODELAY as i64);
+    let value_one = client_integer(1);
+    let root = heap::root_values(&[sock, level, option, value_one]);
+    client_invoke(sock, "setsockopt", &[level, option, value_one]);
+    heap::release_roots(root);
+    if exc::pending() {
+        // Platforms without the option raise `ENOPROTOOPT`; CPython tolerates
+        // it, and the native socket surface reports it as an `OSError`.
+        exc::clear();
+    }
+}
+
+/// `connect()`: open the socket and run the CONNECT tunnel, if configured.
+fn connection_connect_impl(instance: i64) -> i64 {
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let host = client_attribute(instance, "host");
+    let port = client_attribute(instance, "port");
+    let timeout = client_attribute(instance, "timeout");
+    let source = client_attribute(instance, "source_address");
+    let create = client_attribute(instance, "_create_connection");
+    let address = value::tuple_new(vec![host, port]);
+    let inner = heap::root_values(&[address, create, timeout, source]);
+    let mut call_args = vec![address, timeout];
+    if source != NONE {
+        call_args.push(source);
+    }
+    let sock = crate::builtins::call(create, call_args.len(), call_args.as_ptr());
+    if exc::pending() {
+        heap::release_roots(inner);
+        heap::release_roots(root);
+        return NONE;
+    }
+    let sock_root = heap::root_values(std::slice::from_ref(&sock));
+    client_set(instance, "sock", sock);
+    connection_set_nodelay(sock);
+    let tunnel = client_attribute(instance, "_tunnel_host");
+    if tunnel != NONE {
+        connection_tunnel(instance);
+    }
+    heap::release_roots(sock_root);
+    heap::release_roots(inner);
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn connection_connect_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    connection_connect_impl(instance)
+}
+
+extern "C" fn https_connect_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    connection_connect_impl(instance);
+    if exc::pending() {
+        heap::release_roots(root);
+        return NONE;
+    }
+    let context = client_attribute(instance, "_context");
+    let sock = client_attribute(instance, "sock");
+    let tunnel = client_attribute(instance, "_tunnel_host");
+    let server_hostname = if tunnel != NONE {
+        tunnel
+    } else {
+        client_attribute(instance, "host")
+    };
+    let inner = heap::root_values(&[context, sock, server_hostname]);
+    let wrapped = socket::ssl_call(
+        "_ssl_context_wrap_socket",
+        &[context, sock, server_hostname],
+    );
+    if exc::pending() {
+        heap::release_roots(inner);
+        heap::release_roots(root);
+        return NONE;
+    }
+    client_set(instance, "sock", wrapped);
+    heap::release_roots(inner);
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn connection_close_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let idle = client_text(CS_IDLE);
+    client_set(instance, "_state", idle);
+    let sock = client_attribute(instance, "sock");
+    if sock != NONE {
+        client_set(instance, "sock", NONE);
+        client_invoke(sock, "close", &[]);
+    }
+    let response = client_attribute(instance, "_response");
+    if response != NONE {
+        client_set(instance, "_response", NONE);
+        client_invoke(response, "close", &[]);
+    }
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn connection_set_debuglevel_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, level).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    client_set(args[0], "debuglevel", args[1]);
+    NONE
+}
+
+extern "C" fn connection_enter_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+
+    unsafe { *argv }
+}
+
+extern "C" fn connection_exit_entry(argv: *const i64) -> i64 {
+    // SAFETY: four declared parameter slots (self, exc_type, exc_value,
+    // traceback).
+    let args = unsafe { std::slice::from_raw_parts(argv, 4) };
+    let instance = args[0];
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    connection_close_entry(std::slice::from_ref(&instance).as_ptr());
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn connection_set_tunnel_entry(argv: *const i64) -> i64 {
+    // SAFETY: four declared parameter slots (self, host, port, headers).
+    let args = unsafe { std::slice::from_raw_parts(argv, 4) };
+    let instance = args[0];
+    let root = heap::root_values(&[instance, args[1], args[2], args[3]]);
+    let sock = client_attribute(instance, "sock");
+    if sock != NONE {
+        exc::raise_with_message(
+            exc::RUNTIME_ERROR,
+            "Can't set up tunnel for established connection",
+        );
+        heap::release_roots(root);
+        return NONE;
+    }
+    let default_port = value::as_integer(client_attribute(instance, "default_port")).unwrap_or(80);
+    let Some((host_text, port_number)) = connection_host_port(args[1], args[2], default_port)
+    else {
+        heap::release_roots(root);
+        return NONE;
+    };
+    let host_value = client_text(&host_text);
+    let inner = heap::root_values(&[host_value]);
+    client_set(instance, "_tunnel_host", host_value);
+    client_set(instance, "_tunnel_port", client_integer(port_number));
+    let mut pairs: Vec<(i64, i64)> = Vec::new();
+    if args[3] != NONE {
+        if let Some(items) = value::as_dict(args[3]) {
+            pairs = items.to_vec();
+        }
+    }
+    let mut has_host = false;
+    for (name, _) in &pairs {
+        if header_key(*name).is_some_and(|text| text.eq_ignore_ascii_case("host")) {
+            has_host = true;
+        }
+    }
+    if !has_host {
+        let host_name = client_text("Host");
+        let host_value = client_text(&format!("{host_text}:{port_number}"));
+        let pair_root = heap::root_values(&[host_name, host_value]);
+        pairs.push((host_name, host_value));
+        heap::release_roots(pair_root);
+    }
+    let tunnel_headers = value::dict_new(pairs);
+    client_set(instance, "_tunnel_headers", tunnel_headers);
+    heap::release_roots(inner);
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn connection_get_proxy_headers_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    if client_attribute(instance, "_raw_proxy_headers") == NONE {
+        return NONE;
+    }
+    client_attribute(instance, "_proxy_headers_message")
+}
+
+/// Bytes of a header name/value, latin-1 encoded.
+fn header_bytes(item: i64) -> Option<Vec<u8>> {
+    if let Some(text) = value::as_str(item) {
+        return latin1_bytes(text, "header");
+    }
+    value::as_bytes(item).map(|bytes| bytes.to_vec())
+}
+
+/// `[^:\s][^:\r\n]*` — the legal header-name shape.
+fn legal_header_name(name: &[u8]) -> bool {
+    let Some(first) = name.first().copied() else {
+        return false;
+    };
+    if first == b':' || first.is_ascii_whitespace() {
+        return false;
+    }
+    !name
+        .iter()
+        .any(|byte| *byte == b':' || *byte == b'\r' || *byte == b'\n')
+}
+
+/// `\n(?![ \t])|\r(?![ \t\n])` — the illegal header-value shape.
+fn legal_header_value(value: &[u8]) -> bool {
+    for (index, byte) in value.iter().enumerate() {
+        let next = value.get(index + 1).copied();
+        if *byte == b'\n' && !matches!(next, Some(b' ') | Some(b'\t')) {
+            return false;
+        }
+        if *byte == b'\r' && !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\n')) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `_validate_method`: no control characters in the method.
+fn connection_validate_method(method: i64) -> Option<()> {
+    let Some(text) = value::as_str(method) else {
+        client_type_error("method must be str");
+        return None;
+    };
+    if let Some(character) = text.chars().find(|character| (*character as u32) <= 0x1f) {
+        exc::raise_with_message(
+            VALUE_ERROR,
+            &format!(
+                "method can't contain control characters. {text:?} (found at least {character:?})"
+            ),
+        );
+        return None;
+    }
+    Some(())
+}
+
+/// `_validate_path`: no control characters or spaces in the request target.
+fn connection_validate_path(url: i64) -> Option<()> {
+    let Some(text) = value::as_str(url) else {
+        client_invoke(url, "startswith", &[]);
+        return None;
+    };
+    if let Some(character) = text
+        .chars()
+        .find(|character| (*character as u32) <= 0x20 || (*character as u32) == 0x7f)
+    {
+        client_raise_message(
+            invalid_url_class(),
+            &format!(
+                "URL can't contain control characters. {text:?} (found at least {character:?})"
+            ),
+        );
+        return None;
+    }
+    Some(())
+}
+
+fn connection_output(instance: i64, line: i64) -> i64 {
+    let buffer = client_attribute(instance, "_buffer");
+    if buffer == NONE {
+        return client_type_error("connection has no output buffer");
+    }
+    let root = heap::root_values(&[instance, buffer, line]);
+    let result = client_invoke(buffer, "append", &[line]);
+    heap::release_roots(root);
+    result
+}
+
+fn connection_send(instance: i64, data: i64) -> i64 {
+    let root = heap::root_values(&[instance, data]);
+    let mut sock = client_attribute(instance, "sock");
+    if sock == NONE {
+        if value::truthy(client_attribute(instance, "auto_open")) {
+            connection_connect_impl(instance);
+            if exc::pending() {
+                heap::release_roots(root);
+                return NONE;
+            }
+            sock = client_attribute(instance, "sock");
+        } else {
+            heap::release_roots(root);
+            return raise_not_connected();
+        }
+    }
+    if sock == NONE {
+        heap::release_roots(root);
+        return NONE;
+    }
+    let sock_root = heap::root_values(std::slice::from_ref(&sock));
+    if client_has(data, "read") {
+        let blocksize = client_attribute(instance, "blocksize");
+        let limit = if value::as_integer(blocksize).is_some_and(|size| size > 0) {
+            blocksize
+        } else {
+            client_integer(8192)
+        };
+        loop {
+            let chunk = client_invoke(data, "read", &[limit]);
+            if exc::pending() {
+                heap::release_roots(sock_root);
+                heap::release_roots(root);
+                return NONE;
+            }
+            let bytes = value::as_bytes(chunk)
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default();
+            if bytes.is_empty() {
+                break;
+            }
+            let piece = value::bytes_new(bytes);
+            let inner = heap::root_values(std::slice::from_ref(&piece));
+            client_invoke(sock, "sendall", &[piece]);
+            heap::release_roots(inner);
+            if exc::pending() {
+                heap::release_roots(sock_root);
+                heap::release_roots(root);
+                return NONE;
+            }
+        }
+    } else {
+        client_invoke(sock, "sendall", &[data]);
+    }
+    heap::release_roots(sock_root);
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn connection_send_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, data).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    connection_send(args[0], args[1])
+}
+
+extern "C" fn connection_output_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, line).
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    connection_output(args[0], args[1])
+}
+
+/// Body chunks: file-like objects stream, buffer objects are one chunk, and
+/// any other iterable is drained chunk by chunk.
+fn connection_body_chunks(instance: i64, body: i64) -> Option<Vec<i64>> {
+    if client_has(body, "read") {
+        let blocksize = client_attribute(instance, "blocksize");
+        let limit = if value::as_integer(blocksize).is_some_and(|size| size > 0) {
+            blocksize
+        } else {
+            client_integer(8192)
+        };
+        let mut chunks = Vec::new();
+        loop {
+            let chunk = client_invoke(body, "read", &[limit]);
+            if exc::pending() {
+                return None;
+            }
+            let bytes = value::as_bytes(chunk)
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default();
+            if bytes.is_empty() {
+                break;
+            }
+            chunks.push(chunk);
+        }
+        return Some(chunks);
+    }
+    if value::as_bytes(body).is_some() {
+        return Some(vec![body]);
+    }
+    let iterator = crate::iter::iter_of(body);
+    if exc::pending() {
+        return None;
+    }
+    let root = heap::root_values(std::slice::from_ref(&iterator));
+    let mut chunks = Vec::new();
+    loop {
+        let mut item = NONE;
+        let status = crate::iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            heap::release_roots(root);
+            return None;
+        }
+        if status == 0 {
+            break;
+        }
+        chunks.push(item);
+    }
+    heap::release_roots(root);
+    Some(chunks)
+}
+
+fn connection_send_output(instance: i64, message_body: i64, encode_chunked: bool) -> i64 {
+    let root = heap::root_values(&[instance, message_body]);
+    let buffer = client_attribute(instance, "_buffer");
+    if buffer == NONE {
+        heap::release_roots(root);
+        return client_type_error("connection has no output buffer");
+    }
+    let buffer_root = heap::root_values(&[buffer]);
+    let empty = value::bytes_new(Vec::new());
+    let tail = value::list_new(vec![empty, empty]);
+    let tail_root = heap::root_values(&[tail]);
+    client_invoke(buffer, "extend", &[tail]);
+    heap::release_roots(tail_root);
+    if exc::pending() {
+        heap::release_roots(buffer_root);
+        heap::release_roots(root);
+        return NONE;
+    }
+    let separator = value::bytes_new(b"\r\n".to_vec());
+    let separator_root = heap::root_values(&[separator]);
+    let message = client_invoke(separator, "join", &[buffer]);
+    heap::release_roots(separator_root);
+    let message_root = heap::root_values(std::slice::from_ref(&message));
+    client_invoke(buffer, "clear", &[]);
+    heap::release_roots(buffer_root);
+    if exc::pending() {
+        heap::release_roots(message_root);
+        heap::release_roots(root);
+        return NONE;
+    }
+    connection_send(instance, message);
+    heap::release_roots(message_root);
+    if exc::pending() {
+        heap::release_roots(root);
+        return NONE;
+    }
+    if message_body != NONE {
+        let Some(chunks) = connection_body_chunks(instance, message_body) else {
+            heap::release_roots(root);
+            return NONE;
+        };
+        let vsn = value::as_integer(client_attribute(instance, "_http_vsn")).unwrap_or(11);
+        for chunk in chunks {
+            let Some(chunk_len) = value::as_bytes(chunk).map(|bytes| bytes.len()) else {
+                heap::release_roots(root);
+                return client_type_error(
+                    "message_body should be a bytes-like object or an iterable",
+                );
+            };
+            if chunk_len == 0 {
+                continue;
+            }
+            let chunk_root = heap::root_values(std::slice::from_ref(&chunk));
+            let outgoing = if encode_chunked && vsn == 11 {
+                let prefix = value::bytes_new(format!("{chunk_len:X}\r\n").into_bytes());
+                let suffix = value::bytes_new(b"\r\n".to_vec());
+                let parts = value::list_new(vec![prefix, chunk, suffix]);
+                let parts_root = heap::root_values(&[parts]);
+                let empty_separator = value::bytes_new(Vec::new());
+                let joined = client_invoke(empty_separator, "join", &[parts]);
+                heap::release_roots(parts_root);
+                joined
+            } else {
+                chunk
+            };
+            let outgoing_root = heap::root_values(std::slice::from_ref(&outgoing));
+            connection_send(instance, outgoing);
+            heap::release_roots(outgoing_root);
+            heap::release_roots(chunk_root);
+            if exc::pending() {
+                heap::release_roots(root);
+                return NONE;
+            }
+        }
+        if encode_chunked && vsn == 11 {
+            let ending = value::bytes_new(b"0\r\n\r\n".to_vec());
+            let ending_root = heap::root_values(std::slice::from_ref(&ending));
+            connection_send(instance, ending);
+            heap::release_roots(ending_root);
+        }
+    }
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn connection_send_output_entry(argv: *const i64) -> i64 {
+    // SAFETY: three declared parameter slots (self, message_body,
+    // encode_chunked).
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    connection_send_output(args[0], args[1], value::truthy(args[2]))
+}
+
+fn connection_putheader_impl(instance: i64, header: i64, values: &[i64]) -> i64 {
+    let state = client_attribute(instance, "_state");
+    if value::as_str(state) != Some(CS_REQ_STARTED) {
+        return raise_cannot_send_header();
+    }
+    let Some(name_bytes) = header_bytes(header) else {
+        return client_type_error("header name must be str or bytes");
+    };
+    if !legal_header_name(&name_bytes) {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            &format!("Invalid header name {}", value::repr(header)),
+        );
+    }
+    let root = heap::root_values(values);
+    let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(values.len());
+    for &one in values {
+        let bytes = if let Some(text) = value::as_str(one) {
+            match latin1_bytes(text, "header") {
+                Some(bytes) => bytes,
+                None => {
+                    heap::release_roots(root);
+                    return NONE;
+                }
+            }
+        } else if let Some(number) = value::as_integer(one) {
+            number.to_string().into_bytes()
+        } else if let Some(bytes) = value::as_bytes(one) {
+            bytes.to_vec()
+        } else {
+            heap::release_roots(root);
+            return client_type_error("header value must be str, int or bytes");
+        };
+        if !legal_header_value(&bytes) {
+            heap::release_roots(root);
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("Invalid header value {}", value::repr(one)),
+            );
+        }
+        encoded.push(bytes);
+    }
+    let mut line = name_bytes;
+    line.extend_from_slice(b": ");
+    for (index, part) in encoded.iter().enumerate() {
+        if index > 0 {
+            line.extend_from_slice(b"\r\n\t");
+        }
+        line.extend_from_slice(part);
+    }
+    let line_value = value::bytes_new(line);
+    let result = connection_output(instance, line_value);
+    heap::release_roots(root);
+    result
+}
+
+extern "C" fn connection_putheader_entry(argv: *const i64) -> i64 {
+    // SAFETY: three declared parameter slots (self, header, values list).
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    let values: Vec<i64> = value::as_list(args[2])
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    connection_putheader_impl(args[0], args[1], &values)
+}
+
+/// The `Host:` header value for `putrequest`.
+fn connection_host_header(instance: i64, url: &str) -> i64 {
+    let mut netloc = String::new();
+    if url.starts_with("http") {
+        if let Some((_, rest)) = url.split_once("://") {
+            netloc = rest.split(['/', '?', '#']).next().unwrap_or("").to_string();
+        }
+    }
+    if !netloc.is_empty() {
+        return client_text(&netloc);
+    }
+    let tunnel = client_attribute(instance, "_tunnel_host");
+    let use_tunnel = tunnel != NONE && value::as_str(tunnel).is_some();
+    let host = if use_tunnel {
+        tunnel
+    } else {
+        client_attribute(instance, "host")
+    };
+    let port = if use_tunnel {
+        client_attribute(instance, "_tunnel_port")
+    } else {
+        client_attribute(instance, "port")
+    };
+    let Some(host_text) = value::as_str(host) else {
+        return NONE;
+    };
+    let mut host_enc = host_text.to_string();
+    if host_enc.contains(':') && !host_enc.starts_with('[') {
+        host_enc = format!("[{host_enc}]");
+    }
+    if host_text.contains(':') {
+        if let Some(percent) = host_enc.find('%') {
+            let prefix = host_enc[..percent].to_string();
+            host_enc = format!("{prefix}]");
+        }
+    }
+    let port_number = value::as_integer(port).unwrap_or(80);
+    let default_port = value::as_integer(client_attribute(instance, "default_port")).unwrap_or(80);
+    if port_number == default_port {
+        client_text(&host_enc)
+    } else {
+        client_text(&format!("{host_enc}:{port_number}"))
+    }
+}
+
+fn connection_putrequest_impl(
+    instance: i64,
+    method: i64,
+    url: i64,
+    skip_host: bool,
+    skip_accept_encoding: bool,
+) -> i64 {
+    let root = heap::root_values(&[instance, method, url]);
+    let response = client_attribute(instance, "_response");
+    if response != NONE {
+        let closed = client_invoke(response, "isclosed", &[]);
+        if !exc::pending() && value::truthy(closed) {
+            client_set(instance, "_response", NONE);
+        }
+    }
+    let state = client_attribute(instance, "_state");
+    if value::as_str(state) == Some(CS_IDLE) {
+        let started = client_text(CS_REQ_STARTED);
+        client_set(instance, "_state", started);
+    } else {
+        heap::release_roots(root);
+        return raise_cannot_send_request(state);
+    }
+    if connection_validate_method(method).is_none() {
+        heap::release_roots(root);
+        return NONE;
+    }
+    client_set(instance, "_method", method);
+    let url = if value::truthy(url) {
+        url
+    } else {
+        client_text("/")
+    };
+    if connection_validate_path(url).is_none() {
+        heap::release_roots(root);
+        return NONE;
+    }
+    let (Some(method_text), Some(url_text)) = (value::as_str(method), value::as_str(url)) else {
+        heap::release_roots(root);
+        return client_type_error("method and url must be str");
+    };
+    let vsn_str = value::as_str(client_attribute(instance, "_http_vsn_str"))
+        .unwrap_or("HTTP/1.1")
+        .to_string();
+    let request = format!("{method_text} {url_text} {vsn_str}");
+    let request_value = value::bytes_new(request.into_bytes());
+    let request_root = heap::root_values(std::slice::from_ref(&request_value));
+    connection_output(instance, request_value);
+    heap::release_roots(request_root);
+    if exc::pending() {
+        heap::release_roots(root);
+        return NONE;
+    }
+    let vsn = value::as_integer(client_attribute(instance, "_http_vsn")).unwrap_or(11);
+    if vsn == 11 {
+        if !skip_host {
+            let host_value = connection_host_header(instance, url_text);
+            if host_value == NONE {
+                heap::release_roots(root);
+                return NONE;
+            }
+            let host_name = client_text("Host");
+            let inner = heap::root_values(&[host_value, host_name]);
+            connection_putheader_impl(instance, host_name, &[host_value]);
+            heap::release_roots(inner);
+            if exc::pending() {
+                heap::release_roots(root);
+                return NONE;
+            }
+        }
+        if !skip_accept_encoding {
+            let name = client_text("Accept-Encoding");
+            let value_part = client_text("identity");
+            let inner = heap::root_values(&[name, value_part]);
+            connection_putheader_impl(instance, name, &[value_part]);
+            heap::release_roots(inner);
+            if exc::pending() {
+                heap::release_roots(root);
+                return NONE;
+            }
+        }
+    }
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn connection_putrequest_entry(argv: *const i64) -> i64 {
+    // SAFETY: five declared parameter slots (self, method, url, skip_host,
+    // skip_accept_encoding).
+    let args = unsafe { std::slice::from_raw_parts(argv, 5) };
+    connection_putrequest_impl(
+        args[0],
+        args[1],
+        args[2],
+        value::truthy(args[3]),
+        value::truthy(args[4]),
+    )
+}
+
+fn connection_endheaders_impl(instance: i64, message_body: i64, encode_chunked: bool) -> i64 {
+    let state = client_attribute(instance, "_state");
+    if value::as_str(state) == Some(CS_REQ_STARTED) {
+        let sent = client_text(CS_REQ_SENT);
+        client_set(instance, "_state", sent);
+    } else {
+        return raise_cannot_send_header();
+    }
+    connection_send_output(instance, message_body, encode_chunked)
+}
+
+extern "C" fn connection_endheaders_entry(argv: *const i64) -> i64 {
+    // SAFETY: three declared parameter slots (self, message_body,
+    // encode_chunked).
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    connection_endheaders_impl(args[0], args[1], value::truthy(args[2]))
+}
+
+fn connection_expects_body(method: i64) -> bool {
+    value::as_str(method)
+        .map(|text| matches!(text.to_uppercase().as_str(), "PATCH" | "POST" | "PUT"))
+        .unwrap_or(false)
+}
+
+/// `_get_content_length(body, method)`.
+fn connection_content_length(body: i64, method: i64) -> Option<i64> {
+    if body == NONE {
+        return if connection_expects_body(method) {
+            Some(0)
+        } else {
+            None
+        };
+    }
+    if client_has(body, "read") {
+        return None;
+    }
+    if let Some(bytes) = value::as_bytes(body) {
+        return Some(bytes.len() as i64);
+    }
+    if let Some(text) = value::as_str(body) {
+        return Some(text.chars().count() as i64);
+    }
+    None
+}
+
+/// Headers as `(name, value)` pairs from a mapping or an iterable of pairs.
+fn connection_header_pairs(headers: i64) -> Option<Vec<(i64, i64)>> {
+    if headers == NONE {
+        return Some(Vec::new());
+    }
+    if let Some(items) = value::as_dict(headers) {
+        return Some(items.to_vec());
+    }
+    let iterator = crate::iter::iter_of(headers);
+    if exc::pending() {
+        return None;
+    }
+    let root = heap::root_values(std::slice::from_ref(&iterator));
+    let mut pairs = Vec::new();
+    loop {
+        let mut item = NONE;
+        let status = crate::iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            heap::release_roots(root);
+            return None;
+        }
+        if status == 0 {
+            break;
+        }
+        let Some(tuple) = value::as_tuple(item) else {
+            heap::release_roots(root);
+            client_type_error("headers must be a mapping or an iterable of 2-tuples");
+            return None;
+        };
+        let items = tuple.to_vec();
+        if items.len() != 2 {
+            heap::release_roots(root);
+            client_type_error("header tuple must have exactly 2 items");
+            return None;
+        }
+        pairs.push((items[0], items[1]));
+    }
+    heap::release_roots(root);
+    Some(pairs)
+}
+
+fn connection_send_request(
+    instance: i64,
+    method: i64,
+    url: i64,
+    body: i64,
+    headers: i64,
+    encode_chunked: bool,
+) -> i64 {
+    let root = heap::root_values(&[instance, method, url, body, headers]);
+    let Some(pairs) = connection_header_pairs(headers) else {
+        heap::release_roots(root);
+        return NONE;
+    };
+    let pairs_root = heap::root_values(
+        &pairs
+            .iter()
+            .flat_map(|(name, value)| [*name, *value])
+            .collect::<Vec<i64>>(),
+    );
+    let mut lower_names: Vec<String> = Vec::with_capacity(pairs.len());
+    for (name, _) in &pairs {
+        if let Some(text) = header_key(*name) {
+            lower_names.push(text.to_lowercase());
+        }
+    }
+    let skip_host = lower_names.iter().any(|name| name == "host");
+    let skip_accept = lower_names.iter().any(|name| name == "accept-encoding");
+    connection_putrequest_impl(instance, method, url, skip_host, skip_accept);
+    if exc::pending() {
+        heap::release_roots(pairs_root);
+        heap::release_roots(root);
+        return NONE;
+    }
+    let mut encode = encode_chunked;
+    if !lower_names.iter().any(|name| name == "content-length") {
+        if !lower_names.iter().any(|name| name == "transfer-encoding") {
+            encode = false;
+            match connection_content_length(body, method) {
+                None => {
+                    if body != NONE {
+                        encode = true;
+                        let name = client_text("Transfer-Encoding");
+                        let part = client_text("chunked");
+                        let inner = heap::root_values(&[name, part]);
+                        connection_putheader_impl(instance, name, &[part]);
+                        heap::release_roots(inner);
+                    }
+                }
+                Some(length) => {
+                    let name = client_text("Content-Length");
+                    let part = client_text(&length.to_string());
+                    let inner = heap::root_values(&[name, part]);
+                    connection_putheader_impl(instance, name, &[part]);
+                    heap::release_roots(inner);
+                }
+            }
+        }
+    } else {
+        encode = false;
+    }
+    if exc::pending() {
+        heap::release_roots(pairs_root);
+        heap::release_roots(root);
+        return NONE;
+    }
+    for (name, value) in &pairs {
+        connection_putheader_impl(instance, *name, &[*value]);
+        if exc::pending() {
+            heap::release_roots(pairs_root);
+            heap::release_roots(root);
+            return NONE;
+        }
+    }
+    let body = if let Some(text) = value::as_str(body) {
+        match latin1_bytes(text, "body") {
+            Some(bytes) => value::bytes_new(bytes),
+            None => {
+                heap::release_roots(pairs_root);
+                heap::release_roots(root);
+                return NONE;
+            }
+        }
+    } else {
+        body
+    };
+    connection_endheaders_impl(instance, body, encode);
+    heap::release_roots(pairs_root);
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn connection_request_entry(argv: *const i64) -> i64 {
+    // SAFETY: six declared parameter slots (self, method, url, body, headers,
+    // encode_chunked).
+    let args = unsafe { std::slice::from_raw_parts(argv, 6) };
+    connection_send_request(
+        args[0],
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        value::truthy(args[5]),
+    )
+}
+
+extern "C" fn connection_send_request_entry(argv: *const i64) -> i64 {
+    connection_request_entry(argv)
+}
+
+extern "C" fn connection_getresponse_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let response = client_attribute(instance, "_response");
+    if response != NONE {
+        let closed = client_invoke(response, "isclosed", &[]);
+        if !exc::pending() && value::truthy(closed) {
+            client_set(instance, "_response", NONE);
+        }
+    }
+    let response = client_attribute(instance, "_response");
+    let state = client_attribute(instance, "_state");
+    if value::as_str(state) != Some(CS_REQ_SENT) || response != NONE {
+        heap::release_roots(root);
+        return raise_response_not_ready(state);
+    }
+    let mut class = client_attribute(instance, "response_class");
+    if class == NONE {
+        class = response_class();
+    }
+    let sock = client_attribute(instance, "sock");
+    let debuglevel = client_attribute(instance, "debuglevel");
+    let method = client_attribute(instance, "_method");
+    let class_root = heap::root_values(&[class, sock, debuglevel, method]);
+    let call_args = [sock, debuglevel];
+    let keyword_name = client_text("method");
+    let keywords = [keyword_name, method];
+    let created = crate::builtins::call_kw(class, 2, call_args.as_ptr(), 1, keywords.as_ptr());
+    if exc::pending() {
+        heap::release_roots(class_root);
+        heap::release_roots(root);
+        return NONE;
+    }
+    let response_root = heap::root_values(std::slice::from_ref(&created));
+    client_invoke(created, "begin", &[]);
+    if exc::pending() {
+        client_invoke(created, "close", &[]);
+        heap::release_roots(response_root);
+        heap::release_roots(class_root);
+        heap::release_roots(root);
+        return NONE;
+    }
+    let idle = client_text(CS_IDLE);
+    client_set(instance, "_state", idle);
+    let will_close = value::truthy(client_attribute(created, "will_close"));
+    if will_close {
+        // CPython closes the connection and lets the response keep its
+        // `makefile` handle; a raw-mode response reads the same socket, so the
+        // socket is handed over instead of closed here.
+        let raw = value::truthy(client_attribute(created, "raw"));
+        let sock = client_attribute(instance, "sock");
+        client_set(instance, "sock", NONE);
+        client_set(instance, "_response", NONE);
+        if raw {
+            client_set(created, "_owns_sock", client_bool(true));
+        } else if sock != NONE {
+            let sock_root = heap::root_values(std::slice::from_ref(&sock));
+            client_invoke(sock, "close", &[]);
+            heap::release_roots(sock_root);
+        }
+    } else {
+        client_set(instance, "_response", created);
+    }
+    heap::release_roots(response_root);
+    heap::release_roots(class_root);
+    heap::release_roots(root);
+    if exc::pending() {
+        NONE
+    } else {
+        created
+    }
+}
+
+/// `_tunnel()`: CONNECT through the proxy and validate the reply.
+fn connection_tunnel(instance: i64) -> i64 {
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let tunnel_host = client_attribute(instance, "_tunnel_host");
+    let Some(tunnel_text) = value::as_str(tunnel_host) else {
+        heap::release_roots(root);
+        return client_type_error("tunnel host must be str");
+    };
+    if let Some(character) = tunnel_text
+        .chars()
+        .find(|character| (*character as u32) <= 0x20 || (*character as u32) == 0x7f)
+    {
+        heap::release_roots(root);
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            &format!(
+                "Tunnel host can't contain control characters {tunnel_text:?} (found at least {character:?})"
+            ),
+        );
+    }
+    let port = value::as_integer(client_attribute(instance, "_tunnel_port")).unwrap_or(443);
+    let vsn_str = value::as_str(client_attribute(instance, "_http_vsn_str"))
+        .unwrap_or("HTTP/1.1")
+        .to_string();
+    let mut connect_line = format!("CONNECT {tunnel_text}:{port} {vsn_str}\r\n").into_bytes();
+    let headers = client_attribute(instance, "_tunnel_headers");
+    let pairs: Vec<(i64, i64)> = value::as_dict(headers)
+        .map(|pairs| pairs.to_vec())
+        .unwrap_or_default();
+    for (name, item) in pairs {
+        let Some(name_bytes) = header_bytes(name) else {
+            heap::release_roots(root);
+            return client_type_error("tunnel header name must be str");
+        };
+        if !legal_header_name(&name_bytes) {
+            heap::release_roots(root);
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("Invalid header name {}", value::repr(name)),
+            );
+        }
+        let item_text = value::to_string(item);
+        let Some(item_bytes) = latin1_bytes(&item_text, "header") else {
+            heap::release_roots(root);
+            return NONE;
+        };
+        if !legal_header_value(&item_bytes) {
+            heap::release_roots(root);
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("Invalid header value {}", value::repr(item)),
+            );
+        }
+        connect_line.extend_from_slice(&name_bytes);
+        connect_line.extend_from_slice(b": ");
+        connect_line.extend_from_slice(&item_bytes);
+        connect_line.extend_from_slice(b"\r\n");
+    }
+    connect_line.extend_from_slice(b"\r\n");
+    let payload = value::bytes_new(connect_line);
+    let payload_root = heap::root_values(std::slice::from_ref(&payload));
+    connection_send(instance, payload);
+    heap::release_roots(payload_root);
+    if exc::pending() {
+        heap::release_roots(root);
+        return NONE;
+    }
+    let mut class = client_attribute(instance, "response_class");
+    if class == NONE {
+        class = response_class();
+    }
+    let sock = client_attribute(instance, "sock");
+    let method = client_attribute(instance, "_method");
+    let class_root = heap::root_values(&[class, sock, method]);
+    let call_args = [sock, client_integer(0)];
+    let keyword_name = client_text("method");
+    let keywords = [keyword_name, method];
+    let response = crate::builtins::call_kw(class, 2, call_args.as_ptr(), 1, keywords.as_ptr());
+    if exc::pending() {
+        heap::release_roots(class_root);
+        heap::release_roots(root);
+        return NONE;
+    }
+    let response_root = heap::root_values(std::slice::from_ref(&response));
+    client_invoke(response, "begin", &[]);
+    if exc::pending() {
+        client_invoke(response, "close", &[]);
+        heap::release_roots(response_root);
+        heap::release_roots(class_root);
+        heap::release_roots(root);
+        return NONE;
+    }
+    let status = client_attribute(response, "status");
+    let headers_message = client_attribute(response, "headers");
+    client_set(instance, "_raw_proxy_headers", client_bool(true));
+    client_set(instance, "_proxy_headers_message", headers_message);
+    if value::as_integer(status) != Some(200) {
+        let reason = value::as_str(client_attribute(response, "reason"))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let code = value::as_integer(status).unwrap_or(0);
+        client_invoke(response, "close", &[]);
+        connection_close_entry(std::slice::from_ref(&instance).as_ptr());
+        heap::release_roots(response_root);
+        heap::release_roots(class_root);
+        heap::release_roots(root);
+        return exc::raise_with_message(
+            OS_ERROR,
+            &format!("Tunnel connection failed: {code} {reason}"),
+        );
+    }
+    client_invoke(response, "close", &[]);
+    heap::release_roots(response_root);
+    heap::release_roots(class_root);
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn connection_tunnel_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    connection_tunnel(instance)
+}
+
+fn connection_class() -> i64 {
+    let self_only = || vec![client_positional("self")];
+    let encode_chunked = || {
+        client_param(
+            "encode_chunked",
+            hydro_ir::ParamKind::KwOnly,
+            Some(client_bool(false)),
+        )
+    };
+    client_class(
+        "http.client.HTTPConnection",
+        "HTTPConnection",
+        NONE,
+        vec![
+            (
+                "__init__",
+                vec![
+                    client_positional("self"),
+                    client_positional("host"),
+                    client_optional("port", NONE),
+                    client_optional("timeout", NONE),
+                    client_optional("source_address", NONE),
+                    client_param(
+                        "blocksize",
+                        hydro_ir::ParamKind::KwOnly,
+                        Some(client_integer(8192)),
+                    ),
+                ],
+                connection_init_entry,
+            ),
+            (
+                "_get_hostport",
+                vec![
+                    client_positional("self"),
+                    client_positional("host"),
+                    client_positional("port"),
+                ],
+                connection_get_hostport_entry,
+            ),
+            (
+                "_validate_host",
+                vec![client_positional("self"), client_positional("host")],
+                connection_validate_host_entry,
+            ),
+            (
+                "set_tunnel",
+                vec![
+                    client_positional("self"),
+                    client_positional("host"),
+                    client_optional("port", NONE),
+                    client_optional("headers", NONE),
+                ],
+                connection_set_tunnel_entry,
+            ),
+            (
+                "get_proxy_response_headers",
+                self_only(),
+                connection_get_proxy_headers_entry,
+            ),
+            (
+                "set_debuglevel",
+                vec![client_positional("self"), client_positional("level")],
+                connection_set_debuglevel_entry,
+            ),
+            ("connect", self_only(), connection_connect_entry),
+            ("close", self_only(), connection_close_entry),
+            (
+                "send",
+                vec![client_positional("self"), client_positional("data")],
+                connection_send_entry,
+            ),
+            (
+                "_output",
+                vec![client_positional("self"), client_positional("line")],
+                connection_output_entry,
+            ),
+            (
+                "_send_output",
+                vec![
+                    client_positional("self"),
+                    client_optional("message_body", NONE),
+                    encode_chunked(),
+                ],
+                connection_send_output_entry,
+            ),
+            (
+                "putrequest",
+                vec![
+                    client_positional("self"),
+                    client_positional("method"),
+                    client_positional("url"),
+                    client_optional("skip_host", client_bool(false)),
+                    client_optional("skip_accept_encoding", client_bool(false)),
+                ],
+                connection_putrequest_entry,
+            ),
+            (
+                "putheader",
+                vec![
+                    client_positional("self"),
+                    client_positional("header"),
+                    client_param("values", hydro_ir::ParamKind::VarArg, None),
+                ],
+                connection_putheader_entry,
+            ),
+            (
+                "endheaders",
+                vec![
+                    client_positional("self"),
+                    client_optional("message_body", NONE),
+                    encode_chunked(),
+                ],
+                connection_endheaders_entry,
+            ),
+            (
+                "request",
+                vec![
+                    client_positional("self"),
+                    client_positional("method"),
+                    client_positional("url"),
+                    client_optional("body", NONE),
+                    client_optional("headers", NONE),
+                    encode_chunked(),
+                ],
+                connection_request_entry,
+            ),
+            (
+                "_send_request",
+                vec![
+                    client_positional("self"),
+                    client_positional("method"),
+                    client_positional("url"),
+                    client_positional("body"),
+                    client_positional("headers"),
+                    client_positional("encode_chunked"),
+                ],
+                connection_send_request_entry,
+            ),
+            ("getresponse", self_only(), connection_getresponse_entry),
+            ("_tunnel", self_only(), connection_tunnel_entry),
+            ("__enter__", self_only(), connection_enter_entry),
+            (
+                "__exit__",
+                vec![
+                    client_positional("self"),
+                    client_optional("exc_type", NONE),
+                    client_optional("exc_value", NONE),
+                    client_optional("traceback", NONE),
+                ],
+                connection_exit_entry,
+            ),
+        ],
+        vec![
+            ("_http_vsn", client_integer(11)),
+            ("_http_vsn_str", client_text("HTTP/1.1")),
+            ("default_port", client_integer(80)),
+            ("auto_open", client_integer(1)),
+            ("debuglevel", client_integer(0)),
+            ("response_class", response_class()),
+        ],
+    )
+}
+
+fn https_connection_class() -> i64 {
+    let self_only = || vec![client_positional("self")];
+    client_class(
+        "http.client.HTTPSConnection",
+        "HTTPSConnection",
+        connection_class(),
+        vec![
+            (
+                "__init__",
+                vec![
+                    client_positional("self"),
+                    client_positional("host"),
+                    client_optional("port", NONE),
+                    client_optional("timeout", NONE),
+                    client_optional("source_address", NONE),
+                    client_param("context", hydro_ir::ParamKind::KwOnly, Some(NONE)),
+                    client_param(
+                        "blocksize",
+                        hydro_ir::ParamKind::KwOnly,
+                        Some(client_integer(8192)),
+                    ),
+                ],
+                https_init_entry,
+            ),
+            ("connect", self_only(), https_connect_entry),
+        ],
+        vec![("default_port", client_integer(443))],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2171,5 +5502,124 @@ mod tests {
         let body_len = body.len();
         assert!(take_request(&mut body).expect("partial body").is_none());
         assert_eq!(body.len(), body_len);
+    }
+
+    #[test]
+    fn client_headers_unfold_and_skip_malformed_lines() {
+        let lines: Vec<Vec<u8>> = vec![
+            b"First: val\r\n".to_vec(),
+            b": nval\r\n".to_vec(),
+            b"obs-fold: text\r\n".to_vec(),
+            b" folded with space\r\n".to_vec(),
+            b"\tfolded with tab\r\n".to_vec(),
+            b"Content-Length: 0\r\n".to_vec(),
+            b"\r\n".to_vec(),
+        ];
+        let pairs = parse_header_lines(&lines);
+        assert_eq!(
+            pairs,
+            vec![
+                ("First".to_string(), "val".to_string()),
+                (
+                    "obs-fold".to_string(),
+                    "text\n folded with space\n\tfolded with tab".to_string()
+                ),
+                ("Content-Length".to_string(), "0".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn client_header_name_and_value_rules_match_cpython() {
+        assert!(legal_header_name(b"ValidName"));
+        assert!(legal_header_name(b"Key Space"));
+        assert!(legal_header_name(b"KeySpace "));
+        assert!(!legal_header_name(b"Invalid:Name"));
+        assert!(!legal_header_name(b":InvalidName"));
+        assert!(!legal_header_name(b" InvalidName"));
+        assert!(!legal_header_name(b"Invalid\r\nName"));
+        assert!(!legal_header_name(b""));
+
+        assert!(legal_header_value(b"is\r\n allowed"));
+        assert!(legal_header_value(b"is\r\n\tallowed"));
+        assert!(!legal_header_value(b"Invalid\r\nValue"));
+        assert!(!legal_header_value(b"InvalidValue\r\n"));
+        assert!(!legal_header_value(b"next\nline"));
+    }
+
+    #[test]
+    fn client_host_port_parsing_matches_cpython() {
+        exc::init();
+        let cases: &[(&str, Option<&str>, i64)] = &[
+            ("www.python.org", Some("www.python.org"), 80),
+            ("www.python.org:80", Some("www.python.org"), 80),
+            ("www.python.org:", Some("www.python.org"), 80),
+            ("[fe80::207:e9ff:fe9b]", Some("fe80::207:e9ff:fe9b"), 80),
+            ("[fe80::207:e9ff:fe9b]:", Some("fe80::207:e9ff:fe9b"), 80),
+            (
+                "[fe80::207:e9ff:fe9b]:8000",
+                Some("fe80::207:e9ff:fe9b"),
+                8000,
+            ),
+        ];
+        for (input, expected_host, expected_port) in cases {
+            let host = client_text(input);
+            let parsed = connection_host_port(host, NONE, 80);
+            assert!(!exc::pending(), "{input}");
+            let (name, port) = parsed.expect("parsed");
+            assert_eq!(name.as_str(), expected_host.unwrap());
+            assert_eq!(port, *expected_port);
+        }
+        for bad in ["www.python.org:abc", "user:password@www.python.org"] {
+            let host = client_text(bad);
+            assert!(connection_host_port(host, NONE, 80).is_none(), "{bad}");
+            assert!(exc::pending(), "{bad}");
+            exc::clear();
+        }
+    }
+
+    #[test]
+    fn client_message_lookup_is_case_insensitive() {
+        exc::init();
+        let pairs = vec![
+            ("Content-Length".to_string(), "0".to_string()),
+            ("Set-Cookie".to_string(), "a=1".to_string()),
+            ("Set-Cookie".to_string(), "b=2".to_string()),
+        ];
+        let message = message_from_pairs(&pairs);
+        assert!(!exc::pending());
+        assert_eq!(
+            message_get_text(message, "content-length").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            message_get_text(message, "CONTENT-LENGTH").as_deref(),
+            Some("0")
+        );
+        let cookies = message_get_all_values(message, "set-cookie").expect("cookies");
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(message_len(message), 3);
+        assert!(message_get_text(message, "missing").is_none());
+    }
+
+    #[test]
+    fn client_classes_are_cached_and_wired() {
+        exc::init();
+        assert_eq!(constant("HTTPMessage"), message_class());
+        assert_eq!(constant("HTTPResponse"), response_class());
+        assert_eq!(constant("HTTPConnection"), connection_class());
+        assert_eq!(constant("HTTPSConnection"), https_connection_class());
+        assert_eq!(
+            value::class_display_name(constant("HTTPConnection")),
+            Some("HTTPConnection")
+        );
+        assert_eq!(
+            value::class_display_name(constant("HTTPSConnection")),
+            Some("HTTPSConnection")
+        );
+        assert_eq!(constant("HTTP_PORT"), client_integer(80));
+        assert_eq!(constant("responses"), responses_dict());
+        assert_eq!(constant("error"), http_exception_class());
+        assert!(!exc::pending());
     }
 }

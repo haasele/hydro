@@ -78,13 +78,13 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-10-31: **3221 tests run
-(3221 passed, 1 skipped)**; the per-crate breakdown below sums to 3222
+`cargo nextest run --workspace` on 2026-10-31: **3231 tests run
+(3231 passed, 1 skipped)**; the per-crate breakdown below sums to 3232
 (the skipped test is not included in the listed binaries):
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 2078 |
+| runtime (unit + integration) | 2088 |
 | frontend | 905 |
 | codegen | 79 |
 | IR | 71 |

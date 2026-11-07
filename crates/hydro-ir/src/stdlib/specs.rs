@@ -3201,14 +3201,51 @@ pub static BASE64: ModuleSpec = ModuleSpec {
         kw("urlsafe_b64decode", 1, 2, Type::Bytes, &["s", "padded"]),
         f("encodebytes", 1, 1, Type::Bytes),
         f("decodebytes", 1, 1, Type::Bytes),
+        // The legacy file-to-file helpers (`encode(in, out)`/`decode(in, out)`).
+        kw("encode", 2, 2, Type::None, &["input", "output"]),
+        kw("decode", 2, 2, Type::None, &["input", "output"]),
         f("encodestring", 1, 1, Type::Bytes),
         f("decodestring", 1, 1, Type::Bytes),
         f("b16encode", 1, 1, Type::Bytes),
         kw("b16decode", 1, 2, Type::Bytes, &["s", "casefold"]),
         f("b32encode", 1, 1, Type::Bytes),
         kw("b32decode", 1, 3, Type::Bytes, &["s", "casefold", "map01"]),
+        f("b32hexencode", 1, 1, Type::Bytes),
+        kw("b32hexdecode", 1, 2, Type::Bytes, &["s", "casefold"]),
+        // Base85 family. The names after `b` are keyword-only in CPython;
+        // declaring them as keyword-bindable parameters keeps the common
+        // `a85encode(data, adobe=True)` call valid.
+        kw("b85encode", 1, 2, Type::Bytes, &["b", "pad"]),
+        f("b85decode", 1, 1, Type::Bytes),
+        f("z85encode", 1, 1, Type::Bytes),
+        f("z85decode", 1, 1, Type::Bytes),
+        kw(
+            "a85encode",
+            1,
+            5,
+            Type::Bytes,
+            &["b", "foldspaces", "wrapcol", "pad", "adobe"],
+        ),
+        kw(
+            "a85decode",
+            1,
+            4,
+            Type::Bytes,
+            &["b", "foldspaces", "adobe", "ignorechars"],
+        ),
     ],
-    constants: &[],
+    constants: &[
+        // The alphabets and line limits `Lib/base64.py` keeps at module scope.
+        c("_b32alphabet", Type::Bytes),
+        c("_b32hexalphabet", Type::Bytes),
+        c("_b85alphabet", Type::Bytes),
+        c("_z85alphabet", Type::Bytes),
+        c("_A85START", Type::Bytes),
+        c("_A85END", Type::Bytes),
+        c("MAXLINESIZE", Type::Int),
+        c("MAXBINSIZE", Type::Int),
+        c("__all__", Type::Any),
+    ],
 };
 
 /// `quopri`: quoted-printable encoding and decoding.
@@ -3426,6 +3463,30 @@ pub static TMPFILE: ModuleSpec = ModuleSpec {
     name: "tempfile",
     functions: &[
         f("gettempdir", 0, 0, Type::Str),
+        f("gettempdirb", 0, 0, Type::Bytes),
+        f("gettempprefix", 0, 0, Type::Str),
+        f("gettempprefixb", 0, 0, Type::Bytes),
+        f("_infer_return_type", 0, 16, Type::Any),
+        f("_candidate_tempdir_list", 0, 0, Type::List),
+        kw("_get_default_tempdir", 0, 1, Type::Str, &["dirlist"]),
+        f("_get_candidate_names", 0, 0, Type::Any),
+        f("_mkstemp_inner", 5, 5, Type::Tuple),
+        kw(
+            "TemporaryFile",
+            0,
+            8,
+            Type::Any,
+            &[
+                "mode",
+                "buffering",
+                "encoding",
+                "newline",
+                "suffix",
+                "prefix",
+                "dir",
+                "errors",
+            ],
+        ),
         // `mktemp(suffix='', prefix='tmp', dir=None)`: CPython's
         // deprecated insecure name generator.
         kw("mktemp", 0, 3, Type::Str, &["suffix", "prefix", "dir"]),
@@ -3442,9 +3503,9 @@ pub static TMPFILE: ModuleSpec = ModuleSpec {
         kw(
             "TemporaryDirectory",
             0,
-            3,
+            5,
             Type::Any,
-            &["suffix", "prefix", "dir"],
+            &["suffix", "prefix", "dir", "ignore_cleanup_errors", "delete"],
         ),
         f("_tempdir_enter", 1, 1, Type::Str),
         f("_tempdir_exit", 4, 4, Type::None),
@@ -3474,6 +3535,15 @@ pub static TMPFILE: ModuleSpec = ModuleSpec {
         ),
     ],
     constants: &[
+        c("SpooledTemporaryFile", Type::Any),
+        c("_RandomNameSequence", Type::Any),
+        c("TMP_MAX", Type::Int),
+        c("template", Type::Str),
+        c("tempdir", Type::Any),
+        c("_bin_openflags", Type::Int),
+        c("_text_openflags", Type::Int),
+        c("_O_TMPFILE_WORKS", Type::Bool),
+        c("_rmtree_use_dir_fd", Type::Bool),
         // `tempfile._TemporaryFileWrapper`: the class `NamedTemporaryFile`
         // returns; tests use it as an `isinstance` target.
         c("_TemporaryFileWrapper", Type::Any),
