@@ -30,6 +30,9 @@ venv/
 /benchmarks/bench_results/
 *.tmp
 
+# CPython test-suite scratch files (e.g. dbm/difflib temp names)
+@test_*
+
 # Editors and OS
 .vscode/
 .idea/
