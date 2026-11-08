@@ -11,10 +11,10 @@
 //!   `bytes`.
 //!
 //! `flock` locks a whole file; `lockf` applies a POSIX record lock. Failures
-//! raise `OSError` (syscall), `TypeError` (argument type), `ValueError`
-//! (invalid `whence`) or `OverflowError` (integer out of range); no user
-//! input can panic. On non-Unix platforms every function raises
-//! `RuntimeError`.
+//! raise `OSError` (syscall), `TypeError` (argument type), `ValueError` (a
+//! negative file descriptor or an invalid `whence`) or `OverflowError`
+//! (integer out of range); no user input can panic. On non-Unix platforms
+//! every function raises `RuntimeError`.
 
 use crate::exc::{self, ATTRIBUTE_ERROR, OS_ERROR, OVERFLOW_ERROR, TYPE_ERROR, VALUE_ERROR};
 #[cfg(unix)]
@@ -128,7 +128,13 @@ fn descriptor_arg(
         number
     };
     if number < 0 {
-        exc::raise_with_message(VALUE_ERROR, "file descriptor cannot be a negative integer");
+        // CPython 3.14's `PyObject_AsFileDescriptor` rejects negative values
+        // before the syscall; a closed-but-positive descriptor still reports
+        // `OSError` from the call itself.
+        exc::raise_with_message(
+            VALUE_ERROR,
+            &format!("file descriptor cannot be a negative integer ({number})"),
+        );
         return None;
     }
     match libc::c_int::try_from(number) {
@@ -705,11 +711,14 @@ mod tests {
         assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
         exc::init();
 
-        // A closed descriptor reports OSError.
+        // CPython 3.14 validates the descriptor itself: a negative value is a
+        // `ValueError` raised before the syscall (a closed non-negative one
+        // would reach the kernel and surface as `OSError`).
         let closed = -1;
         let getfd = constant("F_GETFD").expect("F_GETFD");
         assert_eq!(call("fcntl", &[int(closed), getfd]), NONE);
-        assert_eq!(exc::pending_tag(), i64::from(OS_ERROR));
+        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        assert_eq!(message(), "file descriptor cannot be a negative integer (-1)");
         exc::init();
 
         // A terminal query on a non-terminal descriptor is an errno failure.

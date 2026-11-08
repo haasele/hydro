@@ -2601,9 +2601,61 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         "unittest.TestCase.doCleanups",
         native_member("TestCase.doCleanups", 1, 1),
     ),
+    // Class-scoped hooks are installed as classmethods, so the binder passes
+    // the owner class as the first argument.
+    (
+        "unittest.TestCase.setUpClass",
+        native_member("TestCase.setUpClass", 1, 1),
+    ),
+    (
+        "unittest.TestCase.tearDownClass",
+        native_member("TestCase.tearDownClass", 1, 1),
+    ),
+    (
+        "unittest.TestCase.addClassCleanup",
+        native_dynamic_member(
+            "TestCase.addClassCleanup",
+            2,
+            usize::MAX,
+            &["self", "function"],
+        ),
+    ),
+    (
+        "unittest.TestCase.doClassCleanups",
+        native_member("TestCase.doClassCleanups", 1, 1),
+    ),
+    (
+        "unittest.TestCase.enterClassContext",
+        native_member("TestCase.enterClassContext", 2, 2),
+    ),
+    (
+        "unittest.TestCase.enterContext",
+        native_member("TestCase.enterContext", 2, 2),
+    ),
     (
         "unittest.TestCase.subTest",
         native_dynamic_member("TestCase.subTest", 1, 2, &["self", "msg"]),
+    ),
+    (
+        "unittest.TestCase.skipTest",
+        native_member("TestCase.skipTest", 1, 2),
+    ),
+    // Internal helpers `unittest.case` calls on `self`.
+    (
+        "unittest.TestCase._formatMessage",
+        native_member("TestCase._formatMessage", 3, 3),
+    ),
+    (
+        "unittest.TestCase._baseAssertEqual",
+        native_member("TestCase._baseAssertEqual", 3, 3),
+    ),
+    (
+        "unittest.TestCase._truncateMessage",
+        native_member("TestCase._truncateMessage", 3, 3),
+    ),
+    (
+        "unittest.TestCase.addTypeEqualityFunc",
+        native_member("TestCase.addTypeEqualityFunc", 3, 3),
     ),
     ("unittest.TestCase.id", native_member("TestCase.id", 1, 1)),
     (
@@ -3120,6 +3172,10 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         native_member("TestResult._exc_info_to_string", 3, 3),
     ),
     (
+        "unittest.TextTestResult.getDescription",
+        native_member("TextTestResult.getDescription", 2, 2),
+    ),
+    (
         "unittest.TextTestRunner.__init__",
         native_dynamic_member(
             "TextTestRunner.__init__",
@@ -3194,6 +3250,39 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
     (
         "unittest.TestProgram.parseArgs",
         native_member("TestProgram.parseArgs", 2, 2),
+    ),
+    // The loader's synthetic test case for import failures.
+    (
+        "unittest._FailedTest.__init__",
+        native_member("_FailedTest.__init__", 2, 2),
+    ),
+    (
+        "unittest._FailedTest.__getattr__",
+        native_member("_FailedTest.__getattr__", 2, 2),
+    ),
+    (
+        "unittest._FailedTest.run",
+        native_member("_FailedTest.run", 2, 2),
+    ),
+    (
+        "unittest._FailedTest.countTestCases",
+        native_member("_FailedTest.countTestCases", 1, 1),
+    ),
+    (
+        "unittest._FailedTest.id",
+        native_member("_FailedTest.id", 1, 1),
+    ),
+    (
+        "unittest._FailedTest.shortDescription",
+        native_member("_FailedTest.shortDescription", 1, 1),
+    ),
+    (
+        "unittest._FailedTest.__str__",
+        native_member("_FailedTest.__str__", 1, 1),
+    ),
+    (
+        "unittest._FailedTest.__repr__",
+        native_member("_FailedTest.__repr__", 1, 1),
     ),
     (
         "unittest._ErrorHolder.__init__",
@@ -5466,10 +5555,9 @@ fn builtins_dispatch_kw(function: &str, args: &[i64], keywords: &[(String, i64)]
             // the keyword-only closure slot. The frontend usually binds it
             // positionally already; this covers dynamic calls.
             ("exec", "closure") => 3,
-            // `compile`'s only keyword-only parameter; the runtime compiler
-            // is unavailable, so the value is accepted and then the call
-            // raises the truthful NotImplementedError. Every other parameter
-            // was already bound to its positional slot.
+            // `compile`'s only keyword-only parameter; the compiler accepts
+            // any feature version and ignores it. Every other parameter was
+            // already bound to its positional slot.
             ("compile", "_feature_version") => continue,
             // `dict(**kwargs)` and `type(name, bases, ns, **kwds)` keep their
             // dynamic names for the module's keyword dispatcher; for any
@@ -8353,6 +8441,9 @@ fn constant_value(module: &str, name: &str) -> i64 {
             "TestProgram" => unittest::test_program_class(),
             "defaultTestLoader" => unittest::default_test_loader(),
             "mock" => module_value_by_name("unittest.mock"),
+            // The live module-cleanup list `addModuleCleanup` fills and
+            // `doModuleCleanups` drains; private, but real CPython exposes it.
+            "_module_cleanups" => unittest::module_cleanups(),
             _ => missing_attribute("unittest", name),
         },
         // `unittest.result` re-exports the native result/runner classes, so
@@ -12651,9 +12742,8 @@ pub(crate) fn floor_sqrt_int(v: i64) -> i64 {
 
 /// Dispatches a native `functools` function.
 ///
-/// `lru_cache` is accepted as a decorator factory returning an identity
-/// callable; caching is not implemented, so the decorated function stays
-/// inert. `wraps(wrapped)` is real: it returns the decorator that applies
+/// `cache`/`lru_cache` build real memoising `_lru_cache_wrapper` values in
+/// [`functools::call`]. `wraps(wrapped)` returns the decorator that applies
 /// `update_wrapper` (see [`functools::wraps_decorator`]), so the wrapper gets
 /// the wrapped function's metadata and its `__wrapped__` back-reference.
 ///
@@ -12670,9 +12760,6 @@ fn functools_call(function: &str, args: &[i64]) -> i64 {
     }
     match function {
         "reduce" => reduce(args),
-        // `@cache` is an identity decorator: the function itself is returned.
-        "cache" => args[0],
-        "lru_cache" => value::identity_function_new("lru_cache.<locals>.decorator"),
         "wraps" => functools::wraps_decorator(args[0], args.get(1).copied(), args.get(2).copied()),
         "partial" => value::partial_new(args[0], args[1..].to_vec()),
         "cmp_to_key" => functools_cmp_to_key(args[0]),
@@ -20222,7 +20309,7 @@ fn os_path_call(function: &str, args: &[i64]) -> i64 {
 // os
 
 /// `os.stat(path, *, dir_fd=None, follow_symlinks=True)`: the metadata of
-/// `path` as an `os.stat_result`-shaped namespace.
+/// `path` as an `os.stat_result` struct sequence.
 ///
 /// The frontend reorders keyword spellings into the positional slots (padding
 /// omitted ones with `None`), so `args` may hold up to three entries. The
@@ -20320,8 +20407,14 @@ impl StructSeqLayout {
     }
 
     /// Indexes of the fields that have a Python attribute name.
+    ///
+    /// The named part of the sequence comes first; the extras follow the
+    /// *whole* sequence, including its unnamed trailing fields, because that is
+    /// where their values live (the unnamed `st_atime`/`st_mtime`/`st_ctime`
+    /// integer slots precede the named float extras).
     fn named_slots(&self) -> impl Iterator<Item = (usize, &'static str)> {
         let named_sequence = self.sequence.len() - self.unnamed;
+        let extras_start = self.sequence.len();
         self.sequence
             .iter()
             .take(named_sequence)
@@ -20332,7 +20425,7 @@ impl StructSeqLayout {
                     .iter()
                     .copied()
                     .enumerate()
-                    .map(move |(index, name)| (named_sequence + index, name)),
+                    .map(move |(index, name)| (extras_start + index, name)),
             )
     }
 
@@ -20718,20 +20811,6 @@ fn structseq_method_call(module: &str, function: &str, args: &[i64]) -> Option<i
         }
         _ => return None,
     })
-}
-
-/// Appends one `os.stat_result` field to `namespace`.
-///
-/// The field value is rooted across the mutation so a collection triggered
-/// while the container lock is held cannot free it; the namespace itself is
-/// rooted by the caller until every field is stored.
-fn stat_field(namespace: i64, name: &str, field: i64) {
-    let roots = crate::heap::root_values(&[field]);
-    if let Some(mut state) = value::namespace_pairs_mut(namespace) {
-        state.pairs.push((name.to_string(), field));
-    }
-    crate::heap::write_barrier_edge(namespace, field);
-    crate::heap::release_roots(roots);
 }
 
 /// Encodes a metadata integer, promoting past the tagged-integer range.
@@ -21481,44 +21560,38 @@ fn os_strerror(args: &[i64]) -> i64 {
     value::str_alloc(message.to_string())
 }
 
-/// Builds the `stat_result` namespace from a raw `struct stat`. The field set
-/// matches [`stat_result`] so `os.stat` and `os.fstat` agree.
+/// Builds the `os.stat_result` struct sequence from a raw `struct stat`. The
+/// slot vector matches [`stat_result`], so `os.stat`, `os.lstat` and
+/// `os.fstat` return the same type with the same field order.
 #[cfg(unix)]
 fn stat_result_from_libc(metadata: &libc::stat) -> i64 {
     let seconds_from_nanos = |nanos: i128| value::float_new(nanos as f64 / 1_000_000_000.0);
+    let whole_seconds = |nanos: i128| stat_int(nanos.div_euclid(1_000_000_000));
     let (atime_ns, mtime_ns, ctime_ns) = stat_nanoseconds(metadata);
-    let namespace = value::namespace_new(Vec::new());
-    let roots = crate::heap::root_values(&[namespace]);
-    stat_field(namespace, "st_mode", stat_int(i128::from(metadata.st_mode)));
-    stat_field(namespace, "st_ino", stat_int(i128::from(metadata.st_ino)));
-    stat_field(namespace, "st_dev", stat_int(i128::from(metadata.st_dev)));
-    stat_field(
-        namespace,
-        "st_nlink",
-        stat_int(i128::from(metadata.st_nlink)),
-    );
-    stat_field(namespace, "st_uid", stat_int(i128::from(metadata.st_uid)));
-    stat_field(namespace, "st_gid", stat_int(i128::from(metadata.st_gid)));
-    stat_field(namespace, "st_size", stat_int(i128::from(metadata.st_size)));
-    stat_field(namespace, "st_atime", seconds_from_nanos(atime_ns));
-    stat_field(namespace, "st_mtime", seconds_from_nanos(mtime_ns));
-    stat_field(namespace, "st_ctime", seconds_from_nanos(ctime_ns));
-    stat_field(namespace, "st_atime_ns", stat_int(atime_ns));
-    stat_field(namespace, "st_mtime_ns", stat_int(mtime_ns));
-    stat_field(namespace, "st_ctime_ns", stat_int(ctime_ns));
-    stat_field(namespace, "st_rdev", stat_int(i128::from(metadata.st_rdev)));
-    stat_field(
-        namespace,
-        "st_blksize",
-        stat_int(i128::from(metadata.st_blksize)),
-    );
-    stat_field(
-        namespace,
-        "st_blocks",
-        stat_int(i128::from(metadata.st_blocks)),
-    );
-    crate::heap::release_roots(roots);
-    namespace
+    structseq_new(
+        &STAT_RESULT_LAYOUT,
+        vec![
+            stat_int(i128::from(metadata.st_mode)),
+            stat_int(i128::from(metadata.st_ino)),
+            stat_int(i128::from(metadata.st_dev)),
+            stat_int(i128::from(metadata.st_nlink)),
+            stat_int(i128::from(metadata.st_uid)),
+            stat_int(i128::from(metadata.st_gid)),
+            stat_int(i128::from(metadata.st_size)),
+            whole_seconds(atime_ns),
+            whole_seconds(mtime_ns),
+            whole_seconds(ctime_ns),
+            seconds_from_nanos(atime_ns),
+            seconds_from_nanos(mtime_ns),
+            seconds_from_nanos(ctime_ns),
+            stat_int(atime_ns),
+            stat_int(mtime_ns),
+            stat_int(ctime_ns),
+            stat_int(i128::from(metadata.st_blksize)),
+            stat_int(i128::from(metadata.st_blocks)),
+            stat_int(i128::from(metadata.st_rdev)),
+        ],
+    )
 }
 
 /// Seconds and nanosecond aliases of a raw `struct stat`.
@@ -24202,7 +24275,7 @@ fn os_dir_entry_inode(entry: i64) -> i64 {
     }
 }
 
-/// `DirEntry.stat(*, follow_symlinks=True)`: the `os.stat_result` namespace.
+/// `DirEntry.stat(*, follow_symlinks=True)`: the `os.stat_result` value.
 fn os_dir_entry_stat(entry: i64, args: &[i64]) -> i64 {
     let Some(path) = os_dir_entry_path(entry) else {
         return exc::raise_with_message(
@@ -26109,10 +26182,11 @@ fn sys_getrecursionlimit() -> i64 {
 }
 
 /// `sys.setrecursionlimit(limit)`: validates the new limit like CPython and
-/// stores it for the process. The limit must be an integer greater than zero
-/// (and above the current recursion depth, which is 0 here).
+/// stores it for the process. The limit must be an integer greater than zero;
+/// rejection messages report the Python call depth currently on this thread.
 fn sys_setrecursionlimit(args: &[i64]) -> i64 {
     let limit = args.first().copied().unwrap_or(NONE);
+    let depth = crate::fiber::recursion_depth();
     let Some(limit_value) = value::to_bigint(limit) else {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -26126,7 +26200,7 @@ fn sys_setrecursionlimit(args: &[i64]) -> i64 {
         return exc::raise_with_message(
             RECURSION_ERROR,
             &format!(
-                "cannot set the recursion limit to {limit_value} at the recursion depth 0: \
+                "cannot set the recursion limit to {limit_value} at the recursion depth {depth}: \
                  the limit is too low"
             ),
         );
@@ -26134,7 +26208,10 @@ fn sys_setrecursionlimit(args: &[i64]) -> i64 {
     if limit == 0 {
         return exc::raise_with_message(
             RECURSION_ERROR,
-            "cannot set the recursion limit to 0 at the recursion depth 0: the limit is too low",
+            &format!(
+                "cannot set the recursion limit to 0 at the recursion depth {depth}: \
+                 the limit is too low"
+            ),
         );
     }
     RECURSION_LIMIT.store(limit, Ordering::Relaxed);
@@ -28817,6 +28894,13 @@ mod tests {
             .find_map(|(key, item)| (key.as_str() == name).then_some(*item))
     }
 
+    /// Reads a named field of a struct-sequence instance (`os.stat_result`,
+    /// `os.struct_rusage`, `sys.int_info`), which exposes every named field as
+    /// an instance attribute.
+    fn structseq_field(instance: i64, name: &str) -> Option<i64> {
+        value::instance_attr(instance, name)
+    }
+
     /// Calls `obj.name(args...)` through the native method dispatcher.
     fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
         crate::core::methods::call(obj, name.as_ptr(), name.len(), args.len(), args.as_ptr())
@@ -31378,7 +31462,9 @@ mod tests {
         assert_eq!(method(sub, "is_file", &[]), FALSE);
         let metadata = method(alpha, "stat", &[]);
         assert!(!exc::pending(), "{}", message());
-        let inode = namespace_value(metadata, "st_ino").expect("st_ino");
+        // `DirEntry.stat()` returns an `os.stat_result` struct-sequence
+        // instance; its fields are instance attributes.
+        let inode = structseq_field(metadata, "st_ino").expect("st_ino");
         assert_eq!(method(alpha, "inode", &[]), inode);
         assert!(method_kw(alpha, "stat", &[], &[("follow_symlinks", FALSE)]).ne(&NONE));
         let fspath = crate::core::methods::getattr(alpha, b"__fspath__".as_ptr(), 10);
@@ -33861,17 +33947,34 @@ mod tests {
     #[test]
     fn future_and_types_are_reachable() {
         exc::init();
-        for name in [
-            "annotations",
-            "generator_stop",
-            "division",
-            "absolute_import",
-            "print_function",
-            "unicode_literals",
+        // CPython exposes every feature as a `__future__._Feature` instance
+        // (never a boolean); the record's `compiler_flag` identifies it.
+        for (name, flag) in [
+            ("annotations", 0x1000000),
+            ("generator_stop", 0x800000),
+            ("division", 0x20000),
+            ("absolute_import", 0x40000),
+            ("print_function", 0x100000),
+            ("unicode_literals", 0x200000),
         ] {
-            assert_eq!(get("__future__", name), TRUE, "{name}");
+            let feature = get("__future__", name);
+            assert!(!exc::pending(), "{name}");
+            assert_eq!(
+                value::instance_class_name(feature),
+                Some("_Feature"),
+                "{name} must be a _Feature instance"
+            );
+            assert_eq!(
+                value::instance_attr(feature, "compiler_flag"),
+                Some(int(flag)),
+                "{name} compiler_flag"
+            );
         }
-        assert_eq!(get("__future__", "barry_as_FLUFL"), FALSE);
+        // `barry_as_FLUFL` is a feature record too, not `False`.
+        assert_eq!(
+            value::instance_class_name(get("__future__", "barry_as_FLUFL")),
+            Some("_Feature")
+        );
 
         let class = value::as_class(get("types", "TracebackType")).expect("class value");
         assert_eq!(class.name, "TracebackType");
@@ -33924,12 +34027,20 @@ mod tests {
         let partial = call("functools", "partial", &[target, int(9)]);
         assert_eq!(value::as_str(call_value(partial, &[])), Some("9"));
 
-        // `cache` is the identity decorator.
-        let decorated = string("function");
-        assert_eq!(call("functools", "cache", &[decorated]), decorated);
+        // `cache` wraps the decorated function in a real memoising
+        // `_lru_cache_wrapper`; the wrapper is not the function itself.
+        let cached_source = value::identity_function_new("cached_source");
+        let cached = call("functools", "cache", &[cached_source]);
+        assert!(!exc::pending(), "{}", message());
+        assert_ne!(cached, cached_source);
+        assert_eq!(call_value(cached, &[int(7)]), int(7));
+        assert_eq!(call_value(cached, &[int(7)]), int(7));
+        let info = method(cached, "cache_info", &[]);
+        assert_eq!(value::instance_attr(info, "misses"), Some(int(1)));
+        assert_eq!(value::instance_attr(info, "hits"), Some(int(1)));
 
         // `wraps` copies the wrapped function's metadata and records the
-        // `__wrapped__` back-reference; `lru_cache` stays an identity value.
+        // `__wrapped__` back-reference.
         let wrapped = value::identity_function_new("wrapped");
         let wrapper = value::identity_function_new("wrapper");
         let decorator = call("functools", "wraps", &[wrapped]);
@@ -33940,8 +34051,20 @@ mod tests {
             value::function_attribute(wrapper, "__wrapped__"),
             Some(wrapped)
         );
-        let cached = call("functools", "lru_cache", &[int(16), FALSE]);
-        assert_eq!(call_value(cached, &[decorated]), decorated);
+
+        // `lru_cache(maxsize, typed)` returns the decorator that installs the
+        // same caching wrapper; a repeated call is served from the cache.
+        let limited_source = value::identity_function_new("limited_source");
+        let lru_decorator = call("functools", "lru_cache", &[int(16), FALSE]);
+        assert!(!exc::pending(), "{}", message());
+        let limited = call_value(lru_decorator, &[limited_source]);
+        assert!(!exc::pending(), "{}", message());
+        assert_ne!(limited, limited_source);
+        assert_eq!(call_value(limited, &[int(3)]), int(3));
+        assert_eq!(call_value(limited, &[int(3)]), int(3));
+        let info = method(limited, "cache_info", &[]);
+        assert_eq!(value::instance_attr(info, "hits"), Some(int(1)));
+        assert_eq!(value::instance_attr(info, "misses"), Some(int(1)));
         assert!(!exc::pending());
     }
 
@@ -34555,39 +34678,39 @@ mod tests {
         assert!(!exc::pending());
 
         assert_eq!(
-            as_int(namespace_value(stat, "st_size").expect("st_size")),
+            as_int(structseq_field(stat, "st_size").expect("st_size")),
             5
         );
-        let mode = as_int(namespace_value(stat, "st_mode").expect("st_mode"));
+        let mode = as_int(structseq_field(stat, "st_mode").expect("st_mode"));
         assert_eq!(mode & 0o170000, 0o100000, "regular file mode");
         assert!(
-            as_int(namespace_value(stat, "st_nlink").expect("st_nlink")) >= 1,
+            as_int(structseq_field(stat, "st_nlink").expect("st_nlink")) >= 1,
             "st_nlink must be at least one"
         );
         for name in ["st_ino", "st_dev", "st_uid", "st_gid"] {
-            let field = namespace_value(stat, name).unwrap_or_else(|| panic!("{name}"));
+            let field = structseq_field(stat, name).unwrap_or_else(|| panic!("{name}"));
             assert!(
                 as_big(field) >= BigInt::from(0),
                 "{name} must be a non-negative integer"
             );
         }
-        let mtime = as_float(namespace_value(stat, "st_mtime").expect("st_mtime"));
+        let mtime = as_float(structseq_field(stat, "st_mtime").expect("st_mtime"));
         assert!(mtime > 0.0);
-        assert!(as_float(namespace_value(stat, "st_atime").expect("st_atime")) > 0.0);
-        assert!(as_float(namespace_value(stat, "st_ctime").expect("st_ctime")) > 0.0);
+        assert!(as_float(structseq_field(stat, "st_atime").expect("st_atime")) > 0.0);
+        assert!(as_float(structseq_field(stat, "st_ctime").expect("st_ctime")) > 0.0);
         // Nanosecond aliases are exact integers; 2026 timestamps already
         // exceed the tagged range, so they arrive as BigInts.
-        let mtime_ns = as_big(namespace_value(stat, "st_mtime_ns").expect("st_mtime_ns"));
+        let mtime_ns = as_big(structseq_field(stat, "st_mtime_ns").expect("st_mtime_ns"));
         let approx = value::bigint_to_f64(&mtime_ns).expect("ns fits f64") / 1e9;
         assert!((approx - mtime).abs() < 1e-3);
         assert!(
-            as_big(namespace_value(stat, "st_atime_ns").expect("st_atime_ns")) >= BigInt::from(0)
+            as_big(structseq_field(stat, "st_atime_ns").expect("st_atime_ns")) >= BigInt::from(0)
         );
 
         // Directories keep their file-type bits too.
         let dir_stat = call("os", "stat", &[string(&root.to_string_lossy())]);
         assert!(!exc::pending());
-        let dir_mode = as_int(namespace_value(dir_stat, "st_mode").expect("st_mode"));
+        let dir_mode = as_int(structseq_field(dir_stat, "st_mode").expect("st_mode"));
         assert_eq!(dir_mode & 0o170000, 0o040000, "directory mode");
     }
 
@@ -34623,17 +34746,17 @@ mod tests {
         let followed = call("os", "stat", &[link_value]);
         assert!(!exc::pending());
         assert_eq!(
-            as_int(namespace_value(followed, "st_size").expect("st_size")),
+            as_int(structseq_field(followed, "st_size").expect("st_size")),
             7
         );
 
         // Keyword calls arrive with the omitted `dir_fd` padded to `None`.
         let link_stat = call("os", "stat", &[link_value, NONE, FALSE]);
         assert!(!exc::pending());
-        let link_mode = as_int(namespace_value(link_stat, "st_mode").expect("st_mode"));
+        let link_mode = as_int(structseq_field(link_stat, "st_mode").expect("st_mode"));
         assert_eq!(link_mode & 0o170000, 0o120000, "symbolic link mode");
         assert_ne!(
-            as_int(namespace_value(link_stat, "st_size").expect("st_size")),
+            as_int(structseq_field(link_stat, "st_size").expect("st_size")),
             7
         );
     }
@@ -34651,17 +34774,17 @@ mod tests {
         let link_value = string(&link.to_string_lossy());
         let link_stat = call("os", "lstat", &[link_value]);
         assert!(!exc::pending());
-        let link_mode = as_int(namespace_value(link_stat, "st_mode").expect("st_mode"));
+        let link_mode = as_int(structseq_field(link_stat, "st_mode").expect("st_mode"));
         assert_eq!(link_mode & 0o170000, 0o120000, "symbolic link mode");
         assert_ne!(
-            as_int(namespace_value(link_stat, "st_size").expect("st_size")),
+            as_int(structseq_field(link_stat, "st_size").expect("st_size")),
             7
         );
 
         // `stat` follows the same link to the regular target.
         let target_stat = call("os", "stat", &[link_value]);
         assert!(!exc::pending());
-        let target_mode = as_int(namespace_value(target_stat, "st_mode").expect("st_mode"));
+        let target_mode = as_int(structseq_field(target_stat, "st_mode").expect("st_mode"));
         assert_eq!(target_mode & 0o170000, 0o100000, "regular file mode");
     }
 
@@ -36833,14 +36956,13 @@ mod tests {
             Some(&b"raw"[..])
         );
         exc::init();
+        // `fsdecode` decodes with `surrogateescape`: the undecodable byte
+        // becomes the matching lone surrogate (U+DCFF), which `fsencode`
+        // maps back to the original byte. No replacement character is used.
         let surrogate = call("os", "fsdecode", &[value::bytes_new(vec![0xff])]);
-        assert!(!exc::pending());
-        assert_eq!(value::as_str(surrogate), Some("\u{fffd}"));
-        let roundtrip = call(
-            "os",
-            "fsencode",
-            &[value::str_alloc("\u{fffd}".to_string())],
-        );
+        assert!(!exc::pending(), "{}", message());
+        assert_eq!(value::as_str_codes(surrogate), Some(vec![0xDCFF]));
+        let roundtrip = call("os", "fsencode", &[surrogate]);
         assert_eq!(value::as_bytes(roundtrip), Some(&[0xff][..]));
         exc::init();
         assert_eq!(call("os", "system", &[int(1)]), NONE);
@@ -36868,11 +36990,11 @@ mod tests {
             let metadata = call("os", "fstat", &[int(i64::from(fd))]);
             assert!(!exc::pending());
             assert_eq!(
-                as_int(namespace_value(metadata, "st_size").expect("st_size")),
+                as_int(structseq_field(metadata, "st_size").expect("st_size")),
                 5
             );
             assert_eq!(
-                as_int(namespace_value(metadata, "st_mode").expect("st_mode")) & 0o170000,
+                as_int(structseq_field(metadata, "st_mode").expect("st_mode")) & 0o170000,
                 0o100000
             );
 
@@ -36979,7 +37101,9 @@ mod tests {
         assert_eq!(value::instance_class_name(gm), Some("struct_time"));
         assert_eq!(value::instance_attr(gm, "tm_year"), Some(int(1970)));
         assert_eq!(value::instance_attr(gm, "tm_mday"), Some(int(1)));
-        assert_eq!(value::instance_attr(gm, "tm_wday"), Some(int(4)));
+        // CPython's `struct_time.tm_wday` numbers Monday as 0, so 1 January
+        // 1970 (a Thursday) is 3, not libc's Sunday-based 4.
+        assert_eq!(value::instance_attr(gm, "tm_wday"), Some(int(3)));
         assert_eq!(value::instance_attr(gm, "tm_yday"), Some(int(1)));
         assert_eq!(
             value::as_str(call("time", "strftime", &[string("%Y-%m-%d"), gm])),
@@ -37673,14 +37797,18 @@ mod tests {
             Some("ff")
         );
 
+        // `compile` builds a real runtime unit; the keyword-only `optimize`
+        // value is accepted (the evaluator keeps asserts and annotations as
+        // written, like `optimize=-1`).
         let result = call_kw(
             "builtins",
             "compile",
             &[string("x = 1"), string("<test>"), string("exec")],
             &[("optimize", int(1))],
         );
-        assert_eq!(result, NONE);
-        assert!(message().contains("compile() is not supported"));
+        assert!(!exc::pending(), "{}", message());
+        let code = value::as_code(result).expect("compile returns a code object");
+        assert_eq!(code.filename, "<test>");
     }
 
     #[test]

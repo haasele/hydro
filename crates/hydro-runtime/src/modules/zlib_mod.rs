@@ -1932,9 +1932,11 @@ mod tests {
         );
         let second = call("_zlib_decompress", &[instance, bytes(b"")]);
         assert_eq!(data(second), b" world".to_vec());
+        // CPython 3.14 reports `needs_input = False` once the stream reached
+        // EOF: the decompressor no longer accepts meaningful input.
         assert_eq!(
             value::instance_attr(instance, "needs_input"),
-            Some(value::TRUE)
+            Some(value::FALSE)
         );
         assert_eq!(value::instance_attr(instance, "eof"), Some(value::TRUE));
     }

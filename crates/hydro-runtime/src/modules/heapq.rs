@@ -725,8 +725,14 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         exc::clear();
 
-        assert_eq!(call_heap("merge", &[values]), NONE);
-        assert_eq!(exc::pending_tag(), exc::ATTRIBUTE_ERROR as i64);
+        // `merge()` is implemented: a single sorted input streams through
+        // unchanged (the older stub raised AttributeError for the name).
+        assert_eq!(numbers(call_heap("merge", &[values])), vec![1, 2]);
+        assert!(!exc::pending());
+
+        // A non-iterable argument still reports TypeError without panicking.
+        assert_eq!(call_heap("merge", &[int(1)]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         exc::clear();
     }
 }

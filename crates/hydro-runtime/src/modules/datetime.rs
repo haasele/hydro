@@ -1617,7 +1617,7 @@ fn directive(
         ),
         'B' => Piece::padded(MONTH_NAMES[parts.month as usize - 1].to_string(), 0, ' '),
         'z' => Piece::padded(
-            offset.map(offset_text).unwrap_or_default(),
+            offset.map(offset_compact_text).unwrap_or_default(),
             0,
             ' ',
         ),
@@ -1797,6 +1797,27 @@ fn offset_text(offset: i128) -> String {
         format!("{sign}{hours:02}:{minutes:02}")
     } else {
         format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
+    }
+}
+
+/// `strftime("%z")` form of an offset in microseconds: `±HHMM[SS[.ffffff]]`.
+///
+/// Unlike [`offset_text`] (the `timezone.__str__`/`%Z` spelling, which keeps
+/// the colons), CPython renders `%z` without separators.
+fn offset_compact_text(offset: i128) -> String {
+    let sign = if offset < 0 { '-' } else { '+' };
+    let magnitude = offset.abs();
+    let total_seconds = magnitude / i128::from(MICROS_PER_SECOND);
+    let micros = magnitude % i128::from(MICROS_PER_SECOND);
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    if micros != 0 {
+        format!("{sign}{hours:02}{minutes:02}{seconds:02}.{micros:06}")
+    } else if seconds == 0 {
+        format!("{sign}{hours:02}{minutes:02}")
+    } else {
+        format!("{sign}{hours:02}{minutes:02}{seconds:02}")
     }
 }
 

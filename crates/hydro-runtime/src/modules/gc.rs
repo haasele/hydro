@@ -591,6 +591,9 @@ mod tests {
     fn freeze_pins_and_unfreezes() {
         let _guard = crate::heap::heap_reset_test_guard();
         exc::init();
+        // A fresh test thread starts with an empty heap, and `freeze()` only
+        // pins objects that are already live, so keep one allocated first.
+        let _live = value::list_new(vec![ops::int_result(1)]);
         let before = get_freeze_count();
         assert_eq!(before, ops::int_result(0));
         call("freeze", &[]);
