@@ -51,12 +51,16 @@ fi
 } | tee "$LOG"
 
 CMD=(cargo nextest run --no-fail-fast --test-threads "$NEXTEST_TEST_THREADS" "$@")
+TIMEOUT_CMD=()
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD=(timeout --foreground --signal=INT "${HYDRO_TEST_TIMEOUT:-300}s")
+fi
 set +e
 if [[ -x /usr/bin/time ]]; then
-    /usr/bin/time -v -o "$METRICS" "${CMD[@]}" 2>&1 | tee -a "$LOG"
+    /usr/bin/time -v -o "$METRICS" "${TIMEOUT_CMD[@]}" "${CMD[@]}" 2>&1 | tee -a "$LOG"
     STATUS=${PIPESTATUS[0]}
 else
-    "${CMD[@]}" 2>&1 | tee -a "$LOG"
+    "${TIMEOUT_CMD[@]}" "${CMD[@]}" 2>&1 | tee -a "$LOG"
     STATUS=${PIPESTATUS[0]}
 fi
 set -e

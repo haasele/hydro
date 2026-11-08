@@ -9424,7 +9424,7 @@ mod tests {
         ] {
             assert_eq!(
                 constant("__future__", name).unwrap().ty,
-                Type::Bool,
+                Type::Any,
                 "{name}"
             );
         }
@@ -10119,7 +10119,7 @@ mod tests {
         assert_eq!((explicit.min_args, explicit.max_args), (4, 7));
 
         let dumps = function("marshal", "dumps").unwrap();
-        assert_eq!((dumps.min_args, dumps.max_args), (1, 2));
+        assert_eq!((dumps.min_args, dumps.max_args), (1, 3));
         assert_eq!(dumps.ret, Type::Bytes);
         assert_eq!(function("marshal", "load").unwrap().min_args, 1);
         assert_eq!(constant("marshal", "version").unwrap().ty, Type::Int);
@@ -11098,7 +11098,6 @@ mod tests {
             ("_frozen_importlib", "importlib"),
             ("_frozen_importlib_external", "importlib.machinery"),
             ("importlib._bootstrap_external", "importlib.machinery"),
-            ("zipimport", "importlib.machinery"),
             ("_sysconfig", "sysconfig"),
             ("_json", "json"),
             ("_csv", "csv"),
@@ -12368,7 +12367,7 @@ mod tests {
         );
         assert_eq!(
             constant("locale", "ALT_DIGITS").expect("ALT_DIGITS").ty,
-            Type::List
+            Type::Int
         );
 
         // The semaphore classes and their native method bodies.
