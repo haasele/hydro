@@ -68,8 +68,8 @@ PID=$!
 (
     while kill -0 "$PID" 2>/dev/null; do
         avail=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
-        rss=$(awk '/VmRSS/ {print int($2/1024)}' "/proc/$PID/status" 2>/dev/null || echo 0)
-        printf '%s avail_mb=%s cargo_rss_mb=%s\n' \
+        rss=$(ps -o rss= -g "$PID" 2>/dev/null | awk '{sum += $1} END {print int(sum/1024)}')
+        printf '%s avail_mb=%s test_group_rss_mb=%s\n' \
             "$(date -u +%H:%M:%SZ)" "$avail" "$rss" >> "$METRICS"
         if (( avail < MIN_AVAIL )); then
             printf 'watchdog: avail_mb=%s below %s; terminating test group\n' \
