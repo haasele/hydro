@@ -366,12 +366,12 @@ pub(crate) fn ord_value(v: i64) -> i64 {
     }
 }
 
-/// `chr(i)`: the one-character string for a Unicode scalar value.
+/// `chr(i)`: the one-character string for a Unicode code point.
 ///
-/// `i` must be an integer in `0..=0x10FFFF`; surrogate code points are
-/// rejected because Hydro strings are UTF-8 and cannot represent them. A
-/// non-integer argument raises `TypeError`, a rejected code point
-/// `ValueError`.
+/// `i` must be an integer in `0..=0x10FFFF`. Surrogate code points are valid
+/// arguments, exactly as in CPython; the payload stores them through the
+/// surrogate-preserving encoding. A non-integer argument raises `TypeError`, an
+/// out-of-range code point `ValueError`.
 pub(crate) fn chr_value(v: i64) -> i64 {
     let Some(code) = value::as_integer(v) else {
         return exc::raise_with_message(
@@ -11174,13 +11174,17 @@ mod tests {
         assert_eq!(builtin_call(Builtin::Chr, &[int(0x110000)]), NONE);
         assert_eq!(pending_message(), "chr() arg not in range(0x110000)");
 
+        // Surrogates are legal Python code points (`chr(0xD800) == '\ud800'`);
+        // the payload keeps them in the surrogate-preserving mirror block.
         exc::init();
-        assert_eq!(builtin_call(Builtin::Chr, &[int(0xD800)]), NONE);
-        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        let surrogate = builtin_call(Builtin::Chr, &[int(0xD800)]);
+        assert!(!exc::pending());
+        assert_eq!(value::as_str_codes(surrogate), Some(vec![0xD800]));
         assert_eq!(
-            pending_message(),
-            "chr() arg cannot be a surrogate code point"
+            value::as_integer(builtin_call(Builtin::Ord, &[surrogate])),
+            Some(0xD800)
         );
+        assert!(!exc::pending());
 
         exc::init();
         assert_eq!(builtin_call(Builtin::Chr, &[string("A")]), NONE);
@@ -11643,20 +11647,20 @@ mod tests {
             )),
             Some(2)
         );
-        // A call requires the full call protocol, which the runtime
-        // expression evaluator does not implement; it says so honestly.
-        let _ = builtin_call(Builtin::Eval, &[string("len([1])")]);
-        assert_eq!(exc::pending_tag(), NOT_IMPLEMENTED_ERROR as i64);
-        exc::clear();
-        let _ = builtin_call(Builtin::Exec, &[string("x = 1")]);
-        assert_eq!(exc::pending_tag(), NOT_IMPLEMENTED_ERROR as i64);
-        exc::clear();
-        let _ = builtin_call(
+        // The runtime compiler executes calls and statements.
+        let called = builtin_call(Builtin::Eval, &[string("len([1])")]);
+        assert_eq!(value::as_integer(called), Some(1), "{}", pending_message());
+        assert!(!exc::pending());
+        let exec_globals = value::dict_new(Vec::new());
+        let _ = builtin_call(Builtin::Exec, &[string("x = 1"), exec_globals]);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(namespace_get(exec_globals, "x"), Some(int(1)));
+        let code = builtin_call(
             Builtin::Compile,
             &[string("x = 1"), string("<test>"), string("exec")],
         );
-        assert_eq!(exc::pending_tag(), NOT_IMPLEMENTED_ERROR as i64);
-        exc::clear();
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_ne!(code, NONE);
     }
 
     /// Runs the bounded `exec` compiler and returns the locals namespace.
@@ -11856,42 +11860,20 @@ mod tests {
         assert_eq!(value::class_display_name(class), Some("function"));
         assert!(value::function_setattr(function, "__doc__", string("doc")));
         assert_eq!(rendered(value::function_doc(function)), "doc");
-        assert_eq!(
-            value::function_signature(function)
-                .iter()
-                .map(|param| param.kind)
-                .collect::<Vec<_>>(),
-            vec![ParamKind::PosOnly]
-        );
+        let signature = value::function_signature(function);
+        let positional: Vec<_> = signature
+            .iter()
+            .filter(|param| param.kind == ParamKind::PosOnly)
+            .collect();
+        assert_eq!(positional.len(), 1);
+        assert_eq!(positional[0].name, "obj");
 
-        for source in [
-            "x = 1",
-            "def f(obj, /):\n    pass",
-            "def f(obj, /):\n    return obj.attr",
-            "def f(obj, /):\n    return obj is _obj\n    x = 1",
-            "def f(obj):\n    return obj is _obj",
-            "def f(obj, other, /):\n    return obj is _obj",
-        ] {
-            let _ = builtin_call(
-                Builtin::Exec,
-                &[
-                    string(source),
-                    value::dict_new(Vec::new()),
-                    value::dict_new(Vec::new()),
-                ],
-            );
-            assert_eq!(
-                exc::pending_tag(),
-                NOT_IMPLEMENTED_ERROR as i64,
-                "source should be rejected: {source}"
-            );
-            let message = pending_message();
-            assert!(
-                message.contains("exec() cannot compile Python source at runtime in Hydro"),
-                "{message}"
-            );
-            exc::clear();
-        }
+        // The runtime compiler accepts dynamic source.
+        let globals = value::dict_new(Vec::new());
+        let locals = value::dict_new(Vec::new());
+        let _ = builtin_call(Builtin::Exec, &[string("x = 1"), globals, locals]);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(namespace_get(locals, "x"), Some(int(1)));
     }
 
     #[test]
@@ -11905,17 +11887,12 @@ mod tests {
         let locals = value::dict_new(Vec::new());
         let args = [source, globals, locals];
 
-        // `closure=None` is the documented default and is accepted; the
-        // ordinary source-compilation rejection then applies.
+        // `closure=None` is the documented default and is accepted by the
+        // runtime compiler.
         let none_pair = [string("closure"), NONE];
         let _ = call_kw(function, 3, args.as_ptr(), 1, none_pair.as_ptr());
-        assert_eq!(
-            exc::pending_tag(),
-            NOT_IMPLEMENTED_ERROR as i64,
-            "{}",
-            pending_message()
-        );
-        exc::clear();
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(namespace_get(locals, "x"), Some(int(1)));
 
         // A real closure tuple needs a code object, which Hydro cannot accept.
         let cells = value::tuple_new(vec![NONE]);
@@ -11977,14 +11954,16 @@ mod tests {
         crate::heap::collect();
 
         let func = value::as_function(function).expect("function value");
-        let (globals_ns, locals_ns) = match &func.body {
-            FunctionBody::Exec {
-                globals, locals, ..
-            } => (*globals, *locals),
-            _ => panic!("expected an exec-compiled function"),
-        };
+        assert!(
+            matches!(func.body, FunctionBody::Wrapper { .. }),
+            "expected a runtime-compiled wrapper"
+        );
+        let globals_ns = value::function_signature(function)
+            .iter()
+            .find(|param| param.name == "\u{0}hydro-globals")
+            .and_then(|param| param.default)
+            .expect("globals mapping is retained as a hidden default");
         let target = namespace_get(globals_ns, "_obj").expect("globals entry survived");
-        assert_eq!(namespace_get(locals_ns, "gc_check"), Some(function));
         assert_eq!(call_one(function, target), TRUE);
         assert!(!exc::pending(), "{}", pending_message());
         let other = value::list_new(vec![int(2)]);

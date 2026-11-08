@@ -7555,7 +7555,6 @@ pub(crate) fn function_set_doc(function: i64, doc: &str) {
 pub(crate) fn function_posonly_count(function: i64) -> usize {
     function_signature(function)
         .iter()
-        .take_while(|param| param.kind.is_positional())
         .filter(|param| param.kind == ParamKind::PosOnly)
         .count()
 }

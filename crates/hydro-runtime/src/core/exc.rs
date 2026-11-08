@@ -524,7 +524,7 @@ pub(crate) fn exception_value_with_keywords(
         tag,
         name: tag_name(tag),
         msg: message.to_string(),
-        file: syntax_file_from_keywords(tag, &keywords),
+        file: String::new(),
         line: 0,
         frame: String::new(),
         cause: None,
@@ -537,24 +537,6 @@ pub(crate) fn exception_value_with_keywords(
         keywords,
         object: None,
     })
-}
-
-/// `SyntaxError.filename` supplied through the constructor's `filename`
-/// keyword, or `""` (the accessor then reports `"<string>"`).
-fn syntax_file_from_keywords(tag: u32, keywords: &[(String, i64)]) -> String {
-    if !is_syntax_tag(tag) {
-        return String::new();
-    }
-    keywords
-        .iter()
-        .find_map(|(name, value)| {
-            if name == "filename" {
-                value::as_str(*value).map(str::to_string)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default()
 }
 
 /// Keyword names accepted by the built-in exception constructor `tag`.
@@ -598,7 +580,7 @@ pub(crate) fn exception_value_with_arguments(
         tag,
         name: tag_name(tag),
         msg: message.to_string(),
-        file: syntax_file_from_keywords(tag, &keywords),
+        file: String::new(),
         line: 0,
         frame: String::new(),
         cause: None,
@@ -2700,19 +2682,11 @@ pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
         {
             value::bound_method_new(object, name.to_string())
         }
-        // `SyntaxError`'s human-readable text and source file. CPython stores
-        // them as members; Hydro derives them from the payload and the raise
-        // location, defaulting the filename to `"<string>"` for a
-        // programmatically built error.
+        // `SyntaxError.msg` is the exception's message. The remaining members
+        // (`filename`, `lineno`, `offset`, `text`, `end_lineno`, `end_offset`)
+        // are keyword-backed and default to `None`, exactly like CPython's
+        // member descriptors for an error built without source info.
         "msg" if is_syntax_tag(data.tag) => value::str_alloc(data.msg.clone()),
-        "filename" if is_syntax_tag(data.tag) => {
-            let file = if data.file.is_empty() {
-                "<string>"
-            } else {
-                data.file.as_str()
-            };
-            value::str_alloc(file.to_string())
-        }
         _ => {
             if !exception_keyword_names(data.tag).contains(&name) {
                 return None;
@@ -3593,7 +3567,7 @@ mod tests {
         assert_eq!(exception_attr(syntax, "lineno"), Some(lineno));
         assert_eq!(exception_attr(syntax, "offset"), Some(NONE));
         assert_eq!(exception_attr(syntax, "text"), Some(NONE));
-        assert_eq!(exception_attr(syntax, "filename"), None);
+        assert_eq!(exception_attr(syntax, "filename"), Some(NONE));
         init();
     }
 

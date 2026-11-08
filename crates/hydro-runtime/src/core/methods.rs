@@ -7451,8 +7451,8 @@ fn dict_view_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 return err;
             }
             if view.kind != value::DictViewKind::Values {
-                if let Some(name) = container::unhashable_name(args[0]) {
-                    return type_error(container::unhashable_message(name));
+                if container::unhashable_name(args[0]).is_some() {
+                    return type_error(container::dict_key_unhashable_message(args[0]));
                 }
             }
             value::bool_value(container::dict_view_contains(view, args[0]))
@@ -8743,8 +8743,8 @@ fn dict_update_from_pairs(obj: i64, source: i64) -> i64 {
             );
         }
         let (key, val) = (items[0], items[1]);
-        if let Some(name) = container::unhashable_name(key) {
-            return type_error(container::unhashable_message(name));
+        if let Some(err) = check_hashable(key) {
+            return err;
         }
         if let Some(mut pairs) = value::dict_pairs_mut(obj) {
             container::dict_insert_barrier(obj, &mut pairs, key, val);
@@ -11344,7 +11344,10 @@ mod tests {
         reset();
         invoke(dict(&[]), "update", &[list(&[tuple(&[list(&[]), int(1)])])]);
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
-        assert_eq!(message(), "unhashable type: 'list'");
+        assert_eq!(
+            message(),
+            "cannot use 'list' as a dict key (unhashable type: 'list')"
+        );
 
         reset();
         invoke(dict(&[]), "update", &[int(1)]);
@@ -11357,12 +11360,18 @@ mod tests {
         reset();
         invoke(dict(&[]), "get", &[list(&[])]);
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
-        assert_eq!(message(), "unhashable type: 'list'");
+        assert_eq!(
+            message(),
+            "cannot use 'list' as a dict key (unhashable type: 'list')"
+        );
 
         reset();
         invoke(dict(&[]), "pop", &[dict(&[])]);
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
-        assert_eq!(message(), "unhashable type: 'dict'");
+        assert_eq!(
+            message(),
+            "cannot use 'dict' as a dict key (unhashable type: 'dict')"
+        );
     }
 
     #[test]
@@ -11599,7 +11608,10 @@ mod tests {
 
         invoke(s, "remove", &[list(&[int(1)])]);
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
-        assert_eq!(message(), "unhashable type: 'list'");
+        assert_eq!(
+            message(),
+            "cannot use 'list' as a set element (unhashable type: 'list')"
+        );
         crate::exc::clear();
 
         // copy() is independent.
@@ -11640,7 +11652,10 @@ mod tests {
         crate::exc::clear();
         invoke(base, "union", &[list(&[list(&[int(1)])])]);
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
-        assert_eq!(message(), "unhashable type: 'list'");
+        assert_eq!(
+            message(),
+            "cannot use 'list' as a set element (unhashable type: 'list')"
+        );
 
         crate::exc::clear();
         invoke(base, "union", &[int(1)]);
@@ -11718,7 +11733,10 @@ mod tests {
         crate::exc::clear();
         invoke(partial, "update", &[list(&[int(7), list(&[])])]);
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
-        assert_eq!(message(), "unhashable type: 'list'");
+        assert_eq!(
+            message(),
+            "cannot use 'list' as a set element (unhashable type: 'list')"
+        );
         assert_eq!(value::as_set(partial), Some(&[int(7)][..]));
 
         crate::exc::clear();
@@ -11787,7 +11805,10 @@ mod tests {
         crate::exc::clear();
         invoke(base, "intersection", &[list(&[list(&[])])]);
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
-        assert_eq!(message(), "unhashable type: 'list'");
+        assert_eq!(
+            message(),
+            "cannot use 'list' as a set element (unhashable type: 'list')"
+        );
     }
 
     #[test]
@@ -11888,7 +11909,10 @@ mod tests {
         crate::exc::clear();
         invoke(base, "issubset", &[list(&[list(&[])])]);
         assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
-        assert_eq!(message(), "unhashable type: 'list'");
+        assert_eq!(
+            message(),
+            "cannot use 'list' as a set element (unhashable type: 'list')"
+        );
 
         crate::exc::clear();
         invoke(base, "isdisjoint", &[int(1)]);

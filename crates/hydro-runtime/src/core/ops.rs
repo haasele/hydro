@@ -68,14 +68,27 @@ fn zero_div(message: &str) -> i64 {
     exc::raise_with_message(ZERO_DIVISION_ERROR, message)
 }
 
+/// Type name used in operator diagnostics.
+///
+/// CPython names an instance by its class but reports `type` for a class
+/// object (the metaclass), so a bare class operand never leaks its own name
+/// into an operator error.
+fn operand_type_name(v: i64) -> String {
+    if value::as_class(v).is_some() || is_extension_type(v) {
+        "type".to_string()
+    } else {
+        value::type_name_of(v)
+    }
+}
+
 fn arithmetic_type_error(op: &str, a: i64, b: i64) -> i64 {
     exc::raise_with_message(
         TYPE_ERROR,
         &format!(
             "unsupported operand type(s) for {}: '{}' and '{}'",
             op,
-            value::type_name_of(a),
-            value::type_name_of(b)
+            operand_type_name(a),
+            operand_type_name(b)
         ),
     )
 }
@@ -345,19 +358,12 @@ fn type_union_or(left: i64, right: i64) -> Option<i64> {
 /// A `PyTypeObject` handle is a class, so it is named `type` in the message
 /// even though the opaque storage otherwise reports `object`.
 fn type_union_error(a: i64, b: i64) -> i64 {
-    fn operand(v: i64) -> String {
-        if is_extension_type(v) {
-            "type".to_string()
-        } else {
-            value::type_name_of(v)
-        }
-    }
     exc::raise_with_message(
         TYPE_ERROR,
         &format!(
             "unsupported operand type(s) for |: '{}' and '{}'",
-            operand(a),
-            operand(b)
+            operand_type_name(a),
+            operand_type_name(b)
         ),
     )
 }
@@ -646,7 +652,7 @@ fn contains(left: i64, right: i64, negate: bool) -> i64 {
             TYPE_ERROR,
             &format!(
                 "argument of type '{}' is not iterable",
-                value::type_name(right)
+                operand_type_name(right)
             ),
         );
     };
@@ -1793,8 +1799,8 @@ fn compare(op: u32, a: i64, b: i64) -> i64 {
         &format!(
             "'{}' not supported between instances of '{}' and '{}'",
             cmp_symbol(op),
-            value::type_name_of(a),
-            value::type_name_of(b)
+            operand_type_name(a),
+            operand_type_name(b)
         ),
     )
 }
@@ -2678,11 +2684,17 @@ mod tests {
 
         let unhashable = list(&[int(1)]);
         assert_eq!(binop(OP_IN, unhashable, set(&[int(1)])), NONE);
-        assert_eq!(pending_message(), "unhashable type: 'list'");
+        assert_eq!(
+            pending_message(),
+            "cannot use 'list' as a set element (unhashable type: 'list')"
+        );
 
         exc::init();
         assert_eq!(binop(OP_IN, unhashable, dict(&[(int(1), int(2))])), NONE);
-        assert_eq!(pending_message(), "unhashable type: 'list'");
+        assert_eq!(
+            pending_message(),
+            "cannot use 'list' as a dict key (unhashable type: 'list')"
+        );
     }
 
     #[test]

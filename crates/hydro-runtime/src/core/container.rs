@@ -2405,7 +2405,7 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(
             value::to_string(exc::pending_value()),
-            "unhashable type: 'list'"
+            "cannot use 'list' as a dict key (unhashable type: 'list')"
         );
     }
 
@@ -2472,7 +2472,7 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(
             value::to_string(exc::pending_value()),
-            "unhashable type: 'list'"
+            "cannot use 'list' as a dict key (unhashable type: 'list')"
         );
     }
 
@@ -2545,7 +2545,7 @@ mod tests {
         subscript_set(d, list(&[]), int(1));
         assert_eq!(
             value::to_string(exc::pending_value()),
-            "unhashable type: 'list'"
+            "cannot use 'list' as a dict key (unhashable type: 'list')"
         );
     }
 
@@ -2830,7 +2830,7 @@ mod tests {
         assert_eq!(dict_new(1, bad.as_ptr(), values.as_ptr()), NONE);
         assert_eq!(
             value::to_string(exc::pending_value()),
-            "unhashable type: 'list'"
+            "cannot use 'tuple' as a dict key (unhashable type: 'list')"
         );
     }
 
@@ -2888,7 +2888,7 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(
             value::to_string(exc::pending_value()),
-            "unhashable type: 'list'"
+            "cannot use 'list' as a set element (unhashable type: 'list')"
         );
 
         exc::init();
@@ -2897,7 +2897,7 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(
             value::to_string(exc::pending_value()),
-            "unhashable type: 'list'"
+            "cannot use 'tuple' as a set element (unhashable type: 'list')"
         );
 
         exc::init();
@@ -2907,7 +2907,7 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(
             value::to_string(exc::pending_value()),
-            "unhashable type: 'set'"
+            "cannot use 'set' as a set element (unhashable type: 'set')"
         );
     }
 
@@ -2973,7 +2973,7 @@ mod tests {
         assert_eq!(set_from(mixed), NONE);
         assert_eq!(
             value::to_string(exc::pending_value()),
-            "unhashable type: 'list'"
+            "cannot use 'list' as a set element (unhashable type: 'list')"
         );
     }
 
@@ -3052,7 +3052,7 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(
             value::to_string(exc::pending_value()),
-            "unhashable type: 'list'"
+            "cannot use 'list' as a set element (unhashable type: 'list')"
         );
 
         exc::init();
@@ -3084,7 +3084,7 @@ mod tests {
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
         assert_eq!(
             value::to_string(exc::pending_value()),
-            "unhashable type: 'list'"
+            "cannot use 'list' as a dict key (unhashable type: 'list')"
         );
         assert_eq!(value::as_dict(d).map(|p| p.len()), Some(2));
 
