@@ -401,11 +401,43 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "ignore_errors" => ignore_errors(args),
         "replace_errors" => replace_errors(args),
         "surrogateescape_errors" => surrogateescape_errors(args),
-        _ => exc::raise_with_message(
-            exc::ATTRIBUTE_ERROR,
-            &format!("module '_codecs' has no attribute '{function}'"),
-        ),
+        // The stateless entry points [`codec_info`] advertises for the codecs
+        // without a hand-written function above: `utf_16_encode`,
+        // `cp1252_decode`, `shift_jis_encode`, ...
+        _ => codec_entry(function, args),
     }
+}
+
+/// Dispatches a generic `{codec}_encode`/`{codec}_decode` entry point.
+///
+/// The suffix is stripped and the remainder resolved through the same alias
+/// table `lookup` uses, so `utf_16_le_decode` and `iso8859_15_encode` reach the
+/// shared engines instead of failing as unknown module attributes.
+fn codec_entry(function: &str, args: &[i64]) -> i64 {
+    let (prog, encode) = match function
+        .strip_suffix("_encode")
+        .map(|prog| (prog, true))
+        .or_else(|| function.strip_suffix("_decode").map(|prog| (prog, false)))
+    {
+        Some(entry) => entry,
+        None => return unknown_entry(function),
+    };
+    let Some(codec) = codec_for_name(prog) else {
+        return unknown_entry(function);
+    };
+    if encode {
+        encode_entry(args, codec, function)
+    } else {
+        decode_entry(args, codec, function)
+    }
+}
+
+/// `AttributeError` for a name `_codecs` does not expose.
+fn unknown_entry(function: &str) -> i64 {
+    exc::raise_with_message(
+        exc::ATTRIBUTE_ERROR,
+        &format!("module '_codecs' has no attribute '{function}'"),
+    )
 }
 
 // Argument helpers
@@ -583,12 +615,22 @@ fn codec_call(args: &[i64], member: &str) -> i64 {
         return NONE;
     }
     let roots = heap::root_values(&[info, object, errors, entry]);
-    let result = if value::as_function(entry).is_some() {
-        // A native `_codecs` entry: the decoder takes the trailing `final`
-        // flag the stateless protocol defines.
-        let final_ = value::bool_value(member == "decode");
-        let call_args = [object, errors, final_];
-        core_builtins::call(entry, call_args.len(), call_args.as_ptr())
+    // A built-in `_codecs` entry is invoked through this module directly. The
+    // central `_codecs` specs cap the positional count below the trailing
+    // `final` flag the stateless decoder protocol defines (`ascii_decode` and
+    // `latin_1_decode` stop at two arguments, `utf_8_encode` at one), so the
+    // module dispatcher would reject the trailing flag. Decoding treats its
+    // whole input as final — an incomplete trailing sequence is a
+    // `UnicodeDecodeError`, not silently unconsumed — and encoding takes
+    // `(object, errors)` like CPython's `_codecs.encode`.
+    let native_entry = value::as_function(entry).and_then(|function| match &function.body {
+        value::FunctionBody::Native { module, name } if *module == "_codecs" => Some(*name),
+        _ => None,
+    });
+    let result = if let Some(function) = native_entry {
+        let call_args = [object, errors, value::bool_value(true)];
+        let count = if member == "decode" { 3 } else { 2 };
+        call(function, &call_args[..count])
     } else {
         let call_args = [object, errors];
         core_builtins::call(entry, call_args.len(), call_args.as_ptr())
@@ -2863,6 +2905,21 @@ mod tests {
         value::as_bytes(v).expect("bytes value").to_vec()
     }
 
+    /// The Python code points of a string value.
+    ///
+    /// Lone surrogates are stored in the private-use mirror block, so a
+    /// payload can never be compared, character by character, against a
+    /// literal containing `\udcXX`; `str_codes` inverts the representation.
+    fn codes_of(v: i64) -> Vec<u32> {
+        let text = value::as_str(v).expect("str value");
+        value::str_codes(text).collect()
+    }
+
+    /// A string value built from Python code points (surrogates included).
+    fn text_codes(codes: &[u32]) -> i64 {
+        value::str_alloc(value::str_from_codes(codes.iter().copied()))
+    }
+
     fn info_entry(name: &str, index: usize) -> i64 {
         let info = call("lookup", &[text(name)]);
         assert!(!exc::pending(), "lookup({name}) must not fail");
@@ -3025,11 +3082,19 @@ mod tests {
             assert_eq!(info_entry(alias, 2), NONE, "{alias} incremental encoder");
             assert_eq!(info_entry(alias, 3), NONE, "{alias} incremental decoder");
         }
-        call("lookup", &[text("cp1252")]);
+        // Charset codecs are served through the system `iconv`, so `cp1252` is
+        // a real codec now; only a name no table knows is a LookupError.
+        let encode = info_entry("cp1252", 0);
+        assert_eq!(
+            value::as_function(encode).map(|function| function.name.as_str()),
+            Some("cp1252_encode"),
+            "cp1252 charset entry"
+        );
+        call("lookup", &[text("no-such-codec")]);
         assert_eq!(exc::pending_tag(), i64::from(LOOKUP_ERROR));
         assert_eq!(
             value::to_string(exc::pending_value()),
-            "unknown encoding: cp1252"
+            "unknown encoding: no-such-codec"
         );
     }
 
@@ -3060,10 +3125,9 @@ mod tests {
             &[bytes(b"f\x80o\xff"), text("utf-8"), text("surrogateescape")],
         );
         assert!(!exc::pending());
-        assert_eq!(str_of(decoded), "f\u{fffd}o\u{fffd}");
-        // The CPython assertion `b'\xff'.decode(...) == '\udcff'` holds
-        // because this runtime's `'\udcff'` literal is U+FFFD.
-        assert_eq!(str_of(decoded).chars().last(), Some('\u{FFFD}'));
+        // PEP 383: undecodable byte `b` becomes code point `0xDC00 + b`.
+        assert_eq!(codes_of(decoded), vec![0x66, 0xDC80, 0x6F, 0xDCFF]);
+        assert_eq!(codes_of(decoded).last().copied(), Some(0xDCFF));
 
         // Every byte in 0x80..=0xff becomes one stand-in (one per byte).
         let invalid: Vec<u8> = (0x80..=0xff).collect();
@@ -3071,8 +3135,15 @@ mod tests {
             "decode",
             &[bytes(&invalid), text("utf-8"), text("surrogateescape")],
         );
-        assert_eq!(str_of(decoded).chars().count(), invalid.len());
-        assert!(str_of(decoded).chars().all(|c| c == '\u{FFFD}'));
+        let codes = codes_of(decoded);
+        assert_eq!(codes.len(), invalid.len());
+        assert_eq!(
+            codes,
+            invalid
+                .iter()
+                .map(|byte| 0xDC00 + u32::from(*byte))
+                .collect::<Vec<_>>()
+        );
 
         // A surrogate encoded as UTF-8 is escaped byte by byte.
         let decoded = call(
@@ -3083,14 +3154,14 @@ mod tests {
                 text("surrogateescape"),
             ],
         );
-        assert_eq!(str_of(decoded), "\u{fffd}\u{fffd}\u{fffd}");
+        assert_eq!(codes_of(decoded), vec![0xDCED, 0xDCB0, 0xDC80]);
 
         // ASCII takes the same per-byte path.
         let decoded = call(
             "decode",
             &[bytes(b"a\xffb"), text("ascii"), text("surrogateescape")],
         );
-        assert_eq!(str_of(decoded), "a\u{fffd}b");
+        assert_eq!(codes_of(decoded), vec![0x61, 0xDCFF, 0x62]);
     }
 
     #[test]
@@ -3103,7 +3174,7 @@ mod tests {
                 &[bytes(input), text(codec), text("surrogateescape")],
             );
             assert!(!exc::pending(), "{codec}");
-            assert_eq!(str_of(decoded), "a\u{fffd}b", "{codec}");
+            assert_eq!(codes_of(decoded), vec![0x61, 0xDCFF, 0x62], "{codec}");
             let encoded = call("encode", &[decoded, text(codec), text("surrogateescape")]);
             assert!(!exc::pending(), "{codec}");
             assert_eq!(bytes_of(encoded), input, "{codec}");
@@ -3118,7 +3189,11 @@ mod tests {
         assert_eq!(str_of(decoded), "aÿb");
         let encoded = call(
             "encode",
-            &[text("a\u{fffd}b"), text("latin-1"), text("surrogateescape")],
+            &[
+                text_codes(&[0x61, 0xDCFF, 0x62]),
+                text("latin-1"),
+                text("surrogateescape"),
+            ],
         );
         assert_eq!(bytes_of(encoded), input);
 
@@ -3127,7 +3202,7 @@ mod tests {
             "decode",
             &[bytes(&[0xff]), text("utf-8"), text("surrogateescape")],
         );
-        assert_eq!(str_of(decoded), "\u{fffd}");
+        assert_eq!(codes_of(decoded), vec![0xDCFF]);
         let encoded = call("encode", &[decoded, text("utf-8"), text("surrogateescape")]);
         assert_eq!(bytes_of(encoded), vec![0xff]);
 
@@ -3140,7 +3215,7 @@ mod tests {
                 text("surrogateescape"),
             ],
         );
-        assert_eq!(str_of(decoded), "\u{fffd}\u{fffd}\u{fffd}");
+        assert_eq!(codes_of(decoded), vec![0xDCF0, 0xDC90, 0xDC80]);
     }
 
     #[test]
@@ -3187,12 +3262,12 @@ mod tests {
             "decode",
             &[bytes(b"a\xffb"), text("utf-8"), text("surrogateescape")],
         );
-        assert_eq!(str_of(decoded), "a\u{fffd}b");
+        assert_eq!(codes_of(decoded), vec![0x61, 0xDCFF, 0x62]);
         let decoded = call(
             "decode",
             &[bytes(b"\xff"), text("ascii"), text("surrogateescape")],
         );
-        assert_eq!(str_of(decoded), "\u{fffd}");
+        assert_eq!(codes_of(decoded), vec![0xDCFF]);
         let encoded = call("encode", &[decoded, text("ascii"), text("surrogateescape")]);
         assert_eq!(bytes_of(encoded), b"\xff");
     }
@@ -3202,7 +3277,18 @@ mod tests {
         let _guard = init();
         assert_eq!(fsdecode(b"plain"), "plain");
         assert_eq!(fsencode("plain"), b"plain");
-        assert_eq!(fsdecode(b"name-\xff"), "name-\u{fffd}");
-        assert_eq!(fsencode("name-\u{fffd}"), b"name-\xff");
+        // The undecodable byte becomes its PEP 383 stand-in code point.
+        let undecodable = fsdecode(b"name-\xff");
+        assert_eq!(
+            value::str_codes(&undecodable).collect::<Vec<_>>(),
+            vec![0x6E, 0x61, 0x6D, 0x65, 0x2D, 0xDCFF]
+        );
+        assert_eq!(fsencode(&undecodable), b"name-\xff");
+        assert_eq!(
+            fsencode(&value::str_from_codes([
+                0x6E, 0x61, 0x6D, 0x65, 0x2D, 0xDCFF
+            ])),
+            b"name-\xff"
+        );
     }
 }

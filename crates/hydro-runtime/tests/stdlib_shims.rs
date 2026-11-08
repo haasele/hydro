@@ -356,7 +356,9 @@ fn codecs_error_handling_and_lookup_errors() {
         assert_no_error();
         assert_int(hydro_len(info), 4);
     }
-    let _ = module("_codecs", "lookup", &[text("cp1252")]);
+    // `cp1252` resolves through the iconv charset table, so only a name no
+    // table knows is unknown.
+    let _ = module("_codecs", "lookup", &[text("no-such-codec")]);
     assert_error_tag(LOOKUP_ERROR);
 
     // Error-handler registration is real: lookup returns the registered
@@ -1050,8 +1052,8 @@ fn str_decodes_bytes_like_objects() {
         ),
         "a\u{fffd}",
     );
-    let unknown = hydro_call(function, 2, [bytes(b"a"), text("cp1252")].as_ptr());
-    assert_error(unknown, LOOKUP_ERROR, "unknown encoding: cp1252");
+    let unknown = hydro_call(function, 2, [bytes(b"a"), text("no-such-codec")].as_ptr());
+    assert_error(unknown, LOOKUP_ERROR, "unknown encoding: no-such-codec");
     let handler = hydro_call(
         function,
         3,

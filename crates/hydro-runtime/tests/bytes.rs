@@ -222,8 +222,9 @@ fn constructor_with_encoding() {
     // A str without an encoding is an error.
     build(&[text("hi")]);
     expect_error(TYPE_ERROR);
-    // Unknown encodings are rejected.
-    build(&[text("hi"), text("cp1252")]);
+    // Unknown encodings are rejected. (`cp1252` is *not* unknown: the iconv
+    // charset table serves it, so the name has to be one no table knows.)
+    build(&[text("hi"), text("no-such-codec")]);
     expect_error(LOOKUP_ERROR);
     // Encoding without a string.
     build(&[int(3), text("utf-8")]);
@@ -419,7 +420,7 @@ fn decode_and_encode() {
         "decode".as_ptr(),
         6,
         1,
-        [text("cp1252")].as_ptr(),
+        [text("no-such-codec")].as_ptr(),
     );
     expect_error(LOOKUP_ERROR);
     // Unknown error handler.
@@ -456,7 +457,7 @@ fn decode_and_encode() {
         "encode".as_ptr(),
         6,
         1,
-        [text("cp1252")].as_ptr(),
+        [text("no-such-codec")].as_ptr(),
     );
     expect_error(LOOKUP_ERROR);
 }

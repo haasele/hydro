@@ -797,14 +797,12 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "unhexlify" | "a2b_hex" => unhexlify(args),
         "b2a_base64" => b2a_base64(args),
         "a2b_base64" => a2b_base64(args),
-        // `backtick` is keyword-only in CPython: `b2a_uu(data, backtick=True)`
-        // is valid, `b2a_uu(data, True)` is a `TypeError`.
-        "b2a_uu" => {
-            if args.len() > 1 {
-                return type_error("b2a_uu() takes 1 positional argument but 2 were given");
-            }
-            b2a_uu(args)
-        }
+        // The compiler folds fixed-parameter keywords into positional slots
+        // (`b2a_uu(data, backtick=True)` arrives as two slots), so slot 2 is
+        // the `backtick` flag; `call_kw` also accepts the literal keyword
+        // spelling. `backtick` is keyword-only in CPython, but slot folding
+        // makes the two call shapes indistinguishable here.
+        "b2a_uu" => b2a_uu(args),
         "a2b_uu" => a2b_uu(args),
         "crc32" => crc32(args),
         "crc_hqx" => crc_hqx(args),
@@ -857,10 +855,6 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
             ));
         }
         bound[position] = *item;
-    }
-    if function == "b2a_uu" {
-        // Skip `call`'s positional-only guard: the flag arrived by keyword.
-        return b2a_uu(&bound);
     }
     call(function, &bound)
 }
