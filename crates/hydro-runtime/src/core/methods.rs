@@ -702,6 +702,11 @@ fn call_bound_entry(
     }
 }
 
+pub(crate) fn class_has_custom_new(class: i64) -> bool {
+    value::class_member(class, "__new__")
+        .is_some_and(|(_, function)| value::function_native_name(function) != Some("__object_new__"))
+}
+
 fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
     if crate::modules::asyncio::is_task_group(obj) {
         return crate::modules::asyncio::task_group_method(obj, method, argc, argv);
@@ -721,7 +726,9 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
     // `object.__init__` ignores extra arguments once a native scalar payload
     // consumed them (`class N(int): pass`; `enum` calls a member's `__init__`
     // after constructing it through `int.__new__`).
-    if method == "__init__" && value::scalar_payload(obj).is_some() {
+    if method == "__init__"
+        && (value::scalar_payload(obj).is_some() || class_has_custom_new(class))
+    {
         if let Some(value::ClassEntry::Method(_, function)) = &entry {
             if value::function_native_name(*function) == Some("__object_init__") {
                 return NONE;

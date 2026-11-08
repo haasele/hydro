@@ -5,10 +5,13 @@
 //! the metaclass hooks, abstract-method reporting and the explicit errors for
 //! arguments that are not classes.
 //!
-//! `_opcode` tests pin the truthful bytecode-less surface: the predicates the
-//! pure-Python `opcode` module imports answer `False`, operations that would
-//! need CPython bytecode raise `NotImplementedError`, and no opcode table is
-//! invented.
+//! `_opcode` tests pin the CPython 3.14 instruction tables the pure-Python
+//! `opcode`/`dis` modules build their public surface from: the argument,
+//! constant, name, jump, free, local and exception classifications, opcode
+//! validity, `stack_effect`, and the intrinsic/number-operation metadata.
+//! Only the executor and specialization-statistics entry points remain
+//! unsupported, because Hydro executes its own HIR rather than CPython
+//! bytecode.
 
 use hydro_runtime::abi::*;
 
@@ -23,6 +26,7 @@ const NONE: i64 = 1;
 const TYPE_ERROR: i64 = 1;
 const ATTRIBUTE_ERROR: i64 = 9;
 const NOT_IMPLEMENTED_ERROR: i64 = 32;
+const VALUE_ERROR: i64 = 0;
 
 const OP_EQ: u32 = 7;
 const OP_IN: u32 = 13;
@@ -361,9 +365,25 @@ fn abstract_methods_are_reported_through_the_metaclass() {
 
     // `update_abstractmethods` is the identity for this runtime.
     assert_same(abc_module("update_abstractmethods", &[base]), base);
-    // The deprecated descriptors are importable but explicitly unsupported.
-    abc_module("abstractproperty", &[abstract_fn]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
+    // The deprecated descriptors are real decorators. `abstractproperty`
+    // returns a property whose getter is abstract and which reports
+    // `__isabstractmethod__` itself; the classmethod/staticmethod spellings
+    // wrap the callable the same way and proxy the marker.
+    let abstract_property = abc_module("abstractproperty", &[abstract_fn]);
+    assert_no_error();
+    assert_ne!(abstract_property, hydro_none());
+    assert_true(getattr(abstract_property, "__isabstractmethod__"));
+    assert_true(getattr(abstract_fn, "__isabstractmethod__"));
+
+    let abstract_classmethod = abc_module("abstractclassmethod", &[abstract_fn]);
+    assert_no_error();
+    assert_ne!(abstract_classmethod, hydro_none());
+    assert_true(getattr(abstract_classmethod, "__isabstractmethod__"));
+
+    let abstract_staticmethod = abc_module("abstractstaticmethod", &[abstract_fn]);
+    assert_no_error();
+    assert_ne!(abstract_staticmethod, hydro_none());
+    assert_true(getattr(abstract_staticmethod, "__isabstractmethod__"));
 }
 
 // -------------------------------------------------------------------------
@@ -408,54 +428,134 @@ fn opcode_import_surface_exists() {
     module_get("_opcode", "opname");
     assert_error_tag(ATTRIBUTE_ERROR);
 
-    // Specialization is disabled.
-    assert_eq!(module_get("_opcode", "ENABLE_SPECIALIZATION"), int(0));
-    assert_eq!(module_get("_opcode", "ENABLE_SPECIALIZATION_FT"), int(0));
+    // Specialization is enabled in the reference 3.14 build, matching the
+    // flag `opcode.py` reads.
+    assert_eq!(module_get("_opcode", "ENABLE_SPECIALIZATION"), int(1));
+    assert_eq!(module_get("_opcode", "ENABLE_SPECIALIZATION_FT"), int(1));
     assert_no_error();
 }
 
 #[test]
-fn opcode_predicates_report_no_opcodes() {
+fn opcode_predicates_follow_the_reference_classification() {
     let _guard = test_guard();
     hydro_runtime_init();
-    for name in [
-        "has_arg",
-        "has_const",
-        "has_name",
-        "has_jump",
-        "has_free",
-        "has_local",
-        "has_exc",
-        "is_valid",
-    ] {
-        assert_false(module(name, &[int(1)]));
-    }
+
+    // Opcode numbers of the 3.14 tables (`_opcode.opmap`).
+    const CACHE: i64 = 0;
+    const POP_TOP: i64 = 31;
+    const BUILD_SLICE: i64 = 49;
+    const FOR_ITER: i64 = 70;
+    const IMPORT_NAME: i64 = 73;
+    const LOAD_CONST: i64 = 82;
+    const LOAD_FAST: i64 = 84;
+    const LOAD_GLOBAL: i64 = 92;
+    const STORE_DEREF: i64 = 111;
+    const INSTRUMENTED_RETURN_VALUE: i64 = 246;
+    const JUMP: i64 = 257;
+    const SETUP_FINALLY: i64 = 264;
+
+    // Every opcode in the table is valid, including the specialized and
+    // instrumented ranges; anything outside it is not.
+    assert_true(module("is_valid", &[int(CACHE)]));
+    assert_true(module("is_valid", &[int(INSTRUMENTED_RETURN_VALUE)]));
+    assert_true(module("is_valid", &[int(JUMP)]));
+    assert_false(module("is_valid", &[int(267)]));
+    assert_false(module("is_valid", &[int(520)]));
+
+    // Argument-carrying instructions are those with code >= HAVE_ARGUMENT
+    // (43); the argument-less prefix is not.
+    assert_true(module("has_arg", &[int(LOAD_CONST)]));
+    assert_true(module("has_arg", &[int(BUILD_SLICE)]));
+    assert_false(module("has_arg", &[int(POP_TOP)]));
+    assert_false(module("has_arg", &[int(CACHE)]));
+
+    // Constant / name / jump / free / local / exception classification.
+    assert_true(module("has_const", &[int(LOAD_CONST)]));
+    assert_false(module("has_const", &[int(LOAD_FAST)]));
+
+    assert_true(module("has_name", &[int(IMPORT_NAME)]));
+    assert_true(module("has_name", &[int(LOAD_GLOBAL)]));
+    assert_false(module("has_name", &[int(LOAD_CONST)]));
+
+    assert_true(module("has_jump", &[int(JUMP)]));
+    assert_true(module("has_jump", &[int(FOR_ITER)]));
+    assert_false(module("has_jump", &[int(LOAD_CONST)]));
+
+    assert_true(module("has_local", &[int(LOAD_FAST)]));
+    assert_false(module("has_local", &[int(LOAD_CONST)]));
+
+    assert_true(module("has_free", &[int(STORE_DEREF)]));
+    assert_false(module("has_free", &[int(LOAD_FAST)]));
+
+    assert_true(module("has_exc", &[int(SETUP_FINALLY)]));
+    assert_false(module("has_exc", &[int(LOAD_CONST)]));
 }
 
 #[test]
-fn opcode_unsupported_operations_raise_not_implemented() {
+fn opcode_stack_effect_matches_the_reference_and_executors_stay_unsupported() {
     let _guard = test_guard();
     hydro_runtime_init();
 
-    let result = module("stack_effect", &[int(1), int(0)]);
-    assert_eq!(result, hydro_none());
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
+    const POP_TOP: i64 = 31;
+    const BUILD_SLICE: i64 = 49;
+    const FOR_ITER: i64 = 70;
+    const JUMP_FORWARD: i64 = 77;
 
+    // `stack_effect` reports the reference values, including the
+    // oparg-dependent families.
+    assert_eq!(module("stack_effect", &[int(POP_TOP)]), int(-1));
+    assert_eq!(module("stack_effect", &[int(BUILD_SLICE), int(2)]), int(-1));
+    assert_eq!(module("stack_effect", &[int(BUILD_SLICE), int(3)]), int(-2));
+    assert_eq!(module("stack_effect", &[int(FOR_ITER), int(0)]), int(1));
+    assert_eq!(module("stack_effect", &[int(JUMP_FORWARD), int(0)]), int(0));
+    assert_no_error();
+
+    // Undefined and specialized opcodes have no stack effect.
+    let result = module("stack_effect", &[int(30000)]);
+    assert_eq!(result, hydro_none());
+    assert_error_tag(VALUE_ERROR);
+    module("stack_effect", &[int(129)]);
+    assert_error_tag(VALUE_ERROR);
+
+    // No CPython executor exists: Hydro runs its own HIR.
     module("get_executor", &[int(1), int(0)]);
     assert_error_tag(NOT_IMPLEMENTED_ERROR);
 
-    module("get_specialization_stats", &[]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
+    // CPython answers `None` when the interpreter exposes no specialization
+    // statistics, which is exactly this runtime's contract.
+    assert_eq!(module("get_specialization_stats", &[]), hydro_none());
+    assert_no_error();
 }
 
 #[test]
-fn opcode_metadata_helpers_are_empty() {
+fn opcode_metadata_helpers_report_the_reference_tables() {
     let _guard = test_guard();
     hydro_runtime_init();
-    for name in ["get_intrinsic1_descs", "get_intrinsic2_descs", "get_nb_ops"] {
-        assert_eq!(hydro_len(module(name, &[])), int(0), "{name}");
+
+    // 12 one-operand intrinsics, index 0 being the invalid placeholder.
+    let intrinsics = module("get_intrinsic1_descs", &[]);
+    assert_no_error();
+    assert_eq!(hydro_len(intrinsics), int(12));
+    assert_contains(intrinsics, text("INTRINSIC_1_INVALID"));
+    assert_contains(intrinsics, text("INTRINSIC_TYPEALIAS"));
+
+    let intrinsics2 = module("get_intrinsic2_descs", &[]);
+    assert_no_error();
+    assert_eq!(hydro_len(intrinsics2), int(6));
+    assert_contains(intrinsics2, text("INTRINSIC_SET_TYPEPARAM_DEFAULT"));
+
+    // The special-method names `dis` uses for `LOAD_SPECIAL`.
+    let special = module("get_special_method_names", &[]);
+    assert_no_error();
+    assert_eq!(hydro_len(special), int(4));
+    for name in ["__enter__", "__exit__", "__aenter__", "__aexit__"] {
+        assert_contains(special, text(name));
     }
-    assert_eq!(hydro_len(module("get_special_method_names", &[])), int(0));
+
+    // `NB_*` machine-operation families, each a `(name, symbol)` pair.
+    let nb_ops = module("get_nb_ops", &[]);
+    assert_no_error();
+    assert_eq!(hydro_len(nb_ops), int(27));
 }
 
 #[test]

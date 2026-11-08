@@ -4813,7 +4813,8 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     // already consumed them, matching CPython's behaviour for builtin
     // subclasses (`class N(int): pass; N(3)`).
     if value::function_native_name(init) == Some("__object_init__")
-        && value::scalar_payload(instance).is_some()
+        && (value::scalar_payload(instance).is_some()
+            || crate::core::methods::class_has_custom_new(class))
     {
         return instance;
     }
