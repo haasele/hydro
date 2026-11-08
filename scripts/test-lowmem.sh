@@ -55,14 +55,38 @@ TIMEOUT_CMD=()
 if command -v timeout >/dev/null 2>&1; then
     TIMEOUT_CMD=(timeout --foreground --signal=INT "${HYDRO_TEST_TIMEOUT:-300}s")
 fi
-set +e
-if [[ -x /usr/bin/time ]]; then
-    /usr/bin/time -v -o "$METRICS" "${TIMEOUT_CMD[@]}" "${CMD[@]}" 2>&1 | tee -a "$LOG"
-    STATUS=${PIPESTATUS[0]}
-else
-    "${TIMEOUT_CMD[@]}" "${CMD[@]}" 2>&1 | tee -a "$LOG"
-    STATUS=${PIPESTATUS[0]}
+RAW="$LOG.raw"
+MIN_AVAIL="${HYDRO_MIN_AVAIL_MB:-1500}"
+: > "$METRICS"
+RUN=()
+if command -v setsid >/dev/null 2>&1; then
+    RUN=(setsid)
 fi
+set +e
+"${RUN[@]}" "${TIMEOUT_CMD[@]}" "${CMD[@]}" >"$RAW" 2>&1 &
+PID=$!
+(
+    while kill -0 "$PID" 2>/dev/null; do
+        avail=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+        rss=$(awk '/VmRSS/ {print int($2/1024)}' "/proc/$PID/status" 2>/dev/null || echo 0)
+        printf '%s avail_mb=%s cargo_rss_mb=%s\n' \
+            "$(date -u +%H:%M:%SZ)" "$avail" "$rss" >> "$METRICS"
+        if (( avail < MIN_AVAIL )); then
+            printf 'watchdog: avail_mb=%s below %s; terminating test group\n' \
+                "$avail" "$MIN_AVAIL" >> "$LOG"
+            pkill -TERM -f 'cargo nextest run' 2>/dev/null || true
+            kill -TERM "$PID" 2>/dev/null || true
+            break
+        fi
+        sleep 2
+    done
+) &
+WATCH=$!
+wait "$PID"
+STATUS=$?
+wait "$WATCH" 2>/dev/null || true
+cat "$RAW" >> "$LOG"
+rm -f "$RAW"
 set -e
 
 {
@@ -70,7 +94,8 @@ set -e
     echo "== end of run =="
     echo "exit:    $STATUS"
     if [[ -f "$METRICS" ]]; then
-        grep -E 'Elapsed \(wall clock\)|Maximum resident set size|Exit status' "$METRICS" || true
+        echo "memory samples (last 5, min available ${MIN_AVAIL}MB):"
+        tail -5 "$METRICS"
     fi
     free -m
     echo "log:     $LOG"
