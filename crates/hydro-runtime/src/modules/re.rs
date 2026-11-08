@@ -2859,9 +2859,12 @@ mod tests {
         assert!(value::repr(found).contains("re.Match"));
         assert!(value::repr(compiled).contains("re.compile"));
 
-        // Invalid bytes patterns raise ValueError, never panic.
+        // Invalid bytes patterns raise `re.PatternError`, never panic.
         call("compile", &[bytes_value(b"(")]);
-        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        assert_eq!(
+            value::type_class(exc::pending_value()),
+            pattern_error_class()
+        );
         exc::init();
     }
 
@@ -2915,9 +2918,13 @@ mod tests {
         assert_eq!(error, submodule_constant("re._constants", "error"));
         assert_eq!(error, submodule_constant("re._compiler", "PatternError"));
         assert_eq!(error, submodule_constant("re._parser", "error"));
-        assert_eq!(error, exc::exception_class(VALUE_ERROR));
+        // `re.PatternError` (and its 3.13 alias `re.error`) is the module-level
+        // class; CPython's spelling is `class PatternError(Exception)`.
+        assert_eq!(error, constant("PatternError"));
+        assert_eq!(error, constant("error"));
+        assert_eq!(value::class_display_name(error), Some("PatternError"));
         call("compile", &[text("(")]);
-        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        assert_eq!(value::type_class(exc::pending_value()), error);
         exc::init();
 
         // `_compiler.compile` is the same engine `re.compile` uses.
@@ -3233,10 +3240,13 @@ mod tests {
     #[test]
     fn duplicate_group_names_are_rejected_like_cpython() {
         exc::init();
-        // CPython raises PatternError (a ValueError) for a redefinition; the
-        // Rust engine also refuses the duplicate, so no dict can be built.
+        // CPython raises `PatternError` for a redefinition; the Rust engine
+        // also refuses the duplicate, so no dict can be built.
         call("compile", &[text(r"(?P<a>x)(?P<a>y)")]);
-        assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
+        assert_eq!(
+            value::type_class(exc::pending_value()),
+            pattern_error_class()
+        );
         exc::init();
     }
 }

@@ -1965,7 +1965,8 @@ extern "C" fn typevar_tuple_iter_entry(argv: *const i64) -> i64 {
         return unpack;
     }
     let unpack_roots = heap::root_values(&[unpack]);
-    // `typing.Unpack[Ts]` is a class subscript, which yields the class value.
+    // `typing.Unpack[Ts]` subscripts the special form, which builds the named
+    // alias (a `_GenericAlias` whose origin is `Unpack`).
     let item = crate::core::container::subscript(unpack, this);
     if exc::pending() {
         heap::release_roots(unpack_roots);
@@ -3997,16 +3998,31 @@ mod tests {
     #[test]
     fn generic_aliases_and_classes_are_subscriptable() {
         exc::init();
-        let index = crate::core::value::str_alloc("int".to_string());
+        // A real type argument: `typing.Tuple["int"]` type-checks the string
+        // into a `ForwardRef`, so the spelling assertion needs a class value
+        // named `int`.
+        let index = value::class_new("int".to_string(), NONE, Vec::new());
         let alias = constant("Tuple");
         // `typing.Tuple[int]` is a named generic alias; a plain class stays
         // the tolerant fallback it always was.
         let built = crate::core::container::subscript(alias, index);
         assert!(!exc::pending(), "{:?}", pending_message());
         assert_eq!(value::repr(built), "typing.Tuple[int]");
+        // `get_origin(typing.Tuple[int]) is tuple`. A builtin spelling is a
+        // fresh function value per reference, so compare the builtin body
+        // rather than the handle.
+        let origin = call("get_origin", &[built]);
+        assert!(
+            value::as_function(origin).is_some_and(|function| matches!(
+                &function.body,
+                value::FunctionBody::Builtin(Builtin::Tuple)
+            )),
+            "get_origin(typing.Tuple[int]) must be tuple, got {}",
+            value::repr(origin)
+        );
         assert_eq!(
-            call("get_origin", &[built]),
-            value::builtin_function_new(Builtin::Tuple)
+            as_tuple(call("get_args", &[built])).map(|items| items.to_vec()),
+            Some(vec![index])
         );
         let class = value::class_new("Plain".to_string(), NONE, Vec::new());
         assert_eq!(crate::core::container::subscript(class, index), class);
@@ -4944,7 +4960,20 @@ mod tests {
         let iter = crate::core::iter::iter_of(tuple_var);
         let first = crate::core::iter::next_value(iter, NONE, false);
         assert!(!exc::pending(), "{:?}", pending_message());
-        assert_eq!(value::class_display_name(first), Some("Unpack"));
+        // Iteration yields `Unpack[Ts]`: a `typing._GenericAlias` over the
+        // `Unpack` special form. CPython spells the concrete class
+        // `_UnpackAlias`; this runtime models every typing alias with
+        // `_GenericAlias`, so the origin and arguments are the stable
+        // observable facts.
+        assert_eq!(
+            value::instance_class_value(first),
+            Some(cached_class("_GenericAlias"))
+        );
+        assert_eq!(call("get_origin", &[first]), constant("Unpack"));
+        assert_eq!(
+            as_tuple(call("get_args", &[first])).map(|items| items.to_vec()),
+            Some(vec![tuple_var])
+        );
         let end = crate::core::iter::next_value(iter, NONE, true);
         assert!(!exc::pending());
         assert_eq!(end, NONE);
@@ -4955,8 +4984,12 @@ mod tests {
         let converted_items = as_tuple(converted).expect("tuple");
         assert_eq!(converted_items.len(), 1);
         assert_eq!(
-            value::class_display_name(converted_items[0]),
-            Some("Unpack")
+            value::instance_class_value(converted_items[0]),
+            Some(cached_class("_GenericAlias"))
+        );
+        assert_eq!(
+            call("get_origin", &[converted_items[0]]),
+            constant("Unpack")
         );
         // `ParamSpec` is not iterable, like CPython's.
         let param = call("ParamSpec", &[text("P")]);
