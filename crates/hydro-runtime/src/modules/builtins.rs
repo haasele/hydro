@@ -76,6 +76,30 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         return core_builtins::call_builtin(builtin, args.len(), args.as_ptr());
     }
     match function {
+        // `aiter(obj)` / `anext(aiterator[, default])`: the async builtins
+        // (3.10+/3.11+), served by the core iterator helpers.
+        "aiter" => {
+            if args.len() != 1 {
+                return exc::raise_with_message(
+                    exc::TYPE_ERROR,
+                    &format!("aiter() takes exactly one argument ({} given)", args.len()),
+                );
+            }
+            core_builtins::aiter(args[0])
+        }
+        "anext" => {
+            if args.is_empty() || args.len() > 2 {
+                return exc::raise_with_message(
+                    exc::TYPE_ERROR,
+                    &format!("anext() takes 1 or 2 arguments ({} given)", args.len()),
+                );
+            }
+            core_builtins::anext(
+                args[0],
+                args.get(1).copied().unwrap_or(value::NONE),
+                args.len() == 2,
+            )
+        }
         "__object_new__" => {
             let class = args.first().copied().unwrap_or_else(value::object_class);
             value::instance_new(class)
@@ -733,9 +757,9 @@ fn exception_tag(name: &str) -> Option<u32> {
         "MemoryError" => exc::MEMORY_ERROR,
         "ModuleNotFoundError" => exc::MODULE_NOT_FOUND_ERROR,
         "NameError" => exc::NAME_ERROR,
-        // Hydro has no distinct tag for this NameError subclass yet; the
-        // name must still resolve and inherit NameError for tests.
-        "UnboundLocalError" => exc::NAME_ERROR,
+        // A distinct tag so `builtins.UnboundLocalError` has its own class
+        // object and name while inheriting `NameError`.
+        "UnboundLocalError" => exc::UNBOUND_LOCAL_ERROR,
         "NotADirectoryError" => exc::NOT_A_DIRECTORY_ERROR,
         "NotImplementedError" => exc::NOT_IMPLEMENTED_ERROR,
         "OSError" => exc::OS_ERROR,

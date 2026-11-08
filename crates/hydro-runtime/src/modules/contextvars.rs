@@ -30,21 +30,23 @@
 //! updating `_data` need check-then-act atomicity. `Context.run` holds that
 //! mutex only around the enter/leave bookkeeping, never while user code runs.
 //!
-//! Documented limits: `iter(context)` is not implemented (there is no native
-//! instance iterator in this runtime); `keys()`, `values()` and `items()`
-//! return snapshots as lists. Fibers share their thread's current context:
-//! `Context.run` restores the caller's context when its callback returns, so a
-//! context around a suspending coroutine is not automatically re-entered per
-//! task step.
+//! Documented limits: `Context` implements the mapping protocol (`__iter__`
+//! yields the variable keys, `__eq__`/`__ne__` compare bindings) but is not
+//! registered as a `collections.abc.Mapping` subclass; `keys()`, `values()`
+//! and `items()` return snapshots as lists. Fibers share their thread's
+//! current context: `Context.run` restores the caller's context when its
+//! callback returns, so a context around a suspending coroutine is not
+//! automatically re-entered per task step.
 
 use std::cell::RefCell;
 use std::sync::{Mutex, MutexGuard};
 
-use hydro_ir::MethodKind;
+use hydro_ir::{MethodKind, ParamKind};
 
 use crate::container;
 use crate::exc::{self, ATTRIBUTE_ERROR, LOOKUP_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::heap;
+use crate::iter;
 use crate::ops;
 use crate::value::{self, FALSE, NONE, TRUE};
 
@@ -62,6 +64,8 @@ const TOKEN_VAR: &str = "var";
 const TOKEN_OLD_VALUE: &str = "old_value";
 const TOKEN_HAS_OLD: &str = "_has_old";
 const TOKEN_USED: &str = "_used";
+/// The `Context` a token was created in (`reset` refuses a foreign context).
+const TOKEN_CONTEXT: &str = "_context";
 
 /// Serialises check-then-act sequences on contexts. It is never held while
 /// user code runs (`Context.run` releases it before invoking the callback).
@@ -127,15 +131,132 @@ fn rooted_method(name: &str, function: &'static str, arity: usize) -> (String, i
     entry
 }
 
+/// A `self` parameter descriptor for native methods.
+fn self_parameter() -> value::ParamMeta {
+    value::ParamMeta {
+        name: "self".to_string(),
+        kind: ParamKind::Positional,
+        default: None,
+    }
+}
+
+fn positional_parameter(name: &str) -> value::ParamMeta {
+    value::ParamMeta {
+        name: name.to_string(),
+        kind: ParamKind::Positional,
+        default: None,
+    }
+}
+
+fn vararg_parameter(name: &str) -> value::ParamMeta {
+    value::ParamMeta {
+        name: name.to_string(),
+        kind: ParamKind::VarArg,
+        default: None,
+    }
+}
+
+fn kwargs_parameter() -> value::ParamMeta {
+    value::ParamMeta {
+        name: "kwargs".to_string(),
+        kind: ParamKind::KwArg,
+        default: Some(NONE),
+    }
+}
+
+/// Builds a native method with a declared signature and a full-argv
+/// trampoline.
+///
+/// Signature methods bind through the shared argument binder (attribute
+/// dispatch, `==`, `with`, `__setattr__`), which validates arguments and
+/// invokes the trampoline with `[self, args...]`. They therefore need no
+/// entry in the central module spec and can take an optional or variadic
+/// argument list.
+fn signature_method(
+    name: &str,
+    function: &'static str,
+    entry: extern "C" fn(*const i64) -> i64,
+    signature: Vec<value::ParamMeta>,
+) -> (String, i64, MethodKind) {
+    let function_value = value::native_function_new("_contextvars", function, usize::MAX);
+    value::function_set_signature(function_value, signature);
+    value::function_set_full_entry(function_value, entry as *const () as usize);
+    heap::add_thread_root(function_value);
+    (name.to_string(), function_value, MethodKind::Normal)
+}
+
+extern "C" fn var_get_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self, *args]`; slot 1 is the vararg list.
+    let (receiver, rest) = unsafe { (*argv, *argv.add(1)) };
+    let mut args = Vec::with_capacity(2);
+    args.push(receiver);
+    if let Some(items) = value::as_list(rest) {
+        args.extend_from_slice(items);
+    }
+    var_get(&args)
+}
+
+extern "C" fn var_setattr_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self, name, value]`.
+    let args = unsafe { std::slice::from_raw_parts(argv, 3) };
+    var_setattr(args)
+}
+
+extern "C" fn ctx_iter_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self]`.
+    let args = unsafe { std::slice::from_raw_parts(argv, 1) };
+    ctx_iter(args)
+}
+
+extern "C" fn ctx_eq_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self, other]`.
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    ctx_compare(args, false)
+}
+
+extern "C" fn ctx_ne_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self, other]`.
+    let args = unsafe { std::slice::from_raw_parts(argv, 2) };
+    ctx_compare(args, true)
+}
+
+extern "C" fn token_enter_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self]`.
+    unsafe { *argv }
+}
+
+extern "C" fn token_exit_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self, type, value, traceback]`.
+    let args = unsafe { std::slice::from_raw_parts(argv, 4) };
+    token_exit(args)
+}
+
 fn build_classes(generation: u64) -> ClassCache {
     let var_class = value::class_new_full(
         "ContextVar".to_string(),
         NONE,
         vec![
-            rooted_method("get", "_contextvars_var_get", 1),
+            signature_method(
+                "get",
+                "_contextvars_var_get",
+                var_get_entry,
+                vec![self_parameter(), vararg_parameter("args")],
+            ),
             rooted_method("set", "_contextvars_var_set", 2),
             rooted_method("reset", "_contextvars_var_reset", 2),
             rooted_method("__repr__", "_contextvars_var_repr", 1),
+            // `name` is a read-only member in CPython; every Python-level
+            // attribute assignment on a ContextVar is refused.
+            signature_method(
+                "__setattr__",
+                "_contextvars_var_setattr",
+                var_setattr_entry,
+                vec![
+                    self_parameter(),
+                    positional_parameter("name"),
+                    positional_parameter("value"),
+                ],
+            ),
         ],
         Vec::new(),
     );
@@ -145,8 +266,27 @@ fn build_classes(generation: u64) -> ClassCache {
         "Context".to_string(),
         NONE,
         vec![
-            rooted_method("__init__", "_contextvars_ctx_init", usize::MAX),
-            rooted_method("run", "_contextvars_ctx_run", usize::MAX),
+            signature_method(
+                "__init__",
+                "_contextvars_ctx_init",
+                ctx_init_entry,
+                vec![
+                    self_parameter(),
+                    vararg_parameter("args"),
+                    kwargs_parameter(),
+                ],
+            ),
+            signature_method(
+                "run",
+                "_contextvars_ctx_run",
+                ctx_run_entry,
+                vec![
+                    self_parameter(),
+                    positional_parameter("callable"),
+                    vararg_parameter("args"),
+                    kwargs_parameter(),
+                ],
+            ),
             rooted_method("copy", "_contextvars_ctx_copy", 1),
             rooted_method("get", "_contextvars_ctx_get", 3),
             rooted_method("__getitem__", "_contextvars_ctx_getitem", 2),
@@ -154,6 +294,24 @@ fn build_classes(generation: u64) -> ClassCache {
             rooted_method("__delitem__", "_contextvars_ctx_delitem", 2),
             rooted_method("__contains__", "_contextvars_ctx_contains", 2),
             rooted_method("__len__", "_contextvars_ctx_len", 1),
+            signature_method(
+                "__iter__",
+                "_contextvars_ctx_iter",
+                ctx_iter_entry,
+                vec![self_parameter()],
+            ),
+            signature_method(
+                "__eq__",
+                "_contextvars_ctx_eq",
+                ctx_eq_entry,
+                vec![self_parameter(), positional_parameter("other")],
+            ),
+            signature_method(
+                "__ne__",
+                "_contextvars_ctx_ne",
+                ctx_ne_entry,
+                vec![self_parameter(), positional_parameter("other")],
+            ),
             rooted_method("keys", "_contextvars_ctx_keys", 1),
             rooted_method("values", "_contextvars_ctx_values", 1),
             rooted_method("items", "_contextvars_ctx_items", 1),
@@ -179,6 +337,24 @@ fn build_classes(generation: u64) -> ClassCache {
         vec![
             rooted_method("__init__", "_contextvars_token_init", usize::MAX),
             rooted_method("__repr__", "_contextvars_token_repr", 1),
+            // `with c.set(value): ...` restores the previous binding at exit.
+            signature_method(
+                "__enter__",
+                "_contextvars_token_enter",
+                token_enter_entry,
+                vec![self_parameter()],
+            ),
+            signature_method(
+                "__exit__",
+                "_contextvars_token_exit",
+                token_exit_entry,
+                vec![
+                    self_parameter(),
+                    positional_parameter("type"),
+                    positional_parameter("value"),
+                    positional_parameter("traceback"),
+                ],
+            ),
         ],
         vec![("MISSING".to_string(), missing)],
     );
@@ -255,11 +431,14 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "_contextvars_var_set" => var_set(args),
         "_contextvars_var_reset" => var_reset(args),
         "_contextvars_var_repr" => var_repr(args),
+        "_contextvars_var_setattr" => var_setattr(args),
         "_contextvars_token_init" => exc::raise_with_message(
-            TYPE_ERROR,
-            "Token objects are created by ContextVar.set(); they cannot be instantiated directly",
+            RUNTIME_ERROR,
+            "Tokens can only be created by ContextVars",
         ),
         "_contextvars_token_repr" => token_repr(args),
+        "_contextvars_token_enter" => args.first().copied().unwrap_or(NONE),
+        "_contextvars_token_exit" => token_exit(args),
         "_contextvars_ctx_init" => ctx_init(args),
         "_contextvars_ctx_run" => ctx_run(args),
         "_contextvars_ctx_copy" => ctx_copy(args),
@@ -269,6 +448,9 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "_contextvars_ctx_delitem" => ctx_delitem(args),
         "_contextvars_ctx_contains" => ctx_contains(args),
         "_contextvars_ctx_len" => ctx_len(args),
+        "_contextvars_ctx_iter" => ctx_iter(args),
+        "_contextvars_ctx_eq" => ctx_compare(args, false),
+        "_contextvars_ctx_ne" => ctx_compare(args, true),
         "_contextvars_ctx_keys" => ctx_keys(args),
         "_contextvars_ctx_values" => ctx_values(args),
         "_contextvars_ctx_items" => ctx_items(args),
@@ -386,6 +568,21 @@ fn var_error() -> i64 {
     exc::raise_with_message(TYPE_ERROR, "argument must be a ContextVar object")
 }
 
+/// Rejects a non-`ContextVar` subscript/`get` key, like CPython's
+/// `context_check_key_type`. Returns `Some(raised)` when the key is invalid.
+fn check_key(key: i64) -> Option<i64> {
+    if is_instance_of(key, "ContextVar") {
+        return None;
+    }
+    Some(exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "a ContextVar key was expected, got {}",
+            value::repr(key)
+        ),
+    ))
+}
+
 /// `ContextVar(name, default=...)`: allocates the native variable object.
 ///
 /// A one-argument call has no default and `get()` raises `LookupError` when the
@@ -396,6 +593,13 @@ fn new_var(args: &[i64]) -> i64 {
     let name = args.first().copied().unwrap_or(NONE);
     if value::as_str(name).is_none() {
         return exc::raise_with_message(TYPE_ERROR, "context variable name must be a str");
+    }
+    // CPython hashes the name while validating it, so an unhashable `str`
+    // subclass (`__eq__` without `__hash__`) is rejected here with the
+    // standard "unhashable type" error.
+    let _ = crate::builtins::hash(name);
+    if exc::pending() {
+        return NONE;
     }
     let var = value::instance_new(var_class());
     value::instance_setattr(var, VAR_NAME.to_string(), name);
@@ -425,15 +629,9 @@ fn var_get(args: &[i64]) -> i64 {
     if value::instance_attr(var, VAR_HAS_DEFAULT) == Some(TRUE) {
         return value::instance_attr(var, VAR_DEFAULT).unwrap_or(NONE);
     }
-    let name = value::instance_attr(var, VAR_NAME).unwrap_or(NONE);
-    exc::raise_with_message(
-        LOOKUP_ERROR,
-        &format!(
-            "<ContextVar name={} at 0x{:x}>",
-            value::repr(name),
-            var as usize
-        ),
-    )
+    // CPython raises `LookupError` with the variable itself as the value, so
+    // `str(e)` is the variable's repr.
+    exc::raise_with_message(LOOKUP_ERROR, &value::repr(var))
 }
 
 /// `ContextVar.set(value)`: stores the value in the current context and
@@ -469,6 +667,7 @@ fn var_set(args: &[i64]) -> i64 {
     );
     value::instance_setattr(token, TOKEN_HAS_OLD.to_string(), value::bool_value(has_old));
     value::instance_setattr(token, TOKEN_USED.to_string(), FALSE);
+    value::instance_setattr(token, TOKEN_CONTEXT.to_string(), context);
     token
 }
 
@@ -482,15 +681,38 @@ fn var_reset(args: &[i64]) -> i64 {
         return var_error();
     }
     if !is_instance_of(token, "Token") {
-        return exc::raise_with_message(TYPE_ERROR, "reset() argument must be a Token");
-    }
-    if value::instance_attr(token, TOKEN_USED) == Some(TRUE) {
-        return exc::raise_with_message(RUNTIME_ERROR, "Token has already been used once");
-    }
-    if value::instance_attr(token, TOKEN_VAR) != Some(var) {
-        return exc::raise_with_message(VALUE_ERROR, "Token was created by a different ContextVar");
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("expected an instance of Token, got {}", value::repr(token)),
+        );
     }
     let context = current_context();
+    if value::instance_attr(token, TOKEN_USED) == Some(TRUE) {
+        return exc::raise_with_message(
+            RUNTIME_ERROR,
+            &format!("{} has already been used once", token_repr_text(token)),
+        );
+    }
+    if value::instance_attr(token, TOKEN_VAR) != Some(var) {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            &format!(
+                "{} was created by a different ContextVar",
+                token_repr_text(token)
+            ),
+        );
+    }
+    if let Some(created_in) = value::instance_attr(token, TOKEN_CONTEXT) {
+        if created_in != context {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                &format!(
+                    "{} was created in a different Context",
+                    token_repr_text(token)
+                ),
+            );
+        }
+    }
     let _guard = context_lock();
     let Some(data) = context_data(context) else {
         return context_error();
@@ -508,34 +730,106 @@ fn var_reset(args: &[i64]) -> i64 {
 fn var_repr(args: &[i64]) -> i64 {
     let var = args.first().copied().unwrap_or(NONE);
     let name = value::instance_attr(var, VAR_NAME).unwrap_or(NONE);
+    let default = if value::instance_attr(var, VAR_HAS_DEFAULT) == Some(TRUE) {
+        format!(
+            " default={}",
+            value::repr(value::instance_attr(var, VAR_DEFAULT).unwrap_or(NONE))
+        )
+    } else {
+        String::new()
+    };
     value::str_alloc(format!(
-        "<ContextVar name={} at 0x{:x}>",
+        "<ContextVar name={}{} at 0x{:x}>",
         value::repr(name),
+        default,
         var as usize
     ))
 }
 
-fn token_repr(args: &[i64]) -> i64 {
-    let token = args.first().copied().unwrap_or(NONE);
+fn token_repr_text(token: i64) -> String {
     let var = value::instance_attr(token, TOKEN_VAR).unwrap_or(NONE);
     let var_name = value::instance_attr(var, VAR_NAME).unwrap_or(NONE);
-    value::str_alloc(format!(
-        "<Token var=<ContextVar name={} at 0x{:x}> at 0x{:x}>",
-        value::repr(var_name),
-        var as usize,
-        token as usize
-    ))
+    if value::instance_attr(token, TOKEN_USED) == Some(TRUE) {
+        format!(
+            "<Token used var=<ContextVar name={} at 0x{:x}> at 0x{:x}>",
+            value::repr(var_name),
+            var as usize,
+            token as usize
+        )
+    } else {
+        format!(
+            "<Token var=<ContextVar name={} at 0x{:x}> at 0x{:x}>",
+            value::repr(var_name),
+            var as usize,
+            token as usize
+        )
+    }
+}
+
+fn token_repr(args: &[i64]) -> i64 {
+    let token = args.first().copied().unwrap_or(NONE);
+    value::str_alloc(token_repr_text(token))
+}
+
+/// `Token.__exit__(type, value, traceback)`: restores the binding captured by
+/// the `ContextVar.set()` that created the token.
+///
+/// Exceptions raised by the `with` body are never suppressed, so the return
+/// value is always `False`.
+fn token_exit(args: &[i64]) -> i64 {
+    let token = args.first().copied().unwrap_or(NONE);
+    if !is_instance_of(token, "Token") {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("expected an instance of Token, got {}", value::repr(token)),
+        );
+    }
+    let var = value::instance_attr(token, TOKEN_VAR).unwrap_or(NONE);
+    var_reset(&[var, token]);
+    if exc::pending() {
+        return NONE;
+    }
+    FALSE
+}
+
+/// `ContextVar.__setattr__`: the `name` member is read-only, and a native
+/// `ContextVar` carries no other writable Python attribute.
+fn var_setattr(args: &[i64]) -> i64 {
+    let name = args.get(1).copied().unwrap_or(NONE);
+    let name = value::as_str(name).unwrap_or("?");
+    exc::raise_with_message(
+        ATTRIBUTE_ERROR,
+        &format!("attribute '{name}' of 'ContextVar' objects is not writable"),
+    )
 }
 
 /// `Context()` accepts no arguments (the data dict is created lazily).
 fn ctx_init(args: &[i64]) -> i64 {
     if args.len() > 1 {
-        return exc::raise_with_message(TYPE_ERROR, "Context() takes no arguments");
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "Context() does not accept any arguments",
+        );
     }
     NONE
 }
 
-/// `Context.run(callable, *args)`: run `callable` with this context active.
+extern "C" fn ctx_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self, args, kwargs]`.
+    let (args, keywords) = unsafe { (*argv.add(1), *argv.add(2)) };
+    let no_args = value::as_list(args).is_none_or(|items| items.is_empty());
+    let no_keywords = value::as_dict(keywords).is_none_or(|pairs| pairs.is_empty());
+    if !no_args || !no_keywords {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "Context() does not accept any arguments",
+        );
+    }
+    NONE
+}
+
+/// `Context.run(callable, /, *args, **kwargs)`: run `callable` with this
+/// context active, forwarding the positional and keyword arguments.
 fn ctx_run(args: &[i64]) -> i64 {
     let context = args.first().copied().unwrap_or(NONE);
     if context_data(context).is_none() {
@@ -544,6 +838,46 @@ fn ctx_run(args: &[i64]) -> i64 {
     let Some(callable) = args.get(1).copied() else {
         return exc::raise_with_message(TYPE_ERROR, "run() requires a callable");
     };
+    ctx_run_slots(context, callable, &args[2..], &[])
+}
+
+extern "C" fn ctx_run_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self, callable, args, kwargs]`.
+    let (context, callable, rest, keywords) = unsafe {
+        (*argv, *argv.add(1), *argv.add(2), *argv.add(3))
+    };
+    let positional: Vec<i64> = value::as_list(rest)
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    let pairs: Vec<(String, i64)> = value::as_dict(keywords)
+        .map(|pairs| {
+            pairs
+                .iter()
+                .filter_map(|(name, item)| {
+                    value::as_str(*name).map(|name| (name.to_string(), *item))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // The argument lists live in Rust-owned buffers while the callback runs;
+    // root every value so a collection inside it cannot free them.
+    let mut owned = Vec::with_capacity(positional.len() + pairs.len() + 2);
+    owned.push(rest);
+    owned.push(keywords);
+    owned.extend_from_slice(&positional);
+    owned.extend(pairs.iter().map(|(_, item)| *item));
+    let roots = heap::root_values(&owned);
+    let result = ctx_run_slots(context, callable, &positional, &pairs);
+    heap::release_roots(roots);
+    result
+}
+
+/// Shared body of `Context.run`: validates the context, enters it, forwards
+/// the arguments to `callable` and restores the previous context afterwards.
+fn ctx_run_slots(context: i64, callable: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if context_data(context).is_none() {
+        return context_error();
+    }
     {
         let _guard = context_lock();
         if value::instance_attr(context, CTX_ENTERED) == Some(TRUE) {
@@ -555,7 +889,25 @@ fn ctx_run(args: &[i64]) -> i64 {
         value::instance_setattr(context, CTX_ENTERED.to_string(), TRUE);
     }
     let previous = enter_current(context);
-    let result = crate::builtins::call(callable, args.len() - 2, args[2..].as_ptr());
+    let result = if keywords.is_empty() {
+        crate::builtins::call(callable, args.len(), args.as_ptr())
+    } else {
+        let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+        for (name, item) in keywords {
+            pairs.push(value::str_alloc(name.clone()));
+            pairs.push(*item);
+        }
+        let pair_roots = heap::root_values(&pairs);
+        let result = crate::builtins::call_kw(
+            callable,
+            args.len(),
+            args.as_ptr(),
+            keywords.len(),
+            pairs.as_ptr(),
+        );
+        heap::release_roots(pair_roots);
+        result
+    };
     leave_current(previous);
     {
         let _guard = context_lock();
@@ -609,6 +961,9 @@ fn ctx_get(args: &[i64]) -> i64 {
         (Some(context), Some(var)) => (context, var),
         _ => return exc::raise_with_message(TYPE_ERROR, "get() requires a ContextVar"),
     };
+    if let Some(raised) = check_key(var) {
+        return raised;
+    }
     let _guard = context_lock();
     let Some(data) = context_data(context) else {
         return context_error();
@@ -616,18 +971,12 @@ fn ctx_get(args: &[i64]) -> i64 {
     if let Some(found) = data_lookup(data, var) {
         return found;
     }
+    // `Context.get(key, default=None)` returns `None` when the key is absent
+    // and no explicit default was supplied.
     if let Some(default) = args.get(2) {
         return *default;
     }
-    let name = value::instance_attr(var, VAR_NAME).unwrap_or(NONE);
-    exc::raise_with_message(
-        LOOKUP_ERROR,
-        &format!(
-            "<ContextVar name={} at 0x{:x}>",
-            value::repr(name),
-            var as usize
-        ),
-    )
+    NONE
 }
 
 fn ctx_getitem(args: &[i64]) -> i64 {
@@ -635,6 +984,9 @@ fn ctx_getitem(args: &[i64]) -> i64 {
         (Some(context), Some(var)) => (context, var),
         _ => return exc::raise_with_message(TYPE_ERROR, "__getitem__ requires a ContextVar"),
     };
+    if let Some(raised) = check_key(var) {
+        return raised;
+    }
     let _guard = context_lock();
     let Some(data) = context_data(context) else {
         return context_error();
@@ -662,6 +1014,9 @@ fn ctx_setitem(args: &[i64]) -> i64 {
             )
         }
     };
+    if let Some(raised) = check_key(var) {
+        return raised;
+    }
     let _guard = context_lock();
     let Some(data) = context_data(context) else {
         return context_error();
@@ -675,6 +1030,9 @@ fn ctx_delitem(args: &[i64]) -> i64 {
         (Some(context), Some(var)) => (context, var),
         _ => return exc::raise_with_message(TYPE_ERROR, "__delitem__ requires a ContextVar"),
     };
+    if let Some(raised) = check_key(var) {
+        return raised;
+    }
     let _guard = context_lock();
     let Some(data) = context_data(context) else {
         return context_error();
@@ -694,6 +1052,9 @@ fn ctx_contains(args: &[i64]) -> i64 {
         (Some(context), Some(var)) => (context, var),
         _ => return value::bool_value(false),
     };
+    if let Some(raised) = check_key(var) {
+        return raised;
+    }
     let _guard = context_lock();
     let found = context_data(context)
         .and_then(|data| data_lookup(data, var))
@@ -708,6 +1069,66 @@ fn ctx_len(args: &[i64]) -> i64 {
         return context_error();
     };
     ops::int_result(value::as_dict(data).map_or(0, |pairs| pairs.len()) as i64)
+}
+
+/// `iter(context)`: the context's `ContextVar` keys, in insertion order.
+fn ctx_iter(args: &[i64]) -> i64 {
+    let context = args.first().copied().unwrap_or(NONE);
+    let pairs = {
+        let _guard = context_lock();
+        match snapshot_pairs(context) {
+            Some(pairs) => pairs,
+            None => return context_error(),
+        }
+    };
+    let keys: Vec<i64> = pairs.into_iter().map(|(key, _)| key).collect();
+    let list = value::list_new(keys);
+    let roots = heap::root_values(&[list]);
+    let iterator = iter::iter_new(list);
+    heap::release_roots(roots);
+    iterator
+}
+
+/// `context == other` / `context != other`: two contexts are equal when they
+/// hold the same variable bindings. CPython returns `NotImplemented` when the
+/// other operand is not a `Context`.
+///
+/// The comparison snapshots both data dicts under the context lock and drops
+/// it before comparing values, so a user `__eq__` that re-enters a context
+/// (and therefore the lock) cannot deadlock.
+fn ctx_compare(args: &[i64], negated: bool) -> i64 {
+    let (this, other) = match (args.first().copied(), args.get(1).copied()) {
+        (Some(this), Some(other)) => (this, other),
+        _ => return value::NOT_IMPLEMENTED,
+    };
+    if !is_instance_of(other, "Context") {
+        return value::NOT_IMPLEMENTED;
+    }
+    let (left, right) = {
+        let _guard = context_lock();
+        match (snapshot_pairs(this), snapshot_pairs(other)) {
+            (Some(left), Some(right)) => (left, right),
+            _ => return value::NOT_IMPLEMENTED,
+        }
+    };
+    let mut equal = left.len() == right.len();
+    if equal {
+        for (key, value) in left {
+            match right.iter().find(|(candidate, _)| *candidate == key) {
+                Some((_, other_value)) => {
+                    if !container::equals(value, *other_value) {
+                        equal = false;
+                        break;
+                    }
+                }
+                None => {
+                    equal = false;
+                    break;
+                }
+            }
+        }
+    }
+    value::bool_value(if negated { !equal } else { equal })
 }
 
 fn ctx_keys(args: &[i64]) -> i64 {

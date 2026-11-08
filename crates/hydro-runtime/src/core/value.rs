@@ -2006,14 +2006,16 @@ impl InstanceState {
 /// Payload of a `memoryview` value.
 ///
 /// The view never copies the exporter: `buffer` is the `bytes`/`bytearray`
-/// object itself and is traced, so a live view keeps it alive. `offset` and
-/// `stride` address the view through the exporter's current payload, which is
-/// what makes writes through a view observable on the buffer (and vice versa).
-/// Only one-dimensional, single-byte-element views are constructed by the
-/// runtime; `shape`/`strides` are still reported (and traced as native state)
-/// so the Python-visible attributes behave.
+/// object (or an `array.array`, whose packed payload is a `bytearray`) and is
+/// traced, so a live view keeps it alive. `offset` and `stride` address the
+/// view through the exporter's current payload, which is what makes writes
+/// through a view observable on the buffer (and vice versa). Only
+/// one-dimensional, single-byte-element views are constructed by the runtime;
+/// `shape`/`strides` are still reported (and traced as native state) so the
+/// Python-visible attributes behave.
 pub(crate) struct MemoryViewState {
-    /// Exporter object (`bytes` or `bytearray`); `NONE` after `release()`.
+    /// Exporter object (`bytes`, `bytearray` or `array.array`); `NONE` after
+    /// `release()`.
     pub(crate) buffer: i64,
     /// Byte offset of the first element inside the exporter.
     pub(crate) offset: usize,
@@ -2030,8 +2032,8 @@ pub(crate) struct MemoryViewState {
     /// `true` once `release()` ran; every other operation then raises.
     pub(crate) released: bool,
     /// `true` for a view created over the whole exporter. Such a view follows
-    /// the exporter's current length (a `bytearray` that grows or shrinks is
-    /// observed live); slices and casts are fixed windows.
+    /// the exporter's current length (a `bytearray`/`array.array` that grows or
+    /// shrinks is observed live); slices and casts are fixed windows.
     pub(crate) whole: bool,
 }
 
@@ -2046,7 +2048,7 @@ impl MemoryViewState {
             return 0;
         }
         if self.whole {
-            return as_bytes(self.buffer).map_or(0, |bytes| bytes.len());
+            return memoryview_exporter_len(self.buffer).unwrap_or(0);
         }
         self.length
     }
@@ -2057,8 +2059,11 @@ impl MemoryViewState {
     }
 
     /// Number of visible bytes.
+    ///
+    /// Derived from [`Self::len`], so a whole-exporter view reports the
+    /// exporter's current byte count (including an `array.array`).
     pub(crate) fn nbytes(&self) -> usize {
-        self.length.saturating_mul(self.itemsize)
+        self.len().saturating_mul(self.itemsize)
     }
 
     /// Byte offset of element `index`, or `None` when out of range.
@@ -3266,6 +3271,108 @@ pub(crate) fn as_str(v: i64) -> Option<&'static str> {
         ObjDataRef::Str(s) => Some(s.as_str()),
         _ => None,
     }
+}
+
+// Lone surrogates in the string payload
+//
+// A Python `str` is a sequence of code points in `0..=0x10FFFF`, including the
+// surrogate range `U+D800..=U+DFFF`. A Rust `String` is a sequence of
+// `char`s, which excludes exactly that range: storing a lone surrogate
+// directly is impossible without invalid UTF-8. Hydro therefore stores
+// `U+D800 + n` (0 <= n < 0x800) as the scalar value `U+F0000 + n`, the first
+// 2048 code points of the Plane 15 Private Use Area. Every other code point is
+// stored unchanged, so [`as_str`] keeps returning the exact text for the
+// overwhelmingly common case of a string without lone surrogates, and the
+// char-based operations (`len`, indexing, slicing, concatenation, repetition,
+// formatting) keep counting one code point per stored `char`.
+//
+// The representation is inverted by [`storage_char_to_code`]; `as_str` is the
+// fast path and the `*_code(s)` helpers are the surrogate-aware accessors that
+// encode/decode/repr/ord style paths must use. Because a valid Python string
+// may itself contain `U+F0000..=U+F07FF`, those 2048 code points are reserved
+// by this representation: they decode as surrogates. No representation in a
+// valid UTF-8 `String` can be injective over all 0x110000 code points with one
+// `char` per code point (Rust has only 0x10F800 of them), and keeping the
+// one-char-per-code-point property is what makes indexing/slicing/length work
+// without a second storage kind.
+
+/// First stored code point of the surrogate mirror block.
+///
+/// `U+D800 + n` is stored as `SURROGATE_STORAGE_BASE + n`; see the module's
+/// representation note above.
+pub(crate) const SURROGATE_STORAGE_BASE: u32 = 0xF0000;
+
+/// Number of code points reserved by [`SURROGATE_STORAGE_BASE`].
+pub(crate) const SURROGATE_STORAGE_LEN: u32 = 0x800;
+
+/// Whether `code` is a surrogate code point (`U+D800..=U+DFFF`).
+pub(crate) fn is_surrogate_code(code: u32) -> bool {
+    (0xD800..=0xDFFF).contains(&code)
+}
+
+/// Encodes one Python code point as the `char` kept in a string payload.
+///
+/// Surrogates become their mirror in the reserved Private Use Area block;
+/// every other code point is returned unchanged. `None` means `code` is not a
+/// Unicode code point (`> 0x10FFFF`).
+pub(crate) fn code_to_storage_char(code: u32) -> Option<char> {
+    if is_surrogate_code(code) {
+        char::from_u32(SURROGATE_STORAGE_BASE + (code - 0xD800))
+    } else {
+        char::from_u32(code)
+    }
+}
+
+/// Decodes one stored `char` back to its Python code point.
+///
+/// Characters in the reserved mirror block become the lone surrogate they
+/// stand for; every other character is returned unchanged.
+pub(crate) fn storage_char_to_code(character: char) -> u32 {
+    let code = character as u32;
+    if (SURROGATE_STORAGE_BASE..SURROGATE_STORAGE_BASE + SURROGATE_STORAGE_LEN).contains(&code) {
+        code - SURROGATE_STORAGE_BASE + 0xD800
+    } else {
+        code
+    }
+}
+
+/// Appends one Python code point to a string payload.
+///
+/// An out-of-range code point is replaced with `U+FFFD`, which is only reachable
+/// from defensive internal callers: every public creation path validates the
+/// range first.
+pub(crate) fn str_push_code(out: &mut String, code: u32) {
+    out.push(code_to_storage_char(code).unwrap_or(char::REPLACEMENT_CHARACTER));
+}
+
+/// Builds a string payload from Python code points.
+///
+/// Shared with the codec and `chr` slices: it is the creation-side counterpart
+/// of [`str_codes`].
+#[allow(dead_code)] // Used by the codec/`chr` paths outside this module.
+pub(crate) fn str_from_codes<I: IntoIterator<Item = u32>>(codes: I) -> String {
+    let codes = codes.into_iter();
+    let mut out = String::with_capacity(codes.size_hint().0);
+    for code in codes {
+        str_push_code(&mut out, code);
+    }
+    out
+}
+
+/// Iterates the Python code points of a string payload.
+pub(crate) fn str_codes(text: &str) -> impl Iterator<Item = u32> + '_ {
+    text.chars().map(storage_char_to_code)
+}
+
+/// Copies the Python code points of a string value, if it is a string.
+///
+/// This is the explicit surrogate-aware accessor used by paths that must see
+/// `U+D800..=U+DFFF` rather than the internal mirror: encoding, repr, `ord`
+/// and the C API's UCS views. `len`, indexing and slicing need no accessor:
+/// the payload keeps exactly one `char` per code point.
+#[allow(dead_code)] // Used by the codec/`ord` paths outside this module.
+pub(crate) fn as_str_codes(v: i64) -> Option<Vec<u32>> {
+    as_str(v).map(|text| text.chars().map(storage_char_to_code).collect())
 }
 
 /// Borrows the contents of a bytes-like value (`bytes` or `bytearray`).
@@ -5147,10 +5254,66 @@ pub(crate) fn interpolation_alloc(
     )
 }
 
-/// Copies `bytes` into a fresh string object. Invalid UTF-8 is replaced
-/// defensively (the ABI only ever carries UTF-8).
+/// Copies `bytes` into a fresh string object.
+///
+/// UTF-8 and WTF-8 (the `surrogatepass` encoding of lone surrogates) are kept
+/// losslessly; genuinely malformed bytes are replaced defensively, since the
+/// ABI contract is UTF-8.
 pub(crate) fn str_from_bytes(bytes: &[u8]) -> i64 {
-    str_alloc(String::from_utf8_lossy(bytes).into_owned())
+    match wtf8_text(bytes) {
+        Some(text) => str_alloc(text),
+        // Defensive fallback for genuinely malformed bytes (the ABI contract
+        // is UTF-8): keep the historical lossy replacement.
+        None => str_alloc(String::from_utf8_lossy(bytes).into_owned()),
+    }
+}
+
+/// Decodes UTF-8, keeping WTF-8 encoded lone surrogates losslessly.
+///
+/// `surrogatepass` produces the UTF-8 encoding of a surrogate (`ED A0 80` for
+/// `U+D800`), which is not valid UTF-8 but is a common wire form for Python
+/// strings. Those three-byte sequences become the runtime's mirror code
+/// points; every other valid sequence is copied unchanged. `None` means the
+/// input is not UTF-8/WTF-8 at all, leaving the caller's lossy fallback in
+/// charge.
+fn wtf8_text(bytes: &[u8]) -> Option<String> {
+    let mut out = String::with_capacity(bytes.len());
+    let mut position = 0;
+    while position < bytes.len() {
+        let first = bytes[position];
+        if first < 0x80 {
+            out.push(first as char);
+            position += 1;
+            continue;
+        }
+        let width = match first {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return None,
+        };
+        let sequence = bytes.get(position..position + width)?;
+        if let Ok(text) = std::str::from_utf8(sequence) {
+            out.push_str(text);
+            position += width;
+            continue;
+        }
+        if width != 3 || first != 0xED {
+            return None;
+        }
+        let code = ((first as u32 & 0x0F) << 12)
+            | ((sequence[1] as u32 & 0x3F) << 6)
+            | (sequence[2] as u32 & 0x3F);
+        if !is_surrogate_code(code)
+            || sequence[1] & 0xC0 != 0x80
+            || sequence[2] & 0xC0 != 0x80
+        {
+            return None;
+        }
+        str_push_code(&mut out, code);
+        position += width;
+    }
+    Some(out)
 }
 
 /// Copies `len` bytes at `ptr` into a string object. `NULL` yields `""`.
@@ -5239,18 +5402,34 @@ pub(crate) fn bytearray_from_bytes(ptr: *const u8, len: usize) -> i64 {
     bytearray_new(bytes.to_vec())
 }
 
-/// Exporter kind of a `memoryview` buffer.
+/// Exporter kind of a `memoryview` buffer (`true` when writable).
+///
+/// `bytes` is read-only, `bytearray` and `array.array` are writable. The array
+/// payload is its packed byte representation, so a view over an array exposes
+/// exactly the bytes `struct`/`binascii` read from it.
 fn memoryview_exporter(buffer: i64) -> Option<bool> {
     if as_bytearray(buffer).is_some() {
         Some(true)
     } else if as_bytes(buffer).is_some() {
         Some(false)
+    } else if crate::modules::array_mod::is_array(buffer) {
+        Some(true)
     } else {
         None
     }
 }
 
-/// Creates a `memoryview` over `buffer`, which must be `bytes` or `bytearray`.
+/// Byte length of a `memoryview` exporter, if `buffer` exports a buffer.
+fn memoryview_exporter_len(buffer: i64) -> Option<usize> {
+    if let Some(bytes) = as_bytes(buffer) {
+        Some(bytes.len())
+    } else {
+        crate::modules::array_mod::buffer_length(buffer)
+    }
+}
+
+/// Creates a `memoryview` over `buffer`, which must be `bytes`, `bytearray` or
+/// `array.array`.
 ///
 /// Any other value raises `TypeError` and returns `NONE`, matching CPython's
 /// "memoryview: a bytes-like object is required" contract.
@@ -5264,7 +5443,7 @@ pub(crate) fn memoryview_abi(buffer: i64) -> i64 {
             ),
         );
     };
-    let len = as_bytes(buffer).map(|bytes| bytes.len()).unwrap_or(0);
+    let len = memoryview_exporter_len(buffer).unwrap_or(0);
     alloc(
         KIND_MEMORYVIEW,
         ObjData::MemoryView(MemoryViewState {
@@ -5289,7 +5468,7 @@ pub(crate) fn memoryview_with_window(
     stride: isize,
     format: char,
 ) -> i64 {
-    let readonly = as_bytearray(buffer).is_none();
+    let readonly = !memoryview_exporter(buffer).unwrap_or(false);
     alloc(
         KIND_MEMORYVIEW,
         ObjData::MemoryView(MemoryViewState {
@@ -5318,7 +5497,13 @@ pub(crate) fn memoryview_bytes(state: &MemoryViewState) -> Result<Vec<u8>, &'sta
     if state.released {
         return Err(MEMORYVIEW_RELEASED);
     }
-    let Some(source) = as_bytes(state.buffer) else {
+    let snapshot;
+    let source: &[u8] = if let Some(bytes) = as_bytes(state.buffer) {
+        bytes
+    } else if let Some(bytes) = crate::modules::array_mod::buffer_snapshot(state.buffer) {
+        snapshot = bytes;
+        &snapshot
+    } else {
         return Err(MEMORYVIEW_RELEASED);
     };
     let mut out = Vec::with_capacity(state.len());
@@ -5340,7 +5525,13 @@ pub(crate) fn memoryview_get(state: &MemoryViewState, index: usize) -> Result<i6
     if state.released {
         return Err(MEMORYVIEW_RELEASED);
     }
-    let Some(source) = as_bytes(state.buffer) else {
+    let snapshot;
+    let source: &[u8] = if let Some(bytes) = as_bytes(state.buffer) {
+        bytes
+    } else if let Some(bytes) = crate::modules::array_mod::buffer_snapshot(state.buffer) {
+        snapshot = bytes;
+        &snapshot
+    } else {
         return Err(MEMORYVIEW_RELEASED);
     };
     let Some(offset) = state.element_offset(index) else {
@@ -5372,16 +5563,25 @@ pub(crate) fn memoryview_set_byte(
     let Some(offset) = state.element_offset(index) else {
         return Err(MEMORYVIEW_OUT_OF_RANGE);
     };
-    let Some(target) = bytearray_bytes_mut(state.buffer) else {
-        return Err(MEMORYVIEW_READONLY);
-    };
-    match target.get_mut(offset) {
-        Some(slot) => {
-            *slot = byte;
-            Ok(())
-        }
-        None => Err(MEMORYVIEW_OUT_OF_RANGE),
+    if let Some(target) = bytearray_bytes_mut(state.buffer) {
+        return match target.get_mut(offset) {
+            Some(slot) => {
+                *slot = byte;
+                Ok(())
+            }
+            None => Err(MEMORYVIEW_OUT_OF_RANGE),
+        };
     }
+    if crate::modules::array_mod::is_array(state.buffer) {
+        // The array's packed payload is a `bytearray`; the buffer helper
+        // bounds-checks the offset against the array's current length.
+        return if crate::modules::array_mod::buffer_write(state.buffer, offset, &[byte]) {
+            Ok(())
+        } else {
+            Err(MEMORYVIEW_OUT_OF_RANGE)
+        };
+    }
+    Err(MEMORYVIEW_READONLY)
 }
 
 /// Writes one element from a Python value.
@@ -5578,8 +5778,38 @@ fn c3_merge(sequences: &[Vec<i64>]) -> Option<Vec<i64>> {
     }
 }
 
+/// The cached native `object` class without creating it.
+///
+/// [`compute_mro`] needs `object` as the implicit last ancestor of every
+/// class, but the class that *is* `object` is itself built through
+/// [`compute_mro`]; creating it recursively from here would loop. When the
+/// cache has no live entry yet (bootstrap), callers simply omit it.
+fn cached_object_class() -> Option<i64> {
+    let generation = crate::heap::generation();
+    TYPE_CLASS_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get("object")
+            .and_then(|cached| (cached.generation == generation).then_some(cached.class))
+    })
+}
+
 /// Computes the ancestor linearization of a class with `bases`.
+///
+/// `object` is the implicit ancestor of every class. A native class created
+/// with no explicit bases (for example `unittest.TestCase`) records an empty
+/// `mro`, so the C3 merge would otherwise order `object` *before* later bases
+/// and let `object.__init__` shadow a real base's method:
+///
+/// ```text
+/// class CompressTestCase(BaseCompressTestCase, unittest.TestCase)
+/// ```
+///
+/// Without `object` in `TestCase`'s sequence the merge yields
+/// `[Base, object, TestCase]`; appending the implicit `object` to every base
+/// sequence yields the CPython order `[Base, TestCase, object]`.
 fn compute_mro(bases: &[i64]) -> Option<Vec<i64>> {
+    let implicit_object = cached_object_class();
     let mut sequences: Vec<Vec<i64>> = Vec::with_capacity(bases.len() + 1);
     for &base in bases {
         if is_extension_type(base) {
@@ -5589,9 +5819,14 @@ fn compute_mro(bases: &[i64]) -> Option<Vec<i64>> {
             continue;
         }
         let state = as_class(base)?;
-        let mut sequence = Vec::with_capacity(state.mro.len() + 1);
+        let mut sequence = Vec::with_capacity(state.mro.len() + 2);
         sequence.push(base);
         sequence.extend_from_slice(&state.mro);
+        if let Some(object) = implicit_object {
+            if base != object && !sequence.contains(&object) {
+                sequence.push(object);
+            }
+        }
         sequences.push(sequence);
     }
     sequences.push(bases.to_vec());
@@ -9734,7 +9969,8 @@ fn repr_depth(v: i64) -> String {
 /// Quotes a string like Python's `repr`: single quotes by default, double
 /// quotes when the string contains a single quote but no double quote; `\\`,
 /// the active quote, `\n`, `\r`, `\t` escaped and other control bytes rendered
-/// as `\xNN`.
+/// as `\xNN`. Lone surrogates live in the internal mirror block (see
+/// [`SURROGATE_STORAGE_BASE`]) and render as `\uNNNN`, as CPython does.
 pub(crate) fn quote_str(s: &str) -> String {
     let quote = if s.contains('\'') && !s.contains('"') {
         '"'
@@ -9743,8 +9979,13 @@ pub(crate) fn quote_str(s: &str) -> String {
     };
     let mut out = String::with_capacity(s.len() + 2);
     out.push(quote);
-    for ch in s.chars() {
-        match ch {
+    for stored in s.chars() {
+        let code = storage_char_to_code(stored);
+        if is_surrogate_code(code) {
+            out.push_str(&format!("\\u{code:04x}"));
+            continue;
+        }
+        match stored {
             '\\' => out.push_str("\\\\"),
             c if c == quote => {
                 out.push('\\');
@@ -9999,6 +10240,35 @@ mod tests {
         assert_eq!(repr(str_from_bytes(b"a\\b")), "'a\\\\b'");
         assert_eq!(repr(str_from_bytes(b"a\nb\r\t")), "'a\\nb\\r\\t'");
         assert_eq!(repr(str_from_bytes(&[0x01])), "'\\x01'");
+    }
+
+    #[test]
+    fn lone_surrogates_survive_the_string_payload() {
+        // Creation from code points maps each surrogate into the mirror block.
+        let text = str_from_codes([0xD800, 0x61, 0xDC80]);
+        assert_eq!(
+            str_codes(&text).collect::<Vec<_>>(),
+            vec![0xD800, 0x61, 0xDC80]
+        );
+        // One stored `char` per Python code point keeps length/index/slice
+        // arithmetic correct.
+        assert_eq!(text.chars().count(), 3);
+        assert_eq!(quote_str(&text), "'\\ud800a\\udc80'");
+        // The tagged accessor sees the same code points.
+        let tagged = str_alloc(text.clone());
+        assert_eq!(as_str_codes(tagged), Some(vec![0xD800, 0x61, 0xDC80]));
+
+        // Valid text, including the noncharacters and astral code points the
+        // codec tests use, stays byte-identical (the `as_str` fast path).
+        let plain = str_from_codes([0x61, 0xE9, 0xFFFF, 0x10000]);
+        assert_eq!(plain, "aé\u{FFFF}\u{10000}");
+
+        // The ABI constructor accepts WTF-8, the `surrogatepass` wire form.
+        let from_wtf8 = str_from_bytes(&[0x61, 0xED, 0xA0, 0x80]);
+        assert_eq!(as_str_codes(from_wtf8), Some(vec![0x61, 0xD800]));
+        assert_eq!(repr(from_wtf8), "'a\\ud800'");
+        // Genuinely malformed escape is not a surrogate.
+        assert_eq!(repr(str_from_bytes(&[0xED, 0x9F])), "'\u{FFFD}'");
     }
 
     #[test]
@@ -10326,6 +10596,53 @@ mod tests {
         assert_eq!(to_string(plain), "<Plain object>");
         assert_eq!(repr(plain), "<Plain object>");
         assert!(!crate::exc::pending(), "default rendering raised");
+    }
+
+    /// Regression: C3 must keep a later base before the implicit `object`
+    /// ancestor even when an earlier base was recorded with an empty
+    /// linearization (a native class built with no explicit bases, such as
+    /// `unittest.TestCase`). Without `object` in that base's sequence the
+    /// merge ordered `object` before the second base, so `object.__init__`
+    /// shadowed the real initializer and `super().__init__` stopped there.
+    #[test]
+    fn c3_orders_later_bases_before_implicit_object() {
+        crate::exc::init();
+        let object = object_class();
+        let init = native_function_new("value_tests", "_c3_native_init", usize::MAX);
+        // `class Plain(object)` — explicit object base.
+        let plain = class_new("PlainForC3".to_string(), object, Vec::new());
+        // A native class with no explicit bases, like `unittest.TestCase`.
+        let native = class_new(
+            "NativeForC3".to_string(),
+            NONE,
+            vec![("__init__".to_string(), init)],
+        );
+        assert!(as_class(native)
+            .map(|state| state.mro.is_empty())
+            .unwrap_or(false));
+
+        let combined = class_new_multi(
+            "CombinedForC3".to_string(),
+            vec![plain, native],
+            NONE,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            class_mro(combined)[1..].to_vec(),
+            vec![plain, native, object],
+            "later base must precede the implicit object ancestor"
+        );
+        // Normal lookup reaches the second base's initializer, not object's.
+        match class_lookup(combined, "__init__") {
+            Some(ClassEntry::Method(_, function)) => assert_eq!(function, init),
+            _ => panic!("__init__ did not resolve to the later base"),
+        }
+        // `super().__init__` from the first base continues into the second.
+        match class_lookup_after(combined, plain, "__init__") {
+            Some(ClassEntry::Method(_, function)) => assert_eq!(function, init),
+            _ => panic!("super() did not continue to the next base"),
+        }
     }
 
     extern "C" fn raising_repr_entry(_argv: *const i64) -> i64 {

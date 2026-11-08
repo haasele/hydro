@@ -46,11 +46,15 @@ const TEST_PROGRAM_KEY: &str = "unittest.TestProgram.class";
 const ERROR_HOLDER_KEY: &str = "unittest.util._ErrorHolder.class";
 const TEST_LIST_KEY: &str = "unittest.util.TestList.class";
 const SUBTEST_KEY: &str = "unittest._SubTest.class";
+const FAILED_TEST_KEY: &str = "unittest.loader._FailedTest.class";
 const RAISES_KEY: &str = "unittest._AssertRaisesContext.class";
 const DEFAULT_LOADER_KEY: &str = "unittest.defaultTestLoader";
 
 /// Registered test classes, in creation order.
 static REGISTRY: LazyLock<Mutex<Vec<i64>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Cache key of the module-level cleanup list (`unittest.case._module_cleanups`).
+const MODULE_CLEANUPS_KEY: &str = "unittest.module_cleanups";
 
 fn registry() -> MutexGuard<'static, Vec<i64>> {
     REGISTRY
@@ -67,6 +71,59 @@ pub(crate) fn register(class: i64) {
 /// Forgets every registered class (used by tests and a fresh runner start).
 pub(crate) fn reset() {
     registry().clear();
+    if let Some(list) = globals::registry_get(MODULE_CLEANUPS_KEY) {
+        if let Some(items) = value::as_list(list) {
+            let mut remaining = items.len();
+            while remaining > 0 {
+                remaining -= 1;
+                let index = encode_int(i64::try_from(remaining).unwrap_or(i64::MAX));
+                container::delete_subscript(list, index);
+            }
+        }
+    }
+}
+
+/// The module-level cleanup list (`unittest.case._module_cleanups`).
+///
+/// CPython keeps one process-wide list of `(function, args, kwargs)` entries;
+/// `addModuleCleanup` appends and `doModuleCleanups` drains it LIFO. The list
+/// is a real Python list value cached in the globals registry so its contents
+/// stay visible to the collector and to user code that reads the private name.
+fn module_cleanups_list() -> i64 {
+    if let Some(list) = globals::registry_get(MODULE_CLEANUPS_KEY) {
+        return list;
+    }
+    let list = value::list_new(Vec::new());
+    let roots = heap::root_values(std::slice::from_ref(&list));
+    globals::registry_set(MODULE_CLEANUPS_KEY, list);
+    heap::release_roots(roots);
+    list
+}
+
+/// `unittest._module_cleanups`: the live cleanup list value.
+pub(crate) fn module_cleanups() -> i64 {
+    module_cleanups_list()
+}
+
+/// The `_class_cleanups` list owned by `class`, created on first use.
+///
+/// CPython gives every `TestCase` subclass its own list in
+/// `__init_subclass__`; the runtime creates it lazily so a subclass never
+/// inherits and drains its base class' cleanups.
+fn class_cleanups_list(class: i64) -> Option<i64> {
+    if value::as_class(class).is_none() {
+        return None;
+    }
+    if let Some(value::ClassEntry::Attr(list)) = value::class_own_lookup(class, "_class_cleanups") {
+        if value::as_list(list).is_some() {
+            return Some(list);
+        }
+    }
+    let list = value::list_new(Vec::new());
+    let roots = heap::root_values(std::slice::from_ref(&list));
+    value::class_set_attr(class, "_class_cleanups".to_string(), list);
+    heap::release_roots(roots);
+    Some(list)
 }
 
 /// Builds (or returns) the cached native class for `name`.
@@ -439,7 +496,7 @@ pub(crate) fn test_case() -> i64 {
         return class;
     }
     // (Python name, dispatch name, minimum argc including `self`).
-    static METHODS: [(&str, &str, usize); 48] = [
+    static METHODS: &[(&str, &str, usize)] = &[
         (CASE_MARKER, "_case_marker", 1),
         ("__init__", "TestCase.__init__", 1),
         ("run", "TestCase.run", 1),
@@ -447,8 +504,15 @@ pub(crate) fn test_case() -> i64 {
         ("debug", "TestCase.debug", 1),
         ("setUp", "TestCase.setUp", 1),
         ("tearDown", "TestCase.tearDown", 1),
+        ("setUpClass", "TestCase.setUpClass", 1),
+        ("tearDownClass", "TestCase.tearDownClass", 1),
         ("addCleanup", "TestCase.addCleanup", 2),
         ("doCleanups", "TestCase.doCleanups", 1),
+        ("addClassCleanup", "TestCase.addClassCleanup", 2),
+        ("doClassCleanups", "TestCase.doClassCleanups", 1),
+        ("enterClassContext", "TestCase.enterClassContext", 2),
+        ("enterContext", "TestCase.enterContext", 2),
+        ("skipTest", "TestCase.skipTest", 1),
         ("subTest", "TestCase.subTest", 1),
         ("id", "TestCase.id", 1),
         ("shortDescription", "TestCase.shortDescription", 1),
@@ -456,6 +520,10 @@ pub(crate) fn test_case() -> i64 {
         ("__repr__", "TestCase.__repr__", 1),
         ("countTestCases", "TestCase.countTestCases", 1),
         ("defaultTestResult", "TestCase.defaultTestResult", 1),
+        ("_formatMessage", "TestCase._formatMessage", 3),
+        ("_baseAssertEqual", "TestCase._baseAssertEqual", 3),
+        ("_truncateMessage", "TestCase._truncateMessage", 3),
+        ("addTypeEqualityFunc", "TestCase.addTypeEqualityFunc", 3),
         ("assertEqual", "TestCase.assertEqual", 3),
         ("assertNotEqual", "TestCase.assertNotEqual", 3),
         ("assertTrue", "TestCase.assertTrue", 2),
@@ -489,7 +557,7 @@ pub(crate) fn test_case() -> i64 {
         ("assertNotHasAttr", "TestCase.assertNotHasAttr", 3),
         ("fail", "TestCase.fail", 1),
     ];
-    let class = cached_class(TEST_CASE_KEY, "TestCase", NONE, &METHODS);
+    let class = cached_class(TEST_CASE_KEY, "TestCase", NONE, METHODS);
     // CPython's `TestCase` class attributes that user code reads.
     value::class_set_attr(
         class,
@@ -498,6 +566,27 @@ pub(crate) fn test_case() -> i64 {
     );
     value::class_set_attr(class, "longMessage".to_string(), TRUE);
     value::class_set_attr(class, "maxDiff".to_string(), encode_int(80 * 8));
+    value::class_set_attr(class, "_diffThreshold".to_string(), encode_int(2i64.pow(16)));
+    value::class_set_attr(class, "_classSetupFailed".to_string(), FALSE);
+    value::class_set_attr(class, "tearDown_exceptions".to_string(), value::list_new(Vec::new()));
+    let _ = class_cleanups_list(class);
+    // Class-scoped hooks are classmethods, so `TestCase.addClassCleanup(fn)`
+    // and `Cls.doClassCleanups()` receive the owner class exactly as CPython's
+    // descriptors do.
+    for (python_name, dispatch_name) in [
+        ("addClassCleanup", "TestCase.addClassCleanup"),
+        ("doClassCleanups", "TestCase.doClassCleanups"),
+        ("enterClassContext", "TestCase.enterClassContext"),
+        ("setUpClass", "TestCase.setUpClass"),
+        ("tearDownClass", "TestCase.tearDownClass"),
+    ] {
+        let function = value::native_function_new("unittest", dispatch_name, 1);
+        value::class_set_attr(
+            class,
+            python_name.to_string(),
+            value::classmethod_new(function),
+        );
+    }
     // `failIf`/`failUnless` are the deprecated spellings of assertFalse/True.
     value::class_set_attr(
         class,
@@ -547,7 +636,14 @@ pub(crate) fn test_result_class() -> i64 {
 
 /// The cached `TextTestResult` class (a real `TestResult` subclass).
 pub(crate) fn text_test_result_class() -> i64 {
-    cached_class(TEXT_RESULT_KEY, "TextTestResult", test_result_class(), &[])
+    static METHODS: [(&str, &str, usize); 1] =
+        [("getDescription", "TextTestResult.getDescription", 2)];
+    cached_class(
+        TEXT_RESULT_KEY,
+        "TextTestResult",
+        test_result_class(),
+        &METHODS,
+    )
 }
 
 /// The cached `TextTestRunner` class.
@@ -592,6 +688,8 @@ pub(crate) fn test_loader_class() -> i64 {
         "suiteClass".to_string(),
         crate::modules::unittest_test_suite_class(),
     );
+    value::class_set_attr(class, "testNamePatterns".to_string(), NONE);
+    value::class_set_attr(class, "_top_level_dir".to_string(), NONE);
     class
 }
 
@@ -602,6 +700,13 @@ pub(crate) fn default_test_loader() -> i64 {
     }
     let loader = value::instance_new(test_loader_class());
     let roots = heap::root_values(std::slice::from_ref(&loader));
+    value::instance_setattr(loader, "errors".to_string(), value::list_new(Vec::new()));
+    value::instance_setattr(
+        loader,
+        "_loading_packages".to_string(),
+        value::list_new(Vec::new()),
+    );
+    value::instance_setattr(loader, "_top_level_dir".to_string(), NONE);
     globals::registry_set(DEFAULT_LOADER_KEY, loader);
     heap::release_roots(roots);
     loader
@@ -648,13 +753,17 @@ pub(crate) fn test_list_class() -> i64 {
 
 /// The cached `_SubTest` context manager class.
 fn subtest_class() -> i64 {
-    static METHODS: [(&str, &str, usize); 4] = [
+    static METHODS: [(&str, &str, usize); 6] = [
         ("__init__", "_SubTest.__init__", 3),
         ("__enter__", "_SubTest.__enter__", 1),
         ("__exit__", "_SubTest.__exit__", 4),
         ("__str__", "_SubTest.__str__", 1),
+        ("id", "_SubTest.id", 1),
+        ("shortDescription", "_SubTest.shortDescription", 1),
     ];
-    cached_class(SUBTEST_KEY, "_SubTest", NONE, &METHODS)
+    let class = cached_class(SUBTEST_KEY, "_SubTest", NONE, &METHODS);
+    value::class_set_attr(class, "failureException".to_string(), NONE);
+    class
 }
 
 /// The cached `_AssertRaisesContext` class.
@@ -678,6 +787,10 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "_skip_apply" => skip_apply(args),
         "_identity" => args.first().copied().unwrap_or(NONE),
         "_three_way_cmp" => three_way_cmp(args),
+        // Module-wide cleanups (CPython's `unittest.case` module functions).
+        "addModuleCleanup" => add_module_cleanup(args, &[]),
+        "doModuleCleanups" => do_module_cleanups(args),
+        "enterModuleContext" => enter_module_context(args),
         // Legacy internal hooks used by earlier native wrappers: they map to
         // the public assertion methods.
         "_case_marker" => NONE,
@@ -712,6 +825,72 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>
             let mut call_args = args.to_vec();
             call_args.push(dictionary);
             dispatch(function, &call_args)
+        }
+        // `addClassCleanup(function, /, *args, **kwargs)` keeps the trailing
+        // keyword dict as the cleanup's own `**kwargs`, exactly like
+        // `addCleanup`.
+        "TestCase.addClassCleanup" => {
+            let dictionary = keywords_dict(&keywords);
+            let mut call_args = args.to_vec();
+            call_args.push(dictionary);
+            dispatch(function, &call_args)
+        }
+        // `TestLoader.loadTestsFromModule(module, *, pattern=None)`.
+        "TestLoader.loadTestsFromModule" => {
+            let mut call_args = args.to_vec();
+            let mut remaining = keywords;
+            if let Some(index) = remaining.iter().position(|(name, _)| name == "pattern") {
+                let (_, pattern) = remaining.remove(index);
+                while call_args.len() < 2 {
+                    call_args.push(NONE);
+                }
+                call_args.push(pattern);
+            }
+            if let Some((name, _)) = remaining.first() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "unittest.TestLoader.loadTestsFromModule() got an unexpected keyword argument '{name}'"
+                    ),
+                );
+            }
+            dispatch(function, &call_args)
+        }
+        // The skip/expected-failure decorators accept their documented names
+        // (`reason=`, `condition=`), including when the spec entry leaves the
+        // names dynamic.
+        "skip" | "skipIf" | "skipUnless" => {
+            let mut slots = args.to_vec();
+            for (name, item) in keywords {
+                let index = match (function, name.as_str()) {
+                    ("skip", "reason") => 0,
+                    (_, "condition") => 0,
+                    (_, "reason") => 1,
+                    _ => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!(
+                                "unittest.{function}() got an unexpected keyword argument '{name}'"
+                            ),
+                        )
+                    }
+                };
+                while slots.len() <= index {
+                    slots.push(NONE);
+                }
+                slots[index] = item;
+            }
+            dispatch(function, &slots)
+        }
+        "addModuleCleanup" => add_module_cleanup(args, &keywords),
+        "enterModuleContext" | "doModuleCleanups" => {
+            if let Some((name, _)) = keywords.first() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("unittest.{function}() got an unexpected keyword argument '{name}'"),
+                );
+            }
+            dispatch(function, args)
         }
         // `unittest.main(module=...)` names the module whose tests run; the
         // argument is also accepted positionally through `call`.
@@ -766,6 +945,9 @@ fn dispatch(function: &str, args: &[i64]) -> i64 {
     if let Some(method) = function.strip_prefix("TestResult.") {
         return test_result_method(method, args);
     }
+    if let Some(method) = function.strip_prefix("TextTestResult.") {
+        return text_test_result_method(method, args);
+    }
     if let Some(method) = function.strip_prefix("TextTestRunner.") {
         return runner_method(method, args);
     }
@@ -783,6 +965,9 @@ fn dispatch(function: &str, args: &[i64]) -> i64 {
     }
     if let Some(method) = function.strip_prefix("_SubTest.") {
         return subtest_method(method, args);
+    }
+    if let Some(method) = function.strip_prefix("_FailedTest.") {
+        return failed_test_method(method, args);
     }
     if let Some(method) = function.strip_prefix("_AssertRaisesContext.") {
         return raises_context_method(method, args);
@@ -884,6 +1069,283 @@ fn reason_text(reason: i64) -> String {
 }
 
 // -------------------------------------------------------------------------
+// Cleanups and context managers
+// -------------------------------------------------------------------------
+
+/// Builds one cleanup entry: `(function, args_tuple, kwargs_dict)`.
+fn cleanup_entry(function: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let positional = value::tuple_new(args.to_vec());
+    let kwargs = keywords_dict(keywords);
+    value::tuple_new(vec![function, positional, kwargs])
+}
+
+/// Calls a cleanup function with positional and keyword arguments.
+///
+/// The error (if any) is left pending in the exception slot, exactly like a
+/// direct Python call; callers that must continue running decide whether to
+/// collect or propagate it.
+fn call_cleanup(function: i64, positional: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if keywords.is_empty() {
+        return builtins::call(function, positional.len(), positional.as_ptr());
+    }
+    let words = keyword_words(keywords);
+    builtins::call_kw(
+        function,
+        positional.len(),
+        positional.as_ptr(),
+        keywords.len(),
+        words.as_ptr(),
+    )
+}
+
+/// Runs the entry at `entry` (already popped from its cleanup list).
+fn run_cleanup_entry(entry: i64) -> i64 {
+    let Some(parts) = value::as_tuple(entry) else {
+        return NONE;
+    };
+    let function = parts.first().copied().unwrap_or(NONE);
+    let positional: Vec<i64> = parts
+        .get(1)
+        .and_then(|args| value::as_tuple(*args))
+        .map(<[i64]>::to_vec)
+        .unwrap_or_default();
+    let keywords = match parts.get(2).copied() {
+        Some(kwargs) if value::as_dict(kwargs).is_some() => keywords_from_dict(kwargs),
+        _ => Vec::new(),
+    };
+    let roots = heap::root_values(&[entry, function]);
+    let result = call_cleanup(function, &positional, &keywords);
+    heap::release_roots(roots);
+    result
+}
+
+/// Pops and runs every entry of `list`, LIFO, collecting the exceptions.
+///
+/// Returns the exceptions in execution order; the exception slot is left
+/// clear so the caller can report them through a result.
+fn drain_cleanups(list: i64) -> Vec<i64> {
+    let mut errors = Vec::new();
+    while let Some(items) = value::as_list(list) {
+        let Some(&entry) = items.last() else {
+            break;
+        };
+        let roots = heap::root_values(&[entry]);
+        let index = encode_int(i64::try_from(items.len() - 1).unwrap_or(i64::MAX));
+        container::delete_subscript(list, index);
+        run_cleanup_entry(entry);
+        if exc::pending() {
+            errors.push(take_pending());
+        }
+        heap::release_roots(roots);
+    }
+    errors
+}
+
+/// Raises CPython's `TypeError` for a non-context-manager object.
+fn context_protocol_error(cm: i64) -> i64 {
+    let class = value::type_class(cm);
+    let module = class_module(class).unwrap_or_else(|| "builtins".to_string());
+    let name = class_name(class);
+    let mut msg = format!("'{module}.{name}' object does not support the context manager protocol");
+    let is_async = value::class_lookup(class, "__aenter__").is_some()
+        && value::class_lookup(class, "__aexit__").is_some();
+    if is_async {
+        msg.push_str(
+            " but it supports the asynchronous context manager protocol. Did you mean to use enterAsyncContext()?",
+        );
+    }
+    exc::raise_with_message(TYPE_ERROR, &msg)
+}
+
+/// Enters `cm` and returns `(enter_result, bound_exit)`.
+///
+/// CPython looks the special methods up on the type, so a context manager
+/// with a missing `__enter__`/`__exit__` reports the protocol error even when
+/// the instance shadows the name.
+fn enter_context_core(cm: i64) -> Option<(i64, i64)> {
+    let class = value::type_class(cm);
+    let has_enter = value::class_lookup(class, "__enter__").is_some();
+    let has_exit = value::class_lookup(class, "__exit__").is_some();
+    if !has_enter || !has_exit {
+        context_protocol_error(cm);
+        return None;
+    }
+    let exit = methods::getattr(cm, b"__exit__".as_ptr(), 8);
+    if exc::pending() {
+        return None;
+    }
+    let enter = methods::getattr(cm, b"__enter__".as_ptr(), 9);
+    if exc::pending() {
+        return None;
+    }
+    let roots = heap::root_values(&[exit, enter]);
+    let entered = builtins::call(enter, 0, std::ptr::null());
+    heap::release_roots(roots);
+    if exc::pending() {
+        return None;
+    }
+    Some((entered, exit))
+}
+
+/// Registers `cm.__exit__` as a cleanup after entering it.
+fn add_context_cleanup<F>(cm: i64, add: F) -> i64
+where
+    F: FnOnce(i64),
+{
+    let Some((entered, exit)) = enter_context_core(cm) else {
+        return NONE;
+    };
+    let entry = cleanup_entry(exit, &[cm, NONE, NONE, NONE], &[]);
+    let roots = heap::root_values(&[entry]);
+    add(entry);
+    heap::release_roots(roots);
+    entered
+}
+
+fn append_cleanup(list: i64, entry: i64) -> i64 {
+    let roots = heap::root_values(&[list, entry]);
+    container::list_append(list, entry);
+    heap::release_roots(roots);
+    NONE
+}
+
+/// `unittest.addModuleCleanup(function, /, *args, **kwargs)`.
+fn add_module_cleanup(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let Some(&function) = args.first() else {
+        return missing_arguments("addModuleCleanup");
+    };
+    if function == NONE {
+        return exc::raise_with_message(TYPE_ERROR, "addModuleCleanup() requires a callable");
+    }
+    let entry = cleanup_entry(function, &args[1..], keywords);
+    append_cleanup(module_cleanups_list(), entry)
+}
+
+/// `unittest.doModuleCleanups()`: run every module cleanup LIFO and raise the
+/// first failure after the list is drained.
+fn do_module_cleanups(_args: &[i64]) -> i64 {
+    let errors = drain_cleanups(module_cleanups_list());
+    if let Some(&first) = errors.first() {
+        return exc::raise_value(first);
+    }
+    NONE
+}
+
+/// `unittest.enterModuleContext(cm)`.
+fn enter_module_context(args: &[i64]) -> i64 {
+    let Some(&cm) = args.first() else {
+        return missing_arguments("enterModuleContext");
+    };
+    add_context_cleanup(cm, |entry| {
+        append_cleanup(module_cleanups_list(), entry);
+    })
+}
+
+/// `TestCase.addClassCleanup(function, /, *args, **kwargs)` (classmethod).
+fn add_class_cleanup(args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let (Some(&class), Some(&function)) = (args.first(), args.get(1)) else {
+        return missing_arguments("TestCase.addClassCleanup");
+    };
+    if value::as_class(class).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "addClassCleanup() requires a TestCase subclass",
+        );
+    }
+    let Some(list) = class_cleanups_list(class) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "addClassCleanup() requires a TestCase subclass",
+        );
+    };
+    let entry = cleanup_entry(function, &args[2..], keywords);
+    append_cleanup(list, entry)
+}
+
+/// Runs every class cleanup, storing the `sys.exc_info()` tuples CPython's
+/// suite turns into `tearDownClass` errors.
+fn do_class_cleanups_core(class: i64) -> i64 {
+    let Some(list) = class_cleanups_list(class) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "doClassCleanups() requires a TestCase subclass",
+        );
+    };
+    let exceptions = value::list_new(Vec::new());
+    let roots = heap::root_values(&[exceptions]);
+    for error in drain_cleanups(list) {
+        let info = error_tuple(error);
+        let info_roots = heap::root_values(&[info]);
+        container::list_append(exceptions, info);
+        heap::release_roots(info_roots);
+    }
+    value::class_set_attr(class, "tearDown_exceptions".to_string(), exceptions);
+    heap::release_roots(roots);
+    NONE
+}
+
+/// `TestCase.doClassCleanups()` (classmethod).
+fn do_class_cleanups(args: &[i64]) -> i64 {
+    let Some(&class) = args.first() else {
+        return missing_arguments("TestCase.doClassCleanups");
+    };
+    if value::as_class(class).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "doClassCleanups() requires a TestCase subclass",
+        );
+    }
+    do_class_cleanups_core(class)
+}
+
+/// `TestCase.enterClassContext(cm)` (classmethod).
+fn enter_class_context(args: &[i64]) -> i64 {
+    let (Some(&class), Some(&cm)) = (args.first(), args.get(1)) else {
+        return missing_arguments("TestCase.enterClassContext");
+    };
+    if value::as_class(class).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "enterClassContext() requires a TestCase subclass",
+        );
+    }
+    add_context_cleanup(cm, |entry| {
+        if let Some(list) = class_cleanups_list(class) {
+            append_cleanup(list, entry);
+        }
+    })
+}
+
+/// `TestCase.enterContext(cm)`: enter `cm` and register its `__exit__` as a
+/// test cleanup, returning the `__enter__` result.
+fn enter_context(args: &[i64]) -> i64 {
+    let (Some(&instance), Some(&cm)) = (args.first(), args.get(1)) else {
+        return missing_arguments("TestCase.enterContext");
+    };
+    add_context_cleanup(cm, |entry| {
+        append_test_cleanup(instance, entry);
+    })
+}
+
+/// Appends `entry` to `instance._cleanups`, creating the list when needed.
+fn append_test_cleanup(instance: i64, entry: i64) -> i64 {
+    let cleanups = value::instance_attr(instance, "_cleanups")
+        .filter(|list| value::as_list(*list).is_some())
+        .unwrap_or_else(|| {
+            let list = value::list_new(Vec::new());
+            value::instance_setattr(instance, "_cleanups".to_string(), list);
+            list
+        });
+    append_cleanup(cleanups, entry)
+}
+
+/// `TestCase.skipTest(reason)`: raise `SkipTest` with the rendered reason.
+fn skip_test(args: &[i64]) -> i64 {
+    let reason = args.get(1).copied().unwrap_or(NONE);
+    exc::raise_with_message(SKIPPED, &reason_text(reason))
+}
+
+// -------------------------------------------------------------------------
 // TestCase
 // -------------------------------------------------------------------------
 
@@ -901,18 +1363,29 @@ fn test_case_method(method: &str, args: &[i64]) -> i64 {
             test_case_run(&call_args)
         }
         "debug" => test_case_debug(args),
-        "setUp" | "tearDown" => NONE,
+        "setUp" | "tearDown" | "setUpClass" | "tearDownClass" => NONE,
         "addCleanup" => add_cleanup(args),
-        "doCleanups" => match do_cleanups(args[0]) {
-            Some(error) => {
-                let result = value::instance_attr(args[0], "_unittest_result").unwrap_or(NONE);
-                if result != NONE {
-                    call_method(result, "addError", &[args[0], error_tuple(error)]);
-                }
-                FALSE
-            }
-            None => TRUE,
-        },
+        "doCleanups" => {
+            let instance = args.first().copied().unwrap_or(NONE);
+            value::bool_value(do_cleanups(instance))
+        }
+        "addClassCleanup" => {
+            let mut call_args = args.to_vec();
+            let dictionary = match call_args.last().copied() {
+                Some(dict) if value::as_dict(dict).is_some() => call_args.pop().unwrap_or(NONE),
+                _ => value::dict_new(Vec::new()),
+            };
+            let keywords = if value::as_dict(dictionary).is_some() {
+                keywords_from_dict(dictionary)
+            } else {
+                Vec::new()
+            };
+            add_class_cleanup(&call_args, &keywords)
+        }
+        "doClassCleanups" => do_class_cleanups(args),
+        "enterClassContext" => enter_class_context(args),
+        "enterContext" => enter_context(args),
+        "skipTest" => skip_test(args),
         "subTest" => sub_test(args),
         "id" => test_case_id(args),
         "shortDescription" => short_description(args),
@@ -921,13 +1394,17 @@ fn test_case_method(method: &str, args: &[i64]) -> i64 {
         "countTestCases" => encode_int(1),
         "defaultTestResult" => new_test_result(),
         "fail" => fail(args),
-        "assertEqual"
-        | "assertListEqual"
-        | "assertTupleEqual"
-        | "assertSetEqual"
-        | "assertDictEqual"
-        | "assertMultiLineEqual"
-        | "assertSequenceEqual" => assert_equal(args),
+        "_formatMessage" => format_message(args),
+        "_baseAssertEqual" => base_assert_equal(args),
+        "_truncateMessage" => truncate_message(args),
+        "addTypeEqualityFunc" => add_type_equality_func(args),
+        "assertEqual" => assert_equal(args),
+        "assertListEqual" => assert_sequence_equal(args, Some("list")),
+        "assertTupleEqual" => assert_sequence_equal(args, Some("tuple")),
+        "assertSetEqual" => assert_set_equal(args),
+        "assertDictEqual" => assert_dict_equal(args),
+        "assertMultiLineEqual" => assert_multi_line_equal(args),
+        "assertSequenceEqual" => assert_sequence_equal(args, None),
         "assertNotEqual" => assert_not_equal(args),
         "assertTrue" => assert_true(args, true),
         "assertFalse" => assert_true(args, false),
@@ -990,7 +1467,7 @@ fn test_case_init(args: &[i64]) -> i64 {
     value::instance_setattr(
         instance,
         "_testMethodName".to_string(),
-        value::str_alloc(name),
+        value::str_alloc(name.clone()),
     );
     value::instance_setattr(
         instance,
@@ -998,7 +1475,41 @@ fn test_case_init(args: &[i64]) -> i64 {
         value::list_new(Vec::new()),
     );
     value::instance_setattr(instance, "_unittest_result".to_string(), NONE);
+    value::instance_setattr(instance, "_unittest_expecting".to_string(), FALSE);
+    value::instance_setattr(instance, "_unittest_expected_failure".to_string(), NONE);
+    value::instance_setattr(instance, "_outcome".to_string(), NONE);
+    value::instance_setattr(instance, "_subtest".to_string(), NONE);
+    value::instance_setattr(
+        instance,
+        "_type_equality_funcs".to_string(),
+        type_equality_defaults(),
+    );
+    let doc = method_function(class, &name)
+        .map(value::function_doc)
+        .filter(|doc| *doc != NONE)
+        .unwrap_or_else(|| value::str_alloc("No test".to_string()));
+    value::instance_setattr(instance, "_testMethodDoc".to_string(), doc);
     NONE
+}
+
+/// CPython's default `_type_equality_funcs`: the type-specific assertions
+/// `assertEqual` dispatches to for containers and strings.
+fn type_equality_defaults() -> i64 {
+    let mut pairs = Vec::new();
+    for (type_name, method) in [
+        ("dict", "assertDictEqual"),
+        ("list", "assertListEqual"),
+        ("tuple", "assertTupleEqual"),
+        ("set", "assertSetEqual"),
+        ("frozenset", "assertSetEqual"),
+        ("str", "assertMultiLineEqual"),
+    ] {
+        let class = value::native_class(type_name);
+        if class != NONE {
+            pairs.push((class, value::str_alloc(method.to_string())));
+        }
+    }
+    value::dict_new(pairs)
 }
 
 /// `TestCase.run(result=None)`.
@@ -1055,52 +1566,105 @@ fn test_case_run(args: &[i64]) -> i64 {
     let expecting = class_attr_truthy(class, "__unittest_expecting_failure__")
         || method.is_some_and(|function| attr_truthy(function, "__unittest_expecting_failure__"));
 
-    // Expose the active result so `subTest` contexts can report into it.
+    // Expose the active result so `subTest` contexts and cleanups report into
+    // it, and the expectation so a failing subtest registers the expected
+    // failure of the whole test.
     value::instance_setattr(instance, "_unittest_result".to_string(), result);
+    value::instance_setattr(instance, "_unittest_expecting".to_string(), value::bool_value(expecting));
+    value::instance_setattr(instance, "_unittest_expected_failure".to_string(), NONE);
+
+    // CPython's `_Outcome`: `success` gates tearDown and final accounting;
+    // `expectedFailure` is the exception an `@expectedFailure` body raised,
+    // which still lets tearDown and cleanups run.
+    let mut success = true;
+    let mut expected_failure: Option<i64> = None;
 
     call_method(instance, "setUp", &[]);
-    let mut failure: Option<i64> = None;
-    let mut from_test = false;
     if exc::pending() {
-        // `setUp` failures are always errors; CPython only arms the expected
-        // failure flag around the test method itself.
-        failure = Some(take_pending());
+        success = false;
+        let error = take_pending();
+        record_test_error(result, instance, error, false);
     } else {
-        call_method(instance, &name, &[]);
+        call_instance_method(instance, &name);
         if exc::pending() {
-            failure = Some(take_pending());
-            from_test = true;
-        } else {
-            // `tearDown` runs only when the test body itself succeeded,
-            // exactly like CPython's `_Outcome.success` gate.
+            let error = take_pending();
+            // `SkipTest` wins over the expected-failure flag: the test is
+            // reported as skipped, not as an expected failure.
+            if value::exception_data(error).map(|data| data.tag) == Some(SKIPPED) {
+                success = false;
+                record_test_error(result, instance, error, false);
+            } else if expecting {
+                expected_failure = Some(error);
+            } else {
+                success = false;
+                record_test_error(result, instance, error, false);
+            }
+        }
+        // A failing subtest with an expected failure may have been recorded by
+        // `_SubTest.__exit__` and suppressed; treat it like a body failure.
+        if expected_failure.is_none() {
+            if let Some(error) = value::instance_attr(instance, "_unittest_expected_failure")
+                .filter(|error| *error != NONE)
+            {
+                expected_failure = Some(error);
+                value::instance_setattr(instance, "_unittest_expected_failure".to_string(), NONE);
+            }
+        }
+        // `tearDown` runs when the body's outcome was a pass or an expected
+        // failure (CPython keeps `success` true for the latter).
+        if success {
             call_method(instance, "tearDown", &[]);
             if exc::pending() {
-                failure = Some(take_pending());
+                success = false;
+                let error = take_pending();
+                record_test_error(result, instance, error, false);
             }
         }
     }
 
-    // Cleanups always run, even after a failing `setUp`. A failing cleanup is
-    // an error of its own and prevents the run from being reported as a pass.
-    let cleanup_failure = do_cleanups(instance);
-    if let Some(error) = failure {
-        record_test_error(result, instance, error, from_test && expecting);
-    } else if cleanup_failure.is_none() {
+    // Cleanups always run, even after a failing `setUp`. Each failure is
+    // reported as its own outcome and prevents a pass/expected-failure report.
+    if !do_cleanups(instance) {
+        success = false;
+    }
+
+    if success {
         if expecting {
-            call_method(result, "addUnexpectedSuccess", &[instance]);
+            match expected_failure {
+                Some(error) => {
+                    call_method(result, "addExpectedFailure", &[instance, error_tuple(error)]);
+                }
+                None => {
+                    call_method(result, "addUnexpectedSuccess", &[instance]);
+                }
+            }
         } else {
             call_method(result, "addSuccess", &[instance]);
         }
     }
-    if let Some(error) = cleanup_failure {
-        call_method(result, "addError", &[instance, error_tuple(error)]);
-    }
 
     value::instance_setattr(instance, "_unittest_result".to_string(), NONE);
+    value::instance_setattr(instance, "_unittest_expecting".to_string(), FALSE);
     call_method(result, "stopTest", &[instance]);
     if owns_result {
         call_method(result, "stopTestRun", &[]);
     }
+    result
+}
+
+/// Calls `instance.<name>()` through a bound attribute.
+///
+/// Resolving the attribute first keeps descriptors and `functools.wraps`
+/// wrappers bound exactly as Python would; calling the class-namespace entry
+/// directly would drop `self` for wrappers stored as plain attributes.
+fn call_instance_method(instance: i64, name: &str) -> i64 {
+    let bound = methods::getattr(instance, name.as_ptr(), name.len());
+    if exc::pending() {
+        return NONE;
+    }
+    let roots = heap::root_values(std::slice::from_ref(&bound));
+    let result = builtins::call(bound, 0, std::ptr::null());
+    heap::release_roots(roots);
     result
 }
 
@@ -1132,7 +1696,7 @@ fn test_case_debug(args: &[i64]) -> i64 {
     if exc::pending() {
         return NONE;
     }
-    call_method(instance, &name, &[]);
+    call_instance_method(instance, &name);
     if exc::pending() {
         return NONE;
     }
@@ -1166,57 +1730,38 @@ fn add_cleanup(args: &[i64]) -> i64 {
     NONE
 }
 
-/// Runtime of the cleanup list: run every stored cleanup LIFO and return the
-/// first error, if any. The error is already cleared from the pending slot.
-fn do_cleanups(instance: i64) -> Option<i64> {
-    let cleanups = value::instance_attr(instance, "_cleanups")?;
-    value::as_list(cleanups)?;
-    let mut first_error = None;
+/// Runs the instance's cleanup list LIFO, reporting every failure through the
+/// active result (if any) and returning CPython's `outcome.success`.
+///
+/// A `SkipTest` raised by a cleanup is reported with `addSkip`; an ordinary
+/// exception goes through the same failure/error classification as a test
+/// outcome. Every cleanup runs even after an earlier one failed.
+fn do_cleanups(instance: i64) -> bool {
+    let Some(cleanups) = value::instance_attr(instance, "_cleanups")
+        .filter(|list| value::as_list(*list).is_some())
+    else {
+        return true;
+    };
+    let result = value::instance_attr(instance, "_unittest_result").unwrap_or(NONE);
+    let mut success = true;
     while let Some(items) = value::as_list(cleanups) {
         let Some(&entry) = items.last() else {
             break;
         };
-        let roots = heap::root_values(&[cleanups, entry]);
-        container::delete_subscript(
-            cleanups,
-            encode_int(i64::try_from(items.len() - 1).unwrap_or(i64::MAX)),
-        );
-        if let Some(parts) = value::as_tuple(entry) {
-            if let (Some(&function), Some(&call_args), Some(&kwargs)) =
-                (parts.first(), parts.get(1), parts.get(2))
-            {
-                let kwargs = if value::as_dict(kwargs).is_some() {
-                    keywords_from_dict(kwargs)
-                } else {
-                    Vec::new()
-                };
-                let positional: Vec<i64> = value::as_tuple(call_args)
-                    .map(<[i64]>::to_vec)
-                    .unwrap_or_default();
-                if kwargs.is_empty() {
-                    builtins::call(function, positional.len(), positional.as_ptr());
-                } else {
-                    // Native keyword ABI: interleave name/value pointers.
-                    let words = keyword_words(&kwargs);
-                    builtins::call_kw(
-                        function,
-                        positional.len(),
-                        positional.as_ptr(),
-                        kwargs.len(),
-                        words.as_ptr(),
-                    );
-                }
-            }
-        }
+        let roots = heap::root_values(&[entry]);
+        let index = encode_int(i64::try_from(items.len() - 1).unwrap_or(i64::MAX));
+        container::delete_subscript(cleanups, index);
+        run_cleanup_entry(entry);
         if exc::pending() {
+            success = false;
             let error = take_pending();
-            if first_error.is_none() {
-                first_error = Some(error);
+            if result != NONE {
+                record_test_error(result, instance, error, false);
             }
         }
         heap::release_roots(roots);
     }
-    first_error
+    success
 }
 
 fn sub_test(args: &[i64]) -> i64 {
@@ -1233,6 +1778,9 @@ fn sub_test(args: &[i64]) -> i64 {
     value::instance_setattr(context, "test_case".to_string(), instance);
     value::instance_setattr(context, "_message".to_string(), message);
     value::instance_setattr(context, "_params".to_string(), params);
+    let failure = self_attribute(instance, "failureException")
+        .unwrap_or_else(|| exc::exception_class(ASSERTION_ERROR));
+    value::instance_setattr(context, "failureException".to_string(), failure);
     heap::release_roots(roots);
     context
 }
@@ -1322,17 +1870,582 @@ fn fail(args: &[i64]) -> i64 {
 }
 
 fn assert_equal(args: &[i64]) -> i64 {
-    let (Some(&first), Some(&second)) = (args.get(1), args.get(2)) else {
+    let (Some(&instance), Some(&first), Some(&second)) =
+        (args.first(), args.get(1), args.get(2))
+    else {
         return missing_arguments("assertEqual");
     };
     if container::equals(first, second) {
         return NONE;
     }
+    let msg = args.get(3).copied().unwrap_or(NONE);
+    // CPython dispatches to a type-specific assertion when both operands have
+    // exactly the same type and the class registered one.
+    if value::type_class(first) == value::type_class(second) {
+        if let Some(dispatch) = type_equality_entry(instance, first) {
+            if let Some(name) = value::as_str(dispatch) {
+                let name = name.to_string();
+                return test_case_method(&name, &[instance, first, second, msg]);
+            }
+            let call_args = [first, second, msg];
+            let roots = heap::root_values(&[dispatch]);
+            let result = builtins::call(dispatch, call_args.len(), call_args.as_ptr());
+            heap::release_roots(roots);
+            return result;
+        }
+    }
+    let (first_repr, second_repr) = shorten_pair(first, second);
     raise_assertion(assertion_message(
         args,
         3,
-        format!("{} != {}", value::repr(first), value::repr(second)),
+        format!("{first_repr} != {second_repr}"),
     ))
+}
+
+/// The registered type-specific equality assertion for `value`'s type, if any.
+fn type_equality_entry(instance: i64, value_to_check: i64) -> Option<i64> {
+    let table = value::instance_attr(instance, "_type_equality_funcs")?;
+    let pairs = value::as_dict(table)?;
+    let class = value::type_class(value_to_check);
+    pairs
+        .iter()
+        .find(|(key, _)| *key == class)
+        .map(|(_, entry)| *entry)
+}
+
+/// `self._formatMessage(msg, standardMsg)`.
+fn format_message_text(instance: i64, msg: i64, standard: String) -> String {
+    let long = self_attribute(instance, "longMessage").is_some_and(value::truthy);
+    if !long {
+        if msg == NONE {
+            return standard;
+        }
+        return match value::as_str(msg) {
+            Some(text) => text.to_string(),
+            None => value::to_string(msg),
+        };
+    }
+    if msg == NONE {
+        return standard;
+    }
+    let text = match value::as_str(msg) {
+        Some(text) => text.to_string(),
+        None => value::to_string(msg),
+    };
+    format!("{standard} : {text}")
+}
+
+/// `self._formatMessage(msg, standardMsg)` as a native method.
+fn format_message(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return missing_arguments("TestCase._formatMessage");
+    };
+    let msg = args.get(1).copied().unwrap_or(NONE);
+    let standard = reason_text(args.get(2).copied().unwrap_or(NONE));
+    value::str_alloc(format_message_text(instance, msg, standard))
+}
+
+/// `self._baseAssertEqual(first, second, msg)`: plain `==`, no type dispatch.
+fn base_assert_equal(args: &[i64]) -> i64 {
+    let (Some(&instance), Some(&first), Some(&second)) =
+        (args.first(), args.get(1), args.get(2))
+    else {
+        return missing_arguments("TestCase._baseAssertEqual");
+    };
+    if container::equals(first, second) {
+        return NONE;
+    }
+    let msg = args.get(3).copied().unwrap_or(NONE);
+    let standard = format!("{} != {}", value::repr(first), value::repr(second));
+    raise_assertion(format_message_text(instance, msg, standard))
+}
+
+/// The receiver attribute, falling back to the class attribute (CPython's
+/// normal `self.name` lookup).
+fn self_attribute(instance: i64, name: &str) -> Option<i64> {
+    if let Some(value) = value::instance_attr(instance, name) {
+        return Some(value);
+    }
+    let class = value::as_instance(instance)
+        .map(|state| state.class)
+        .unwrap_or(instance);
+    match value::class_lookup(class, name) {
+        Some(value::ClassEntry::Attr(item)) => Some(item),
+        _ => None,
+    }
+}
+
+/// CPython's `_truncateMessage`: append `diff` unless it exceeds `maxDiff`.
+fn truncate_message_text(instance: i64, message: String, diff: String) -> String {
+    let max_diff = self_attribute(instance, "maxDiff").unwrap_or(NONE);
+    if max_diff == NONE {
+        return format!("{message}{diff}");
+    }
+    let Some(limit) = value::as_integer(max_diff) else {
+        return format!("{message}{diff}");
+    };
+    let length = diff.chars().count();
+    if i64::try_from(length).unwrap_or(i64::MAX) <= limit {
+        format!("{message}{diff}")
+    } else {
+        format!(
+            "{message}\nDiff is {length} characters long. Set self.maxDiff to None to see it."
+        )
+    }
+}
+
+/// `self._truncateMessage(message, diff)` as a native method.
+fn truncate_message(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return missing_arguments("TestCase._truncateMessage");
+    };
+    let message = reason_text(args.get(1).copied().unwrap_or(NONE));
+    let diff = reason_text(args.get(2).copied().unwrap_or(NONE));
+    value::str_alloc(truncate_message_text(instance, message, diff))
+}
+
+/// `self.addTypeEqualityFunc(typeobj, function)`.
+fn add_type_equality_func(args: &[i64]) -> i64 {
+    let (Some(&instance), Some(&typeobj), Some(&function)) =
+        (args.first(), args.get(1), args.get(2))
+    else {
+        return missing_arguments("TestCase.addTypeEqualityFunc");
+    };
+    let table = value::instance_attr(instance, "_type_equality_funcs")
+        .filter(|table| value::as_dict(*table).is_some())
+        .unwrap_or_else(|| {
+            let table = value::dict_new(Vec::new());
+            value::instance_setattr(instance, "_type_equality_funcs".to_string(), table);
+            table
+        });
+    container::dict_set(table, typeobj, function)
+}
+
+/// Capitalized form used by sequence failure messages.
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Length of a sequence, or `None` for a non-sequence (the pending
+/// `TypeError` is cleared).
+fn len_of(item: i64) -> Option<i64> {
+    let length = builtins::len(item);
+    if exc::pending() {
+        exc::clear();
+        None
+    } else {
+        Some(length)
+    }
+}
+
+/// `seq[index]`, or `None` (with the pending error cleared) on failure.
+fn item_at(seq: i64, index: i64) -> Option<i64> {
+    let item = container::subscript(seq, encode_int(index));
+    if exc::pending() {
+        exc::clear();
+        None
+    } else {
+        Some(item)
+    }
+}
+
+/// `(_common_shorten_repr(first, second))` as a pair of strings.
+fn shorten_pair(first: i64, second: i64) -> (String, String) {
+    let pair = common_shorten_repr(&[first, second]);
+    match value::as_tuple(pair) {
+        Some(items) if items.len() == 2 => (
+            value::as_str(items[0])
+                .map(str::to_string)
+                .unwrap_or_else(|| value::repr(items[0])),
+            value::as_str(items[1])
+                .map(str::to_string)
+                .unwrap_or_else(|| value::repr(items[1])),
+        ),
+        _ => (value::repr(first), value::repr(second)),
+    }
+}
+
+/// Imports `module` on demand and resolves `module.name`.
+///
+/// Used only while building a failure message; an unavailable module (or a
+/// function this runtime cannot provide) simply means the message omits its
+/// diff instead of failing the assertion a second time.
+fn imported_function(module: &str, name: &str) -> Option<i64> {
+    let module_arg = value::str_alloc(module.to_string());
+    let roots = heap::root_values(std::slice::from_ref(&module_arg));
+    let _ = crate::modules::importlib::call("import_module", std::slice::from_ref(&module_arg));
+    if exc::pending() {
+        exc::clear();
+        heap::release_roots(roots);
+        return None;
+    }
+    let function = globals::lookup(module, name).or_else(|| {
+        let candidate = crate::modules::module_get_by_name(module, name);
+        if exc::pending() {
+            exc::clear();
+            None
+        } else {
+            Some(candidate)
+        }
+    });
+    heap::release_roots(roots);
+    function
+}
+
+/// `pprint.pformat(value)` as text, when the module is available.
+fn pprint_text(item: i64) -> Option<String> {
+    let function = imported_function("pprint", "pformat")?;
+    let roots = heap::root_values(std::slice::from_ref(&item));
+    let text = builtins::call(function, 1, std::slice::from_ref(&item).as_ptr());
+    let result = if exc::pending() {
+        exc::clear();
+        None
+    } else {
+        value::as_str(text).map(str::to_string)
+    };
+    heap::release_roots(roots);
+    result
+}
+
+/// `difflib.ndiff(first.splitlines(), second.splitlines())` joined by newlines.
+fn ndiff_text(first: &str, second: &str) -> Option<String> {
+    let function = imported_function("difflib", "ndiff")?;
+    let first_lines = value::list_new(
+        first
+            .lines()
+            .map(|line| value::str_alloc(line.to_string()))
+            .collect(),
+    );
+    let second_lines = value::list_new(
+        second
+            .lines()
+            .map(|line| value::str_alloc(line.to_string()))
+            .collect(),
+    );
+    let arguments = [first_lines, second_lines];
+    let roots = heap::root_values(&arguments);
+    let diff = builtins::call(function, 2, arguments.as_ptr());
+    let lines = if exc::pending() {
+        exc::clear();
+        None
+    } else {
+        collect_items(diff)
+    };
+    heap::release_roots(roots);
+    let lines = lines?;
+    let mut out = String::new();
+    for line in lines {
+        if let Some(text) = value::as_str(line) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(text);
+        }
+    }
+    Some(out)
+}
+
+/// `text.splitlines(keepends=True)` as a list of string values.
+fn splitlines_keepends(text: i64) -> Vec<i64> {
+    let splitlines = methods::getattr(text, b"splitlines".as_ptr(), 10);
+    if !exc::pending() {
+        let roots = heap::root_values(std::slice::from_ref(&splitlines));
+        let keep_ends = TRUE;
+        let listed = builtins::call(splitlines, 1, &keep_ends as *const i64);
+        let items = if exc::pending() {
+            exc::clear();
+            None
+        } else {
+            collect_items(listed)
+        };
+        heap::release_roots(roots);
+        if let Some(items) = items {
+            return items;
+        }
+    } else {
+        exc::clear();
+    }
+    match value::as_str(text) {
+        Some(text) => text
+            .split_inclusive('\n')
+            .map(|line| value::str_alloc(line.to_string()))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// `assertSequenceEqual(seq1, seq2, msg=None, seq_type=None)`.
+fn assert_sequence_equal(args: &[i64], seq_type_name: Option<&str>) -> i64 {
+    let (Some(&instance), Some(&seq1), Some(&seq2)) =
+        (args.first(), args.get(1), args.get(2))
+    else {
+        return missing_arguments("assertSequenceEqual");
+    };
+    let msg = args.get(3).copied().unwrap_or(NONE);
+    let seq_type = seq_type_name.map(str::to_string).or_else(|| {
+        args.get(4)
+            .copied()
+            .filter(|class| *class != NONE && value::as_class(*class).is_some())
+            .map(class_name)
+    });
+    let seq_type_name = seq_type.clone().unwrap_or_else(|| "sequence".to_string());
+    if let Some(name) = &seq_type {
+        let class = value::native_class(name);
+        for (label, sequence) in [("First", seq1), ("Second", seq2)] {
+            if class != NONE && !value::truthy(builtins::isinstance(sequence, class)) {
+                return raise_assertion(format!(
+                    "{label} sequence is not a {name}: {}",
+                    value::repr(sequence)
+                ));
+            }
+        }
+    }
+    if container::equals(seq1, seq2) {
+        return NONE;
+    }
+    let mut differing = String::new();
+    let len1 = len_of(seq1);
+    let len2 = len_of(seq2);
+    match (len1, len2) {
+        (None, _) => differing.push_str(&format!(
+            "First {seq_type_name} has no length.    Non-sequence?"
+        )),
+        (_, None) => differing.push_str(&format!(
+            "Second {seq_type_name} has no length.    Non-sequence?"
+        )),
+        (Some(len1), Some(len2)) => {
+            let (first_repr, second_repr) = shorten_pair(seq1, seq2);
+            differing.push_str(&format!(
+                "{}s differ: {first_repr} != {second_repr}\n",
+                capitalize(&seq_type_name)
+            ));
+            let mut same_prefix = true;
+            for index in 0..len1.min(len2) {
+                let Some(item1) = item_at(seq1, index) else {
+                    differing.push_str(&format!(
+                        "\nUnable to index element {index} of first {seq_type_name}\n"
+                    ));
+                    same_prefix = false;
+                    break;
+                };
+                let Some(item2) = item_at(seq2, index) else {
+                    differing.push_str(&format!(
+                        "\nUnable to index element {index} of second {seq_type_name}\n"
+                    ));
+                    same_prefix = false;
+                    break;
+                };
+                if !container::equals(item1, item2) {
+                    let (first_item, second_item) = shorten_pair(item1, item2);
+                    differing.push_str(&format!(
+                        "\nFirst differing element {index}:\n{first_item}\n{second_item}\n"
+                    ));
+                    same_prefix = false;
+                    break;
+                }
+            }
+            if same_prefix
+                && len1 == len2
+                && seq_type.is_none()
+                && value::type_class(seq1) != value::type_class(seq2)
+            {
+                return NONE;
+            }
+            if len1 > len2 {
+                differing.push_str(&format!(
+                    "\nFirst {seq_type_name} contains {} additional elements.\n",
+                    len1 - len2
+                ));
+                if let Some(extra) = item_at(seq1, len2) {
+                    differing.push_str(&format!(
+                        "First extra element {len2}:\n{}\n",
+                        value::repr(extra)
+                    ));
+                }
+            } else if len1 < len2 {
+                differing.push_str(&format!(
+                    "\nSecond {seq_type_name} contains {} additional elements.\n",
+                    len2 - len1
+                ));
+                if let Some(extra) = item_at(seq2, len1) {
+                    differing.push_str(&format!(
+                        "First extra element {len1}:\n{}\n",
+                        value::repr(extra)
+                    ));
+                }
+            }
+        }
+    }
+    let diff = match (pprint_text(seq1), pprint_text(seq2)) {
+        (Some(first), Some(second)) => ndiff_text(&first, &second)
+            .map(|diff| format!("\n{diff}"))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    let standard = truncate_message_text(instance, differing, diff);
+    raise_assertion(format_message_text(instance, msg, standard))
+}
+
+/// `assertSetEqual(set1, set2, msg=None)`.
+fn assert_set_equal(args: &[i64]) -> i64 {
+    let (Some(&instance), Some(&set1), Some(&set2)) =
+        (args.first(), args.get(1), args.get(2))
+    else {
+        return missing_arguments("assertSetEqual");
+    };
+    let msg = args.get(3).copied().unwrap_or(NONE);
+    let difference = |first: i64, second: i64| {
+        let result = methods::call(
+            first,
+            b"difference".as_ptr(),
+            10,
+            1,
+            std::slice::from_ref(&second).as_ptr(),
+        );
+        if exc::pending() {
+            return None;
+        }
+        collect_items(result)
+    };
+    let Some(first_only) = difference(set1, set2) else {
+        return raise_assertion("first argument does not support set difference".to_string());
+    };
+    let Some(second_only) = difference(set2, set1) else {
+        return raise_assertion("second argument does not support set difference".to_string());
+    };
+    if first_only.is_empty() && second_only.is_empty() {
+        return NONE;
+    }
+    let mut lines = Vec::new();
+    if !first_only.is_empty() {
+        lines.push("Items in the first set but not the second:".to_string());
+        lines.extend(first_only.into_iter().map(value::repr));
+    }
+    if !second_only.is_empty() {
+        lines.push("Items in the second set but not the first:".to_string());
+        lines.extend(second_only.into_iter().map(value::repr));
+    }
+    raise_assertion(format_message_text(instance, msg, lines.join("\n")))
+}
+
+/// `assertDictEqual(d1, d2, msg=None)`.
+fn assert_dict_equal(args: &[i64]) -> i64 {
+    let (Some(&instance), Some(&first), Some(&second)) =
+        (args.first(), args.get(1), args.get(2))
+    else {
+        return missing_arguments("assertDictEqual");
+    };
+    let msg = args.get(3).copied().unwrap_or(NONE);
+    if value::as_dict(first).is_none() {
+        return raise_assertion(format_message_text(
+            instance,
+            msg,
+            "First argument is not a dictionary".to_string(),
+        ));
+    }
+    if value::as_dict(second).is_none() {
+        return raise_assertion(format_message_text(
+            instance,
+            msg,
+            "Second argument is not a dictionary".to_string(),
+        ));
+    }
+    if container::equals(first, second) {
+        return NONE;
+    }
+    let (first_repr, second_repr) = shorten_pair(first, second);
+    let standard = format!("{first_repr} != {second_repr}");
+    let diff = match (pprint_text(first), pprint_text(second)) {
+        (Some(first), Some(second)) => ndiff_text(&first, &second)
+            .map(|diff| format!("\n{diff}"))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    let standard = truncate_message_text(instance, standard, diff);
+    raise_assertion(format_message_text(instance, msg, standard))
+}
+
+/// `assertMultiLineEqual(first, second, msg=None)`.
+fn assert_multi_line_equal(args: &[i64]) -> i64 {
+    let (Some(&instance), Some(&first), Some(&second)) =
+        (args.first(), args.get(1), args.get(2))
+    else {
+        return missing_arguments("assertMultiLineEqual");
+    };
+    let msg = args.get(3).copied().unwrap_or(NONE);
+    let Some(first_text) = value::as_str(first) else {
+        return raise_assertion(format_message_text(
+            instance,
+            msg,
+            "First argument is not a string".to_string(),
+        ));
+    };
+    let Some(second_text) = value::as_str(second) else {
+        return raise_assertion(format_message_text(
+            instance,
+            msg,
+            "Second argument is not a string".to_string(),
+        ));
+    };
+    if first_text == second_text {
+        return NONE;
+    }
+    let (short_first, short_second) = shorten_pair(first, second);
+    let standard = format!("{short_first} != {short_second}");
+    // CPython skips difflib for strings above `_diffThreshold`.
+    let threshold = self_attribute(instance, "_diffThreshold")
+        .and_then(value::as_integer)
+        .unwrap_or(2i64.pow(16));
+    let too_long = i64::try_from(first_text.chars().count())
+        .unwrap_or(i64::MAX)
+        > threshold
+        || i64::try_from(second_text.chars().count()).unwrap_or(i64::MAX) > threshold;
+    if !too_long {
+        // Append a newline to either side that lacks one so the diff shows the
+        // line break difference; empty strings stay empty.
+        let mut first_lines_text = first_text.to_string();
+        let mut second_lines_text = second_text.to_string();
+        if !first_text.is_empty() && !second_text.is_empty() {
+            if !first_text.ends_with('\n') || !second_text.ends_with('\n') {
+                first_lines_text.push('\n');
+                second_lines_text.push('\n');
+            }
+        } else if !first_text.is_empty() && !first_text.ends_with('\n') {
+            first_lines_text.push('\n');
+        } else if !second_text.is_empty() && !second_text.ends_with('\n') {
+            second_lines_text.push('\n');
+        }
+        let first_values = value::list_new(splitlines_keepends(value::str_alloc(first_lines_text)));
+        let second_values =
+            value::list_new(splitlines_keepends(value::str_alloc(second_lines_text)));
+        if let Some(function) = imported_function("difflib", "ndiff") {
+            let arguments = [first_values, second_values];
+            let roots = heap::root_values(&arguments);
+            let diff = builtins::call(function, 2, arguments.as_ptr());
+            let lines = if exc::pending() {
+                exc::clear();
+                None
+            } else {
+                collect_items(diff)
+            };
+            heap::release_roots(roots);
+            if let Some(lines) = lines {
+                let mut text = String::new();
+                for line in lines {
+                    if let Some(line) = value::as_str(line) {
+                        text.push_str(line);
+                    }
+                }
+                let standard = truncate_message_text(instance, standard, format!("\n{text}"));
+                return raise_assertion(format_message_text(instance, msg, standard));
+            }
+        }
+    }
+    raise_assertion(format_message_text(instance, msg, standard))
 }
 
 fn assert_not_equal(args: &[i64]) -> i64 {
@@ -1554,39 +2667,57 @@ fn assert_regex(args: &[i64], expected: bool) -> i64 {
 }
 
 fn assert_count_equal(args: &[i64]) -> i64 {
-    let (Some(&first), Some(&second)) = (args.get(1), args.get(2)) else {
+    let (Some(&instance), Some(&first), Some(&second)) =
+        (args.first(), args.get(1), args.get(2))
+    else {
         return missing_arguments("assertCountEqual");
     };
-    let first_items = collect_items(first);
-    let second_items = collect_items(second);
-    if first_items.is_some() && second_items.is_some() {
-        let mut left = first_items.unwrap_or_default();
-        let mut right = second_items.unwrap_or_default();
-        let mut index = 0;
-        while index < left.len() {
-            if let Some(position) = right
-                .iter()
-                .position(|item| container::equals(*item, left[index]))
-            {
-                right.remove(position);
-                left.remove(index);
-            } else {
-                index += 1;
-            }
+    let msg = args.get(3).copied().unwrap_or(NONE);
+    let Some(left) = collect_items(first) else {
+        return raise_assertion(format_message_text(
+            instance,
+            msg,
+            "First argument is not iterable".to_string(),
+        ));
+    };
+    let Some(right) = collect_items(second) else {
+        return raise_assertion(format_message_text(
+            instance,
+            msg,
+            "Second argument is not iterable".to_string(),
+        ));
+    };
+    let count_in = |items: &[i64], target: i64| {
+        items
+            .iter()
+            .filter(|item| container::equals(**item, target))
+            .count()
+    };
+    let mut seen: Vec<i64> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    for &item in left.iter().chain(right.iter()) {
+        if seen.iter().any(|known| container::equals(*known, item)) {
+            continue;
         }
-        if left.is_empty() && right.is_empty() {
-            return NONE;
+        seen.push(item);
+        let first_count = count_in(&left, item);
+        let second_count = count_in(&right, item);
+        if first_count != second_count {
+            lines.push(format!(
+                "First has {first_count}, Second has {second_count}:  {}",
+                value::repr(item)
+            ));
         }
     }
-    raise_assertion(assertion_message(
-        args,
-        3,
-        format!(
-            "Counts differ: {} != {}",
-            value::repr(first),
-            value::repr(second)
-        ),
-    ))
+    if lines.is_empty() {
+        return NONE;
+    }
+    let standard = truncate_message_text(
+        instance,
+        "Element counts were not equal:\n".to_string(),
+        lines.join("\n"),
+    );
+    raise_assertion(format_message_text(instance, msg, standard))
 }
 
 fn assert_raises(args: &[i64], with_regex: bool) -> i64 {
@@ -1632,7 +2763,11 @@ fn assert_raises(args: &[i64], with_regex: bool) -> i64 {
         }
         if let Some(regex) = regex {
             if !regex_matches(regex, error) {
-                return exc::raise_value(error);
+                return raise_assertion(format!(
+                    "{} does not match {}",
+                    value::repr(regex),
+                    value::repr(error)
+                ));
             }
         }
         return NONE;
@@ -1707,13 +2842,9 @@ fn raise_assertion(message: String) -> i64 {
 }
 
 fn assertion_message(args: &[i64], index: usize, standard: String) -> String {
-    match args.get(index).copied() {
-        Some(message) if message != NONE => match value::as_str(message) {
-            Some(text) => format!("{text}\n{standard}"),
-            None => format!("{}\n{standard}", value::repr(message)),
-        },
-        _ => standard,
-    }
+    let instance = args.first().copied().unwrap_or(NONE);
+    let msg = args.get(index).copied().unwrap_or(NONE);
+    format_message_text(instance, msg, standard)
 }
 
 // -------------------------------------------------------------------------
@@ -1733,11 +2864,18 @@ fn test_result_method(method: &str, args: &[i64]) -> i64 {
             };
             let count = result_integer(result, "testsRun").unwrap_or(0) + 1;
             value::instance_setattr(result, "testsRun".to_string(), encode_int(count));
+            value::instance_setattr(result, "_mirrorOutput".to_string(), FALSE);
             NONE
         }
         "stopTest" | "startTestRun" | "stopTestRun" | "addSuccess" | "printErrors" => NONE,
-        "addError" => result_add_pair(args, "errors"),
-        "addFailure" => result_add_pair(args, "failures"),
+        "addError" => {
+            maybe_failfast(args.first().copied().unwrap_or(NONE));
+            result_add_pair(args, "errors")
+        }
+        "addFailure" => {
+            maybe_failfast(args.first().copied().unwrap_or(NONE));
+            result_add_pair(args, "failures")
+        }
         "addExpectedFailure" => result_add_pair(args, "expectedFailures"),
         "addSubTest" => result_add_subtest(args),
         "addSkip" => {
@@ -1746,13 +2884,13 @@ fn test_result_method(method: &str, args: &[i64]) -> i64 {
             else {
                 return missing_arguments("TestResult.addSkip");
             };
-            let reason = value::str_alloc(reason_text(reason));
             append_pair(result, "skipped", test, reason)
         }
         "addUnexpectedSuccess" => {
             let (Some(&result), Some(&test)) = (args.first(), args.get(1)) else {
                 return missing_arguments("TestResult.addUnexpectedSuccess");
             };
+            maybe_failfast(result);
             append_value(result, "unexpectedSuccesses", test)
         }
         "addDuration" => {
@@ -1800,6 +2938,28 @@ fn test_result_method(method: &str, args: &[i64]) -> i64 {
     }
 }
 
+/// Native methods of `TextTestResult`.
+fn text_test_result_method(method: &str, args: &[i64]) -> i64 {
+    match method {
+        "getDescription" => {
+            let (Some(&result), Some(&test)) = (args.first(), args.get(1)) else {
+                return missing_arguments("TextTestResult.getDescription");
+            };
+            let described = value::to_string(test);
+            let doc = call_method(test, "shortDescription", &[]);
+            let descriptions = value::instance_attr(result, "descriptions")
+                .map(value::truthy)
+                .unwrap_or(true);
+            if descriptions && doc != NONE && value::truthy(doc) {
+                value::str_alloc(format!("{described}\n{}", value::to_string(doc)))
+            } else {
+                value::str_alloc(described)
+            }
+        }
+        _ => missing_method("TextTestResult", method),
+    }
+}
+
 fn result_init(args: &[i64]) -> i64 {
     let Some(&result) = args.first() else {
         return missing_arguments("TestResult.__init__");
@@ -1820,6 +2980,13 @@ fn result_init(args: &[i64]) -> i64 {
     value::instance_setattr(result, "failfast".to_string(), FALSE);
     value::instance_setattr(result, "buffer".to_string(), FALSE);
     value::instance_setattr(result, "tb_locals".to_string(), FALSE);
+    // CPython's class-level run bookkeeping, also read by `TestSuite`.
+    value::instance_setattr(result, "_testRunEntered".to_string(), FALSE);
+    value::instance_setattr(result, "_previousTestClass".to_string(), NONE);
+    value::instance_setattr(result, "_moduleSetUpFailed".to_string(), FALSE);
+    value::instance_setattr(result, "_mirrorOutput".to_string(), FALSE);
+    value::instance_setattr(result, "_stdout_buffer".to_string(), NONE);
+    value::instance_setattr(result, "_stderr_buffer".to_string(), NONE);
     value::instance_setattr(
         result,
         "stream".to_string(),
@@ -1839,6 +3006,17 @@ fn result_init(args: &[i64]) -> i64 {
     NONE
 }
 
+/// CPython's `@failfast` wrapper: stop the run before recording an outcome
+/// when the result was constructed with `failfast=True`.
+fn maybe_failfast(result: i64) {
+    if result == NONE {
+        return;
+    }
+    if value::instance_attr(result, "failfast").is_some_and(value::truthy) {
+        value::instance_setattr(result, "shouldStop".to_string(), TRUE);
+    }
+}
+
 fn result_add_pair(args: &[i64], list: &str) -> i64 {
     let (Some(&result), Some(&test), Some(&error)) = (args.first(), args.get(1), args.get(2))
     else {
@@ -1856,6 +3034,7 @@ fn result_add_subtest(args: &[i64]) -> i64 {
     if error == NONE {
         return NONE;
     }
+    maybe_failfast(result);
     let test = args.get(1).copied().unwrap_or(NONE);
     let list = if error_is_failure(error, test) {
         "failures"
@@ -2000,7 +3179,11 @@ fn runner_run(args: &[i64]) -> i64 {
         return NONE;
     }
     call_method(result, "startTestRun", &[]);
-    run_test_item(test, result);
+    if is_suite_like(test) {
+        let _ = run_suite_root(test, result);
+    } else {
+        run_test_item(test, result);
+    }
     if exc::pending() {
         return NONE;
     }
@@ -2034,9 +3217,448 @@ fn run_test_item(test: i64, result: i64) -> i64 {
 // TestLoader
 // -------------------------------------------------------------------------
 
+/// The cached `_FailedTest` class: a synthetic test case that re-raises the
+/// exception a loader could not handle.
+fn failed_test_class() -> i64 {
+    static METHODS: [(&str, &str, usize); 8] = [
+        ("__init__", "_FailedTest.__init__", 2),
+        ("__getattr__", "_FailedTest.__getattr__", 2),
+        ("run", "_FailedTest.run", 2),
+        ("countTestCases", "_FailedTest.countTestCases", 1),
+        ("id", "_FailedTest.id", 1),
+        ("shortDescription", "_FailedTest.shortDescription", 1),
+        ("__str__", "_FailedTest.__str__", 1),
+        ("__repr__", "_FailedTest.__repr__", 1),
+    ];
+    let class = cached_class(FAILED_TEST_KEY, "_FailedTest", NONE, &METHODS);
+    value::class_set_attr(class, "failureException".to_string(), NONE);
+    class
+}
+
+fn failed_test_method(method: &str, args: &[i64]) -> i64 {
+    match method {
+        "__init__" => {
+            let (Some(&instance), Some(&name)) = (args.first(), args.get(1)) else {
+                return missing_arguments("_FailedTest.__init__");
+            };
+            value::instance_setattr(instance, "_testMethodName".to_string(), name);
+            value::instance_setattr(
+                instance,
+                "_exception".to_string(),
+                args.get(2).copied().unwrap_or(NONE),
+            );
+            NONE
+        }
+        "__getattr__" => {
+            let (Some(&instance), Some(&name)) = (args.first(), args.get(1)) else {
+                return missing_arguments("_FailedTest.__getattr__");
+            };
+            let method_name = value::instance_attr(instance, "_testMethodName")
+                .and_then(value::as_str)
+                .unwrap_or("");
+            let requested = value::as_str(name).unwrap_or("");
+            if requested != method_name {
+                return missing_method("_FailedTest", requested);
+            }
+            let error = value::instance_attr(instance, "_exception").unwrap_or(NONE);
+            if error == NONE {
+                return NONE;
+            }
+            exc::raise_value(error)
+        }
+        "run" => {
+            let (Some(&instance), Some(&result)) = (args.first(), args.get(1)) else {
+                return missing_arguments("_FailedTest.run");
+            };
+            call_method(result, "startTest", &[instance]);
+            let error = value::instance_attr(instance, "_exception").unwrap_or(NONE);
+            if error != NONE {
+                call_method(result, "addError", &[instance, error_tuple(error)]);
+            }
+            call_method(result, "stopTest", &[instance]);
+            result
+        }
+        "countTestCases" => encode_int(1),
+        "id" | "__str__" => {
+            let name = args
+                .first()
+                .and_then(|instance| value::instance_attr(*instance, "_testMethodName"))
+                .unwrap_or(NONE);
+            value::str_alloc(format!("unittest.loader._FailedTest.{}", value::to_string(name)))
+        }
+        "shortDescription" => NONE,
+        "__repr__" => {
+            let name = args
+                .first()
+                .and_then(|instance| value::instance_attr(*instance, "_testMethodName"))
+                .unwrap_or(NONE);
+            value::str_alloc(format!("<_FailedTest {}>", value::to_string(name)))
+        }
+        _ => missing_method("_FailedTest", method),
+    }
+}
+
+/// Builds CPython's failed-test suite and records the message on the loader.
+fn make_failed_test(
+    loader: i64,
+    method_name: &str,
+    error: i64,
+    message: String,
+) -> i64 {
+    if let Some(errors) = value::instance_attr(loader, "errors").filter(|list| {
+        value::as_list(*list).is_some()
+    }) {
+        let text = value::str_alloc(message);
+        let roots = heap::root_values(&[text]);
+        container::list_append(errors, text);
+        heap::release_roots(roots);
+    }
+    let instance = value::instance_new(failed_test_class());
+    let name = value::str_alloc(method_name.to_string());
+    let roots = heap::root_values(&[instance, name]);
+    value::instance_setattr(instance, "_testMethodName".to_string(), name);
+    value::instance_setattr(instance, "_exception".to_string(), error);
+    heap::release_roots(roots);
+    make_suite(vec![instance])
+}
+
+/// `_make_failed_import_test`: the ImportError's text is the loader message.
+fn make_failed_import_test(loader: i64, name: &str, error: i64) -> i64 {
+    let message = format!(
+        "Failed to import test module: {name}\n{}",
+        error_text(error)
+    );
+    make_failed_test(loader, name, error, message)
+}
+
+/// Imports `name` and returns the module value, or `None` with the pending
+/// exception left for the caller.
+fn import_module_value(name: &str) -> Option<i64> {
+    let argument = value::str_alloc(name.to_string());
+    let roots = heap::root_values(std::slice::from_ref(&argument));
+    let module = crate::modules::importlib::call("import_module", std::slice::from_ref(&argument));
+    heap::release_roots(roots);
+    if exc::pending() {
+        None
+    } else {
+        Some(module)
+    }
+}
+
+/// `getattr(obj, name)` where modules resolve through the module surface.
+fn traverse_attr(item: i64, name: &str) -> i64 {
+    if let Some(state) = value::as_module(item) {
+        return crate::modules::module_get_by_name(&state.name.clone(), name);
+    }
+    methods::getattr(item, name.as_ptr(), name.len())
+}
+
+/// Whether `item` is a module package (`__path__` is not None).
+fn is_package_value(item: i64) -> bool {
+    let Some(state) = value::as_module(item) else {
+        return false;
+    };
+    let name = state.name.clone();
+    let path = crate::modules::module_get_by_name(&name, "__path__");
+    if exc::pending() {
+        exc::clear();
+        false
+    } else {
+        path != NONE
+    }
+}
+
+/// Whether `item` is callable (used by `loadTestsFromName`).
+fn is_callable(item: i64) -> bool {
+    if value::as_function(item).is_some() || value::as_class(item).is_some() {
+        return true;
+    }
+    let call = methods::getattr(item, b"__call__".as_ptr(), 8);
+    if exc::pending() {
+        exc::clear();
+        false
+    } else {
+        call != NONE
+    }
+}
+
+/// CPython's `loadTestsFromName` object classification.
+fn suite_from_object(
+    loader: i64,
+    object: i64,
+    parent: i64,
+    last_name: &str,
+) -> i64 {
+    let test_case = test_case();
+    if value::as_module(object).is_some() {
+        return loader_method("loadTestsFromModule", &[loader, object, NONE]);
+    }
+    if value::as_class(object).is_some()
+        && object != test_case
+        && value::is_subclass_of(object, test_case)
+    {
+        return loader_method("loadTestsFromTestCase", &[loader, object]);
+    }
+    if is_suite_like(object) {
+        return object;
+    }
+    if value::as_function(object).is_some()
+        && value::as_class(parent).is_some()
+        && value::is_subclass_of(parent, test_case)
+    {
+        // `Class.testMethod`: a function descriptor on a TestCase subclass.
+        let argument = value::str_alloc(last_name.to_string());
+        let roots = heap::root_values(std::slice::from_ref(&argument));
+        let instance = builtins::call(parent, 1, std::slice::from_ref(&argument).as_ptr());
+        heap::release_roots(roots);
+        if exc::pending() {
+            return NONE;
+        }
+        return make_suite(vec![instance]);
+    }
+    if is_callable(object) {
+        let created = builtins::call(object, 0, std::ptr::null());
+        if exc::pending() {
+            return NONE;
+        }
+        if is_suite_like(created) {
+            return created;
+        }
+        if value::as_instance(created).is_some() && has_method(created, "run") {
+            return make_suite(vec![created]);
+        }
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "calling {} returned {}, not a test",
+                value::repr(object),
+                value::type_name(created)
+            ),
+        );
+    }
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!("don't know how to make test from: {}", value::repr(object)),
+    )
+}
+
+/// CPython's `TestLoader.loadTestsFromName`.
+fn load_tests_from_name(loader: i64, name_value: i64, module_value: i64) -> i64 {
+    let Some(name) = value::as_str(name_value).map(str::to_string) else {
+        return exc::raise_with_message(TYPE_ERROR, "loadTestsFromName() argument must be str");
+    };
+    if name.is_empty() {
+        return exc::raise_with_message(VALUE_ERROR, "Empty module name");
+    }
+    let parts: Vec<String> = name.split('.').map(str::to_string).collect();
+    let (mut object, mut consumed, mut error_case, mut error_message) = if module_value != NONE {
+        if value::as_module(module_value).is_none() {
+            return exc::raise_with_message(TYPE_ERROR, "module argument must be a module");
+        }
+        (module_value, 0usize, NONE, String::new())
+    } else {
+        let mut found = NONE;
+        let mut consumed = 0usize;
+        let mut error_case = NONE;
+        let mut error_message = String::new();
+        for count in (1..=parts.len()).rev() {
+            let candidate = parts[..count].join(".");
+            match import_module_value(&candidate) {
+                Some(module) => {
+                    found = module;
+                    consumed = count;
+                    break;
+                }
+                None => {
+                    let error = take_pending();
+                    error_case = make_failed_import_test(loader, &parts[count - 1], error);
+                    error_message = format!(
+                        "Failed to import test module: {}",
+                        parts[count - 1]
+                    );
+                    if count == 1 {
+                        return error_case;
+                    }
+                }
+            }
+        }
+        if found == NONE {
+            return error_case;
+        }
+        (found, consumed, error_case, error_message)
+    };
+    let mut parent = NONE;
+    for part in parts.iter().skip(consumed) {
+        let current = if parent == NONE { object } else { object };
+        let next = traverse_attr(current, part);
+        if exc::pending() {
+            let error = take_pending();
+            // A package with a failed import reports the ImportError; any
+            // other missing attribute is its own AttributeError.
+            if is_package_value(object) && error_case != NONE {
+                let _ = error_message;
+                return error_case;
+            }
+            let message = format!("Failed to access attribute:\n{}", error_text(error));
+            return make_failed_test(loader, part, error, message);
+        }
+        parent = current;
+        object = next;
+    }
+    let last = parts.last().cloned().unwrap_or_default();
+    suite_from_object(loader, object, parent, &last)
+}
+
+/// A real `discover` for dotted module names and directories.
+///
+/// Dotted names use the runtime's loaded-module registry (package recursion
+/// walks the already-loaded submodules); directories are listed, filtered by
+/// the `test*.py` glob and imported individually, matching CPython's
+/// failed-import behaviour for modules this runtime cannot compile.
+fn discover_tests(loader: i64, start_dir: i64, pattern: i64) -> i64 {
+    let Some(start) = value::as_str(start_dir).map(str::to_string) else {
+        return exc::raise_with_message(TYPE_ERROR, "discover() start_dir must be str");
+    };
+    let pattern = value::as_str(pattern)
+        .map(str::to_string)
+        .unwrap_or_else(|| "test*.py".to_string());
+    if !start.is_empty() && std::path::Path::new(&start).is_dir() {
+        return discover_directory(loader, &start, &pattern);
+    }
+    // Dotted module name: load it and recurse into its loaded children.
+    let Some(module) = import_module_value(&start) else {
+        let error = take_pending();
+        return make_failed_import_test(loader, &start, error);
+    };
+    let mut suites = vec![loader_method("loadTestsFromModule", &[loader, module, NONE])];
+    let prefix = format!("{start}.");
+    for name in globals::module_names() {
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let leaf = name.strip_prefix(&prefix).unwrap_or(&name);
+        if leaf.contains('.') {
+            continue;
+        }
+        if let Some(child) = import_module_value(&name) {
+            suites.push(loader_method("loadTestsFromModule", &[loader, child, NONE]));
+        } else {
+            exc::clear();
+        }
+    }
+    make_suite(suites)
+}
+
+/// Glob matching for `discover`'s `test*.py` pattern (`*` and `?` only).
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut pattern_index, mut name_index) = (0usize, 0usize);
+    let (mut star, mut matched) = (None, 0usize);
+    while name_index < name.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?' || pattern[pattern_index] == name[name_index])
+        {
+            pattern_index += 1;
+            name_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star = Some(pattern_index);
+            matched = name_index;
+            pattern_index += 1;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            matched += 1;
+            name_index = matched;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+/// Directory discovery: one suite per matching `*.py` file and package.
+fn discover_directory(loader: i64, start_dir: &str, pattern: &str) -> i64 {
+    let listdir = crate::modules::module_get_by_name("os", "listdir");
+    if exc::pending() {
+        exc::clear();
+        return make_suite(Vec::new());
+    }
+    let argument = value::str_alloc(start_dir.to_string());
+    let roots = heap::root_values(std::slice::from_ref(&argument));
+    let listing = builtins::call(listdir, 1, std::slice::from_ref(&argument).as_ptr());
+    let entries = if exc::pending() {
+        exc::clear();
+        None
+    } else {
+        collect_items(listing)
+    };
+    heap::release_roots(roots);
+    let Some(mut entries) = entries else {
+        return make_suite(Vec::new());
+    };
+    entries.sort_by_key(|item| value::to_string(*item));
+    let mut suites = Vec::new();
+    for entry in entries {
+        let Some(name) = value::as_str(entry).map(str::to_string) else {
+            continue;
+        };
+        if name == "__pycache__" || name.starts_with('.') {
+            continue;
+        }
+        let path = format!("{start_dir}/{name}");
+        if std::path::Path::new(&path).is_dir() {
+            let package_init = format!("{path}/__init__.py");
+            if !std::path::Path::new(&package_init).is_file() {
+                continue;
+            }
+            match import_module_value(&name) {
+                Some(module) => {
+                    suites.push(loader_method("loadTestsFromModule", &[loader, module, NONE]));
+                }
+                None => {
+                    let error = take_pending();
+                    suites.push(make_failed_import_test(loader, &name, error));
+                }
+            }
+            continue;
+        }
+        if !name.ends_with(".py") || !glob_matches(pattern, &name) {
+            continue;
+        }
+        let module_name = name.trim_end_matches(".py").to_string();
+        match import_module_value(&module_name) {
+            Some(module) => {
+                suites.push(loader_method("loadTestsFromModule", &[loader, module, NONE]));
+            }
+            None => {
+                let error = take_pending();
+                suites.push(make_failed_import_test(loader, &module_name, error));
+            }
+        }
+    }
+    make_suite(suites)
+}
+
 fn loader_method(method: &str, args: &[i64]) -> i64 {
     match method {
-        "__init__" => NONE,
+        "__init__" => {
+            let Some(&loader) = args.first() else {
+                return missing_arguments("TestLoader.__init__");
+            };
+            if value::as_instance(loader).is_some() {
+                value::instance_setattr(loader, "errors".to_string(), value::list_new(Vec::new()));
+                value::instance_setattr(
+                    loader,
+                    "_loading_packages".to_string(),
+                    value::list_new(Vec::new()),
+                );
+                value::instance_setattr(loader, "_top_level_dir".to_string(), NONE);
+            }
+            NONE
+        }
         "getTestCaseNames" => {
             let Some(&_loader) = args.first() else {
                 return missing_arguments("TestLoader.getTestCaseNames");
@@ -2080,9 +3702,10 @@ fn loader_method(method: &str, args: &[i64]) -> i64 {
             make_suite(tests)
         }
         "loadTestsFromModule" => {
-            let Some(&module) = args.get(1) else {
+            let (Some(&loader), Some(&module)) = (args.first(), args.get(1)) else {
                 return missing_arguments("TestLoader.loadTestsFromModule");
             };
+            let pattern = args.get(2).copied().unwrap_or(NONE);
             let Some(state) = value::as_module(module) else {
                 return exc::raise_with_message(TYPE_ERROR, "module argument must be a module");
             };
@@ -2091,40 +3714,61 @@ fn loader_method(method: &str, args: &[i64]) -> i64 {
             let tests = load_module_tests(dictionary, test_case());
             let suite = make_suite(tests);
             // CPython's `loadTestsFromModule` delegates to the module's
-            // `load_tests` hook and returns the suite that hook produces.
+            // `load_tests` hook and returns the suite that hook produces; a
+            // failing hook becomes a failed test on the loader's error list.
             match load_tests_hook(&name) {
                 Some(hook) => {
                     let roots = heap::root_values(&[suite]);
-                    let returned = call_load_tests(hook, suite);
+                    let returned = call_load_tests(hook, suite, pattern);
                     heap::release_roots(roots);
+                    if exc::pending() {
+                        let error = take_pending();
+                        let message =
+                            format!("Failed to call load_tests:\n{}", error_text(error));
+                        return make_failed_test(loader, &name, error, message);
+                    }
                     returned
                 }
                 None => suite,
             }
         }
-        "loadTestsFromNames" | "loadTestsFromName" => {
-            // Resolve names that denote a registered test class; anything else
-            // yields an empty suite instead of fabricating a test.
-            let Some(&names) = args.get(1) else {
+        "loadTestsFromName" => {
+            let (Some(&loader), Some(&name)) = (args.first(), args.get(1)) else {
                 return missing_arguments("TestLoader.loadTestsFromName");
             };
-            let mut tests = Vec::new();
-            if let Some(text) = value::as_str(names) {
-                if let Some(class) = find_registered_class(text) {
-                    tests.extend(load_class_tests(class));
-                }
-            } else if let Some(items) = value::as_list(names) {
-                for &item in items {
-                    if let Some(text) = value::as_str(item) {
-                        if let Some(class) = find_registered_class(text) {
-                            tests.extend(load_class_tests(class));
-                        }
-                    }
-                }
-            }
-            make_suite(tests)
+            let module = args.get(2).copied().unwrap_or(NONE);
+            load_tests_from_name(loader, name, module)
         }
-        "discover" => make_suite(Vec::new()),
+        "loadTestsFromNames" => {
+            let (Some(&loader), Some(&names)) = (args.first(), args.get(1)) else {
+                return missing_arguments("TestLoader.loadTestsFromNames");
+            };
+            let module = args.get(2).copied().unwrap_or(NONE);
+            let items = if value::as_str(names).is_some() {
+                vec![names]
+            } else {
+                collect_items(names).unwrap_or_default()
+            };
+            let roots = heap::root_values(&items);
+            let mut suites = Vec::with_capacity(items.len());
+            for item in items {
+                let suite = load_tests_from_name(loader, item, module);
+                if exc::pending() {
+                    heap::release_roots(roots);
+                    return NONE;
+                }
+                suites.push(suite);
+            }
+            heap::release_roots(roots);
+            make_suite(suites)
+        }
+        "discover" => {
+            let (Some(&loader), Some(&start_dir)) = (args.first(), args.get(1)) else {
+                return missing_arguments("TestLoader.discover");
+            };
+            let pattern = args.get(2).copied().unwrap_or(NONE);
+            discover_tests(loader, start_dir, pattern)
+        }
         "_makeSuite" => {
             let Some(&tests) = args.get(1) else {
                 return missing_arguments("TestLoader._makeSuite");
@@ -2175,16 +3819,6 @@ fn load_module_tests(dictionary: i64, test_case_class: i64) -> Vec<i64> {
     tests
 }
 
-fn find_registered_class(name: &str) -> Option<i64> {
-    // `package.Class` and `Class` both denote the registered class; a
-    // `Class.method` name selects the owning class.
-    let short = name.rsplit('.').next().unwrap_or(name);
-    registry().iter().copied().find(|class| {
-        let class_name = value::class_display_name(*class).unwrap_or("");
-        class_name == name || class_name == short
-    })
-}
-
 /// Builds a `TestSuite` from a list of tests.
 fn make_suite(tests: Vec<i64>) -> i64 {
     let class = crate::modules::unittest_test_suite_class();
@@ -2200,10 +3834,11 @@ fn make_suite(tests: Vec<i64>) -> i64 {
 // TestProgram
 // -------------------------------------------------------------------------
 
-fn program_method(method: &str, _args: &[i64]) -> i64 {
+fn program_method(method: &str, args: &[i64]) -> i64 {
     match method {
         "__init__" | "runTests" => {
-            run_main(MAIN_MODULE);
+            let module = main_module(&args[1..], &[]).unwrap_or_else(|| MAIN_MODULE.to_string());
+            run_main(&module);
             NONE
         }
         "parseArgs" => NONE,
@@ -2317,6 +3952,32 @@ fn make_test_list(tests: Vec<i64>) -> i64 {
     instance
 }
 
+/// CPython's `_SubTest._subDescription()`.
+fn subtest_description(instance: i64) -> String {
+    let mut parts = Vec::new();
+    let message = value::instance_attr(instance, "_message").unwrap_or(NONE);
+    if message != NONE {
+        parts.push(format!("[{}]", value::to_string(message)));
+    }
+    if let Some(params) = value::instance_attr(instance, "_params").and_then(value::as_dict) {
+        if !params.is_empty() {
+            let rendered = params
+                .iter()
+                .map(|(key, item)| {
+                    format!("{}={}", value::to_string(*key), value::repr(*item))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("({rendered})"));
+        }
+    }
+    if parts.is_empty() {
+        "(<subtest>)".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
 fn subtest_method(method: &str, args: &[i64]) -> i64 {
     match method {
         "__init__" => {
@@ -2332,16 +3993,31 @@ fn subtest_method(method: &str, args: &[i64]) -> i64 {
         }
         "__enter__" => args.first().copied().unwrap_or(NONE),
         "__exit__" => subtest_exit(args),
+        "id" => {
+            let Some(&instance) = args.first() else {
+                return missing_arguments("_SubTest.id");
+            };
+            let test = value::instance_attr(instance, "test_case").unwrap_or(NONE);
+            let described = call_method(test, "id", &[]);
+            value::str_alloc(format!("{} {}", value::to_string(described), subtest_description(instance)))
+        }
+        "shortDescription" => {
+            let Some(&instance) = args.first() else {
+                return missing_arguments("_SubTest.shortDescription");
+            };
+            let test = value::instance_attr(instance, "test_case").unwrap_or(NONE);
+            call_method(test, "shortDescription", &[])
+        }
         "__str__" => {
-            let message = args
-                .first()
-                .and_then(|instance| value::instance_attr(*instance, "_message"))
-                .unwrap_or(NONE);
-            if message == NONE {
-                value::str_alloc("subTest".to_string())
-            } else {
-                value::str_alloc(format!("subTest {}", value::to_string(message)))
-            }
+            let Some(&instance) = args.first() else {
+                return missing_arguments("_SubTest.__str__");
+            };
+            let test = value::instance_attr(instance, "test_case").unwrap_or(NONE);
+            value::str_alloc(format!(
+                "{} {}",
+                value::to_string(test),
+                subtest_description(instance)
+            ))
         }
         _ => missing_method("_SubTest", method),
     }
@@ -2351,12 +4027,13 @@ fn subtest_exit(args: &[i64]) -> i64 {
     let (Some(&instance), Some(&exc_type)) = (args.first(), args.get(1)) else {
         return missing_arguments("_SubTest.__exit__");
     };
-    if exc_type == NONE {
-        return FALSE;
-    }
     let test = value::instance_attr(instance, "test_case").unwrap_or(NONE);
     let result = value::instance_attr(test, "_unittest_result").unwrap_or(NONE);
-    if result == NONE {
+    if exc_type == NONE {
+        // A successful subtest is reported when the result supports subtests.
+        if result != NONE && has_method(result, "addSubTest") {
+            call_method(result, "addSubTest", &[test, instance, NONE]);
+        }
         return FALSE;
     }
     let error = match args.get(2).copied() {
@@ -2366,9 +4043,38 @@ fn subtest_exit(args: &[i64]) -> i64 {
     if error == NONE {
         return FALSE;
     }
+    // `SkipTest` inside a subtest is reported as a skip of that subtest and
+    // suppressed, exactly like `_Outcome.testPartExecutor`.
+    if value::exception_data(error).map(|data| data.tag) == Some(SKIPPED) {
+        exc::clear();
+        if result != NONE && has_method(result, "addSkip") {
+            let why = value::exception_data(error)
+                .map(|data| data.msg.clone())
+                .unwrap_or_default();
+            call_method(result, "addSkip", &[instance, value::str_alloc(why)]);
+        }
+        return TRUE;
+    }
+    // Under `@expectedFailure`, the first failing subtest is the whole test's
+    // expected failure and is reported by `TestCase.run` after the body.
+    if value::instance_attr(test, "_unittest_expecting").is_some_and(value::truthy) {
+        exc::clear();
+        if value::instance_attr(test, "_unittest_expected_failure")
+            .map_or(true, |stored| stored == NONE)
+        {
+            value::instance_setattr(
+                test,
+                "_unittest_expected_failure".to_string(),
+                error,
+            );
+        }
+        return TRUE;
+    }
     exc::clear();
-    let tuple = error_tuple(error);
-    call_method(result, "addSubTest", &[test, instance, tuple]);
+    if result != NONE && has_method(result, "addSubTest") {
+        let tuple = error_tuple(error);
+        call_method(result, "addSubTest", &[test, instance, tuple]);
+    }
     TRUE
 }
 
@@ -2414,7 +4120,11 @@ fn raises_context_exit(args: &[i64]) -> i64 {
     }
     if let Some(regex) = value::instance_attr(instance, "expected_regex") {
         if regex != NONE && !regex_matches(regex, error) {
-            raise_assertion(format!("Regex didn't match: {}", value::repr(regex)));
+            raise_assertion(format!(
+                "{} does not match {}",
+                value::repr(regex),
+                value::repr(error)
+            ));
             return FALSE;
         }
     }
@@ -2774,7 +4484,7 @@ fn load_tests_hook(module: &str) -> Option<i64> {
     }
 }
 
-/// The module's standard tests shaped like CPython's loader output: one suite
+/// The loader's standard tests shaped like CPython's loader output: one suite
 /// per `TestCase` subclass, collected into a module suite.
 fn standard_suite(classes: &[i64]) -> i64 {
     let marker = heap::root_values(&[]);
@@ -2796,11 +4506,11 @@ fn standard_suite(classes: &[i64]) -> i64 {
 /// Calls a module's `load_tests(loader, tests, pattern)` hook.
 ///
 /// The loader is `unittest.defaultTestLoader`, matching CPython's
-/// `TestProgram`, and `pattern` is `None` because the runner is not
-/// discovering files. A non-callable hook raises `TypeError` here.
-fn call_load_tests(hook: i64, standard: i64) -> i64 {
+/// `TestProgram`; `pattern` is the caller's discovery pattern (or `None`). A
+/// non-callable hook raises `TypeError` here.
+fn call_load_tests(hook: i64, standard: i64, pattern: i64) -> i64 {
     let loader = default_test_loader();
-    let arguments = [loader, standard, NONE];
+    let arguments = [loader, standard, pattern];
     let roots = heap::root_values(&arguments);
     let returned = builtins::call(hook, arguments.len(), arguments.as_ptr());
     heap::release_roots(roots);
@@ -2810,63 +4520,344 @@ fn call_load_tests(hook: i64, standard: i64) -> i64 {
 /// CPython's `load_tests` protocol: run the suite the hook returns instead of
 /// the module's standard tests.
 ///
-/// The returned value is executed as a suite element, so a hook returning
-/// `None` (or any other value that is not a test) reports CPython's
-/// `TypeError` instead of a false "Ran 0 test(s)" pass. A pending exception
-/// left by the hook or by the returned suite aborts the run.
-fn run_load_tests(hook: i64, classes: &[i64], result: i64) {
+/// The returned value is executed through the fixture-aware suite runner, so
+/// module/class fixtures and cleanups fire exactly as they do for discovery.
+/// A pending exception left by the hook aborts the run.
+fn run_load_tests(hook: i64, classes: &[i64], result: i64) -> bool {
     let standard = standard_suite(classes);
     if exc::pending() {
-        return;
+        return false;
     }
     let marker = heap::root_values(&[standard]);
-    let returned = call_load_tests(hook, standard);
+    let returned = call_load_tests(hook, standard, NONE);
     heap::push_scoped_root(returned);
     if exc::pending() {
         heap::release_roots(marker);
-        return;
+        return false;
     }
-    let suite = make_suite(vec![returned]);
-    heap::push_scoped_root(suite);
-    call_method(suite, "run", &[result]);
+    let completed = run_suite_root(returned, result);
     heap::release_roots(marker);
+    completed
 }
 
-/// Runs `classes`' `test*` methods against `result` in discovery order.
-///
-/// Returns `false` when a test raised out of the receiver's own `run` (a
-/// result object that failed), which aborts the run.
-fn run_test_classes(classes: &[i64], result: i64) -> bool {
-    for &class in classes {
-        for name in test_method_names(class) {
-            let argument = value::str_alloc(name.clone());
-            let roots = heap::root_values(&[argument]);
-            let instance = builtins::call(class, 1, std::slice::from_ref(&argument).as_ptr());
-            heap::release_roots(roots);
-            if exc::pending() {
-                let error = take_pending();
-                let holder = value::instance_new(error_holder_class());
-                let description = value::str_alloc(format!("{}.{}", class_name(class), name));
-                let holder_roots = heap::root_values(&[holder, description]);
-                value::instance_setattr(holder, "description".to_string(), description);
-                call_method(result, "addError", &[holder, error_tuple(error)]);
-                heap::release_roots(holder_roots);
-                continue;
-            }
-            test_case_run(&[instance, result]);
-            if exc::pending() {
-                // A result object that raised aborts the run.
-                return false;
-            }
-            if value::instance_attr(result, "shouldStop").is_some_and(value::truthy) {
-                break;
+/// A suite-like value: a native `TestSuite` (or any instance) carrying a
+/// `_tests` list. Bare callables and `TestCase` instances are not suites.
+fn is_suite_like(item: i64) -> bool {
+    value::as_instance(item).is_some()
+        && value::instance_attr(item, "_tests")
+            .map(|tests| value::as_list(tests).is_some())
+            .unwrap_or(false)
+}
+
+fn instance_class_value(item: i64) -> i64 {
+    value::as_instance(item)
+        .map(|state| state.class)
+        .unwrap_or(NONE)
+}
+
+/// `unittest.util.strclass`: `module.qualname` (just the qualified name for
+/// classes without a recorded module).
+fn class_text(class: i64) -> String {
+    let name = class_name(class);
+    match class_module(class) {
+        Some(module) if module != "builtins" => format!("{module}.{name}"),
+        _ => name,
+    }
+}
+
+/// Resolves `module.name` for fixture hooks: compiled-module globals first,
+/// then the native module surface.
+fn module_attr(module: &str, name: &str) -> Option<i64> {
+    if let Some(value) = globals::lookup(module, name) {
+        return Some(value);
+    }
+    let value = crate::modules::module_get_by_name(module, name);
+    if exc::pending() {
+        exc::clear();
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Reports a class/module-level fixture failure under CPython's
+/// `_ErrorHolder` description (`"setUpClass (module.Class)"`).
+fn report_fixture_exception(
+    result: i64,
+    error: i64,
+    description: String,
+    info: Option<i64>,
+) {
+    let holder = value::instance_new(error_holder_class());
+    let text = value::str_alloc(description);
+    let roots = heap::root_values(&[holder, text]);
+    value::instance_setattr(holder, "description".to_string(), text);
+    let is_skip = value::exception_data(error).map(|data| data.tag) == Some(SKIPPED);
+    if is_skip {
+        let why = value::exception_data(error)
+            .map(|data| data.msg.clone())
+            .unwrap_or_default();
+        call_method(result, "addSkip", &[holder, value::str_alloc(why)]);
+    } else {
+        let info = info.unwrap_or_else(|| error_tuple(error));
+        call_method(result, "addError", &[holder, info]);
+    }
+    heap::release_roots(roots);
+}
+
+fn previous_test_class(result: i64) -> i64 {
+    value::instance_attr(result, "_previousTestClass").unwrap_or(NONE)
+}
+
+/// A list stored as a class attribute (`tearDown_exceptions`).
+fn class_attr_list(class: i64, name: &str) -> Option<Vec<i64>> {
+    match value::class_lookup(class, name) {
+        Some(value::ClassEntry::Attr(item)) => value::as_list(item).map(<[i64]>::to_vec),
+        _ => None,
+    }
+}
+
+fn module_setup_failed(result: i64) -> bool {
+    value::instance_attr(result, "_moduleSetUpFailed").is_some_and(value::truthy)
+}
+
+/// `TestSuite._tearDownPreviousClass(test, result)`.
+fn tear_down_previous_class(test: i64, result: i64) {
+    let previous = previous_test_class(result);
+    if previous == NONE {
+        return;
+    }
+    let current = if test == NONE {
+        NONE
+    } else {
+        instance_class_value(test)
+    };
+    if current == previous {
+        return;
+    }
+    if class_attr_truthy(previous, "_classSetupFailed") || module_setup_failed(result) {
+        return;
+    }
+    if class_attr_truthy(previous, "__unittest_skip__") {
+        return;
+    }
+    let parent = class_text(previous);
+    let has_teardown = value::class_lookup(previous, "tearDownClass").is_some();
+    if has_teardown {
+        methods::call(previous, b"tearDownClass".as_ptr(), 13, 0, std::ptr::null());
+        if exc::pending() {
+            let error = take_pending();
+            report_fixture_exception(
+                result,
+                error,
+                format!("tearDownClass ({parent})"),
+                None,
+            );
+        }
+    }
+    do_class_cleanups_core(previous);
+    if let Some(exceptions) = class_attr_list(previous, "tearDown_exceptions")
+    {
+        for info in exceptions {
+            let error = value::as_tuple(info)
+                .and_then(|parts| parts.get(1).copied())
+                .unwrap_or(NONE);
+            report_fixture_exception(
+                result,
+                error,
+                format!("tearDownClass ({parent})"),
+                Some(info),
+            );
+        }
+    }
+}
+
+/// `TestSuite._handleClassSetUp(test, result)`.
+fn handle_class_setup(test: i64, result: i64) {
+    let class = instance_class_value(test);
+    if class == NONE {
+        return;
+    }
+    if class == previous_test_class(result) || module_setup_failed(result) {
+        return;
+    }
+    if class_attr_truthy(class, "__unittest_skip__") {
+        return;
+    }
+    value::class_set_attr(class, "_classSetupFailed".to_string(), FALSE);
+    if value::class_lookup(class, "setUpClass").is_none() {
+        return;
+    }
+    let parent = class_text(class);
+    methods::call(class, b"setUpClass".as_ptr(), 10, 0, std::ptr::null());
+    if exc::pending() {
+        let error = take_pending();
+        value::class_set_attr(class, "_classSetupFailed".to_string(), TRUE);
+        report_fixture_exception(result, error, format!("setUpClass ({parent})"), None);
+        do_class_cleanups_core(class);
+        if let Some(exceptions) = class_attr_list(class, "tearDown_exceptions")
+        {
+            for info in exceptions {
+                let error = value::as_tuple(info)
+                    .and_then(|parts| parts.get(1).copied())
+                    .unwrap_or(NONE);
+                report_fixture_exception(
+                    result,
+                    error,
+                    format!("setUpClass ({parent})"),
+                    Some(info),
+                );
             }
         }
+    }
+}
+
+/// `TestSuite._get_previous_module(result)`.
+fn previous_module(result: i64) -> Option<String> {
+    let previous = previous_test_class(result);
+    if previous == NONE {
+        return None;
+    }
+    class_module(previous)
+}
+
+/// `TestSuite._handleModuleFixture(test, result)`.
+fn handle_module_fixture(test: i64, result: i64) {
+    let class = instance_class_value(test);
+    if class == NONE {
+        return;
+    }
+    let previous = previous_module(result);
+    let current = class_module(class);
+    if current == previous {
+        return;
+    }
+    handle_module_teardown(result);
+    value::instance_setattr(result, "_moduleSetUpFailed".to_string(), FALSE);
+    let Some(module) = current else {
+        return;
+    };
+    let Some(setup) = module_attr(&module, "setUpModule") else {
+        return;
+    };
+    let roots = heap::root_values(std::slice::from_ref(&setup));
+    builtins::call(setup, 0, std::ptr::null());
+    heap::release_roots(roots);
+    if exc::pending() {
+        let error = take_pending();
+        value::instance_setattr(result, "_moduleSetUpFailed".to_string(), TRUE);
+        report_fixture_exception(
+            result,
+            error,
+            format!("setUpModule ({module})"),
+            None,
+        );
+        // CPython still runs module cleanups after a failed setUpModule.
+        let cleanup_error = do_module_cleanups(&[]);
+        if exc::pending() {
+            let error = take_pending();
+            let _ = cleanup_error;
+            report_fixture_exception(
+                result,
+                error,
+                format!("setUpModule ({module})"),
+                None,
+            );
+        }
+    }
+}
+
+/// `TestSuite._handleModuleTearDown(result)`.
+fn handle_module_teardown(result: i64) {
+    let Some(module) = previous_module(result) else {
+        return;
+    };
+    if module_setup_failed(result) {
+        return;
+    }
+    if let Some(teardown) = module_attr(&module, "tearDownModule") {
+        let roots = heap::root_values(std::slice::from_ref(&teardown));
+        builtins::call(teardown, 0, std::ptr::null());
+        heap::release_roots(roots);
+        if exc::pending() {
+            let error = take_pending();
+            report_fixture_exception(
+                result,
+                error,
+                format!("tearDownModule ({module})"),
+                None,
+            );
+        }
+    }
+    let _ = do_module_cleanups(&[]);
+    if exc::pending() {
+        let error = take_pending();
+        report_fixture_exception(
+            result,
+            error,
+            format!("tearDownModule ({module})"),
+            None,
+        );
+    }
+}
+
+/// Runs one test item through the CPython suite fixture protocol.
+///
+/// Returns `false` when an exception escaped the item (a broken result
+/// object), which aborts the run.
+fn run_one_test_with_fixtures(test: i64, result: i64) -> bool {
+    tear_down_previous_class(test, result);
+    handle_module_fixture(test, result);
+    handle_class_setup(test, result);
+    let class = instance_class_value(test);
+    value::instance_setattr(result, "_previousTestClass".to_string(), class);
+    if class_attr_truthy(class, "_classSetupFailed") || module_setup_failed(result) {
+        return true;
+    }
+    run_test_item(test, result);
+    !exc::pending()
+}
+
+/// Recursively runs a suite (or single item) with fixtures.
+fn run_suite_items(item: i64, result: i64) -> bool {
+    if !is_suite_like(item) {
+        return run_one_test_with_fixtures(item, result);
+    }
+    let Some(tests) = value::instance_attr(item, "_tests").and_then(value::as_list) else {
+        return true;
+    };
+    let items: Vec<i64> = tests.to_vec();
+    let roots = heap::root_values(&items);
+    let mut completed = true;
+    for test in items {
         if value::instance_attr(result, "shouldStop").is_some_and(value::truthy) {
             break;
         }
+        let test_roots = heap::root_values(std::slice::from_ref(&test));
+        completed = run_suite_items(test, result);
+        heap::release_roots(test_roots);
+        if !completed {
+            break;
+        }
     }
-    true
+    heap::release_roots(roots);
+    completed
+}
+
+/// CPython's `TestSuite.run`: enter the run, recurse, then tear down the last
+/// class and module when this call is the top-level suite run.
+pub(crate) fn run_suite_root(item: i64, result: i64) -> bool {
+    let top_level = !value::instance_attr(result, "_testRunEntered").is_some_and(value::truthy);
+    if top_level {
+        value::instance_setattr(result, "_testRunEntered".to_string(), TRUE);
+    }
+    let completed = run_suite_items(item, result);
+    if top_level {
+        tear_down_previous_class(NONE, result);
+        handle_module_teardown(result);
+        value::instance_setattr(result, "_testRunEntered".to_string(), FALSE);
+    }
+    completed && !exc::pending()
 }
 
 /// Runs the test classes `module` defines: one fresh `TestResult`, a printed
@@ -2876,13 +4867,16 @@ fn run_main(module: &str) -> i64 {
     let result = new_test_result();
     call_method(result, "startTestRun", &[]);
     // A module that defines `load_tests` runs exactly what that hook returns,
-    // like CPython's `loadTestsFromModule`.
+    // like CPython's `loadTestsFromModule`; otherwise the standard suites run.
     let completed = match load_tests_hook(module) {
-        Some(hook) => {
-            run_load_tests(hook, &classes, result);
-            !exc::pending()
+        Some(hook) => run_load_tests(hook, &classes, result),
+        None => {
+            let suite = standard_suite(&classes);
+            let roots = heap::root_values(std::slice::from_ref(&suite));
+            let completed = run_suite_root(suite, result);
+            heap::release_roots(roots);
+            completed
         }
-        None => run_test_classes(&classes, result),
     };
     if !completed {
         return NONE;

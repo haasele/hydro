@@ -20,7 +20,10 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use crate::exc::{self, ATTRIBUTE_ERROR, KEY_ERROR, OS_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::core::methods;
+use crate::exc::{
+    self, ATTRIBUTE_ERROR, KEY_ERROR, OS_ERROR, OVERFLOW_ERROR, TYPE_ERROR, VALUE_ERROR,
+};
 use crate::heap;
 use crate::value::{self, NONE};
 
@@ -73,8 +76,34 @@ pub(crate) fn constant(name: &str) -> i64 {
         "POLLHUP" => encode_int(POLLHUP),
         "POLLNVAL" => encode_int(POLLNVAL),
         "error" => exc::exception_class(OS_ERROR),
-        _ => attribute_error("select", name),
+        _ => epoll_constant(name),
     }
+}
+
+/// `select.epoll` and its `EPOLL*` masks on the platforms that have epoll.
+fn epoll_constant(name: &str) -> i64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        match name {
+            "epoll" => return epoll_class(),
+            "EPOLLIN" => return encode_int(libc::EPOLLIN as i64),
+            "EPOLLPRI" => return encode_int(libc::EPOLLPRI as i64),
+            "EPOLLOUT" => return encode_int(libc::EPOLLOUT as i64),
+            "EPOLLERR" => return encode_int(libc::EPOLLERR as i64),
+            "EPOLLHUP" => return encode_int(libc::EPOLLHUP as i64),
+            "EPOLLRDHUP" => return encode_int(libc::EPOLLRDHUP as i64),
+            "EPOLLET" => return encode_int(libc::EPOLLET as i64),
+            "EPOLLONESHOT" => return encode_int(libc::EPOLLONESHOT as i64),
+            "EPOLLWAKEUP" => return encode_int(libc::EPOLLWAKEUP as i64),
+            "EPOLLEXCLUSIVE" => return encode_int(libc::EPOLLEXCLUSIVE as i64),
+            "EPOLL_CLOEXEC" => return encode_int(libc::EPOLL_CLOEXEC as i64),
+            "EPOLL_CTL_ADD" => return encode_int(libc::EPOLL_CTL_ADD as i64),
+            "EPOLL_CTL_DEL" => return encode_int(libc::EPOLL_CTL_DEL as i64),
+            "EPOLL_CTL_MOD" => return encode_int(libc::EPOLL_CTL_MOD as i64),
+            _ => {}
+        }
+    }
+    attribute_error("select", name)
 }
 
 /// Module constants for `selectors`.
@@ -86,7 +115,8 @@ pub(crate) fn selectors_constant(name: &str) -> i64 {
     }
 }
 
-/// Resolves a descriptor from an integer or a native socket object.
+/// Resolves a descriptor from an integer, a native socket object, or any
+/// object exposing `fileno()`.
 fn file_descriptor(item: i64) -> Result<i32, i64> {
     if let Some(number) = value::as_integer(item) {
         if number < 0 {
@@ -98,22 +128,65 @@ fn file_descriptor(item: i64) -> Result<i32, i64> {
         return crate::modules::socket::descriptor(state)
             .ok_or_else(|| os_error("[Errno 9] Bad file descriptor"));
     }
-    Err(type_error(
-        "argument must be an int, or a socket object with a file descriptor",
-    ))
+    // CPython's `PyObject_AsFileDescriptor` calls a user `fileno()` method;
+    // the same path serves file objects and test helpers.
+    let method = methods::getattr(item, b"fileno".as_ptr(), b"fileno".len());
+    if exc::pending() {
+        exc::clear();
+        return Err(type_error(
+            "argument must be an int, or have a fileno() method",
+        ));
+    }
+    let result = crate::builtins::call(method, 0, std::ptr::null());
+    if exc::pending() {
+        return Err(NONE);
+    }
+    match value::as_integer(result) {
+        Some(number) if number >= 0 && number <= i32::MAX as i64 => Ok(number as i32),
+        _ => Err(type_error(&format!(
+            "fileno() returned a non-integer ({})",
+            value::type_name(result)
+        ))),
+    }
 }
 
-fn sequence(v: i64) -> Result<Vec<i64>, i64> {
-    if let Some(items) = value::as_list(v) {
-        return Ok(items.to_vec());
+/// One descriptor sequence argument of `select.select`.
+///
+/// A list is read live (index by index, re-borrowing each step) because a
+/// user `fileno()` may resize it during the scan, which is exactly the
+/// behaviour CPython documents for a mutated argument. A tuple is snapshotted.
+enum SequenceSource {
+    List(i64),
+    Items(Vec<i64>),
+}
+
+impl SequenceSource {
+    fn from_value(v: i64) -> Result<Self, i64> {
+        if value::as_list(v).is_some() {
+            return Ok(Self::List(v));
+        }
+        if let Some(items) = value::as_tuple(v) {
+            return Ok(Self::Items(items.to_vec()));
+        }
+        Err(type_error(&format!(
+            "expected a list or tuple, not {}",
+            value::type_name(v)
+        )))
     }
-    if let Some(items) = value::as_tuple(v) {
-        return Ok(items.to_vec());
+
+    fn len(&self) -> usize {
+        match self {
+            Self::List(list) => value::as_list(*list).map(<[i64]>::len).unwrap_or(0),
+            Self::Items(items) => items.len(),
+        }
     }
-    Err(type_error(&format!(
-        "expected a list or tuple, not {}",
-        value::type_name(v)
-    )))
+
+    fn get(&self, index: usize) -> Option<i64> {
+        match self {
+            Self::List(list) => value::as_list(*list).and_then(|items| items.get(index).copied()),
+            Self::Items(items) => items.get(index).copied(),
+        }
+    }
 }
 
 fn seconds_argument(v: i64) -> Result<Option<Duration>, i64> {
@@ -134,21 +207,76 @@ fn seconds_argument(v: i64) -> Result<Option<Duration>, i64> {
 }
 
 /// `poll()` timeout: milliseconds, `None`/negative meaning infinite.
+///
+/// An integer that does not fit the C `int` timeout is an `OverflowError`,
+/// like CPython; floats are accepted and truncated.
 fn milliseconds_argument(v: i64) -> Result<Option<Duration>, i64> {
     if v == NONE {
         return Ok(None);
     }
-    let millis = if let Some(integer) = value::as_integer(v) {
-        integer as f64
-    } else if let Some(float) = value::as_float(v) {
-        float
-    } else {
+    if let Some(integer) = value::as_integer(v) {
+        if integer < i32::MIN as i64 || integer > i32::MAX as i64 {
+            return Err(exc::raise_with_message(
+                OVERFLOW_ERROR,
+                "timeout is out of range",
+            ));
+        }
+        if integer < 0 {
+            return Ok(None);
+        }
+        return Ok(Some(Duration::from_millis(integer as u64)));
+    }
+    if value::as_bigint(v).is_some() {
+        return Err(exc::raise_with_message(
+            OVERFLOW_ERROR,
+            "timeout is out of range",
+        ));
+    }
+    let Some(float) = value::as_float(v) else {
         return Err(type_error("timeout must be an int, float or None"));
     };
-    if millis.is_nan() || millis < 0.0 || !millis.is_finite() || millis >= u64::MAX as f64 {
+    if !float.is_finite() {
+        if float > 0.0 {
+            return Err(exc::raise_with_message(
+                OVERFLOW_ERROR,
+                "timeout is out of range",
+            ));
+        }
         return Ok(None);
     }
-    Ok(Some(Duration::from_millis(millis as u64)))
+    if float <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(Duration::from_millis(float as u64)))
+}
+
+/// Decodes a `poll` event mask (`unsigned short` in CPython).
+fn event_mask(function: &str, argument: i64) -> Result<i16, i64> {
+    let Some(number) = value::as_integer(argument) else {
+        if value::as_bigint(argument).is_some() {
+            return Err(exc::raise_with_message(
+                OVERFLOW_ERROR,
+                &format!("{function}() eventmask is out of range"),
+            ));
+        }
+        return Err(type_error(&format!(
+            "{function}() argument must be an int, not {}",
+            value::type_name(argument)
+        )));
+    };
+    if number < 0 {
+        return Err(exc::raise_with_message(
+            VALUE_ERROR,
+            &format!("{function}() eventmask must be non-negative"),
+        ));
+    }
+    if number > 0xffff {
+        return Err(exc::raise_with_message(
+            OVERFLOW_ERROR,
+            &format!("{function}() eventmask is out of range"),
+        ));
+    }
+    Ok(number as i16)
 }
 
 /// Waits for `entries` and returns the descriptors with a non-zero `revents`.
@@ -235,25 +363,57 @@ fn poll_entries(
     Ok(entries.iter().map(|&(fd, events)| (fd, events)).collect())
 }
 
-fn add_event(events: &mut Vec<(i32, i16)>, item: i64, mask: i16) -> Result<(), i64> {
-    let fd = file_descriptor(item)?;
-    match events.iter_mut().find(|(existing, _)| *existing == fd) {
-        Some(entry) => entry.1 |= mask,
-        None => events.push((fd, mask)),
+/// Scans one sequence argument, merging its descriptors into the `pollfd`
+/// set and remembering the (item, fd) pairs for result construction.
+fn collect_descriptors(
+    source: &SequenceSource,
+    mask: i16,
+    events: &mut Vec<(i32, i16)>,
+    pairs: &mut Vec<(i64, i32)>,
+) -> Result<(), i64> {
+    let mut index = 0;
+    while index < source.len() {
+        let Some(item) = source.get(index) else {
+            break;
+        };
+        // The length is re-read every iteration, so a `fileno()` that shrinks
+        // the list ends the scan exactly like CPython's index loop.
+        index += 1;
+        let fd = file_descriptor(item)?;
+        match events.iter_mut().find(|(existing, _)| *existing == fd) {
+            Some(entry) => entry.1 |= mask,
+            None => events.push((fd, mask)),
+        }
+        pairs.push((item, fd));
     }
     Ok(())
 }
 
+/// Builds the ready list for one sequence argument from the recorded pairs.
+fn ready_items(pairs: &[(i64, i32)], ready: &[(i32, i16)], mask: i16) -> i64 {
+    let mut out = Vec::new();
+    for &(item, fd) in pairs {
+        if ready
+            .iter()
+            .find(|(ready_fd, _)| *ready_fd == fd)
+            .is_some_and(|(_, revents)| revents & mask != 0)
+        {
+            out.push(item);
+        }
+    }
+    value::list_new(out)
+}
+
 fn select_call(args: &[i64]) -> i64 {
-    let readables = match sequence(args[0]) {
+    let readables = match SequenceSource::from_value(args[0]) {
         Ok(items) => items,
         Err(err) => return err,
     };
-    let writables = match sequence(args[1]) {
+    let writables = match SequenceSource::from_value(args[1]) {
         Ok(items) => items,
         Err(err) => return err,
     };
-    let exceptionals = match sequence(args[2]) {
+    let exceptionals = match SequenceSource::from_value(args[2]) {
         Ok(items) => items,
         Err(err) => return err,
     };
@@ -265,56 +425,51 @@ fn select_call(args: &[i64]) -> i64 {
         None => None,
     };
     let mut events: Vec<(i32, i16)> = Vec::new();
-    for &item in &readables {
-        if let Err(err) = add_event(&mut events, item, POLLIN as i16) {
-            return err;
-        }
+    let mut read_pairs: Vec<(i64, i32)> = Vec::new();
+    let mut write_pairs: Vec<(i64, i32)> = Vec::new();
+    let mut exception_pairs: Vec<(i64, i32)> = Vec::new();
+    if let Err(err) = collect_descriptors(
+        &readables,
+        POLLIN as i16,
+        &mut events,
+        &mut read_pairs,
+    ) {
+        return err;
     }
-    for &item in &writables {
-        if let Err(err) = add_event(&mut events, item, POLLOUT as i16) {
-            return err;
-        }
+    if let Err(err) = collect_descriptors(
+        &writables,
+        POLLOUT as i16,
+        &mut events,
+        &mut write_pairs,
+    ) {
+        return err;
     }
-    for &item in &exceptionals {
-        if let Err(err) = add_event(&mut events, item, POLLPRI as i16) {
-            return err;
-        }
+    if let Err(err) = collect_descriptors(
+        &exceptionals,
+        POLLPRI as i16,
+        &mut events,
+        &mut exception_pairs,
+    ) {
+        return err;
     }
     let ready = match poll_entries(&events, timeout) {
         Ok(ready) => ready,
         Err(error) => return os_error(&error.to_string()),
     };
-    let revents = |fd: i32| {
-        ready
-            .iter()
-            .find(|(ready_fd, _)| *ready_fd == fd)
-            .map(|(_, mask)| *mask)
-    };
-    let readable_mask = (POLLIN | POLLERR | POLLHUP | POLLNVAL) as i16;
-    let writable_mask = (POLLOUT | POLLERR | POLLHUP | POLLNVAL) as i16;
-    let exceptional_mask = (POLLPRI | POLLERR | POLLNVAL) as i16;
-    let filter = |items: &[i64], mask: i16| -> Result<i64, i64> {
-        let mut out = Vec::new();
-        for &item in items {
-            let fd = file_descriptor(item)?;
-            if revents(fd).is_some_and(|found| found & mask != 0) {
-                out.push(item);
-            }
-        }
-        Ok(value::list_new(out))
-    };
-    let read = match filter(&readables, readable_mask) {
-        Ok(list) => list,
-        Err(err) => return err,
-    };
-    let write = match filter(&writables, writable_mask) {
-        Ok(list) => list,
-        Err(err) => return err,
-    };
-    let exceptional = match filter(&exceptionals, exceptional_mask) {
-        Ok(list) => list,
-        Err(err) => return err,
-    };
+    // `select(2)` reports a closed descriptor as `EBADF`; the `poll(2)`
+    // backend underneath signals the same condition with `POLLNVAL`.
+    if ready
+        .iter()
+        .any(|(_, revents)| revents & POLLNVAL as i16 != 0)
+    {
+        return os_error("[Errno 9] Bad file descriptor");
+    }
+    let readable_mask = (POLLIN | POLLERR | POLLHUP) as i16;
+    let writable_mask = (POLLOUT | POLLERR | POLLHUP) as i16;
+    let exceptional_mask = (POLLPRI | POLLERR) as i16;
+    let read = ready_items(&read_pairs, &ready, readable_mask);
+    let write = ready_items(&write_pairs, &ready, writable_mask);
+    let exceptional = ready_items(&exception_pairs, &ready, exceptional_mask);
     value::tuple_new(vec![read, write, exceptional])
 }
 
@@ -397,6 +552,10 @@ fn poll_new() -> i64 {
             "__exit__".to_string(),
             value::native_function_new("select", "_poll_exit", 4),
         ),
+        (
+            "__init__".to_string(),
+            value::native_function_new("select", "_poll_init", 1),
+        ),
     ];
     let class = value::class_new("poll".to_string(), NONE, methods);
     let object = value::instance_new(class);
@@ -415,11 +574,11 @@ fn poll_register(args: &[i64]) -> i64 {
         Err(err) => return err,
     };
     let mask = match args.get(2) {
-        Some(&value) => match value::as_integer(value) {
-            Some(mask) => mask as i16,
-            None => return type_error("eventmask must be an integer"),
+        Some(&value) if value != NONE => match event_mask("register", value) {
+            Ok(mask) => mask,
+            Err(err) => return err,
         },
-        None => (POLLIN | POLLPRI | POLLOUT) as i16,
+        _ => (POLLIN | POLLPRI | POLLOUT) as i16,
     };
     let mut entries = poll_entries_attr(object);
     match entries.iter_mut().find(|(existing, _)| *existing == fd) {
@@ -457,14 +616,15 @@ fn poll_modify(args: &[i64]) -> i64 {
         Ok(fd) => fd,
         Err(err) => return err,
     };
-    let Some(mask) = value::as_integer(args[2]) else {
-        return type_error("eventmask must be an integer");
+    let mask = match event_mask("modify", args[2]) {
+        Ok(mask) => mask,
+        Err(err) => return err,
     };
     let mut entries = poll_entries_attr(object);
     let Some(index) = entries.iter().position(|(existing, _)| *existing == fd) else {
         return key_error(&format!("fd {fd} not registered"));
     };
-    entries[index].1 = mask as i16;
+    entries[index].1 = mask;
     store_poll_entries(object, entries);
     NONE
 }
@@ -474,6 +634,18 @@ fn poll_poll(args: &[i64]) -> i64 {
     if is_closed(object) {
         return value_error("I/O operation on closed poll object");
     }
+    // CPython keeps one `pollfd` array per object and reports a concurrent
+    // `poll()` call on the same object as a `RuntimeError`; the descriptor
+    // set cannot be read safely while another thread is inside `poll(2)`.
+    if value::instance_attr(object, "_polling")
+        .map(value::truthy)
+        .unwrap_or(false)
+    {
+        return exc::raise_with_message(
+            exc::RUNTIME_ERROR,
+            "poll() is not thread-safe; use select()",
+        );
+    }
     let timeout = match args.get(1) {
         Some(&value) => match milliseconds_argument(value) {
             Ok(timeout) => timeout,
@@ -482,7 +654,10 @@ fn poll_poll(args: &[i64]) -> i64 {
         None => None,
     };
     let entries = poll_entries_attr(object);
-    let ready = match poll_entries(&entries, timeout) {
+    set_instance_attr(object, "_polling", value::TRUE);
+    let ready = poll_entries(&entries, timeout);
+    set_instance_attr(object, "_polling", value::FALSE);
+    let ready = match ready {
         Ok(ready) => ready,
         Err(error) => return os_error(&error.to_string()),
     };
@@ -493,11 +668,404 @@ fn poll_poll(args: &[i64]) -> i64 {
     value::list_new(items)
 }
 
+/// `poll.__init__`: a poll object is only created by `select.poll()`.
+fn poll_init(_args: &[i64]) -> i64 {
+    type_error("cannot create 'poll' instances")
+}
+
 fn poll_close(args: &[i64]) -> i64 {
     let object = args[0];
     set_instance_attr(object, "_entries", value::list_new(Vec::new()));
     set_instance_attr(object, "_closed", value::TRUE);
     NONE
+}
+
+// -------------------------------------------------------------------------
+// select.epoll (Linux / Android)
+// -------------------------------------------------------------------------
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_class() -> i64 {
+    const KEY: &str = "select.epoll.class";
+    if let Some(class) = crate::core::globals::registry_get(KEY) {
+        return class;
+    }
+    let native = |name: &'static str, arity: usize| value::native_function_new("select", name, arity);
+    let methods = vec![
+        ("__init__".to_string(), native("_epoll_init", 3)),
+        ("register".to_string(), native("_epoll_register", 3)),
+        ("unregister".to_string(), native("_epoll_unregister", 2)),
+        ("modify".to_string(), native("_epoll_modify", 3)),
+        ("poll".to_string(), native("_epoll_poll", 3)),
+        ("fileno".to_string(), native("_epoll_fileno", 1)),
+        ("close".to_string(), native("_epoll_close", 1)),
+        ("__enter__".to_string(), native("_epoll_enter", 1)),
+        ("__exit__".to_string(), native("_epoll_exit", 4)),
+    ];
+    // `fromfd` is a class-level function: a class attribute holding a plain
+    // function value, so `epoll.fromfd(fd)` passes the descriptor only.
+    let attrs = vec![(
+        "fromfd".to_string(),
+        value::native_function_new("select", "_epoll_fromfd", 1),
+    )];
+    let methods = methods
+        .into_iter()
+        .map(|(name, function)| (name, function, hydro_ir::MethodKind::Normal))
+        .collect();
+    let class = value::class_new_full("epoll".to_string(), NONE, methods, attrs);
+    crate::core::globals::registry_set(KEY, class);
+    class
+}
+
+/// Formats a failed syscall as CPython renders `OSError`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_io_error(error: std::io::Error) -> i64 {
+    let code = error.raw_os_error().unwrap_or(0);
+    let text = error.to_string();
+    let detail = text.split(" (os error").next().unwrap_or(text.as_str());
+    os_error(&format!("[Errno {code}] {detail}"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_instance(fd: i32) -> i64 {
+    let instance = value::instance_new(epoll_class());
+    set_instance_attr(instance, "_fd", encode_int(i64::from(fd)));
+    set_instance_attr(instance, "closed", value::FALSE);
+    instance
+}
+
+/// The epoll descriptor of a live object, or `ValueError` once closed.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_fd(object: i64) -> Result<i32, i64> {
+    if value::instance_attr(object, "closed")
+        .map(value::truthy)
+        .unwrap_or(false)
+    {
+        return Err(value_error("I/O operation on closed epoll object"));
+    }
+    value::instance_attr(object, "_fd")
+        .and_then(value::as_integer)
+        .and_then(|fd| i32::try_from(fd).ok())
+        .ok_or_else(|| value_error("I/O operation on closed epoll object"))
+}
+
+/// Converts `epoll.poll`'s timeout (seconds) to milliseconds.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_timeout(value_arg: i64) -> Result<i32, i64> {
+    if value_arg == NONE {
+        return Ok(-1);
+    }
+    if let Some(integer) = value::as_integer(value_arg) {
+        if integer < 0 {
+            return Ok(-1);
+        }
+        return Ok(integer.min(i64::from(i32::MAX)) as i32);
+    }
+    if value::as_bigint(value_arg).is_some() {
+        return Ok(i32::MAX);
+    }
+    let Some(seconds) = value::as_float(value_arg) else {
+        return Err(type_error("timeout must be an int, float or None"));
+    };
+    if !(seconds > 0.0) {
+        return Ok(-1);
+    }
+    let millis = (seconds * 1000.0).ceil();
+    Ok(if millis >= f64::from(i32::MAX) {
+        i32::MAX
+    } else {
+        millis as i32
+    })
+}
+
+/// `epoll.__init__(sizehint=-1, flags=0)`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_init(args: &[i64]) -> i64 {
+    let object = args[0];
+    let mut sizehint = -1i64;
+    if let Some(&argument) = args.get(1) {
+        if argument != NONE {
+            let Some(number) = value::as_integer(argument) else {
+                if value::as_bigint(argument).is_some() {
+                    return exc::raise_with_message(
+                        OVERFLOW_ERROR,
+                        "sizehint is out of range",
+                    );
+                }
+                return type_error(&format!(
+                    "argument 1 must be an integer, not {}",
+                    value::type_name(argument)
+                ));
+            };
+            sizehint = number;
+        }
+    }
+    if sizehint <= 0 && sizehint != -1 {
+        return value_error("sizehint must be greater than zero");
+    }
+    let mut flags = 0i64;
+    if let Some(&argument) = args.get(2) {
+        if argument != NONE {
+            let Some(number) = value::as_integer(argument) else {
+                if value::as_bigint(argument).is_some() {
+                    return exc::raise_with_message(
+                        OVERFLOW_ERROR,
+                        "flags is out of range",
+                    );
+                }
+                return type_error(&format!(
+                    "argument 2 must be an integer, not {}",
+                    value::type_name(argument)
+                ));
+            };
+            flags = number;
+        }
+    }
+    let Ok(flags) = i32::try_from(flags) else {
+        return exc::raise_with_message(OVERFLOW_ERROR, "flags is out of range");
+    };
+    // CPython always creates the epoll descriptor close-on-exec.
+    // SAFETY: `epoll_create1` only reads its flag argument.
+    let fd = unsafe { libc::epoll_create1(flags | libc::EPOLL_CLOEXEC) };
+    if fd < 0 {
+        return epoll_io_error(std::io::Error::last_os_error());
+    }
+    set_instance_attr(object, "_fd", encode_int(i64::from(fd)));
+    set_instance_attr(object, "closed", value::FALSE);
+    NONE
+}
+
+/// `epoll.register(fd, eventmask=EPOLLIN)`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_register(args: &[i64]) -> i64 {
+    let object = args[0];
+    let epfd = match epoll_fd(object) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let target = match file_descriptor(args[1]) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let mask = match args.get(2) {
+        Some(&argument) if argument != NONE => match event_mask("register", argument) {
+            Ok(mask) => mask as u32,
+            Err(err) => return err,
+        },
+        _ => libc::EPOLLIN as u32,
+    };
+    let mut event = libc::epoll_event {
+        events: mask,
+        u64: target as u64,
+    };
+    // SAFETY: `event` is a valid, fully initialised `epoll_event`.
+    let result =
+        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, target, &mut event) };
+    if result < 0 {
+        return epoll_io_error(std::io::Error::last_os_error());
+    }
+    NONE
+}
+
+/// `epoll.modify(fd, eventmask)`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_modify(args: &[i64]) -> i64 {
+    let object = args[0];
+    let epfd = match epoll_fd(object) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let target = match file_descriptor(args[1]) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let mask = match event_mask("modify", args[2]) {
+        Ok(mask) => mask as u32,
+        Err(err) => return err,
+    };
+    let mut event = libc::epoll_event {
+        events: mask,
+        u64: target as u64,
+    };
+    // SAFETY: `event` is a valid, fully initialised `epoll_event`.
+    let result =
+        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, target, &mut event) };
+    if result < 0 {
+        return epoll_io_error(std::io::Error::last_os_error());
+    }
+    NONE
+}
+
+/// `epoll.unregister(fd)`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_unregister(args: &[i64]) -> i64 {
+    let object = args[0];
+    let epfd = match epoll_fd(object) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let target = match file_descriptor(args[1]) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    // SAFETY: `EPOLL_CTL_DEL` ignores the event argument on Linux; a null
+    // pointer is accepted (kernel >= 2.6.9).
+    let result = unsafe {
+        libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, target, std::ptr::null_mut())
+    };
+    if result < 0 {
+        return epoll_io_error(std::io::Error::last_os_error());
+    }
+    NONE
+}
+
+/// `epoll.poll(timeout=-1, maxevents=-1)`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_poll(args: &[i64]) -> i64 {
+    let object = args[0];
+    let epfd = match epoll_fd(object) {
+        Ok(fd) => fd,
+        Err(err) => return err,
+    };
+    let timeout = match args.get(1) {
+        Some(&argument) => match epoll_timeout(argument) {
+            Ok(timeout) => timeout,
+            Err(err) => return err,
+        },
+        None => -1,
+    };
+    let maxevents = match args.get(2) {
+        Some(&argument) if argument != NONE => {
+            let Some(number) = value::as_integer(argument) else {
+                if value::as_bigint(argument).is_some() {
+                    return exc::raise_with_message(
+                        OVERFLOW_ERROR,
+                        "maxevents is out of range",
+                    );
+                }
+                return type_error(&format!(
+                    "maxevents must be an integer, not {}",
+                    value::type_name(argument)
+                ));
+            };
+            if number <= 0 {
+                return value_error("maxevents must be greater than zero");
+            }
+            number.min(1 << 20) as usize
+        }
+        _ => 128,
+    };
+    let mut events = vec![unsafe { std::mem::zeroed::<libc::epoll_event>() }; maxevents];
+    let blocking = timeout != 0;
+    if blocking {
+        heap::blocking_enter();
+    }
+    // SAFETY: `events` has room for `maxevents` entries.
+    let count = unsafe {
+        libc::epoll_wait(
+            epfd,
+            events.as_mut_ptr(),
+            maxevents as libc::c_int,
+            timeout,
+        )
+    };
+    if blocking {
+        heap::blocking_leave();
+    }
+    if count < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return value::list_new(Vec::new());
+        }
+        return epoll_io_error(error);
+    }
+    let items: Vec<i64> = events[..count as usize]
+        .iter()
+        .map(|event| {
+            value::tuple_new(vec![
+                encode_int(event.u64 as i64),
+                encode_int(i64::from(event.events)),
+            ])
+        })
+        .collect();
+    value::list_new(items)
+}
+
+/// `epoll.fileno()`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_fileno(args: &[i64]) -> i64 {
+    match epoll_fd(args[0]) {
+        Ok(fd) => encode_int(i64::from(fd)),
+        Err(err) => err,
+    }
+}
+
+/// `epoll.close()`; idempotent.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_close(args: &[i64]) -> i64 {
+    let object = args[0];
+    if value::instance_attr(object, "closed")
+        .map(value::truthy)
+        .unwrap_or(false)
+    {
+        return NONE;
+    }
+    if let Some(fd) = value::instance_attr(object, "_fd").and_then(value::as_integer) {
+        if let Ok(fd) = i32::try_from(fd) {
+            // SAFETY: closing our own descriptor; errors are irrelevant to the
+            // idempotent `close()` contract.
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+    set_instance_attr(object, "closed", value::TRUE);
+    NONE
+}
+
+/// `epoll.__enter__()`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_enter(args: &[i64]) -> i64 {
+    match epoll_fd(args[0]) {
+        Ok(_) => args[0],
+        Err(err) => err,
+    }
+}
+
+/// `epoll.__exit__(...)` closes the object.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_exit(args: &[i64]) -> i64 {
+    epoll_close(args)
+}
+
+/// `epoll.fromfd(fd)`: a new epoll object over a duplicate of `fd`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn epoll_fromfd(args: &[i64]) -> i64 {
+    let Some(number) = value::as_integer(args[0]) else {
+        if value::as_bigint(args[0]).is_some() {
+            return exc::raise_with_message(OVERFLOW_ERROR, "fd is out of range");
+        }
+        return type_error(&format!(
+            "argument must be an int, not {}",
+            value::type_name(args[0])
+        ));
+    };
+    if number < 0 {
+        return value_error("file descriptor cannot be a negative integer");
+    }
+    let Ok(fd) = i32::try_from(number) else {
+        return exc::raise_with_message(OVERFLOW_ERROR, "fd is out of range");
+    };
+    // SAFETY: `dup` only reads the descriptor number.
+    let duplicate = unsafe { libc::dup(fd) };
+    if duplicate < 0 {
+        return epoll_io_error(std::io::Error::last_os_error());
+    }
+    // SAFETY: setting close-on-exec on our own duplicate.
+    unsafe {
+        libc::fcntl(duplicate, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    epoll_instance(duplicate)
 }
 
 // -------------------------------------------------------------------------
@@ -792,6 +1360,27 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             }
         }
         "_poll_exit" => poll_close(args),
+        "_poll_init" => poll_init(args),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "_epoll_init" => epoll_init(args),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "_epoll_register" => epoll_register(args),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "_epoll_unregister" => epoll_unregister(args),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "_epoll_modify" => epoll_modify(args),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "_epoll_poll" => epoll_poll(args),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "_epoll_fileno" => epoll_fileno(args),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "_epoll_close" => epoll_close(args),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "_epoll_enter" => epoll_enter(args),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "_epoll_exit" => epoll_exit(args),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        "_epoll_fromfd" => epoll_fromfd(args),
         _ => attribute_error("select", function),
     }
 }

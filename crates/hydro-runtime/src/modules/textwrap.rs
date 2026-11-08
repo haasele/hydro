@@ -37,7 +37,7 @@ const CLASS_KEY: &str = "textwrap.TextWrapper.class";
 /// Dispatches a native `textwrap` function.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "dedent" => match text_argument(args, 0, "dedent") {
+        "dedent" => match dedent_argument(args) {
             Ok(text) => value::str_alloc(dedent(&text)),
             Err(error) => error,
         },
@@ -60,6 +60,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         // `_textwrapper_fill`.
         "_textwrapper_wrap" => textwrapper_method(args, "wrap"),
         "_textwrapper_fill" => textwrapper_method(args, "fill"),
+        "_textwrap_split" => textwrapper_split(args),
         _ => exc::raise_with_message(
             exc::ATTRIBUTE_ERROR,
             &format!("module 'textwrap' has no attribute '{function}'"),
@@ -166,6 +167,23 @@ fn text_argument(args: &[i64], index: usize, function: &str) -> Result<String, i
         None => Err(type_error(format!(
             "{function}() argument {} must be str",
             index + 1
+        ))),
+    }
+}
+
+/// `dedent`'s argument check: CPython reports
+/// `expected str object, not 'bytes'` rather than a parameter message.
+fn dedent_argument(args: &[i64]) -> Result<String, i64> {
+    let Some(argument) = args.first().copied() else {
+        return Err(type_error(
+            "dedent() missing required argument: 'text'".to_string(),
+        ));
+    };
+    match value::as_str(argument) {
+        Some(text) => Ok(text.to_string()),
+        None => Err(type_error(format!(
+            "expected str object, not '{}'",
+            value::type_name(argument)
         ))),
     }
 }
@@ -962,9 +980,10 @@ fn textwrapper_class() -> i64 {
     if let Some(cached) = globals::registry_get(CLASS_KEY) {
         return cached;
     }
-    let specs: [(&str, &'static str, usize); 2] = [
+    let specs: [(&str, &'static str, usize); 3] = [
         ("wrap", "_textwrapper_wrap", 2),
         ("fill", "_textwrapper_fill", 2),
+        ("_split", "_textwrap_split", 2),
     ];
     let mut values = Vec::with_capacity(specs.len());
     let mut methods = Vec::with_capacity(specs.len());
@@ -1018,6 +1037,20 @@ fn textwrapper_method(args: &[i64], method: &str) -> i64 {
         Ok(lines) => value::list_new(lines.into_iter().map(value::str_alloc).collect()),
         Err(error) => error,
     }
+}
+
+/// `TextWrapper._split`: the indivisible chunks `wrap` builds lines from.
+fn textwrapper_split(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return type_error("TextWrapper._split() missing self".to_string());
+    };
+    let text = match text_argument(args, 1, "_split") {
+        Ok(text) => text,
+        Err(error) => return error,
+    };
+    let options = options_of(instance);
+    let munged = options.munge_whitespace(&text);
+    value::list_new(options.split(&munged).into_iter().map(value::str_alloc).collect())
 }
 
 #[cfg(test)]

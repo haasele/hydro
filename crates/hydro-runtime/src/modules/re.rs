@@ -33,6 +33,7 @@
 
 use regex::{bytes as regex_bytes, Regex, RegexBuilder};
 
+use crate::core::globals;
 use crate::exc::{self, ATTRIBUTE_ERROR, INDEX_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::value::{self, NONE};
 
@@ -87,6 +88,13 @@ pub(crate) fn constant(name: &str) -> i64 {
         "VERBOSE" | "X" => VERBOSE,
         "DEBUG" => DEBUG,
         "ASCII" | "A" => ASCII,
+        // `re.error` is the `PatternError` class itself.
+        "error" | "PatternError" => return pattern_error_class(),
+        // `re.Scanner` is a real (callable) class value.
+        "Scanner" => return scanner_class(),
+        // `re.RegexFlag` is CPython's `IntFlag`; the runtime's flag members
+        // are plain ints, so the `int` class is the honest stand-in.
+        "RegexFlag" => return value::type_class(crate::ops::int_result(0)),
         // `re.Pattern`/`re.Match` are the cached classes `type()` reports for
         // compiled patterns and match objects; `isinstance` resolves them
         // through the native type-name table.
@@ -99,6 +107,8 @@ pub(crate) fn constant(name: &str) -> i64 {
         "_compiler" => return super::module_value_by_name("re._compiler"),
         "_constants" => return super::module_value_by_name("re._constants"),
         "_parser" => return super::module_value_by_name("re._parser"),
+        // `re.__all__`, in CPython's order.
+        "__all__" => return all_names(),
         // The spec table only announces the names above; anything else is
         // still reported like a missing module attribute.
         _ => {
@@ -109,6 +119,27 @@ pub(crate) fn constant(name: &str) -> i64 {
         }
     };
     value::encode_int(bits).unwrap_or(NONE)
+}
+
+/// `re.__all__`: the public names CPython's `re/__init__.py` exports.
+fn all_names() -> i64 {
+    const KEY: &str = "re.__all__";
+    if let Some(list) = globals::registry_get(KEY) {
+        return list;
+    }
+    let names = [
+        "match", "fullmatch", "search", "sub", "subn", "split", "findall", "finditer",
+        "compile", "purge", "escape", "error", "Pattern", "Match", "A", "I", "L", "M",
+        "S", "X", "U", "ASCII", "IGNORECASE", "LOCALE", "MULTILINE", "DOTALL",
+        "VERBOSE", "UNICODE", "NOFLAG", "RegexFlag", "PatternError",
+    ];
+    let values = names
+        .iter()
+        .map(|name| value::str_alloc((*name).to_string()))
+        .collect();
+    let list = value::list_new(values);
+    globals::registry_set(KEY, list);
+    list
 }
 
 /// State of a successful match: the searched text and byte positions of the
@@ -173,8 +204,29 @@ fn attribute_error(kind: &str, name: &str) -> i64 {
     )
 }
 
+/// Turns a `regex` crate error into CPython's `PatternError`, carrying the
+/// `msg`/`pos`/`lineno`/`colno` attributes the test suite inspects.
 fn regex_error(error: regex::Error) -> i64 {
-    exc::raise_with_message(VALUE_ERROR, &format!("invalid regular expression: {error}"))
+    let text = error.to_string();
+    let mut pos = None;
+    let mut indent = 0usize;
+    for (index, line) in text.lines().enumerate() {
+        if line.trim() == "^" {
+            let caret = line.find('^').unwrap_or(0);
+            pos = Some(caret.saturating_sub(indent));
+            break;
+        }
+        if index == 1 {
+            indent = line.len() - line.trim_start().len();
+        }
+    }
+    let message = text
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("error: "))
+        .unwrap_or(&text)
+        .to_string();
+    raise_pattern_error(&message, pos)
 }
 
 /// Returns the pattern source from a `str`, bytes-like or compiled `Pattern`
@@ -239,6 +291,13 @@ fn domain_error(source: &Source, subject: &Subject) -> Option<i64> {
 /// character class in verbose mode, while CPython keeps it literal
 /// (`[a b]` matches a space in Python only).
 fn compile_source(source: &str, flags: i64) -> Result<Regex, i64> {
+    // CPython rejects LOCALE on a `str` pattern (it is a bytes-only flag).
+    if flags & LOCALE != 0 {
+        return Err(exc::raise_with_message(
+            VALUE_ERROR,
+            "cannot use LOCALE flag with a str pattern",
+        ));
+    }
     // CPython accepts an unescaped `[` inside a character class (`[^[]` means
     // "not `[`"), while the Rust regex parser treats it as a nested class.
     // Escape that form before handing the pattern to the parser.
@@ -246,6 +305,11 @@ fn compile_source(source: &str, flags: i64) -> Result<Regex, i64> {
         escape_literal_braces(&escape_class_brackets(&translate_octal_escapes(source)));
     if flags & VERBOSE != 0 {
         normalized = escape_verbose_class_chars(&normalized);
+    }
+    // `re.ASCII` restricts `\w`, `\d` and `\s` to ASCII; express that by
+    // rewriting the shorthands (Rust's byte mode would split UTF-8).
+    if flags & ASCII != 0 {
+        normalized = ascii_shorthand(&normalized);
     }
     normalized = rewrite_atomic_groups(&normalized);
     let build = |pattern: &str| {
@@ -266,6 +330,74 @@ fn compile_source(source: &str, flags: i64) -> Result<Regex, i64> {
         }
         Err(error) => Err(regex_error(error)),
     }
+}
+
+/// Rewrites the Unicode-aware shorthands `\w`, `\W`, `\d`, `\D`, `\s`, `\S`
+/// into explicit ASCII classes, mirroring `re.ASCII` on a `str` pattern.
+fn ascii_shorthand(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let mut index = 0usize;
+    let mut in_class = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            let next = chars.get(index + 1).copied();
+            match next {
+                Some('w') => {
+                    out.push_str(if in_class { "0-9A-Za-z_" } else { "[0-9A-Za-z_]" });
+                    index += 2;
+                    continue;
+                }
+                Some('W') if !in_class => {
+                    out.push_str("[^0-9A-Za-z_]");
+                    index += 2;
+                    continue;
+                }
+                Some('d') => {
+                    out.push_str(if in_class { "0-9" } else { "[0-9]" });
+                    index += 2;
+                    continue;
+                }
+                Some('D') if !in_class => {
+                    out.push_str("[^0-9]");
+                    index += 2;
+                    continue;
+                }
+                Some('s') => {
+                    out.push_str(if in_class {
+                        " \\t\\n\\r\\x0B\\f"
+                    } else {
+                        "[ \\t\\n\\r\\x0B\\f]"
+                    });
+                    index += 2;
+                    continue;
+                }
+                Some('S') if !in_class => {
+                    out.push_str("[^ \\t\\n\\r\\x0B\\f]");
+                    index += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            out.push(ch);
+            if let Some(escaped) = next {
+                out.push(escaped);
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+        } else if ch == ']' {
+            in_class = false;
+        }
+        out.push(ch);
+        index += 1;
+    }
+    out
 }
 
 /// Translates CPython numeric escapes to Rust regex `\xNN` escapes.
@@ -436,6 +568,13 @@ fn bytes_pattern_text(source: &[u8]) -> String {
 /// Compiles bytes pattern text (see [`bytes_pattern_text`]) with the same
 /// normalisation and flag handling as [`compile_source`], in byte mode.
 fn compile_bytes_text(pattern: &str, flags: i64) -> Result<regex_bytes::Regex, i64> {
+    // CPython rejects UNICODE on a bytes pattern (it is a str-only flag).
+    if flags & UNICODE != 0 {
+        return Err(exc::raise_with_message(
+            VALUE_ERROR,
+            "cannot use UNICODE flag with a bytes pattern",
+        ));
+    }
     let mut normalized =
         escape_literal_braces(&escape_class_brackets(&translate_octal_escapes(pattern)));
     if flags & VERBOSE != 0 {
@@ -1446,7 +1585,17 @@ fn push_part_bytes(result: i64, part: &[u8]) {
 /// Module-level functions.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "compile" => {
+        // `re.Scanner` construction and scanning (the class value is
+        // `re.Scanner`; its methods dispatch here).
+        "Scanner.__init__" => scanner_init(args),
+        "Scanner.scan" => scanner_scan(args),
+        // `re.purge()` clears the (nonexistent) pattern cache; the engine
+        // compiles on demand and keeps no module-level cache.
+        "purge" => NONE,
+        "compile" | "_compile" => {
+            if args.is_empty() {
+                return type_error("compile() missing required argument 'pattern'");
+            }
             // Already-compiled patterns are returned unchanged; their own
             // flags travel with them.
             if value::as_pattern(args[0]).is_some() {
@@ -1590,15 +1739,65 @@ fn isstring_call(args: &[i64]) -> i64 {
     value::bool_value(matches!(value::type_name(args[0]), "str" | "bytes"))
 }
 
-/// `PatternError`/`error` of the three private namespaces.
-///
-/// CPython's `re.PatternError` is its own `Exception` subclass; this runtime
-/// reports every invalid pattern as `ValueError`, so the error class here is
-/// the cached `ValueError` class. `except re.error` and `except ValueError`
-/// then catch the same failures, exactly like the `ssl.SSLError`/`OSError`
-/// mapping the socket module uses.
-fn pattern_error_class() -> i64 {
-    exc::exception_class(VALUE_ERROR)
+/// `re.PatternError` / `re.error`: a real `Exception` subclass whose
+/// instances carry CPython's `msg`, `pattern`, `pos`, `lineno` and `colno`
+/// attributes. `error` is the same class, so `re.error is re.PatternError`.
+pub(crate) fn pattern_error_class() -> i64 {
+    const KEY: &str = "re.PatternError";
+    if let Some(class) = globals::registry_get(KEY) {
+        return class;
+    }
+    let defaults = vec![
+        ("msg".to_string(), value::str_alloc(String::new())),
+        ("pattern".to_string(), NONE),
+        ("pos".to_string(), NONE),
+        ("lineno".to_string(), NONE),
+        ("colno".to_string(), NONE),
+    ];
+    let class = value::class_new_full(
+        "PatternError".to_string(),
+        exc::exception_class(exc::EXCEPTION),
+        Vec::new(),
+        defaults,
+    );
+    let roots = crate::heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    crate::heap::release_roots(roots);
+    class
+}
+
+/// Raises a `PatternError` with the given message and 0-based pattern offset.
+pub(crate) fn raise_pattern_error(message: &str, pos: Option<usize>) -> i64 {
+    let class = pattern_error_class();
+    let msg = value::str_alloc(message.to_string());
+    let roots = crate::heap::root_values(&[msg, class]);
+    let argv = [msg];
+    let instance = crate::core::builtins::call(class, argv.len(), argv.as_ptr());
+    if exc::pending() {
+        crate::heap::release_roots(roots);
+        return NONE;
+    }
+    let position = match pos {
+        Some(position) => crate::ops::int_result(position as i64),
+        None => NONE,
+    };
+    let lineno = match pos {
+        Some(_) => crate::ops::int_result(1),
+        None => NONE,
+    };
+    let colno = match pos {
+        Some(position) => crate::ops::int_result(position as i64 + 1),
+        None => NONE,
+    };
+    let instance_roots = crate::heap::root_values(&[instance, position, lineno, colno]);
+    value::instance_setattr(instance, "msg".to_string(), msg);
+    value::instance_setattr(instance, "pattern".to_string(), NONE);
+    value::instance_setattr(instance, "pos".to_string(), position);
+    value::instance_setattr(instance, "lineno".to_string(), lineno);
+    value::instance_setattr(instance, "colno".to_string(), colno);
+    crate::heap::release_roots(instance_roots);
+    crate::heap::release_roots(roots);
+    exc::raise_value(instance)
 }
 
 /// Constants of `re._compiler`, `re._constants` and `re._parser`.
@@ -1647,10 +1846,315 @@ pub(crate) fn submodule_call(module: &str, function: &str, args: &[i64]) -> i64 
     match (module, function) {
         ("re._compiler", "compile") => call("compile", args),
         ("re._compiler", "isstring") => isstring_call(args),
+        // The literal-prefix overlap table the SRE compiler builds; the
+        // CPython test suite exercises it directly.
+        ("re._compiler", "_generate_overlap_table") => overlap_table(args),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module '{module}' has no attribute '{function}'"),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `re.Scanner` (CPython's `re/__init__.py` scanner)
+// ---------------------------------------------------------------------------
+
+/// `re.Scanner`: a callable class holding a combined pattern and the lexicon.
+fn scanner_class() -> i64 {
+    const KEY: &str = "re.Scanner.class";
+    if let Some(class) = globals::registry_get(KEY) {
+        return class;
+    }
+    let init = value::native_function_new("re", "Scanner.__init__", usize::MAX);
+    let scan = value::native_function_new("re", "Scanner.scan", 2);
+    let class = value::class_new_full(
+        "Scanner".to_string(),
+        value::object_class(),
+        vec![
+            ("__init__".to_string(), init, hydro_ir::MethodKind::Normal),
+            ("scan".to_string(), scan, hydro_ir::MethodKind::Normal),
+        ],
+        vec![("scanner".to_string(), NONE), ("lexicon".to_string(), NONE)],
+    );
+    let roots = crate::heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    crate::heap::release_roots(roots);
+    class
+}
+
+/// Reads an instance attribute, leaving any pending exception for the caller.
+fn instance_value(instance: i64, name: &str) -> Option<i64> {
+    let value = crate::core::methods::getattr(instance, name.as_ptr(), name.len());
+    if exc::pending() {
+        return None;
+    }
+    Some(value)
+}
+
+fn instance_int(instance: i64, name: &str) -> Option<i64> {
+    instance_value(instance, name).and_then(value::as_integer)
+}
+
+fn append_item(list: i64, item: i64) {
+    if let Some(mut items) = value::list_items_mut(list) {
+        items.push(item);
+        crate::heap::write_barrier_edge(list, item);
+    }
+}
+
+fn is_callable(item: i64) -> bool {
+    if value::as_function(item).is_some() || value::as_class(item).is_some() {
+        return true;
+    }
+    value::as_instance(item).is_some_and(|instance| {
+        value::class_lookup(instance.class, "__call__").is_some()
+    })
+}
+
+/// `Scanner(lexicon, flags=0)`: combines every phrase into one pattern (group
+/// order records which lexicon entry matched) and stores the lexicon.
+fn scanner_init(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return type_error("Scanner.__init__() missing self");
+    };
+    let Some(&lexicon) = args.get(1) else {
+        return type_error("Scanner() missing required argument 'lexicon'");
+    };
+    let flags = match flags_argument(args.get(2).copied()) {
+        Ok(flags) => flags,
+        Err(error) => return error,
+    };
+    let Some(entries) = value::as_list(lexicon).or_else(|| value::as_tuple(lexicon)) else {
+        return type_error("Scanner() lexicon must be a list of (pattern, action) pairs");
+    };
+    let mut combined = String::new();
+    let mut phrases: Vec<i64> = Vec::new();
+    for entry in entries {
+        let Some(parts) = value::as_list(*entry).or_else(|| value::as_tuple(*entry)) else {
+            return type_error("Scanner() lexicon entries must be (pattern, action) pairs");
+        };
+        if parts.len() < 2 {
+            return type_error("Scanner() lexicon entries must be (pattern, action) pairs");
+        }
+        let Some(phrase) = value::as_str(parts[0]) else {
+            return type_error("Scanner() pattern must be str");
+        };
+        if !combined.is_empty() {
+            combined.push('|');
+        }
+        combined.push_str("(?:");
+        combined.push_str(phrase);
+        combined.push(')');
+        phrases.push(parts[0]);
+    }
+    if let Err(error) = compile_source(&combined, flags) {
+        return error;
+    }
+    let pattern = value::pattern_new(combined, flags);
+    let phrase_list = value::list_new(phrases);
+    let flags_value = crate::ops::int_result(flags);
+    let roots = crate::heap::root_values(&[pattern, phrase_list, flags_value, instance]);
+    value::instance_setattr(instance, "scanner".to_string(), pattern);
+    value::instance_setattr(instance, "lexicon".to_string(), lexicon);
+    value::instance_setattr(instance, "_phrases".to_string(), phrase_list);
+    value::instance_setattr(instance, "_flags".to_string(), flags_value);
+    crate::heap::release_roots(roots);
+    NONE
+}
+
+/// `Scanner.scan(string)`: applies the first matching lexicon entry at every
+/// position and returns `(results, remainder)`.
+fn scanner_scan(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return type_error("Scanner.scan() missing self");
+    };
+    let Some(&subject) = args.get(1) else {
+        return type_error("Scanner.scan() missing required argument 'string'");
+    };
+    let Some(text) = value::as_str(subject) else {
+        return type_error("Scanner.scan() argument must be str");
+    };
+    let Some(flags) = instance_int(instance, "_flags") else {
+        return NONE;
+    };
+    let Some(phrases) = instance_value(instance, "_phrases") else {
+        return NONE;
+    };
+    let Some(phrase_items) = value::as_list(phrases) else {
+        return NONE;
+    };
+    let Some(lexicon) = instance_value(instance, "lexicon") else {
+        return NONE;
+    };
+    let Some(entries) = value::as_list(lexicon).or_else(|| value::as_tuple(lexicon)) else {
+        return NONE;
+    };
+    let results = value::list_new(Vec::new());
+    let mut index = 0usize;
+    while index < text.len() {
+        let slice = &text[index..];
+        let mut matched: Option<(usize, usize, String)> = None;
+        for (order, phrase_value) in phrase_items.iter().enumerate() {
+            let Some(phrase) = value::as_str(*phrase_value) else {
+                continue;
+            };
+            let regex = match compile_anchored(phrase, false, flags) {
+                Ok(regex) => regex,
+                Err(error) => return error,
+            };
+            if let Some(captures) = regex.captures(slice) {
+                if let Some(whole) = captures.get(0) {
+                    if whole.end() > 0 {
+                        matched = Some((order, whole.end(), whole.as_str().to_string()));
+                        break;
+                    }
+                }
+            }
+        }
+        match matched {
+            Some((order, end, token)) => {
+                let Some(entry) = entries.get(order).copied() else {
+                    break;
+                };
+                let action = value::as_list(entry)
+                    .or_else(|| value::as_tuple(entry))
+                    .and_then(|parts| parts.get(1).copied())
+                    .unwrap_or(NONE);
+                let produced = if is_callable(action) {
+                    let token_value = value::str_alloc(token);
+                    let roots = crate::heap::root_values(&[token_value, instance]);
+                    let argv = [instance, token_value];
+                    let result = crate::core::builtins::call(action, argv.len(), argv.as_ptr());
+                    crate::heap::release_roots(roots);
+                    result
+                } else {
+                    action
+                };
+                if exc::pending() {
+                    return NONE;
+                }
+                if produced != NONE {
+                    append_item(results, produced);
+                }
+                index += end;
+            }
+            None => {
+                index += text[index..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+    let rest = value::str_alloc(text[index..].to_string());
+    value::tuple_new(vec![results, rest])
+}
+
+/// `re._compiler._generate_overlap_table(prefix)`: the prefix overlap table
+/// the SRE compiler builds for literal prefixes.
+fn overlap_table(args: &[i64]) -> i64 {
+    let Some(&raw) = args.first() else {
+        return type_error("_generate_overlap_table() missing required argument 'prefix'");
+    };
+    let prefix: Vec<char> = if let Some(text) = value::as_str(raw) {
+        text.chars().collect()
+    } else if let Some(bytes) = value::as_bytes(raw) {
+        bytes.iter().map(|&byte| char::from(byte)).collect()
+    } else {
+        return type_error("_generate_overlap_table() argument must be str or bytes");
+    };
+    let mut table = vec![0usize; prefix.len()];
+    for index in 1..prefix.len() {
+        let mut position = table[index - 1];
+        loop {
+            if prefix[index] == prefix[position] {
+                table[index] = position + 1;
+                break;
+            }
+            if position == 0 {
+                table[index] = 0;
+                break;
+            }
+            position = table[position - 1];
+        }
+    }
+    let values = table
+        .into_iter()
+        .map(|item| crate::ops::int_result(item as i64))
+        .collect();
+    value::list_new(values)
+}
+
+/// Match-object attributes (`.string`, `.re`, `.pos`, `.endpos`,
+/// `.lastindex`, `.lastgroup`, `.regs`).
+pub(crate) fn match_attr(obj: i64, attr: &str) -> Option<i64> {
+    let state = value::as_match(obj)?;
+    let bytes = is_bytes_match(state);
+    match attr {
+        "string" => Some(if bytes {
+            value::bytes_new(latin1_bytes(&state.text))
+        } else {
+            value::str_alloc(state.text.clone())
+        }),
+        "re" => Some(value::pattern_new(state.pattern.clone(), 0)),
+        "pos" => Some(crate::ops::int_result(0)),
+        "endpos" => Some(crate::ops::int_result(if bytes {
+            state.text.len() as i64
+        } else {
+            state.text.chars().count() as i64
+        })),
+        "lastindex" => {
+            let mut last = None;
+            for (group, position) in state
+                .groups
+                .iter()
+                .take(match_group_count(state))
+                .enumerate()
+                .skip(1)
+            {
+                if position.is_some() {
+                    last = Some(group);
+                }
+            }
+            Some(match last {
+                Some(group) => crate::ops::int_result(group as i64),
+                None => NONE,
+            })
+        }
+        "lastgroup" => {
+            let mut last = None;
+            for (group, position) in state
+                .groups
+                .iter()
+                .take(match_group_count(state))
+                .enumerate()
+                .skip(1)
+            {
+                if position.is_some() {
+                    last = state.names.get(group).cloned().flatten();
+                }
+            }
+            Some(last.map_or(NONE, value::str_alloc))
+        }
+        "regs" => {
+            let mut spans = Vec::with_capacity(match_group_count(state));
+            for position in state.groups.iter().take(match_group_count(state)) {
+                match position {
+                    Some((start, end)) => {
+                        let start = match_offset(state, *start, bytes) as i64;
+                        let end = match_offset(state, *end, bytes) as i64;
+                        spans.push(value::tuple_new(vec![
+                            crate::ops::int_result(start),
+                            crate::ops::int_result(end),
+                        ]));
+                    }
+                    None => spans.push(value::tuple_new(vec![
+                        crate::ops::int_result(-1),
+                        crate::ops::int_result(-1),
+                    ])),
+                }
+            }
+            Some(value::tuple_new(spans))
+        }
+        _ => None,
     }
 }
 
@@ -1781,6 +2285,35 @@ pub(crate) fn pattern_method(obj: i64, name: &str, args: &[i64]) -> i64 {
                 ));
             }
             split(&source, flags, args)
+        }
+        "subn" => {
+            if args.len() < 2 || args.len() > 3 {
+                return type_error(&format!(
+                    "Pattern.subn() takes 2 to 3 arguments ({} given)",
+                    args.len()
+                ));
+            }
+            subn(&source, flags, args)
+        }
+        // `Pattern.scanner(string)`: CPython returns a low-level scanner over
+        // this pattern. The runtime's engine has no incremental scanner, so
+        // the marker namespace exposes the pattern text (all `Scanner` needs)
+        // and no `match` hook.
+        "scanner" => {
+            if let Some(err) = pattern_arity(name, args.len(), 1) {
+                return err;
+            }
+            if let Err(err) = subject_argument(args[0], "string") {
+                return err;
+            }
+            let text = match &source {
+                Source::Str(text) => text.clone(),
+                Source::Bytes(bytes) => latin1_string(bytes),
+            };
+            value::namespace_new(vec![
+                ("pattern".to_string(), value::str_alloc(text)),
+                ("match".to_string(), NONE),
+            ])
         }
         _ => attribute_error("Pattern", name),
     }
@@ -1933,6 +2466,9 @@ pub(crate) fn pattern_attr(obj: i64, attr: &str) -> Option<i64> {
             value::str_alloc(state.source.clone())
         }),
         "flags" => Some(crate::ops::int_result(state.flags & !BYTES_PATTERN)),
+        // `Pattern.scanner(string)` is a method; `getattr` must hand back a
+        // bound method value so `p.scanner(...)` reaches `pattern_method`.
+        "scanner" => Some(value::bound_method_new(obj, "scanner".to_string())),
         _ => None,
     }
 }

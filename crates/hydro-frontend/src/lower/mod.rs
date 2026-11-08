@@ -334,6 +334,18 @@ pub enum HStmtKind {
         else_body: Vec<HStmt>,
         finally_body: Vec<HStmt>,
     },
+    /// `try: ... except* ...: ... else: ... finally: ...` (PEP 654).
+    ///
+    /// Same shape and `else`/`finally` semantics as [`HStmtKind::Try`], but
+    /// every handler is an `except*` clause. `handler.exc_expr` always holds
+    /// the runtime matcher: static names lower to the built-in exception class
+    /// value so a tuple clause stays one matcher (and therefore runs once).
+    TryStar {
+        body: Vec<HStmt>,
+        handlers: Vec<HHandler>,
+        else_body: Vec<HStmt>,
+        finally_body: Vec<HStmt>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1106,6 +1118,88 @@ static TYPES_CELLTYPE_MEMBER: FunctionSpec = FunctionSpec {
     dynamic_keywords: false,
 };
 
+/// Whether `name` is a module whose CPython implementation is Python source.
+///
+/// The `hydro_ir::stdlib` tables for these modules are curated approximations
+/// of a `Lib/*.py` file, not authoritative native tables: a member the table
+/// does not list may still exist (or the table may simply lag CPython), so an
+/// unknown member resolves at runtime and raises the same `AttributeError`
+/// CPython raises. Native modules with authoritative tables (`math`,
+/// `socket`, `struct`, `_io`, ...) keep the compile-time diagnostic.
+fn python_source_module(name: &str) -> bool {
+    const MODULES: &[&str] = &[
+        "__future__",
+        "argparse",
+        "ast",
+        "asyncio",
+        "base64",
+        "bisect",
+        "code",
+        "codecs",
+        "collections",
+        "contextlib",
+        "contextvars",
+        "csv",
+        "dataclasses",
+        "datetime",
+        "decimal",
+        "fnmatch",
+        "fractions",
+        "functools",
+        "getopt",
+        "gzip",
+        "hashlib",
+        "heapq",
+        "html",
+        "http",
+        "importlib",
+        "inspect",
+        "itertools",
+        "json",
+        "keyword",
+        "locale",
+        "mimetypes",
+        "multiprocessing",
+        "opcode",
+        "operator",
+        "os",
+        "pathlib",
+        "pickle",
+        "platform",
+        "pytest",
+        "queue",
+        "quopri",
+        "random",
+        "re",
+        "runpy",
+        "selectors",
+        "shutil",
+        "sqlite3",
+        "stat",
+        "statistics",
+        "subprocess",
+        "sysconfig",
+        "tempfile",
+        "textwrap",
+        "threading",
+        "timeit",
+        "token",
+        "tty",
+        "types",
+        "typing",
+        "unittest",
+        "uuid",
+        "warnings",
+        "zoneinfo",
+    ];
+    MODULES.iter().any(|module| {
+        name == *module
+            || name
+                .strip_prefix(module)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
+}
+
 /// Members CPython exposes only on some builds.
 ///
 /// `sys.pypy_version_info` exists only under PyPy, `os.O_BINARY` and
@@ -1336,6 +1430,57 @@ fn extension_search_paths() -> Vec<PathBuf> {
         conda_prefix.as_deref(),
     );
     crate::push_stdlib_extension_dirs(&mut dirs, std::env::var_os("HYDRO_STDLIB").as_deref());
+    // The host interpreter's own extension directories. A run under a system or
+    // uv-managed CPython must discover the same `lib-dynload` extensions the
+    // runtime `sys.path` has, even when `HYDRO_STDLIB` points at a source
+    // checkout whose build never produced them.
+    dirs.extend(host_extension_dirs());
+    dirs
+}
+
+/// Extension directories of the host's own CPython 3.14 installation.
+///
+/// Covers the standard Linux prefixes, a per-user install and uv-managed
+/// interpreters (`$UV_PYTHON_INSTALL_DIR`, or uv's default root). Entries are
+/// returned only when they exist, so this never widens the search path with
+/// phantom directories.
+fn host_extension_dirs() -> Vec<PathBuf> {
+    const VERSION: &str = "python3.14";
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for prefix in ["/usr", "/usr/local"] {
+        let prefix = PathBuf::from(prefix);
+        roots.push(prefix.join("lib").join(VERSION));
+        roots.push(prefix.join("lib64").join(VERSION));
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(home) = &home {
+        roots.push(home.join(".local").join("lib").join(VERSION));
+    }
+    let uv_root = std::env::var_os("UV_PYTHON_INSTALL_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.as_ref()
+                .map(|home| home.join(".local").join("share").join("uv").join("python"))
+        });
+    if let Some(uv_root) = uv_root {
+        if let Ok(entries) = fs::read_dir(&uv_root) {
+            let mut interpreters: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path().join("lib").join(VERSION))
+                .filter(|dir| dir.is_dir())
+                .collect();
+            interpreters.sort();
+            roots.extend(interpreters);
+        }
+    }
+    let mut dirs = Vec::new();
+    for root in roots {
+        for candidate in [root.clone(), root.join("lib-dynload")] {
+            if candidate.is_dir() {
+                dirs.push(candidate);
+            }
+        }
+    }
     dirs
 }
 
@@ -2501,6 +2646,10 @@ pub struct Lowerer<'a> {
     /// `_compat_pickle`). Nested `try` statements add to the depth so only
     /// the covered block gets the fallback.
     name_fallback_depth: usize,
+    /// Pattern captures bound to a name the body declares `global`: the
+    /// capture lands in the hidden local (the key) and [`Self::pattern_assign`]
+    /// publishes it to the module global table under this name.
+    pattern_global_names: HashMap<LocalId, String>,
     /// `start:stop:step` is legal only inside a subscript index. While such an
     /// index lowers, the syntax becomes a real `slice` value
     /// ([`Lowerer::slice_value_expr`]); everywhere else it keeps the
@@ -2604,6 +2753,7 @@ impl<'a> Lowerer<'a> {
             method_captures: HashMap::new(),
             in_default_expr: false,
             name_fallback_depth: 0,
+            pattern_global_names: HashMap::new(),
             slice_value_allowed: false,
             diags: Vec::new(),
         }
@@ -7243,6 +7393,20 @@ impl<'a> Lowerer<'a> {
                     col,
                 });
             }
+            // A Python-source module keeps members the curated table does not
+            // list; read them at runtime, where an absent one raises the same
+            // `AttributeError` CPython raises.
+            if python_source_module(module.name) {
+                return Some(HExpr {
+                    kind: HExprKind::ModuleAttr {
+                        module: module.name.to_string(),
+                        name: member.to_string(),
+                    },
+                    ty: Ty::Concrete(Type::Any),
+                    line,
+                    col,
+                });
+            }
             return None;
         };
         match found {
@@ -7345,7 +7509,9 @@ impl<'a> Lowerer<'a> {
                 // resolves at runtime, where this host reports the same
                 // `AttributeError` CPython does. The guard around the call
                 // keeps the read from running on the wrong platform.
-                if runtime_conditional_member(module.name, member) {
+                if runtime_conditional_member(module.name, member)
+                    || python_source_module(module.name)
+                {
                     return self.lower_dynamic_call(call, fs, line, col);
                 }
                 self.error_unknown_member(call.range, module, member);
@@ -9270,14 +9436,52 @@ impl<'a> Lowerer<'a> {
         col: u32,
     ) -> Option<HStmt> {
         let name = decl.name.to_string();
-        let Some(target) = fs.lookup(&name) else {
-            self.error_at_code(
-                decl.range,
-                codes::DECL,
-                format!("nested function '{name}' has no local slot"),
-            );
-            return None;
-        };
+        if !fs.is_global(&name) {
+            let Some(target) = fs.lookup(&name) else {
+                self.error_at_code(
+                    decl.range,
+                    codes::DECL,
+                    format!("nested function '{name}' has no local slot"),
+                );
+                return None;
+            };
+            return self.lower_nested_function_into(decl, target, false, fs, line, col);
+        }
+        // `global name` + `def name(): ...` binds through the runtime global
+        // table: create the function in a hidden local, then publish it there.
+        self.used_globals.insert(name.clone());
+        let target = self.hidden_temp(fs, "$globaldef", Type::Any).0;
+        let stmt = self.lower_nested_function_into(decl, target, true, fs, line, col)?;
+        let value = self.local_read_expr(target, Type::Any, line, col);
+        Some(if_true_block(
+            vec![
+                stmt,
+                HStmt {
+                    kind: HStmtKind::GlobalSet {
+                        module: self.dunder_name.clone(),
+                        name,
+                        value,
+                    },
+                    line,
+                    col,
+                },
+            ],
+            line,
+            col,
+        ))
+    }
+
+    /// Lower a nested `def` into an already-resolved slot.
+    fn lower_nested_function_into(
+        &mut self,
+        decl: FnDecl<'_>,
+        target: LocalId,
+        global_binding: bool,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let name = decl.name.to_string();
 
         // Depth-first free-variable analysis. Names needed by deeper nested
         // functions and lambdas are included so they can pass through this
@@ -9341,7 +9545,7 @@ impl<'a> Lowerer<'a> {
         // the fallback below is unreachable for a well-formed scope.
         let self_reference =
             loaded.iter().any(|loaded_name| loaded_name == &name) && !nested_locals.contains(&name);
-        if self_reference && !fs.is_cell(target) {
+        if self_reference && !fs.is_cell(target) && !global_binding {
             self.error_at_code(
                 decl.range,
                 codes::UNSUPPORTED,
@@ -10260,11 +10464,12 @@ impl<'a> Lowerer<'a> {
     /// `T: Bound`, `[*Ts]` and `[**P]` are all representable: the owning
     /// definition evaluates each parameter into a hidden local holding a real
     /// `typing.TypeVar`/`TypeVarTuple`/`ParamSpec` value, and the bounds are
-    /// ordinary expressions in the enclosing scope. The vendored parser's
-    /// `TypeParam` node has no PEP 696 default field, so `[T = int]` is a
-    /// syntax error before lowering ever runs. A tuple annotation
-    /// (`[T: (int, str)]`) is the only constraint spelling the grammar admits;
-    /// CPython rejects it with a syntax error as well.
+    /// ordinary expressions in the enclosing scope. A tuple annotation
+    /// (`[T: (int, str)]`) is PEP 695's constraint spelling and is accepted.
+    /// PEP 696 defaults are parsed into
+    /// [`hydro_python_parser::TypeParamDefaults`] because the vendored
+    /// `ast::TypeParam` has no default field; they do not change this
+    /// validation.
     ///
     /// Called for every `def` when its signature is registered (so methods,
     /// whose parameter lists are only evaluated in a class namespace, are
@@ -10282,17 +10487,11 @@ impl<'a> Lowerer<'a> {
                 );
                 continue;
             }
-            if let ast::TypeParam::TypeVar(v) = param {
-                if let Some(bound) = &v.bound {
-                    if matches!(**bound, ast::Expr::Tuple(_)) {
-                        self.error_at_code(
-                            bound.range(),
-                            codes::SYNTAX,
-                            "cannot use constraints with type parameter syntax",
-                        );
-                    }
-                }
-            }
+            // A tuple bound (`[T: (str, bytes)]`) is PEP 695's spelling of
+            // `TypeVar("T", str, bytes)`: CPython passes the tuple as
+            // constraints, exactly like the pre-PEP 695 `TypeVar` form, so it
+            // is accepted here. The bound value is evaluated as an ordinary
+            // expression and handed to the runtime constructor.
         }
     }
 
@@ -11624,7 +11823,30 @@ impl<'a> Lowerer<'a> {
         } else {
             HStmtKind::Assign { target, value }
         };
-        HStmt { kind, line, col }
+        let assign = HStmt { kind, line, col };
+        let Some(name) = self.pattern_global_names.get(&target) else {
+            return assign;
+        };
+        // `global name` + a pattern capture: the capture lands in a hidden slot
+        // and is published to the module global table at the moment the
+        // pattern matches.
+        let read = self.local_read_expr(target, Type::Any, line, col);
+        if_true_block(
+            vec![
+                assign,
+                HStmt {
+                    kind: HStmtKind::GlobalSet {
+                        module: self.dunder_name.clone(),
+                        name: name.clone(),
+                        value: read,
+                    },
+                    line,
+                    col,
+                },
+            ],
+            line,
+            col,
+        )
     }
 
     /// Resolve a pattern capture name to a local slot of the current scope.
@@ -11637,33 +11859,41 @@ impl<'a> Lowerer<'a> {
         if let Some(local) = fs.lookup(name) {
             return Some(local);
         }
+        // A capture name the body declares `global` has no local slot: capture
+        // into a hidden one and publish it from [`Self::pattern_assign`].
+        if fs.is_global(name) {
+            self.used_globals.insert(name.to_string());
+            let local = self.hidden_temp(fs, "$matchglobal", Type::Any).0;
+            self.pattern_global_names.insert(local, name.to_string());
+            return Some(local);
+        }
         // The pre-pass registers pattern captures as locals; reaching this
         // point means the name was not collected (a malformed pattern AST).
         self.error_name(range, name, fs, format!("unknown pattern name '{name}'"));
         None
     }
 
-    /// Lower `try: ... except* E: ...`.
+    /// Lower `try: ... except* E: ...` (PEP 654).
     ///
-    /// Full PEP 654 semantics require splitting an `ExceptionGroup` into the
-    /// exceptions each `except*` clause matches, running every clause on its
-    /// share and re-raising the unhandled remainder (possibly re-grouped). The
-    /// runtime has no exception-group representation yet, so this lowering is
-    /// deliberately explicit instead of pretending: the `try` body runs
-    /// normally, `else`/`finally` keep their meaning, and the first exception
-    /// escaping the body raises `NotImplementedError` explaining that no
-    /// `except*` handler ran. The intended runtime protocol is:
+    /// The shape matches [`HStmtKind::Try`]: the body runs normally, `else`
+    /// runs only after a normal body, `finally` always runs, and exceptions
+    /// raised in `else`/`finally` bypass the clauses.
     ///
-    /// - `hydro_exc_star_begin() -> i64` — start splitting the pending
-    ///   exception, returning the group (or a one-element group).
-    /// - `hydro_exc_star_take(handler_class: i64) -> i64` — remove and return
-    ///   the subset of the current group matched by `handler_class`, or `None`.
-    /// - `hydro_exc_star_finish() -> i64` — re-raise the unmatched remainder
-    ///   after the last clause (clearing the pending exception when empty).
+    /// Every clause becomes exactly one [`HHandler`]; its `exc_expr` is the
+    /// runtime matcher. Static names lower to the built-in exception class
+    /// value ([`HExprKind::ExceptionClass`]) and a parenthesized tuple of
+    /// static names stays one `HExprKind::Tuple` matcher, so a tuple clause
+    /// runs at most once (splitting it into one arm per type would run the
+    /// body once per matching type). Dynamic expressions are used as-is.
     ///
-    /// These names and their exact argument order are reported to the
-    /// orchestrator; no generated code calls them until the runtime provides
-    /// them.
+    /// CPython rejects `return` in an `except*` block and `break`/`continue`
+    /// that would leave it; loops declared inside the block keep their own
+    /// `break`/`continue`. The check mirrors
+    /// `codegen_unwind_fblock_stack` and is a compile-time error here.
+    ///
+    /// The split/re-raise protocol itself is statement-shaped at runtime, so
+    /// it lowers to [`HStmtKind::TryStar`] and is implemented once by codegen
+    /// (and the tree-walk interpreter), not synthesized as HIR statements.
     fn lower_try_star(
         &mut self,
         s: &ast::StmtTryStar,
@@ -11671,47 +11901,83 @@ impl<'a> Lowerer<'a> {
         line: u32,
         col: u32,
     ) -> Option<HStmt> {
+        let body = self.lower_block(&s.body, fs);
+        let mut handlers = Vec::with_capacity(s.handlers.len());
         for handler in &s.handlers {
             let ast::ExceptHandler::ExceptHandler(handler) = handler;
-            if handler.type_.is_none() {
+            let Some(type_expr) = handler.type_.as_deref() else {
                 self.error_at_code(
                     handler.range,
                     codes::SYNTAX,
                     "except* requires an exception type",
                 );
+                continue;
+            };
+            if let Some(range) = except_star_control_flow(&handler.body, false) {
+                self.error_at_code(
+                    range,
+                    codes::SYNTAX,
+                    "'break', 'continue' and 'return' cannot appear in an except* block",
+                );
             }
+            let matcher = match self.handler_matcher(type_expr, fs) {
+                None => continue,
+                Some(HandlerMatcher::Dynamic(expr)) => expr,
+                Some(HandlerMatcher::Kinds(kinds)) => {
+                    let (matcher_line, matcher_col) = self.span(type_expr.range());
+                    let mut exprs: Vec<HExpr> = kinds
+                        .iter()
+                        .map(|kind| HExpr {
+                            kind: HExprKind::ExceptionClass(*kind),
+                            ty: Ty::Concrete(Type::Any),
+                            line: matcher_line,
+                            col: matcher_col,
+                        })
+                        .collect();
+                    if exprs.len() == 1 {
+                        // `handler_matcher` never returns an empty kind list.
+                        exprs.pop().unwrap_or_else(|| self.error_expr(handler.range))
+                    } else {
+                        HExpr {
+                            kind: HExprKind::Tuple(exprs),
+                            ty: Ty::Concrete(Type::Any),
+                            line: matcher_line,
+                            col: matcher_col,
+                        }
+                    }
+                }
+            };
+            let binding = match &handler.name {
+                Some(name) => match fs.lookup(name.as_str()) {
+                    Some(id) => Some(id),
+                    None => {
+                        self.error_name(
+                            handler.range,
+                            name.as_str(),
+                            fs,
+                            format!("unknown handler binding '{}'", name),
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            let binding_cell = binding.is_some_and(|local| fs.is_cell(local));
+            let handler_body = self.lower_block(&handler.body, fs);
+            handlers.push(HHandler {
+                exc: None,
+                exc_expr: Some(matcher),
+                binding,
+                binding_cell,
+                body: handler_body,
+            });
         }
-        let body = self.lower_block(&s.body, fs);
         let else_body = self.lower_block(&s.orelse, fs);
         let finally_body = self.lower_block(&s.finalbody, fs);
-        let message = HExpr {
-            kind: HExprKind::Const(Const::Str(
-                "except* (PEP 654 exception groups) is not implemented: Hydro cannot split an ExceptionGroup; no except* handler was run"
-                    .to_string(),
-            )),
-            ty: Ty::Concrete(Type::Str),
-            line,
-            col,
-        };
-        let raise = HStmt {
-            kind: HStmtKind::Raise {
-                exc: Some(ExcKind::NotImplementedError),
-                msg: Some(message),
-                cause: None,
-            },
-            line,
-            col,
-        };
         Some(HStmt {
-            kind: HStmtKind::Try {
+            kind: HStmtKind::TryStar {
                 body,
-                handlers: vec![HHandler {
-                    exc: None,
-                    exc_expr: None,
-                    binding: None,
-                    binding_cell: false,
-                    body: vec![raise],
-                }],
+                handlers,
                 else_body,
                 finally_body,
             },
@@ -12164,14 +12430,24 @@ impl<'a> Lowerer<'a> {
         col: u32,
     ) -> Option<HStmt> {
         let name = s.name.to_string();
-        let Some(target) = fs.lookup(&name) else {
-            self.error_name(
-                s.range,
-                &name,
-                fs,
-                format!("class '{name}' has no local slot"),
-            );
-            return None;
+        // `global name` + `class name:` binds through the runtime global
+        // table. Build the class in a hidden local and let the mirror below
+        // publish it.
+        let target = match fs.lookup(&name) {
+            Some(target) => target,
+            None if fs.is_global(&name) => {
+                self.used_globals.insert(name.clone());
+                self.hidden_temp(fs, "$globalclass", Type::Any).0
+            }
+            None => {
+                self.error_name(
+                    s.range,
+                    &name,
+                    fs,
+                    format!("class '{name}' has no local slot"),
+                );
+                return None;
+            }
         };
         let statements = self.lower_dynamic_class_value(
             fs,
@@ -12684,14 +12960,24 @@ impl<'a> Lowerer<'a> {
             return self.lower_class_in_class_body(s, plan, fs, type_params, line, col);
         }
         let name = s.name.to_string();
-        let Some(target) = fs.lookup(&name) else {
-            self.error_name(
-                s.range,
-                &name,
-                fs,
-                format!("class '{name}' has no local slot"),
-            );
-            return None;
+        // `global name` + `class name:` binds through the runtime global
+        // table: build the class in a hidden local, then publish it.
+        let global_binding = fs.is_global(&name);
+        let target = match fs.lookup(&name) {
+            Some(target) => target,
+            None if global_binding => {
+                self.used_globals.insert(name.clone());
+                self.hidden_temp(fs, "$globalclass", Type::Any).0
+            }
+            None => {
+                self.error_name(
+                    s.range,
+                    &name,
+                    fs,
+                    format!("class '{name}' has no local slot"),
+                );
+                return None;
+            }
         };
         if fs.is_module {
             if plan.dynamic {
@@ -12712,7 +12998,28 @@ impl<'a> Lowerer<'a> {
                 },
             );
         }
-        self.lower_nested_class_stmt(s, plan, fs, target, type_params, line, col)
+        let stmt =
+            self.lower_nested_class_stmt(s, plan, fs, target, type_params, line, col)?;
+        if !global_binding {
+            return Some(stmt);
+        }
+        let value = self.local_read_expr(target, Type::Any, line, col);
+        Some(if_true_block(
+            vec![
+                stmt,
+                HStmt {
+                    kind: HStmtKind::GlobalSet {
+                        module: self.dunder_name.clone(),
+                        name,
+                        value,
+                    },
+                    line,
+                    col,
+                },
+            ],
+            line,
+            col,
+        ))
     }
 
     /// Register a class statement that appears inside a function or a method.
@@ -16988,24 +17295,52 @@ impl<'a> Lowerer<'a> {
                     Some(HandlerMatcher::Dynamic(expr)) => exc_expr = Some(expr),
                 },
             };
+            let (handler_line, handler_col) = self.span(h.range);
+            let mut global_binding: Option<String> = None;
             let binding = match &h.name {
-                Some(name) => match fs.lookup(name.as_str()) {
-                    Some(id) => Some(id),
-                    None => {
-                        self.error_name(
-                            h.range,
-                            name.as_str(),
-                            fs,
-                            format!("unknown handler binding '{}'", name),
-                        );
-                        None
+                Some(name) => {
+                    if fs.is_global(name.as_str()) {
+                        // `global name` + `except ... as name:`: the runtime
+                        // binds the exception to a hidden slot and the handler
+                        // publishes it to the global table before its body.
+                        self.used_globals.insert(name.to_string());
+                        global_binding = Some(name.to_string());
+                        Some(self.hidden_temp(fs, "$excas", Type::Any).0)
+                    } else {
+                        match fs.lookup(name.as_str()) {
+                            Some(id) => Some(id),
+                            None => {
+                                self.error_name(
+                                    h.range,
+                                    name.as_str(),
+                                    fs,
+                                    format!("unknown handler binding '{}'", name),
+                                );
+                                None
+                            }
+                        }
                     }
-                },
+                }
                 None => None,
             };
             let binding_cell = binding.is_some_and(|local| fs.is_cell(local));
             // Lower the handler body once; tuple handlers share it.
-            let handler_body = self.lower_block(&h.body, fs);
+            let mut handler_body = self.lower_block(&h.body, fs);
+            if let (Some(name), Some(local)) = (&global_binding, binding) {
+                let value = self.local_read_expr(local, Type::Any, handler_line, handler_col);
+                handler_body.insert(
+                    0,
+                    HStmt {
+                        kind: HStmtKind::GlobalSet {
+                            module: self.dunder_name.clone(),
+                            name: name.clone(),
+                            value,
+                        },
+                        line: handler_line,
+                        col: handler_col,
+                    },
+                );
+            }
             if is_bare {
                 handlers.push(HHandler {
                     exc: None,
@@ -18115,14 +18450,38 @@ impl<'a> Lowerer<'a> {
                         col,
                     }
                 } else {
-                    if !fs.is_module && self.module_local_names.contains(name) {
-                        self.error_at_code(
-                            e.range(),
-                            codes::NAME,
-                            format!(
-                                "name '{name}' is not visible inside a function; pass it as a parameter"
-                            ),
-                        );
+                    // A name that resolves to nothing in a *function* body is
+                    // a runtime `LOAD_GLOBAL`: CPython raises `NameError` only
+                    // when the read executes, and the name may be installed at
+                    // runtime (`globals()[...]`, a decorator, `exec`, a
+                    // module-level `global` write from another function).
+                    // Module bodies keep the compile-time diagnostic: there
+                    // the whole module namespace is statically known.
+                    //
+                    // A module local that a function cannot see is still a
+                    // scope error worth reporting statically.
+                    if !fs.is_module {
+                        if self.module_local_names.contains(name) {
+                            self.error_at_code(
+                                e.range(),
+                                codes::NAME,
+                                format!(
+                                    "name '{name}' is not visible inside a function; pass it as a parameter"
+                                ),
+                            );
+                            self.error_expr(e.range())
+                        } else {
+                            self.used_globals.insert(name.to_string());
+                            HExpr {
+                                kind: HExprKind::GlobalGet {
+                                    module: self.dunder_name.clone(),
+                                    name: name.to_string(),
+                                },
+                                ty: Ty::Concrete(Type::Any),
+                                line,
+                                col,
+                            }
+                        }
                     } else {
                         self.error_name(
                             e.range(),
@@ -18130,8 +18489,8 @@ impl<'a> Lowerer<'a> {
                             fs,
                             format!("name '{name}' is not defined"),
                         );
+                        self.error_expr(e.range())
                     }
-                    self.error_expr(e.range())
                 }
             }
             ast::Expr::BinOp(b) => {
@@ -22056,6 +22415,8 @@ impl<'a> Lowerer<'a> {
         }
         // Omitted keyword-only parameters (and optional positional ones) fall
         // back to their literal defaults.
+        let mut missing_positional: Vec<String> = Vec::new();
+        let mut missing_keyword_only: Vec<String> = Vec::new();
         for (index, slot) in slots.iter_mut().enumerate().skip(capture_count) {
             if slot.is_some() {
                 continue;
@@ -22086,24 +22447,22 @@ impl<'a> Lowerer<'a> {
                     });
                 }
                 None => {
-                    let label = if kind == ParamKind::KwOnly {
-                        "keyword-only argument"
-                    } else if kind == ParamKind::PosOnly {
-                        "positional argument"
+                    // CPython reports every missing required argument at once,
+                    // grouped by kind, in signature order.
+                    let name = signature.params[index].0.clone();
+                    if kind == ParamKind::KwOnly {
+                        missing_keyword_only.push(name);
                     } else {
-                        "argument"
-                    };
-                    self.error_at_code(
-                        call.range,
-                        codes::CALL,
-                        format!(
-                            "{name}() missing required {label} '{}'",
-                            signature.params[index].0
-                        ),
-                    );
-                    return None;
+                        missing_positional.push(name);
+                    }
                 }
             }
+        }
+        if let Some(message) =
+            missing_arguments_message(&name, &missing_positional, &missing_keyword_only)
+        {
+            self.error_at_code(call.range, codes::CALL, message);
+            return None;
         }
         if kwarg_index < param_count {
             slots[kwarg_index] = Some(HExpr {
@@ -26173,6 +26532,48 @@ fn type_param_range(param: &ast::TypeParam) -> TextRange {
     }
 }
 
+/// CPython's missing-argument message for a direct call.
+///
+/// `f()` with three missing positional parameters reports
+/// `f() missing 3 required positional arguments: 'a', 'b', and 'c'`; with two
+/// it reports `'a' and 'b'`; keyword-only parameters are grouped separately
+/// and every group is listed in signature order.
+fn missing_arguments_message(
+    callable: &str,
+    positional: &[String],
+    keyword_only: &[String],
+) -> Option<String> {
+    fn describe(label: &str, names: &[String]) -> String {
+        let quoted: Vec<String> = names.iter().map(|name| format!("'{name}'")).collect();
+        let rendered = match quoted.len() {
+            0 => String::new(),
+            1 => quoted[0].clone(),
+            2 => format!("{} and {}", quoted[0], quoted[1]),
+            // CPython uses the serial comma for three or more names.
+            _ => format!(
+                "{}, and {}",
+                quoted[..quoted.len() - 1].join(", "),
+                quoted[quoted.len() - 1]
+            ),
+        };
+        let noun = if names.len() == 1 {
+            "argument"
+        } else {
+            "arguments"
+        };
+        format!("{} {noun} {label}: {rendered}", names.len())
+    }
+
+    let mut groups = Vec::new();
+    if !positional.is_empty() {
+        groups.push(describe("positional", positional));
+    }
+    if !keyword_only.is_empty() {
+        groups.push(describe("keyword-only", keyword_only));
+    }
+    (!groups.is_empty()).then(|| format!("{callable}() missing {}", groups.join(" and ")))
+}
+
 fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool) {
     for stmt in stmts {
         match stmt {
@@ -26205,6 +26606,36 @@ fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool)
             ast::Stmt::TypeAlias(s) => {
                 if let ast::Expr::Name(name) = &*s.name {
                     out.push(name.id.to_string());
+                }
+            }
+            // `import x as y` binds `y` in the current scope, and `del name`
+            // is a binding operation too: both make the name local, exactly
+            // like CPython's symbol table (`del frame` in a function makes
+            // `frame` local, so a nested `nonlocal frame` finds it).
+            ast::Stmt::Import(s) => {
+                for alias in &s.names {
+                    let bound = alias.asname.as_ref().map_or_else(
+                        || alias.name.split('.').next().unwrap_or(alias.name.as_str()),
+                        |asname| asname.as_str(),
+                    );
+                    out.push(bound.to_string());
+                }
+            }
+            ast::Stmt::ImportFrom(s) => {
+                for alias in &s.names {
+                    if alias.name.as_str() == "*" {
+                        continue;
+                    }
+                    let bound = alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| alias.name.as_str(), |asname| asname.as_str());
+                    out.push(bound.to_string());
+                }
+            }
+            ast::Stmt::Delete(s) => {
+                for target in &s.targets {
+                    collect_target_names(target, out);
                 }
             }
             ast::Stmt::For(s) => {
@@ -27718,6 +28149,109 @@ fn collect_inline_comp_walrus_targets(
     for element in elements {
         collect_genexp_walrus_expr(element, in_genexp, out, seen);
     }
+}
+
+/// First `return`, or `break`/`continue` that leaves an `except*` block, in
+/// source order.
+///
+/// CPython's compiler raises `SyntaxError` when unwinding reaches the
+/// `COMPILE_FBLOCK_EXCEPTION_GROUP_HANDLER` block. `break`/`continue` stop at
+/// the innermost loop, so a loop declared inside the block is legal;
+/// `return` unwinds the whole block and is always illegal. Nested functions,
+/// lambdas and classes are separate code objects and are not inspected.
+fn except_star_control_flow(body: &[ast::Stmt], in_loop: bool) -> Option<TextRange> {
+    fn walk(stmts: &[ast::Stmt], in_loop: bool) -> Option<TextRange> {
+        for stmt in stmts {
+            match stmt {
+                ast::Stmt::Return(ret) => return Some(ret.range),
+                ast::Stmt::Break(brk) if !in_loop => return Some(brk.range),
+                ast::Stmt::Continue(cont) if !in_loop => return Some(cont.range),
+                ast::Stmt::FunctionDef(_)
+                | ast::Stmt::AsyncFunctionDef(_)
+                | ast::Stmt::ClassDef(_) => {}
+                ast::Stmt::If(s) => {
+                    if let Some(range) =
+                        walk(&s.body, in_loop).or_else(|| walk(&s.orelse, in_loop))
+                    {
+                        return Some(range);
+                    }
+                }
+                ast::Stmt::While(s) => {
+                    if let Some(range) =
+                        walk(&s.body, true).or_else(|| walk(&s.orelse, in_loop))
+                    {
+                        return Some(range);
+                    }
+                }
+                ast::Stmt::For(s) => {
+                    if let Some(range) =
+                        walk(&s.body, true).or_else(|| walk(&s.orelse, in_loop))
+                    {
+                        return Some(range);
+                    }
+                }
+                ast::Stmt::AsyncFor(s) => {
+                    if let Some(range) =
+                        walk(&s.body, true).or_else(|| walk(&s.orelse, in_loop))
+                    {
+                        return Some(range);
+                    }
+                }
+                ast::Stmt::With(s) => {
+                    if let Some(range) = walk(&s.body, in_loop) {
+                        return Some(range);
+                    }
+                }
+                ast::Stmt::AsyncWith(s) => {
+                    if let Some(range) = walk(&s.body, in_loop) {
+                        return Some(range);
+                    }
+                }
+                ast::Stmt::Try(s) => {
+                    if let Some(range) = walk(&s.body, in_loop) {
+                        return Some(range);
+                    }
+                    for handler in &s.handlers {
+                        let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                        if let Some(range) = walk(&handler.body, in_loop) {
+                            return Some(range);
+                        }
+                    }
+                    if let Some(range) =
+                        walk(&s.orelse, in_loop).or_else(|| walk(&s.finalbody, in_loop))
+                    {
+                        return Some(range);
+                    }
+                }
+                ast::Stmt::TryStar(s) => {
+                    if let Some(range) = walk(&s.body, in_loop) {
+                        return Some(range);
+                    }
+                    for handler in &s.handlers {
+                        let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                        if let Some(range) = walk(&handler.body, in_loop) {
+                            return Some(range);
+                        }
+                    }
+                    if let Some(range) =
+                        walk(&s.orelse, in_loop).or_else(|| walk(&s.finalbody, in_loop))
+                    {
+                        return Some(range);
+                    }
+                }
+                ast::Stmt::Match(s) => {
+                    for case in &s.cases {
+                        if let Some(range) = walk(&case.body, in_loop) {
+                            return Some(range);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    walk(body, in_loop)
 }
 
 #[cfg(test)]

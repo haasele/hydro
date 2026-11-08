@@ -103,30 +103,59 @@ fn getrlimit(args: &[i64]) -> i64 {
     }
     let soft = rlim_to_value(limits.rlim_cur);
     let hard = rlim_to_value(limits.rlim_max);
-    value::tuple_new(vec![int_value(soft), int_value(hard)])
+    value::tuple_new(vec![soft, hard])
 }
 
 /// Maps a raw `rlim_t` to CPython's limit representation (`-1` = unlimited).
+///
+/// A finite limit may exceed `i64` on 64-bit platforms (`rlim_t` is unsigned),
+/// so the value is promoted to a heap integer instead of saturating.
 #[cfg(unix)]
 fn rlim_to_value(limit: libc::rlim_t) -> i64 {
     if limit == libc::RLIM_INFINITY {
-        -1
-    } else {
-        i64::try_from(limit).unwrap_or(i64::MAX)
+        return -1;
+    }
+    let raw = limit as u64;
+    match i64::try_from(raw) {
+        Ok(value) => value,
+        Err(_) => value::bigint_new(num_bigint::BigInt::from(raw)),
     }
 }
 
-/// Maps CPython's limit representation to a raw `rlim_t`; `None` for a
-/// negative value other than `-1`.
+/// Decodes one limit argument to a raw `rlim_t`.
+///
+/// `-1` (CPython's spelling of `RLIM_INFINITY`) and any value that fits the
+/// platform's unsigned `rlim_t` are accepted; other negatives are invalid.
 #[cfg(unix)]
-fn value_to_rlim(number: i64) -> Option<libc::rlim_t> {
-    if number == -1 || number as u64 == libc::RLIM_INFINITY {
-        return Some(libc::RLIM_INFINITY);
+fn limit_to_rlim(item: i64) -> Result<libc::rlim_t, LimitError> {
+    if let Some(number) = value::as_integer(item) {
+        if number == -1 {
+            return Ok(libc::RLIM_INFINITY);
+        }
+        if number < 0 {
+            return Err(LimitError::Invalid);
+        }
+        return Ok(number as libc::rlim_t);
     }
-    if number < 0 {
-        return None;
+    if let Some(big) = value::as_bigint(item) {
+        if let Ok(raw) = u64::try_from(big.clone()) {
+            return Ok(raw as libc::rlim_t);
+        }
+        return Err(if big.sign() == num_bigint::Sign::Minus {
+            LimitError::Invalid
+        } else {
+            LimitError::Overflow
+        });
     }
-    libc::rlim_t::try_from(number as u64).ok()
+    Err(LimitError::NotAnInteger)
+}
+
+/// Why a limit argument could not be converted.
+#[cfg(unix)]
+enum LimitError {
+    NotAnInteger,
+    Invalid,
+    Overflow,
 }
 
 /// `resource.setrlimit(resource, limits)`: installs a `(soft, hard)` pair.
@@ -163,22 +192,30 @@ fn setrlimit(args: &[i64]) -> i64 {
             values.len()
         ));
     }
-    let mut parsed = [0i64; 2];
+    let mut parsed = [0 as libc::rlim_t; 2];
     for (index, item) in values.iter().enumerate() {
-        let Some(number) = value::as_integer(*item) else {
-            return type_error("setrlimit() argument 2 must be a tuple of two integers");
+        parsed[index] = match limit_to_rlim(*item) {
+            Ok(limit) => limit,
+            Err(LimitError::NotAnInteger) => {
+                return type_error("setrlimit() argument 2 must be a tuple of two integers")
+            }
+            Err(LimitError::Invalid) => {
+                return exc::raise_with_message(
+                    VALUE_ERROR,
+                    "not a valid value for a resource limit",
+                )
+            }
+            Err(LimitError::Overflow) => {
+                return exc::raise_with_message(
+                    OVERFLOW_ERROR,
+                    "not a valid value for a resource limit",
+                )
+            }
         };
-        parsed[index] = number;
     }
     let mut limits: libc::rlimit = unsafe { std::mem::zeroed() };
-    let Some(soft) = value_to_rlim(parsed[0]) else {
-        return exc::raise_with_message(VALUE_ERROR, "not a valid value for a resource limit");
-    };
-    let Some(hard) = value_to_rlim(parsed[1]) else {
-        return exc::raise_with_message(VALUE_ERROR, "not a valid value for a resource limit");
-    };
-    limits.rlim_cur = soft;
-    limits.rlim_max = hard;
+    limits.rlim_cur = parsed[0];
+    limits.rlim_max = parsed[1];
     // SAFETY: `limits` is a fully initialised `struct rlimit`.
     let result = unsafe { libc::setrlimit(resource as _, &limits) };
     if result != 0 {

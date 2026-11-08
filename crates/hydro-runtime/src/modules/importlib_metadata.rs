@@ -105,6 +105,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "distribution" => distribution(args),
         "distributions" => distributions_kw(&[]),
         "entry_points" => entry_points_kw(&[]),
+        "files" => files(args),
+        "packages_distributions" => packages_distributions(),
         DISTRIBUTION_READ_TEXT => distribution_read_text(args),
         ENTRY_POINT_LOAD => entry_point_load(args),
         PACKAGE_NOT_FOUND_STR => package_not_found_str(args),
@@ -805,6 +807,70 @@ fn requires(args: &[i64]) -> i64 {
         Some(_) => NONE,
         None => not_found(&name),
     }
+}
+
+/// `files(distribution_name)`: the `RECORD` paths, or `None`.
+fn files(args: &[i64]) -> i64 {
+    let name = match name_argument(args, "files") {
+        Ok(name) => name,
+        Err(raised) => return raised,
+    };
+    match find_dist(&name) {
+        Some(dist) => dist
+            .files
+            .as_ref()
+            .map(|files| strings(files.clone()))
+            .unwrap_or(NONE),
+        None => not_found(&name),
+    }
+}
+
+/// `packages_distributions()`: top-level package name -> distribution names.
+///
+/// CPython infers the mapping from each distribution's `RECORD` when it
+/// declares no `top_level.txt`; this implementation does the same, skipping
+/// cache and metadata entries.
+fn packages_distributions() -> i64 {
+    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+    for dist in distributions_cache() {
+        let Some(files) = dist.files.as_ref() else {
+            continue;
+        };
+        for file in files {
+            let mut parts = file.split('/');
+            let Some(first) = parts.next() else {
+                continue;
+            };
+            if first.is_empty()
+                || first == ".."
+                || first == "__pycache__"
+                || first.ends_with(".dist-info")
+                || first.ends_with(".egg-info")
+            {
+                continue;
+            }
+            let package = first.strip_suffix(".py").unwrap_or(first);
+            if package.is_empty() {
+                continue;
+            }
+            match grouped
+                .iter_mut()
+                .find(|(name, _)| name.as_str() == package)
+            {
+                Some((_, dists)) => {
+                    if !dists.contains(&dist.name) {
+                        dists.push(dist.name.clone());
+                    }
+                }
+                None => grouped.push((package.to_string(), vec![dist.name.clone()])),
+            }
+        }
+    }
+    let pairs: Vec<(i64, i64)> = grouped
+        .into_iter()
+        .map(|(package, dists)| (value::str_alloc(package), strings(dists)))
+        .collect();
+    value::dict_new(pairs)
 }
 
 fn distribution(args: &[i64]) -> i64 {

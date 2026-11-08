@@ -16,7 +16,7 @@
 //! reports a pending `ValueError`/`TypeError` and returns `None`.
 
 use crate::core::globals;
-use crate::exc::{self, ATTRIBUTE_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::exc::{self, ATTRIBUTE_ERROR, EXCEPTION, TYPE_ERROR, VALUE_ERROR};
 use crate::heap;
 use crate::value::{self, NONE};
 
@@ -78,13 +78,32 @@ pub(crate) fn error_class() -> i64 {
     class
 }
 
+/// `binascii.Incomplete`: the class for truncated input (a `Exception`
+/// subclass, *not* a `ValueError`, exactly like `Modules/binascii.c`).
+pub(crate) fn incomplete_class() -> i64 {
+    if let Some(class) = globals::registry_get("binascii.Incomplete") {
+        return class;
+    }
+    let class = value::class_new(
+        "Incomplete".to_string(),
+        exc::exception_class(EXCEPTION),
+        Vec::new(),
+    );
+    globals::registry_set("binascii.Incomplete", class);
+    class
+}
+
 /// Class-valued module attributes for attribute wiring.
 ///
-/// `binascii.Error` and `_binascii.Error` are the same class, exactly as in
-/// CPython (the accelerator module re-exports the pure-Python module's names).
+/// `binascii.Error`/`binascii.Incomplete` and their `_binascii` spellings are
+/// the same classes, exactly as in CPython (the accelerator module re-exports
+/// the pure-Python module's names).
 pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
     if matches!(module, "binascii" | "_binascii") && name == "Error" {
         return Some(error_class());
+    }
+    if matches!(module, "binascii" | "_binascii") && name == "Incomplete" {
+        return Some(incomplete_class());
     }
     None
 }
@@ -106,15 +125,59 @@ fn value_error(message: &str) -> i64 {
     exc::raise_value(instance)
 }
 
-/// Copies a `bytes` argument, so the buffer stays valid across allocations.
+/// Copies a bytes-like argument (`PyBUF_SIMPLE` semantics): `bytes`,
+/// `bytearray`, a C-contiguous `memoryview` or an `array.array`. Strings are
+/// rejected with the `TypeError` `b2a_*` functions raise.
 pub(crate) fn bytes_argument(value_arg: i64, name: &str) -> Result<Vec<u8>, i64> {
-    match value::as_bytes(value_arg) {
-        Some(bytes) => Ok(bytes.to_vec()),
+    match buffer_argument(value_arg) {
+        Some(Ok(bytes)) => Ok(bytes),
+        Some(Err(error)) => Err(error),
         None => Err(type_error(&format!(
             "argument '{name}' must be a bytes-like object, not '{}'",
             value::type_name(value_arg)
         ))),
     }
+}
+
+/// `a2b_*` arguments also accept an ASCII `str` (CPython decodes it as
+/// ASCII), reporting `UnicodeEncodeError` for non-ASCII text.
+pub(crate) fn data_argument(value_arg: i64, name: &str) -> Result<Vec<u8>, i64> {
+    if let Some(text) = value::as_str(value_arg) {
+        if text.is_ascii() {
+            return Ok(text.as_bytes().to_vec());
+        }
+        return Err(exc::raise_with_message(
+            exc::UNICODE_ENCODE_ERROR,
+            "'ascii' codec can't encode character: ordinal not in range(128)",
+        ));
+    }
+    bytes_argument(value_arg, name)
+}
+
+/// Reads a bytes-like value; `None` means "not a buffer at all".
+fn buffer_argument(value_arg: i64) -> Option<Result<Vec<u8>, i64>> {
+    if let Some(bytes) = value::as_bytes(value_arg) {
+        return Some(Ok(bytes.to_vec()));
+    }
+    if let Some(view) = value::as_memoryview(value_arg) {
+        if view.released {
+            return Some(Err(exc::raise_with_message(
+                VALUE_ERROR,
+                value::MEMORYVIEW_RELEASED,
+            )));
+        }
+        if view.stride != 1 && view.len() > 1 {
+            return Some(Err(exc::raise_with_message(
+                exc::BUFFER_ERROR,
+                "memoryview: underlying buffer is not C-contiguous",
+            )));
+        }
+        return Some(match value::memoryview_bytes(view) {
+            Ok(bytes) => Ok(bytes),
+            Err(message) => Err(exc::raise_with_message(VALUE_ERROR, message)),
+        });
+    }
+    crate::modules::array_mod::buffer_snapshot(value_arg).map(Ok)
 }
 
 /// Interprets a boolean flag slot: `None` selects the documented default.
@@ -371,7 +434,7 @@ fn hexlify(args: &[i64]) -> i64 {
 
 /// `unhexlify(hexstr)`; `a2b_hex` is an alias.
 fn unhexlify(args: &[i64]) -> i64 {
-    let data = match bytes_argument(argument(args, 0), "hexstr") {
+    let data = match data_argument(argument(args, 0), "hexstr") {
         Ok(data) => data,
         Err(error) => return error,
     };
@@ -397,7 +460,7 @@ fn b2a_base64(args: &[i64]) -> i64 {
 
 /// `a2b_base64(data, strict_mode=False)`.
 fn a2b_base64(args: &[i64]) -> i64 {
-    let data = match bytes_argument(argument(args, 0), "data") {
+    let data = match data_argument(argument(args, 0), "data") {
         Ok(data) => data,
         Err(error) => return error,
     };
@@ -417,7 +480,7 @@ fn a2b_base64(args: &[i64]) -> i64 {
 /// `Modules/binascii.c`. Any other character is an error, as is non-padding
 /// text left over after the declared byte count.
 fn a2b_uu(args: &[i64]) -> i64 {
-    let data = match bytes_argument(argument(args, 0), "data") {
+    let data = match data_argument(argument(args, 0), "data") {
         Ok(data) => data,
         Err(error) => return error,
     };
@@ -514,6 +577,181 @@ fn b2a_uu(args: &[i64]) -> i64 {
     value::bytes_new(encoded)
 }
 
+/// `crc_hqx(data, value)`: the CRC-CCITT (XMODEM) checksum.
+fn crc_hqx(args: &[i64]) -> i64 {
+    let data = match bytes_argument(argument(args, 0), "data") {
+        Ok(data) => data,
+        Err(error) => return error,
+    };
+    let initial = match int_argument(argument(args, 1), "value", 0) {
+        Ok(initial) => initial as u64 & 0xFFFF,
+        Err(error) => return error,
+    };
+    let mut crc = initial as u16;
+    for &byte in &data {
+        crc ^= u16::from(byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    int_result(i64::from(crc))
+}
+
+/// Uppercase hex pair of one byte.
+fn hex2_upper(byte: u8) -> [u8; 2] {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    [DIGITS[(byte >> 4) as usize], DIGITS[(byte & 0x0f) as usize]]
+}
+
+/// Maximum encoded line length used by `b2a_qp`.
+const MAXLINESIZE: usize = 76;
+
+/// `b2a_qp(data, quotetabs=False, istext=True, header=False)`, a direct port
+/// of `binascii_b2a_qp_impl`.
+fn qp_encode(data: &[u8], quotetabs: bool, istext: bool, header: bool) -> Vec<u8> {
+    let crlf = match data.iter().position(|&byte| byte == b'\n') {
+        Some(index) if index > 0 && data[index - 1] == b'\r' => true,
+        _ => false,
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut linelen = 0usize;
+    let mut index = 0usize;
+    let len = data.len();
+    while index < len {
+        let byte = data[index];
+        let quote = byte > 126
+            || byte == b'='
+            || (header && byte == b'_')
+            || (byte == b'.'
+                && linelen == 0
+                && (index + 1 == len
+                    || matches!(data[index + 1], b'\n' | b'\r' | 0)))
+            || (!istext && matches!(byte, b'\r' | b'\n'))
+            || (matches!(byte, b'\t' | b' ') && index + 1 == len)
+            || (byte < 33
+                && !matches!(byte, b'\r' | b'\n')
+                && (quotetabs || !matches!(byte, b'\t' | b' ')));
+        if quote {
+            if linelen + 3 >= MAXLINESIZE {
+                out.push(b'=');
+                if crlf {
+                    out.push(b'\r');
+                }
+                out.push(b'\n');
+                linelen = 0;
+            }
+            out.push(b'=');
+            out.extend_from_slice(&hex2_upper(byte));
+            index += 1;
+            linelen += 3;
+        } else if istext
+            && (byte == b'\n'
+                || (index + 1 < len && byte == b'\r' && data[index + 1] == b'\n'))
+        {
+            linelen = 0;
+            if let Some(&last) = out.last() {
+                if matches!(last, b' ' | b'\t') {
+                    out.pop();
+                    out.push(b'=');
+                    out.extend_from_slice(&hex2_upper(last));
+                }
+            }
+            if crlf {
+                out.push(b'\r');
+            }
+            out.push(b'\n');
+            index += if byte == b'\r' { 2 } else { 1 };
+        } else {
+            if index + 1 != len && data[index + 1] != b'\n' && linelen + 1 >= MAXLINESIZE {
+                out.push(b'=');
+                if crlf {
+                    out.push(b'\r');
+                }
+                out.push(b'\n');
+                linelen = 0;
+            }
+            out.push(byte);
+            index += 1;
+            linelen += 1;
+        }
+    }
+    out
+}
+
+/// `a2b_qp(data, header=False)`, a direct port of
+/// `binascii_a2b_qp_impl`.
+fn qp_decode(data: &[u8], header: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut index = 0usize;
+    let len = data.len();
+    while index < len {
+        if data[index] == b'=' {
+            index += 1;
+            if index >= len {
+                break;
+            }
+            // Soft line breaks.
+            if matches!(data[index], b'\n' | b'\r') {
+                if data[index] != b'\n' {
+                    while index < len && data[index] != b'\n' {
+                        index += 1;
+                    }
+                }
+                if index < len {
+                    index += 1;
+                }
+            } else if data[index] == b'=' {
+                out.push(b'=');
+                index += 1;
+            } else if index + 1 < len
+                && hex_digit(data[index]).is_some()
+                && hex_digit(data[index + 1]).is_some()
+            {
+                let high = hex_digit(data[index]).unwrap_or(0);
+                index += 1;
+                let low = hex_digit(data[index]).unwrap_or(0);
+                index += 1;
+                out.push((high << 4) | low);
+            } else {
+                out.push(b'=');
+            }
+        } else if header && data[index] == b'_' {
+            out.push(b' ');
+            index += 1;
+        } else {
+            out.push(data[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+/// `b2a_qp(data, *, quotetabs=False, istext=True, header=False)`.
+fn b2a_qp(args: &[i64]) -> i64 {
+    let data = match bytes_argument(argument(args, 0), "data") {
+        Ok(data) => data,
+        Err(error) => return error,
+    };
+    let quotetabs = flag_argument(argument(args, 1), false);
+    let istext = flag_argument(argument(args, 2), true);
+    let header = flag_argument(argument(args, 3), false);
+    value::bytes_new(qp_encode(&data, quotetabs, istext, header))
+}
+
+/// `a2b_qp(data, *, header=False)`.
+fn a2b_qp(args: &[i64]) -> i64 {
+    let data = match data_argument(argument(args, 0), "data") {
+        Ok(data) => data,
+        Err(error) => return error,
+    };
+    let header = flag_argument(argument(args, 1), false);
+    value::bytes_new(qp_decode(&data, header))
+}
+
 /// `crc32(data, value=0)`: the initial CRC is the previous result.
 fn crc32(args: &[i64]) -> i64 {
     let data = match bytes_argument(argument(args, 0), "data") {
@@ -559,9 +797,19 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "unhexlify" | "a2b_hex" => unhexlify(args),
         "b2a_base64" => b2a_base64(args),
         "a2b_base64" => a2b_base64(args),
-        "b2a_uu" => b2a_uu(args),
+        // `backtick` is keyword-only in CPython: `b2a_uu(data, backtick=True)`
+        // is valid, `b2a_uu(data, True)` is a `TypeError`.
+        "b2a_uu" => {
+            if args.len() > 1 {
+                return type_error("b2a_uu() takes 1 positional argument but 2 were given");
+            }
+            b2a_uu(args)
+        }
         "a2b_uu" => a2b_uu(args),
         "crc32" => crc32(args),
+        "crc_hqx" => crc_hqx(args),
+        "b2a_qp" => b2a_qp(args),
+        "a2b_qp" => a2b_qp(args),
         "adler32" => adler32(args),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
@@ -570,36 +818,51 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     }
 }
 
+/// Declared parameter names used to bind keyword arguments into slots.
+fn parameter_names(function: &str) -> &'static [&'static str] {
+    match function {
+        "hexlify" | "b2a_hex" => &["data", "sep", "bytes_per_sep"],
+        "unhexlify" | "a2b_hex" => &["hexstr"],
+        "b2a_base64" => &["data", "newline"],
+        "a2b_base64" => &["data", "strict_mode"],
+        "a2b_uu" => &["data"],
+        "b2a_uu" => &["data", "backtick"],
+        "crc32" | "crc_hqx" => &["data", "value"],
+        "b2a_qp" => &["data", "quotetabs", "istext", "header"],
+        "a2b_qp" => &["data", "header"],
+        _ => &[],
+    }
+}
+
 /// Keyword-aware dispatch for `binascii`.
 ///
-/// Only `b2a_uu` has a keyword-only parameter (`backtick`); the binder has
-/// already moved every declared positional parameter into its slot, so a
-/// remaining name here is either `backtick` or an error.
+/// The generic binder already moved declared parameters into their slots; a
+/// name left over is bound here by position so every documented keyword
+/// spelling works.
 pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
-    if function != "b2a_uu" {
-        if let Some((name, _)) = keywords.first() {
+    let names = parameter_names(function);
+    let mut bound = args.to_vec();
+    for (name, item) in keywords {
+        let Some(position) = names.iter().position(|candidate| *candidate == name) else {
             return type_error(&format!(
                 "binascii.{function}() got an unexpected keyword argument '{name}'"
             ));
-        }
-        return call(function, args);
-    }
-    let mut bound = args.to_vec();
-    for (name, item) in keywords {
-        if name != "backtick" {
-            return type_error(&format!(
-                "b2a_uu() got an unexpected keyword argument '{name}'"
-            ));
-        }
-        while bound.len() < 2 {
+        };
+        while bound.len() <= position {
             bound.push(NONE);
         }
-        if bound[1] != NONE {
-            return type_error("b2a_uu() got multiple values for argument 'backtick'");
+        if bound[position] != NONE {
+            return type_error(&format!(
+                "{function}() got multiple values for argument '{name}'"
+            ));
         }
-        bound[1] = *item;
+        bound[position] = *item;
     }
-    b2a_uu(&bound)
+    if function == "b2a_uu" {
+        // Skip `call`'s positional-only guard: the flag arrived by keyword.
+        return b2a_uu(&bound);
+    }
+    call(function, &bound)
 }
 
 #[cfg(test)]

@@ -13,12 +13,15 @@
 //! classes with classmethods, matching `importlib.machinery`'s package
 //! attributes.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use hydro_ir::MethodKind;
 
 use crate::core::globals;
-use crate::exc::{self, ATTRIBUTE_ERROR, IMPORT_ERROR, TYPE_ERROR};
+use crate::exc::{
+    self, ATTRIBUTE_ERROR, IMPORT_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR, TYPE_ERROR,
+};
 use crate::value::{self, NONE};
 
 pub(crate) const MODULE: &str = "importlib.machinery";
@@ -49,6 +52,52 @@ const FILE_FINDER_PATH_HOOK: &str = "_file_finder_path_hook";
 const FILE_FINDER_HOOK: &str = "_file_finder_hook";
 const FILE_FINDER_FIND_SPEC: &str = "_file_finder_find_spec";
 const FILE_FINDER_INVALIDATE: &str = "_file_finder_invalidate_caches";
+const LOADER_BASICS_IS_PACKAGE: &str = "_loader_basics_is_package";
+const SOURCE_GET_SOURCE: &str = "_source_get_source";
+const SOURCE_GET_CODE: &str = "_source_get_code";
+const SOURCE_SOURCE_TO_CODE: &str = "_source_source_to_code";
+const SOURCE_PATH_STATS: &str = "_source_path_stats";
+const SOURCE_PATH_MTIME: &str = "_source_path_mtime";
+const SOURCE_SET_DATA: &str = "_source_set_data";
+const FILE_LOADER_GET_DATA: &str = "_file_loader_get_data";
+const EXTENSION_IS_PACKAGE: &str = "_extension_is_package";
+const NAMESPACE_LOADER_CREATE_MODULE: &str = "_namespace_loader_create_module";
+const NAMESPACE_LOADER_IS_PACKAGE: &str = "_namespace_loader_is_package";
+const NAMESPACE_LOADER_GET_CODE: &str = "_namespace_loader_get_code";
+const NAMESPACE_LOADER_GET_SOURCE: &str = "_namespace_loader_get_source";
+const NAMESPACE_LOADER_EXEC_MODULE: &str = "_namespace_loader_exec_module";
+const WINDOWS_REGISTRY_FIND_SPEC: &str = "_windows_registry_finder_find_spec";
+const ZIPIMPORTER_INIT: &str = "_zipimporter_init";
+const ZIPIMPORTER_FIND_SPEC: &str = "_zipimporter_find_spec";
+const ZIPIMPORTER_IS_PACKAGE: &str = "_zipimporter_is_package";
+const ZIPIMPORTER_GET_FILENAME: &str = "_zipimporter_get_filename";
+const ZIPIMPORTER_GET_SOURCE: &str = "_zipimporter_get_source";
+const ZIPIMPORTER_GET_CODE: &str = "_zipimporter_get_code";
+const ZIPIMPORTER_GET_DATA: &str = "_zipimporter_get_data";
+const ZIPIMPORTER_LOAD_MODULE: &str = "_zipimporter_load_module";
+const ZIPIMPORTER_INVALIDATE: &str = "_zipimporter_invalidate_caches";
+const ZIPIMPORTER_GET_FILES: &str = "_zipimporter_get_files";
+
+// `importlib.abc` class methods. Their function values carry the
+// `importlib.machinery` module id so the central dispatch reaches them; the
+// `importlib.abc` module spec therefore only declares constants.
+const LOADER_CREATE_MODULE: &str = "_loader_create_module";
+const LOADER_LOAD_MODULE: &str = "_loader_load_module";
+const META_PATH_FINDER_INVALIDATE: &str = "_meta_path_finder_invalidate_caches";
+const PATH_ENTRY_FINDER_INVALIDATE: &str = "_path_entry_finder_invalidate_caches";
+const FINDER_FIND_MODULE: &str = "_finder_find_module";
+const RESOURCE_LOADER_GET_DATA: &str = "_resource_loader_get_data";
+const INSPECT_LOADER_IS_PACKAGE: &str = "_inspect_loader_is_package";
+const INSPECT_LOADER_GET_SOURCE: &str = "_inspect_loader_get_source";
+const INSPECT_LOADER_GET_CODE: &str = "_inspect_loader_get_code";
+const INSPECT_LOADER_SOURCE_TO_CODE: &str = "_inspect_loader_source_to_code";
+const EXECUTION_LOADER_GET_FILENAME: &str = "_execution_loader_get_filename";
+const EXECUTION_LOADER_GET_CODE: &str = "_execution_loader_get_code";
+const RESOURCE_READER_OPEN_RESOURCE: &str = "_resource_reader_open_resource";
+const RESOURCE_READER_RESOURCE_PATH: &str = "_resource_reader_resource_path";
+const RESOURCE_READER_IS_RESOURCE: &str = "_resource_reader_is_resource";
+const RESOURCE_READER_CONTENTS: &str = "_resource_reader_contents";
+const TRAVERSABLE_RESOURCES_FILES: &str = "_traversable_resources_files";
 
 /// Registry key of the bootstrap module `_install()` was called with.
 const BOOTSTRAP_KEY: &str = "importlib.machinery._bootstrap";
@@ -84,6 +133,56 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         FILE_FINDER_PATH_HOOK => file_finder_path_hook(args),
         FILE_FINDER_HOOK => file_finder_hook(args),
         FILE_FINDER_FIND_SPEC => file_finder_find_spec(args),
+        LOADER_BASICS_IS_PACKAGE => loader_basics_is_package(args),
+        SOURCE_GET_SOURCE => source_get_source(args),
+        SOURCE_GET_CODE => source_get_code(args),
+        SOURCE_SOURCE_TO_CODE => source_to_code(args),
+        SOURCE_PATH_STATS => source_path_stats(args),
+        SOURCE_PATH_MTIME => source_path_mtime(args),
+        SOURCE_SET_DATA => source_set_data(args),
+        FILE_LOADER_GET_DATA => file_loader_get_data(args),
+        EXTENSION_IS_PACKAGE => extension_is_package(args),
+        NAMESPACE_LOADER_EXEC_MODULE => exec_loaded_module(args[1]),
+        NAMESPACE_LOADER_CREATE_MODULE
+        | NAMESPACE_LOADER_GET_CODE
+        | NAMESPACE_LOADER_GET_SOURCE
+        | WINDOWS_REGISTRY_FIND_SPEC => NONE,
+        NAMESPACE_LOADER_IS_PACKAGE => value::bool_value(true),
+        ZIPIMPORTER_INIT => zipimporter_init(args),
+        ZIPIMPORTER_FIND_SPEC => zipimporter_find_spec(args),
+        ZIPIMPORTER_IS_PACKAGE => zipimporter_is_package(args),
+        ZIPIMPORTER_GET_FILENAME => zipimporter_get_filename(args),
+        ZIPIMPORTER_GET_SOURCE => zipimporter_get_source(args),
+        ZIPIMPORTER_GET_CODE => zipimporter_get_code(args),
+        ZIPIMPORTER_GET_DATA => zipimporter_get_data(args),
+        ZIPIMPORTER_LOAD_MODULE => zipimporter_load_module(args),
+        ZIPIMPORTER_INVALIDATE => zipimporter_invalidate(args),
+        ZIPIMPORTER_GET_FILES => zipimporter_get_files(args),
+        LOADER_CREATE_MODULE => NONE,
+        LOADER_LOAD_MODULE => loader_load_module(args),
+        META_PATH_FINDER_INVALIDATE | PATH_ENTRY_FINDER_INVALIDATE => NONE,
+        FINDER_FIND_MODULE => exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            "Finder.find_module() is not implemented; define find_spec()",
+        ),
+        RESOURCE_LOADER_GET_DATA => exc::raise_with_message(
+            OS_ERROR,
+            "ResourceLoader.get_data() is not implemented by this loader",
+        ),
+        INSPECT_LOADER_IS_PACKAGE => import_error("InspectLoader.is_package()"),
+        INSPECT_LOADER_GET_SOURCE => import_error("InspectLoader.get_source()"),
+        INSPECT_LOADER_GET_CODE => inspect_get_code(args),
+        INSPECT_LOADER_SOURCE_TO_CODE => source_to_code(args),
+        EXECUTION_LOADER_GET_FILENAME => import_error("ExecutionLoader.get_filename()"),
+        EXECUTION_LOADER_GET_CODE => execution_get_code(args),
+        RESOURCE_READER_OPEN_RESOURCE
+        | RESOURCE_READER_RESOURCE_PATH
+        | RESOURCE_READER_IS_RESOURCE
+        | RESOURCE_READER_CONTENTS
+        | TRAVERSABLE_RESOURCES_FILES => exc::raise_with_message(
+            NOT_IMPLEMENTED_ERROR,
+            "the resource reader interface is abstract; implement it in the reader",
+        ),
         "all_suffixes" => all_suffixes(),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
@@ -109,6 +208,19 @@ pub(crate) fn constant(name: &str) -> i64 {
         "FileFinder" => file_finder_class(),
         "SourcelessFileLoader" => sourceless_loader_class(),
         "AppleFrameworkLoader" => apple_framework_loader_class(),
+        // `NamespaceLoader`: the loader of PEP 420 namespace packages.
+        "NamespaceLoader" => namespace_loader_class(),
+        // The abstract file-backed loader bases `importlib.abc` mixes in.
+        "FileLoader" => file_loader_class(),
+        "SourceLoader" => source_loader_base_class(),
+        "_LoaderBasics" => loader_basics_class(),
+        // `WindowsRegistryFinder` exists on every platform in CPython's
+        // `importlib.machinery`; on POSIX its `find_spec` finds nothing.
+        "WindowsRegistryFinder" => windows_registry_finder_class(),
+        // `zipimport.zipimporter` and its error type. The `zipimport` alias
+        // resolves these through this table.
+        "zipimporter" => zipimporter_class(),
+        "ZipImportError" => zip_import_error_class(),
         // `zipimport._zip_directory_cache`: Hydro imports no zip archives, so
         // the mapping is a real, permanently empty dict (`pkgutil` reads it
         // only for an existing `zipimporter`, which Hydro never creates).
@@ -199,16 +311,31 @@ fn extension_suffix_list() -> i64 {
 
 /// Allocates (once) a native class under a registry key.
 fn cached_class(key: &str, name: &str, base: i64, methods: Vec<(String, i64, MethodKind)>) -> i64 {
+    let bases = if base == NONE { Vec::new() } else { vec![base] };
+    cached_class_multi(key, name, bases, methods)
+}
+
+/// [`cached_class`] with an explicit base list, so the abstract classes mirror
+/// CPython's multiple inheritance (`FileLoader(FileLoader, ResourceLoader,
+/// ExecutionLoader)`) and `issubclass()` checks follow the real C3 MRO.
+fn cached_class_multi(
+    key: &str,
+    name: &str,
+    bases: Vec<i64>,
+    methods: Vec<(String, i64, MethodKind)>,
+) -> i64 {
     if let Some(class) = globals::registry_get(key) {
         return class;
     }
     let method_values: Vec<i64> = methods.iter().map(|(_, value, _)| *value).collect();
-    let method_roots = crate::heap::root_values(&method_values);
-    let class = value::class_new_full(name.to_string(), base, methods, Vec::new());
+    let mut rooted = method_values.clone();
+    rooted.extend_from_slice(&bases);
+    let roots = crate::heap::root_values(&rooted);
+    let class = value::class_new_multi(name.to_string(), bases, NONE, methods, Vec::new());
     let class_roots = crate::heap::root_values(&[class]);
     globals::registry_set(key, class);
     crate::heap::release_roots(class_roots);
-    crate::heap::release_roots(method_roots);
+    crate::heap::release_roots(roots);
     class
 }
 
@@ -229,17 +356,348 @@ pub(crate) fn module_spec_class() -> i64 {
     )
 }
 
-/// `importlib.machinery.Loader`: the loader base class.
+/// `importlib.abc.Loader` (exposed here so `importlib.abc` can share the
+/// value): `create_module()` defers to default module creation and
+/// `load_module()` reports the module the runtime compiled ahead of time.
+///
+/// CPython deliberately omits `exec_module()` from this class so
+/// `hasattr(loader, 'exec_module')` stays a capability probe.
 pub(crate) fn loader_class() -> i64 {
-    cached_class("importlib.machinery.Loader", "Loader", NONE, Vec::new())
+    cached_class(
+        "importlib.abc.Loader",
+        "Loader",
+        NONE,
+        vec![
+            (
+                "create_module".to_string(),
+                native(LOADER_CREATE_MODULE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "load_module".to_string(),
+                native(LOADER_LOAD_MODULE, 2),
+                MethodKind::Normal,
+            ),
+        ],
+    )
+}
+
+/// `importlib.abc.MetaPathFinder`: an entry on `sys.meta_path`.
+///
+/// `find_spec()` is absent on purpose (CPython omits it for the same
+/// `hasattr` reason); `invalidate_caches()` is the optional no-op hook.
+pub(crate) fn meta_path_finder_class() -> i64 {
+    cached_class(
+        "importlib.abc.MetaPathFinder",
+        "MetaPathFinder",
+        NONE,
+        vec![(
+            "invalidate_caches".to_string(),
+            native(META_PATH_FINDER_INVALIDATE, 1),
+            MethodKind::Normal,
+        )],
+    )
+}
+
+/// `importlib.abc.PathEntryFinder`: a finder for one `sys.path` entry.
+pub(crate) fn path_entry_finder_class() -> i64 {
+    cached_class(
+        "importlib.abc.PathEntryFinder",
+        "PathEntryFinder",
+        NONE,
+        vec![(
+            "invalidate_caches".to_string(),
+            native(PATH_ENTRY_FINDER_INVALIDATE, 1),
+            MethodKind::Normal,
+        )],
+    )
+}
+
+/// `importlib.abc.Finder`: the pre-PEP 451 finder interface. Hydro's finders
+/// implement `find_spec()`, so `find_module()` only reports
+/// `NotImplementedError`, exactly like CPython's modern ABC.
+pub(crate) fn finder_class() -> i64 {
+    cached_class(
+        "importlib.abc.Finder",
+        "Finder",
+        NONE,
+        vec![(
+            "find_module".to_string(),
+            native(FINDER_FIND_MODULE, 3),
+            MethodKind::Normal,
+        )],
+    )
+}
+
+/// `importlib.abc.ResourceLoader(Loader)`.
+pub(crate) fn resource_loader_class() -> i64 {
+    cached_class(
+        "importlib.abc.ResourceLoader",
+        "ResourceLoader",
+        loader_class(),
+        vec![(
+            "get_data".to_string(),
+            native(RESOURCE_LOADER_GET_DATA, 2),
+            MethodKind::Normal,
+        )],
+    )
+}
+
+/// `importlib.abc.InspectLoader(Loader)`.
+pub(crate) fn inspect_loader_class() -> i64 {
+    cached_class(
+        "importlib.abc.InspectLoader",
+        "InspectLoader",
+        loader_class(),
+        vec![
+            (
+                "is_package".to_string(),
+                native(INSPECT_LOADER_IS_PACKAGE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_source".to_string(),
+                native(INSPECT_LOADER_GET_SOURCE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_code".to_string(),
+                native(INSPECT_LOADER_GET_CODE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "source_to_code".to_string(),
+                native(INSPECT_LOADER_SOURCE_TO_CODE, 2),
+                MethodKind::Staticmethod,
+            ),
+            // `_bootstrap_external._LoaderBasics` supplies this on the ABCs
+            // that mix it in; the runtime value is the shared
+            // "already executed" implementation.
+            (
+                "exec_module".to_string(),
+                native(SOURCE_EXEC_MODULE, 2),
+                MethodKind::Normal,
+            ),
+        ],
+    )
+}
+
+/// `importlib.abc.ExecutionLoader(InspectLoader)`.
+pub(crate) fn execution_loader_class() -> i64 {
+    cached_class(
+        "importlib.abc.ExecutionLoader",
+        "ExecutionLoader",
+        inspect_loader_class(),
+        vec![
+            (
+                "get_filename".to_string(),
+                native(EXECUTION_LOADER_GET_FILENAME, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_code".to_string(),
+                native(EXECUTION_LOADER_GET_CODE, 2),
+                MethodKind::Normal,
+            ),
+        ],
+    )
+}
+
+/// `_bootstrap_external._LoaderBasics`: the concrete defaults shared by
+/// `SourceLoader` and `SourcelessFileLoader`.
+pub(crate) fn loader_basics_class() -> i64 {
+    cached_class(
+        "importlib.machinery._LoaderBasics",
+        "_LoaderBasics",
+        NONE,
+        vec![
+            (
+                "is_package".to_string(),
+                native(LOADER_BASICS_IS_PACKAGE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "create_module".to_string(),
+                native(SOURCE_CREATE_MODULE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "exec_module".to_string(),
+                native(SOURCE_EXEC_MODULE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "load_module".to_string(),
+                native(LOADER_LOAD_MODULE, 2),
+                MethodKind::Normal,
+            ),
+        ],
+    )
+}
+
+/// `_bootstrap_external.FileLoader`: the file-backed loader base
+/// (`__init__`, `get_filename`, `get_data`, `get_resource_reader`).
+pub(crate) fn file_loader_class() -> i64 {
+    cached_class(
+        "importlib.machinery.FileLoader",
+        "FileLoader",
+        NONE,
+        vec![
+            (
+                "__init__".to_string(),
+                native(SOURCE_INIT, 3),
+                MethodKind::Normal,
+            ),
+            (
+                "get_filename".to_string(),
+                native(SOURCE_GET_FILENAME, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_data".to_string(),
+                native(FILE_LOADER_GET_DATA, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "is_package".to_string(),
+                native(LOADER_BASICS_IS_PACKAGE, 2),
+                MethodKind::Normal,
+            ),
+        ],
+    )
+}
+
+/// `_bootstrap_external.SourceLoader`: the abstract source/bytecode loader.
+///
+/// `get_source()` reads and decodes the file for real; `get_code()` reports
+/// the missing runtime compiler rather than inventing a code object.
+pub(crate) fn source_loader_base_class() -> i64 {
+    cached_class(
+        "importlib.machinery.SourceLoader",
+        "SourceLoader",
+        loader_basics_class(),
+        vec![
+            (
+                "get_source".to_string(),
+                native(SOURCE_GET_SOURCE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_code".to_string(),
+                native(SOURCE_GET_CODE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "source_to_code".to_string(),
+                native(SOURCE_SOURCE_TO_CODE, 4),
+                MethodKind::Normal,
+            ),
+            (
+                "path_stats".to_string(),
+                native(SOURCE_PATH_STATS, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "path_mtime".to_string(),
+                native(SOURCE_PATH_MTIME, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "set_data".to_string(),
+                native(SOURCE_SET_DATA, 4),
+                MethodKind::Normal,
+            ),
+        ],
+    )
+}
+
+/// `importlib.abc.FileLoader(_bootstrap_external.FileLoader, ResourceLoader,
+/// ExecutionLoader)`: the file loader with the documented ABC surface.
+pub(crate) fn abc_file_loader_class() -> i64 {
+    cached_class_multi(
+        "importlib.abc.FileLoader",
+        "FileLoader",
+        vec![
+            file_loader_class(),
+            resource_loader_class(),
+            execution_loader_class(),
+        ],
+        Vec::new(),
+    )
+}
+
+/// `importlib.abc.SourceLoader(_bootstrap_external.SourceLoader,
+/// ResourceLoader, ExecutionLoader)`.
+pub(crate) fn abc_source_loader_class() -> i64 {
+    cached_class_multi(
+        "importlib.abc.SourceLoader",
+        "SourceLoader",
+        vec![
+            source_loader_base_class(),
+            resource_loader_class(),
+            execution_loader_class(),
+        ],
+        Vec::new(),
+    )
+}
+
+/// `importlib.abc.ResourceReader`: the legacy resource-reader ABC (kept under
+/// `importlib.resources.abc` in CPython 3.14; the same class value is exposed
+/// under the historical `importlib.abc` spelling).
+pub(crate) fn resource_reader_class() -> i64 {
+    cached_class(
+        "importlib.abc.ResourceReader",
+        "ResourceReader",
+        NONE,
+        vec![
+            (
+                "open_resource".to_string(),
+                native(RESOURCE_READER_OPEN_RESOURCE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "resource_path".to_string(),
+                native(RESOURCE_READER_RESOURCE_PATH, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "is_resource".to_string(),
+                native(RESOURCE_READER_IS_RESOURCE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "contents".to_string(),
+                native(RESOURCE_READER_CONTENTS, 1),
+                MethodKind::Normal,
+            ),
+        ],
+    )
+}
+
+/// `importlib.abc.TraversableResources(ResourceReader)`.
+pub(crate) fn traversable_resources_class() -> i64 {
+    cached_class(
+        "importlib.abc.TraversableResources",
+        "TraversableResources",
+        resource_reader_class(),
+        vec![(
+            "files".to_string(),
+            native(TRAVERSABLE_RESOURCES_FILES, 1),
+            MethodKind::Normal,
+        )],
+    )
 }
 
 /// `importlib.machinery.SourceFileLoader(name, path)`.
+///
+/// CPython's class is `SourceFileLoader(FileLoader, SourceLoader)`; the ABC
+/// value is used as the base so `issubclass(SourceFileLoader,
+/// importlib.abc.FileLoader)` holds with the real C3 linearization.
 pub(crate) fn source_loader_class() -> i64 {
-    cached_class(
+    cached_class_multi(
         "importlib.machinery.SourceFileLoader",
         "SourceFileLoader",
-        loader_class(),
+        vec![abc_file_loader_class(), abc_source_loader_class()],
         vec![
             (
                 "__init__".to_string(),
@@ -270,7 +728,7 @@ pub(crate) fn extension_loader_class() -> i64 {
     cached_class(
         "importlib.machinery.ExtensionFileLoader",
         "ExtensionFileLoader",
-        loader_class(),
+        abc_file_loader_class(),
         vec![
             (
                 "__init__".to_string(),
@@ -292,16 +750,31 @@ pub(crate) fn extension_loader_class() -> i64 {
                 native(EXTENSION_EXEC_MODULE, 2),
                 MethodKind::Normal,
             ),
+            (
+                "is_package".to_string(),
+                native(EXTENSION_IS_PACKAGE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_code".to_string(),
+                native(NAMESPACE_LOADER_GET_CODE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_source".to_string(),
+                native(NAMESPACE_LOADER_GET_SOURCE, 2),
+                MethodKind::Normal,
+            ),
         ],
     )
 }
 
 /// `importlib.machinery.BuiltinImporter`: classmethods for native modules.
 pub(crate) fn builtin_importer_class() -> i64 {
-    cached_class(
+    cached_class_multi(
         "importlib.machinery.BuiltinImporter",
         "BuiltinImporter",
-        NONE,
+        vec![meta_path_finder_class(), inspect_loader_class()],
         vec![
             (
                 "find_spec".to_string(),
@@ -330,10 +803,10 @@ pub(crate) fn builtin_importer_class() -> i64 {
 /// `importlib.machinery.FrozenImporter`: Hydro ships no frozen modules, so
 /// discovery returns `None` and `create_module` reports the exact reason.
 pub(crate) fn frozen_importer_class() -> i64 {
-    cached_class(
+    cached_class_multi(
         "importlib.machinery.FrozenImporter",
         "FrozenImporter",
-        NONE,
+        vec![meta_path_finder_class(), inspect_loader_class()],
         vec![
             (
                 "find_spec".to_string(),
@@ -367,7 +840,7 @@ pub(crate) fn path_finder_class() -> i64 {
     cached_class(
         "importlib.machinery.PathFinder",
         "PathFinder",
-        NONE,
+        meta_path_finder_class(),
         vec![
             (
                 "find_spec".to_string(),
@@ -395,7 +868,7 @@ pub(crate) fn file_finder_class() -> i64 {
     cached_class(
         "importlib.machinery.FileFinder",
         "FileFinder",
-        NONE,
+        path_entry_finder_class(),
         vec![
             (
                 "__init__".to_string(),
@@ -431,7 +904,7 @@ pub(crate) fn sourceless_loader_class() -> i64 {
     cached_class(
         "importlib.machinery.SourcelessFileLoader",
         "SourcelessFileLoader",
-        loader_class(),
+        abc_file_loader_class(),
         vec![
             (
                 "__init__".to_string(),
@@ -451,6 +924,16 @@ pub(crate) fn sourceless_loader_class() -> i64 {
             (
                 "exec_module".to_string(),
                 native(SOURCE_EXEC_MODULE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_source".to_string(),
+                native(NAMESPACE_LOADER_GET_SOURCE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_code".to_string(),
+                native(SOURCE_GET_CODE, 2),
                 MethodKind::Normal,
             ),
         ],
@@ -488,6 +971,162 @@ pub(crate) fn apple_framework_loader_class() -> i64 {
             ),
         ],
     )
+}
+
+/// `importlib.machinery.NamespaceLoader`: the PEP 420 loader.
+pub(crate) fn namespace_loader_class() -> i64 {
+    cached_class(
+        "importlib.machinery.NamespaceLoader",
+        "NamespaceLoader",
+        inspect_loader_class(),
+        vec![
+            (
+                "create_module".to_string(),
+                native(NAMESPACE_LOADER_CREATE_MODULE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "exec_module".to_string(),
+                native(NAMESPACE_LOADER_EXEC_MODULE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "is_package".to_string(),
+                native(NAMESPACE_LOADER_IS_PACKAGE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_code".to_string(),
+                native(NAMESPACE_LOADER_GET_CODE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_source".to_string(),
+                native(NAMESPACE_LOADER_GET_SOURCE, 2),
+                MethodKind::Normal,
+            ),
+        ],
+    )
+}
+
+/// `importlib.machinery.WindowsRegistryFinder`: present on every platform;
+/// on POSIX its `find_spec()` finds nothing, exactly like CPython's.
+pub(crate) fn windows_registry_finder_class() -> i64 {
+    cached_class(
+        "importlib.machinery.WindowsRegistryFinder",
+        "WindowsRegistryFinder",
+        meta_path_finder_class(),
+        vec![(
+            "find_spec".to_string(),
+            native(WINDOWS_REGISTRY_FIND_SPEC, 4),
+            MethodKind::Classmethod,
+        )],
+    )
+}
+
+/// `zipimport.ZipImportError`, an `ImportError` subclass.
+pub(crate) fn zip_import_error_class() -> i64 {
+    cached_class(
+        "zipimport.ZipImportError",
+        "ZipImportError",
+        exc::exception_class(IMPORT_ERROR),
+        Vec::new(),
+    )
+}
+
+/// `zipimport.zipimporter(archivepath)`.
+///
+/// The implementation reads the archive's central directory for real, so
+/// `_get_files()`, `find_spec()`, `is_package()`, `get_filename()` and
+/// `get_source()` report the archive's actual contents. Executing a module
+/// from the archive still needs a runtime compiler, which Hydro does not have;
+/// `get_code()`/`load_module()` report that instead of inventing a module.
+pub(crate) fn zipimporter_class() -> i64 {
+    cached_class(
+        "zipimport.zipimporter",
+        "zipimporter",
+        inspect_loader_class(),
+        vec![
+            (
+                "__init__".to_string(),
+                native(ZIPIMPORTER_INIT, usize::MAX),
+                MethodKind::Normal,
+            ),
+            (
+                "find_spec".to_string(),
+                native(ZIPIMPORTER_FIND_SPEC, 3),
+                MethodKind::Normal,
+            ),
+            (
+                "is_package".to_string(),
+                native(ZIPIMPORTER_IS_PACKAGE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_filename".to_string(),
+                native(ZIPIMPORTER_GET_FILENAME, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_source".to_string(),
+                native(ZIPIMPORTER_GET_SOURCE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_code".to_string(),
+                native(ZIPIMPORTER_GET_CODE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "get_data".to_string(),
+                native(ZIPIMPORTER_GET_DATA, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "load_module".to_string(),
+                native(ZIPIMPORTER_LOAD_MODULE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "exec_module".to_string(),
+                native(SOURCE_EXEC_MODULE, 2),
+                MethodKind::Normal,
+            ),
+            (
+                "invalidate_caches".to_string(),
+                native(ZIPIMPORTER_INVALIDATE, 1),
+                MethodKind::Normal,
+            ),
+            (
+                "_get_files".to_string(),
+                native(ZIPIMPORTER_GET_FILES, 1),
+                MethodKind::Normal,
+            ),
+        ],
+    )
+}
+
+/// Materialises an `importlib.abc` module constant. The classes live in this
+/// module so the concrete finders and loaders share their values, which keeps
+/// `issubclass()` checks true across both spellings.
+pub(crate) fn abc_constant(name: &str) -> i64 {
+    match name {
+        "Loader" => loader_class(),
+        "MetaPathFinder" => meta_path_finder_class(),
+        "PathEntryFinder" => path_entry_finder_class(),
+        "Finder" => finder_class(),
+        "ResourceLoader" => resource_loader_class(),
+        "InspectLoader" => inspect_loader_class(),
+        "ExecutionLoader" => execution_loader_class(),
+        "FileLoader" => abc_file_loader_class(),
+        "SourceLoader" => abc_source_loader_class(),
+        "ResourceReader" => resource_reader_class(),
+        "TraversableResources" => traversable_resources_class(),
+        _ => exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("module 'importlib.abc' has no attribute '{name}'"),
+        ),
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -623,12 +1262,12 @@ fn file_finder_find_spec(args: &[i64]) -> i64 {
     }
 }
 
-/// `zipimport._zip_directory_cache`: archive path -> directory mapping.
+/// `zipimport._zip_directory_cache`: archive path -> `{member: info}` mapping.
 ///
-/// Hydro never creates a `zipimporter`, so no archive is ever imported and the
-/// mapping stays empty; it is a real cached dict so identity and mutation
-/// behave like CPython's module global. `pkgutil` only indexes it with an
-/// existing importer's `archive`, which cannot occur here.
+/// The mapping is a real cached dict so identity and mutation behave like
+/// CPython's module global: `zipimporter()` fills it with the archive's
+/// central directory, `invalidate_caches()` drops one archive's entry and
+/// `pkgutil` reads the member names.
 fn zip_directory_cache() -> i64 {
     if let Some(cached) = globals::registry_get(ZIP_DIRECTORY_CACHE) {
         return cached;
@@ -1092,6 +1731,970 @@ pub(crate) fn absolute(path: &str) -> String {
         Ok(dir) => dir.join(path).to_string_lossy().into_owned(),
         Err(_) => path.to_string_lossy().into_owned(),
     }
+}
+
+// -------------------------------------------------------------------------
+// Shared loader method implementations
+// -------------------------------------------------------------------------
+
+/// `getattr(receiver, name)`, clearing a missing attribute to `NONE`.
+fn lookup_method(receiver: i64, name: &str) -> i64 {
+    let found = crate::core::methods::getattr(receiver, name.as_ptr(), name.len());
+    if exc::pending() {
+        if exc::pending_tag() == i64::from(ATTRIBUTE_ERROR) {
+            exc::clear();
+        }
+        return NONE;
+    }
+    found
+}
+
+/// Calls `receiver.name(*args)`.
+fn call_method(receiver: i64, name: &str, args: &[i64]) -> i64 {
+    let function = lookup_method(receiver, name);
+    if exc::pending() {
+        return NONE;
+    }
+    if function == NONE {
+        return exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!(
+                "'{}' object has no attribute '{name}'",
+                value::type_name(receiver)
+            ),
+        );
+    }
+    crate::builtins::call(function, args.len(), args.as_ptr())
+}
+
+fn import_error(method: &str) -> i64 {
+    exc::raise_with_message(
+        IMPORT_ERROR,
+        &format!("{method} is not implemented by this loader"),
+    )
+}
+
+/// `Loader.load_module(fullname)`: the module body already ran, so the
+/// registry entry is the result; anything else needs a runtime compiler.
+fn loader_load_module(args: &[i64]) -> i64 {
+    let receiver = args[0];
+    let Some(fullname) = value::as_str(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "load_module() argument 'fullname' must be str, not '{}'",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    if let Some(module) = super::registry_lookup(fullname) {
+        return module;
+    }
+    if lookup_method(receiver, "exec_module") == NONE {
+        return exc::raise_with_message(
+            IMPORT_ERROR,
+            &format!("cannot load module {fullname:?}: loader defines no exec_module()"),
+        );
+    }
+    exc::raise_with_message(
+        IMPORT_ERROR,
+        &format!(
+            "cannot load module {fullname:?}: Hydro executes module bodies ahead of time \
+             and has no runtime Python compiler"
+        ),
+    )
+}
+
+/// `self.get_filename(fullname)` as an owned path.
+fn method_filename(loader: i64, fullname: i64) -> Result<String, i64> {
+    let found = call_method(loader, "get_filename", &[fullname]);
+    if exc::pending() {
+        return Err(found);
+    }
+    match value::as_str(found) {
+        Some(text) => Ok(text.to_string()),
+        None => Err(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "get_filename() must return str, not '{}'",
+                value::type_name(found)
+            ),
+        )),
+    }
+}
+
+/// `_LoaderBasics.is_package(fullname)`: the filename base is `__init__`.
+fn loader_basics_is_package(args: &[i64]) -> i64 {
+    let loader = args[0];
+    let Some(fullname) = value::as_str(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "is_package() argument 'fullname' must be str, not '{}'",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    let filename = match method_filename(loader, args[1]) {
+        Ok(filename) => filename,
+        Err(raised) => return raised,
+    };
+    let base = Path::new(&filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name))
+        .unwrap_or("");
+    let tail = fullname.rsplit('.').next().unwrap_or(fullname);
+    value::bool_value(base == "__init__" && tail != "__init__")
+}
+
+/// `SourceLoader.get_source(fullname)`: the decoded source file.
+fn source_get_source(args: &[i64]) -> i64 {
+    let loader = args[0];
+    let path = match method_filename(loader, args[1]) {
+        Ok(path) => path,
+        Err(raised) => return raised,
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return exc::raise_with_message(
+                IMPORT_ERROR,
+                "source not available through get_data()",
+            )
+        }
+    };
+    let source = value::bytes_new(bytes);
+    super::importlib_util::call("decode_source", &[source])
+}
+
+/// `SourceLoader.get_code(fullname)`: reading succeeds, compiling does not.
+fn source_get_code(args: &[i64]) -> i64 {
+    let loader = args[0];
+    let path = match method_filename(loader, args[1]) {
+        Ok(path) => path,
+        Err(raised) => return raised,
+    };
+    if let Err(error) = std::fs::read(&path) {
+        return exc::raise_with_message(
+            IMPORT_ERROR,
+            &format!("source not available through get_data(): {error}"),
+        );
+    }
+    exc::raise_with_message(
+        NOT_IMPLEMENTED_ERROR,
+        &format!(
+            "get_code() cannot produce a code object for '{path}': Hydro consumes \
+             Python source ahead of time and has no runtime bytecode compiler"
+        ),
+    )
+}
+
+/// `SourceLoader.source_to_code(data, path='<string>')`.
+fn source_to_code(args: &[i64]) -> i64 {
+    let path = args.get(1).copied().and_then(value::as_str).unwrap_or("<string>");
+    exc::raise_with_message(
+        NOT_IMPLEMENTED_ERROR,
+        &format!(
+            "source_to_code() cannot compile Python source at runtime in Hydro \
+             (path: '{path}'): module bodies are compiled ahead of time"
+        ),
+    )
+}
+
+/// `InspectLoader.get_code(fullname)`: `get_source()` then `source_to_code()`.
+fn inspect_get_code(args: &[i64]) -> i64 {
+    let receiver = args[0];
+    let fullname = args[1];
+    let source = call_method(receiver, "get_source", &[fullname]);
+    if exc::pending() {
+        return NONE;
+    }
+    if source == NONE {
+        return NONE;
+    }
+    call_method(receiver, "source_to_code", &[source])
+}
+
+/// `ExecutionLoader.get_code(fullname)`: pass the filename when available.
+fn execution_get_code(args: &[i64]) -> i64 {
+    let receiver = args[0];
+    let fullname = args[1];
+    let source = call_method(receiver, "get_source", &[fullname]);
+    if exc::pending() {
+        return NONE;
+    }
+    if source == NONE {
+        return NONE;
+    }
+    let path = call_method(receiver, "get_filename", &[fullname]);
+    if exc::pending() {
+        if exc::pending_tag() == i64::from(IMPORT_ERROR) {
+            exc::clear();
+            return call_method(receiver, "source_to_code", &[source]);
+        }
+        return NONE;
+    }
+    call_method(receiver, "source_to_code", &[source, path])
+}
+
+fn stat_error(path: &str, error: &std::io::Error) -> i64 {
+    exc::raise_with_message(OS_ERROR, &format!("{error}: '{path}'"))
+}
+
+/// `SourceLoader.path_stats(path)`.
+fn source_path_stats(args: &[i64]) -> i64 {
+    let Some(path) = args.get(1).copied().and_then(value::as_str) else {
+        return exc::raise_with_message(TYPE_ERROR, "path_stats() argument must be str");
+    };
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_secs_f64())
+                .unwrap_or(0.0);
+            let key_mtime = value::str_alloc("mtime".to_string());
+            let key_size = value::str_alloc("size".to_string());
+            let roots = crate::heap::root_values(&[key_mtime, key_size]);
+            let dict = value::dict_new(vec![
+                (key_mtime, value::float_new(mtime)),
+                (key_size, crate::ops::int_result(metadata.len() as i64)),
+            ]);
+            crate::heap::release_roots(roots);
+            dict
+        }
+        Err(error) => stat_error(path, &error),
+    }
+}
+
+/// `SourceLoader.path_mtime(path)`: the integer modification time.
+fn source_path_mtime(args: &[i64]) -> i64 {
+    let Some(path) = args.get(1).copied().and_then(value::as_str) else {
+        return exc::raise_with_message(TYPE_ERROR, "path_mtime() argument must be str");
+    };
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let seconds = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            crate::ops::int_result(seconds as i64)
+        }
+        Err(error) => stat_error(path, &error),
+    }
+}
+
+/// `SourceLoader.set_data(path, data, *, _mode=0o666)`: write bytecode.
+///
+/// CPython silently ignores write failures (a read-only installation simply
+/// does not cache bytecode); this keeps that behaviour.
+fn source_set_data(args: &[i64]) -> i64 {
+    let Some(path) = args.get(1).copied().and_then(value::as_str) else {
+        return exc::raise_with_message(TYPE_ERROR, "set_data() argument 'path' must be str");
+    };
+    let Some(data) = args.get(2).copied().and_then(value::as_bytes) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "set_data() argument 'data' must be bytes, not '{}'",
+                value::type_name(args.get(2).copied().unwrap_or(NONE))
+            ),
+        );
+    };
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    let _ = std::fs::write(path, data);
+    NONE
+}
+
+/// `FileLoader.get_data(path)`.
+fn file_loader_get_data(args: &[i64]) -> i64 {
+    let Some(path) = args.get(1).copied().and_then(value::as_str) else {
+        return exc::raise_with_message(TYPE_ERROR, "get_data() argument must be str");
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => value::bytes_new(bytes),
+        Err(error) => stat_error(path, &error),
+    }
+}
+
+/// `ExtensionFileLoader.is_package(fullname)`.
+fn extension_is_package(args: &[i64]) -> i64 {
+    let Some(path) = value::instance_attr(args[0], "path").and_then(value::as_str) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "is_package() receiver has no str 'path' attribute",
+        );
+    };
+    let Some(filename) = Path::new(path).file_name().and_then(|name| name.to_str()) else {
+        return value::bool_value(false);
+    };
+    let suffixes = constant("EXTENSION_SUFFIXES");
+    let matches = value::as_list(suffixes).is_some_and(|suffixes| {
+        suffixes.iter().any(|suffix| {
+            value::as_str(*suffix)
+                .is_some_and(|suffix| filename == format!("__init__{suffix}"))
+        })
+    });
+    if exc::pending() {
+        return NONE;
+    }
+    value::bool_value(matches)
+}
+
+// -------------------------------------------------------------------------
+// `zipimport.zipimporter`
+// -------------------------------------------------------------------------
+
+/// One central-directory entry.
+#[derive(Clone, Debug)]
+struct ZipEntry {
+    name: String,
+    compress_type: u16,
+    crc: u32,
+    compress_size: u64,
+    file_size: u64,
+    header_offset: u64,
+    time: u16,
+    date: u16,
+}
+
+fn u16_at(data: &[u8], offset: usize) -> Option<u16> {
+    let slice = data.get(offset..offset + 2)?;
+    Some(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn u32_at(data: &[u8], offset: usize) -> Option<u32> {
+    let slice = data.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn u64_at(data: &[u8], offset: usize) -> Option<u64> {
+    let slice = data.get(offset..offset + 8)?;
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(slice);
+    Some(u64::from_le_bytes(bytes))
+}
+
+/// Reads the central directory of `archive`.
+///
+/// Supports the ZIP32 layout and the ZIP64 end-of-central-directory record
+/// (the sparse-ZIP64 fixtures in CPython's tests use it). Returning `Err`
+/// means the file is not a usable zip archive, which `zipimporter()` reports
+/// as `ZipImportError`.
+fn read_central_directory(archive: &str) -> Result<Vec<ZipEntry>, String> {
+    let mut file = std::fs::File::open(archive).map_err(|error| format!("{error}: {archive}"))?;
+    let length = file.metadata().map_err(|error| error.to_string())?.len();
+    if length < 22 {
+        return Err(format!("{archive} is not a zip file"));
+    }
+    let tail_len = length.min(22 + 0xFFFF);
+    let mut tail = vec![0u8; tail_len as usize];
+    file.seek(SeekFrom::Start(length - tail_len))
+        .map_err(|error| error.to_string())?;
+    file.read_exact(&mut tail)
+        .map_err(|error| error.to_string())?;
+    // Locate the end-of-central-directory signature, scanning backwards.
+    let mut eocd = None;
+    for index in (0..tail.len().saturating_sub(21)).rev() {
+        if tail[index..index + 4] == [0x50, 0x4B, 0x05, 0x06] {
+            eocd = Some(index);
+            break;
+        }
+    }
+    let Some(eocd) = eocd else {
+        return Err(format!("{archive} is not a zip file"));
+    };
+    let mut count = u64::from(u16_at(&tail, eocd + 10).ok_or("truncated directory")?);
+    let mut directory_size = u64::from(u32_at(&tail, eocd + 12).ok_or("truncated directory")?);
+    let mut directory_offset = u64::from(u32_at(&tail, eocd + 16).ok_or("truncated directory")?);
+    let eocd_file_offset = length - tail_len + eocd as u64;
+
+    if count == 0xFFFF
+        || directory_size == 0xFFFF_FFFF
+        || directory_offset == 0xFFFF_FFFF
+    {
+        // ZIP64: the locator precedes the classic record.
+        if eocd_file_offset >= 20 {
+            let mut locator = [0u8; 20];
+            file.seek(SeekFrom::Start(eocd_file_offset - 20))
+                .map_err(|error| error.to_string())?;
+            file.read_exact(&mut locator)
+                .map_err(|error| error.to_string())?;
+            if locator[0..4] == [0x50, 0x4B, 0x06, 0x07] {
+                let zip64_offset = u64_at(&locator, 8).ok_or("truncated zip64 locator")?;
+                let mut record = [0u8; 56];
+                file.seek(SeekFrom::Start(zip64_offset))
+                    .map_err(|error| error.to_string())?;
+                file.read_exact(&mut record)
+                    .map_err(|error| error.to_string())?;
+                if record[0..4] != [0x50, 0x4B, 0x06, 0x06] {
+                    return Err(format!("{archive} has a corrupt zip64 directory"));
+                }
+                count = u64_at(&record, 32).ok_or("truncated zip64 directory")?;
+                directory_size = u64_at(&record, 40).ok_or("truncated zip64 directory")?;
+                directory_offset = u64_at(&record, 48).ok_or("truncated zip64 directory")?;
+            }
+        }
+    }
+
+    let mut directory = vec![0u8; directory_size.min(length) as usize];
+    file.seek(SeekFrom::Start(directory_offset))
+        .map_err(|error| error.to_string())?;
+    file.read_exact(&mut directory)
+        .map_err(|error| error.to_string())?;
+
+    let mut entries = Vec::new();
+    let mut position = 0usize;
+    for _ in 0..count {
+        if directory.get(position..position + 4) != Some(&[0x50u8, 0x4B, 0x01, 0x02][..]) {
+            break;
+        }
+        let compress_type = u16_at(&directory, position + 10).ok_or("truncated entry")?;
+        let time = u16_at(&directory, position + 12).ok_or("truncated entry")?;
+        let date = u16_at(&directory, position + 14).ok_or("truncated entry")?;
+        let crc = u32_at(&directory, position + 16).ok_or("truncated entry")?;
+        let mut compress_size = u64::from(u32_at(&directory, position + 20).ok_or("truncated entry")?);
+        let mut file_size = u64::from(u32_at(&directory, position + 24).ok_or("truncated entry")?);
+        let name_len = u16_at(&directory, position + 28).ok_or("truncated entry")? as usize;
+        let extra_len = u16_at(&directory, position + 30).ok_or("truncated entry")? as usize;
+        let comment_len = u16_at(&directory, position + 32).ok_or("truncated entry")? as usize;
+        let mut header_offset =
+            u64::from(u32_at(&directory, position + 42).ok_or("truncated entry")?);
+        let name_start = position + 46;
+        let name_end = name_start + name_len;
+        let extra_end = name_end + extra_len;
+        let Some(name_bytes) = directory.get(name_start..name_end) else {
+            break;
+        };
+        // ZIP64 extra field: only the components that overflowed are present,
+        // in the fixed order usize, csize, offset.
+        let mut extra = directory.get(name_end..extra_end).unwrap_or(&[]);
+        while extra.len() >= 4 {
+            let id = u16_at(extra, 0).unwrap_or(0);
+            let size = u16_at(extra, 2).unwrap_or(0) as usize;
+            let Some(body) = extra.get(4..4 + size) else {
+                break;
+            };
+            if id == 0x0001 {
+                let mut cursor = 0usize;
+                let mut take = |width: usize| -> Option<u64> {
+                    let value = if width == 8 {
+                        u64_at(body, cursor)
+                    } else {
+                        u32_at(body, cursor).map(u64::from)
+                    };
+                    cursor += width;
+                    value
+                };
+                if file_size == 0xFFFF_FFFF {
+                    file_size = take(8).unwrap_or(file_size);
+                }
+                if compress_size == 0xFFFF_FFFF {
+                    compress_size = take(8).unwrap_or(compress_size);
+                }
+                if header_offset == 0xFFFF_FFFF {
+                    header_offset = take(8).unwrap_or(header_offset);
+                }
+            }
+            extra = extra.get(4 + size..).unwrap_or(&[]);
+        }
+        let name = String::from_utf8_lossy(name_bytes).into_owned();
+        entries.push(ZipEntry {
+            name,
+            compress_type,
+            crc,
+            compress_size,
+            file_size,
+            header_offset,
+            time,
+            date,
+        });
+        position = extra_end + comment_len;
+    }
+    Ok(entries)
+}
+
+/// Reads one member's uncompressed bytes, verifying its CRC.
+fn read_zip_member(archive: &str, entry: &ZipEntry) -> Result<Vec<u8>, String> {
+    let mut file = std::fs::File::open(archive).map_err(|error| format!("{error}: {archive}"))?;
+    let mut header = [0u8; 30];
+    file.seek(SeekFrom::Start(entry.header_offset))
+        .map_err(|error| error.to_string())?;
+    file.read_exact(&mut header)
+        .map_err(|error| error.to_string())?;
+    if header[0..4] != [0x50, 0x4B, 0x03, 0x04] {
+        return Err(format!("{archive} has a corrupt local header"));
+    }
+    let name_len = u16_at(&header, 26).ok_or("truncated local header")? as u64;
+    let extra_len = u16_at(&header, 28).ok_or("truncated local header")? as u64;
+    let data_offset = entry.header_offset + 30 + name_len + extra_len;
+    let mut compressed = vec![0u8; entry.compress_size as usize];
+    file.seek(SeekFrom::Start(data_offset))
+        .map_err(|error| error.to_string())?;
+    file.read_exact(&mut compressed)
+        .map_err(|error| error.to_string())?;
+    let plain = match entry.compress_type {
+        0 => compressed,
+        8 => {
+            let source = value::bytes_new(compressed);
+            let wbits = crate::ops::int_result(-15);
+            let roots = crate::heap::root_values(&[source]);
+            let inflated = super::zlib_mod::call("decompress", &[source, wbits]);
+            crate::heap::release_roots(roots);
+            if exc::pending() {
+                return Err("deflate stream is corrupt".to_string());
+            }
+            match value::as_bytes(inflated) {
+                Some(bytes) => bytes.to_vec(),
+                None => return Err("deflate stream is corrupt".to_string()),
+            }
+        }
+        other => return Err(format!("compression type {other} is not supported")),
+    };
+    let crc_input = value::bytes_new(plain.clone());
+    let roots = crate::heap::root_values(&[crc_input]);
+    let crc = super::zlib_mod::call("crc32", &[crc_input]);
+    crate::heap::release_roots(roots);
+    if exc::pending() {
+        return Err("cannot checksum entry".to_string());
+    }
+    if value::as_integer(crc).map(|crc| crc as u64 & 0xFFFF_FFFF) != Some(u64::from(entry.crc)) {
+        return Err(format!("bad CRC-32 for file '{}'", entry.name));
+    }
+    Ok(plain)
+}
+
+/// Central-directory entries of `archive`, cached in
+/// `zipimport._zip_directory_cache`.
+fn zip_entries(archive: &str) -> Result<Vec<ZipEntry>, String> {
+    if let Some(cached) = zip_cache(archive) {
+        let entries: Vec<ZipEntry> = value::as_dict(cached)
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .filter_map(|(key, item)| {
+                        let name = value::as_str(*key)?.to_string();
+                        let fields = value::as_tuple(*item)?;
+                        if fields.len() != 7 {
+                            return None;
+                        }
+                        Some(ZipEntry {
+                            name,
+                            compress_type: value::as_integer(fields[0])? as u16,
+                            compress_size: value::as_integer(fields[1])? as u64,
+                            file_size: value::as_integer(fields[2])? as u64,
+                            header_offset: value::as_integer(fields[3])? as u64,
+                            time: value::as_integer(fields[4])? as u16,
+                            date: value::as_integer(fields[5])? as u16,
+                            crc: value::as_integer(fields[6])? as u32,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !entries.is_empty() {
+            return Ok(entries);
+        }
+    }
+    let entries = read_central_directory(archive)?;
+    store_zip_cache(archive, &entries);
+    Ok(entries)
+}
+
+fn zip_cache(archive: &str) -> Option<i64> {
+    let cache = zip_directory_cache();
+    value::as_dict(cache).and_then(|pairs| {
+        pairs
+            .iter()
+            .find_map(|(key, item)| (value::as_str(*key) == Some(archive)).then_some(*item))
+    })
+}
+
+fn store_zip_cache(archive: &str, entries: &[ZipEntry]) {
+    let cache = zip_directory_cache();
+    let key = value::str_alloc(archive.to_string());
+    let dict = value::dict_new(Vec::new());
+    let roots = crate::heap::root_values(&[cache, key, dict]);
+    for entry in entries {
+        let name = value::str_alloc(entry.name.clone());
+        let name_roots = crate::heap::root_values(&[name]);
+        let fields = vec![
+            crate::ops::int_result(i64::from(entry.compress_type)),
+            crate::ops::int_result(entry.compress_size as i64),
+            crate::ops::int_result(entry.file_size as i64),
+            crate::ops::int_result(entry.header_offset as i64),
+            crate::ops::int_result(i64::from(entry.time)),
+            crate::ops::int_result(i64::from(entry.date)),
+            crate::ops::int_result(i64::from(entry.crc)),
+        ];
+        let tuple = value::tuple_new(fields);
+        let tuple_roots = crate::heap::root_values(&[tuple]);
+        crate::container::dict_set(dict, name, tuple);
+        crate::heap::release_roots(tuple_roots);
+        crate::heap::release_roots(name_roots);
+    }
+    if let Some(mut pairs) = value::dict_pairs_mut(cache) {
+        let _ = pairs.remove(key);
+    }
+    crate::container::dict_set(cache, key, dict);
+    crate::heap::release_roots(roots);
+}
+
+fn remove_zip_cache(archive: &str) -> bool {
+    let cache = zip_directory_cache();
+    let key = value::str_alloc(archive.to_string());
+    let roots = crate::heap::root_values(&[key]);
+    let removed = match value::dict_pairs_mut(cache) {
+        Some(mut pairs) => pairs.remove(key).is_some(),
+        None => false,
+    };
+    crate::heap::release_roots(roots);
+    removed
+}
+
+/// Raises `zipimport.ZipImportError` with `message`.
+fn raise_zip_error(message: String) -> i64 {
+    let class = zip_import_error_class();
+    let text = value::str_alloc(message);
+    let roots = crate::heap::root_values(&[class, text]);
+    let instance = crate::builtins::call(class, 1, &text as *const i64);
+    crate::heap::release_roots(roots);
+    if exc::pending() {
+        return instance;
+    }
+    exc::raise_value(instance)
+}
+
+/// Splits `archivepath` into the archive file and the in-archive prefix.
+///
+/// CPython walks up the path until an existing file is found; the remainder is
+/// the prefix (normalised to `/`-separated with a trailing separator).
+fn find_archive(archivepath: &str) -> Result<(String, String), String> {
+    if archivepath.is_empty() {
+        return Err("archive path is empty".to_string());
+    }
+    let mut candidate = std::path::PathBuf::from(archivepath);
+    loop {
+        match std::fs::metadata(&candidate) {
+            Ok(metadata) => {
+                if metadata.is_dir() {
+                    return Err(format!("{archivepath} is a directory"));
+                }
+                let archive = candidate.to_string_lossy().into_owned();
+                let mut prefix = archivepath[archive.len()..].replace('\\', "/");
+                while prefix.starts_with('/') {
+                    prefix.remove(0);
+                }
+                if !prefix.is_empty() && !prefix.ends_with('/') {
+                    prefix.push('/');
+                }
+                return Ok((archive, prefix));
+            }
+            Err(_) => match candidate.parent().map(|parent| parent.to_path_buf()) {
+                Some(parent) if !parent.as_os_str().is_empty() => candidate = parent,
+                _ => return Err(format!("{archivepath} is not a valid file")),
+            },
+        }
+    }
+}
+
+fn zip_field(importer: i64, name: &str) -> Option<String> {
+    value::instance_attr(importer, name)
+        .and_then(value::as_str)
+        .map(str::to_string)
+}
+
+/// The in-archive key for `fullname`: `prefix + dotted-name-as-path`.
+fn zip_key(prefix: &str, fullname: &str) -> String {
+    let mut key = prefix.to_string();
+    let relative = fullname.trim_start_matches('/');
+    if relative.contains('/') {
+        key.push_str(relative);
+    } else {
+        key.push_str(&relative.replace('.', "/"));
+    }
+    key
+}
+
+fn zip_entry_named(archive: &str, name: &str) -> Result<Option<ZipEntry>, String> {
+    Ok(zip_entries(archive)?.into_iter().find(|entry| entry.name == name))
+}
+
+/// `zipimporter(archivepath)`.
+fn zipimporter_init(args: &[i64]) -> i64 {
+    let receiver = args[0];
+    let Some(archivepath) = args.get(1).and_then(|arg| value::as_str(*arg)) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "archivepath must be str, not '{}'",
+                value::type_name(args.get(1).copied().unwrap_or(NONE))
+            ),
+        );
+    };
+    let (archive, prefix) = match find_archive(archivepath) {
+        Ok(found) => found,
+        Err(message) => return raise_zip_error(message),
+    };
+    if let Err(message) = read_central_directory(&archive) {
+        return raise_zip_error(message);
+    }
+    // Populate the shared directory cache for this archive (a re-created
+    // importer must observe the file as it is now).
+    remove_zip_cache(&archive);
+    if let Err(message) = zip_entries(&archive) {
+        return raise_zip_error(message);
+    }
+    for (field, text) in [("archive", archive.clone()), ("prefix", prefix)] {
+        value::instance_setattr(
+            receiver,
+            field.to_string(),
+            value::str_alloc(text),
+        );
+    }
+    NONE
+}
+
+fn zipimporter_get_files(args: &[i64]) -> i64 {
+    let Some(archive) = zip_field(args[0], "archive") else {
+        return exc::raise_with_message(TYPE_ERROR, "zipimporter has no 'archive' attribute");
+    };
+    match zip_entries(&archive) {
+        Ok(entries) => {
+            let names: Vec<i64> = entries
+                .iter()
+                .map(|entry| value::str_alloc(entry.name.clone()))
+                .collect();
+            let roots = crate::heap::root_values(&names);
+            let list = value::list_new(names);
+            crate::heap::release_roots(roots);
+            list
+        }
+        Err(message) => raise_zip_error(message),
+    }
+}
+
+fn zipimporter_invalidate(args: &[i64]) -> i64 {
+    if let Some(archive) = zip_field(args[0], "archive") {
+        remove_zip_cache(&archive);
+    }
+    NONE
+}
+
+/// The module file or package initializer of `fullname` inside the importer's
+/// archive, as `(key, is_package)`.
+fn zip_module_info(importer: i64, fullname: &str) -> Result<(String, bool), String> {
+    let archive = zip_field(importer, "archive").ok_or("zipimporter has no 'archive'")?;
+    let prefix = zip_field(importer, "prefix").unwrap_or_default();
+    let key = zip_key(&prefix, fullname);
+    let entries = zip_entries(&archive)?;
+    let has = |name: &str| entries.iter().any(|entry| entry.name == name);
+    if has(&format!("{key}/__init__.pyc")) {
+        return Ok((format!("{key}/__init__.pyc"), true));
+    }
+    if has(&format!("{key}/__init__.py")) {
+        return Ok((format!("{key}/__init__.py"), true));
+    }
+    if has(&format!("{key}.pyc")) {
+        return Ok((format!("{key}.pyc"), false));
+    }
+    if has(&format!("{key}.py")) {
+        return Ok((format!("{key}.py"), false));
+    }
+    Err(format!("can't find module '{fullname}' on path"))
+}
+
+fn zipimporter_find_spec(args: &[i64]) -> i64 {
+    let importer = args[0];
+    let Some(fullname) = value::as_str(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "find_spec() argument 'fullname' must be str, not '{}'",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    let archive = match zip_field(importer, "archive") {
+        Some(archive) => archive,
+        None => return exc::raise_with_message(TYPE_ERROR, "zipimporter has no archive"),
+    };
+    let (key, is_package) = match zip_module_info(importer, fullname) {
+        Ok(info) => info,
+        Err(_) => return NONE,
+    };
+    let origin = format!("{archive}/{key}");
+    let search_locations = is_package.then(|| {
+        let package_dir = key.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+        vec![format!("{archive}/{package_dir}")]
+    });
+    new_spec(
+        fullname,
+        importer,
+        Some(origin),
+        search_locations,
+        true,
+    )
+}
+
+fn zipimporter_is_package(args: &[i64]) -> i64 {
+    let Some(fullname) = value::as_str(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "is_package() argument must be str, not '{}'",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    match zip_module_info(args[0], fullname) {
+        Ok((_, is_package)) => value::bool_value(is_package),
+        Err(message) => raise_zip_error(message),
+    }
+}
+
+fn zipimporter_get_filename(args: &[i64]) -> i64 {
+    let Some(fullname) = value::as_str(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "get_filename() argument must be str, not '{}'",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    let Some(archive) = zip_field(args[0], "archive") else {
+        return exc::raise_with_message(TYPE_ERROR, "zipimporter has no archive");
+    };
+    match zip_module_info(args[0], fullname) {
+        Ok((key, _)) => value::str_alloc(format!("{archive}/{key}")),
+        Err(message) => raise_zip_error(message),
+    }
+}
+
+fn zipimporter_get_source(args: &[i64]) -> i64 {
+    let Some(fullname) = value::as_str(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "get_source() argument must be str, not '{}'",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    let Some(archive) = zip_field(args[0], "archive") else {
+        return exc::raise_with_message(TYPE_ERROR, "zipimporter has no archive");
+    };
+    let (key, _) = match zip_module_info(args[0], fullname) {
+        Ok(info) => info,
+        Err(message) => return raise_zip_error(message),
+    };
+    // A source file may accompany the bytecode; only `.pyc` means "no source".
+    let source_key = match key.strip_suffix(".pyc") {
+        Some(stem) => format!("{stem}.py"),
+        None => key.clone(),
+    };
+    let entry = match zip_entry_named(&archive, &source_key) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return NONE,
+        Err(message) => return raise_zip_error(message),
+    };
+    match read_zip_member(&archive, &entry) {
+        Ok(bytes) => {
+            let source = value::bytes_new(bytes);
+            super::importlib_util::call("decode_source", &[source])
+        }
+        Err(message) => raise_zip_error(message),
+    }
+}
+
+fn zipimporter_get_code(args: &[i64]) -> i64 {
+    let Some(fullname) = value::as_str(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "get_code() argument must be str, not '{}'",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    let Some(archive) = zip_field(args[0], "archive") else {
+        return exc::raise_with_message(TYPE_ERROR, "zipimporter has no archive");
+    };
+    let (key, _) = match zip_module_info(args[0], fullname) {
+        Ok(info) => info,
+        Err(message) => return raise_zip_error(message),
+    };
+    // Validate the entry's data so a corrupt archive still fails truthfully.
+    if let Ok(Some(entry)) = zip_entry_named(&archive, &key) {
+        if let Err(message) = read_zip_member(&archive, &entry) {
+            return raise_zip_error(message);
+        }
+    }
+    exc::raise_with_message(
+        NOT_IMPLEMENTED_ERROR,
+        &format!(
+            "get_code({fullname:?}) cannot unmarshal a code object: Hydro executes \
+             modules ahead of time and has no runtime bytecode interpreter"
+        ),
+    )
+}
+
+fn zipimporter_get_data(args: &[i64]) -> i64 {
+    let Some(path) = value::as_str(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "get_data() argument must be str, not '{}'",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    let Some(archive) = zip_field(args[0], "archive") else {
+        return exc::raise_with_message(TYPE_ERROR, "zipimporter has no archive");
+    };
+    let key = match path.strip_prefix(archive.as_str()) {
+        Some(rest) => rest.trim_start_matches('/').to_string(),
+        None => path.to_string(),
+    };
+    match zip_entry_named(&archive, &key) {
+        Ok(Some(entry)) => match read_zip_member(&archive, &entry) {
+            Ok(bytes) => value::bytes_new(bytes),
+            Err(message) => raise_zip_error(message),
+        },
+        Ok(None) => exc::raise_with_message(
+            OS_ERROR,
+            &format!("can't find {path:?} in {archive}"),
+        ),
+        Err(message) => raise_zip_error(message),
+    }
+}
+
+fn zipimporter_load_module(args: &[i64]) -> i64 {
+    let Some(fullname) = value::as_str(args[1]) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "load_module() argument must be str, not '{}'",
+                value::type_name(args[1])
+            ),
+        );
+    };
+    if let Some(module) = super::registry_lookup(fullname) {
+        return module;
+    }
+    raise_zip_error(format!(
+        "cannot load module '{fullname}' from a zip archive: Hydro executes \
+         modules ahead of time and has no runtime bytecode interpreter"
+    ))
 }
 
 #[cfg(test)]

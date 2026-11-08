@@ -19,6 +19,27 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use crate::exc::{self, IMPORT_ERROR, NOT_IMPLEMENTED_ERROR, TYPE_ERROR};
 use crate::value::{self, FALSE, NONE};
 
+/// Materialises an `_imp` module constant.
+///
+/// `pyc_magic_number_token` is the single definition shared with
+/// `importlib.util.MAGIC_NUMBER`, so a `.pyc` header written from either name
+/// agrees. The frozen-module list is the one this runtime actually has (no
+/// frozen modules), and `check_hash_based_pycs` reports the CPython default
+/// mode.
+pub(crate) fn constant(name: &str) -> i64 {
+    match name {
+        "pyc_magic_number_token" => crate::ops::int_result(
+            crate::modules::importlib_util::PYC_MAGIC_NUMBER_TOKEN as i64,
+        ),
+        "check_hash_based_pycs" => value::str_alloc("default".to_string()),
+        "_frozen_module_names" => value::list_new(Vec::new()),
+        _ => exc::raise_with_message(
+            crate::exc::ATTRIBUTE_ERROR,
+            &format!("module '_imp' has no attribute '{name}'"),
+        ),
+    }
+}
+
 static FROZEN_OVERRIDE: AtomicI64 = AtomicI64::new(-1);
 static MULTI_INTERP_OVERRIDE: AtomicI64 = AtomicI64::new(-1);
 
@@ -33,6 +54,13 @@ fn override_state(state: &AtomicI64, args: &[i64]) -> i64 {
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         "acquire_lock" | "release_lock" => NONE,
+        // The import lock is process-wide and is never held while user code
+        // runs, so this thread's answer is always `False`.
+        "lock_held" => FALSE,
+        "init_frozen" => exc::raise_with_message(
+            IMPORT_ERROR,
+            "frozen modules are not available in Hydro",
+        ),
         "is_builtin" => match module_name(function, args[0]) {
             Some(name) => value::bool_value(stdlib::module(name).is_some()),
             None => NONE,

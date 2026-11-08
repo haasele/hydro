@@ -1,25 +1,27 @@
 //! `pwd`: the Unix user account database.
 //!
 //! `getpwnam`, `getpwuid` and `getpwall` read the real password database
-//! through libc. The returned entries are namespaces with CPython's
-//! `struct_passwd` fields (`pw_name`, `pw_passwd`, `pw_uid`, `pw_gid`,
-//! `pw_gecos`, `pw_dir`, `pw_shell`); `struct_passwd(sequence)` builds one
-//! from a 7-item sequence exactly like CPython's struct sequence constructor.
+//! through libc. The returned entries are `struct_passwd` struct sequence
+//! records carrying CPython's fields (`pw_name`, `pw_passwd`, `pw_uid`,
+//! `pw_gid`, `pw_gecos`, `pw_dir`, `pw_shell`) as named attributes and the
+//! same values as the record's tuple payload, so `len()`, indexing, iteration
+//! and tuple equality all work. `struct_passwd(sequence)` builds one from a
+//! 7-item sequence exactly like CPython's struct sequence constructor.
 //!
 //! `getpwnam`/`getpwuid` go through the reentrant `*_r` entry points so a
 //! concurrent lookup on another runtime thread cannot overwrite the entry
 //! being converted. `getpwall` enumerates the non-reentrant iterator under
 //! process-wide lock and copies every entry immediately.
 //!
-//! Errors follow CPython: a missing account is a `KeyError`, a wrong argument
-//! type a `TypeError`, an out-of-range uid a `KeyError`-free `OverflowError`
-//! and a lookup failure an `OSError`. No user input can panic.
+//! Errors follow CPython: a missing account or an out-of-range uid is a
+//! `KeyError`, a wrong argument type a `TypeError` and a lookup failure an
+//! `OSError`. No user input can panic.
 
 use std::ffi::CStr;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, KEY_ERROR, OS_ERROR, OVERFLOW_ERROR, TYPE_ERROR, VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, KEY_ERROR, OS_ERROR, TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::value;
@@ -75,15 +77,47 @@ fn cstr_value(pointer: *const libc::c_char) -> i64 {
     value::str_from_bytes(bytes)
 }
 
-/// Appends one field to a rooted namespace, keeping the value alive across
-/// the mutation so a collection inside the container lock cannot free it.
-fn record_field(namespace: i64, name: &str, field_value: i64) {
+/// Stores one structseq field on a record instance, keeping the value alive
+/// across the mutation so a collection cannot free it.
+fn set_field(record: i64, name: &str, field_value: i64) {
     let roots = heap::root_values(&[field_value]);
-    if let Some(mut state) = value::namespace_pairs_mut(namespace) {
-        state.pairs.push((name.to_string(), field_value));
-    }
-    heap::write_barrier_edge(namespace, field_value);
+    value::instance_setattr(record, name.to_string(), field_value);
     heap::release_roots(roots);
+}
+
+/// The cached `struct_passwd` class.
+///
+/// A structseq record is an instance of this class whose *container payload*
+/// is the tuple of fields: `len()` and indexing therefore read the payload
+/// while the named attributes read the instance attributes, exactly like
+/// CPython's struct sequence type. The class is cached so `type(entry)` keeps
+/// its identity across lookups.
+fn record_class() -> i64 {
+    const KEY: &str = "pwd.struct_passwd.class";
+    if let Some(class) = crate::core::globals::registry_get(KEY) {
+        return class;
+    }
+    let class = value::class_new("struct_passwd".to_string(), value::NONE, Vec::new());
+    crate::core::globals::registry_set(KEY, class);
+    class
+}
+
+/// Builds a `struct_passwd` record from its seven field values.
+fn passwd_record(fields: Vec<i64>) -> i64 {
+    let class = record_class();
+    let roots = heap::root_values(&fields);
+    let payload = value::tuple_new(fields.clone());
+    let payload_roots = heap::root_values(&[payload]);
+    let record = value::instance_new(class);
+    let record_roots = heap::root_values(&[record]);
+    for (name, item) in PASSWD_FIELDS.iter().zip(fields.iter()) {
+        set_field(record, name, *item);
+    }
+    value::instance_set_container_payload(record, payload);
+    heap::release_roots(record_roots);
+    heap::release_roots(payload_roots);
+    heap::release_roots(roots);
+    record
 }
 
 /// Pushes `item` onto a rooted list, keeping it alive across the mutation.
@@ -96,19 +130,17 @@ fn push_item(list: i64, item: i64) {
     heap::release_roots(roots);
 }
 
-/// Converts a raw `struct passwd` into a `struct_passwd`-shaped namespace.
+/// Converts a raw `struct passwd` into a `struct_passwd` structseq record.
 fn passwd_namespace(entry: &libc::passwd) -> i64 {
-    let namespace = value::namespace_new(Vec::new());
-    let roots = heap::root_values(&[namespace]);
-    record_field(namespace, "pw_name", cstr_value(entry.pw_name));
-    record_field(namespace, "pw_passwd", cstr_value(entry.pw_passwd));
-    record_field(namespace, "pw_uid", int_value(i64::from(entry.pw_uid)));
-    record_field(namespace, "pw_gid", int_value(i64::from(entry.pw_gid)));
-    record_field(namespace, "pw_gecos", cstr_value(entry.pw_gecos));
-    record_field(namespace, "pw_dir", cstr_value(entry.pw_dir));
-    record_field(namespace, "pw_shell", cstr_value(entry.pw_shell));
-    heap::release_roots(roots);
-    namespace
+    passwd_record(vec![
+        cstr_value(entry.pw_name),
+        cstr_value(entry.pw_passwd),
+        int_value(i64::from(entry.pw_uid)),
+        int_value(i64::from(entry.pw_gid)),
+        cstr_value(entry.pw_gecos),
+        cstr_value(entry.pw_dir),
+        cstr_value(entry.pw_shell),
+    ])
 }
 
 /// Calls a reentrant passwd lookup, retrying with a larger buffer on
@@ -209,11 +241,11 @@ fn getpwuid(args: &[i64]) -> i64 {
             value::type_name(uid_value)
         ));
     };
+    // CPython 3.14 treats an integer outside `uid_t` as a lookup that cannot
+    // match any account, reporting `KeyError` just like a missing uid.
     let uid = match libc::uid_t::try_from(uid) {
         Ok(uid) => uid,
-        Err(_) => {
-            return exc::raise_with_message(OVERFLOW_ERROR, "getpwuid(): uid is out of range")
-        }
+        Err(_) => return raise_missing(format!("getpwuid(): uid not found: {uid}")),
     };
     let result = lookup_passwd(|entry, buffer, len, result| unsafe {
         libc::getpwuid_r(uid, entry, buffer, len, result)
@@ -282,15 +314,7 @@ fn struct_passwd(args: &[i64]) -> i64 {
             items.len()
         ));
     }
-    let namespace = value::namespace_new(Vec::new());
-    let mut roots_values = items.clone();
-    roots_values.push(namespace);
-    let roots = heap::root_values(&roots_values);
-    for (name, item) in PASSWD_FIELDS.iter().zip(items.iter()) {
-        record_field(namespace, name, *item);
-    }
-    heap::release_roots(roots);
-    namespace
+    passwd_record(items)
 }
 
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
@@ -326,10 +350,7 @@ mod tests {
     }
 
     fn field(entry: i64, name: &str) -> i64 {
-        value::as_namespace(entry)
-            .and_then(|pairs| pairs.iter().find(|(key, _)| key == name))
-            .map(|(_, item)| *item)
-            .unwrap_or(NONE)
+        value::instance_attr(entry, name).unwrap_or(NONE)
     }
 
     fn message() -> String {
@@ -434,9 +455,9 @@ mod tests {
         assert_eq!(exc::pending_tag(), i64::from(TYPE_ERROR));
         exc::init();
 
-        // A uid that does not fit `uid_t` is an OverflowError, not a panic.
+        // A uid that does not fit `uid_t` is a KeyError, not a panic.
         assert_eq!(call("getpwuid", &[int(1 << 40)]), NONE);
-        assert_eq!(exc::pending_tag(), i64::from(OVERFLOW_ERROR));
+        assert_eq!(exc::pending_tag(), i64::from(KEY_ERROR));
         exc::init();
 
         assert_eq!(call("getpwall", &[int(1)]), NONE);
@@ -473,6 +494,28 @@ mod tests {
         assert_eq!(field(entry, "pw_uid"), int(4242));
         assert_eq!(field(entry, "pw_gid"), int(4243));
         assert_eq!(value::to_string(field(entry, "pw_shell")), "/bin/sh");
+        // Struct sequence protocol: length, indexing and payload equality.
+        assert_eq!(crate::core::builtins::len(entry), int(7));
+        assert_eq!(
+            crate::core::container::subscript(entry, int(0)),
+            field(entry, "pw_name")
+        );
+        assert_eq!(
+            crate::core::container::subscript(entry, int(2)),
+            field(entry, "pw_uid")
+        );
+        assert!(crate::core::container::equals(
+            entry,
+            value::tuple_new(vec![
+                text("hydro"),
+                text("x"),
+                int(4242),
+                int(4243),
+                text("gecos"),
+                text("/home/hydro"),
+                text("/bin/sh"),
+            ])
+        ));
 
         assert_eq!(
             call("struct_passwd", &[value::tuple_new(vec![int(1)])]),

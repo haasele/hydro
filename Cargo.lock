@@ -461,6 +461,7 @@ dependencies = [
  "cc",
  "hydro-hna",
  "hydro-ir",
+ "hydro-python-parser",
  "libc",
  "num-bigint",
  "num-traits",

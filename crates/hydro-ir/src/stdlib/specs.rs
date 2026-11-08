@@ -59,6 +59,11 @@ pub static MATH: ModuleSpec = ModuleSpec {
         // integer start), so it stays dynamic. `start` is keyword-only, hence
         // `dynamic_keywords` rather than a positional slot.
         kw_dynamic("prod", 1, 1, Type::Any, &["iterable"]),
+        // `fsum(iterable)`: the accurately rounded sum of floats.
+        f("fsum", 1, 1, Type::Float),
+        // `nextafter(x, y, steps=1)`: the `steps`-th representable float from
+        // `x` toward `y` (3.12+ optional step count).
+        f("nextafter", 2, 3, Type::Float),
     ],
     constants: &[
         c("pi", Type::Float),
@@ -218,6 +223,91 @@ const OPERATOR_FUNCTIONS: &[FunctionSpec] = &[
     f("_compare_digest", 2, 2, Type::Bool),
     // `length_hint(obj, default=0)`: the object's declared length hint.
     f("length_hint", 1, 2, Type::Int),
+    // `call(obj, /, *args, **kwargs)`: `obj(*args, **kwargs)` (3.11+). The
+    // trailing positional and keyword arguments are forwarded to `obj`.
+    kw_dynamic("call", 1, usize::MAX, Type::Any, &["obj"]),
+    // `aiter(obj)`/`next(it[, default])`: the builtin spellings (3.11+).
+    f("aiter", 1, 1, Type::Any),
+    f("next", 1, 2, Type::Any),
+    // `concat(a, b)`/`iconcat(a, b)`: sequence concatenation (`a + b` and the
+    // in-place `a += b`).
+    f("concat", 2, 2, Type::Any),
+    f("iconcat", 2, 2, Type::Any),
+    // `indexOf(a, b)`: the index of the first occurrence, the same callable
+    // as `index`.
+    f("indexOf", 2, 2, Type::Int),
+    // Identity predicates and shifts.
+    f("is_", 2, 2, Type::Bool),
+    f("is_not", 2, 2, Type::Bool),
+    f("is_none", 1, 1, Type::Bool),
+    f("is_not_none", 1, 1, Type::Bool),
+    f("lshift", 2, 2, Type::Any),
+    f("rshift", 2, 2, Type::Any),
+    // The in-place operators (`operator.iadd(a, b)` etc.).
+    f("iadd", 2, 2, Type::Any),
+    f("iand", 2, 2, Type::Any),
+    f("ifloordiv", 2, 2, Type::Any),
+    f("ilshift", 2, 2, Type::Any),
+    f("imatmul", 2, 2, Type::Any),
+    f("imod", 2, 2, Type::Any),
+    f("imul", 2, 2, Type::Any),
+    f("ior", 2, 2, Type::Any),
+    f("ipow", 2, 2, Type::Any),
+    f("irshift", 2, 2, Type::Any),
+    f("isub", 2, 2, Type::Any),
+    f("itruediv", 2, 2, Type::Any),
+    f("ixor", 2, 2, Type::Any),
+    // `matmul(a, b)`: the `@` operator.
+    f("matmul", 2, 2, Type::Any),
+    // The double-underscore aliases CPython assigns for every operator
+    // (`operator.__lt__ is operator.lt`, ...). They are distinct module
+    // attributes even though they name the same callables.
+    f("__abs__", 1, 1, Type::Any),
+    f("__add__", 2, 2, Type::Any),
+    f("__and__", 2, 2, Type::Any),
+    f("__call__", 1, usize::MAX, Type::Any),
+    f("__concat__", 2, 2, Type::Any),
+    f("__contains__", 2, 2, Type::Bool),
+    f("__delitem__", 2, 2, Type::None),
+    f("__eq__", 2, 2, Type::Bool),
+    f("__floordiv__", 2, 2, Type::Any),
+    f("__ge__", 2, 2, Type::Bool),
+    f("__getitem__", 2, 2, Type::Any),
+    f("__gt__", 2, 2, Type::Bool),
+    f("__iadd__", 2, 2, Type::Any),
+    f("__iand__", 2, 2, Type::Any),
+    f("__iconcat__", 2, 2, Type::Any),
+    f("__ifloordiv__", 2, 2, Type::Any),
+    f("__ilshift__", 2, 2, Type::Any),
+    f("__imatmul__", 2, 2, Type::Any),
+    f("__imod__", 2, 2, Type::Any),
+    f("__imul__", 2, 2, Type::Any),
+    f("__index__", 1, 1, Type::Int),
+    f("__inv__", 1, 1, Type::Any),
+    f("__invert__", 1, 1, Type::Any),
+    f("__ior__", 2, 2, Type::Any),
+    f("__ipow__", 2, 2, Type::Any),
+    f("__irshift__", 2, 2, Type::Any),
+    f("__isub__", 2, 2, Type::Any),
+    f("__itruediv__", 2, 2, Type::Any),
+    f("__ixor__", 2, 2, Type::Any),
+    f("__le__", 2, 2, Type::Bool),
+    f("__lshift__", 2, 2, Type::Any),
+    f("__lt__", 2, 2, Type::Bool),
+    f("__matmul__", 2, 2, Type::Any),
+    f("__mod__", 2, 2, Type::Any),
+    f("__mul__", 2, 2, Type::Any),
+    f("__ne__", 2, 2, Type::Bool),
+    f("__neg__", 1, 1, Type::Any),
+    f("__not__", 1, 1, Type::Bool),
+    f("__or__", 2, 2, Type::Any),
+    f("__pos__", 1, 1, Type::Any),
+    f("__pow__", 2, 2, Type::Any),
+    f("__rshift__", 2, 2, Type::Any),
+    f("__setitem__", 3, 3, Type::None),
+    f("__sub__", 2, 2, Type::Any),
+    f("__truediv__", 2, 2, Type::Any),
+    f("__xor__", 2, 2, Type::Any),
 ];
 
 pub static OPERATOR: ModuleSpec = ModuleSpec {
@@ -244,6 +334,8 @@ pub static TIME: ModuleSpec = ModuleSpec {
         f("monotonic_ns", 0, 0, Type::Int),
         // `process_time()`: consumed CPU time of the current process.
         f("process_time", 0, 0, Type::Float),
+        // `process_time_ns()`: the same value in integer nanoseconds.
+        f("process_time_ns", 0, 0, Type::Int),
         f("sleep", 1, 1, Type::None),
         // Broken-down local/UTC time as a `struct_time` sequence; both take an
         // optional epoch-seconds argument.
@@ -297,7 +389,14 @@ pub static THREAD: ModuleSpec = ModuleSpec {
         // polls it while waiting for workers to exit).
         f("_count", 0, 0, Type::Int),
     ],
-    constants: &[],
+    constants: &[
+        // `_thread._local`: the per-thread attribute storage type behind
+        // `threading.local`.
+        c("_local", Type::Any),
+        // `_thread.TIMEOUT_MAX`: the largest accepted lock timeout, in
+        // seconds.
+        c("TIMEOUT_MAX", Type::Float),
+    ],
 };
 
 pub static RANDOM: ModuleSpec = ModuleSpec {
@@ -313,6 +412,9 @@ pub static RANDOM: ModuleSpec = ModuleSpec {
         // from a normal distribution using the module generator.
         kw("gauss", 0, 2, Type::Float, &["mu", "sigma"]),
         kw("normalvariate", 0, 2, Type::Float, &["mu", "sigma"]),
+        // `expovariate(lambd=1.0)`: an exponential draw; the parameter is
+        // named `lambd` because `lambda` is reserved.
+        kw("expovariate", 0, 1, Type::Float, &["lambd"]),
         f("shuffle", 1, 1, Type::None),
         // `random.sample(population, k)`: `k` distinct elements as a list.
         f("sample", 2, 2, Type::List),
@@ -437,6 +539,9 @@ pub static PLATFORM: ModuleSpec = ModuleSpec {
         // `platform.uname()`: CPython's `uname_result` namedtuple with
         // `system`/`node`/`release`/`version`/`machine`/`processor`.
         f("uname", 0, 0, Type::Any),
+        // `_comparable_version(version)`: the component list
+        // `_sys_version`/`_java_ver` compare against.
+        f("_comparable_version", 1, 1, Type::List),
     ],
     constants: &[],
 };
@@ -450,7 +555,11 @@ pub static STATISTICS: ModuleSpec = ModuleSpec {
         f("pstdev", 1, 1, Type::Float),
         f("stdev", 1, 1, Type::Float),
     ],
-    constants: &[],
+    constants: &[
+        // `statistics.StatisticsError`: the `ValueError` subclass raised for
+        // empty or otherwise invalid samples.
+        c("StatisticsError", Type::Any),
+    ],
 };
 
 pub static JSON: ModuleSpec = ModuleSpec {
@@ -607,6 +716,8 @@ pub static OS_PATH: ModuleSpec = ModuleSpec {
         // `relpath(path, start=os.curdir)`: a relative path; bytes operands
         // return bytes, hence the dynamic result type. `start` binds by name.
         kw("relpath", 1, 2, Type::Any, &["path", "start"]),
+        // `ismount(path)`: whether `path` is a mount point.
+        f("ismount", 1, 1, Type::Bool),
     ],
     constants: &[
         // The path-flavour constants, shared with `os` on POSIX.
@@ -650,6 +761,12 @@ pub static OS: ModuleSpec = ModuleSpec {
         // reports as the dynamic type.
         kw("fspath", 1, 1, Type::Any, &["path"]),
         f("fork", 0, 0, Type::Int),
+        // `getpgrp()`: the process group of the current process.
+        f("getpgrp", 0, 0, Type::Int),
+        // `wait3(options)` / `wait4(pid, options)`: wait for any child / one
+        // child and report `(pid, status, rusage)`.
+        f("wait3", 1, 1, Type::Tuple),
+        f("wait4", 2, 2, Type::Tuple),
         f("waitpid", 2, 2, Type::Tuple),
         // `waitstatus_to_exitcode(status)`: decodes a `waitpid` status into an
         // exit code (negative for a signal). An invalid status raises
@@ -724,6 +841,11 @@ pub static OS: ModuleSpec = ModuleSpec {
         // `os.mkdir(path, mode=0o777, *, dir_fd=None)`: a single directory
         // level, created through `mkdir(2)` so `mode` is honoured.
         kw("mkdir", 1, 3, Type::None, &["path", "mode", "dir_fd"]),
+        // `mkfifo(path, mode=0o666, *, dir_fd=None)`: create a FIFO.
+        kw("mkfifo", 1, 3, Type::None, &["path", "mode", "dir_fd"]),
+        // `popen(cmd, mode='r', buffering=-1)`: a file object connected to a
+        // child shell command.
+        kw("popen", 1, 3, Type::Any, &["cmd", "mode", "buffering"]),
         // `os.rmdir(path, *, dir_fd=None)`: remove one empty directory.
         // `dir_fd` binds into the second positional slot; only `None` is
         // accepted (Hydro has no descriptor-relative path lookup).
@@ -891,6 +1013,16 @@ pub static OS: ModuleSpec = ModuleSpec {
         c("O_NONBLOCK", Type::Int),
         c("O_NDELAY", Type::Int),
         c("O_ACCMODE", Type::Int),
+        // Large-file offsets (always enabled on 64-bit Linux).
+        c("O_LARGEFILE", Type::Int),
+        // The `os.stat` result type and the `dir_fd`/fd/`follow_symlinks`
+        // support sets CPython derives from `os.supports_*`.
+        c("stat_result", Type::Any),
+        c("statvfs_result", Type::Any),
+        c("supports_dir_fd", Type::Set),
+        c("supports_fd", Type::Set),
+        c("supports_follow_symlinks", Type::Set),
+        c("supports_effective_ids", Type::Set),
     ],
 };
 
@@ -1015,6 +1147,9 @@ pub static SYSLOG: ModuleSpec = ModuleSpec {
         f("syslog", 1, 2, Type::None),
         f("closelog", 0, 0, Type::None),
         f("setlogmask", 1, 1, Type::Int),
+        // `LOG_MASK(pri)` / `LOG_UPTO(pri)`: the mask helpers.
+        f("LOG_MASK", 1, 1, Type::Int),
+        f("LOG_UPTO", 1, 1, Type::Int),
     ],
     constants: &[
         // Priorities.
@@ -1359,7 +1494,12 @@ pub static TERMIOS: ModuleSpec = ModuleSpec {
 /// supported type-code string.
 pub static ARRAY: ModuleSpec = ModuleSpec {
     name: "array",
-    functions: &[kw_dynamic("array", 1, 2, Type::Any, &[])],
+    functions: &[
+        kw_dynamic("array", 1, 2, Type::Any, &[]),
+        // `_array_reconstructor(arraytype, typecode, mformat_code, items)`:
+        // `array.__reduce_ex__`'s unpickling entry point.
+        f("_array_reconstructor", 4, 4, Type::Any),
+    ],
     constants: &[c("typecodes", Type::Str)],
 };
 
@@ -1502,6 +1642,9 @@ pub static THREADING: ModuleSpec = ModuleSpec {
         // `threading.settrace(func)`: install the per-thread trace hook. It
         // exists for imports; Hydro has no trace callback machinery.
         f("settrace", 1, 1, Type::None),
+        // `_register_atexit(func, *arg, **kwargs)`: CPython's internal
+        // pre-shutdown callback registration.
+        kw_dynamic("_register_atexit", 1, usize::MAX, Type::None, &["func"]),
     ],
     constants: &[
         // Empty base class; Hydro has no per-thread attribute storage.
@@ -1527,7 +1670,11 @@ pub static HTML: ModuleSpec = ModuleSpec {
         kw("escape", 1, 2, Type::Str, &["s", "quote"]),
         f("unescape", 1, 1, Type::Str),
     ],
-    constants: &[],
+    constants: &[
+        // Nested native submodules (`html.parser`, `html.entities`).
+        c("parser", Type::Any),
+        c("entities", Type::Any),
+    ],
 };
 
 pub static RICH_STATUS: ModuleSpec = ModuleSpec {
@@ -1563,8 +1710,18 @@ pub static QUEUE: ModuleSpec = ModuleSpec {
         // `SimpleQueue()`: CPython's unbounded FIFO. It takes no arguments
         // (the runtime backs it with the same state as `Queue(0)`).
         f("SimpleQueue", 0, 0, Type::Any),
+        // `LifoQueue(maxsize=0)` / `PriorityQueue(maxsize=0)`.
+        kw("LifoQueue", 0, 1, Type::Any, &["maxsize"]),
+        kw("PriorityQueue", 0, 1, Type::Any, &["maxsize"]),
+        // `_PySimpleQueue`: the pre-3.7 Python implementation spelling.
+        f("_PySimpleQueue", 0, 0, Type::Any),
     ],
-    constants: &[],
+    constants: &[
+        // The exception classes and the `shutdown()` sentinel.
+        c("Empty", Type::Any),
+        c("Full", Type::Any),
+        c("ShutDown", Type::Any),
+    ],
 };
 
 pub static MULTIPROCESSING: ModuleSpec = ModuleSpec {
@@ -1841,6 +1998,9 @@ pub static SYS: ModuleSpec = ModuleSpec {
         // attach/debugger-injection protocol, so the attribute exists and the
         // call reports that limitation instead of claiming success.
         f("remote_exec", 2, 2, Type::None),
+        // `sys._is_gil_enabled()`: whether the GIL is enabled (Hydro's
+        // runtime is single-threaded with no free-threading build, so `True`).
+        f("_is_gil_enabled", 0, 0, Type::Bool),
     ],
     constants: &[
         c("argv", Type::List),
@@ -1915,6 +2075,12 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("prefix", Type::Str),
         c("base_prefix", Type::Str),
         c("exec_prefix", Type::Str),
+        // `base_exec_prefix`: the base installation's exec prefix;
+        // `platlibdir`: the platform library directory name.
+        c("base_exec_prefix", Type::Str),
+        c("platlibdir", Type::Str),
+        // `sys.int_info`: the `int` implementation parameters structseq.
+        c("int_info", Type::Any),
         // Last uncaught exception. Hydro is a batch compiler with no
         // interactive frame that survives an uncaught exception, so these
         // resolve to `None`. They exist (rather than raising
@@ -1983,6 +2149,9 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("bytes", 0, 3, Type::Bytes),
         f("iter", 1, 2, Type::Any),
         f("next", 1, 2, Type::Any),
+        // `aiter(obj)` / `anext(aiterator[, default])`: the async builtins.
+        f("aiter", 1, 1, Type::Any),
+        f("anext", 1, 2, Type::Any),
         f("frozenset", 0, 1, Type::Set),
         f("getattr", 2, 3, Type::Any),
         f("hasattr", 2, 2, Type::Bool),
@@ -2334,9 +2503,20 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
             Type::Any,
             &["mode", "bufsize", "encoding", "errors"],
         ),
+        // `_get_action_name(argument)`: the display name of an action.
+        f("_get_action_name", 1, 1, Type::Any),
+        // `_`: the `gettext.gettext` alias argparse imports.
+        f("_", 1, 1, Type::Str),
     ],
     constants: &[
         c("SUPPRESS", Type::Any),
+        // `argparse.ArgumentTypeError`: the exception `type=` callables raise.
+        c("ArgumentTypeError", Type::Any),
+        // `PARSER`: the `nargs` sentinel string `'A...'`; `_sys` is the
+        // `sys` module alias argparse imports.
+        c("PARSER", Type::Str),
+        c("_sys", Type::Any),
+        c("__all__", Type::List),
         // `argparse.REMAINDER`: the `nargs` sentinel string that collects all
         // remaining arguments.
         c("REMAINDER", Type::Str),
@@ -2347,6 +2527,9 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
         c("MetavarTypeHelpFormatter", Type::Any),
         c("Action", Type::Any),
         c("BooleanOptionalAction", Type::Any),
+        // `argparse.ArgumentError`: the exception raised for a bad argument
+        // definition or value.
+        c("ArgumentError", Type::Any),
     ],
 };
 
@@ -2426,6 +2609,18 @@ const SOCKET_FUNCTIONS: &[FunctionSpec] = &[
     kw("getfqdn", 0, 1, Type::Str, &["name"]),
     f("inet_pton", 2, 2, Type::Bytes),
     f("inet_ntop", 2, 2, Type::Str),
+    // Legacy IPv4 conversions: `inet_aton` returns the packed 4-byte address,
+    // `inet_ntoa` the dotted string.
+    f("inet_aton", 1, 1, Type::Bytes),
+    f("inet_ntoa", 1, 1, Type::Str),
+    // `getservbyname(servicename, protocolname=None)` /
+    // `getservbyport(port, protocolname=None)`.
+    kw("getservbyname", 1, 2, Type::Int, &["servicename", "protocolname"]),
+    kw("getservbyport", 1, 2, Type::Str, &["port", "protocolname"]),
+    // `gethostbyname_ex(name)` / `gethostbyaddr(ip_address)` return the
+    // `(name, aliases, addresses)` triple.
+    f("gethostbyname_ex", 1, 1, Type::Tuple),
+    f("gethostbyaddr", 1, 1, Type::Tuple),
 ];
 
 /// Shared constants: the option/protocol numbers plus the class spellings.
@@ -2523,6 +2718,31 @@ pub static SELECT: ModuleSpec = ModuleSpec {
         f("_poll_close", 1, 1, Type::Any),
         f("_poll_enter", 1, 1, Type::Any),
         f("_poll_exit", 1, 4, Type::Any),
+        f("_poll_init", 1, 1, Type::Any),
+        // Native methods of the `epoll` object (Linux/Android). `epoll`
+        // itself is a constant class value so `epoll.fromfd` resolves.
+        kw_dynamic(
+            "_epoll_init",
+            1,
+            3,
+            Type::Any,
+            &["self", "sizehint", "flags"],
+        ),
+        f("_epoll_register", 2, 3, Type::Any),
+        f("_epoll_unregister", 2, 2, Type::Any),
+        f("_epoll_modify", 3, 3, Type::Any),
+        kw_dynamic(
+            "_epoll_poll",
+            1,
+            3,
+            Type::List,
+            &["self", "timeout", "maxevents"],
+        ),
+        f("_epoll_fileno", 1, 1, Type::Int),
+        f("_epoll_close", 1, 1, Type::Any),
+        f("_epoll_enter", 1, 1, Type::Any),
+        f("_epoll_exit", 1, 4, Type::Any),
+        f("_epoll_fromfd", 1, 1, Type::Any),
     ],
     constants: &[
         c("POLLIN", Type::Int),
@@ -2532,6 +2752,25 @@ pub static SELECT: ModuleSpec = ModuleSpec {
         c("POLLHUP", Type::Int),
         c("POLLNVAL", Type::Int),
         c("error", Type::Any),
+        // The `epoll` class value (a Linux/Android epoll object) and its
+        // event mask bits.
+        c("epoll", Type::Any),
+        c("EPOLLIN", Type::Int),
+        c("EPOLLOUT", Type::Int),
+        c("EPOLLPRI", Type::Int),
+        c("EPOLLERR", Type::Int),
+        c("EPOLLHUP", Type::Int),
+        c("EPOLLRDHUP", Type::Int),
+        c("EPOLLET", Type::Int),
+        c("EPOLLONESHOT", Type::Int),
+        c("EPOLLEXCLUSIVE", Type::Int),
+        c("EPOLLRDNORM", Type::Int),
+        c("EPOLLRDBAND", Type::Int),
+        c("EPOLLWRNORM", Type::Int),
+        c("EPOLLWRBAND", Type::Int),
+        c("EPOLLMSG", Type::Int),
+        c("EPOLLWAKEUP", Type::Int),
+        c("EPOLL_CLOEXEC", Type::Int),
     ],
 };
 
@@ -2552,7 +2791,12 @@ pub static SELECTORS: ModuleSpec = ModuleSpec {
         f("_selector_enter", 1, 1, Type::Any),
         f("_selector_exit", 1, 4, Type::Any),
     ],
-    constants: &[c("EVENT_READ", Type::Int), c("EVENT_WRITE", Type::Int)],
+    constants: &[
+        c("EVENT_READ", Type::Int),
+        c("EVENT_WRITE", Type::Int),
+        // `SelectorKey`: the namedtuple `select()` returns for a file object.
+        c("SelectorKey", Type::Any),
+    ],
 };
 
 /// `ssl`: client-side TLS backed by `rustls` and the Mozilla root store.
@@ -2582,6 +2826,21 @@ pub static SSL: ModuleSpec = ModuleSpec {
         // `SSLSocket` class value.
         c("Purpose", Type::Any),
         c("SSLSocket", Type::Any),
+        // The TLS exception hierarchy (`SSLError` is the base; the rest are
+        // its documented subclasses) and the context/BIO class values.
+        c("CertificateError", Type::Any),
+        c("SSLZeroReturnError", Type::Any),
+        c("SSLWantReadError", Type::Any),
+        c("SSLWantWriteError", Type::Any),
+        c("SSLSyscallError", Type::Any),
+        c("SSLEOFError", Type::Any),
+        c("SSLObject", Type::Any),
+        c("MemoryBIO", Type::Any),
+        // The IntEnum classes (`ssl.VerifyMode`, `ssl.VerifyFlags`,
+        // `ssl.Options`) and the `Purpose` flags namespace.
+        c("VerifyMode", Type::Any),
+        c("VerifyFlags", Type::Any),
+        c("Options", Type::Any),
         c("CERT_NONE", Type::Int),
         c("CERT_OPTIONAL", Type::Int),
         c("CERT_REQUIRED", Type::Int),
@@ -2616,8 +2875,9 @@ pub static RE: ModuleSpec = ModuleSpec {
         f("split", 2, 3, Type::List),
         f("escape", 1, 1, Type::Str),
         // `compile(pattern, flags=0)`; the runtime forwards the flags to the
-        // regex builder.
+        // regex builder. `_compile` is the cache-aware internal spelling.
         f("compile", 1, 2, Type::Any),
+        f("_compile", 2, 2, Type::Any),
         // `finditer(pattern, string, flags=0)`: every non-overlapping match
         // as a `Match` object in a list. `flags` may be passed by keyword,
         // which rich does (`flags=re.MULTILINE`).
@@ -2655,6 +2915,14 @@ pub static RE: ModuleSpec = ModuleSpec {
         // and `isinstance(m, re.Match)` hold; neither can be instantiated.
         c("Pattern", Type::Any),
         c("Match", Type::Any),
+        // `re.Scanner`: the simple lexical scanner class.
+        c("Scanner", Type::Any),
+        // `re.error` and its modern `PatternError` alias, plus the
+        // `RegexFlag` IntFlag class.
+        c("error", Type::Any),
+        c("PatternError", Type::Any),
+        c("RegexFlag", Type::Any),
+        c("__all__", Type::List),
         // The private namespaces the deprecated `sre_compile`/
         // `sre_constants`/`sre_parse` wrappers import.
         c("_compiler", Type::Any),
@@ -2702,6 +2970,8 @@ pub static RE_COMPILER: ModuleSpec = ModuleSpec {
     functions: &[
         f("compile", 1, 2, Type::Any),
         f("isstring", 1, 1, Type::Bool),
+        // `_generate_overlap_table(prefix)`.
+        f("_generate_overlap_table", 1, 1, Type::List),
     ],
     constants: RE_CONSTANTS,
 };
@@ -2737,6 +3007,11 @@ pub static ASYNCIO: ModuleSpec = ModuleSpec {
         // runtime dispatch arm returns a TaskGroup instance, keeping
         // `from asyncio import TaskGroup; TaskGroup()` callable.
         f("TaskGroup", 0, 0, Type::Any),
+        // `Runner(*, debug=None, loop_factory=None)`: the 3.11+ run helper.
+        kw("Runner", 0, 2, Type::Any, &["debug", "loop_factory"]),
+        // `wait_for(aw, timeout)` and `timeout(delay)`.
+        kw("wait_for", 2, 2, Type::Any, &["aw", "timeout"]),
+        kw("timeout", 1, 1, Type::Any, &["delay"]),
     ],
     constants: &[
         c("CancelledError", Type::Any),
@@ -2747,6 +3022,8 @@ pub static ASYNCIO: ModuleSpec = ModuleSpec {
         // event-loop policy submodule. Hydro has one native event loop and no
         // pluggable policy, so the module's only member reports `None`.
         c("events", Type::Any),
+        // `asyncio.staggered`: the staggered-race helper submodule.
+        c("staggered", Type::Any),
     ],
 };
 
@@ -2776,6 +3053,27 @@ pub static ASYNCIO_EVENTS: ModuleSpec = ModuleSpec {
     constants: &[c("_event_loop_policy", Type::Any)],
 };
 
+/// `asyncio.staggered`: the staggered-race helper.
+///
+/// `staggered_race(coro_fns, delay, *, loop=None)` starts the coroutine
+/// factories one at a time and returns `(winner, index, exceptions)`.
+pub static ASYNCIO_STAGGERED: ModuleSpec = ModuleSpec {
+    name: "asyncio.staggered",
+    functions: &[kw(
+        "staggered_race",
+        2,
+        3,
+        Type::Any,
+        &["coro_fns", "delay", "loop"],
+    )],
+    constants: &[
+        // Submodules imported by this module in CPython.
+        c("contextlib", Type::Any),
+        c("asyncio", Type::Any),
+        c("__all__", Type::Any),
+    ],
+};
+
 /// `errno`: POSIX error numbers and the `errorcode` reverse mapping.
 ///
 /// The runtime resolves every other attribute through
@@ -2784,40 +3082,143 @@ pub static ERRNO: ModuleSpec = ModuleSpec {
     name: "errno",
     functions: &[],
     constants: &[
-        c("EDOM", Type::Int),
-        c("ERANGE", Type::Int),
-        // The common POSIX names; the runtime resolves the platform value
-        // from the Linux table.
-        c("ENOENT", Type::Int),
-        c("EINVAL", Type::Int),
+        // The complete Linux errno table (135 public constants); the runtime
+        // resolves each name to the platform value from its errno table.
+        c("E2BIG", Type::Int),
         c("EACCES", Type::Int),
-        c("EEXIST", Type::Int),
-        c("ENOTDIR", Type::Int),
-        c("EISDIR", Type::Int),
-        c("ENOSPC", Type::Int),
-        c("EROFS", Type::Int),
-        c("EPIPE", Type::Int),
-        c("ESPIPE", Type::Int),
-        c("ECONNREFUSED", Type::Int),
         c("EADDRINUSE", Type::Int),
         c("EADDRNOTAVAIL", Type::Int),
+        c("EADV", Type::Int),
         c("EAFNOSUPPORT", Type::Int),
-        c("EHOSTUNREACH", Type::Int),
-        c("ENETUNREACH", Type::Int),
-        c("ENETDOWN", Type::Int),
-        c("ECONNRESET", Type::Int),
-        c("EINPROGRESS", Type::Int),
-        c("ENOTCONN", Type::Int),
-        c("ETIMEDOUT", Type::Int),
         c("EAGAIN", Type::Int),
-        c("EWOULDBLOCK", Type::Int),
-        c("EINTR", Type::Int),
-        c("ENOMEM", Type::Int),
+        c("EALREADY", Type::Int),
+        c("EBADE", Type::Int),
         c("EBADF", Type::Int),
+        c("EBADFD", Type::Int),
+        c("EBADMSG", Type::Int),
+        c("EBADR", Type::Int),
+        c("EBADRQC", Type::Int),
+        c("EBADSLT", Type::Int),
+        c("EBFONT", Type::Int),
+        c("EBUSY", Type::Int),
+        c("ECANCELED", Type::Int),
+        c("ECHILD", Type::Int),
+        c("ECHRNG", Type::Int),
+        c("ECOMM", Type::Int),
+        c("ECONNABORTED", Type::Int),
+        c("ECONNREFUSED", Type::Int),
+        c("ECONNRESET", Type::Int),
+        c("EDEADLK", Type::Int),
+        c("EDEADLOCK", Type::Int),
+        c("EDESTADDRREQ", Type::Int),
+        c("EDOM", Type::Int),
+        c("EDOTDOT", Type::Int),
+        c("EDQUOT", Type::Int),
+        c("EEXIST", Type::Int),
+        c("EFAULT", Type::Int),
+        c("EFBIG", Type::Int),
+        c("EFTYPE", Type::Int),
+        c("EHOSTDOWN", Type::Int),
+        c("EHOSTUNREACH", Type::Int),
+        c("EHWPOISON", Type::Int),
+        c("EIDRM", Type::Int),
+        c("EILSEQ", Type::Int),
+        c("EINPROGRESS", Type::Int),
+        c("EINTR", Type::Int),
+        c("EINVAL", Type::Int),
         c("EIO", Type::Int),
+        c("EISCONN", Type::Int),
+        c("EISDIR", Type::Int),
+        c("EISNAM", Type::Int),
+        c("EKEYEXPIRED", Type::Int),
+        c("EKEYREJECTED", Type::Int),
+        c("EKEYREVOKED", Type::Int),
+        c("EL2HLT", Type::Int),
+        c("EL2NSYNC", Type::Int),
+        c("EL3HLT", Type::Int),
+        c("EL3RST", Type::Int),
+        c("ELIBACC", Type::Int),
+        c("ELIBBAD", Type::Int),
+        c("ELIBEXEC", Type::Int),
+        c("ELIBMAX", Type::Int),
+        c("ELIBSCN", Type::Int),
+        c("ELNRNG", Type::Int),
+        c("ELOOP", Type::Int),
+        c("EMEDIUMTYPE", Type::Int),
+        c("EMFILE", Type::Int),
+        c("EMLINK", Type::Int),
+        c("EMSGSIZE", Type::Int),
+        c("EMULTIHOP", Type::Int),
+        c("ENAMETOOLONG", Type::Int),
+        c("ENAVAIL", Type::Int),
+        c("ENETDOWN", Type::Int),
+        c("ENETRESET", Type::Int),
+        c("ENETUNREACH", Type::Int),
+        c("ENFILE", Type::Int),
+        c("ENOANO", Type::Int),
+        c("ENOBUFS", Type::Int),
+        c("ENOCSI", Type::Int),
+        c("ENODATA", Type::Int),
+        c("ENODEV", Type::Int),
+        c("ENOENT", Type::Int),
+        c("ENOEXEC", Type::Int),
+        c("ENOKEY", Type::Int),
+        c("ENOLCK", Type::Int),
+        c("ENOLINK", Type::Int),
+        c("ENOMEDIUM", Type::Int),
+        c("ENOMEM", Type::Int),
+        c("ENOMSG", Type::Int),
+        c("ENONET", Type::Int),
+        c("ENOPKG", Type::Int),
+        c("ENOPROTOOPT", Type::Int),
+        c("ENOSPC", Type::Int),
+        c("ENOSR", Type::Int),
+        c("ENOSTR", Type::Int),
         c("ENOSYS", Type::Int),
-        c("EOPNOTSUPP", Type::Int),
+        c("ENOTBLK", Type::Int),
+        c("ENOTCONN", Type::Int),
+        c("ENOTDIR", Type::Int),
+        c("ENOTEMPTY", Type::Int),
+        c("ENOTNAM", Type::Int),
+        c("ENOTRECOVERABLE", Type::Int),
+        c("ENOTSOCK", Type::Int),
         c("ENOTSUP", Type::Int),
+        c("ENOTTY", Type::Int),
+        c("ENOTUNIQ", Type::Int),
+        c("ENXIO", Type::Int),
+        c("EOPNOTSUPP", Type::Int),
+        c("EOVERFLOW", Type::Int),
+        c("EOWNERDEAD", Type::Int),
+        c("EPERM", Type::Int),
+        c("EPFNOSUPPORT", Type::Int),
+        c("EPIPE", Type::Int),
+        c("EPROTO", Type::Int),
+        c("EPROTONOSUPPORT", Type::Int),
+        c("EPROTOTYPE", Type::Int),
+        c("ERANGE", Type::Int),
+        c("EREMCHG", Type::Int),
+        c("EREMOTE", Type::Int),
+        c("EREMOTEIO", Type::Int),
+        c("ERESTART", Type::Int),
+        c("ERFKILL", Type::Int),
+        c("EROFS", Type::Int),
+        c("ESHUTDOWN", Type::Int),
+        c("ESOCKTNOSUPPORT", Type::Int),
+        c("ESPIPE", Type::Int),
+        c("ESRCH", Type::Int),
+        c("ESRMNT", Type::Int),
+        c("ESTALE", Type::Int),
+        c("ESTRPIPE", Type::Int),
+        c("ETIME", Type::Int),
+        c("ETIMEDOUT", Type::Int),
+        c("ETOOMANYREFS", Type::Int),
+        c("ETXTBSY", Type::Int),
+        c("EUCLEAN", Type::Int),
+        c("EUNATCH", Type::Int),
+        c("EUSERS", Type::Int),
+        c("EWOULDBLOCK", Type::Int),
+        c("EXDEV", Type::Int),
+        c("EXFULL", Type::Int),
         c("errorcode", Type::Dict),
         c("__dict__", Type::Dict),
     ],
@@ -2839,6 +3240,17 @@ pub static UNITTEST: ModuleSpec = ModuleSpec {
         // `@skip(reason)` and as the bare `@skip` decorator.
         f("expectedFailure", 1, 1, Type::Any),
         f("skip", 1, 1, Type::Any),
+        // Module-level cleanup helpers (`unittest/addModuleCleanup` & co. are
+        // re-exported from `unittest.case` by `unittest/__init__.py`).
+        kw_dynamic("addModuleCleanup", 1, usize::MAX, Type::None, &["function"]),
+        f("doModuleCleanups", 0, 0, Type::None),
+        f("enterModuleContext", 1, 1, Type::Any),
+        // `TestCase.addClassCleanup`/`doClassCleanups`/`enterClassContext`
+        // are class methods in CPython; the runtime dispatches them through
+        // this same table with the receiver (`cls`) as the first argument.
+        kw_dynamic("addClassCleanup", 2, usize::MAX, Type::None, &["function"]),
+        f("doClassCleanups", 1, 1, Type::None),
+        f("enterClassContext", 2, 2, Type::Any),
         f("skipIf", 2, 2, Type::Any),
         f("skipUnless", 2, 2, Type::Any),
         f("_skip_apply", 3, 3, Type::Any),
@@ -2935,6 +3347,35 @@ pub static PYTEST: ModuleSpec = ModuleSpec {
         f("_raises_enter", 1, 1, Type::Any),
         f("_raises_exit", 4, 4, Type::Bool),
         f("_approx_eq", 2, 2, Type::Bool),
+        // Builtin fixture bodies.
+        f("_fixture_builtin", 1, 1, Type::Any),
+        f("_request_addfinalizer", 2, 2, Type::None),
+        f("_request_getfixturevalue", 2, 2, Type::Any),
+        f("_request_getoption", 2, 3, Type::Any),
+        // `MonkeyPatch` method bodies (receiver first).
+        f("_monkeypatch_setattr", 4, 5, Type::None),
+        f("_monkeypatch_delattr", 3, 4, Type::None),
+        f("_monkeypatch_setitem", 4, 4, Type::None),
+        f("_monkeypatch_delitem", 3, 4, Type::None),
+        f("_monkeypatch_setenv", 3, 4, Type::None),
+        f("_monkeypatch_delenv", 2, 3, Type::None),
+        f("_monkeypatch_chdir", 2, 2, Type::None),
+        f("_monkeypatch_syspath_prepend", 2, 2, Type::None),
+        f("_monkeypatch_undo", 1, 1, Type::None),
+        // `capsys`/`capsysbinary`/`capfd` capture object bodies.
+        f("_capsys_readouterr", 1, 1, Type::Any),
+        f("_capsys_close", 1, 1, Type::None),
+        // `caplog` fixture and `LogCaptureHandler` bodies.
+        f("_caplog_set_level", 2, 3, Type::None),
+        f("_caplog_at_level", 2, 4, Type::Any),
+        f("_caplog_clear", 1, 1, Type::None),
+        f("_caplog_close", 1, 1, Type::None),
+        f("_caplog_handle", 2, 2, Type::Bool),
+        f("_caplog_records", 1, 1, Type::Any),
+        f("_caplog_messages", 1, 1, Type::Any),
+        f("_caplog_text", 1, 1, Type::Str),
+        f("_caplog_at_enter", 1, 1, Type::None),
+        f("_caplog_at_exit", 1, 4, Type::Bool),
     ],
     constants: &[c("mark", Type::Any)],
 };
@@ -3000,6 +3441,15 @@ const HEAPQ_FUNCTIONS: &[FunctionSpec] = &[
     f("heapreplace", 2, 2, Type::Any),
     kw("nlargest", 2, 3, Type::List, &["n", "iterable", "key"]),
     kw("nsmallest", 2, 3, Type::List, &["n", "iterable", "key"]),
+    // `merge(*iterables, key=None, reverse=False)`: the merged iterator
+    // (materialised by this runtime), whose keyword names are keyword-only.
+    kw_dynamic("merge", 0, usize::MAX, Type::List, &[]),
+    // The max-heap variants (3.14+).
+    f("heappush_max", 2, 2, Type::None),
+    f("heappop_max", 1, 1, Type::Any),
+    f("heapify_max", 1, 1, Type::None),
+    f("heapreplace_max", 2, 2, Type::Any),
+    f("heappushpop_max", 2, 2, Type::Any),
 ];
 
 pub static HEAPQ: ModuleSpec = ModuleSpec {
@@ -3027,7 +3477,12 @@ pub static COLORSYS: ModuleSpec = ModuleSpec {
         f("rgb_to_hsv", 3, 3, Type::Tuple),
         f("hsv_to_rgb", 3, 3, Type::Tuple),
     ],
-    constants: &[],
+    constants: &[
+        // The rational factors CPython's `colorsys` keeps at module scope.
+        c("ONE_THIRD", Type::Float),
+        c("ONE_SIXTH", Type::Float),
+        c("TWO_THIRD", Type::Float),
+    ],
 };
 
 /// `keyword`: the interpreter's keyword tables.
@@ -3176,10 +3631,24 @@ pub static BINASCII: ModuleSpec = ModuleSpec {
         // backtick=False)`.
         f("a2b_uu", 1, 1, Type::Bytes),
         kw("b2a_uu", 1, 2, Type::Bytes, &["data", "backtick"]),
+        // `crc_hqx(data, value)`: the 16-bit CRC with the caller's seed.
+        f("crc_hqx", 2, 2, Type::Int),
+        // `b2a_qp(data, quotetabs=False, istext=True, header=False)` /
+        // `a2b_qp(data, header=False)`: the quoted-printable codecs.
+        kw(
+            "b2a_qp",
+            1,
+            4,
+            Type::Bytes,
+            &["data", "quotetabs", "istext", "header"],
+        ),
+        kw("a2b_qp", 1, 2, Type::Bytes, &["data", "header"]),
     ],
     constants: &[
-        // `binascii.Error` is the exception the codec helpers raise.
+        // `binascii.Error` is the exception the codec helpers raise;
+        // `Incomplete` (a subclass) reports truncated input.
         c("Error", Type::Any),
+        c("Incomplete", Type::Any),
     ],
 };
 
@@ -3314,6 +3783,14 @@ pub static GETOPT: ModuleSpec = ModuleSpec {
             Type::Tuple,
             &["args", "shortopts", "longopts"],
         ),
+        // `short_has_arg(opt, shortopts)` / `long_has_args(opt, longopts)`:
+        // the option-spec classifiers `getopt` itself uses.
+        f("short_has_arg", 2, 2, Type::Bool),
+        f("long_has_args", 2, 2, Type::Tuple),
+        // `do_longs(opts, opt, longopts, args)` /
+        // `do_shorts(opts, optstring, shortopts, args)`.
+        f("do_longs", 4, 4, Type::Tuple),
+        f("do_shorts", 4, 4, Type::Tuple),
     ],
     constants: &[
         // `GetoptError`: the `Exception` subclass `getopt` raises; `error` is
@@ -3338,12 +3815,28 @@ pub static MIMETYPES: ModuleSpec = ModuleSpec {
         kw("guess_extension", 1, 2, Type::Str, &["type", "strict"]),
         kw("add_type", 2, 3, Type::None, &["type", "ext", "strict"]),
         kw("init", 0, 1, Type::None, &["files"]),
+        // `guess_file_type(path, *, strict=True)`: MIME type from a path.
+        kw("guess_file_type", 1, 2, Type::Tuple, &["path", "strict"]),
+        // `read_mime_types(file)`: parse one mime.types file.
+        f("read_mime_types", 1, 1, Type::Any),
+        // Internal defaults builder and the command-line entry points.
+        f("_default_mime_types", 0, 0, Type::None),
+        f("_parse_args", 1, 1, Type::Any),
+        kw("_main", 0, 1, Type::List, &["args"]),
     ],
     constants: &[
         c("types_map", Type::Dict),
         c("common_types", Type::Dict),
         c("encodings_map", Type::Dict),
         c("suffix_map", Type::Dict),
+        // `mimetypes.knownfiles`: the standard MIME configuration paths.
+        c("knownfiles", Type::List),
+        // `inited`: whether `init()` has run; `_db` the parsed database;
+        // `MimeTypes` the datastore class; `__all__` the export list.
+        c("inited", Type::Bool),
+        c("_db", Type::Any),
+        c("MimeTypes", Type::Any),
+        c("__all__", Type::List),
     ],
 };
 
@@ -3559,6 +4052,8 @@ pub static SHUTIL: ModuleSpec = ModuleSpec {
         // Returns the resolved executable path, or `None` when not found.
         kw("which", 1, 3, Type::Any, &["cmd", "mode", "path"]),
         kw("get_terminal_size", 0, 1, Type::Any, &["fallback"]),
+        // `disk_usage(path)`: the `(total, used, free)` usage namedtuple.
+        f("disk_usage", 1, 1, Type::Any),
         kw("copyfile", 2, 2, Type::Str, &["src", "dst"]),
         // Streams between file-like objects; the buffer size defaults to
         // shutil's 256 KiB (`length=0`).
@@ -3593,6 +4088,9 @@ pub static TEXTWRAP: ModuleSpec = ModuleSpec {
     name: "textwrap",
     functions: &[
         f("dedent", 1, 1, Type::Str),
+        // `_textwrap_split(text, sep)`: Hydro's spelling of CPython's
+        // module-private `_split` chunk/separator helper.
+        f("_textwrap_split", 2, 2, Type::List),
         kw("indent", 2, 3, Type::Str, &["text", "prefix", "predicate"]),
         kw(
             "wrap",
@@ -3720,6 +4218,8 @@ pub static TIMEIT: ModuleSpec = ModuleSpec {
         f("_timer_autorange", 1, 2, Type::Tuple),
         // `reindent(src, indent)`: strips common leading whitespace.
         f("reindent", 2, 2, Type::Str),
+        // `main(args=None, *, _wrap_timer=None)`: the command-line driver.
+        kw("main", 0, 2, Type::None, &["args", "_wrap_timer"]),
     ],
     constants: &[],
 };
@@ -3753,6 +4253,33 @@ pub static DATACLASSES: ModuleSpec = ModuleSpec {
         f("is_dataclass", 1, 1, Type::Bool),
         // `fields(class_or_instance)`: tuple of the declared `Field` objects.
         f("fields", 1, 1, Type::Tuple),
+        // `make_dataclass(cls_name, fields, *, bases=(), namespace=None, ...)`:
+        // builds and returns a new dataclass. The keyword-only options follow
+        // `dataclass()`.
+        kw(
+            "make_dataclass",
+            2,
+            17,
+            Type::Any,
+            &[
+                "cls_name",
+                "fields",
+                "bases",
+                "namespace",
+                "init",
+                "repr",
+                "eq",
+                "order",
+                "unsafe_hash",
+                "frozen",
+                "match_args",
+                "kw_only",
+                "slots",
+                "weakref_slot",
+                "module",
+                "decorator",
+            ],
+        ),
     ],
     constants: &[
         c("dataclass", Type::Any),
@@ -3783,6 +4310,14 @@ pub static DATETIME: ModuleSpec = ModuleSpec {
         f("_datetime_today", 0, 0, Type::Any),
         f("_datetime_fromtimestamp", 1, 2, Type::Any),
         f("_datetime_combine", 2, 2, Type::Any),
+        // Classmethod bodies landed for the date/datetime API.
+        f("_date_fromordinal", 1, 1, Type::Any),
+        f("_datetime_fromordinal", 1, 1, Type::Any),
+        f("_date_fromisocalendar", 3, 3, Type::Any),
+        f("_datetime_fromisocalendar", 3, 3, Type::Any),
+        f("_date_strptime", 2, 2, Type::Any),
+        f("_datetime_strptime", 2, 2, Type::Any),
+        f("_datetime_isocalendar", 1, 1, Type::Any),
         // Instance methods.
         f("_datetime_strftime", 2, 2, Type::Str),
         f("_datetime_isoformat", 1, 2, Type::Str),
@@ -3954,6 +4489,13 @@ pub static TYPING: ModuleSpec = ModuleSpec {
     ],
     constants: &[
         c("TYPE_CHECKING", Type::Bool),
+        // `typing._cleanups`: the list of zero-argument cache-clearing
+        // callables `typing` registers at import time.
+        c("_cleanups", Type::List),
+        // The module-level type variables CPython defines (`T`, `KT`, `VT`).
+        c("T", Type::Any),
+        c("KT", Type::Any),
+        c("VT", Type::Any),
         // `typing.__all__`: the module's public export list (built by the
         // runtime from this spec so `from typing import *` and
         // `typing_extensions`' name probing agree with it).
@@ -4137,19 +4679,30 @@ pub static FUTURE: ModuleSpec = ModuleSpec {
     constants: &[
         // The ordered list of every feature name, in CPython 3.14 order.
         c("all_feature_names", Type::List),
-        c("annotations", Type::Bool),
-        c("barry_as_FLUFL", Type::Bool),
-        c("division", Type::Bool),
-        c("absolute_import", Type::Bool),
-        c("print_function", Type::Bool),
-        c("generator_stop", Type::Bool),
-        c("unicode_literals", Type::Bool),
+        c("__all__", Type::List),
+        // The feature records are `_Feature` instances (not plain booleans).
+        c("annotations", Type::Any),
+        c("barry_as_FLUFL", Type::Any),
+        c("division", Type::Any),
+        c("absolute_import", Type::Any),
+        c("print_function", Type::Any),
+        c("generator_stop", Type::Any),
+        c("unicode_literals", Type::Any),
         // Legacy features retained for `__future__` compatibility.
-        c("nested_scopes", Type::Bool),
-        c("generators", Type::Bool),
-        c("with_statement", Type::Bool),
-        // The compiler flag constant `compile(..., flags=...)` reads.
+        c("nested_scopes", Type::Any),
+        c("generators", Type::Any),
+        c("with_statement", Type::Any),
+        // The compiler flag constants `compile(..., flags=...)` reads.
+        c("CO_NESTED", Type::Int),
+        c("CO_GENERATOR_ALLOWED", Type::Int),
+        c("CO_FUTURE_DIVISION", Type::Int),
+        c("CO_FUTURE_ABSOLUTE_IMPORT", Type::Int),
+        c("CO_FUTURE_WITH_STATEMENT", Type::Int),
+        c("CO_FUTURE_PRINT_FUNCTION", Type::Int),
+        c("CO_FUTURE_UNICODE_LITERALS", Type::Int),
         c("CO_FUTURE_BARRY_AS_BDFL", Type::Int),
+        c("CO_FUTURE_GENERATOR_STOP", Type::Int),
+        c("CO_FUTURE_ANNOTATIONS", Type::Int),
         // The release-record class `pydoc` uses as an `isinstance` target.
         c("_Feature", Type::Any),
     ],
@@ -4280,8 +4833,19 @@ pub static ITERTOOLS: ModuleSpec = ModuleSpec {
         // `groupby(iterable, key=None)`: consecutive keys. `key` may be
         // passed by name.
         kw("groupby", 1, 2, Type::Any, &["iterable", "key"]),
+        // `starmap(function, iterable)`: calls `function(*item)` per item.
+        f("starmap", 2, 2, Type::List),
+        // `batched(iterable, n)`: fixed-size tuples (3.12+).
+        kw_dynamic("batched", 2, 2, Type::List, &[]),
+        // `compress(data, selectors)`: items whose selector is true.
+        f("compress", 2, 2, Type::List),
     ],
-    constants: &[],
+    constants: &[
+        // Internal iterator types `test_itertools` imports directly.
+        c("_grouper", Type::Any),
+        c("_tee", Type::Any),
+        c("_tee_dataobject", Type::Any),
+    ],
 };
 
 /// `ast`: literal parsing, the runtime AST node surface used by
@@ -4299,7 +4863,11 @@ pub static AST: ModuleSpec = ModuleSpec {
         // parses the keyword names because they are not a fixed leading run.
         kw_dynamic("parse", 1, 5, Type::Any, &[]),
         f("unparse", 1, 1, Type::Str),
+        // `walk(node)`: yields every descendant node, including `node`.
+        f("walk", 1, 1, Type::Any),
         f("fix_missing_locations", 1, 1, Type::Any),
+        // `copy_location(new_node, old_node)`: copies the line/column fields.
+        f("copy_location", 2, 2, Type::Any),
         f("_node_visit", 2, 2, Type::Any),
         f("_node_generic_visit", 2, 2, Type::Any),
         kw_dynamic("Module", 0, usize::MAX, Type::Any, &[]),
@@ -4434,6 +5002,12 @@ pub static AST: ModuleSpec = ModuleSpec {
     ],
     constants: &[
         c("AST", Type::Any),
+        // `compile()` flag bits re-exported by `ast`.
+        c("PyCF_ONLY_AST", Type::Int),
+        c("PyCF_ALLOW_TOP_LEVEL_AWAIT", Type::Int),
+        c("PyCF_TYPE_COMMENTS", Type::Int),
+        c("PyCF_OPTIMIZED_AST", Type::Int),
+        c("PyCF_SOURCE_IS_UTF8", Type::Int),
         c("NodeVisitor", Type::Any),
         c("NodeTransformer", Type::Any),
         c("mod", Type::Any),
@@ -4525,6 +5099,8 @@ pub static IMPORTLIB: ModuleSpec = ModuleSpec {
         c("machinery", Type::Any),
         c("metadata", Type::Any),
         c("resources", Type::Any),
+        // `importlib.abc`: the abstract loader/finder classes.
+        c("abc", Type::Any),
         // `importlib._bootstrap`: the frozen bootstrap module `pkgutil` reads
         // (`_bootstrap._find_spec`); the runtime serves the module value.
         c("_bootstrap", Type::Any),
@@ -4620,6 +5196,58 @@ pub static IMPORTLIB_MACHINERY: ModuleSpec = ModuleSpec {
         f("_frozen_create_module", 2, 2, Type::Any),
         f("_frozen_exec_module", 2, 2, Type::None),
         f("_frozen_invalidate_caches", 1, 1, Type::None),
+        // The `importlib.abc` protocol method bodies. The receiver is the
+        // first argument, exactly as for every native method.
+        f("_loader_create_module", 2, 2, Type::Any),
+        f("_loader_load_module", 2, 2, Type::Any),
+        f("_loader_basics_is_package", 2, 2, Type::Bool),
+        f("_meta_path_finder_invalidate_caches", 1, 1, Type::None),
+        f("_path_entry_finder_invalidate_caches", 1, 1, Type::None),
+        f("_finder_find_module", 2, 3, Type::Any),
+        f("_resource_loader_get_data", 2, 2, Type::Bytes),
+        f("_inspect_loader_is_package", 2, 2, Type::Bool),
+        f("_inspect_loader_get_source", 2, 2, Type::Any),
+        f("_inspect_loader_get_code", 2, 2, Type::Any),
+        f("_inspect_loader_source_to_code", 1, 2, Type::Any),
+        f("_execution_loader_get_filename", 2, 2, Type::Str),
+        f("_execution_loader_get_code", 2, 2, Type::Any),
+        f("_resource_reader_open_resource", 2, 2, Type::Any),
+        f("_resource_reader_resource_path", 2, 2, Type::Any),
+        f("_resource_reader_is_resource", 2, 2, Type::Bool),
+        f("_resource_reader_contents", 1, 1, Type::List),
+        f("_traversable_resources_files", 1, 1, Type::Any),
+        // `SourceLoader`/`FileLoader` native bodies.
+        f("_source_get_source", 2, 2, Type::Any),
+        f("_source_get_code", 2, 2, Type::Any),
+        f("_source_source_to_code", 2, 4, Type::Any),
+        f("_source_path_stats", 2, 2, Type::Tuple),
+        f("_source_path_mtime", 2, 2, Type::Int),
+        f("_source_set_data", 3, 4, Type::None),
+        f("_file_loader_get_data", 2, 2, Type::Bytes),
+        f("_extension_is_package", 2, 2, Type::Bool),
+        // `NamespaceLoader` method bodies.
+        f("_namespace_loader_init", 2, 2, Type::None),
+        f("_namespace_loader_create_module", 2, 2, Type::Any),
+        f("_namespace_loader_exec_module", 2, 2, Type::None),
+        f("_namespace_loader_is_package", 2, 2, Type::Bool),
+        f("_namespace_loader_repr", 1, 1, Type::Str),
+        // `WindowsRegistryFinder.find_spec(fullname, path=None, target=None)`.
+        f("_windows_registry_finder_find_spec", 2, 4, Type::Any),
+        // `zipimporter` method bodies.
+        f("_zipimporter_init", 2, 2, Type::None),
+        f("_zipimporter_find_spec", 2, 4, Type::Any),
+        f("_zipimporter_find_module", 2, 3, Type::Any),
+        f("_zipimporter_get_data", 2, 2, Type::Bytes),
+        f("_zipimporter_get_filename", 2, 2, Type::Str),
+        f("_zipimporter_get_code", 2, 2, Type::Any),
+        f("_zipimporter_get_source", 2, 2, Type::Any),
+        f("_zipimporter_get_resource_reader", 2, 2, Type::Any),
+        f("_zipimporter_is_package", 2, 2, Type::Bool),
+        f("_zipimporter_load_module", 2, 2, Type::Any),
+        f("_zipimporter_create_module", 2, 2, Type::Any),
+        f("_zipimporter_exec_module", 2, 2, Type::None),
+        f("_zipimporter_invalidate_caches", 1, 1, Type::None),
+        f("_zipimporter_repr", 1, 1, Type::Str),
         // `all_suffixes()`: the concatenation of the three suffix lists.
         f("all_suffixes", 0, 0, Type::List),
         // `_install(bootstrap_module)`: registers the path finder with
@@ -4652,6 +5280,15 @@ pub static IMPORTLIB_MACHINERY: ModuleSpec = ModuleSpec {
     constants: &[
         c("ModuleSpec", Type::Any),
         c("Loader", Type::Any),
+        c("FileLoader", Type::Any),
+        c("SourceLoader", Type::Any),
+        c("_LoaderBasics", Type::Any),
+        c("NamespaceLoader", Type::Any),
+        c("WindowsRegistryFinder", Type::Any),
+        c("zipimporter", Type::Any),
+        c("ZipImportError", Type::Any),
+        c("ResourceReader", Type::Any),
+        c("TraversableResources", Type::Any),
         c("SourceFileLoader", Type::Any),
         c("ExtensionFileLoader", Type::Any),
         c("BuiltinImporter", Type::Any),
@@ -4686,6 +5323,10 @@ pub static IMPORTLIB_METADATA: ModuleSpec = ModuleSpec {
         kw("metadata", 1, 1, Type::Any, &["distribution_name"]),
         kw("requires", 1, 1, Type::Any, &["distribution_name"]),
         kw("distribution", 1, 1, Type::Any, &["distribution_name"]),
+        // `files(distribution_name)`: the installed files, or `None`.
+        kw("files", 1, 1, Type::Any, &["distribution_name"]),
+        // `packages_distributions()`: top-level package -> distribution names.
+        kw("packages_distributions", 0, 0, Type::Dict, &[]),
         kw_dynamic("distributions", 0, 0, Type::Any, &[]),
         kw_dynamic("entry_points", 0, 0, Type::Any, &[]),
         f("_distribution_read_text", 2, 2, Type::Any),
@@ -4722,7 +5363,11 @@ pub static IMPORTLIB_RESOURCES: ModuleSpec = ModuleSpec {
         f("_traversable_fspath", 1, 1, Type::Str),
         f("_traversable_open", 1, 5, Type::Any),
     ],
-    constants: &[c("Traversable", Type::Any)],
+    constants: &[
+        c("Traversable", Type::Any),
+        c("ResourceReader", Type::Any),
+        c("TraversableResources", Type::Any),
+    ],
 };
 
 /// `contextlib`: the `suppress`/`nullcontext` context managers and the
@@ -4884,6 +5529,14 @@ pub static CODECS: ModuleSpec = ModuleSpec {
         // The error-handler registry.
         f("register_error", 2, 2, Type::None),
         f("lookup_error", 1, 1, Type::Any),
+        // The built-in error handlers (`ignore_errors` / `strict_errors` /
+        // `replace_errors` and their transliteration variants).
+        f("ignore_errors", 1, 1, Type::None),
+        f("strict_errors", 1, 1, Type::Any),
+        f("replace_errors", 1, 1, Type::Any),
+        f("xmlcharrefreplace_errors", 1, 1, Type::Any),
+        f("backslashreplace_errors", 1, 1, Type::Any),
+        f("namereplace_errors", 1, 1, Type::Any),
         // `escape_decode(data, errors='strict')`: the `unicode_escape` /
         // `raw_unicode_escape` decoder shared with `_codecs`.
         f("escape_decode", 1, 2, Type::Tuple),
@@ -4897,6 +5550,50 @@ pub static CODECS: ModuleSpec = ModuleSpec {
         // codec classes used by `io.TextIOWrapper`.
         f("getincrementaldecoder", 1, 1, Type::Any),
         f("getincrementalencoder", 1, 1, Type::Any),
+        // `iterencode`/`iterdecode`: streaming (generator) codecs.
+        kw_dynamic("iterencode", 2, 3, Type::Any, &["iterator", "encoding", "errors"]),
+        kw_dynamic("iterdecode", 2, 3, Type::Any, &["iterator", "encoding", "errors"]),
+        // `open(filename, mode='r', encoding=None, errors='strict',
+        // buffering=-1)`: the transparent encoded-file wrapper.
+        kw(
+            "open",
+            1,
+            5,
+            Type::Any,
+            &["filename", "mode", "encoding", "errors", "buffering"],
+        ),
+        // The `surrogateescape` error handler (the other built-ins are above).
+        f("surrogateescape_errors", 1, 1, Type::Any),
+        // Encoding/decoding entry points CPython exposes from `_codecs`.
+        f("readbuffer_encode", 1, 2, Type::Bytes),
+        f("utf_7_encode", 1, 2, Type::Bytes),
+        f("utf_7_decode", 1, 2, Type::Tuple),
+        f("utf_8_encode", 1, 1, Type::Bytes),
+        f("utf_8_decode", 1, 3, Type::Tuple),
+        f("utf_16_encode", 1, 3, Type::Bytes),
+        f("utf_16_decode", 1, 3, Type::Tuple),
+        f("utf_16_ex_decode", 1, 4, Type::Tuple),
+        f("utf_16_le_encode", 1, 2, Type::Bytes),
+        f("utf_16_le_decode", 1, 3, Type::Tuple),
+        f("utf_16_be_encode", 1, 2, Type::Bytes),
+        f("utf_16_be_decode", 1, 3, Type::Tuple),
+        f("utf_32_encode", 1, 3, Type::Bytes),
+        f("utf_32_decode", 1, 3, Type::Tuple),
+        f("utf_32_ex_decode", 1, 4, Type::Tuple),
+        f("utf_32_le_encode", 1, 2, Type::Bytes),
+        f("utf_32_le_decode", 1, 3, Type::Tuple),
+        f("utf_32_be_encode", 1, 2, Type::Bytes),
+        f("utf_32_be_decode", 1, 3, Type::Tuple),
+        f("unicode_escape_encode", 1, 2, Type::Bytes),
+        f("unicode_escape_decode", 1, 2, Type::Tuple),
+        f("raw_unicode_escape_encode", 1, 2, Type::Bytes),
+        f("raw_unicode_escape_decode", 1, 2, Type::Tuple),
+        f("charmap_encode", 1, 3, Type::Tuple),
+        f("charmap_decode", 1, 3, Type::Tuple),
+        f("charmap_build", 1, 1, Type::Dict),
+        // `make_identity_dict(rng)` / `make_encoding_map(decoding_map)`.
+        f("make_identity_dict", 1, 1, Type::Dict),
+        f("make_encoding_map", 1, 1, Type::Dict),
     ],
     constants: &[
         // `CodecInfo(encode, decode, streamreader=None, streamwriter=None,
@@ -4918,6 +5615,12 @@ pub static CODECS: ModuleSpec = ModuleSpec {
         c("BOM_LE", Type::Bytes),
         c("BOM_BE", Type::Bytes),
         c("BOM", Type::Bytes),
+        // The remaining public classes and the export list.
+        c("Codec", Type::Any),
+        c("BufferedIncrementalEncoder", Type::Any),
+        c("BufferedIncrementalDecoder", Type::Any),
+        c("EncodedFile", Type::Any),
+        c("__all__", Type::List),
     ],
 };
 
@@ -4928,9 +5631,14 @@ pub static _IMP: ModuleSpec = ModuleSpec {
     functions: &[
         f("acquire_lock", 0, 0, Type::None),
         f("release_lock", 0, 0, Type::None),
+        f("lock_held", 0, 0, Type::Bool),
         f("is_builtin", 1, 1, Type::Bool),
         f("is_frozen", 1, 1, Type::Bool),
         f("is_frozen_package", 1, 1, Type::Bool),
+        f("init_frozen", 1, 1, Type::Any),
+        f("pyc_magic_number_token", 0, 0, Type::Int),
+        f("check_hash_based_pycs", 2, 2, Type::Bool),
+        f("_frozen_module_names", 0, 0, Type::List),
         f("extension_suffixes", 0, 0, Type::List),
         f("create_builtin", 1, 1, Type::Any),
         f("exec_builtin", 1, 1, Type::Any),
@@ -5137,10 +5845,15 @@ pub static _WARNINGS: ModuleSpec = ModuleSpec {
 pub static MARSHAL: ModuleSpec = ModuleSpec {
     name: "marshal",
     functions: &[
-        kw("dump", 2, 3, Type::None, &["value", "file", "version"]),
-        kw("dumps", 1, 2, Type::Bytes, &["value", "version"]),
-        f("load", 1, 1, Type::Any),
-        f("loads", 1, 1, Type::Any),
+        // `dump(value, file, version=version, /, *, allow_code=True)` and
+        // `dumps(value, version=version, /, *, allow_code=True)`: the
+        // keyword-only `allow_code` flag travels in the extra slot.
+        kw_dynamic("dump", 2, 4, Type::None, &["value", "file", "version"]),
+        kw_dynamic("dumps", 1, 3, Type::Bytes, &["value", "version"]),
+        // `load(file, /, *, allow_code=True)` and
+        // `loads(bytes, /, *, allow_code=True)`.
+        kw_dynamic("load", 1, 2, Type::Any, &[]),
+        kw_dynamic("loads", 1, 2, Type::Any, &[]),
     ],
     constants: &[c("version", Type::Int)],
 };
@@ -5149,13 +5862,19 @@ pub static MARSHAL: ModuleSpec = ModuleSpec {
 /// raises `NotImplementedError`; Hydro never fabricates tokens.
 pub static _TOKENIZE: ModuleSpec = ModuleSpec {
     name: "_tokenize",
-    functions: &[kw(
-        "TokenizerIter",
-        1,
-        3,
-        Type::Any,
-        &["source", "encoding", "extra_tokens"],
-    )],
+    functions: &[
+        kw(
+            "TokenizerIter",
+            1,
+            3,
+            Type::Any,
+            &["source", "encoding", "extra_tokens"],
+        ),
+        // Native method bodies of the `TokenizerIter` object.
+        f("_tokenizeriter_next", 1, 1, Type::Any),
+        f("_tokenizeriter_iter", 1, 1, Type::Any),
+        f("_tokenizeriter_set_extra_tokens", 2, 2, Type::None),
+    ],
     constants: &[],
 };
 
@@ -5279,6 +5998,7 @@ pub static _COLLECTIONS_ABC: ModuleSpec = ModuleSpec {
         c("Container", Type::Any),
         c("Callable", Type::Any),
         c("Collection", Type::Any),
+        c("ByteString", Type::Any),
         c("Set", Type::Any),
         c("MutableSet", Type::Any),
         c("Mapping", Type::Any),
@@ -5319,6 +6039,7 @@ pub static COLLECTIONS_ABC: ModuleSpec = ModuleSpec {
         c("Container", Type::Any),
         c("Callable", Type::Any),
         c("Collection", Type::Any),
+        c("ByteString", Type::Any),
         c("Set", Type::Any),
         c("MutableSet", Type::Any),
         c("Mapping", Type::Any),
@@ -5356,10 +6077,27 @@ pub static GC: ModuleSpec = ModuleSpec {
         // runtime has no heap enumeration, so it raises NotImplementedError;
         // the name is declared so imports and attribute reads resolve.
         f("get_referrers", 0, usize::MAX, Type::List),
+        // `get_referents(*objs)`: objects directly referred to by the args.
+        f("get_referents", 0, usize::MAX, Type::List),
+        // `get_freeze_count()`: the number of frozen objects.
+        f("get_freeze_count", 0, 0, Type::Int),
+        // `get_debug()` / `set_debug(flags)`: the collector debug flags.
+        f("get_debug", 0, 0, Type::Int),
+        f("set_debug", 1, 1, Type::None),
+        // `is_finalized(obj)`: whether finalizers already ran for the object.
+        f("is_finalized", 1, 1, Type::Bool),
     ],
     constants: &[
-        // `gc.garbage`: the list of uncollectable objects.
+        // `gc.garbage`: the list of uncollectable objects; `gc.callbacks`
+        // the pre/post-collection callback list.
         c("garbage", Type::List),
+        c("callbacks", Type::List),
+        // The `gc.DEBUG_*` flag bits.
+        c("DEBUG_STATS", Type::Int),
+        c("DEBUG_COLLECTABLE", Type::Int),
+        c("DEBUG_UNCOLLECTABLE", Type::Int),
+        c("DEBUG_SAVEALL", Type::Int),
+        c("DEBUG_LEAK", Type::Int),
     ],
 };
 
@@ -5371,6 +6109,8 @@ pub static ATEXIT: ModuleSpec = ModuleSpec {
         f("unregister", 1, 1, Type::None),
         f("_run_exitfuncs", 0, 0, Type::None),
         f("_clear", 0, 0, Type::None),
+        // `_ncallbacks()`: the number of registered callbacks.
+        f("_ncallbacks", 0, 0, Type::Int),
     ],
     constants: &[],
 };
@@ -5514,6 +6254,9 @@ const CTYPES_CONSTANTS: &[ConstantSpec] = &[
     c("_CFuncPtr", Type::Any),
     c("CDLL", Type::Any),
     c("PyDLL", Type::Any),
+    // `ctypes.WinDLL`: the `stdcall` calling-convention DLL class (a `CDLL`
+    // subclass on Windows; exposed so cross-platform code resolves the name).
+    c("WinDLL", Type::Any),
     c("LibraryLoader", Type::Any),
     c("ArgumentError", Type::Any),
     c("CField", Type::Any),
@@ -5586,6 +6329,25 @@ pub static LOCALE: ModuleSpec = ModuleSpec {
         f("normalize", 1, 1, Type::Str),
         f("strcoll", 2, 2, Type::Int),
         f("strxfrm", 1, 1, Type::Str),
+        // `nl_langinfo(item)`: the locale information string for an item code.
+        f("nl_langinfo", 1, 1, Type::Str),
+        // `format_string(f, val, grouping=False, monetary=False)`: `%`
+        // formatting with the locale's separators.
+        kw(
+            "format_string",
+            2,
+            4,
+            Type::Str,
+            &["f", "val", "grouping", "monetary"],
+        ),
+        // `currency(val, symbol=True, grouping=False, international=False)`.
+        kw(
+            "currency",
+            1,
+            4,
+            Type::Str,
+            &["val", "symbol", "grouping", "international"],
+        ),
         f("bindtextdomain", 1, 2, Type::Any),
         f("textdomain", 0, 1, Type::Any),
         f("gettext", 1, 1, Type::Str),
@@ -5594,6 +6356,29 @@ pub static LOCALE: ModuleSpec = ModuleSpec {
         f("_gettext", 1, 1, Type::Str),
         f("_dgettext", 2, 2, Type::Str),
         f("_dcgettext", 2, 3, Type::Str),
+        // Numeric/string conversions that honour the current locale.
+        kw("atof", 1, 2, Type::Float, &["string", "func"]),
+        f("atoi", 1, 1, Type::Int),
+        f("str", 1, 1, Type::Str),
+        f("delocalize", 1, 1, Type::Str),
+        kw("localize", 1, 3, Type::Str, &["string", "grouping", "monetary"]),
+        // Locale-name/default resolution helpers.
+        kw(
+            "getdefaultlocale",
+            0,
+            1,
+            Type::Tuple,
+            &["envvars"],
+        ),
+        kw(
+            "_getdefaultlocale",
+            0,
+            1,
+            Type::Tuple,
+            &["envvars"],
+        ),
+        f("_parse_localename", 1, 1, Type::Tuple),
+        f("_build_localename", 1, 1, Type::Any),
     ],
     constants: &[
         c("LC_CTYPE", Type::Int),
@@ -5605,9 +6390,68 @@ pub static LOCALE: ModuleSpec = ModuleSpec {
         c("LC_ALL", Type::Int),
         c("Error", Type::Any),
         c("CHAR_MAX", Type::Int),
-        // `locale.ALT_DIGITS`: the locale-specific alternative digit symbols.
-        // The C locale defines none, so the list is empty.
-        c("ALT_DIGITS", Type::List),
+        // `locale_alias`: the locale-name normalization table.
+        c("locale_alias", Type::Any),
+        // `locale.ALT_DIGITS`: the `nl_langinfo` item code for the
+        // locale-specific alternative digit symbols.
+        c("ALT_DIGITS", Type::Int),
+        // `nl_langinfo` item codes exported by `_locale` and re-exported by
+        // `locale` (`from _locale import *`).
+        c("DAY_1", Type::Int),
+        c("DAY_2", Type::Int),
+        c("DAY_3", Type::Int),
+        c("DAY_4", Type::Int),
+        c("DAY_5", Type::Int),
+        c("DAY_6", Type::Int),
+        c("DAY_7", Type::Int),
+        c("ABDAY_1", Type::Int),
+        c("ABDAY_2", Type::Int),
+        c("ABDAY_3", Type::Int),
+        c("ABDAY_4", Type::Int),
+        c("ABDAY_5", Type::Int),
+        c("ABDAY_6", Type::Int),
+        c("ABDAY_7", Type::Int),
+        c("MON_1", Type::Int),
+        c("MON_2", Type::Int),
+        c("MON_3", Type::Int),
+        c("MON_4", Type::Int),
+        c("MON_5", Type::Int),
+        c("MON_6", Type::Int),
+        c("MON_7", Type::Int),
+        c("MON_8", Type::Int),
+        c("MON_9", Type::Int),
+        c("MON_10", Type::Int),
+        c("MON_11", Type::Int),
+        c("MON_12", Type::Int),
+        c("ABMON_1", Type::Int),
+        c("ABMON_2", Type::Int),
+        c("ABMON_3", Type::Int),
+        c("ABMON_4", Type::Int),
+        c("ABMON_5", Type::Int),
+        c("ABMON_6", Type::Int),
+        c("ABMON_7", Type::Int),
+        c("ABMON_8", Type::Int),
+        c("ABMON_9", Type::Int),
+        c("ABMON_10", Type::Int),
+        c("ABMON_11", Type::Int),
+        c("ABMON_12", Type::Int),
+        c("RADIXCHAR", Type::Int),
+        c("THOUSEP", Type::Int),
+        c("CRNCYSTR", Type::Int),
+        c("D_T_FMT", Type::Int),
+        c("D_FMT", Type::Int),
+        c("T_FMT", Type::Int),
+        c("AM_STR", Type::Int),
+        c("PM_STR", Type::Int),
+        c("CODESET", Type::Int),
+        c("T_FMT_AMPM", Type::Int),
+        c("ERA", Type::Int),
+        c("ERA_D_FMT", Type::Int),
+        c("ERA_D_T_FMT", Type::Int),
+        c("ERA_T_FMT", Type::Int),
+        c("YESEXPR", Type::Int),
+        c("NOEXPR", Type::Int),
+        c("_DATE_FMT", Type::Int),
     ],
 };
 
@@ -5816,6 +6660,8 @@ pub static UNICODEDATA: ModuleSpec = ModuleSpec {
         // `ucd_3_2_0`: the frozen Unicode 3.2 database used by the `idna`
         // codec.
         c("ucd_3_2_0", Type::Any),
+        // `UCD`: the database-class type `ucd_3_2_0` is an instance of.
+        c("UCD", Type::Any),
     ],
 };
 
@@ -5841,9 +6687,9 @@ pub static ZLIB: ModuleSpec = ModuleSpec {
         kw(
             "compressobj",
             0,
-            5,
+            6,
             Type::Any,
-            &["level", "method", "wbits", "memLevel", "strategy"],
+            &["level", "method", "wbits", "memLevel", "strategy", "zdict"],
         ),
         kw("decompressobj", 0, 2, Type::Any, &["wbits", "zdict"]),
         // `Compress` / `Decompress` native method bodies.
@@ -5861,6 +6707,7 @@ pub static ZLIB: ModuleSpec = ModuleSpec {
         c("Z_BEST_COMPRESSION", Type::Int),
         c("Z_DEFAULT_COMPRESSION", Type::Int),
         c("DEFLATED", Type::Int),
+        c("DEF_BUF_SIZE", Type::Int),
         c("DEF_MEM_LEVEL", Type::Int),
         c("MAX_WBITS", Type::Int),
         c("Z_DEFAULT_STRATEGY", Type::Int),
@@ -5974,6 +6821,7 @@ pub static HTTP: ModuleSpec = ModuleSpec {
         c("HTTPStatus", Type::Any),
         // Nested native submodules exposed as module values.
         c("client", Type::Any),
+        c("cookies", Type::Any),
         c("server", Type::Any),
     ],
 };
@@ -5985,7 +6833,11 @@ pub static HTTP: ModuleSpec = ModuleSpec {
 /// succeed; its `HTTPConnection` family is not part of the native surface.
 pub static HTTP_CLIENT: ModuleSpec = ModuleSpec {
     name: "http.client",
-    functions: &[],
+    functions: &[
+        // `_create_https_context(http_version)`: the default HTTPS context
+        // factory, also used by `urllib.request`.
+        kw_dynamic("_create_https_context", 1, 1, Type::Any, &["http_version"]),
+    ],
     constants: &[
         // The exception classes `http.client` defines; `urllib.request` and
         // the test suite catch them by identity.
@@ -6212,6 +7064,15 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
         f("findsource", 1, 1, Type::Tuple),
         f("getsourcelines", 1, 1, Type::Tuple),
         f("getblock", 1, 1, Type::List),
+        // `getsource(object)` / `getframeinfo(frame, context=1)`.
+        f("getsource", 1, 1, Type::Str),
+        kw("getframeinfo", 1, 2, Type::Any, &["frame", "context"]),
+        // `get_annotations(obj, *, globals=None, locals=None, eval_str=False,
+        // format=Format.VALUE)` (re-exported from `annotationlib`).
+        kw_dynamic("get_annotations", 1, 1, Type::Dict, &["obj"]),
+        // `getmembers_static(object, predicate=None)`: like `getmembers`, but
+        // without triggering the descriptor protocol.
+        kw("getmembers_static", 1, 2, Type::List, &["object", "predicate"]),
         kw("unwrap", 1, 2, Type::Any, &["func", "stop"]),
         // Signature construction and argument binding.
         kw(
@@ -6366,7 +7227,7 @@ pub static HASHLIB: ModuleSpec = ModuleSpec {
 pub static _HASHLIB: ModuleSpec = ModuleSpec {
     name: "_hashlib",
     functions: &[
-        kw("new", 1, 2, Type::Any, &["name", "data"]),
+        kw_dynamic("new", 1, 2, Type::Any, &["name", "data"]),
         kw("hmac_new", 1, 3, Type::Any, &["key", "msg", "digestmod"]),
         kw(
             "hmac_digest",
@@ -6385,20 +7246,22 @@ pub static _HASHLIB: ModuleSpec = ModuleSpec {
             Type::Bytes,
             &["hash_name", "password", "salt", "iterations", "dklen"],
         ),
-        kw("openssl_md5", 0, 1, Type::Any, &["data"]),
-        kw("openssl_sha1", 0, 1, Type::Any, &["data"]),
-        kw("openssl_sha224", 0, 1, Type::Any, &["data"]),
-        kw("openssl_sha256", 0, 1, Type::Any, &["data"]),
-        kw("openssl_sha384", 0, 1, Type::Any, &["data"]),
-        kw("openssl_sha512", 0, 1, Type::Any, &["data"]),
-        kw("openssl_blake2b512", 0, 1, Type::Any, &["data"]),
-        kw("openssl_blake2s256", 0, 1, Type::Any, &["data"]),
-        kw("openssl_sha3_224", 0, 1, Type::Any, &["data"]),
-        kw("openssl_sha3_256", 0, 1, Type::Any, &["data"]),
-        kw("openssl_sha3_384", 0, 1, Type::Any, &["data"]),
-        kw("openssl_sha3_512", 0, 1, Type::Any, &["data"]),
-        kw("openssl_shake_128", 0, 1, Type::Any, &["data"]),
-        kw("openssl_shake_256", 0, 1, Type::Any, &["data"]),
+        // The OpenSSL constructors accept `data` plus the keyword-only
+        // `usedforsecurity` flag, so they are keyword-dynamic.
+        kw_dynamic("openssl_md5", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_sha1", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_sha224", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_sha256", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_sha384", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_sha512", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_blake2b512", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_blake2s256", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_sha3_224", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_sha3_256", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_sha3_384", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_sha3_512", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_shake_128", 0, 1, Type::Any, &["data"]),
+        kw_dynamic("openssl_shake_256", 0, 1, Type::Any, &["data"]),
     ],
     constants: &[
         c("HASH", Type::Any),
@@ -6596,6 +7459,8 @@ pub static PYEXPAT: ModuleSpec = ModuleSpec {
         f("_pyexpat_external_entity_parser_create", 2, 3, Type::Any),
         f("_pyexpat_set_param_entity_parsing", 2, 2, Type::Bool),
         f("_pyexpat_use_foreign_dtd", 1, 2, Type::None),
+        f("_pyexpat_get_reparse_deferral", 1, 1, Type::Bool),
+        f("_pyexpat_set_reparse_deferral", 2, 2, Type::None),
         f("_pyexpat_get_buffer_text", 1, 1, Type::Bool),
         f("_pyexpat_set_buffer_text", 2, 2, Type::None),
         f("_pyexpat_get_buffer_size", 1, 1, Type::Int),
@@ -6698,6 +7563,8 @@ pub static GDBM: ModuleSpec = ModuleSpec {
     ],
     constants: &[
         c("error", Type::Any),
+        // The mapping type itself, like CPython's `_gdbm.gdbm`.
+        c("gdbm", Type::Any),
         c("open_flags", Type::Str),
         c("_GDBM_VERSION", Type::Tuple),
     ],
@@ -6723,7 +7590,12 @@ pub static DBM: ModuleSpec = ModuleSpec {
         f("_dbm_enter", 1, 1, Type::Any),
         f("_dbm_exit", 1, 4, Type::None),
     ],
-    constants: &[c("error", Type::Any), c("library", Type::Str)],
+    constants: &[
+        c("error", Type::Any),
+        // The mapping type itself, like CPython's `_dbm.dbm`.
+        c("dbm", Type::Any),
+        c("library", Type::Str),
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -7286,13 +8158,23 @@ pub static IMPORTLIB_BOOTSTRAP_EXTERNAL: ModuleSpec = ModuleSpec {
     constants: IMPORTLIB_MACHINERY.constants,
 };
 
-/// `zipimport`: the zip-file importer. Hydro has no zip import machinery, so
-/// the table exposes the shared finder/loader surface from
-/// `importlib.machinery` and nothing extra.
+/// `zipimport`: the zip-file importer.
+///
+/// `zipimporter(path)` is the type CPython's `zipimport.py` exports (declared
+/// as a callable module entry so construction lowers like any other
+/// constructor), and `ZipImportError` the exception it raises. The module also
+/// exposes the directory cache and path separators the pure-Python
+/// implementation keeps at module scope.
 pub static ZIPIMPORT: ModuleSpec = ModuleSpec {
     name: "zipimport",
-    functions: IMPORTLIB_MACHINERY.functions,
-    constants: IMPORTLIB_MACHINERY.constants,
+    functions: &[f("zipimporter", 1, 1, Type::Any)],
+    constants: &[
+        c("ZipImportError", Type::Any),
+        c("_zip_directory_cache", Type::Dict),
+        c("path_sep", Type::Str),
+        c("alt_path_sep", Type::Str),
+        c("__all__", Type::List),
+    ],
 };
 
 /// `_sysconfig`: the C accelerator behind `sysconfig`.
@@ -7427,6 +8309,387 @@ pub static _AST: ModuleSpec = ModuleSpec {
     name: "_ast",
     functions: AST.functions,
     constants: AST.constants,
+};
+
+/// `html.parser`: the `HTMLParser` class.
+///
+/// `HTMLParser(*, convert_charrefs=True, scripting=False)` feeds markup to
+/// `handle_starttag`/`handle_data`/... callbacks; the runtime implements the
+/// parser natively.
+pub static HTML_PARSER: ModuleSpec = ModuleSpec {
+    name: "html.parser",
+    functions: &[kw(
+        "HTMLParser",
+        0,
+        2,
+        Type::Any,
+        &["convert_charrefs", "scripting"],
+    )],
+    constants: &[c("__all__", Type::List)],
+};
+
+/// `html.entities`: the HTML character-reference tables.
+pub static HTML_ENTITIES: ModuleSpec = ModuleSpec {
+    name: "html.entities",
+    functions: &[],
+    constants: &[
+        // `html5`: entity name (with trailing `;`) -> replacement string.
+        c("html5", Type::Dict),
+        // `name2codepoint`: HTML4 entity name -> code point.
+        c("name2codepoint", Type::Dict),
+        c("codepoint2name", Type::Dict),
+        c("entitydefs", Type::Dict),
+        c("__all__", Type::List),
+    ],
+};
+
+/// `http.cookies`: cookie parsing and generation.
+pub static HTTP_COOKIES: ModuleSpec = ModuleSpec {
+    name: "http.cookies",
+    functions: &[
+        // The quoting helpers the module itself uses.
+        f("_quote", 1, 1, Type::Str),
+        f("_unquote", 1, 1, Type::Str),
+        kw("_getdate", 0, 1, Type::Str, &["future"]),
+    ],
+    constants: &[
+        c("CookieError", Type::Any),
+        c("Morsel", Type::Any),
+        c("BaseCookie", Type::Any),
+        c("SimpleCookie", Type::Any),
+        c("__all__", Type::List),
+    ],
+};
+
+/// `importlib.abc`: the abstract loader and finder classes.
+pub static IMPORTLIB_ABC: ModuleSpec = ModuleSpec {
+    name: "importlib.abc",
+    functions: &[],
+    constants: &[
+        c("Loader", Type::Any),
+        c("MetaPathFinder", Type::Any),
+        c("PathEntryFinder", Type::Any),
+        c("Finder", Type::Any),
+        c("ResourceLoader", Type::Any),
+        c("InspectLoader", Type::Any),
+        c("ExecutionLoader", Type::Any),
+        c("FileLoader", Type::Any),
+        c("SourceLoader", Type::Any),
+        c("ResourceReader", Type::Any),
+        c("TraversableResources", Type::Any),
+        c("__all__", Type::List),
+    ],
+};
+
+/// `gzip`: RFC 1952 gzip compression over the `zlib` primitive.
+pub static GZIP: ModuleSpec = ModuleSpec {
+    name: "gzip",
+    functions: &[
+        // `open(filename, mode='rb', compresslevel=9, *, encoding=None,
+        // errors=None, newline=None)`.
+        kw(
+            "open",
+            1,
+            6,
+            Type::Any,
+            &[
+                "filename",
+                "mode",
+                "compresslevel",
+                "encoding",
+                "errors",
+                "newline",
+            ],
+        ),
+        // `compress(data, compresslevel=9, *, mtime=0)` / `decompress(data)`.
+        kw("compress", 1, 3, Type::Bytes, &["data", "compresslevel", "mtime"]),
+        f("decompress", 1, 1, Type::Bytes),
+        // `_read_gzip_header(fp)`: `(magic, method, flags, mtime)`.
+        f("_read_gzip_header", 1, 1, Type::Tuple),
+        f("_read_exact", 2, 2, Type::Bytes),
+    ],
+    constants: &[
+        c("BadGzipFile", Type::Any),
+        c("GzipFile", Type::Any),
+        // Header flag bits and the binary/text mode strings.
+        c("FTEXT", Type::Int),
+        c("FHCRC", Type::Int),
+        c("FEXTRA", Type::Int),
+        c("FNAME", Type::Int),
+        c("FCOMMENT", Type::Int),
+        c("READ", Type::Str),
+        c("WRITE", Type::Str),
+        c("READ_BUFFER_SIZE", Type::Int),
+        c("__all__", Type::List),
+    ],
+};
+
+/// `code`: the interactive-interpreter helpers.
+pub static CODE: ModuleSpec = ModuleSpec {
+    name: "code",
+    functions: &[
+        kw("InteractiveInterpreter", 0, 1, Type::Any, &["locals"]),
+        kw(
+            "InteractiveConsole",
+            0,
+            2,
+            Type::Any,
+            &["locals", "local_exit"],
+        ),
+        kw(
+            "interact",
+            0,
+            5,
+            Type::None,
+            &["banner", "readfunc", "local", "exitmsg", "local_exit"],
+        ),
+        // `compile_command(source, filename='<input>', symbol='single')` and
+        // its stateful `CommandCompiler` wrapper.
+        kw(
+            "compile_command",
+            1,
+            3,
+            Type::Any,
+            &["source", "filename", "symbol"],
+        ),
+        kw("CommandCompiler", 0, 0, Type::Any, &[]),
+    ],
+    constants: &[c("Quitter", Type::Any), c("__all__", Type::List)],
+};
+
+/// `tty`: terminal mode helpers built on `termios`.
+pub static TTY: ModuleSpec = ModuleSpec {
+    name: "tty",
+    functions: &[
+        kw("cfmakeraw", 1, 1, Type::None, &["mode"]),
+        kw("cfmakecbreak", 1, 1, Type::None, &["mode"]),
+        kw("setraw", 1, 2, Type::Any, &["fd", "when"]),
+        kw("setcbreak", 1, 2, Type::Any, &["fd", "when"]),
+    ],
+    constants: &[
+        // The `termios.tcgetattr()` list indices.
+        c("IFLAG", Type::Int),
+        c("OFLAG", Type::Int),
+        c("CFLAG", Type::Int),
+        c("LFLAG", Type::Int),
+        c("ISPEED", Type::Int),
+        c("OSPEED", Type::Int),
+        c("CC", Type::Int),
+        c("__all__", Type::List),
+    ],
+};
+
+/// `uuid`: RFC 9562 UUID generation and parsing.
+pub static UUID: ModuleSpec = ModuleSpec {
+    name: "uuid",
+    functions: &[
+        kw("uuid1", 0, 2, Type::Any, &["node", "clock_seq"]),
+        kw("uuid3", 2, 2, Type::Any, &["namespace", "name"]),
+        f("uuid4", 0, 0, Type::Any),
+        kw("uuid5", 2, 2, Type::Any, &["namespace", "name"]),
+        kw("uuid6", 0, 2, Type::Any, &["node", "clock_seq"]),
+        f("uuid7", 0, 0, Type::Any),
+        kw("uuid8", 0, 3, Type::Any, &["a", "b", "c"]),
+        f("getnode", 0, 0, Type::Int),
+        f("main", 0, 0, Type::None),
+        // The internal time/random helpers `test_uuid` exercises directly.
+        f("_uuid7_get_counter_and_tail", 0, 0, Type::Tuple),
+        f("_get_command_stdout", 1, usize::MAX, Type::Any),
+        f("_is_universal", 1, 1, Type::Bool),
+        f("_parse_mac", 1, 1, Type::Int),
+        f("_find_mac_near_keyword", 4, 4, Type::Int),
+        f("_find_mac_under_heading", 3, 3, Type::Int),
+        f("_ifconfig_getnode", 0, 0, Type::Int),
+        f("_ip_getnode", 0, 0, Type::Int),
+        f("_arp_getnode", 0, 0, Type::Int),
+        f("_netstat_getnode", 0, 0, Type::Int),
+        f("_lanscan_getnode", 0, 0, Type::Int),
+        f("_unix_getnode", 0, 0, Type::Int),
+        f("_windll_getnode", 0, 0, Type::Int),
+        f("_random_getnode", 0, 0, Type::Int),
+    ],
+    constants: &[
+        c("UUID", Type::Any),
+        c("SafeUUID", Type::Any),
+        // The variant description strings.
+        c("RESERVED_NCS", Type::Str),
+        c("RFC_4122", Type::Str),
+        c("RESERVED_MICROSOFT", Type::Str),
+        c("RESERVED_FUTURE", Type::Str),
+        // The RFC 9562 namespace UUIDs and the nil/max sentinels.
+        c("NAMESPACE_DNS", Type::Any),
+        c("NAMESPACE_URL", Type::Any),
+        c("NAMESPACE_OID", Type::Any),
+        c("NAMESPACE_X500", Type::Any),
+        c("NIL", Type::Any),
+        c("MAX", Type::Any),
+        // Platform getter list and the version-1 native generator handle.
+        c("_GETTERS", Type::List),
+        c("_generate_time_safe", Type::Any),
+        c("_has_stable_extractable_node", Type::Bool),
+        c("_last_timestamp_v7", Type::Any),
+        c("_last_counter_v7", Type::Int),
+        c("__all__", Type::List),
+    ],
+};
+
+/// `opcode`: the public opcode tables `dis` builds on.
+///
+/// CPython 3.14 splits the tables between `_opcode_metadata` and `_opcode`;
+/// `opcode.py` re-exports them here. Hydro has no bytecode, so the tables are
+/// empty and the predicates answer `False`, but the names resolve.
+pub static OPCODE: ModuleSpec = ModuleSpec {
+    name: "opcode",
+    functions: &[
+        kw(
+            "stack_effect",
+            1,
+            3,
+            Type::Int,
+            &["opcode", "oparg", "jump"],
+        ),
+    ],
+    constants: &[
+        c("opmap", Type::Dict),
+        c("opname", Type::List),
+        c("HAVE_ARGUMENT", Type::Int),
+        c("EXTENDED_ARG", Type::Int),
+        c("MIN_INSTRUMENTED_OPCODE", Type::Int),
+        c("cmp_op", Type::Tuple),
+        c("hascompare", Type::List),
+        c("hasarg", Type::List),
+        c("hasconst", Type::List),
+        c("hasname", Type::List),
+        c("hasjump", Type::List),
+        c("hasjrel", Type::List),
+        c("hasjabs", Type::List),
+        c("hasfree", Type::List),
+        c("haslocal", Type::List),
+        c("hasexc", Type::List),
+        c("_specializations", Type::Dict),
+        c("_specialized_opmap", Type::Dict),
+        c("_intrinsic_1_descs", Type::List),
+        c("_intrinsic_2_descs", Type::List),
+        c("_special_method_names", Type::Dict),
+        c("_common_constants", Type::List),
+        c("_nb_ops", Type::List),
+        c("_cache_format", Type::Dict),
+        c("__all__", Type::List),
+    ],
+};
+
+/// `_testinternalcapi`: the interpreter-internals query surface used by the
+/// CPython test suite.
+pub static _TESTINTERNALCAPI: ModuleSpec = ModuleSpec {
+    name: "_testinternalcapi",
+    functions: &[
+        f("get_configs", 0, 0, Type::Dict),
+        f("set_config", 2, 2, Type::None),
+        f("get_hash_seed", 0, 0, Type::Int),
+        f("get_recursion_depth", 0, 0, Type::Int),
+        f("get_recursion_remaining", 0, 0, Type::Int),
+        f("get_recursion_limit", 0, 0, Type::Int),
+        f("set_recursion_limit", 1, 1, Type::None),
+        f("get_c_recursion_remaining", 0, 0, Type::Int),
+        f("normalize_path", 1, 1, Type::Str),
+        f("get_rare_event_counters", 0, 0, Type::Dict),
+        f("reset_rare_event_counters", 0, 0, Type::None),
+        f("set_eval_frame_record", 1, 1, Type::None),
+        f("set_eval_frame_default", 0, 0, Type::None),
+        f("has_inline_values", 1, 1, Type::Bool),
+        f("has_split_table", 1, 1, Type::Bool),
+        f("has_deferred_refcount", 1, 1, Type::Bool),
+        f("is_static_immortal", 1, 1, Type::Bool),
+        f("get_static_builtin_types", 0, 0, Type::List),
+        f("identify_type_slot_wrappers", 0, 0, Type::List),
+        f("write_perf_map_entry", 3, 3, Type::Int),
+        f("perf_map_state_teardown", 0, 0, Type::None),
+        f("get_tlbc", 1, 1, Type::Any),
+        f("get_tlbc_id", 1, 1, Type::Any),
+        f("get_stack_pointer", 0, 0, Type::Int),
+        f("get_stack_margin", 0, 0, Type::Int),
+        f("pymem_getallocatorsname", 0, 0, Type::Str),
+        f("py_thread_id", 0, 0, Type::Int),
+        f("interpreter_exists", 1, 1, Type::Bool),
+        f("next_interpreter_id", 0, 0, Type::Int),
+        f("unused_interpreter_id", 0, 0, Type::Int),
+        f("normalize_interp_id", 1, 1, Type::Int),
+        f("get_interpreter_refcount", 1, 1, Type::Int),
+        f("link_interpreter_refcount", 1, 1, Type::None),
+        f("unlink_interpreter_refcount", 1, 1, Type::None),
+        f("interpreter_refcount_linked", 1, 1, Type::Bool),
+        f("get_interp_settings", 1, 1, Type::Dict),
+        f("create_interpreter", 0, 2, Type::Any),
+        f("destroy_interpreter", 1, 2, Type::Any),
+        f("exec_interpreter", 2, 3, Type::Any),
+        f("run_in_subinterp_with_config", 1, 2, Type::Any),
+        f("pystate_getmodule", 1, 1, Type::Any),
+        f("pystate_addmodule_run", 1, 1, Type::Any),
+    ],
+    constants: &[
+        c("SIZEOF_PYGC_HEAD", Type::Int),
+        c("SIZEOF_MANAGED_PRE_HEADER", Type::Int),
+        c("SIZEOF_PYOBJECT", Type::Int),
+        c("SIZEOF_PYTHON_RECORD", Type::Int),
+        c("SIZEOF_TIME_T", Type::Int),
+        c("SIZEOF_PYHASH", Type::Int),
+        c("TIER2_THRESHOLD", Type::Int),
+        c("SPECIALIZATION_THRESHOLD", Type::Int),
+        c("SPECIALIZATION_COOLDOWN", Type::Int),
+        c("SHARED_KEYS_MAX_SIZE", Type::Int),
+    ],
+};
+
+/// `_testbuffer`: the PEP 3118 test support module.
+///
+/// `ndarray`/`Py_buffer` are class constants (so `isinstance` sees the cached
+/// class); their method bodies are supplemental native members.
+pub static _TESTBUFFER: ModuleSpec = ModuleSpec {
+    name: "_testbuffer",
+    functions: &[
+        f("getbuffer", 1, 2, Type::Any),
+        f("releasebuffer", 1, 1, Type::None),
+        f("get_pointer", 2, 2, Type::Any),
+        f("get_sizeof_void_p", 0, 0, Type::Int),
+        f("slice_indices", 2, 2, Type::Tuple),
+        f("get_contiguous", 3, 3, Type::Bytes),
+        f("py_buffer_to_contiguous", 3, 3, Type::Bytes),
+        f("is_contiguous", 2, 2, Type::Bool),
+        f("cmp_contig", 2, 2, Type::Bool),
+    ],
+    constants: &[
+        c("ndarray", Type::Any),
+        c("Py_buffer", Type::Any),
+        c("ND_MAX_NDIM", Type::Int),
+        c("ND_VAREXPORT", Type::Int),
+        c("ND_WRITABLE", Type::Int),
+        c("ND_FORTRAN", Type::Int),
+        c("ND_SCALAR", Type::Int),
+        c("ND_PIL", Type::Int),
+        c("ND_REDIRECT", Type::Int),
+        c("ND_GETBUF_FAIL", Type::Int),
+        c("ND_GETBUF_UNDEFINED", Type::Int),
+        c("PyBUF_SIMPLE", Type::Int),
+        c("PyBUF_WRITABLE", Type::Int),
+        c("PyBUF_FORMAT", Type::Int),
+        c("PyBUF_ND", Type::Int),
+        c("PyBUF_STRIDES", Type::Int),
+        c("PyBUF_INDIRECT", Type::Int),
+        c("PyBUF_C_CONTIGUOUS", Type::Int),
+        c("PyBUF_F_CONTIGUOUS", Type::Int),
+        c("PyBUF_ANY_CONTIGUOUS", Type::Int),
+        c("PyBUF_FULL", Type::Int),
+        c("PyBUF_FULL_RO", Type::Int),
+        c("PyBUF_RECORDS", Type::Int),
+        c("PyBUF_RECORDS_RO", Type::Int),
+        c("PyBUF_STRIDED", Type::Int),
+        c("PyBUF_STRIDED_RO", Type::Int),
+        c("PyBUF_CONTIG", Type::Int),
+        c("PyBUF_CONTIG_RO", Type::Int),
+        c("PyBUF_READ", Type::Int),
+        c("PyBUF_WRITE", Type::Int),
+        c("BUFFER_MAX_SIZE", Type::Int),
+    ],
 };
 
 #[cfg(test)]

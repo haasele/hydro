@@ -24,7 +24,8 @@ use crate::container;
 use crate::core::globals;
 use crate::core::iter;
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, INDEX_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, EOF_ERROR, INDEX_ERROR, MEMORY_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR,
+    TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::ops;
@@ -55,10 +56,12 @@ const fn descr(code: char) -> Option<Descr> {
     let itemsize = match code {
         'b' | 'B' => 1,
         'u' => WCHAR_SIZE,
+        'w' => 4,
         'h' | 'H' => 2,
         'i' | 'I' => 4,
         'l' => LONG_SIZE,
         'L' => ULONG_SIZE,
+        'q' | 'Q' => 8,
         'f' => 4,
         'd' => 8,
         _ => return None,
@@ -66,8 +69,9 @@ const fn descr(code: char) -> Option<Descr> {
     Some(Descr { code, itemsize })
 }
 
-/// The module-level `array.typecodes` string.
-const TYPECODES: &str = "bBuhHiIlLfd";
+/// The module-level `array.typecodes` string, in CPython's `descriptors`
+/// order.
+const TYPECODES: &str = "bBuwHhiIlLqQfd";
 
 fn type_error(message: &str) -> i64 {
     exc::raise_with_message(TYPE_ERROR, message)
@@ -98,7 +102,7 @@ pub(crate) fn array_class() -> i64 {
         return cached;
     }
     // Method name, native dispatch name, and maximum arity (including `self`).
-    let specs: [(&str, &'static str, usize); 20] = [
+    let specs: [(&str, &'static str, usize); 40] = [
         ("__init__", "array.__init__", 3),
         ("append", "array.append", 2),
         ("extend", "array.extend", 2),
@@ -111,6 +115,12 @@ pub(crate) fn array_class() -> i64 {
         ("tobytes", "array.tobytes", 1),
         ("frombytes", "array.frombytes", 2),
         ("tolist", "array.tolist", 1),
+        ("fromlist", "array.fromlist", 2),
+        ("tounicode", "array.tounicode", 1),
+        ("fromunicode", "array.fromunicode", 2),
+        ("buffer_info", "array.buffer_info", 1),
+        ("tofile", "array.tofile", 2),
+        ("fromfile", "array.fromfile", 3),
         ("byteswap", "array.byteswap", 1),
         ("__getitem__", "array.__getitem__", 2),
         ("__setitem__", "array.__setitem__", 3),
@@ -119,6 +129,20 @@ pub(crate) fn array_class() -> i64 {
         ("__contains__", "array.__contains__", 2),
         ("__repr__", "array.__repr__", 1),
         ("__eq__", "array.__eq__", 2),
+        ("__ne__", "array.__ne__", 2),
+        ("__lt__", "array.__lt__", 2),
+        ("__le__", "array.__le__", 2),
+        ("__gt__", "array.__gt__", 2),
+        ("__ge__", "array.__ge__", 2),
+        ("__add__", "array.__add__", 2),
+        ("__mul__", "array.__mul__", 2),
+        ("__rmul__", "array.__rmul__", 2),
+        ("__iadd__", "array.__iadd__", 2),
+        ("__imul__", "array.__imul__", 2),
+        ("__copy__", "array.__copy__", 1),
+        ("__deepcopy__", "array.__deepcopy__", 2),
+        ("__reduce_ex__", "array.__reduce_ex__", 2),
+        ("__sizeof__", "array.__sizeof__", 1),
     ];
     let mut methods = Vec::with_capacity(specs.len());
     let mut values = Vec::with_capacity(specs.len());
@@ -136,10 +160,11 @@ pub(crate) fn array_class() -> i64 {
     class
 }
 
-/// Module constants (`array` class and `typecodes`).
+/// Module constants (`array` class, `ArrayType` alias and `typecodes`).
 pub(crate) fn constant(name: &str) -> Option<i64> {
     match name {
-        "array" => Some(array_class()),
+        // `ArrayType` is documented as "an alias for array".
+        "array" | "ArrayType" => Some(array_class()),
         "typecodes" => Some(value::str_alloc(TYPECODES.to_string())),
         _ => None,
     }
@@ -349,7 +374,7 @@ fn encode_item(descr: Descr, v: i64) -> Option<[u8; 8]> {
             let x = float_item(v)?;
             Some(x.to_ne_bytes())
         }
-        'u' => {
+        'u' | 'w' => {
             let Some(text) = value::as_str(v) else {
                 type_error(&format!(
                     "array item must be a unicode character, not {}",
@@ -387,7 +412,7 @@ fn encode_item(descr: Descr, v: i64) -> Option<[u8; 8]> {
 /// Integer item conversion, matching CPython's per-code `PyArg_Parse`
 /// formatters and range checks.
 fn encode_integer(code: char, n: &BigInt) -> Option<[u8; 8]> {
-    if matches!(code, 'I' | 'L') {
+    if matches!(code, 'I' | 'L' | 'Q') {
         let Ok(x) = u64::try_from(n) else {
             if n.sign() == Sign::Minus {
                 overflow_error("can't convert negative value to unsigned int");
@@ -400,7 +425,11 @@ fn encode_integer(code: char, n: &BigInt) -> Option<[u8; 8]> {
             overflow_error("unsigned int is greater than maximum");
             return None;
         }
-        let size = if code == 'I' { 4 } else { ULONG_SIZE };
+        let size = match code {
+            'I' => 4,
+            'Q' => 8,
+            _ => ULONG_SIZE,
+        };
         return Some(unsigned_bytes(x, size));
     }
     let Ok(x) = i64::try_from(n) else {
@@ -484,6 +513,7 @@ fn encode_integer(code: char, n: &BigInt) -> Option<[u8; 8]> {
             Some(signed_bytes(x, 4))
         }
         'l' => Some(signed_bytes(x, LONG_SIZE)),
+        'q' => Some(signed_bytes(x, 8)),
         _ => None,
     }
 }
@@ -499,7 +529,7 @@ fn decode_item(descr: Descr, raw: &[u8]) -> i64 {
             Some(byte) => ops::int_result(*byte as i64),
             None => NONE,
         },
-        'u' => match read_unsigned(raw, descr.itemsize) {
+        'u' | 'w' => match read_unsigned(raw, descr.itemsize) {
             Some(code) => match u32::try_from(code).ok().and_then(char::from_u32) {
                 Some(ch) => value::str_alloc(ch.to_string()),
                 None => value_error(&format!(
@@ -514,6 +544,12 @@ fn decode_item(descr: Descr, raw: &[u8]) -> i64 {
         'I' => read_unsigned(raw, 4).map_or(NONE, |n| ops::int_result(n as i64)),
         'l' => read_signed(raw, LONG_SIZE).map_or(NONE, ops::int_result),
         'L' => match read_unsigned(raw, ULONG_SIZE) {
+            Some(n) if n <= i64::MAX as u64 => ops::int_result(n as i64),
+            Some(n) => value::bigint_new(BigInt::from(n)),
+            None => NONE,
+        },
+        'q' => read_signed(raw, 8).map_or(NONE, ops::int_result),
+        'Q' => match read_unsigned(raw, 8) {
             Some(n) if n <= i64::MAX as u64 => ops::int_result(n as i64),
             Some(n) => value::bigint_new(BigInt::from(n)),
             None => NONE,
@@ -782,7 +818,7 @@ fn initial_kind(init: i64, code: char) -> Initial {
 }
 
 /// Whether `v` is an `array.array` instance (or subclass instance).
-fn is_array(v: i64) -> bool {
+pub(crate) fn is_array(v: i64) -> bool {
     let Some(class) = value::instance_class_value(v) else {
         return false;
     };
@@ -1565,6 +1601,664 @@ fn eq_method(args: &[i64]) -> i64 {
 }
 
 // -------------------------------------------------------------------------
+// Buffer protocol
+// -------------------------------------------------------------------------
+
+/// Packed payload of an `array.array`, for the `struct`/`binascii` buffer
+/// readers. `None` for any other value.
+pub(crate) fn buffer_snapshot(value_arg: i64) -> Option<Vec<u8>> {
+    if !is_array(value_arg) {
+        return None;
+    }
+    raw_of(value_arg).map(<[u8]>::to_vec)
+}
+
+/// Byte length of an `array.array` payload.
+pub(crate) fn buffer_length(value_arg: i64) -> Option<usize> {
+    if !is_array(value_arg) {
+        return None;
+    }
+    raw_of(value_arg).map(<[u8]>::len)
+}
+
+/// Writes `payload` into the packed representation of `value_arg`.
+pub(crate) fn buffer_write(value_arg: i64, start: usize, payload: &[u8]) -> bool {
+    if !is_array(value_arg) {
+        return false;
+    }
+    let Some(data) = data_of(value_arg) else {
+        return false;
+    };
+    let Some(target) = value::bytearray_bytes_mut(data) else {
+        return false;
+    };
+    let Some(end) = start.checked_add(payload.len()) else {
+        return false;
+    };
+    if end > target.len() {
+        return false;
+    }
+    target[start..end].copy_from_slice(payload);
+    true
+}
+
+// -------------------------------------------------------------------------
+// Additional methods
+// -------------------------------------------------------------------------
+
+/// Builds an `array` of `class` with the given packed payload.
+fn build_class(class: i64, descr: Descr, raw: Vec<u8>) -> i64 {
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(std::slice::from_ref(&instance));
+    let code = value::str_alloc(descr.code.to_string());
+    value::instance_setattr(instance, CODE_ATTR.to_string(), code);
+    let typecode = value::str_alloc(descr.code.to_string());
+    value::instance_setattr(instance, "typecode".to_string(), typecode);
+    let itemsize = ops::int_result(descr.itemsize as i64);
+    value::instance_setattr(instance, "itemsize".to_string(), itemsize);
+    store_raw(instance, raw);
+    heap::release_roots(roots);
+    instance
+}
+
+/// Builds a new array with the receiver's class and type code.
+fn build_like(obj: i64, descr: Descr, raw: Vec<u8>) -> i64 {
+    let class = value::instance_class_value(obj).unwrap_or_else(array_class);
+    build_class(class, descr, raw)
+}
+
+/// `a.buffer_info()`: `(address, length)` of the packed payload.
+fn buffer_info_method(args: &[i64]) -> i64 {
+    let Ok((obj, descr)) = receiver(args, "array.buffer_info") else {
+        return NONE;
+    };
+    let length = items_len(obj, descr);
+    let address = data_of(obj)
+        .and_then(value::as_bytearray)
+        .map_or(0, |bytes| bytes.as_ptr() as usize);
+    let address_value = ops::int_result(address as i64);
+    let length_value = ops::int_result(length as i64);
+    let roots = heap::root_values(&[address_value, length_value]);
+    let result = value::tuple_new(vec![address_value, length_value]);
+    heap::release_roots(roots);
+    result
+}
+
+/// `a.fromlist(list)`.
+fn fromlist_method(args: &[i64]) -> i64 {
+    let Ok((obj, descr)) = receiver(args, "array.fromlist") else {
+        return NONE;
+    };
+    let Some(&list) = args.get(1) else {
+        return type_error("fromlist() takes exactly one argument (0 given)");
+    };
+    let Some(items) = value::as_list(list) else {
+        return type_error(&format!(
+            "fromlist() argument must be a list, not {}",
+            value::type_name_of(list)
+        ));
+    };
+    let items = items.to_vec();
+    push_sequence(obj, descr, &items)
+}
+
+/// `a.tounicode()`.
+fn tounicode_method(args: &[i64]) -> i64 {
+    let Ok((obj, descr)) = receiver(args, "array.tounicode") else {
+        return NONE;
+    };
+    if !matches!(descr.code, 'u' | 'w') {
+        return value_error("tounicode() may only be called on unicode type arrays ('u' or 'w')");
+    }
+    let raw = raw_snapshot(obj);
+    let mut text = String::with_capacity(raw.len() / descr.itemsize);
+    for chunk in raw.chunks(descr.itemsize) {
+        let item = decode_item(descr, chunk);
+        if exc::pending() {
+            return NONE;
+        }
+        match value::as_str(item) {
+            Some(ch) => text.push_str(ch),
+            None => return type_error("array payload is unavailable"),
+        }
+    }
+    value::str_alloc(text)
+}
+
+/// `a.fromunicode(str)`.
+fn fromunicode_method(args: &[i64]) -> i64 {
+    let Ok((obj, descr)) = receiver(args, "array.fromunicode") else {
+        return NONE;
+    };
+    if !matches!(descr.code, 'u' | 'w') {
+        return value_error("fromunicode() may only be called on unicode type arrays ('u' or 'w')");
+    }
+    let Some(&argument) = args.get(1) else {
+        return type_error("fromunicode() takes exactly one argument (0 given)");
+    };
+    let Some(text) = value::as_str(argument) else {
+        return type_error(&format!(
+            "fromunicode() argument must be str, not {}",
+            value::type_name_of(argument)
+        ));
+    };
+    for ch in text.chars() {
+        let encoded = unsigned_bytes(ch as u32 as u64, descr.itemsize);
+        if !push_raw(obj, &encoded[..descr.itemsize]) {
+            return type_error("array payload is unavailable");
+        }
+    }
+    NONE
+}
+
+/// `a.tofile(f)`: writes the packed payload in 64 KiB blocks.
+fn tofile_method(args: &[i64]) -> i64 {
+    let Ok((obj, _descr)) = receiver(args, "array.tofile") else {
+        return NONE;
+    };
+    let Some(&file) = args.get(1) else {
+        return type_error("tofile() takes exactly one argument (0 given)");
+    };
+    let raw = raw_snapshot(obj);
+    for chunk in raw.chunks(64 * 1024) {
+        let bytes = value::bytes_new(chunk.to_vec());
+        let roots = heap::root_values(std::slice::from_ref(&bytes));
+        let write = b"write";
+        let _ = crate::methods::call(file, write.as_ptr(), write.len(), 1, &bytes as *const i64);
+        heap::release_roots(roots);
+        if exc::pending() {
+            return NONE;
+        }
+    }
+    NONE
+}
+
+/// `a.fromfile(f, n)`: appends `n` items read from `f`.
+fn fromfile_method(args: &[i64]) -> i64 {
+    let Ok((obj, descr)) = receiver(args, "array.fromfile") else {
+        return NONE;
+    };
+    let Some(&file) = args.get(1) else {
+        return type_error("fromfile() takes exactly 2 arguments (1 given)");
+    };
+    let count = match ssize_arg(args.get(2).copied().unwrap_or(NONE)) {
+        Ok(count) => count,
+        Err(error) => return error,
+    };
+    if count < 0 {
+        return value_error("negative count");
+    }
+    let Some(bytes_requested) = (count as usize).checked_mul(descr.itemsize) else {
+        return exc::raise_with_message(MEMORY_ERROR, "array is too large");
+    };
+    let count_value = ops::int_result(bytes_requested as i64);
+    let roots = heap::root_values(std::slice::from_ref(&count_value));
+    let read = b"read";
+    let data = crate::methods::call(file, read.as_ptr(), read.len(), 1, &count_value as *const i64);
+    heap::release_roots(roots);
+    if exc::pending() {
+        return NONE;
+    }
+    let Some(data) = value::as_bytes(data).map(<[u8]>::to_vec) else {
+        return type_error("read() didn't return bytes");
+    };
+    let short = data.len() != bytes_requested;
+    let result = append_bytes(obj, descr, &data);
+    if exc::pending() {
+        return NONE;
+    }
+    if short {
+        return exc::raise_with_message(EOF_ERROR, "read() didn't return enough bytes");
+    }
+    result
+}
+
+/// `a + b`: concatenation of two arrays with the same type code.
+fn add_method(args: &[i64]) -> i64 {
+    let Ok((obj, descr)) = receiver(args, "array.__add__") else {
+        return NONE;
+    };
+    let Some(&other) = args.get(1) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    if !is_array(other) {
+        return value::NOT_IMPLEMENTED;
+    }
+    let Some(other_descr) = code_of(other) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    if other_descr.code != descr.code {
+        return type_error(&format!(
+            "can only append array (not \"{}\") to array",
+            value::type_name_of(other)
+        ));
+    }
+    let mut raw = raw_snapshot(obj);
+    raw.extend_from_slice(&raw_snapshot(other));
+    build_like(obj, descr, raw)
+}
+
+/// `a * n` / `n * a`: repetition.
+fn mul_method(args: &[i64]) -> i64 {
+    let Ok((obj, descr)) = receiver(args, "array.__mul__") else {
+        return NONE;
+    };
+    let Some(&factor) = args.get(1) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    let Some(count) = value::as_integer(factor) else {
+        return type_error(&format!(
+            "can't multiply sequence by non-int of type '{}'",
+            value::type_name_of(factor)
+        ));
+    };
+    if count <= 0 {
+        return build_like(obj, descr, Vec::new());
+    }
+    let raw = raw_snapshot(obj);
+    let mut out = Vec::with_capacity(raw.len().saturating_mul(count as usize));
+    for _ in 0..count {
+        out.extend_from_slice(&raw);
+    }
+    build_like(obj, descr, out)
+}
+
+/// `a += b`.
+fn iadd_method(args: &[i64]) -> i64 {
+    let Ok((obj, descr)) = receiver(args, "array.__iadd__") else {
+        return NONE;
+    };
+    let Some(&other) = args.get(1) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    if !is_array(other) {
+        return value::NOT_IMPLEMENTED;
+    }
+    let Some(other_descr) = code_of(other) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    if other_descr.code != descr.code {
+        return type_error(&format!(
+            "can only append array (not \"{}\") to array",
+            value::type_name_of(other)
+        ));
+    }
+    let extra = raw_snapshot(other);
+    if !push_raw(obj, &extra) {
+        return type_error("array payload is unavailable");
+    }
+    obj
+}
+
+/// `a *= n`.
+fn imul_method(args: &[i64]) -> i64 {
+    let Ok((obj, descr)) = receiver(args, "array.__imul__") else {
+        return NONE;
+    };
+    let Some(&factor) = args.get(1) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    let Some(count) = value::as_integer(factor) else {
+        return type_error(&format!(
+            "can't multiply sequence by non-int of type '{}'",
+            value::type_name_of(factor)
+        ));
+    };
+    let raw = raw_snapshot(obj);
+    let mut out = Vec::with_capacity(raw.len().saturating_mul(count.max(0) as usize));
+    for _ in 0..count.max(0) {
+        out.extend_from_slice(&raw);
+    }
+    store_raw(obj, out);
+    obj
+}
+
+/// Numeric/unicode ordering of two decoded items.
+fn compare_items(a: i64, b: i64) -> Option<std::cmp::Ordering> {
+    if let (Some(x), Some(y)) = (value::as_integer(a), value::as_integer(b)) {
+        return Some(x.cmp(&y));
+    }
+    if let (Some(x), Some(y)) = (value::as_str(a), value::as_str(b)) {
+        return Some(x.cmp(y));
+    }
+    let x = value::as_float(a)?;
+    let y = value::as_float(b)?;
+    x.partial_cmp(&y)
+}
+
+/// Comparison operators: `op` is `<`, `<=`, `>`, `>=`, `!=`.
+fn compare_method(args: &[i64], op: u8) -> i64 {
+    let Ok((obj, descr)) = receiver(args, "array comparison") else {
+        return NONE;
+    };
+    let Some(&other) = args.get(1) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    if !is_array(other) {
+        return value::NOT_IMPLEMENTED;
+    }
+    let Some(other_descr) = code_of(other) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    let left = raw_snapshot(obj);
+    let right = raw_snapshot(other);
+    let mut ordering = std::cmp::Ordering::Equal;
+    for index in 0..left.len() / descr.itemsize {
+        let a = decode_item(
+            descr,
+            &left[index * descr.itemsize..(index + 1) * descr.itemsize],
+        );
+        if exc::pending() {
+            return NONE;
+        }
+        if index >= right.len() / other_descr.itemsize {
+            ordering = std::cmp::Ordering::Greater;
+            break;
+        }
+        let b = decode_item(
+            other_descr,
+            &right[index * other_descr.itemsize..(index + 1) * other_descr.itemsize],
+        );
+        if exc::pending() {
+            return NONE;
+        }
+        match compare_items(a, b) {
+            Some(std::cmp::Ordering::Equal) => continue,
+            Some(order) => {
+                ordering = order;
+                break;
+            }
+            // Elements that do not order are only `!=`-comparable.
+            None => {
+                if op == 4 {
+                    return value::TRUE;
+                }
+                return value::NOT_IMPLEMENTED;
+            }
+        }
+    }
+    if ordering == std::cmp::Ordering::Equal
+        && left.len() / descr.itemsize != right.len() / other_descr.itemsize
+    {
+        ordering = (left.len() / descr.itemsize)
+            .cmp(&(right.len() / other_descr.itemsize));
+    }
+    let result = match op {
+        0 => ordering == std::cmp::Ordering::Less,
+        1 => ordering != std::cmp::Ordering::Greater,
+        2 => ordering == std::cmp::Ordering::Greater,
+        3 => ordering != std::cmp::Ordering::Less,
+        _ => ordering != std::cmp::Ordering::Equal,
+    };
+    value::bool_value(result)
+}
+
+/// `copy.copy(a)` / `copy.deepcopy(a)`.
+fn copy_method(args: &[i64], method: &str) -> i64 {
+    let Ok((obj, descr)) = receiver(args, method) else {
+        return NONE;
+    };
+    build_like(obj, descr, raw_snapshot(obj))
+}
+
+/// CPython's `typecode_to_mformat_code`, including the machine byte order.
+fn mformat_code(descr: Descr) -> i64 {
+    let big_endian = i64::from(cfg!(target_endian = "big"));
+    match descr.code {
+        'b' => 1,
+        'B' => 0,
+        'u' => {
+            if WCHAR_SIZE == 2 {
+                18 + big_endian
+            } else {
+                20 + big_endian
+            }
+        }
+        'w' => 20 + big_endian,
+        'h' => 4 + big_endian,
+        'H' => 2 + big_endian,
+        'i' => 8 + big_endian,
+        'I' => 6 + big_endian,
+        'l' => {
+            if LONG_SIZE == 8 {
+                12 + big_endian
+            } else {
+                8 + big_endian
+            }
+        }
+        'L' => {
+            if ULONG_SIZE == 8 {
+                10 + big_endian
+            } else {
+                6 + big_endian
+            }
+        }
+        'q' => 12 + big_endian,
+        'Q' => 10 + big_endian,
+        'f' => 14 + big_endian,
+        'd' => 16 + big_endian,
+        _ => -1,
+    }
+}
+
+/// `array._array_reconstructor(arraytype, typecode, mformat_code, items)`.
+fn reconstruct(args: &[i64]) -> i64 {
+    let argument = |index: usize| args.get(index).copied().unwrap_or(NONE);
+    let arraytype = argument(0);
+    if value::as_class(arraytype).is_none() {
+        return type_error(&format!(
+            "first argument must be a type object, not {}",
+            value::type_name_of(arraytype)
+        ));
+    }
+    if !value::is_subclass_of(arraytype, array_class()) {
+        return type_error(&format!(
+            "{} is not a subtype of array.array",
+            value::type_name_of(arraytype)
+        ));
+    }
+    let Some(code_text) = value::as_str(argument(1)) else {
+        return type_error(&format!(
+            "argument 2 must be a unicode character, not {}",
+            value::type_name_of(argument(1))
+        ));
+    };
+    let mut chars = code_text.chars();
+    let (Some(code), None) = (chars.next(), chars.next()) else {
+        return type_error(&format!(
+            "argument 2 must be a unicode character, not a string of length {}",
+            code_text.chars().count()
+        ));
+    };
+    let Some(descr) = descr(code) else {
+        return value_error("second argument must be a valid type code");
+    };
+    let Some(mformat) = value::as_integer(argument(2)) else {
+        return type_error("an integer is required");
+    };
+    if !(0..=21).contains(&mformat) {
+        return value_error("third argument must be a valid machine format code.");
+    }
+    let items = argument(3);
+    let Some(data) = value::as_bytes(items).map(<[u8]>::to_vec) else {
+        return type_error(&format!(
+            "fourth argument should be bytes, not {}",
+            value::type_name_of(items)
+        ));
+    };
+    let class = arraytype;
+    // Fast path: the bytes already use this machine's representation.
+    if mformat == mformat_code(descr) {
+        if !data.len().is_multiple_of(descr.itemsize) {
+            return value_error("string length not a multiple of item size");
+        }
+        return build_class(class, descr, data);
+    }
+    // Slow path: decode the foreign representation into Python values.
+    let (item_size, signed) = match mformat {
+        0 | 1 => (1usize, mformat == 1),
+        2..=5 => (2, mformat >= 4),
+        6..=9 => (4, mformat >= 8),
+        10..=13 => (8, mformat >= 12),
+        14 | 15 => (4, false),
+        16 | 17 => (8, false),
+        18 | 19 => (2, false),
+        _ => (4, false),
+    };
+    if mformat <= 13 && !data.len().is_multiple_of(item_size) {
+        return value_error("string length not a multiple of item size");
+    }
+    if mformat >= 18 && !data.len().is_multiple_of(item_size) {
+        return value_error("string length not a multiple of item size");
+    }
+    match mformat {
+        14 | 15 | 16 | 17 => {
+            // IEEE floats: decode into a list of Python floats.
+            let little = mformat % 2 == 0;
+            let mut values = Vec::with_capacity(data.len() / item_size);
+            for chunk in data.chunks(item_size) {
+                let number = if item_size == 4 {
+                    let raw = if little {
+                        u32::from_le_bytes(chunk.try_into().unwrap_or_default())
+                    } else {
+                        u32::from_be_bytes(chunk.try_into().unwrap_or_default())
+                    };
+                    f64::from(f32::from_bits(raw))
+                } else {
+                    let raw = if little {
+                        u64::from_le_bytes(chunk.try_into().unwrap_or_default())
+                    } else {
+                        u64::from_be_bytes(chunk.try_into().unwrap_or_default())
+                    };
+                    f64::from_bits(raw)
+                };
+                values.push(value::float_new(number));
+            }
+            return construct(&[value::str_alloc(code.to_string()), value::list_new(values)]);
+        }
+        18..=21 => {
+            // UTF-16/UTF-32: decode to a `str` and let the constructor pack it.
+            let little = mformat % 2 == 0;
+            let mut text = String::new();
+            let mut units = Vec::new();
+            for chunk in data.chunks(item_size) {
+                if item_size == 2 {
+                    let unit = if little {
+                        u16::from_le_bytes(chunk.try_into().unwrap_or_default())
+                    } else {
+                        u16::from_be_bytes(chunk.try_into().unwrap_or_default())
+                    };
+                    units.push(u32::from(unit));
+                } else {
+                    units.push(if little {
+                        u32::from_le_bytes(chunk.try_into().unwrap_or_default())
+                    } else {
+                        u32::from_be_bytes(chunk.try_into().unwrap_or_default())
+                    });
+                }
+            }
+            if item_size == 2 {
+                for decoded in char::decode_utf16(units.iter().map(|unit| *unit as u16)) {
+                    match decoded {
+                        Ok(ch) => text.push(ch),
+                        Err(_) => return value_error("invalid UTF-16 data"),
+                    }
+                }
+            } else {
+                for unit in units {
+                    match char::from_u32(unit) {
+                        Some(ch) => text.push(ch),
+                        None => return value_error("invalid UTF-32 data"),
+                    }
+                }
+            }
+            return construct(&[value::str_alloc(code.to_string()), value::str_alloc(text)]);
+        }
+        _ => {}
+    }
+    // Integers: re-pack each foreign-order item into this machine's layout.
+    let big_endian = mformat % 2 == 1;
+    let mut packed = Vec::with_capacity(data.len());
+    for chunk in data.chunks(item_size) {
+        let mut bytes = [0u8; 8];
+        if big_endian {
+            bytes[8 - item_size..].copy_from_slice(chunk);
+        } else {
+            bytes[..item_size].copy_from_slice(chunk);
+        }
+        let raw = if big_endian {
+            u64::from_be_bytes(bytes)
+        } else {
+            u64::from_le_bytes(bytes)
+        };
+        let item_value = if signed {
+            let shift = 64 - item_size * 8;
+            ops::int_result(((raw << shift) as i64) >> shift)
+        } else if raw > i64::MAX as u64 {
+            value::bigint_new(BigInt::from(raw))
+        } else {
+            ops::int_result(raw as i64)
+        };
+        let Some(encoded) = encode_item(descr, item_value) else {
+            return NONE;
+        };
+        packed.extend_from_slice(&encoded[..descr.itemsize]);
+    }
+    build_class(class, descr, packed)
+}
+
+/// Cached value of the `_array_reconstructor` module function.
+pub(crate) fn reconstructor_value() -> i64 {
+    const KEY: &str = "array._array_reconstructor";
+    if let Some(value) = globals::registry_get(KEY) {
+        return value;
+    }
+    let function = value::native_function_new("array", "_array_reconstructor", 4);
+    globals::registry_set(KEY, function);
+    function
+}
+
+/// `a.__reduce_ex__(protocol)`.
+fn reduce_ex_method(args: &[i64]) -> i64 {
+    let Ok((obj, descr)) = receiver(args, "array.__reduce_ex__") else {
+        return NONE;
+    };
+    let protocol = args.get(1).copied().and_then(value::as_integer).unwrap_or(0);
+    let typecode = value::str_alloc(descr.code.to_string());
+    let roots = heap::root_values(std::slice::from_ref(&typecode));
+    if protocol < 3 {
+        let items = tolist_snapshot(obj, descr);
+        if exc::pending() {
+            heap::release_roots(roots);
+            return NONE;
+        }
+        let class = array_class();
+        let state = value::tuple_new(vec![typecode, items]);
+        let result = value::tuple_new(vec![class, state]);
+        heap::release_roots(roots);
+        return result;
+    }
+    let payload = value::bytes_new(raw_snapshot(obj));
+    let mformat = ops::int_result(mformat_code(descr));
+    let class = array_class();
+    let state = value::tuple_new(vec![class, typecode, mformat, payload]);
+    let callable = reconstructor_value();
+    let result = value::tuple_new(vec![callable, state]);
+    heap::release_roots(roots);
+    result
+}
+
+/// `a.__sizeof__()`.
+fn sizeof_method(args: &[i64]) -> i64 {
+    let Ok((obj, descr)) = receiver(args, "array.__sizeof__") else {
+        return NONE;
+    };
+    let payload = items_len(obj, descr) * descr.itemsize;
+    let base = std::mem::size_of::<usize>() * 5;
+    ops::int_result((base + payload) as i64)
+}
+
+// -------------------------------------------------------------------------
 // Dispatch
 // -------------------------------------------------------------------------
 
@@ -1627,6 +2321,26 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "array.__contains__" => contains_method(args),
         "array.__repr__" => repr_method(args),
         "array.__eq__" => eq_method(args),
+        "array.__ne__" => compare_method(args, 4),
+        "array.__lt__" => compare_method(args, 0),
+        "array.__le__" => compare_method(args, 1),
+        "array.__gt__" => compare_method(args, 2),
+        "array.__ge__" => compare_method(args, 3),
+        "array.__add__" => add_method(args),
+        "array.__iadd__" => iadd_method(args),
+        "array.__mul__" | "array.__rmul__" => mul_method(args),
+        "array.__imul__" => imul_method(args),
+        "array.__copy__" => copy_method(args, "array.__copy__"),
+        "array.__deepcopy__" => copy_method(args, "array.__deepcopy__"),
+        "array.__reduce_ex__" => reduce_ex_method(args),
+        "array.__sizeof__" => sizeof_method(args),
+        "array.fromlist" => fromlist_method(args),
+        "array.tounicode" => tounicode_method(args),
+        "array.fromunicode" => fromunicode_method(args),
+        "array.buffer_info" => buffer_info_method(args),
+        "array.tofile" => tofile_method(args),
+        "array.fromfile" => fromfile_method(args),
+        "_array_reconstructor" => reconstruct(args),
         _ => attribute_error(function),
     }
 }

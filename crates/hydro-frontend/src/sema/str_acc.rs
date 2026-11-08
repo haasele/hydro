@@ -500,6 +500,12 @@ fn stmt_use(stmt: &Stmt, local: LocalId) -> Use {
             handlers,
             else_body,
             finally_body,
+        }
+        | StmtKind::TryStar {
+            body,
+            handlers,
+            else_body,
+            finally_body,
         } => {
             let mut use_ = stmts_use(body, local);
             for handler in handlers {

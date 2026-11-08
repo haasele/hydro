@@ -194,6 +194,13 @@ fn clear() -> i64 {
     NONE
 }
 
+/// `atexit._ncallbacks()`: the number of registered callbacks (LIFO stack
+/// depth), the private query CPython's `test_atexit` uses.
+fn ncallbacks() -> i64 {
+    let state = state();
+    crate::ops::int_result(state.entries.len() as i64)
+}
+
 /// Dispatches a native `atexit` function. Arity is enforced by the spec.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -201,6 +208,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "unregister" => unregister(args.first().copied().unwrap_or(NONE)),
         "_run_exitfuncs" => run_exitfuncs(),
         "_clear" => clear(),
+        "_ncallbacks" => ncallbacks(),
         _ => attribute_error(function),
     }
 }

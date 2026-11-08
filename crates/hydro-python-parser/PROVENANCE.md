@@ -50,7 +50,25 @@ The generated LALR grammar (`src/python.lalrpop`, `src/python.rs`) is
   (`TemplateString`, `TemplateConstant`, `Interpolation`), placeholder
   encoding/decoding, and the resolver that turns placeholder `Name` nodes into
   a `ParsedModule` (AST + `Vec<TemplateString>` side table).
+- `src/type_params.rs` (new): the two Python 3.14 syntax extensions the
+  vendored AST and the pre-generated LALR tables cannot express, applied as a
+  token-stream rewrite in front of the parser (the same tagged side-table
+  approach `src/template.rs` uses, so the tables stay byte-identical):
+  - PEP 696 type-parameter defaults. `= <default>` is cut out of `[T = int]`,
+    `[T: int = int]`, `[*Ts = int]` and `[**P = int]`, so the parser sees the
+    PEP 695 spelling it already knows, and the default expression is re-parsed
+    from the source into `TypeParamDefaults`, keyed by the start of the
+    parameter's AST range. Exposed as `ParsedModule::type_param_defaults`.
+  - PEP 758 unparenthesized exception lists. `except A, B:` and
+    `except* A, B:` get a synthetic `(`/`)` around the list, producing exactly
+    the tuple AST CPython builds for the parenthesized spelling. Bare
+    `except:`, single-expression clauses and the CPython-invalid
+    `except A, B as e:` are untouched.
 - `src/parser.rs`: added `parse_module_with_templates`.
+- `src/parser.rs`: `parse_starts_at`, `parse` and `parse_module_with_templates`
+  now lex, apply `type_params::rewrite_tokens` and parse the rewritten stream.
+  `src/python.lalrpop` and `src/python.rs` are unchanged, so the SHA-3 stamp
+  still matches.
 - `src/gen/parse.rs` and the `Parse` implementations in `src/parser.rs`: added
   the explicit anonymous lifetime `'_` to
   `SoftKeywordTransformer<Lexer<std::str::Chars<'_>>>` return types. This is

@@ -379,6 +379,10 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             [fp] => parse_headers_from_fp(*fp),
             _ => type_error("parse_headers() takes 1 argument"),
         },
+        "client_create_https_context" => match args {
+            [version] => create_https_context(*version),
+            _ => type_error("_create_https_context() takes 1 argument"),
+        },
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'http' has no attribute '{function}'"),
@@ -483,6 +487,18 @@ pub(crate) fn constant(name: &str) -> i64 {
             function
         }
         "responses" => responses_dict(),
+        // `_create_https_context(http_version)`: the context factory
+        // `HTTPSConnection` and `urllib.request` share. The value carries its
+        // trampoline directly so it works as a module attribute.
+        "_create_https_context" => {
+            let function = value::native_function_new("http", "client_create_https_context", 1);
+            value::function_set_signature(function, vec![client_positional("http_version")]);
+            value::function_set_full_entry(
+                function,
+                client_create_https_context_entry as *const () as usize,
+            );
+            function
+        }
         "__all__" => client_all(),
         "HTTP_PORT" => client_integer(80),
         "HTTPS_PORT" => client_integer(443),
@@ -4087,6 +4103,53 @@ extern "C" fn connection_init_entry(argv: *const i64) -> i64 {
     connection_init_impl(args[0], args[1], args[2], args[3], args[4], args[5])
 }
 
+/// `http.client._create_https_context(http_version)`.
+///
+/// CPython's factory starts from `ssl._create_default_https_context()`,
+/// selects HTTP/1.1 with ALPN when the connection speaks HTTP/1.1, and enables
+/// TLS 1.3 post-handshake authentication when the context supports it. The
+/// runtime's native TLS client can offer ALPN and record the PHA request, so
+/// the same context is returned to `HTTPSConnection` and to
+/// `urllib.request`, which additionally tweaks `check_hostname`.
+fn create_https_context(http_version: i64) -> i64 {
+    let context = socket::ssl_call("_create_default_https_context", &[]);
+    if exc::pending() {
+        return context;
+    }
+    let root = heap::root_values(std::slice::from_ref(&context));
+    if http_version == 11 {
+        let protocol = client_text("http/1.1");
+        let protocol_root = heap::root_values(std::slice::from_ref(&protocol));
+        let protocols = value::list_new(vec![protocol]);
+        heap::release_roots(protocol_root);
+        let protocols_root = heap::root_values(std::slice::from_ref(&protocols));
+        client_invoke(context, "set_alpn_protocols", &[protocols]);
+        heap::release_roots(protocols_root);
+        if exc::pending() {
+            heap::release_roots(root);
+            return NONE;
+        }
+    }
+    // CPython checks `is not None`, so a context without the attribute is
+    // left untouched; the native context always reports a boolean.
+    if client_attribute(context, "post_handshake_auth") != NONE {
+        client_set(context, "post_handshake_auth", value::TRUE);
+        if exc::pending() {
+            heap::release_roots(root);
+            return NONE;
+        }
+    }
+    heap::release_roots(root);
+    context
+}
+
+/// Native entry for the module-level `_create_https_context(http_version)`.
+extern "C" fn client_create_https_context_entry(argv: *const i64) -> i64 {
+    // SAFETY: one argument slot (the HTTP version number).
+    let version = unsafe { *argv };
+    create_https_context(version)
+}
+
 extern "C" fn https_init_entry(argv: *const i64) -> i64 {
     // SAFETY: seven declared parameter slots (self, host, port, timeout,
     // source_address, context, blocksize).
@@ -4097,7 +4160,8 @@ extern "C" fn https_init_entry(argv: *const i64) -> i64 {
         return NONE;
     }
     let context = if args[5] == NONE {
-        let created = socket::ssl_call("_create_default_https_context", &[]);
+        let vsn = value::as_integer(client_attribute(instance, "_http_vsn")).unwrap_or(11);
+        let created = create_https_context(client_integer(vsn));
         if exc::pending() {
             return NONE;
         }

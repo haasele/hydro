@@ -26,6 +26,7 @@ use std::io::Write;
 
 use crate::builtins;
 use crate::container;
+use crate::core::globals;
 use crate::exc::{self, ATTRIBUTE_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::methods::KeywordArgs;
 use crate::value::{self, NONE};
@@ -233,6 +234,14 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "ArgumentParser" => new_parser(args),
         "Namespace" => namespace_call(args, &[]),
         "FileType" => file_type(args),
+        // `argparse._` is `gettext.gettext` (the identity translation).
+        "_" => args.first().copied().unwrap_or(NONE),
+        // CPython's action-name helper (`_get_action_name`).
+        "_get_action_name" => args
+            .first()
+            .map_or(NONE, |&argument| get_action_name(argument)),
+        "ArgumentError.__init__" => argument_error_init(args),
+        "ArgumentError.__str__" => argument_error_str(args),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'argparse' has no attribute '{function}'"),
@@ -308,10 +317,164 @@ pub(crate) fn constant(name: &str) -> i64 {
         | "HelpFormatter"
         | "Action"
         | "BooleanOptionalAction" => value::class_new(name.to_string(), NONE, Vec::new()),
+        // CPython's `PARSER` nargs sentinel.
+        "PARSER" => text_value("A..."),
+        // `argparse._sys` is the `sys` module value (`mock.patch` rewrites
+        // `argparse._sys.exit`).
+        "_sys" => super::module_value_by_name("sys"),
+        "ArgumentError" => argument_error_class(),
+        "ArgumentTypeError" => argument_type_error_class(),
+        "__all__" => argparse_all_names(),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'argparse' has no attribute '{name}'"),
         ),
+    }
+}
+
+// -------------------------------------------------------------------------
+// Module classes and private helpers
+// -------------------------------------------------------------------------
+
+/// `argparse.ArgumentError`: an `Exception` subclass carrying
+/// `argument_name` and `message`.
+pub(crate) fn argument_error_class() -> i64 {
+    const KEY: &str = "argparse.ArgumentError";
+    if let Some(class) = globals::registry_get(KEY) {
+        return class;
+    }
+    let init = value::native_function_new("argparse", "ArgumentError.__init__", 3);
+    let str_fn = value::native_function_new("argparse", "ArgumentError.__str__", 1);
+    let class = value::class_new_full(
+        "ArgumentError".to_string(),
+        exc::exception_class(exc::EXCEPTION),
+        vec![
+            ("__init__".to_string(), init, hydro_ir::MethodKind::Normal),
+            ("__str__".to_string(), str_fn, hydro_ir::MethodKind::Normal),
+        ],
+        vec![
+            ("argument_name".to_string(), NONE),
+            ("message".to_string(), text_value("")),
+        ],
+    );
+    let roots = crate::heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    crate::heap::release_roots(roots);
+    class
+}
+
+/// `argparse.ArgumentTypeError`: the `Exception` a `type=` callable raises.
+pub(crate) fn argument_type_error_class() -> i64 {
+    const KEY: &str = "argparse.ArgumentTypeError";
+    if let Some(class) = globals::registry_get(KEY) {
+        return class;
+    }
+    let class = value::class_new_full(
+        "ArgumentTypeError".to_string(),
+        exc::exception_class(exc::EXCEPTION),
+        Vec::new(),
+        Vec::new(),
+    );
+    let roots = crate::heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    crate::heap::release_roots(roots);
+    class
+}
+
+/// `argparse.__all__`, in CPython's order.
+fn argparse_all_names() -> i64 {
+    const KEY: &str = "argparse.__all__";
+    if let Some(list) = globals::registry_get(KEY) {
+        return list;
+    }
+    let names = [
+        "ArgumentParser",
+        "ArgumentError",
+        "ArgumentTypeError",
+        "FileType",
+        "HelpFormatter",
+        "ArgumentDefaultsHelpFormatter",
+        "RawDescriptionHelpFormatter",
+        "RawTextHelpFormatter",
+        "MetavarTypeHelpFormatter",
+        "Namespace",
+        "Action",
+        "BooleanOptionalAction",
+        "SUPPRESS",
+    ];
+    let values = names.iter().map(|name| text_value(*name)).collect();
+    let list = value::list_new(values);
+    globals::registry_set(KEY, list);
+    list
+}
+
+/// Reads an attribute, clearing an `AttributeError` so the caller can fall
+/// through to the next candidate.
+fn try_action_attr(argument: i64, name: &str) -> Option<i64> {
+    let item = crate::core::methods::getattr(argument, name.as_ptr(), name.len());
+    if exc::pending() {
+        if exc::pending_tag() == i64::from(ATTRIBUTE_ERROR) {
+            exc::clear();
+        }
+        return None;
+    }
+    Some(item)
+}
+
+/// `argparse._get_action_name(argument)`: the option strings joined with `/`,
+/// else the metavar, else the dest.
+pub(crate) fn get_action_name(argument: i64) -> i64 {
+    if argument == NONE {
+        return NONE;
+    }
+    if let Some(options) = try_action_attr(argument, "option_strings") {
+        if let Some(items) = value::as_list(options) {
+            let names: Vec<&str> = items.iter().filter_map(|&item| value::as_str(item)).collect();
+            if !names.is_empty() {
+                return text_value(&names.join("/"));
+            }
+        }
+    }
+    if let Some(metavar) = try_action_attr(argument, "metavar") {
+        if let Some(name) = value::as_str(metavar) {
+            if name != SUPPRESS {
+                return text_value(name);
+            }
+        }
+    }
+    if let Some(dest) = try_action_attr(argument, "dest") {
+        if let Some(name) = value::as_str(dest) {
+            if name != SUPPRESS {
+                return text_value(name);
+            }
+        }
+    }
+    NONE
+}
+
+/// `ArgumentError(argument, message)`.
+fn argument_error_init(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return type_error("ArgumentError.__init__() missing self");
+    };
+    let argument = args.get(1).copied().unwrap_or(NONE);
+    let message = args.get(2).copied().unwrap_or_else(|| text_value(""));
+    let name = get_action_name(argument);
+    let roots = crate::heap::root_values(&[instance, name, message]);
+    value::instance_setattr(instance, "argument_name".to_string(), name);
+    value::instance_setattr(instance, "message".to_string(), message);
+    crate::heap::release_roots(roots);
+    NONE
+}
+
+/// `ArgumentError.__str__`: the stored message.
+fn argument_error_str(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return text_value("");
+    };
+    match try_action_attr(instance, "message") {
+        Some(message) if value::as_str(message).is_some() => message,
+        _ => text_value(""),
     }
 }
 
@@ -532,6 +695,10 @@ pub(crate) fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
         "get_default" => get_default(obj, args),
         "parse_args" => parse(obj, args, &[], false),
         "parse_known_args" => parse(obj, args, &[], true),
+        // The intermixed spellings share the same scanner: this parser already
+        // accepts optionals and positionals in any order.
+        "parse_intermixed_args" => parse(obj, args, &[], false),
+        "parse_known_intermixed_args" => parse(obj, args, &[], true),
         "print_help" => print_help_method(obj, args),
         "print_usage" => print_usage_method(obj, args),
         "format_help" => text_value(&format_help(obj)),
@@ -566,6 +733,8 @@ pub(crate) fn method_kw(obj: i64, name: &str, args: &mut [i64], keywords: &Keywo
         }
         "parse_args" => parse(obj, args, &keywords.items, false),
         "parse_known_args" => parse(obj, args, &keywords.items, true),
+        "parse_intermixed_args" => parse(obj, args, &keywords.items, false),
+        "parse_known_intermixed_args" => parse(obj, args, &keywords.items, true),
         "print_help" => print_help_method(obj, args),
         "print_usage" => print_usage_method(obj, args),
         "format_help" | "format_usage" => {
@@ -1374,13 +1543,28 @@ fn fail(_parser: i64, view: &View, tag: u32, message: &str) -> i64 {
         return exc::raise_with_message(tag, message);
     }
     if !view.exit_on_error {
-        return exc::raise_with_message(VALUE_ERROR, message);
+        return raise_argument_error(NONE, message);
     }
     print_usage_to_stderr(view);
     let mut stderr = std::io::stderr();
     let _ = writeln!(stderr, "{}: error: {}", view.prog, message);
     let _ = stderr.flush();
     exc::raise_exit(tagged_int(2))
+}
+
+/// Raises `argparse.ArgumentError(argument, message)`; used for
+/// `exit_on_error=False` and for conflicts detected while defining arguments.
+fn raise_argument_error(argument: i64, message: &str) -> i64 {
+    let class = argument_error_class();
+    let text = text_value(message);
+    let roots = crate::heap::root_values(&[class, text, argument]);
+    let argv = [argument, text];
+    let instance = crate::builtins::call(class, argv.len(), argv.as_ptr());
+    crate::heap::release_roots(roots);
+    if exc::pending() {
+        return NONE;
+    }
+    exc::raise_value(instance)
 }
 
 fn print_usage_to_stderr(view: &View) {
@@ -1488,7 +1672,23 @@ fn exit_method(_parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
             let _ = stdout.flush();
         }
     }
-    exc::raise_exit(status)
+    if status == NONE {
+        status = tagged_int(0);
+    }
+    // CPython's `exit` calls `_sys.exit`, which `unittest.mock` patches in the
+    // test suite. Route through the module attribute so the patch takes effect
+    // (a patched exit returns normally instead of raising `SystemExit`).
+    let sys = super::module_value_by_name("sys");
+    let exit = crate::core::methods::getattr(sys, b"exit".as_ptr(), 4);
+    if exc::pending() {
+        exc::clear();
+        return exc::raise_exit(status);
+    }
+    let _ = crate::core::builtins::call(exit, 1, [status].as_ptr());
+    if exc::pending() {
+        return NONE;
+    }
+    NONE
 }
 
 /// `parse_args`/`parse_known_args`: binds `args` and `namespace`.

@@ -23,6 +23,13 @@
 //!
 //! `strftime` implements the common CPython directives plus the `-`, `_`, `0`,
 //! width and `^` modifiers; unknown directives are copied through unchanged.
+//! `%z`/`%Z` come from the value's `tzinfo` (empty for a naive value) and `%s`
+//! subtracts the reported offset.
+//!
+//! Classmethods: `date`/`datetime` implement `today`, `fromtimestamp`,
+//! `combine`, `fromordinal`, `fromisocalendar`, `strptime` and `isocalendar`;
+//! `strptime` delegates to the pure-Python `_strptime` helpers when that
+//! module is loaded, exactly like CPython's C implementation.
 //!
 //! Time is taken from [`SystemTime`] and interpreted as UTC. A `tzinfo` value
 //! is stored and consulted for `utcoffset`/`isoformat`/`timestamp`, but
@@ -66,6 +73,13 @@ const DATE_TODAY_METHOD: &str = "_date_today";
 const TODAY_METHOD: &str = "_datetime_today";
 const FROMTIMESTAMP_METHOD: &str = "_datetime_fromtimestamp";
 const COMBINE_METHOD: &str = "_datetime_combine";
+const DATE_FROMORDINAL_METHOD: &str = "_date_fromordinal";
+const DATETIME_FROMORDINAL_METHOD: &str = "_datetime_fromordinal";
+const DATE_FROMISOCALENDAR_METHOD: &str = "_date_fromisocalendar";
+const DATETIME_FROMISOCALENDAR_METHOD: &str = "_datetime_fromisocalendar";
+const DATE_STRPTIME_METHOD: &str = "_date_strptime";
+const DATETIME_STRPTIME_METHOD: &str = "_datetime_strptime";
+const ISOCALENDAR_METHOD: &str = "_datetime_isocalendar";
 const STRFTIME_METHOD: &str = "_datetime_strftime";
 const ISOFORMAT_METHOD: &str = "_datetime_isoformat";
 const DATE_METHOD: &str = "_datetime_date";
@@ -104,6 +118,9 @@ const MAXYEAR: i64 = 9_999;
 
 /// Days between 0001-01-01 (ordinal 1) and 1970-01-01 (`toordinal()` 719_163).
 const ORDINAL_EPOCH_OFFSET: i64 = 719_162;
+
+/// `date.max.toordinal()`: the last one-based ordinal in the valid range.
+const MAX_ORDINAL: i64 = 3_652_059;
 
 /// Seconds in a day.
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -308,6 +325,30 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
+/// Year for an out-of-range [`MAX_ORDINAL`] ordinal, computed in `i128` so an
+/// `i64::MAX` input cannot overflow `civil_from_days`.
+fn year_for_ordinal(ordinal: i64) -> i128 {
+    let days = i128::from(ordinal) - 1 - i128::from(ORDINAL_EPOCH_OFFSET);
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_position = (5 * day_of_year + 2) / 153;
+    let month = if month_position < 10 {
+        month_position + 3
+    } else {
+        month_position - 9
+    };
+    if month <= 2 {
+        year + 1
+    } else {
+        year
+    }
+}
+
 /// Days elapsed in `year` before `month` (ignoring leap-day adjustment).
 const MONTH_STARTS: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
 
@@ -416,6 +457,20 @@ fn date_class() -> i64 {
         entry("toordinal", TOORDINAL_METHOD, 1, MethodKind::Normal),
         entry("replace", REPLACE_METHOD, 1, MethodKind::Normal),
         entry("today", DATE_TODAY_METHOD, 0, MethodKind::Staticmethod),
+        entry(
+            "fromordinal",
+            DATE_FROMORDINAL_METHOD,
+            1,
+            MethodKind::Staticmethod,
+        ),
+        entry(
+            "fromisocalendar",
+            DATE_FROMISOCALENDAR_METHOD,
+            3,
+            MethodKind::Staticmethod,
+        ),
+        entry("strptime", DATE_STRPTIME_METHOD, 2, MethodKind::Staticmethod),
+        entry("isocalendar", ISOCALENDAR_METHOD, 1, MethodKind::Normal),
         entry("__repr__", REPR_METHOD, 1, MethodKind::Normal),
         entry("__str__", STR_METHOD, 1, MethodKind::Normal),
         entry("__eq__", EQ_METHOD, 2, MethodKind::Normal),
@@ -522,6 +577,25 @@ fn datetime_class() -> i64 {
             MethodKind::Staticmethod,
         ),
         entry("combine", COMBINE_METHOD, 2, MethodKind::Staticmethod),
+        entry(
+            "fromordinal",
+            DATETIME_FROMORDINAL_METHOD,
+            1,
+            MethodKind::Staticmethod,
+        ),
+        entry(
+            "fromisocalendar",
+            DATETIME_FROMISOCALENDAR_METHOD,
+            3,
+            MethodKind::Staticmethod,
+        ),
+        entry(
+            "strptime",
+            DATETIME_STRPTIME_METHOD,
+            2,
+            MethodKind::Staticmethod,
+        ),
+        entry("isocalendar", ISOCALENDAR_METHOD, 1, MethodKind::Normal),
         entry("strftime", STRFTIME_METHOD, 2, MethodKind::Normal),
         entry("isoformat", ISOFORMAT_METHOD, 2, MethodKind::Normal),
         entry("date", DATE_METHOD, 1, MethodKind::Normal),
@@ -1491,7 +1565,12 @@ impl Piece {
 
 /// Renders one directive (without flags or width), or `None` when the
 /// directive is unsupported.
-fn directive(parts: &Parts, conversion: char) -> Option<Piece> {
+fn directive(
+    parts: &Parts,
+    conversion: char,
+    offset: Option<i128>,
+    name: Option<&str>,
+) -> Option<Piece> {
     let weekday = iso_weekday(parts.year, parts.month, parts.day) as usize - 1;
     let piece = match conversion {
         '%' => Piece::padded("%".to_string(), 0, ' '),
@@ -1537,9 +1616,20 @@ fn directive(parts: &Parts, conversion: char) -> Option<Piece> {
             ' ',
         ),
         'B' => Piece::padded(MONTH_NAMES[parts.month as usize - 1].to_string(), 0, ' '),
-        'z' => Piece::padded("+0000".to_string(), 0, ' '),
-        'Z' => Piece::padded("UTC".to_string(), 0, ' '),
-        's' => Piece::number(unix_seconds(parts), 0),
+        'z' => Piece::padded(
+            offset.map(offset_text).unwrap_or_default(),
+            0,
+            ' ',
+        ),
+        'Z' => Piece::padded(name.unwrap_or("").to_string(), 0, ' '),
+        's' => {
+            let base = unix_seconds(parts);
+            let seconds = match offset {
+                Some(offset) => base - (offset / i128::from(MICROS_PER_SECOND)) as i64,
+                None => base,
+            };
+            Piece::number(seconds, 0)
+        }
         'V' => Piece::number(i64::from(iso_week(parts).1), 2),
         'G' => Piece::number(iso_week(parts).0, 4),
         'g' => Piece::number(iso_week(parts).0.rem_euclid(100), 2),
@@ -1552,13 +1642,17 @@ fn directive(parts: &Parts, conversion: char) -> Option<Piece> {
             let week = (day_of_year(parts) as i64 + 6 - weekday as i64).div_euclid(7);
             Piece::number(week, 2)
         }
-        'c' => Piece::padded(format(parts, "%a %b %e %H:%M:%S %Y"), 0, ' '),
-        'x' => Piece::padded(format(parts, "%m/%d/%y"), 0, ' '),
-        'X' => Piece::padded(format(parts, "%H:%M:%S"), 0, ' '),
-        'D' => Piece::padded(format(parts, "%m/%d/%y"), 0, ' '),
-        'F' => Piece::padded(format(parts, "%Y-%m-%d"), 0, ' '),
-        'T' => Piece::padded(format(parts, "%H:%M:%S"), 0, ' '),
-        'R' => Piece::padded(format(parts, "%H:%M"), 0, ' '),
+        'c' => Piece::padded(
+            format(parts, "%a %b %e %H:%M:%S %Y", offset, name),
+            0,
+            ' ',
+        ),
+        'x' => Piece::padded(format(parts, "%m/%d/%y", offset, name), 0, ' '),
+        'X' => Piece::padded(format(parts, "%H:%M:%S", offset, name), 0, ' '),
+        'D' => Piece::padded(format(parts, "%m/%d/%y", offset, name), 0, ' '),
+        'F' => Piece::padded(format(parts, "%Y-%m-%d", offset, name), 0, ' '),
+        'T' => Piece::padded(format(parts, "%H:%M:%S", offset, name), 0, ' '),
+        'R' => Piece::padded(format(parts, "%H:%M", offset, name), 0, ' '),
         _ => return None,
     };
     Some(piece)
@@ -1585,7 +1679,12 @@ fn padded(text: &str, width: usize, pad: char) -> String {
 }
 
 /// Renders a datetime with a `strftime`-style format.
-fn format(parts: &Parts, pattern: &str) -> String {
+fn format(
+    parts: &Parts,
+    pattern: &str,
+    offset: Option<i128>,
+    name: Option<&str>,
+) -> String {
     let mut out = String::with_capacity(pattern.len() + 8);
     let mut rest = pattern;
     while let Some(character) = rest.chars().next() {
@@ -1646,7 +1745,7 @@ fn format(parts: &Parts, pattern: &str) -> String {
             break;
         };
         rest = &rest[conversion.len_utf8()..];
-        match directive(parts, conversion) {
+        match directive(parts, conversion, offset, name) {
             Some(piece) => {
                 let width = if no_pad {
                     0
@@ -1726,6 +1825,28 @@ fn offset_of(receiver: i64) -> Result<Option<i128>, i64> {
         return Ok(None);
     }
     utc_offset(receiver, tzinfo)
+}
+
+/// The `%z`/`%Z` view of a value: UTC offset in microseconds and zone name.
+///
+/// A naive `date`/`time`/`datetime` reports neither, matching CPython (the
+/// directives render as empty strings rather than as UTC).
+fn zone_text(receiver: i64) -> Result<(Option<i128>, Option<String>), i64> {
+    if !matches!(kind_of(receiver), Some(Kind::Time) | Some(Kind::DateTime)) {
+        return Ok((None, None));
+    }
+    let tzinfo = tzinfo_of(receiver);
+    if tzinfo == NONE {
+        return Ok((None, None));
+    }
+    let offset = offset_of(receiver)?;
+    let name = b"tzname";
+    let args = [receiver];
+    let raw = crate::methods::call(tzinfo, name.as_ptr(), name.len(), 1, args.as_ptr());
+    if exc::pending() {
+        return Err(NONE);
+    }
+    Ok((offset, value::as_str(raw).map(str::to_string)))
 }
 
 fn date_text(date: Date) -> String {
@@ -2294,6 +2415,212 @@ fn combine_method(args: &[i64]) -> i64 {
     new_datetime(date, time, tzinfo_of(args[1]), fold_of(args[1]))
 }
 
+/// `date.fromordinal(ordinal)` / `datetime.fromordinal(ordinal)`: the inverse
+/// of `toordinal()`, with CPython's one-based proleptic Gregorian ordinals.
+fn fromordinal_method(args: &[i64], want_datetime: bool) -> i64 {
+    if args.len() != 1 {
+        return arity_error("fromordinal", "exactly 1", args.len());
+    }
+    let candidate = args[0];
+    if let Some(number) = value::as_integer(candidate) {
+        if number < 1 {
+            return invalid_instance("ordinal must be >= 1");
+        }
+        if number > MAX_ORDINAL {
+            // The civil-date arithmetic only accepts in-range days; compute
+            // the rejected year in `i128` so huge ordinals stay exact.
+            let year = year_for_ordinal(number);
+            return invalid_instance(&format!("year must be in 1..9999, not {year}"));
+        }
+        let days = number - 1 - ORDINAL_EPOCH_OFFSET;
+        let (year, month, day) = civil_from_days(days);
+        return date_result(Date { year, month, day }, want_datetime);
+    }
+    // Arbitrary-precision ordinals are always out of range (the valid window
+    // fits in `i64`), but CPython reports the computed year, not an overflow.
+    if let Some(big) = value::as_bigint(candidate) {
+        if big.sign() == num_bigint::Sign::Minus {
+            return invalid_instance("ordinal must be >= 1");
+        }
+        let year = big.clone() / num_bigint::BigInt::from(365) + num_bigint::BigInt::from(1);
+        return invalid_instance(&format!("year must be in 1..9999, not {year}"));
+    }
+    type_error(&format!(
+        "'{}' object cannot be interpreted as an integer",
+        value::type_name(candidate)
+    ))
+}
+
+fn date_result(date: Date, want_datetime: bool) -> i64 {
+    if want_datetime {
+        new_datetime(
+            date,
+            Time {
+                hour: 0,
+                minute: 0,
+                second: 0,
+                microsecond: 0,
+            },
+            NONE,
+            0,
+        )
+    } else {
+        new_date(date)
+    }
+}
+
+/// `date.fromisocalendar(year, week, day)` / the `datetime` variant.
+fn fromisocalendar_method(args: &[i64], want_datetime: bool) -> i64 {
+    if args.len() != 3 {
+        return arity_error("fromisocalendar", "exactly 3", args.len());
+    }
+    let year = match integer_argument(args[0]) {
+        Ok(year) => year,
+        Err(err) => return err,
+    };
+    let week = match integer_argument(args[1]) {
+        Ok(week) => week,
+        Err(err) => return err,
+    };
+    let weekday = match integer_argument(args[2]) {
+        Ok(weekday) => weekday,
+        Err(err) => return err,
+    };
+    if !(MINYEAR..=MAXYEAR).contains(&year) {
+        return invalid_instance(&format!("year must be in 1..9999, not {year}"));
+    }
+    let weeks = i64::from(iso_weeks_in_year(year));
+    if !(1..=weeks).contains(&week) {
+        return invalid_instance(&format!("Invalid week: {week}"));
+    }
+    if !(1..=7).contains(&weekday) {
+        return invalid_instance(&format!("Invalid weekday: {weekday} (range is [1, 7])"));
+    }
+    // ISO week 1 is the week containing January 4th; its Monday can fall in
+    // the previous calendar year.
+    let january_fourth = days_from_civil(year, 1, 4);
+    let week_one_monday = january_fourth - (i64::from(iso_weekday(year, 1, 4)) - 1);
+    let target = week_one_monday + (week - 1) * 7 + (weekday - 1);
+    let (result_year, month, day) = civil_from_days(target);
+    if !(MINYEAR..=MAXYEAR).contains(&result_year) {
+        return invalid_instance(&format!("year must be in 1..9999, not {result_year}"));
+    }
+    date_result(
+        Date {
+            year: result_year,
+            month,
+            day,
+        },
+        want_datetime,
+    )
+}
+
+/// `date.isocalendar()` / `datetime.isocalendar()`: `(ISO year, week, weekday)`.
+fn isocalendar_method(args: &[i64]) -> i64 {
+    if args.len() != 1 {
+        return arity_error("isocalendar", "exactly 1", args.len());
+    }
+    let Some(date) = date_from_instance(args[0]) else {
+        return invalid_instance("invalid date object");
+    };
+    let parts = Parts {
+        year: date.year,
+        month: date.month,
+        day: date.day,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        microsecond: 0,
+    };
+    let (iso_year, week) = iso_week(&parts);
+    value::tuple_new(vec![
+        encode(iso_year),
+        encode(i64::from(week)),
+        encode(i64::from(iso_weekday(date.year, date.month, date.day))),
+    ])
+}
+
+/// `date.strptime(string, format)` / `datetime.strptime(string, format)`.
+///
+/// CPython implements both classmethods by importing `_strptime`; the runtime
+/// serves the same pure-Python module, so delegate when it is registered (the
+/// official suites import it). Programs that never import `_strptime` fall
+/// back to the native `time.strptime` parser, which covers the calendar
+/// directives and the `%z` offset.
+fn strptime_method(args: &[i64], class_name: &str) -> i64 {
+    if args.len() != 2 {
+        return arity_error("strptime", "exactly 2", args.len());
+    }
+    for (position, candidate) in args.iter().enumerate() {
+        if value::as_str(*candidate).is_none() {
+            return type_error(&format!(
+                "strptime() argument {} must be str, not {}",
+                position + 1,
+                value::type_name(*candidate)
+            ));
+        }
+    }
+    let is_date = class_name == DATE_CLASS;
+    if let Some(module) = super::registry_lookup("_strptime") {
+        let helper: &[u8] = if is_date {
+            b"_strptime_datetime_date"
+        } else {
+            b"_strptime_datetime_datetime"
+        };
+        let function = crate::methods::getattr(module, helper.as_ptr(), helper.len());
+        if exc::pending() {
+            return NONE;
+        }
+        let class = if is_date { date_class() } else { datetime_class() };
+        let argv = [class, args[0], args[1]];
+        return crate::builtins::call(function, 3, argv.as_ptr());
+    }
+    let parsed = super::module_call(
+        b"time".as_ptr(),
+        4,
+        b"strptime".as_ptr(),
+        8,
+        2,
+        args.as_ptr(),
+    );
+    if exc::pending() || parsed == NONE {
+        return parsed;
+    }
+    let component = |name: &str| {
+        value::as_integer(value::instance_attr(parsed, name).unwrap_or(NONE)).unwrap_or(0)
+    };
+    let date = match validate_date(component("tm_year"), component("tm_mon"), component("tm_mday"))
+    {
+        Ok(date) => date,
+        Err(err) => return err,
+    };
+    if is_date {
+        return new_date(date);
+    }
+    let time = match validate_time(
+        component("tm_hour"),
+        component("tm_min"),
+        component("tm_sec"),
+        0,
+    ) {
+        Ok(time) => time,
+        Err(err) => return err,
+    };
+    let gmtoff = value::instance_attr(parsed, "tm_gmtoff").unwrap_or(NONE);
+    let zone = value::instance_attr(parsed, "tm_zone").unwrap_or(NONE);
+    let tzinfo = match value::as_integer(gmtoff) {
+        Some(seconds) => {
+            let offset = Delta(i128::from(seconds) * i128::from(MICROS_PER_SECOND));
+            match timezone_from_slots(&[Some(new_timedelta(offset)), Some(zone)]) {
+                Ok((offset, name)) => timezone_instance(offset, name),
+                Err(err) => return err,
+            }
+        }
+        None => NONE,
+    };
+    new_datetime(date, time, tzinfo, 0)
+}
+
 fn strftime_method(args: &[i64]) -> i64 {
     let Some(receiver) = args.first().copied() else {
         return arity_error("strftime", "exactly 2", args.len());
@@ -2316,7 +2643,11 @@ fn strftime_method(args: &[i64]) -> i64 {
     // Copy the pattern out before allocating the result: the borrowed string
     // must not be read after an allocation that may collect.
     let pattern = pattern.to_string();
-    value::str_alloc(format(&parts, &pattern))
+    let (offset, name) = match zone_text(receiver) {
+        Ok(view) => view,
+        Err(err) => return err,
+    };
+    value::str_alloc(format(&parts, &pattern, offset, name.as_deref()))
 }
 
 fn isoformat_method(args: &[i64]) -> i64 {
@@ -2775,6 +3106,13 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         TODAY_METHOD => today_method(args),
         FROMTIMESTAMP_METHOD => fromtimestamp_method(args),
         COMBINE_METHOD => combine_method(args),
+        DATE_FROMORDINAL_METHOD => fromordinal_method(args, false),
+        DATETIME_FROMORDINAL_METHOD => fromordinal_method(args, true),
+        DATE_FROMISOCALENDAR_METHOD => fromisocalendar_method(args, false),
+        DATETIME_FROMISOCALENDAR_METHOD => fromisocalendar_method(args, true),
+        DATE_STRPTIME_METHOD => strptime_method(args, DATE_CLASS),
+        DATETIME_STRPTIME_METHOD => strptime_method(args, DATETIME_CLASS),
+        ISOCALENDAR_METHOD => isocalendar_method(args),
         STRFTIME_METHOD => strftime_method(args),
         ISOFORMAT_METHOD => isoformat_method(args),
         DATE_METHOD => date_method(args),
@@ -2937,58 +3275,64 @@ mod tests {
     #[test]
     fn formats_known_timestamp() {
         let parts = sample();
-        assert_eq!(format(&parts, "%Y-%m-%d %H:%M:%S"), "2023-11-14 22:13:20");
-        assert_eq!(format(&parts, "%Y%m%d-%H%M%S"), "20231114-221320");
-        assert_eq!(format(&parts, "%f"), "123456");
-        assert_eq!(format(&parts, "%a %A"), "Tue Tuesday");
-        assert_eq!(format(&parts, "%b %B"), "Nov November");
-        assert_eq!(format(&parts, "%j"), "318");
-        assert_eq!(format(&parts, "%I %p"), "10 PM");
-        assert_eq!(format(&parts, "%z %Z"), "+0000 UTC");
-        assert_eq!(format(&parts, "%s"), "1700000000");
-        assert_eq!(format(&parts, "%V %G"), "46 2023");
-        assert_eq!(format(&parts, "%U %W"), "46 46");
-        assert_eq!(format(&parts, "%c"), "Tue Nov 14 22:13:20 2023");
-        assert_eq!(format(&parts, "%F %T"), "2023-11-14 22:13:20");
-        assert_eq!(format(&parts, "%%n"), "%n");
+        assert_eq!(format(&parts, "%Y-%m-%d %H:%M:%S", None, None), "2023-11-14 22:13:20");
+        assert_eq!(format(&parts, "%Y%m%d-%H%M%S", None, None), "20231114-221320");
+        assert_eq!(format(&parts, "%f", None, None), "123456");
+        assert_eq!(format(&parts, "%a %A", None, None), "Tue Tuesday");
+        assert_eq!(format(&parts, "%b %B", None, None), "Nov November");
+        assert_eq!(format(&parts, "%j", None, None), "318");
+        assert_eq!(format(&parts, "%I %p", None, None), "10 PM");
+        // A naive value renders both zone directives as empty strings;
+        // `%z` is `+HHMM[SS[.ffffff]]` only when a tzinfo reports an offset.
+        assert_eq!(format(&parts, "%z %Z", None, None), " ");
+        assert_eq!(
+            format(&parts, "%z %Z", Some(19_800_000_000), Some("XYZ")),
+            "+0530 XYZ"
+        );
+        assert_eq!(format(&parts, "%s", None, None), "1700000000");
+        assert_eq!(format(&parts, "%V %G", None, None), "46 2023");
+        assert_eq!(format(&parts, "%U %W", None, None), "46 46");
+        assert_eq!(format(&parts, "%c", None, None), "Tue Nov 14 22:13:20 2023");
+        assert_eq!(format(&parts, "%F %T", None, None), "2023-11-14 22:13:20");
+        assert_eq!(format(&parts, "%%n", None, None), "%n");
     }
 
     #[test]
     fn formats_epoch_and_flags() {
         let epoch = from_unix(0, 0);
         assert_eq!(
-            format(&epoch, "%Y-%m-%dT%H:%M:%S.%f"),
+            format(&epoch, "%Y-%m-%dT%H:%M:%S.%f", None, None),
             "1970-01-01T00:00:00.000000"
         );
-        assert_eq!(format(&epoch, "%a %j %p %w %u"), "Thu 001 AM 4 4");
-        assert_eq!(format(&epoch, "%-d/%_m/%0H"), "1/ 1/00");
-        assert_eq!(format(&epoch, "%^a"), "THU");
-        assert_eq!(format(&epoch, "%Q"), "%Q");
-        assert_eq!(format(&epoch, "100%"), "100%");
+        assert_eq!(format(&epoch, "%a %j %p %w %u", None, None), "Thu 001 AM 4 4");
+        assert_eq!(format(&epoch, "%-d/%_m/%0H", None, None), "1/ 1/00");
+        assert_eq!(format(&epoch, "%^a", None, None), "THU");
+        assert_eq!(format(&epoch, "%Q", None, None), "%Q");
+        assert_eq!(format(&epoch, "100%", None, None), "100%");
         // A pathological width is clamped instead of exhausting memory.
-        assert_eq!(format(&epoch, "%5000Y").len(), MAX_FIELD_WIDTH);
+        assert_eq!(format(&epoch, "%5000Y", None, None).len(), MAX_FIELD_WIDTH);
     }
 
     #[test]
     fn formats_leap_day_and_iso_boundaries() {
         let leap = from_unix(days_from_civil(2000, 2, 29) * SECONDS_PER_DAY, 0);
-        assert_eq!(format(&leap, "%Y-%m-%d %j"), "2000-02-29 060");
-        assert_eq!(format(&leap, "%V %G"), "09 2000");
+        assert_eq!(format(&leap, "%Y-%m-%d %j", None, None), "2000-02-29 060");
+        assert_eq!(format(&leap, "%V %G", None, None), "09 2000");
 
         // 2021-01-01 belongs to ISO week 53 of 2020.
         let new_year = from_unix(days_from_civil(2021, 1, 1) * SECONDS_PER_DAY, 0);
-        assert_eq!(format(&new_year, "%V %G"), "53 2020");
+        assert_eq!(format(&new_year, "%V %G", None, None), "53 2020");
 
         // 2016-01-01 belongs to ISO week 53 of 2015.
         let before = from_unix(days_from_civil(2016, 1, 1) * SECONDS_PER_DAY, 0);
-        assert_eq!(format(&before, "%V %G"), "53 2015");
+        assert_eq!(format(&before, "%V %G", None, None), "53 2015");
     }
 
     #[test]
     fn pre_epoch_timestamps_decompose() {
         let parts = from_unix(-1, 500_000);
         assert_eq!(
-            format(&parts, "%Y-%m-%d %H:%M:%S.%f"),
+            format(&parts, "%Y-%m-%d %H:%M:%S.%f", None, None),
             "1969-12-31 23:59:59.500000"
         );
         let (seconds, micros) = unix_parts(UNIX_EPOCH - std::time::Duration::new(1, 500_000_000));

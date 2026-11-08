@@ -18,6 +18,8 @@
 
 use crate::exc::{self, ATTRIBUTE_ERROR, OS_ERROR, OVERFLOW_ERROR, TYPE_ERROR, VALUE_ERROR};
 #[cfg(unix)]
+use crate::core::methods;
+#[cfg(unix)]
 use crate::value::{self, NONE};
 
 /// A type error raised from an argument check.
@@ -78,6 +80,69 @@ fn int32_arg(function: &str, args: &[i64], index: usize, name: &str) -> Option<l
     }
 }
 
+/// Parses a descriptor argument: an integer or an object with `fileno()`.
+#[cfg(unix)]
+fn descriptor_arg(
+    function: &str,
+    args: &[i64],
+    index: usize,
+    name: &str,
+) -> Option<libc::c_int> {
+    let Some(&argument) = args.get(index) else {
+        type_error(&format!(
+            "{function}() missing required argument '{name}' (pos {})",
+            index + 1
+        ));
+        return None;
+    };
+    let number = if let Some(number) = value::as_integer(argument) {
+        number
+    } else {
+        if value::as_bigint(argument).is_some() {
+            exc::raise_with_message(
+                OVERFLOW_ERROR,
+                &format!("{function}(): argument '{name}' is out of range"),
+            );
+            return None;
+        }
+        let method = methods::getattr(argument, b"fileno".as_ptr(), b"fileno".len());
+        if exc::pending() {
+            exc::clear();
+            type_error(&format!(
+                "{function}() argument '{name}' must be an integer or an object with a fileno() method, not {}",
+                value::type_name(argument)
+            ));
+            return None;
+        }
+        let result = crate::builtins::call(method, 0, std::ptr::null());
+        if exc::pending() {
+            return None;
+        }
+        let Some(number) = value::as_integer(result) else {
+            type_error(&format!(
+                "{function}() fileno() must return an integer, not {}",
+                value::type_name(result)
+            ));
+            return None;
+        };
+        number
+    };
+    if number < 0 {
+        exc::raise_with_message(VALUE_ERROR, "file descriptor cannot be a negative integer");
+        return None;
+    }
+    match libc::c_int::try_from(number) {
+        Ok(number) => Some(number),
+        Err(_) => {
+            exc::raise_with_message(
+                OVERFLOW_ERROR,
+                &format!("{function}(): argument '{name}' is out of range"),
+            );
+            None
+        }
+    }
+}
+
 /// Copies a bytes-like value (or `str`) into an owned byte buffer.
 #[cfg(unix)]
 fn buffer_value(argument: i64) -> Option<Vec<u8>> {
@@ -122,7 +187,7 @@ fn fcntl_call(args: &[i64]) -> i64 {
             args.len()
         ));
     }
-    let Some(fd) = int32_arg("fcntl", args, 0, "fd") else {
+    let Some(fd) = descriptor_arg("fcntl", args, 0, "fd") else {
         return NONE;
     };
     let Some(cmd) = int32_arg("fcntl", args, 1, "cmd") else {
@@ -182,7 +247,7 @@ fn ioctl_call(args: &[i64]) -> i64 {
             args.len()
         ));
     }
-    let Some(fd) = int32_arg("ioctl", args, 0, "fd") else {
+    let Some(fd) = descriptor_arg("ioctl", args, 0, "fd") else {
         return NONE;
     };
     let Some(&request_value) = args.get(1) else {
@@ -251,7 +316,7 @@ fn flock_call(args: &[i64]) -> i64 {
             args.len()
         ));
     }
-    let Some(fd) = int32_arg("flock", args, 0, "fd") else {
+    let Some(fd) = descriptor_arg("flock", args, 0, "fd") else {
         return NONE;
     };
     let Some(operation) = int32_arg("flock", args, 1, "operation") else {
@@ -289,7 +354,7 @@ fn lockf_call(args: &[i64]) -> i64 {
             args.len()
         ));
     }
-    let Some(fd) = int32_arg("lockf", args, 0, "fd") else {
+    let Some(fd) = descriptor_arg("lockf", args, 0, "fd") else {
         return NONE;
     };
     let Some(cmd) = int32_arg("lockf", args, 1, "cmd") else {

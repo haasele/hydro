@@ -1,10 +1,12 @@
 //! `grp`: the Unix group database.
 //!
 //! `getgrnam`, `getgrgid` and `getgrall` read the real group database through
-//! libc. Entries are namespaces with CPython's `struct_group` fields
-//! (`gr_name`, `gr_passwd`, `gr_gid`, `gr_mem`); `gr_mem` is a list of member
-//! names. `struct_group(sequence)` builds a record from a 4-item sequence
-//! exactly like CPython's struct sequence constructor.
+//! libc. Entries are `struct_group` struct sequence records carrying CPython's
+//! fields (`gr_name`, `gr_passwd`, `gr_gid`, `gr_mem`) as named attributes and
+//! the same values as the record's tuple payload, so `len()`, indexing,
+//! iteration and tuple equality all work; `gr_mem` is a list of member names.
+//! `struct_group(sequence)` builds a record from a 4-item sequence exactly
+//! like CPython's struct sequence constructor.
 //!
 //! `getgrnam`/`getgrgid` use the reentrant `*_r` entry points so concurrent
 //! lookups on other runtime threads cannot overwrite the entry being
@@ -66,15 +68,47 @@ fn cstr_value(pointer: *const libc::c_char) -> i64 {
     value::str_from_bytes(bytes)
 }
 
-/// Appends one field to a rooted namespace, keeping the value alive across
-/// the mutation.
-fn record_field(namespace: i64, name: &str, field_value: i64) {
+/// Stores one structseq field on a record instance, keeping the value alive
+/// across the mutation.
+fn set_field(record: i64, name: &str, field_value: i64) {
     let roots = heap::root_values(&[field_value]);
-    if let Some(mut state) = value::namespace_pairs_mut(namespace) {
-        state.pairs.push((name.to_string(), field_value));
-    }
-    heap::write_barrier_edge(namespace, field_value);
+    value::instance_setattr(record, name.to_string(), field_value);
     heap::release_roots(roots);
+}
+
+/// The cached `struct_group` class.
+///
+/// A structseq record is an instance of this class whose *container payload*
+/// is the tuple of fields: `len()` and indexing read the payload while the
+/// named attributes read the instance attributes, exactly like CPython's
+/// struct sequence type. The class is cached so `type(entry)` keeps its
+/// identity across lookups.
+fn record_class() -> i64 {
+    const KEY: &str = "grp.struct_group.class";
+    if let Some(class) = crate::core::globals::registry_get(KEY) {
+        return class;
+    }
+    let class = value::class_new("struct_group".to_string(), value::NONE, Vec::new());
+    crate::core::globals::registry_set(KEY, class);
+    class
+}
+
+/// Builds a `struct_group` record from its four field values.
+fn group_record(fields: Vec<i64>) -> i64 {
+    let class = record_class();
+    let roots = heap::root_values(&fields);
+    let payload = value::tuple_new(fields.clone());
+    let payload_roots = heap::root_values(&[payload]);
+    let record = value::instance_new(class);
+    let record_roots = heap::root_values(&[record]);
+    for (name, item) in GROUP_FIELDS.iter().zip(fields.iter()) {
+        set_field(record, name, *item);
+    }
+    value::instance_set_container_payload(record, payload);
+    heap::release_roots(record_roots);
+    heap::release_roots(payload_roots);
+    heap::release_roots(roots);
+    record
 }
 
 /// Pushes `item` onto a rooted list, keeping it alive across the mutation.
@@ -113,17 +147,14 @@ fn members_value(members: *mut *mut libc::c_char) -> i64 {
     list
 }
 
-/// Converts a raw `struct group` into a `struct_group`-shaped namespace.
+/// Converts a raw `struct group` into a `struct_group` structseq record.
 fn group_namespace(entry: &libc::group) -> i64 {
-    let namespace = value::namespace_new(Vec::new());
-    let roots = heap::root_values(&[namespace]);
-    record_field(namespace, "gr_name", cstr_value(entry.gr_name));
-    record_field(namespace, "gr_passwd", cstr_value(entry.gr_passwd));
-    record_field(namespace, "gr_gid", int_value(i64::from(entry.gr_gid)));
-    let members = members_value(entry.gr_mem);
-    record_field(namespace, "gr_mem", members);
-    heap::release_roots(roots);
-    namespace
+    group_record(vec![
+        cstr_value(entry.gr_name),
+        cstr_value(entry.gr_passwd),
+        int_value(i64::from(entry.gr_gid)),
+        members_value(entry.gr_mem),
+    ])
 }
 
 /// Calls a reentrant group lookup, retrying with a larger buffer on `ERANGE`.
@@ -292,15 +323,7 @@ fn struct_group(args: &[i64]) -> i64 {
             items.len()
         ));
     }
-    let namespace = value::namespace_new(Vec::new());
-    let mut roots_values = items.clone();
-    roots_values.push(namespace);
-    let roots = heap::root_values(&roots_values);
-    for (name, item) in GROUP_FIELDS.iter().zip(items.iter()) {
-        record_field(namespace, name, *item);
-    }
-    heap::release_roots(roots);
-    namespace
+    group_record(items)
 }
 
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
@@ -336,10 +359,7 @@ mod tests {
     }
 
     fn field(entry: i64, name: &str) -> i64 {
-        value::as_namespace(entry)
-            .and_then(|pairs| pairs.iter().find(|(key, _)| key == name))
-            .map(|(_, item)| *item)
-            .unwrap_or(NONE)
+        value::instance_attr(entry, name).unwrap_or(NONE)
     }
 
     fn message() -> String {
@@ -388,6 +408,25 @@ mod tests {
             assert_ne!(field(*entry, "gr_name"), NONE);
             assert_ne!(field(*entry, "gr_gid"), NONE);
             assert!(value::as_list(field(*entry, "gr_mem")).is_some());
+            // Struct sequence protocol: length, indexing and payload equality.
+            assert_eq!(crate::core::builtins::len(*entry), int(4));
+            assert_eq!(
+                crate::core::container::subscript(*entry, int(0)),
+                field(*entry, "gr_name")
+            );
+            assert_eq!(
+                crate::core::container::subscript(*entry, int(2)),
+                field(*entry, "gr_gid")
+            );
+            assert!(crate::core::container::equals(
+                *entry,
+                value::tuple_new(vec![
+                    field(*entry, "gr_name"),
+                    field(*entry, "gr_passwd"),
+                    field(*entry, "gr_gid"),
+                    field(*entry, "gr_mem"),
+                ])
+            ));
         }
         assert!(!exc::pending());
     }

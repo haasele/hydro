@@ -58,8 +58,8 @@ pub(crate) fn dict_new(argc: usize, keys: *const i64, values: *const i64) -> i64
     };
     let mut pairs = DictData::new(Vec::new());
     for (key, val) in keys.iter().zip(values.iter()) {
-        if let Some(name) = unhashable_name(*key) {
-            return exc::raise_with_message(TYPE_ERROR, &unhashable_message(name));
+        if unhashable_name(*key).is_some() {
+            return exc::raise_with_message(TYPE_ERROR, &dict_key_unhashable_message(*key));
         }
         // No barrier: the dict does not exist yet; it is allocated below with
         // the complete pair list and is born grey while marking is active.
@@ -99,8 +99,8 @@ pub(crate) fn set_from(iterable: i64) -> i64 {
         if status == 0 {
             break;
         }
-        if let Some(name) = unhashable_name(item) {
-            return type_error(unhashable_message(name));
+        if unhashable_name(item).is_some() {
+            return type_error(set_element_unhashable_message(item));
         }
         insert_set_item(result, item);
     }
@@ -111,7 +111,7 @@ pub(crate) fn set_from(iterable: i64) -> i64 {
 fn hashability_error(items: &[i64]) -> Option<i64> {
     items.iter().find_map(|&item| {
         unhashable_name(item)
-            .map(|name| exc::raise_with_message(TYPE_ERROR, &unhashable_message(name)))
+            .map(|_| exc::raise_with_message(TYPE_ERROR, &set_element_unhashable_message(item)))
     })
 }
 
@@ -662,6 +662,26 @@ pub(crate) fn unhashable_message(name: &str) -> String {
     format!("unhashable type: '{}'", name)
 }
 
+/// The `TypeError` text CPython 3.14 uses when a set operation rejects an
+/// unhashable element.
+///
+/// `%T` is the element's own type and `%S` is the underlying hash error, so a
+/// tuple containing a list reads
+/// `cannot use 'tuple' as a set element (unhashable type: 'list')`.
+pub(crate) fn set_element_unhashable_message(item: i64) -> String {
+    let outer = value::type_name(item);
+    let inner = unhashable_name(item).unwrap_or(outer);
+    format!("cannot use '{outer}' as a set element (unhashable type: '{inner}')")
+}
+
+/// The `TypeError` text CPython 3.14 uses when a dict operation rejects an
+/// unhashable key, mirroring [`set_element_unhashable_message`].
+pub(crate) fn dict_key_unhashable_message(key: i64) -> String {
+    let outer = value::type_name(key);
+    let inner = unhashable_name(key).unwrap_or(outer);
+    format!("cannot use '{outer}' as a dict key (unhashable type: '{inner}')")
+}
+
 /// Number of entries a live `dict` view observes.
 pub(crate) fn dict_view_len(view: &value::DictViewState) -> usize {
     value::as_dict(view.dict).map_or(0, |pairs| pairs.len())
@@ -880,8 +900,8 @@ pub(crate) fn set_add(set: i64, item: i64) -> i64 {
             value::type_name(set)
         ));
     }
-    if let Some(name) = unhashable_name(item) {
-        return type_error(unhashable_message(name));
+    if unhashable_name(item).is_some() {
+        return type_error(set_element_unhashable_message(item));
     }
     insert_set_item(set, item);
     NONE
@@ -897,8 +917,8 @@ pub(crate) fn dict_set(dict: i64, key: i64, new_value: i64) -> i64 {
             value::type_name(dict)
         ));
     }
-    if let Some(name) = unhashable_name(key) {
-        return type_error(unhashable_message(name));
+    if unhashable_name(key).is_some() {
+        return type_error(dict_key_unhashable_message(key));
     }
     if let Some(mut pairs) = value::dict_pairs_mut(dict) {
         dict_insert_barrier(dict, &mut pairs, key, new_value);
@@ -916,7 +936,10 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
     }
     // Checked before `as_bytes`, which also accepts a `bytearray`.
     if let Some(bytes) = value::as_bytearray(obj) {
-        let Some(raw) = value::as_integer(index) else {
+        let Some(raw) = index_or_none(index) else {
+            if exc::pending() {
+                return NONE;
+            }
             return type_error(format!(
                 "bytearray indices must be integers or slices, not {}",
                 value::type_name(index)
@@ -932,7 +955,10 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
         if view.released {
             return exc::raise_with_message(VALUE_ERROR, value::MEMORYVIEW_RELEASED);
         }
-        let Some(raw) = value::as_integer(index) else {
+        let Some(raw) = index_or_none(index) else {
+            if exc::pending() {
+                return NONE;
+            }
             return type_error("memoryview: invalid indices for memoryview".to_string());
         };
         let Some(pos) = normalize_index(raw, view.len()) else {
@@ -944,7 +970,10 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
         };
     }
     if let Some(items) = value::as_list(obj) {
-        let Some(raw) = value::as_integer(index) else {
+        let Some(raw) = index_or_none(index) else {
+            if exc::pending() {
+                return NONE;
+            }
             return type_error(format!(
                 "list indices must be integers or slices, not {}",
                 value::type_name(index)
@@ -959,7 +988,10 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
         return crate::modules::collections::getitem(obj, index);
     }
     if let Some(s) = value::as_str(obj) {
-        let Some(raw) = value::as_integer(index) else {
+        let Some(raw) = index_or_none(index) else {
+            if exc::pending() {
+                return NONE;
+            }
             return type_error(format!(
                 "string indices must be integers, not {}",
                 value::type_name(index)
@@ -975,7 +1007,10 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
         };
     }
     if let Some(bytes) = value::as_bytes(obj) {
-        let Some(raw) = value::as_integer(index) else {
+        let Some(raw) = index_or_none(index) else {
+            if exc::pending() {
+                return NONE;
+            }
             return type_error(format!(
                 "byte indices must be integers or slices, not {}",
                 value::type_name(index)
@@ -988,7 +1023,10 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
         };
     }
     if let Some(items) = value::as_tuple(obj) {
-        let Some(raw) = value::as_integer(index) else {
+        let Some(raw) = index_or_none(index) else {
+            if exc::pending() {
+                return NONE;
+            }
             return type_error(format!(
                 "tuple indices must be integers or slices, not {}",
                 value::type_name(index)
@@ -1000,11 +1038,14 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
         };
     }
     if let Some((start, stop, step)) = value::as_range(obj) {
-        let Some(raw) = value::as_integer(index) else {
-            // An integer too large for `i64` is past the end of every range;
-            // reporting it as a non-integer index would contradict CPython.
-            if value::as_bigint(index).is_some() {
-                return exc::raise_with_message(INDEX_ERROR, "range object index out of range");
+        // An integer too large for `i64` is past the end of every range;
+        // reporting it as a non-integer index would contradict CPython.
+        if value::as_bigint(index).is_some() {
+            return exc::raise_with_message(INDEX_ERROR, "range object index out of range");
+        }
+        let Some(raw) = index_or_none(index) else {
+            if exc::pending() {
+                return NONE;
             }
             return type_error(format!(
                 "range indices must be integers or slices, not {}",
@@ -1032,8 +1073,8 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
         };
     }
     if let Some(dict) = value::as_dict_data(obj) {
-        if let Some(name) = unhashable_name(index) {
-            return type_error(unhashable_message(name));
+        if unhashable_name(index).is_some() {
+            return type_error(dict_key_unhashable_message(index));
         }
         return match dict.find(index) {
             Some(position) => dict.entries()[position].1,
@@ -1091,7 +1132,10 @@ pub(crate) fn subscript(obj: i64, index: i64) -> i64 {
 pub(crate) fn subscript_set(obj: i64, index: i64, new_value: i64) -> i64 {
     // Checked before `as_bytes`, which also accepts a `bytearray`.
     if let Some(bytes) = value::as_bytearray(obj) {
-        let Some(raw) = value::as_integer(index) else {
+        let Some(raw) = index_or_none(index) else {
+            if exc::pending() {
+                return NONE;
+            }
             return type_error(format!(
                 "bytearray indices must be integers or slices, not {}",
                 value::type_name(index)
@@ -1124,7 +1168,10 @@ pub(crate) fn subscript_set(obj: i64, index: i64, new_value: i64) -> i64 {
         if view.released {
             return exc::raise_with_message(VALUE_ERROR, value::MEMORYVIEW_RELEASED);
         }
-        let Some(raw) = value::as_integer(index) else {
+        let Some(raw) = index_or_none(index) else {
+            if exc::pending() {
+                return NONE;
+            }
             return type_error("memoryview: invalid indices for memoryview".to_string());
         };
         let Some(position) = normalize_index(raw, view.len()) else {
@@ -1135,14 +1182,20 @@ pub(crate) fn subscript_set(obj: i64, index: i64, new_value: i64) -> i64 {
             Err(message) => memoryview_error(message),
         };
     }
-    if let Some(mut items) = value::list_items_mut(obj) {
-        let Some(raw) = value::as_integer(index) else {
-            // Drop the graph lock before allocating the exception object.
-            drop(items);
+    if value::as_list(obj).is_some() {
+        // Resolve `__index__` before taking the graph lock: user code may
+        // allocate or collect.
+        let Some(raw) = index_or_none(index) else {
+            if exc::pending() {
+                return NONE;
+            }
             return type_error(format!(
                 "list indices must be integers or slices, not {}",
                 value::type_name(index)
             ));
+        };
+        let Some(mut items) = value::list_items_mut(obj) else {
+            return type_error("list assignment on a non-list".to_string());
         };
         return match normalize_index(raw, items.len()) {
             Some(pos) => {
@@ -1157,9 +1210,9 @@ pub(crate) fn subscript_set(obj: i64, index: i64, new_value: i64) -> i64 {
         };
     }
     if let Some(mut pairs) = value::dict_pairs_mut(obj) {
-        if let Some(name) = unhashable_name(index) {
+        if unhashable_name(index).is_some() {
             drop(pairs);
-            return type_error(unhashable_message(name));
+            return type_error(dict_key_unhashable_message(index));
         }
         dict_insert_barrier(obj, &mut pairs, index, new_value);
         return NONE;
@@ -1196,7 +1249,10 @@ pub(crate) fn delete_subscript(obj: i64, index: i64) -> i64 {
     // Deleting a bytearray element shrinks the sequence; memoryview elements
     // are fixed-size slots, so deletion is rejected like Python does.
     if let Some(bytes) = value::as_bytearray(obj) {
-        let Some(raw) = value::as_integer(index) else {
+        let Some(raw) = index_or_none(index) else {
+            if exc::pending() {
+                return NONE;
+            }
             return type_error(format!(
                 "bytearray indices must be integers or slices, not {}",
                 value::type_name(index)
@@ -1216,14 +1272,18 @@ pub(crate) fn delete_subscript(obj: i64, index: i64) -> i64 {
     if value::as_memoryview(obj).is_some() {
         return type_error("'memoryview' object does not support item deletion".to_string());
     }
-    if let Some(mut items) = value::list_items_mut(obj) {
-        let Some(raw) = value::as_integer(index) else {
-            // Drop the graph lock before allocating the exception object.
-            drop(items);
+    if value::as_list(obj).is_some() {
+        let Some(raw) = index_or_none(index) else {
+            if exc::pending() {
+                return NONE;
+            }
             return type_error(format!(
                 "list indices must be integers or slices, not {}",
                 value::type_name(index)
             ));
+        };
+        let Some(mut items) = value::list_items_mut(obj) else {
+            return type_error("list deletion on a non-list".to_string());
         };
         return match normalize_index(raw, items.len()) {
             Some(pos) => {
@@ -1237,9 +1297,9 @@ pub(crate) fn delete_subscript(obj: i64, index: i64) -> i64 {
         };
     }
     if let Some(mut dict) = value::dict_pairs_mut(obj) {
-        if let Some(name) = unhashable_name(index) {
+        if unhashable_name(index).is_some() {
             drop(dict);
-            return type_error(unhashable_message(name));
+            return type_error(dict_key_unhashable_message(index));
         }
         return match dict.remove(index) {
             Some(_) => NONE,
@@ -1274,6 +1334,61 @@ pub(crate) fn delete_subscript(obj: i64, index: i64) -> i64 {
 }
 
 /// Maps a Python index (possibly negative) into `0..len`.
+/// `PyNumber_Index`-style conversion used by subscripts and slice bounds.
+///
+/// Exact integers (and out-of-range big integers, which raise `OverflowError`)
+/// pass through. Objects defining `__index__` run it, and a non-integer result
+/// raises the protocol `TypeError`. `None` without a pending exception means
+/// the value is not indexable at all, so the caller keeps its own wording
+/// (`list indices must be integers or slices, not X`).
+pub(crate) fn index_or_none(v: i64) -> Option<i64> {
+    if let Some(n) = value::as_integer(v) {
+        return Some(n);
+    }
+    if let Some(n) = value::as_bigint(v) {
+        return match i64::try_from(n) {
+            Ok(n) => Some(n),
+            Err(_) => {
+                exc::raise_with_message(
+                    exc::OVERFLOW_ERROR,
+                    "Python int too large to convert to C ssize_t",
+                );
+                None
+            }
+        };
+    }
+    if value::as_instance(v).is_none() && value::as_class(v).is_none() {
+        return None;
+    }
+    let result = crate::core::methods::call(
+        v,
+        b"__index__".as_ptr(),
+        "__index__".len(),
+        0,
+        std::ptr::null(),
+    );
+    if exc::pending() {
+        if exc::pending_tag() == exc::ATTRIBUTE_ERROR as i64 {
+            exc::clear();
+            return None;
+        }
+        return None;
+    }
+    match value::as_integer(result) {
+        Some(n) => Some(n),
+        None => {
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "__index__ returned non-int (type {})",
+                    value::type_name_of(result)
+                ),
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn normalize_index(index: i64, len: usize) -> Option<usize> {
     let len = len as i64;
     let index = if index < 0 {
@@ -1850,6 +1965,11 @@ fn slice_assignment_values(new_value: i64) -> Option<Vec<i64>> {
 }
 
 fn slice_error(err: SliceError) -> i64 {
+    // A `__index__` method may have raised its own exception; that wins over
+    // the generic slice diagnostic.
+    if exc::pending() {
+        return NONE;
+    }
     match err {
         SliceError::Type => exc::raise_with_message(
             TYPE_ERROR,
@@ -1865,7 +1985,7 @@ fn slice_bound(v: i64) -> Result<Option<i64>, ()> {
     if v == NONE {
         return Ok(None);
     }
-    match value::as_integer(v) {
+    match index_or_none(v) {
         Some(n) => Ok(Some(n)),
         None => Err(()),
     }

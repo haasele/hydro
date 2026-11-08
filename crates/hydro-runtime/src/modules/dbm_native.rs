@@ -1710,10 +1710,14 @@ mod imp {
         }
     }
 
-    /// Class-valued module members (`error`).
+    /// Class-valued module members: `error` and the mapping type itself
+    /// (`_gdbm.gdbm` / `_dbm.dbm`), exactly as CPython exposes them.
     pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
         match (module, name) {
-            (GDBM_MODULE | DBM_MODULE, "error") => Some(error_class(module)),
+            (GDBM_MODULE, "error") => Some(error_class(module)),
+            (DBM_MODULE, "error") => Some(error_class(module)),
+            (GDBM_MODULE, "gdbm") => Some(gdbm_class()),
+            (DBM_MODULE, "dbm") => Some(ndbm_class()),
             _ => None,
         }
     }

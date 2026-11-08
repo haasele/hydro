@@ -679,7 +679,10 @@ fn format_int(number: i64, spec: &Spec, type_name: &str) -> Result<String, Forma
                 "invalid format specifier for character format",
             ));
         }
-        let Some(character) = u32::try_from(number).ok().and_then(char::from_u32) else {
+        let Some(character) = u32::try_from(number)
+            .ok()
+            .and_then(value::code_to_storage_char)
+        else {
             return Err(FormatError::value_error(
                 "character code out of range for 'c' format",
             ));
@@ -754,7 +757,10 @@ fn format_bigint(number: &num_bigint::BigInt, spec: &Spec) -> Result<String, For
                 "invalid format specifier for character format",
             ));
         }
-        let Some(character) = u32::try_from(number).ok().and_then(char::from_u32) else {
+        let Some(character) = u32::try_from(number)
+            .ok()
+            .and_then(value::code_to_storage_char)
+        else {
             return Err(FormatError::value_error(
                 "character code out of range for 'c' format",
             ));
@@ -1181,7 +1187,7 @@ fn percent_piece(
             let body = if let Some(number) = value::as_integer(arg) {
                 u32::try_from(number)
                     .ok()
-                    .and_then(char::from_u32)
+                    .and_then(value::code_to_storage_char)
                     .map(|c| c.to_string())
                     .ok_or_else(|| FormatError::value_error("%c arg not in range(0x110000)"))?
             } else if let Some(text) = value::as_str(arg) {

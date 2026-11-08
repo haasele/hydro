@@ -173,9 +173,12 @@
 //! `PyLong_FromNativeBytes` and `PyLong_AsNativeBytes` raise `OverflowError`
 //! when a value does not fit, instead of silently truncating. `PyUnicode_New`
 //! strings expose writable UCS storage through `PyUnicode_DATA` (1/2/4-byte
-//! code units, exactly as `PyUnicode_New` selects); unpaired surrogates are
-//! replaced when the string is read back as text. Traceback frames are never
-//! created, so `PyTraceBack_Print` only accepts `NULL`/`None`.
+//! code units, exactly as `PyUnicode_New` selects); unpaired surrogates keep the
+//! runtime's reversible mirror representation, and the UTF-8 entry points
+//! (`PyUnicode_AsUTF8`, `PyUnicode_AsUTF8AndSize`, `PyArg_ParseTuple("s")`)
+//! raise `UnicodeEncodeError` for them instead of exposing mirror bytes.
+//! Traceback frames are never created, so `PyTraceBack_Print` only accepts
+//! `NULL`/`None`.
 //!
 //! # Exported data
 //!
@@ -720,6 +723,8 @@ pub(crate) enum ShimKind {
     Float(f64),
     /// `c_text` is the NUL-terminated form used by `PyArg_ParseTuple("s")` and
     /// `PyUnicode_AsUTF8`; absent when the string contains an embedded NUL.
+    /// Strings carrying a lone surrogate are rejected by those entry points
+    /// with `UnicodeEncodeError` even though `c_text` holds their mirror bytes.
     /// `raw` is present for strings created by `PyUnicode_New`, whose storage
     /// an extension may fill through `PyUnicode_DATA`; `text` and `c_text` are
     /// refreshed from it on every read.
@@ -1427,6 +1432,9 @@ fn cached_buffer(object: *mut ShimObject, build: impl FnOnce() -> Vec<u8>) -> *c
 /// Recomputes a `PyUnicode_New` string's text from the storage an extension
 /// may have written through `PyUnicode_DATA`.
 ///
+/// Lone surrogates written into the UCS buffer keep the runtime's reversible
+/// mirror representation instead of collapsing to U+FFFD.
+///
 /// # Safety
 /// `object` must be a live shim object; the caller holds the GIL, which is
 /// what serialises writes to the raw buffer.
@@ -1441,31 +1449,30 @@ unsafe fn refresh_raw_unicode(object: *mut ShimObject) {
     else {
         return;
     };
-    let decoded = match raw.width {
-        1 => raw
-            .data
-            .iter()
-            .map(|&byte| byte as char)
-            .collect::<String>(),
+    let mut decoded = String::with_capacity(raw.data.len());
+    let mut push = |code: u32| {
+        decoded.push(
+            crate::value::code_to_storage_char(code).unwrap_or(char::REPLACEMENT_CHARACTER),
+        );
+    };
+    match raw.width {
+        1 => {
+            for &byte in &raw.data {
+                push(byte as u32);
+            }
+        }
         2 => {
-            let (chunks, _) = raw.data.as_chunks::<2>();
-            let units: Vec<u16> = chunks
-                .iter()
-                .map(|&pair| u16::from_le_bytes(pair))
-                .collect();
-            String::from_utf16_lossy(&units)
+            for chunk in raw.data.as_chunks::<2>().0 {
+                push(u16::from_le_bytes([chunk[0], chunk[1]]) as u32);
+            }
         }
         4 => {
-            let mut decoded = String::with_capacity(raw.data.len() / 4);
-            let (chunks, _) = raw.data.as_chunks::<4>();
-            for chunk in chunks {
-                let code = u32::from_le_bytes(*chunk);
-                decoded.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
+            for chunk in raw.data.as_chunks::<4>().0 {
+                push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
-            decoded
         }
         _ => return,
-    };
+    }
     if *text != decoded {
         *text = decoded;
     }
@@ -3634,13 +3641,34 @@ fn dict_set(
     }
 }
 
+/// First lone surrogate among a string payload's Python code points.
+///
+/// The payload stores surrogates in the runtime's mirror block; this is the
+/// surrogate-aware scan the UTF-8 facing C API entry points use.
+fn first_lone_surrogate(text: &str) -> Option<(usize, u32)> {
+    crate::value::str_codes(text)
+        .enumerate()
+        .find(|(_, code)| crate::value::is_surrogate_code(*code))
+}
+
+/// CPython's `UnicodeEncodeError` for a lone surrogate that cannot be encoded.
+fn surrogate_encode_error(codec: &str, position: usize, code: u32) -> String {
+    format!(
+        "UnicodeEncodeError: '{codec}' codec can't encode character '\\u{code:04x}' in \
+         position {position}: surrogates not allowed"
+    )
+}
+
 fn as_c_string(object: *mut ShimObject) -> Result<*const c_char, String> {
     match kind_ref(object) {
-        Some(ShimKind::Str {
-            c_text: Some(text), ..
-        }) => Ok(text.as_ptr()),
-        Some(ShimKind::Str { c_text: None, .. }) => {
-            Err("string contains an embedded null character".to_string())
+        Some(ShimKind::Str { text, c_text, .. }) => {
+            if let Some((position, code)) = first_lone_surrogate(text) {
+                return Err(surrogate_encode_error("utf-8", position, code));
+            }
+            match c_text {
+                Some(text) => Ok(text.as_ptr()),
+                None => Err("string contains an embedded null character".to_string()),
+            }
         }
         Some(_) => Err("a string is required".to_string()),
         None => Err("cannot read a string from a NULL object".to_string()),
@@ -7019,7 +7047,13 @@ pub extern "C" fn PyUnicode_AsUTF8(object: *mut ShimObject) -> *const c_char {
     match as_c_string(object) {
         Ok(pointer) => pointer,
         Err(error) => {
-            set_error(format!("TypeError: {error}"));
+            // `as_c_string` tags codec failures itself; everything else is the
+            // shim's `TypeError` for a non-string / embedded NUL.
+            if error.starts_with("UnicodeEncodeError") {
+                set_error(error);
+            } else {
+                set_error(format!("TypeError: {error}"));
+            }
             ptr::null()
         }
     }
@@ -9644,7 +9678,12 @@ pub extern "C" fn hydro_capi_parse_s(object: *mut ShimObject, out: *mut *const c
     match as_c_string(object) {
         Ok(value) => store_argument(out, value, "s"),
         Err(error) => {
-            set_type_error(error);
+            // A lone surrogate is an encoding failure, not a type error.
+            if error.starts_with("UnicodeEncodeError") {
+                set_error(error);
+            } else {
+                set_type_error(error);
+            }
             0
         }
     }
@@ -11278,12 +11317,11 @@ pub extern "C" fn PyUnicode_FromStringAndSize(
 }
 
 /// Code unit width CPython would choose for `text`.
+///
+/// The maximum is taken over Python code points, so a lone surrogate selects
+/// UCS-2 storage even though its stored mirror `char` is astral.
 fn unicode_kind_width(text: &str) -> u8 {
-    let max = text
-        .chars()
-        .map(|character| character as u32)
-        .max()
-        .unwrap_or(0);
+    let max = crate::value::str_codes(text).max().unwrap_or(0);
     if max < 0x100 {
         1
     } else if max < 0x10000 {
@@ -11295,11 +11333,13 @@ fn unicode_kind_width(text: &str) -> u8 {
 
 /// Encodes `text` in the UCS storage layout `PyUnicode_DATA` exposes: 1, 2 or
 /// 4 bytes per code point, little endian, with a trailing NUL unit.
+///
+/// The units are Python code points (surrogate mirror chars become their
+/// `U+D800..=U+DFFF` unit), matching CPython's compact-string storage.
 fn unicode_data_buffer(text: &str) -> Vec<u8> {
     let width = unicode_kind_width(text) as usize;
     let mut buffer = Vec::with_capacity((text.chars().count() + 1) * width);
-    for character in text.chars() {
-        let code = character as u32;
+    for code in crate::value::str_codes(text) {
         match width {
             1 => buffer.push(code as u8),
             2 => buffer.extend_from_slice(&(code as u16).to_le_bytes()),
@@ -11373,6 +11413,9 @@ pub extern "C" fn PyUnicode_DATA(object: *mut ShimObject) -> *mut c_void {
 }
 
 /// `PyUnicode_AsUTF8AndSize`: NUL-terminated UTF-8 bytes plus their length.
+///
+/// Like CPython, a string holding a lone surrogate is not UTF-8 encodable and
+/// raises `UnicodeEncodeError`; the internal mirror bytes are never exposed.
 #[no_mangle]
 pub extern "C" fn PyUnicode_AsUTF8AndSize(
     object: *mut ShimObject,
@@ -11390,6 +11433,10 @@ pub extern "C" fn PyUnicode_AsUTF8AndSize(
             return ptr::null();
         }
     };
+    if let Some((position, code)) = first_lone_surrogate(&text) {
+        set_error(surrogate_encode_error("utf-8", position, code));
+        return ptr::null();
+    }
     let length = text.len();
     let buffer = cached_buffer(object, || {
         let mut bytes = Vec::with_capacity(length + 1);
@@ -11434,52 +11481,116 @@ fn normalize_encoding(encoding: &str) -> String {
 /// Encodes `text` with `encoding`, applying `errors` for unencodable code
 /// points.
 fn encode_unicode_text(text: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, String> {
+    // `Ok(true)` skips an unencodable surrogate, `Ok(false)` substitutes `?`,
+    // and `Err` is CPython's strict failure.
+    let surrogate = |position: usize, code: u32, codec: &str| -> Result<bool, String> {
+        match errors {
+            "ignore" => Ok(true),
+            "replace" => Ok(false),
+            _ => Err(surrogate_encode_error(codec, position, code)),
+        }
+    };
     if encoding == "utf_16" {
         let mut bytes = vec![0xFF, 0xFE];
-        for unit in text.encode_utf16() {
-            bytes.extend_from_slice(&unit.to_le_bytes());
+        for (position, code) in crate::value::str_codes(text).enumerate() {
+            if crate::value::is_surrogate_code(code) {
+                if surrogate(position, code, "utf-16")? {
+                    continue;
+                }
+                bytes.extend_from_slice(&(b'?' as u16).to_le_bytes());
+                continue;
+            }
+            let character = char::from_u32(code)
+                .ok_or_else(|| "SystemError: invalid code point in unicode storage".to_string())?;
+            let mut units = [0u16; 2];
+            for unit in character.encode_utf16(&mut units).iter().copied() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
         }
         return Ok(bytes);
     }
     if encoding == "utf_16_le" || encoding == "utf_16_be" {
         let little = encoding == "utf_16_le";
+        let codec = if little { "utf-16-le" } else { "utf-16-be" };
         let mut bytes = Vec::with_capacity(text.len() * 2);
-        for unit in text.encode_utf16() {
-            bytes.extend_from_slice(&if little {
-                unit.to_le_bytes()
-            } else {
-                unit.to_be_bytes()
-            });
+        for (position, code) in crate::value::str_codes(text).enumerate() {
+            if crate::value::is_surrogate_code(code) {
+                if surrogate(position, code, codec)? {
+                    continue;
+                }
+                let unit = b'?' as u16;
+                bytes.extend_from_slice(&if little {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+                continue;
+            }
+            let character = char::from_u32(code)
+                .ok_or_else(|| "SystemError: invalid code point in unicode storage".to_string())?;
+            let mut units = [0u16; 2];
+            for unit in character.encode_utf16(&mut units).iter().copied() {
+                bytes.extend_from_slice(&if little {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+            }
         }
         return Ok(bytes);
     }
-    if encoding == "utf_32" {
-        let mut bytes = vec![0xFF, 0xFE, 0x00, 0x00];
-        for character in text.chars() {
-            bytes.extend_from_slice(&(character as u32).to_le_bytes());
-        }
-        return Ok(bytes);
-    }
-    if encoding == "utf_32_le" || encoding == "utf_32_be" {
-        let little = encoding == "utf_32_le";
-        let mut bytes = Vec::with_capacity(text.len() * 4);
-        for character in text.chars() {
-            let code = character as u32;
-            bytes.extend_from_slice(&if little {
-                code.to_le_bytes()
+    if encoding == "utf_32" || encoding == "utf_32_le" || encoding == "utf_32_be" {
+        let little = encoding != "utf_32_be";
+        let codec = match encoding {
+            "utf_32" => "utf-32",
+            "utf_32_le" => "utf-32-le",
+            _ => "utf-32-be",
+        };
+        let mut bytes = if encoding == "utf_32" {
+            vec![0xFF, 0xFE, 0x00, 0x00]
+        } else {
+            Vec::with_capacity(text.len() * 4)
+        };
+        for (position, code) in crate::value::str_codes(text).enumerate() {
+            let value = if crate::value::is_surrogate_code(code) {
+                if surrogate(position, code, codec)? {
+                    continue;
+                }
+                b'?' as u32
             } else {
-                code.to_be_bytes()
+                code
+            };
+            bytes.extend_from_slice(&if little {
+                value.to_le_bytes()
+            } else {
+                value.to_be_bytes()
             });
         }
         return Ok(bytes);
     }
     match encoding {
-        "utf_8" => Ok(text.as_bytes().to_vec()),
+        "utf_8" => {
+            let mut bytes = Vec::with_capacity(text.len());
+            for (position, code) in crate::value::str_codes(text).enumerate() {
+                if crate::value::is_surrogate_code(code) {
+                    if surrogate(position, code, "utf-8")? {
+                        continue;
+                    }
+                    bytes.push(b'?');
+                    continue;
+                }
+                let character = char::from_u32(code).ok_or_else(|| {
+                    "SystemError: invalid code point in unicode storage".to_string()
+                })?;
+                let mut buffer = [0u8; 4];
+                bytes.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            }
+            Ok(bytes)
+        }
         "ascii" | "latin_1" => {
             let limit = if encoding == "ascii" { 0x7F } else { 0xFF };
             let mut bytes = Vec::with_capacity(text.len());
-            for (position, character) in text.chars().enumerate() {
-                let code = character as u32;
+            for (position, code) in crate::value::str_codes(text).enumerate() {
                 if code <= limit {
                     bytes.push(code as u8);
                     continue;
@@ -11560,6 +11671,10 @@ pub extern "C" fn PyUnicode_EqualToUTF8AndSize(
     let Some(ShimKind::Str { text, .. }) = kind_ref(object) else {
         return 0;
     };
+    // A lone surrogate has no UTF-8 form, so it never compares equal.
+    if first_lone_surrogate(text).is_some() {
+        return 0;
+    }
     let Ok(size) = usize::try_from(size) else {
         return 0;
     };

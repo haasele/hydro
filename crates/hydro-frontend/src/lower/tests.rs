@@ -9752,16 +9752,14 @@ def outer(n):
 }
 
 #[test]
-fn recursive_reference_to_an_unbound_name_is_a_name_error() {
+fn unknown_free_name_in_a_function_body_is_a_runtime_global_read() {
+    // CPython compiles `missing` to `LOAD_GLOBAL`: the `NameError` happens
+    // only when the read executes, so a function that is defined but never
+    // called must still compile (CPython's own suites rely on it).
     let source =
         "def outer():\n    def inner(n):\n        return missing(n - 1)\n    return inner\n";
     let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert!(
-        diags[0].message.contains("name 'missing' is not defined"),
-        "{diags:?}"
-    );
-    assert_eq!(diags[0].code, codes::NAME);
+    assert!(diags.is_empty(), "{diags:?}");
 }
 
 #[test]
@@ -9805,15 +9803,10 @@ fn recursive_nested_function_with_a_global_binding_still_reports_the_slot_error(
 }
 
 #[test]
-fn nested_function_free_name_errors_are_reported() {
+fn nested_function_free_name_resolves_at_runtime() {
     let source = "def outer(x):\n    def inner():\n        return z\n    return inner\n";
     let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert!(
-        diags[0].message.contains("name 'z' is not defined"),
-        "{diags:?}"
-    );
-    assert_eq!(diags[0].code, codes::NAME);
+    assert!(diags.is_empty(), "{diags:?}");
 }
 
 #[test]
@@ -12931,7 +12924,7 @@ fn keyword_binding_diagnostics_are_specific() {
         ),
         (
             "def f(a, b):\n    return a\nx = f(1)\n",
-            "f() missing required argument 'b'",
+            "f() missing 1 required positional argument: 'b'",
         ),
         (
             "def f(a):\n    return a\nx = f(1, 2)\n",
@@ -14848,7 +14841,7 @@ f(1, 2, 3, z=4, extra=5)
     assert!(
         diags[0]
             .message
-            .contains("missing required positional argument 'x'"),
+            .contains("missing 1 required positional argument: 'x'"),
         "{diags:?}"
     );
     // Without `**kwargs`, the keyword name is not bindable at all.
@@ -16785,8 +16778,11 @@ fn dynamic_global_alias_from_vars_allows_unknown_reads() {
 }
 
 #[test]
-fn undefined_name_in_an_ordinary_module_still_errors() {
-    let source = "value = 1\ndef read():\n    return valeu\n";
+fn undefined_name_in_a_module_body_still_errors() {
+    // A function body defers an unresolved name to `LOAD_GLOBAL` (the
+    // `NameError` happens when the read executes), but the module body's
+    // namespace is statically known, so a typo there keeps its diagnostic.
+    let source = "value = 1\ndef read():\n    return value\nx = valeu\n";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, codes::NAME);
@@ -16944,8 +16940,7 @@ def mark(cls):
 class C:
     pass
 
-def read():
-    return missing
+x = missing
 ";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert_eq!(diags.len(), 1, "{diags:?}");
@@ -19436,9 +19431,7 @@ bad = Theme('u')
     let (_, _, diags) = lower_source(source, &parse(source));
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert!(
-        diags[0]
-            .message
-            .contains("missing required argument 'must'"),
+        diags[0].message.contains("missing 1 required") && diags[0].message.contains("'must'"),
         "only the genuinely required field is missing: {diags:?}"
     );
 }

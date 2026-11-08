@@ -227,6 +227,8 @@ const BUFFER_SIZE_ATTR: &str = "_pyexpat_buffer_size";
 const NAMESPACE_PREFIXES_ATTR: &str = "_pyexpat_namespace_prefixes";
 const ORDERED_ATTRIBUTES_ATTR: &str = "_pyexpat_ordered_attributes";
 const SPECIFIED_ATTRIBUTES_ATTR: &str = "_pyexpat_specified_attributes";
+/// Deferred-reparse flag (`Get/SetReparseDeferralEnabled`).
+const REPARSE_DEFERRAL_ATTR: &str = "_pyexpat_reparse_deferral";
 
 const DEFAULT_BUFFER_SIZE: i64 = 8192;
 const MAX_CHUNK_SIZE: usize = 1 << 20;
@@ -1390,6 +1392,16 @@ fn parser_class() -> i64 {
                 native("_pyexpat_use_foreign_dtd"),
                 MethodKind::Normal,
             ),
+            (
+                "GetReparseDeferralEnabled".to_string(),
+                native("_pyexpat_get_reparse_deferral"),
+                MethodKind::Normal,
+            ),
+            (
+                "SetReparseDeferralEnabled".to_string(),
+                native("_pyexpat_set_reparse_deferral"),
+                MethodKind::Normal,
+            ),
         ];
         let mut attributes: Vec<(String, i64)> = Vec::new();
         for handler in HANDLERS {
@@ -1530,6 +1542,11 @@ fn create_parser(
     };
     let roots = heap::root_values(&[instance]);
     value::instance_setattr(instance, INTERN_ATTR.to_string(), intern);
+    value::instance_setattr(
+        instance,
+        REPARSE_DEFERRAL_ATTR.to_string(),
+        bool_value(reparse_deferral_default()),
+    );
     let result = register_parser(instance, parser);
     heap::release_roots(roots);
     match result {
@@ -1843,6 +1860,7 @@ fn external_entity_parser_create(args: &[i64]) -> i64 {
         NAMESPACE_PREFIXES_ATTR,
         ORDERED_ATTRIBUTES_ATTR,
         SPECIFIED_ATTRIBUTES_ATTR,
+        REPARSE_DEFERRAL_ATTR,
     ] {
         if let Some(flag_value) = value::instance_attr(instance, flag_name) {
             value::instance_setattr(child, flag_name.to_string(), flag_value);
@@ -2120,6 +2138,44 @@ fn version_info() -> i64 {
     ])
 }
 
+/// Whether the linked Expat supports deferred reparse (`>= 2.6.0`).
+fn reparse_deferral_default() -> bool {
+    // SAFETY: returns a plain by-value version struct.
+    let info = unsafe { XML_ExpatVersionInfo() };
+    (info.major as i64, info.minor as i64) >= (2, 6)
+}
+
+/// `GetReparseDeferralEnabled()`.
+fn get_reparse_deferral(args: &[i64]) -> i64 {
+    let instance = argument(args, 0);
+    match hidden(instance, REPARSE_DEFERRAL_ATTR) {
+        Some(value_arg) => bool_value(value::truthy(value_arg)),
+        None => bool_value(reparse_deferral_default()),
+    }
+}
+
+/// `SetReparseDeferralEnabled(enabled)`.
+fn set_reparse_deferral(args: &[i64]) -> i64 {
+    let instance = argument(args, 0);
+    let Some(&value_arg) = args.get(1) else {
+        return type_error(
+            "SetReparseDeferralEnabled() missing required argument 'enabled' (pos 2)",
+        );
+    };
+    if value_arg != value::TRUE && value_arg != value::FALSE {
+        return type_error(&format!(
+            "SetReparseDeferralEnabled() argument 1 must be bool, not {}",
+            value::type_name(value_arg)
+        ));
+    }
+    value::instance_setattr(
+        instance,
+        REPARSE_DEFERRAL_ATTR.to_string(),
+        bool_value(value::truthy(value_arg)),
+    );
+    NONE
+}
+
 fn expat_version() -> i64 {
     // SAFETY: returns a static NUL-terminated version string.
     unsafe { c_str_required(XML_ExpatVersion()) }
@@ -2219,6 +2275,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "_pyexpat_external_entity_parser_create" => external_entity_parser_create(args),
         "_pyexpat_set_param_entity_parsing" => set_param_entity_parsing(args),
         "_pyexpat_use_foreign_dtd" => use_foreign_dtd(args),
+        "_pyexpat_get_reparse_deferral" => get_reparse_deferral(args),
+        "_pyexpat_set_reparse_deferral" => set_reparse_deferral(args),
         "_pyexpat_get_buffer_text" => get_buffer_text(args),
         "_pyexpat_set_buffer_text" => set_buffer_text(args),
         "_pyexpat_get_buffer_size" => get_buffer_size(args),

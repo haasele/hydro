@@ -201,12 +201,21 @@ fn heap_operation(function: &str, args: &[i64]) -> i64 {
         order: 0,
         item,
     };
-    let result = match function {
-        "heappush" => heap_push(&mut entries, entry, HeapKind::Min).map(|()| NONE),
-        "heappop" => heap_pop(&mut entries, HeapKind::Min).map(|entry| entry.item),
-        "heapify" => heapify(&mut entries, HeapKind::Min).map(|()| NONE),
-        "heappushpop" => heap_pushpop(&mut entries, entry, HeapKind::Min).map(|entry| entry.item),
-        "heapreplace" => heap_replace(&mut entries, entry, HeapKind::Min).map(|entry| entry.item),
+    // Python 3.14 adds the max-heap spellings: `heappush_max` and friends are
+    // the ordinary operations on a max-heap (`HeapKind::Max`), while
+    // `heapify_max`/`heappop_max` keep their single-argument shape.
+    let kind = if function.ends_with("_max") {
+        HeapKind::Max
+    } else {
+        HeapKind::Min
+    };
+    let base = function.strip_suffix("_max").unwrap_or(function);
+    let result = match base {
+        "heappush" => heap_push(&mut entries, entry, kind).map(|()| NONE),
+        "heappop" => heap_pop(&mut entries, kind).map(|entry| entry.item),
+        "heapify" => heapify(&mut entries, kind).map(|()| NONE),
+        "heappushpop" => heap_pushpop(&mut entries, entry, kind).map(|entry| entry.item),
+        "heapreplace" => heap_replace(&mut entries, entry, kind).map(|entry| entry.item),
         _ => Err(type_error(&format!(
             "module 'heapq' has no attribute '{function}'"
         ))),
@@ -412,19 +421,134 @@ fn nlargest_nsmallest(args: &[i64], largest: bool) -> i64 {
     value::list_new(sorted.iter().map(|entry| entry.item).collect())
 }
 
+/// `merge(*iterables, key=None, reverse=False)`: one sorted stream over all
+/// inputs.
+///
+/// CPython pulls one element at a time from each input; this runtime has no
+/// general lazy iterator over arbitrary user callables, so each input is
+/// materialised first (the same limitation as the `itertools` combinators) and
+/// the heads are merged. Equal keys keep input order, matching the
+/// `order * direction` tiebreaker of CPython's heap entries.
+fn merge(args: &[i64], key: i64, reverse: bool) -> i64 {
+    if let Err(error) = callable_key(key) {
+        return error;
+    }
+    // One `(items, keys)` pair per input. Both lists are kept alive through
+    // `handles` while the result grows.
+    let mut sources: Vec<(i64, i64)> = Vec::with_capacity(args.len());
+    let mut handles: Vec<i64> = Vec::with_capacity(args.len() * 2);
+    for &iterable in args {
+        let items = match collect_items(iterable) {
+            Ok(items) => items,
+            Err(error) => return error,
+        };
+        let keys = match value::as_list(items) {
+            Some(list) => match decorate_keys(list, key) {
+                Ok(keys) => keys,
+                Err(error) => return error,
+            },
+            None => NONE,
+        };
+        handles.push(items);
+        handles.push(keys);
+        sources.push((items, keys));
+    }
+    let roots = gc::root_values(&handles);
+    let mut positions = vec![0usize; sources.len()];
+    let result = value::list_new(Vec::new());
+    loop {
+        let mut best: Option<usize> = None;
+        for index in 0..sources.len() {
+            let (items_list, keys_list) = sources[index];
+            let items = value::as_list(items_list).unwrap_or_default();
+            if positions[index] >= items.len() {
+                continue;
+            }
+            let Some(current) = best else {
+                best = Some(index);
+                continue;
+            };
+            let keys = value::as_list(keys_list).unwrap_or_default();
+            let left = keys.get(positions[index]).copied().unwrap_or(NONE);
+            let right = keys.get(positions[current]).copied().unwrap_or(NONE);
+            let less = if reverse {
+                compare(ops::OP_LT, right, left)
+            } else {
+                compare(ops::OP_LT, left, right)
+            };
+            match less {
+                Ok(true) => best = Some(index),
+                Ok(false) => {}
+                Err(error) => {
+                    gc::release_roots(roots);
+                    return error;
+                }
+            }
+        }
+        let Some(index) = best else {
+            break;
+        };
+        let (items_list, _) = sources[index];
+        let item = value::as_list(items_list)
+            .and_then(|items| items.get(positions[index]).copied())
+            .unwrap_or(NONE);
+        positions[index] += 1;
+        if let Some(mut stored) = value::list_items_mut(result) {
+            stored.push(item);
+            gc::write_barrier_edge(result, item);
+        }
+    }
+    gc::release_roots(roots);
+    result
+}
+
 /// Dispatches `module.function(...)` calls for `heapq` and `_heapq`.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "heappush" | "heappop" | "heapify" | "heappushpop" | "heapreplace" => {
+        "heappush" | "heappop" | "heapify" | "heappushpop" | "heapreplace" | "heappush_max"
+        | "heappop_max" | "heapify_max" | "heappushpop_max" | "heapreplace_max" => {
             heap_operation(function, args)
         }
         "nlargest" => nlargest_nsmallest(args, true),
         "nsmallest" => nlargest_nsmallest(args, false),
+        "merge" => merge(args, NONE, false),
         _ => exc::raise_with_message(
             exc::ATTRIBUTE_ERROR,
             &format!("module 'heapq' has no attribute '{function}'"),
         ),
     }
+}
+
+/// Keyword-aware dispatch: `merge` takes the keyword-only `key`/`reverse`
+/// parameters, and the other functions declare no keyword names.
+pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if function != "merge" {
+        if let Some((name, _)) = keywords.first() {
+            return type_error(&format!(
+                "{function}() got an unexpected keyword argument '{name}'"
+            ));
+        }
+        return call(function, args);
+    }
+    let mut key = NONE;
+    let mut reverse = false;
+    for (name, argument) in keywords {
+        match name.as_str() {
+            "key" => key = *argument,
+            "reverse" => {
+                reverse = value::truthy(*argument);
+                if exc::pending() {
+                    return NONE;
+                }
+            }
+            other => {
+                return type_error(&format!(
+                    "merge() got an unexpected keyword argument '{other}'"
+                ))
+            }
+        }
+    }
+    merge(args, key, reverse)
 }
 
 #[cfg(test)]

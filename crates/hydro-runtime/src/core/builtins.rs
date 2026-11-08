@@ -19,6 +19,7 @@ use crate::methods;
 use crate::modules;
 use crate::ops;
 use crate::value::{self, FunctionBody, NONE};
+use super::compile_runtime;
 
 /// `2^63` as `f64`, the first float outside the `i64` range.
 const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
@@ -302,6 +303,11 @@ pub(crate) fn len(v: i64) -> i64 {
     if let Some(items) = value::as_set(v) {
         return ops::int_result(items.len() as i64);
     }
+    // `argparse.Namespace` is a native attribute bag whose namespace size is
+    // its number of attributes.
+    if let Some(pairs) = value::as_namespace(v) {
+        return ops::int_result(pairs.len() as i64);
+    }
     if let Some((start, stop, step)) = value::as_range(v) {
         return ops::int_result(value::range_len(start, stop, step));
     }
@@ -337,7 +343,9 @@ pub(crate) fn len(v: i64) -> i64 {
 /// A string with any other length (including the empty string) raises
 /// `TypeError`, as does a non-string argument.
 pub(crate) fn ord_value(v: i64) -> i64 {
-    let Some(s) = value::as_str(v) else {
+    // Code-point view: lone surrogates are stored as mirror scalars, so the
+    // raw UTF-8 view would report the wrong length/value for them.
+    let Some(codes) = value::as_str_codes(v) else {
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
@@ -346,16 +354,15 @@ pub(crate) fn ord_value(v: i64) -> i64 {
             ),
         );
     };
-    let mut chars = s.chars();
-    match (chars.next(), chars.next()) {
-        (Some(ch), None) => ops::int_result(ch as i64),
-        _ => {
-            let len = s.chars().count();
-            exc::raise_with_message(
-                TYPE_ERROR,
-                &format!("ord() expected a character, but string of length {len} found"),
-            )
-        }
+    match codes.as_slice() {
+        [code] => ops::int_result(*code as i64),
+        _ => exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "ord() expected a character, but string of length {} found",
+                codes.len()
+            ),
+        ),
     }
 }
 
@@ -378,10 +385,9 @@ pub(crate) fn chr_value(v: i64) -> i64 {
     if !(0..=0x10FFFF).contains(&code) {
         return exc::raise_with_message(VALUE_ERROR, "chr() arg not in range(0x110000)");
     }
-    match char::from_u32(code as u32) {
-        Some(ch) => value::str_alloc(ch.to_string()),
-        None => exc::raise_with_message(VALUE_ERROR, "chr() arg cannot be a surrogate code point"),
-    }
+    // Surrogate code points are valid `chr()` arguments; the string stores
+    // them through the surrogate-preserving encoding.
+    value::str_alloc(value::str_from_codes([code as u32]))
 }
 
 /// Shared implementation of `hex`, `bin` and `oct`: the `radix` spelling of
@@ -608,6 +614,39 @@ fn to_int_base(value_arg: i64, base_arg: i64) -> i64 {
     }
 }
 
+/// Tries `v.__float__()` / `v.__index__()` for the `float()` conversion
+/// protocol, mirroring [`int_special_method`]. The first method that answers
+/// decides; a non-float result raises the protocol `TypeError`.
+fn float_special_method(v: i64, name: &str) -> Option<i64> {
+    let result = methods::call(v, name.as_ptr(), name.len(), 0, std::ptr::null());
+    if exc::pending() {
+        if exc::pending_tag() == ATTRIBUTE_ERROR as i64 {
+            exc::clear();
+            return None;
+        }
+        return Some(NONE);
+    }
+    if let Some(f) = value::as_float(result) {
+        return Some(value::float_new(f));
+    }
+    if let Some(n) = value::as_integer(result) {
+        return Some(value::float_new(n as f64));
+    }
+    if let Some(n) = value::as_bigint(result) {
+        return Some(match value::bigint_to_f64(n) {
+            Some(f) => value::float_new(f),
+            None => exc::raise_with_message(OVERFLOW_ERROR, "int too large to convert to float"),
+        });
+    }
+    Some(exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "{name} returned non-float (type {})",
+            value::type_name_of(result)
+        ),
+    ))
+}
+
 /// `float(v)`.
 pub(crate) fn to_float(v: i64) -> i64 {
     if let Some(n) = value::as_integer(v) {
@@ -631,11 +670,19 @@ pub(crate) fn to_float(v: i64) -> i64 {
             ),
         };
     }
+    // CPython's conversion protocol: `__float__` first, then `__index__`
+    // (which also covers `Fraction`, `Decimal` and `numbers.Real`).
+    if let Some(result) = float_special_method(v, "__float__") {
+        return result;
+    }
+    if let Some(result) = float_special_method(v, "__index__") {
+        return result;
+    }
     exc::raise_with_message(
         TYPE_ERROR,
         &format!(
             "float() argument must be a string or a real number, not '{}'",
-            value::type_name(v)
+            value::type_name_of(v)
         ),
     )
 }
@@ -781,16 +828,21 @@ pub(crate) fn callable(v: i64) -> i64 {
 /// Decodes a `range()` argument, raising the Python `TypeError` for
 /// non-integers (`range_arg_type.py`).
 fn integer_argument(v: i64) -> Option<i64> {
-    match value::as_integer(v) {
+    if let Some(n) = value::as_integer(v) {
+        return Some(n);
+    }
+    match container::index_or_none(v) {
         Some(n) => Some(n),
         None => {
-            exc::raise_with_message(
-                TYPE_ERROR,
-                &format!(
-                    "'{}' object cannot be interpreted as an integer",
-                    value::type_name(v)
-                ),
-            );
+            if !exc::pending() {
+                exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        value::type_name_of(v)
+                    ),
+                );
+            }
             None
         }
     }
@@ -1412,7 +1464,83 @@ pub(crate) fn dict_from(iterable: i64) -> i64 {
 
 /// `sum(iterable, start)`: uses the runtime iterator protocol and `+`
 /// semantics, so pending arithmetic errors propagate unchanged.
+/// `aiter(obj)`: `obj.__aiter__()`. A missing method reports `TypeError`
+/// (`'X' object is not an async iterable`), matching CPython's builtin.
+pub(crate) fn aiter(obj: i64) -> i64 {
+    let result = methods::call(
+        obj,
+        b"__aiter__".as_ptr(),
+        "__aiter__".len(),
+        0,
+        std::ptr::null(),
+    );
+    if exc::pending() {
+        if exc::pending_tag() == exc::ATTRIBUTE_ERROR as i64 {
+            exc::clear();
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "'{}' object is not an async iterable",
+                    value::type_name_of(obj)
+                ),
+            );
+        }
+        return NONE;
+    }
+    result
+}
+
+/// `anext(aiterator[, default])`: calls `__anext__` and returns its awaitable.
+/// A synchronous `StopAsyncIteration` uses the default when one was supplied.
+pub(crate) fn anext(obj: i64, default: i64, has_default: bool) -> i64 {
+    let result = methods::call(
+        obj,
+        b"__anext__".as_ptr(),
+        "__anext__".len(),
+        0,
+        std::ptr::null(),
+    );
+    if exc::pending() {
+        if exc::pending_tag() == exc::ATTRIBUTE_ERROR as i64 {
+            exc::clear();
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "'{}' object is not an async iterator",
+                    value::type_name_of(obj)
+                ),
+            );
+        }
+        if has_default && exc::pending_tag() == exc::STOP_ASYNC_ITERATION as i64 {
+            exc::clear();
+            return default;
+        }
+        return NONE;
+    }
+    result
+}
+
 pub(crate) fn sum(iterable: i64, start: i64) -> i64 {
+    // CPython rejects a string/bytes start before consuming the iterable;
+    // `int + str` would otherwise surface as a generic operand TypeError.
+    if value::as_str(start).is_some() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "sum() can't sum strings [use ''.join(seq) instead]",
+        );
+    }
+    if value::as_bytes(start).is_some() && value::as_bytearray(start).is_none() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "sum() can't sum bytes [use b''.join(seq) instead]",
+        );
+    }
+    if value::as_bytearray(start).is_some() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "sum() can't sum bytearray [use b''.join(seq) instead]",
+        );
+    }
     // A generator fiber is driven directly; wrapping it in an iterator object
     // would re-check the fiber kind and output pointer on every yield.
     if value::as_fiber(iterable)
@@ -3051,6 +3179,116 @@ pub(crate) fn call_kw(
                 bound.push(base);
             }
             return call_builtin(*builtin, bound.len(), bound.as_ptr());
+        }
+        // `sum(iterable, /, start=0)`: `start` is the only named parameter
+        // (CPython 3.14 makes it keyword-or-positional).
+        if matches!(builtin, Builtin::Sum) {
+            let pairs = if kwargc == 0 {
+                &[][..]
+            } else {
+                if kw_argv.is_null() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "keyword arguments were passed without an argument buffer",
+                    );
+                }
+                // SAFETY: the caller validated the buffer and its length.
+                unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) }
+            };
+            let mut start: Option<i64> = None;
+            for pair in pairs.as_chunks::<2>().0 {
+                let Some(keyword) = value::as_str(pair[0]) else {
+                    return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+                };
+                if keyword != "start" {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("sum() got an unexpected keyword argument '{keyword}'"),
+                    );
+                }
+                if start.is_some() || argc >= 2 {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "sum() got multiple values for argument 'start'",
+                    );
+                }
+                start = Some(pair[1]);
+            }
+            if argc == 0 {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "sum() takes at least 1 positional argument (0 given)",
+                );
+            }
+            if argc > 2 {
+                return builtin_arity_error("sum", "1 or 2", argc);
+            }
+            let mut bound = Vec::with_capacity(2);
+            // SAFETY: nil with argc > 0 was rejected by the caller.
+            bound.push(unsafe { *argv });
+            if let Some(start) = start {
+                bound.push(start);
+            } else if argc == 2 {
+                bound.push(unsafe { *argv.add(1) });
+            }
+            return call_builtin(Builtin::Sum, bound.len(), bound.as_ptr());
+        }
+        // `round(number, ndigits=None)`: both parameters may be passed by
+        // name (the keyword-only form is used by `decimal` and test suites).
+        if matches!(builtin, Builtin::Round) {
+            let pairs = if kwargc == 0 {
+                &[][..]
+            } else {
+                if kw_argv.is_null() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "keyword arguments were passed without an argument buffer",
+                    );
+                }
+                // SAFETY: the caller validated the buffer and its length.
+                unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) }
+            };
+            let mut slots: [Option<i64>; 2] = [None; 2];
+            if argc > 2 {
+                return builtin_arity_error("round", "1 or 2", argc);
+            }
+            if argc > 0 {
+                // SAFETY: a NULL buffer with argc > 0 was rejected at entry.
+                let positional = unsafe { std::slice::from_raw_parts(argv, argc) };
+                for (index, argument) in positional.iter().enumerate() {
+                    slots[index] = Some(*argument);
+                }
+            }
+            for pair in pairs.as_chunks::<2>().0 {
+                let Some(keyword) = value::as_str(pair[0]) else {
+                    return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+                };
+                let index = match keyword {
+                    "number" => 0usize,
+                    "ndigits" => 1,
+                    _ => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!("round() got an unexpected keyword argument '{keyword}'"),
+                        )
+                    }
+                };
+                if slots[index].is_some() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("round() got multiple values for argument '{keyword}'"),
+                    );
+                }
+                slots[index] = Some(pair[1]);
+            }
+            let Some(number) = slots[0] else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "round() missing required argument 'number' (pos 1)",
+                );
+            };
+            let ndigits = slots[1].unwrap_or(NONE);
+            return round_value(number, ndigits);
         }
         // `max`/`min` bind `key=` and the keyword-only `default=` here; the
         // direct lowering path appends the key slot instead.
@@ -4983,67 +5221,7 @@ fn namespace_get(namespace: i64, name: &str) -> Option<i64> {
 /// comprehension and lambda forms raise a tagged `NotImplementedError`
 /// instead of guessing.
 fn eval_builtin(args: &[i64]) -> i64 {
-    let (source, global_ns, local_ns) = match args {
-        [source] => (*source, NONE, NONE),
-        [source, globals] => (*source, *globals, NONE),
-        [source, globals, locals] => (*source, *globals, *locals),
-        _ => return builtin_arity_error("eval", "1 to 3", args.len()),
-    };
-    let Some(text) = value::as_str(source) else {
-        return exc::raise_with_message(
-            TYPE_ERROR,
-            &format!(
-                "eval() arg 1 must be a string, bytes or code object, not '{}'",
-                value::type_name(source)
-            ),
-        );
-    };
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return exc::raise_with_message(SYNTAX_ERROR, "invalid syntax");
-    }
-    // Namespaces must be real dicts before anything is evaluated.
-    for namespace in [global_ns, local_ns] {
-        if namespace != NONE && value::as_dict(namespace).is_none() {
-            return exc::raise_with_message(
-                TYPE_ERROR,
-                &format!(
-                    "eval() namespace must be a dict, not '{}'",
-                    value::type_name(namespace)
-                ),
-            );
-        }
-    }
-    let trimmed_value = value::str_alloc(trimmed.to_string());
-    let literal = modules::ast::call("literal_eval", &[trimmed_value]);
-    if !exc::pending() {
-        return literal;
-    }
-    // `literal_eval` reports non-literal text as `ValueError`; that only means
-    // "not a literal", not a user-visible failure.
-    if exc::pending_tag() != VALUE_ERROR as i64 {
-        return NONE;
-    }
-    exc::clear();
-
-    let mut parser = EvalParser::new(trimmed, global_ns, local_ns);
-    match parser.parse_document() {
-        Ok(value) => value,
-        Err(EvalError::Pending) => NONE,
-        Err(EvalError::Name(name)) => {
-            exc::raise_with_message(NAME_ERROR, &format!("name '{name}' is not defined"))
-        }
-        Err(EvalError::Syntax) => exc::raise_with_message(SYNTAX_ERROR, "invalid syntax"),
-        Err(EvalError::Unsupported) => exc::raise_with_message(
-            NOT_IMPLEMENTED_ERROR,
-            &format!(
-                "eval() cannot compile this expression at runtime in Hydro: '{}' \
-                 (only literals, names, attributes, subscripts and arithmetic \
-                 expressions are evaluated; whole programs are compiled ahead of time)",
-                source_snippet(trimmed)
-            ),
-        ),
-    }
+    compile_runtime::builtin_eval(args)
 }
 
 /// Failure of the runtime expression evaluator.
@@ -5869,84 +6047,7 @@ struct ExecSource {
 /// raises a `NotImplementedError` naming the rejected construct instead of
 /// silently doing nothing.
 fn exec_builtin(args: &[i64]) -> i64 {
-    if args.is_empty() || args.len() > 4 {
-        return builtin_arity_error("exec", "1 to 4", args.len());
-    }
-    // `exec(source, globals=None, locals=None, /, *, closure=None)`. Hydro's
-    // `exec` accepts source text only (there is no runtime code object), so a
-    // non-`None` closure can only have come with a code object and reports
-    // CPython's TypeError before the source type is inspected.
-    if args.len() > 3 && args[3] != NONE {
-        return exc::raise_with_message(
-            TYPE_ERROR,
-            "closure can only be used when source is a code object",
-        );
-    }
-    let Some(source) = value::as_str(args[0]) else {
-        return exc::raise_with_message(
-            TYPE_ERROR,
-            &format!(
-                "exec() arg 1 must be a str, not '{}'",
-                value::type_name(args[0])
-            ),
-        );
-    };
-    let provided_globals = args.get(1).copied();
-    let provided_locals = args.get(2).copied();
-    // Namespaces must be real dicts before anything is compiled.
-    for (label, namespace) in [("globals", provided_globals), ("locals", provided_locals)] {
-        if let Some(namespace) = namespace {
-            if namespace != NONE && value::as_dict(namespace).is_none() {
-                return exc::raise_with_message(
-                    TYPE_ERROR,
-                    &format!(
-                        "exec() {label} must be a dict, not '{}'",
-                        value::type_name(namespace)
-                    ),
-                );
-            }
-        }
-    }
-    let parsed = match parse_exec_source(source) {
-        Ok(parsed) => parsed,
-        Err(construct) => {
-            return exc::raise_with_message(
-                NOT_IMPLEMENTED_ERROR,
-                &format!(
-                    "exec() cannot compile Python source at runtime in Hydro: {construct} \
-                     (source: '{}'); supported source is a single function definition \
-                     returning `PARAM is NAME`, `PARAM is NAME or PARAM is NAME`, \
-                     `isinstance(PARAM, NAME)` or `False`",
-                    source_snippet(source)
-                ),
-            )
-        }
-    };
-    let globals_ns = match provided_globals {
-        None | Some(NONE) => value::dict_new(Vec::new()),
-        Some(namespace) => namespace,
-    };
-    let locals_ns = match provided_locals {
-        None | Some(NONE) => globals_ns,
-        Some(namespace) => namespace,
-    };
-    let roots = crate::heap::root_values(&[globals_ns, locals_ns]);
-    let key = value::str_alloc(parsed.name.clone());
-    let key_root = crate::heap::root_values(&[key]);
-    let function = value::exec_function_new(
-        parsed.name,
-        parsed.param,
-        parsed.second,
-        parsed.check,
-        globals_ns,
-        locals_ns,
-    );
-    let live = crate::heap::root_values(&[key, function]);
-    container::dict_set(locals_ns, key, function);
-    crate::heap::release_roots(live);
-    crate::heap::release_roots(key_root);
-    crate::heap::release_roots(roots);
-    NONE
+    compile_runtime::builtin_exec(args)
 }
 
 /// Parses the bounded `exec` grammar.
@@ -6212,20 +6313,7 @@ fn exec_header_colon(text: &str) -> Result<usize, String> {
 
 /// `compile(...)`: no bytecode compiler exists, so fail loudly.
 fn compile_builtin(args: &[i64]) -> i64 {
-    if args.len() < 3 || args.len() > 6 {
-        return builtin_arity_error("compile", "3 to 6", args.len());
-    }
-    let snippet = value::as_str(args[0])
-        .map(source_snippet)
-        .unwrap_or_else(|| "<non-string source>".to_string());
-    exc::raise_with_message(
-        NOT_IMPLEMENTED_ERROR,
-        &format!(
-            "compile() is not supported: Hydro consumes Python source ahead of time \
-             and has no bytecode compiler (source: '{}')",
-            snippet
-        ),
-    )
+    compile_runtime::builtin_compile(args)
 }
 
 /// Internal: build a class from a runtime namespace dict (see
@@ -6394,7 +6482,14 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             [stop] => range_new(ops::int_result(0), *stop, ops::int_result(1)),
             [start, stop] => range_new(*start, *stop, ops::int_result(1)),
             [start, stop, step] => range_new(*start, *stop, *step),
-            _ => builtin_arity_error("range", "1 to 3", argc),
+            [] => exc::raise_with_message(
+                TYPE_ERROR,
+                "range expected at least 1 argument, got 0",
+            ),
+            _ => exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("range expected at most 3 arguments, got {argc}"),
+            ),
         },
         Builtin::List => match args {
             [] => container::list_new(0, std::ptr::null()),
@@ -8052,6 +8147,11 @@ pub(crate) fn complex_class() -> i64 {
                 "__eq__".to_string(),
                 native_method(complex_eq_method, 2, "__eq__"),
             ),
+            // `pickle` reconstructs a complex value via `__getnewargs__`.
+            (
+                "__getnewargs__".to_string(),
+                native_method(complex_getnewargs_method, 1, "__getnewargs__"),
+            ),
         ],
     );
     globals::registry_set("builtins.complex", class);
@@ -8078,6 +8178,10 @@ pub(crate) fn slice_class() -> i64 {
             (
                 "__eq__".to_string(),
                 native_method(slice_eq_method, 2, "__eq__"),
+            ),
+            (
+                "__hash__".to_string(),
+                native_method(slice_hash_method, 1, "__hash__"),
             ),
         ],
     );
@@ -8280,6 +8384,13 @@ extern "C" fn complex_repr_method(argv: *const i64) -> i64 {
     value::str_alloc(complex_repr_text(real, imag))
 }
 
+extern "C" fn complex_getnewargs_method(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes `self` first.
+    let this = unsafe { *argv };
+    let (real, imag) = complex_components(this).unwrap_or((0.0, 0.0));
+    value::tuple_new(vec![value::float_new(real), value::float_new(imag)])
+}
+
 extern "C" fn complex_conjugate(argv: *const i64) -> i64 {
     // SAFETY: bound method call passes `self` first.
     let this = unsafe { *argv };
@@ -8344,20 +8455,41 @@ fn slice_bound_argument(v: i64) -> Result<Option<i64>, i64> {
     if v == NONE {
         return Ok(None);
     }
-    match value::as_integer(v) {
+    match container::index_or_none(v) {
         Some(n) => Ok(Some(n)),
-        None => Err(exc::raise_with_message(
-            TYPE_ERROR,
-            "slice indices must be integers or None or have an __index__ method",
-        )),
+        None => {
+            if exc::pending() {
+                return Err(NONE);
+            }
+            Err(exc::raise_with_message(
+                TYPE_ERROR,
+                "slice indices must be integers or None or have an __index__ method",
+            ))
+        }
     }
+}
+
+extern "C" fn slice_hash_method(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes `self` first.
+    let this = unsafe { *argv };
+    let start = value::instance_attr(this, "start").unwrap_or(NONE);
+    let stop = value::instance_attr(this, "stop").unwrap_or(NONE);
+    let step = value::instance_attr(this, "step").unwrap_or(NONE);
+    let tuple = value::tuple_new(vec![start, stop, step]);
+    let roots = crate::heap::root_values(std::slice::from_ref(&tuple));
+    let result = hash(tuple);
+    crate::heap::release_roots(roots);
+    result
 }
 
 extern "C" fn slice_indices_method(argv: *const i64) -> i64 {
     // SAFETY: bound method call passes `self` and `len`.
     let this = unsafe { *argv };
     let length_value = unsafe { *argv.add(1) };
-    let Some(length) = value::as_integer(length_value) else {
+    let Some(length) = container::index_or_none(length_value) else {
+        if exc::pending() {
+            return NONE;
+        }
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(

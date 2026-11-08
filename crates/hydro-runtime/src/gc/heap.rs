@@ -2320,6 +2320,51 @@ pub(crate) fn objects() -> usize {
     }
 }
 
+/// Tagged values of every registered live object.
+///
+/// The heap keeps its allocation registry as raw cells; `gc` needs the
+/// ordinary tagged handles to enumerate objects (`gc.get_objects`,
+/// `gc.get_referrers`, `gc.freeze`). The values are not rooted: a caller that
+/// allocates must root them first, exactly like any other tagged value. No
+/// Hydro allocation happens while this function runs, so the snapshot cannot
+/// go stale before it is returned.
+pub(crate) fn live_object_values() -> Vec<i64> {
+    let mut values = Vec::new();
+    if shared() {
+        let heap = lock_global();
+        values.reserve(heap.objects.len());
+        for &raw in &heap.objects {
+            values.push((raw as usize as i64) | TAG_HEAP);
+        }
+    } else {
+        HEAP.with(|cell| {
+            let heap = cell.borrow();
+            values.reserve(heap.objects.len());
+            for &raw in &heap.objects {
+                values.push((raw as usize as i64) | TAG_HEAP);
+            }
+        });
+    }
+    values
+}
+
+/// Sets the generation-0 collection threshold and pins it by disabling the
+/// adaptive controller, matching `gc.set_threshold`'s observable effect.
+pub(crate) fn set_collection_threshold(threshold: usize) {
+    let threshold = threshold.max(1);
+    if shared() {
+        let mut heap = lock_global();
+        heap.threshold = threshold;
+        heap.adaptive = false;
+    } else {
+        HEAP.with(|cell| {
+            let mut heap = cell.borrow_mut();
+            heap.threshold = threshold;
+            heap.adaptive = false;
+        });
+    }
+}
+
 /// The current heap's effective threshold and whether the adaptive
 /// controller drives it. Mirrors [`objects`]' local/shared split.
 fn current_threshold() -> (usize, bool) {

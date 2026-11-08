@@ -23,6 +23,7 @@
 
 use crate::exc::{self, IMPORT_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::value;
+use crate::value::NONE;
 
 use super::importlib_machinery as machinery;
 use super::importlib_util;
@@ -40,7 +41,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         ),
         "reload" => reload(args.first().copied().unwrap_or(value::NONE)),
         "invalidate_caches" => {
-            super::importlib_metadata::invalidate_caches();
+            invalidate_caches();
             value::NONE
         }
         _ => exc::raise_with_message(
@@ -89,6 +90,42 @@ fn reload(module_arg: i64) -> i64 {
     )
 }
 
+/// `importlib.invalidate_caches()`.
+///
+/// CPython calls the `invalidate_caches()` hook of every finder on
+/// `sys.meta_path`; the discovered-distribution cache is cleared as well
+/// because `importlib.metadata`'s finder is not installed on the default meta
+/// path. A finder without the hook is skipped, exactly like CPython.
+fn invalidate_caches() {
+    super::importlib_metadata::invalidate_caches();
+    let meta_path = super::module_get_by_name("sys", "meta_path");
+    if exc::pending() {
+        exc::clear();
+        return;
+    }
+    let Some(finders) = value::as_list(meta_path) else {
+        return;
+    };
+    let roots = crate::heap::root_values(&[meta_path]);
+    for finder in finders {
+        let hook = crate::core::methods::getattr(
+            *finder,
+            "invalidate_caches".as_ptr(),
+            "invalidate_caches".len(),
+        );
+        if exc::pending() {
+            // A finder without the optional hook is not an error.
+            exc::clear();
+            continue;
+        }
+        crate::builtins::call(hook, 0, std::ptr::null());
+        if exc::pending() {
+            exc::clear();
+        }
+    }
+    crate::heap::release_roots(roots);
+}
+
 /// `importlib.import_module(name, package=None)`.
 ///
 /// A relative name (`".sub"`, `"..sibling"`) is resolved against `package`
@@ -129,9 +166,102 @@ fn import_module(name_arg: i64, package_arg: i64) -> i64 {
     if name == UNICODE_TABLE_PREFIX || name.starts_with("rich._unicode_data.") {
         return unicode_table_placeholder();
     }
+    // A native module removed from `sys.modules` is imported as a fresh module
+    // value, exactly like CPython re-executing a module body: the new object is
+    // published, so callers observe a distinct module while `import` keeps
+    // working. Native attributes are resolved by name, so the fresh value
+    // exposes the same surface.
+    if hydro_ir::stdlib::module(&name).is_some() {
+        let module = value::module_value(name.clone());
+        super::publish_module(&name, module);
+        return module;
+    }
+    // A custom `sys.meta_path` finder (test doubles, `pkgutil`-style
+    // importers) is consulted before failing.
+    if let Some(module) = import_via_meta_path(&name) {
+        return module;
+    }
+    // A compiled extension module (a shared object on the search path) is
+    // loaded through the extension loader.
+    if let Some(module) = crate::modules::extension::import_module(&name) {
+        return module;
+    }
     // Unknown names never become a fake namespace: callers rely on the import
     // failing so their fallback/probe logic runs.
     crate::builtins::module_not_found(&name)
+}
+
+/// Consults the non-builtin finders on `sys.meta_path`, in order, returning
+/// the first spec a program-defined finder reports.
+///
+/// Hydro's own finders (`BuiltinImporter`, `FrozenImporter`, `PathFinder`) are
+/// handled by the native resolution paths; every other entry is called through
+/// its `find_spec(fullname, None, None)`.
+pub(crate) fn meta_path_find_spec(name: &str) -> Option<i64> {
+    let meta_path = super::module_get_by_name("sys", "meta_path");
+    if exc::pending() {
+        exc::clear();
+        return None;
+    }
+    let finders = value::as_list(meta_path)?;
+    let builtin = super::importlib_machinery::builtin_importer_class();
+    let frozen = super::importlib_machinery::frozen_importer_class();
+    let path_finder = super::importlib_machinery::path_finder_class();
+    let module_name = value::str_alloc(name.to_string());
+    let roots = crate::heap::root_values(&[meta_path, module_name]);
+    for finder in finders {
+        if *finder == builtin || *finder == frozen || *finder == path_finder {
+            continue;
+        }
+        let find_spec =
+            crate::core::methods::getattr(*finder, "find_spec".as_ptr(), "find_spec".len());
+        if exc::pending() {
+            exc::clear();
+            continue;
+        }
+        let spec = crate::builtins::call(find_spec, 3, [module_name, NONE, NONE].as_ptr());
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return None;
+        }
+        if spec != NONE {
+            crate::heap::release_roots(roots);
+            return Some(spec);
+        }
+    }
+    crate::heap::release_roots(roots);
+    None
+}
+
+/// Imports `name` through the spec a program-defined meta-path finder reports.
+fn import_via_meta_path(name: &str) -> Option<i64> {
+    let spec = meta_path_find_spec(name)?;
+    Some(load_spec(name, spec))
+}
+
+/// Loads `spec` through its loader and publishes the result.
+///
+/// `module_from_spec` asks the loader for the module object and falls back to
+/// a fresh module value; the loader's `exec_module` then runs, exactly the two
+/// steps CPython's `_load(spec)` performs.
+fn load_spec(name: &str, spec: i64) -> i64 {
+    let module = super::importlib_util::call("module_from_spec", &[spec]);
+    if exc::pending() {
+        return module;
+    }
+    let loader = value::instance_attr(spec, "loader").unwrap_or(NONE);
+    let roots = crate::heap::root_values(&[module]);
+    super::publish_module(name, module);
+    if loader != NONE {
+        let exec = crate::core::methods::getattr(loader, "exec_module".as_ptr(), 11);
+        if !exc::pending() {
+            crate::builtins::call(exec, 1, &module as *const i64);
+        } else {
+            exc::clear();
+        }
+    }
+    crate::heap::release_roots(roots);
+    module
 }
 
 /// Resolves a relative module name against `package`.

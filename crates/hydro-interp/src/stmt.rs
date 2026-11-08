@@ -279,6 +279,12 @@ impl Interp {
                 else_body,
                 finally_body,
             } => self.exec_try(body, handlers, else_body, finally_body),
+            StmtKind::TryStar {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => self.exec_try_star(body, handlers, else_body, finally_body),
         }
     }
 
@@ -758,6 +764,150 @@ impl Interp {
         // Unwind nested handler contexts before running `finally`; park an
         // in-flight exception, clear the pending flag and enter the body with
         // a handler marker so a bare `raise` sees it.
+        abi::hydro_exc_handler_truncate(outer_depth);
+        let in_flight = matches!(&result, Err(Signal::Raise));
+        let parked = if in_flight {
+            let value = abi::hydro_exc_value();
+            abi::hydro_exc_clear();
+            self.scratch_push(value);
+            value
+        } else {
+            host::none()
+        };
+        abi::hydro_exc_handler_push(parked);
+        self.current_frame_mut().finally_slots.push(parked);
+        let finally_result = self.exec_stmts(finally_body);
+        self.current_frame_mut().finally_slots.pop();
+        match finally_result {
+            Ok(()) => {
+                abi::hydro_exc_handler_pop();
+                if in_flight {
+                    abi::hydro_raise_value(parked);
+                    Err(Signal::Raise)
+                } else {
+                    result
+                }
+            }
+            // A signal from `finally` replaces the in-flight transfer.
+            other => other,
+        }
+    }
+
+    /// Executes `try: ... except* ...: ...` (PEP 654).
+    ///
+    /// Mirrors the codegen protocol through the runtime ABI: the caught
+    /// exception opens a split session, each clause receives the subset its
+    /// matcher selects, exceptions raised by a clause body are collected, and
+    /// the session's final re-raise (if any) becomes the statement's result.
+    fn exec_try_star(
+        &mut self,
+        body: &[Stmt],
+        handlers: &[Handler],
+        else_body: &[Stmt],
+        finally_body: &[Stmt],
+    ) -> Exec {
+        let outer_depth = abi::hydro_exc_handler_depth();
+        let mut result = self.exec_stmts(body);
+        let mut dispatch = matches!(&result, Err(Signal::Raise));
+
+        // `else` runs only after an exception-free body; exceptions raised
+        // there bypass this statement's clauses.
+        if matches!(&result, Ok(())) && !else_body.is_empty() {
+            result = self.exec_stmts(else_body);
+            dispatch = false;
+        }
+
+        if dispatch {
+            abi::hydro_exc_handler_truncate(outer_depth);
+            let mark = self.scratch_mark();
+            let orig = abi::hydro_exc_value();
+            self.scratch_push(orig);
+            abi::hydro_exc_clear();
+            let token = abi::hydro_exc_star_begin(orig);
+
+            for handler in handlers {
+                let matcher = match (handler.exc, handler.exc_expr.as_ref()) {
+                    (Some(kind), _) => abi::hydro_exception_class(kind.tag()),
+                    (None, Some(expr)) => match self.eval(expr) {
+                        Ok(value) => value,
+                        Err(signal) => {
+                            self.scratch_release(mark);
+                            return Err(signal);
+                        }
+                    },
+                    (None, None) => {
+                        self.scratch_release(mark);
+                        return Err(Signal::Raise);
+                    }
+                };
+                self.scratch_push(matcher);
+                if abi::hydro_exc_pending() != 0 {
+                    self.scratch_release(mark);
+                    return Err(Signal::Raise);
+                }
+                let matched = abi::hydro_exc_star_match(token, matcher);
+                if abi::hydro_exc_pending() != 0 {
+                    self.scratch_release(mark);
+                    return Err(Signal::Raise);
+                }
+                if matched == host::none() {
+                    continue;
+                }
+                self.scratch_push(matched);
+                if let Some(binding) = handler.binding {
+                    if handler.binding_cell {
+                        let cell = self.local(binding);
+                        abi::hydro_cell_set(cell, matched);
+                    } else {
+                        self.set_local(binding, matched);
+                    }
+                }
+                // The clause body sees the selected sub-group as the handled
+                // exception (`sys.exc_info()`, bare `raise`).
+                abi::hydro_exc_handler_push(matched);
+                self.current_frame_mut().handled.push(matched);
+                let arm = self.exec_stmts(&handler.body);
+                self.current_frame_mut().handled.pop();
+                match arm {
+                    Ok(()) => {
+                        abi::hydro_exc_handler_pop();
+                    }
+                    Err(Signal::Raise) => {
+                        // Collected for the final re-raise; later clauses
+                        // still run.
+                        abi::hydro_exc_handler_truncate(outer_depth);
+                        abi::hydro_exc_star_raised(token);
+                    }
+                    Err(signal) => {
+                        // `return`/`break`/`continue` cannot leave an except*
+                        // block (compile-time error), so this is defensive.
+                        abi::hydro_exc_handler_truncate(outer_depth);
+                        self.scratch_release(mark);
+                        return Err(signal);
+                    }
+                }
+            }
+
+            abi::hydro_exc_handler_truncate(outer_depth);
+            let remainder = abi::hydro_exc_star_finish(token);
+            if abi::hydro_exc_pending() != 0 {
+                result = Err(Signal::Raise);
+            } else if remainder != host::none() {
+                abi::hydro_raise_value(remainder);
+                result = Err(Signal::Raise);
+            } else {
+                result = Ok(());
+            }
+            self.scratch_release(mark);
+        }
+
+        if finally_body.is_empty() {
+            return result;
+        }
+
+        // Same `finally` contract as `exec_try`: park an in-flight exception,
+        // clear the pending flag and enter the body with a handler marker so a
+        // bare `raise` sees it.
         abi::hydro_exc_handler_truncate(outer_depth);
         let in_flight = matches!(&result, Err(Signal::Raise));
         let parked = if in_flight {

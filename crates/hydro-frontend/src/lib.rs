@@ -2913,19 +2913,26 @@ fn resolve_module_in(root: &Path, parts: &[&str]) -> Option<Vec<ResolvedModule>>
 ///
 /// Returns absolute names (`pkg.main`) in discovery order.
 fn dynamic_import_candidates(module: &ast::ModModule, current: &str, package: &str) -> Vec<String> {
-    // A top-level package initializer is the only dynamic-dispatch surface
-    // preloaded. Everything else (entry script, conftest, REPL fragment,
-    // nested package, plain module) has no package or no public table: its
-    // literals stay lazy so annotation and internal helpers cannot initialize
-    // before the enclosing package graph finishes.
-    if package.is_empty() || package.contains('.') || package != current {
-        return Vec::new();
-    }
+    // A top-level package initializer is the dynamic-dispatch surface
+    // preloaded from *relative* literals. Everything else (entry script,
+    // conftest, REPL fragment, nested package, plain module) still imports
+    // standard-library modules by name at runtime, so an absolute literal that
+    // names a stdlib source module is preloaded as well; its lazy neighbour
+    // semantics are unaffected because the stdlib graph never depends on the
+    // importing script.
+    let package_initializer = !package.is_empty() && !package.contains('.') && package == current;
     let mut literals: Vec<String> = Vec::new();
     collect_dynamic_dispatch_stmts(&module.body, current, &mut literals);
     let mut candidates: Vec<String> = Vec::new();
     for literal in literals {
-        let Some(name) = resolve_dynamic_module_literal(&literal, package) else {
+        let name = if package_initializer {
+            resolve_dynamic_module_literal(&literal, package)
+        } else {
+            is_dotted_identifier(&literal)
+                .then(|| literal.clone())
+                .filter(|name| stdlib_source_module(name))
+        };
+        let Some(name) = name else {
             continue;
         };
         if name == current
@@ -2937,6 +2944,33 @@ fn dynamic_import_candidates(module: &ast::ModModule, current: &str, package: &s
         candidates.push(name);
     }
     candidates
+}
+
+/// Whether `name` is a dotted identifier (`pkg`, `pkg.mod`).
+fn is_dotted_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c == '_' || c.is_alphanumeric()))
+}
+
+/// Whether `name` resolves to a Python source module in the standard library
+/// (the vendored tree or `HYDRO_STDLIB`).
+///
+/// Used to decide whether an absolute dynamic-import literal may be loaded on
+/// demand. User modules and site-packages keep their lazy semantics.
+fn stdlib_source_module(name: &str) -> bool {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(root) = bundled_stdlib_root() {
+        roots.push(root.to_path_buf());
+    }
+    if let Some(dir) = std::env::var_os("HYDRO_STDLIB") {
+        roots.push(PathBuf::from(dir));
+    }
+    if roots.is_empty() {
+        return false;
+    }
+    resolve_module(&roots, name).is_some()
 }
 
 /// Resolves one relative dispatch literal against the naming unit's package.
@@ -2954,10 +2988,8 @@ fn resolve_dynamic_module_literal(literal: &str, package: &str) -> Option<String
     }
     let level = u32::try_from(dots).ok()?;
     let name = lower::resolve_import_name(level, Some(&literal[dots..]), package).ok()?;
-    for part in name.split('.') {
-        if part.is_empty() || !part.chars().all(|c| c == '_' || c.is_alphanumeric()) {
-            return None;
-        }
+    if !is_dotted_identifier(&name) {
+        return None;
     }
     Some(name)
 }

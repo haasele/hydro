@@ -695,6 +695,24 @@ pub enum StmtKind {
         else_body: Vec<Stmt>,
         finally_body: Vec<Stmt>,
     },
+    /// `try: ... except* ...: ... else: ... finally: ...` (PEP 654).
+    ///
+    /// Same shape as [`StmtKind::Try`] and the same `else`/`finally`
+    /// semantics, but every handler is an `except*` clause. The runtime keeps
+    /// the caught exception as a group, hands each clause the subset its
+    /// matcher selects (running every matching clause exactly once), and
+    /// re-raises the unhandled remainder — merged back into the original
+    /// nesting for sub-groups that a clause re-raised, wrapped in a new
+    /// `ExceptionGroup("")` together with exceptions raised by clause bodies.
+    /// `handler.exc` may hold a statically known tag; `handler.exc_expr` is
+    /// the runtime matcher (a class or tuple of classes). A bare clause
+    /// (`exc` and `exc_expr` both `None`) is not valid for `except*`.
+    TryStar {
+        body: Vec<Stmt>,
+        handlers: Vec<Handler>,
+        else_body: Vec<Stmt>,
+        finally_body: Vec<Stmt>,
+    },
 }
 
 /// How a class-body method binds its receiver when it is called.

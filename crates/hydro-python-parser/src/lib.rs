@@ -127,12 +127,14 @@ mod soft_keywords;
 mod string;
 pub mod template;
 mod token;
+pub mod type_params;
 
 pub use parser::{
     parse, parse_module_with_templates, parse_starts_at, parse_tokens, Parse, ParseError,
     ParseErrorType,
 };
 pub use string::FStringErrorType;
+pub use type_params::TypeParamDefaults;
 pub use template::{
     is_template_placeholder, template_placeholder_id, template_placeholder_range, Interpolation,
     ParsedModule, TemplateConstant, TemplateErrorType, TemplateString,

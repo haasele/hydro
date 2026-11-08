@@ -125,6 +125,10 @@ pub struct ParsedModule {
     /// inside interpolation expressions and format specs. Order is outermost
     /// first, depth-first.
     pub templates: Vec<TemplateString>,
+    /// PEP 696 type-parameter defaults cut out of the token stream before
+    /// parsing, keyed by the start of the parameter's AST range. Empty when the
+    /// module declares no default.
+    pub type_param_defaults: crate::type_params::TypeParamDefaults,
 }
 
 impl ParsedModule {
@@ -196,7 +200,11 @@ pub(crate) fn resolve_module(source: &str, module: ast::Mod) -> Result<ParsedMod
     for range in collector.ranges {
         templates.extend(resolve_template(source, range, 0)?);
     }
-    Ok(ParsedModule { module, templates })
+    Ok(ParsedModule {
+        module,
+        templates,
+        type_param_defaults: Default::default(),
+    })
 }
 
 #[derive(Default)]

@@ -104,20 +104,116 @@ fn format_class() -> i64 {
             return class;
         }
     }
-    let class = value::class_new("Format".to_string(), NONE, Vec::new());
-    let roots = heap::root_values(&[class]);
-    for (name, member) in [
-        ("VALUE", FORMAT_VALUE),
-        ("VALUE_WITH_FAKE_GLOBALS", FORMAT_VALUE_WITH_FAKE_GLOBALS),
-        ("FORWARDREF", FORMAT_FORWARDREF),
-        ("STRING", FORMAT_STRING),
+    let self_param = || value::ParamMeta {
+        name: "self".to_string(),
+        kind: hydro_ir::ParamKind::Positional,
+        default: None,
+    };
+    let other_param = || value::ParamMeta {
+        name: "other".to_string(),
+        kind: hydro_ir::ParamKind::Positional,
+        default: None,
+    };
+    let mut methods = Vec::new();
+    for (name, entry, arity) in [
+        ("__eq__", format_eq_entry as *const () as usize, 2usize),
+        ("__hash__", format_hash_entry as *const () as usize, 1),
+        ("__str__", format_str_entry as *const () as usize, 1),
+        ("__repr__", format_repr_entry as *const () as usize, 1),
+        ("__int__", format_int_entry as *const () as usize, 1),
+        ("__index__", format_int_entry as *const () as usize, 1),
     ] {
-        value::class_set_attr(class, name.to_string(), int(member));
+        let function = value::native_function_new("annotationlib", name, arity);
+        let signature = if arity == 2 {
+            vec![self_param(), other_param()]
+        } else {
+            vec![self_param()]
+        };
+        value::function_set_signature(function, signature);
+        value::function_set_full_entry(function, entry);
+        methods.push((name.to_string(), function, hydro_ir::MethodKind::Normal));
+    }
+    let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let roots = heap::root_values(&method_values);
+    let class = value::class_new_full("Format".to_string(), NONE, methods, Vec::new());
+    heap::push_scoped_root(class);
+    for (name, member) in FORMAT_MEMBERS {
+        let member_value = int(member);
+        let name_value = value::str_alloc(name.to_string());
+        let member_roots = heap::root_values(&[member_value, name_value]);
+        let instance = value::instance_new(class);
+        heap::push_scoped_root(instance);
+        value::instance_setattr(instance, "name".to_string(), name_value);
+        value::instance_setattr(instance, "value".to_string(), member_value);
+        value::instance_setattr(instance, "_value_".to_string(), member_value);
+        value::class_set_attr(class, name.to_string(), instance);
+        heap::release_roots(member_roots);
     }
     globals::registry_set(FORMAT_CACHE_GENERATION, generation);
     globals::registry_set(FORMAT_CACHE_KEY, class);
     heap::release_roots(roots);
     class
+}
+
+/// `Format` members in declaration order.
+const FORMAT_MEMBERS: [(&str, i64); 4] = [
+    ("VALUE", FORMAT_VALUE),
+    ("VALUE_WITH_FAKE_GLOBALS", FORMAT_VALUE_WITH_FAKE_GLOBALS),
+    ("FORWARDREF", FORMAT_FORWARDREF),
+    ("STRING", FORMAT_STRING),
+];
+
+/// The integer behind a `Format` member instance.
+fn format_member_value(member: i64) -> Option<i64> {
+    let class = value::instance_class_value(member)?;
+    if class != format_class() {
+        return None;
+    }
+    value::instance_attr(member, "value").and_then(value::as_integer)
+}
+
+fn format_member_name(member: i64) -> Option<&'static str> {
+    FORMAT_MEMBERS
+        .iter()
+        .find(|&(_, value)| Some(*value) == format_member_value(member))
+        .map(|&(name, _)| name)
+}
+
+extern "C" fn format_eq_entry(argv: *const i64) -> i64 {
+    // SAFETY: the class-call binder passes one slot per declared parameter.
+    let (this, other) = unsafe { (*argv, *argv.add(1)) };
+    let Some(left) = format_member_value(this) else {
+        return value::FALSE;
+    };
+    let right = format_member_value(other).or_else(|| value::as_integer(other));
+    value::bool_value(right == Some(left))
+}
+
+extern "C" fn format_hash_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter.
+    let this = unsafe { *argv };
+    format_member_value(this).map_or(NONE, int)
+}
+
+extern "C" fn format_str_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter.
+    let this = unsafe { *argv };
+    let name = format_member_name(this).unwrap_or("VALUE");
+    value::str_alloc(format!("Format.{name}"))
+}
+
+extern "C" fn format_repr_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter.
+    let this = unsafe { *argv };
+    let name = format_member_name(this).unwrap_or("VALUE");
+    let number = format_member_value(this).unwrap_or(0);
+    value::str_alloc(format!("<Format.{name}: {number}>"))
+}
+
+extern "C" fn format_int_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter.
+    let this = unsafe { *argv };
+    format_member_value(this).map_or(NONE, int)
 }
 
 /// Positional-and-keyword dispatch for `annotationlib.<function>(...)`.
@@ -176,7 +272,10 @@ fn is_callable(obj: i64) -> bool {
 }
 
 fn format_member(argument: i64) -> Option<i64> {
-    value::as_integer(argument).filter(|member| (1..=4).contains(member))
+    if let Some(member) = value::as_integer(argument) {
+        return (1..=4).contains(&member).then_some(member);
+    }
+    format_member_value(argument).filter(|member| (1..=4).contains(member))
 }
 
 /// `get_annotations(obj, *, globals=None, locals=None, eval_str=False,
@@ -496,7 +595,17 @@ mod tests {
             "{}",
             value::to_string(exc::pending_value())
         );
-        assert_eq!(value::as_integer(member), Some(3));
+        // The members are `IntEnum`-like instances: `.value` is the integer
+        // and `__eq__`/`__int__` accept it as one.
+        assert_eq!(
+            value::instance_attr(member, "value").and_then(value::as_integer),
+            Some(3)
+        );
+        assert_eq!(
+            value::instance_attr(member, "name").and_then(value::as_str),
+            Some("FORWARDREF")
+        );
+        assert_eq!(format_member(member), Some(3));
     }
 
     #[test]

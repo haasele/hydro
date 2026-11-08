@@ -74,8 +74,8 @@ fn arithmetic_type_error(op: &str, a: i64, b: i64) -> i64 {
         &format!(
             "unsupported operand type(s) for {}: '{}' and '{}'",
             op,
-            value::type_name(a),
-            value::type_name(b)
+            value::type_name_of(a),
+            value::type_name_of(b)
         ),
     )
 }
@@ -536,15 +536,21 @@ fn contains(left: i64, right: i64, negate: bool) -> i64 {
     } else if let Some(items) = value::as_tuple(right) {
         container::set_contains(items, left)
     } else if let Some(pairs) = value::as_dict(right) {
-        if let Some(name) = container::unhashable_name(left) {
-            return exc::raise_with_message(TYPE_ERROR, &container::unhashable_message(name));
+        if container::unhashable_name(left).is_some() {
+            return exc::raise_with_message(TYPE_ERROR, &container::dict_key_unhashable_message(left));
         }
         container::dict_find(pairs, left).is_some()
     } else if let Some((pairs, _)) = value::as_defaultdict(right) {
-        if let Some(name) = container::unhashable_name(left) {
-            return exc::raise_with_message(TYPE_ERROR, &container::unhashable_message(name));
+        if container::unhashable_name(left).is_some() {
+            return exc::raise_with_message(TYPE_ERROR, &container::dict_key_unhashable_message(left));
         }
         container::dict_find(pairs, left).is_some()
+    } else if let Some(pairs) = value::as_namespace(right) {
+        // `argparse.Namespace.__contains__` tests its attribute dictionary.
+        let found = value::as_str(left).is_some_and(|key| {
+            pairs.iter().any(|(name, _)| name.as_str() == key)
+        });
+        found
     } else if let Some(s) = value::as_str(right) {
         let Some(needle) = value::as_str(left) else {
             return exc::raise_with_message(
@@ -599,14 +605,20 @@ fn contains(left: i64, right: i64, negate: bool) -> i64 {
     } else if let Some(view) = value::as_dict_view(right) {
         // Keys and items require a hashable operand, like a dict lookup.
         if view.kind != value::DictViewKind::Values {
-            if let Some(name) = container::unhashable_name(left) {
-                return exc::raise_with_message(TYPE_ERROR, &container::unhashable_message(name));
+            if container::unhashable_name(left).is_some() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &container::dict_key_unhashable_message(left),
+                );
             }
         }
         container::dict_view_contains(view, left)
     } else if let Some(items) = value::as_set(right) {
-        if let Some(name) = container::unhashable_name(left) {
-            return exc::raise_with_message(TYPE_ERROR, &container::unhashable_message(name));
+        if container::unhashable_name(left).is_some() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &container::set_element_unhashable_message(left),
+            );
         }
         container::set_contains(items, left)
     } else if let Some((start, stop, step)) = value::as_range(right) {
@@ -624,7 +636,7 @@ fn contains(left: i64, right: i64, negate: bool) -> i64 {
                     TYPE_ERROR,
                     &format!(
                         "argument of type '{}' is not iterable",
-                        value::type_name(right)
+                        value::type_name_of(right)
                     ),
                 )
             }
@@ -869,6 +881,16 @@ fn is_repeatable(v: i64) -> bool {
         || value::as_tuple(v).is_some()
 }
 
+/// Repeat count for `sequence * n`: exact integers, or any object defining
+/// `__index__` (CPython converts through `PyNumber_AsSsize_t`). `None` means
+/// "not an index"; a pending exception from the user method wins.
+fn repeat_count(v: i64) -> Option<i64> {
+    if let Some(n) = value::as_integer(v) {
+        return Some(n);
+    }
+    crate::core::container::index_or_none(v)
+}
+
 fn mul(a: i64, b: i64) -> i64 {
     if let Some(((ar, ai), (br, bi))) = complex_operands(a, b) {
         return builtins::build_complex(ar * br - ai * bi, ar * bi + ai * br);
@@ -894,39 +916,39 @@ fn mul(a: i64, b: i64) -> i64 {
         };
     }
     // `str * int` / `int * str` (bool counts as 0/1).
-    if let (Some(s), Some(n)) = (value::as_str(a), value::as_integer(b)) {
+    if let (Some(s), Some(n)) = (value::as_str(a), repeat_count(b)) {
         return repeat_str(s, n);
     }
-    if let (Some(n), Some(s)) = (value::as_integer(a), value::as_str(b)) {
+    if let (Some(n), Some(s)) = (repeat_count(a), value::as_str(b)) {
         return repeat_str(s, n);
     }
     // `bytearray * int` / `int * bytearray` (checked before the bytes-like
     // form so the result type stays mutable).
-    if let (Some(bytes), Some(n)) = (value::as_bytearray(a), value::as_integer(b)) {
+    if let (Some(bytes), Some(n)) = (value::as_bytearray(a), repeat_count(b)) {
         return repeat_bytearray(bytes, n);
     }
-    if let (Some(n), Some(bytes)) = (value::as_integer(a), value::as_bytearray(b)) {
+    if let (Some(n), Some(bytes)) = (repeat_count(a), value::as_bytearray(b)) {
         return repeat_bytearray(bytes, n);
     }
     // `bytes * int` / `int * bytes`.
-    if let (Some(bytes), Some(n)) = (value::as_bytes(a), value::as_integer(b)) {
+    if let (Some(bytes), Some(n)) = (value::as_bytes(a), repeat_count(b)) {
         return repeat_bytes(bytes, n);
     }
-    if let (Some(n), Some(bytes)) = (value::as_integer(a), value::as_bytes(b)) {
+    if let (Some(n), Some(bytes)) = (repeat_count(a), value::as_bytes(b)) {
         return repeat_bytes(bytes, n);
     }
     // `list * int` / `int * list`.
-    if let (Some(items), Some(n)) = (value::as_list(a), value::as_integer(b)) {
+    if let (Some(items), Some(n)) = (value::as_list(a), repeat_count(b)) {
         return repeat_list(items, n);
     }
-    if let (Some(n), Some(items)) = (value::as_integer(a), value::as_list(b)) {
+    if let (Some(n), Some(items)) = (repeat_count(a), value::as_list(b)) {
         return repeat_list(items, n);
     }
     // `tuple * int` / `int * tuple`.
-    if let (Some(items), Some(n)) = (value::as_tuple(a), value::as_integer(b)) {
+    if let (Some(items), Some(n)) = (value::as_tuple(a), repeat_count(b)) {
         return repeat_tuple(items, n);
     }
-    if let (Some(n), Some(items)) = (value::as_integer(a), value::as_tuple(b)) {
+    if let (Some(n), Some(items)) = (repeat_count(a), value::as_tuple(b)) {
         return repeat_tuple(items, n);
     }
     arithmetic_type_error("*", a, b)
@@ -1771,8 +1793,8 @@ fn compare(op: u32, a: i64, b: i64) -> i64 {
         &format!(
             "'{}' not supported between instances of '{}' and '{}'",
             cmp_symbol(op),
-            value::type_name(a),
-            value::type_name(b)
+            value::type_name_of(a),
+            value::type_name_of(b)
         ),
     )
 }

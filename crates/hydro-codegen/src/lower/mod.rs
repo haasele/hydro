@@ -276,6 +276,17 @@ struct Runtime {
     /// `except <expr>:` value matcher: (exception, matcher) -> i32, with
     /// CPython's `TypeError` for operands that cannot catch.
     exc_matches_value: FuncId,
+    /// `except*` protocol. `exc_star_begin(orig) -> token` opens a split
+    /// session over the caught exception; `exc_star_match(token, matcher)`
+    /// returns the subset one clause selects (or `None`) and advances the
+    /// unhandled remainder; `exc_star_raised(token)` records the exception a
+    /// clause body raised (reading and clearing the pending exception);
+    /// `exc_star_finish(token)` returns the exception to re-raise after the
+    /// last clause (or `None`) and closes the session.
+    exc_star_begin: FuncId,
+    exc_star_match: FuncId,
+    exc_star_raised: FuncId,
+    exc_star_finish: FuncId,
     uncaught: FuncId,
     runtime_init: FuncId,
     register_function: FuncId,
@@ -774,6 +785,33 @@ impl Runtime {
                 "hydro_exc_matches_value",
                 &[i64t, i64t],
                 Some(i32t),
+            )?,
+            // `except*` split sessions (see `RuntimeFns`): every argument and
+            // result is a tagged value; the token returned by `begin` is a
+            // tagged integer identifying the session.
+            exc_star_begin: declare_runtime(
+                module,
+                "hydro_exc_star_begin",
+                &[i64t],
+                Some(i64t),
+            )?,
+            exc_star_match: declare_runtime(
+                module,
+                "hydro_exc_star_match",
+                &[i64t, i64t],
+                Some(i64t),
+            )?,
+            exc_star_raised: declare_runtime(
+                module,
+                "hydro_exc_star_raised",
+                &[i64t],
+                Some(i64t),
+            )?,
+            exc_star_finish: declare_runtime(
+                module,
+                "hydro_exc_star_finish",
+                &[i64t],
+                Some(i64t),
             )?,
             uncaught: declare_runtime(module, "hydro_uncaught", &[], Some(i64t))?,
             runtime_init: declare_runtime(module, "hydro_runtime_init", &[], None)?,
@@ -1859,6 +1897,12 @@ fn count_stmt(stmt: &Stmt) -> usize {
             handlers,
             else_body,
             finally_body,
+        }
+        | StmtKind::TryStar {
+            body,
+            handlers,
+            else_body,
+            finally_body,
         } => {
             count_body(body)
                 + handlers
@@ -1884,6 +1928,12 @@ fn count_body(body: &[Stmt]) -> usize {
 fn body_has_handler(body: &[Stmt]) -> bool {
     body.iter().any(|stmt| match &stmt.kind {
         StmtKind::Try {
+            body,
+            handlers,
+            else_body,
+            finally_body,
+        }
+        | StmtKind::TryStar {
             body,
             handlers,
             else_body,
@@ -3605,6 +3655,19 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                     finally_body.as_slice(),
                 )?;
             }
+            StmtKind::TryStar {
+                body,
+                handlers,
+                else_body,
+                finally_body,
+            } => {
+                self.lower_try_star(
+                    body.as_slice(),
+                    handlers.as_slice(),
+                    else_body.as_slice(),
+                    finally_body.as_slice(),
+                )?;
+            }
         }
         Ok(())
     }
@@ -4438,6 +4501,250 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             // Every entry into the body pushed a handler context (the
             // in-flight exception or a `None` marker); the body-completion
             // pop below balances it.
+            self.lower_stmts(finally_body)?;
+            if self.finally_slots.pop() != Some(info.pending_root) {
+                return Err(CodegenError::new(
+                    "internal error: finally slot stack is unbalanced",
+                ));
+            }
+            self.suppress_pending -= 1;
+            self.current_exc = saved_current;
+
+            if !self.terminated {
+                let pop_id = self.runtime.exc_handler_pop;
+                self.call_rt(pop_id, &[])?;
+                let dispatch_block = self.builder.create_block();
+                self.jump(dispatch_block);
+                self.switch_to(dispatch_block);
+                self.emit_action_dispatch(id, after)?;
+            }
+
+            self.switch_to(after);
+            self.exc_target = outer_exc;
+            return Ok(());
+        }
+
+        self.switch_to(after);
+        self.exc_target = outer_exc;
+        Ok(())
+    }
+
+    /// Lower `try: ... except* ...: ...` (PEP 654).
+    ///
+    /// Mirrors CPython's `codegen_try_star_except`. The caught exception is
+    /// kept as the original (`orig`); each clause asks the runtime for the
+    /// subset its matcher selects and runs its body on that subset. Exceptions
+    /// raised by a clause body are collected instead of propagated, so every
+    /// later clause still runs. After the last clause the runtime merges the
+    /// collected exceptions with the re-raised sub-groups and the unhandled
+    /// remainder; the result (if any) is raised and routed through this
+    /// statement's `finally`/outer target.
+    ///
+    /// The runtime session is opaque: `exc_star_begin` returns a tagged token,
+    /// `exc_star_match` advances the remainder and returns the clause's share,
+    /// `exc_star_raised` records a clause-body exception and `exc_star_finish`
+    /// closes the session and returns the exception to re-raise (or `None`).
+    fn lower_try_star(
+        &mut self,
+        body: &'a [Stmt],
+        handlers: &'a [Handler],
+        else_body: &'a [Stmt],
+        finally_body: &'a [Stmt],
+    ) -> Result<(), CodegenError> {
+        if handlers.is_empty() {
+            return Err(CodegenError::new(
+                "internal error: except* requires at least one clause",
+            ));
+        }
+        let outer_exc = self.exc_target;
+        let outer_handler_depth = self.capture_handler_depth()?;
+        let after = self.builder.create_block();
+        let has_finally = !finally_body.is_empty();
+
+        // `finally` registration matches `lower_try`: every
+        // return/break/continue/exception inside the region finds it.
+        let cleanup = if has_finally {
+            let finally_entry = self.builder.create_block();
+            let action_var = self.temp_var()?;
+            let zero = self.tagged_int(0);
+            self.builder.def_var(action_var, zero);
+            let pending_root = self.temp_var()?;
+            let none = self.none();
+            self.define_var(pending_root, none)?;
+            let id = self.cleanup_infos.len();
+            let break_loop = self.loops.len().checked_sub(1);
+            self.cleanup_infos.push(CleanupInfo {
+                finally_entry,
+                action_var,
+                break_loop,
+                outer_exc,
+                pending_root,
+                handler_depth: outer_handler_depth,
+            });
+            self.cleanups.push(id);
+            Some(id)
+        } else {
+            None
+        };
+
+        let dispatch = self.builder.create_block();
+        // Everything the clauses (or the final re-raise) produce propagates
+        // through the `finally` when one exists.
+        let handler_exc = match cleanup {
+            Some(id) => ExcTarget::Cleanup(id),
+            None => outer_exc,
+        };
+        // Body exceptions always reach the star dispatch, even with a
+        // `finally`: the clauses see them before the cleanup runs.
+        let inner_exc = ExcTarget::Handler(dispatch, outer_handler_depth);
+
+        // `try` body.
+        self.exc_target = inner_exc;
+        self.lower_stmts(body)?;
+        if !self.terminated {
+            if else_body.is_empty() {
+                self.emit_finally_normal(cleanup, after)?;
+            } else {
+                let else_block = self.builder.create_block();
+                self.jump(else_block);
+                self.switch_to(else_block);
+                // Exceptions in `else` bypass this statement's clauses.
+                self.exc_target = handler_exc;
+                self.lower_stmts(else_body)?;
+                if !self.terminated {
+                    self.emit_finally_normal(cleanup, after)?;
+                }
+            }
+        }
+
+        // `except*` dispatch.
+        self.switch_to(dispatch);
+        self.exc_target = handler_exc;
+
+        let value_id = self.runtime.exc_value;
+        let orig = self.call_rt(value_id, &[])?;
+        // Root the original while the session is open; the runtime state roots
+        // it again, but this slot covers the gap before `begin` runs.
+        let orig_var = self.temp_var()?;
+        self.define_var(orig_var, orig)?;
+        let clear_id = self.runtime.exc_clear;
+        self.call_rt(clear_id, &[])?;
+        let token_var = self.temp_var()?;
+        let begin_id = self.runtime.exc_star_begin;
+        let orig = self.builder.use_var(orig_var);
+        let token = self.call_rt(begin_id, &[orig])?;
+        self.define_var(token_var, token)?;
+
+        let finish = self.builder.create_block();
+        for (position, handler) in handlers.iter().enumerate() {
+            let next_handler = if position + 1 == handlers.len() {
+                finish
+            } else {
+                self.builder.create_block()
+            };
+            let clause_block = self.builder.create_block();
+            let matcher = match (handler.exc, handler.exc_expr.as_ref()) {
+                (Some(kind), _) => {
+                    let tag = self.builder.ins().iconst(types::I32, kind.tag() as i64);
+                    let class_id = self.runtime.exception_class;
+                    self.call_rt(class_id, &[tag])?
+                }
+                (None, Some(expr)) => self.lower_expr(expr)?,
+                (None, None) => {
+                    return Err(CodegenError::new(
+                        "internal error: bare except* clause has no matcher",
+                    ));
+                }
+            };
+            // A matcher expression that raised replaces the exception being
+            // dispatched and propagates unchanged.
+            self.emit_exc_check()?;
+            let token = self.builder.use_var(token_var);
+            let match_id = self.runtime.exc_star_match;
+            let matched = self.call_rt(match_id, &[token, matcher])?;
+            // An invalid matcher (`except* ExceptionGroup`, a non-class, a
+            // tuple with a non-class) raises `TypeError`; propagate it.
+            self.emit_exc_check()?;
+            let is_none = self.builder.ins().icmp_imm(IntCC::Equal, matched, NONE_TAG);
+            self.builder
+                .ins()
+                .brif(is_none, next_handler, &[], clause_block, &[]);
+
+            self.switch_to(clause_block);
+            let match_var = self.temp_var()?;
+            self.define_var(match_var, matched)?;
+            if let Some(binding) = handler.binding {
+                let binding_var = self.local_var(binding)?;
+                if handler.binding_cell {
+                    let cell = self.builder.use_var(binding_var);
+                    let id = self.runtime.cell_set;
+                    self.call_void(id, &[cell, matched]);
+                } else {
+                    self.define_var(binding_var, matched)?;
+                }
+            }
+            // The clause runs with the selected sub-group as the handled
+            // exception (`sys.exc_info()` and bare `raise` observe it).
+            let push_id = self.runtime.exc_handler_push;
+            self.call_rt(push_id, &[matched])?;
+
+            let raised = self.builder.create_block();
+            self.exc_target = ExcTarget::Handler(raised, outer_handler_depth);
+            let previous_exc = self.current_exc.replace(match_var);
+            self.lower_stmts(handler.body.as_slice())?;
+            self.current_exc = previous_exc;
+            if !self.terminated {
+                let pop_id = self.runtime.exc_handler_pop;
+                self.call_rt(pop_id, &[])?;
+                self.jump(next_handler);
+            }
+
+            // A clause-body exception is collected for the final re-raise.
+            self.switch_to(raised);
+            self.exc_target = handler_exc;
+            let token = self.builder.use_var(token_var);
+            let raised_id = self.runtime.exc_star_raised;
+            self.call_rt(raised_id, &[token])?;
+            self.jump(next_handler);
+
+            self.switch_to(next_handler);
+        }
+
+        // After the last clause: merge and re-raise the remainder. The final
+        // loop iteration already switched to `finish`.
+        self.exc_target = handler_exc;
+        let token = self.builder.use_var(token_var);
+        let finish_id = self.runtime.exc_star_finish;
+        let remainder = self.call_rt(finish_id, &[token])?;
+        self.emit_exc_check()?;
+        let done = self.builder.create_block();
+        let reraise = self.builder.create_block();
+        let is_none = self.builder.ins().icmp_imm(IntCC::Equal, remainder, NONE_TAG);
+        self.builder.ins().brif(is_none, done, &[], reraise, &[]);
+
+        self.switch_to(reraise);
+        let raise_id = self.runtime.raise_value;
+        self.call_rt(raise_id, &[remainder])?;
+        let target = handler_exc;
+        self.emit_jump_exc_target(target)?;
+
+        self.switch_to(done);
+        self.emit_finally_normal(cleanup, after)?;
+
+        if let Some(id) = cleanup {
+            let popped = self.cleanups.pop();
+            if popped != Some(id) {
+                return Err(CodegenError::new(
+                    "internal error: try cleanup stack is unbalanced",
+                ));
+            }
+            let info = self.cleanup_info(id)?;
+            let saved_current = self.current_exc;
+
+            self.exc_target = info.outer_exc;
+            self.suppress_pending += 1;
+            self.switch_to(info.finally_entry);
+            self.finally_slots.push(info.pending_root);
             self.lower_stmts(finally_body)?;
             if self.finally_slots.pop() != Some(info.pending_root) {
                 return Err(CodegenError::new(

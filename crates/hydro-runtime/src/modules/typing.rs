@@ -71,6 +71,16 @@
 //!   `__args__` is `(T,)` and `__metadata__` is the flattened annotation
 //!   tuple; `get_args` reports `(T, m...)`.
 //!
+//! The parameterized aliases (`List`, `Dict`, `Tuple`, `Set`, `FrozenSet`,
+//! `Type`, `Callable` and the container/ABC aliases) specialise into real
+//! `_GenericAlias` values: `typing.List[int]` carries `__origin__ = list`,
+//! `__args__ = (int,)` and `__parameters__`, renders as `typing.List[int]`,
+//! compares by origin/name/arguments, supports `copy_with`, parameter
+//! substitution (`List[T][int]`) and `|` composition. The bare names stay
+//! class values because class definitions use them as bases. `Final[T]`,
+//! `ClassVar[T]`, `Unpack[T]` and the other single-argument forms build named
+//! aliases whose origin is the form itself.
+//!
 //! All [`CLASSES`] placeholders are identity-stable per heap generation
 //! ([`placeholder_class`]): `typing.Literal is typing.Literal` holds, which is
 //! what `typing_extensions`/`typing_inspection` identity checks rely on.
@@ -421,10 +431,18 @@ fn forward_ref_class() -> i64 {
     let init = value::native_function_new("typing", "_forward_ref_init", usize::MAX);
     value::function_set_signature(init, signature);
     value::function_set_full_entry(init, init_forward_ref as *const () as usize);
+    let repr = entry_method(
+        "_forward_ref_repr",
+        &["self"],
+        forward_ref_repr_entry as *const () as usize,
+    );
     let class = value::class_new(
         "ForwardRef".to_string(),
         NONE,
-        vec![("__init__".to_string(), init)],
+        vec![
+            ("__init__".to_string(), init),
+            ("__repr__".to_string(), repr),
+        ],
     );
     heap::add_thread_root(class);
     let slots = [
@@ -445,6 +463,30 @@ fn forward_ref_class() -> i64 {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) =
         Some(ForwardRefState { generation, class });
     class
+}
+
+/// `ForwardRef.__repr__`: `ForwardRef('int')`, plus the optional
+/// `module`/`is_class`/`owner` metadata CPython appends.
+extern "C" fn forward_ref_repr_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` first.
+    let instance = unsafe { *argv };
+    let arg = value::instance_attr(instance, "__forward_arg__").unwrap_or(NONE);
+    let mut text = format!("ForwardRef({})", value::repr(arg));
+    if let Some(module) = value::instance_attr(instance, "__forward_module__") {
+        if module != NONE {
+            text.push_str(&format!(", module={}", value::repr(module)));
+        }
+    }
+    if value::instance_attr(instance, "__forward_is_class__") == Some(TRUE) {
+        text.push_str(", is_class=True");
+    }
+    if let Some(owner) = value::instance_attr(instance, "__owner__") {
+        if owner != NONE {
+            text.push_str(&format!(", owner={}", value::repr(owner)));
+        }
+    }
+    text.push(')');
+    value::str_alloc(text)
 }
 
 /// Native `ForwardRef.__init__(self, arg, module=None, owner=None,
@@ -544,7 +586,6 @@ fn new_forward_ref(args: &[i64], keywords: &[(String, i64)]) -> i64 {
 const CLASSES: &[&str] = &[
     "Annotated",
     "Any",
-    "AnyStr",
     "AsyncContextManager",
     "AsyncGenerator",
     "AsyncIterable",
@@ -594,8 +635,6 @@ const CLASSES: &[&str] = &[
     "NotRequired",
     "Optional",
     "OrderedDict",
-    "ParamSpecArgs",
-    "ParamSpecKwargs",
     "Pattern",
     "Protocol",
     "ReadOnly",
@@ -627,6 +666,8 @@ const CLASSES: &[&str] = &[
 /// with `isinstance`. These are cached (identity-stable) classes; they carry
 /// no runtime behaviour of their own, exactly like the placeholders above.
 const CACHED_CLASSES: &[&str] = &[
+    "ParamSpecArgs",
+    "ParamSpecKwargs",
     "_AnnotatedAlias",
     "_BaseGenericAlias",
     "_ConcatenateGenericAlias",
@@ -692,6 +733,38 @@ const PROHIBITED_ATTRIBUTES: &[&str] = &[
 /// `typing._ASSERT_NEVER_REPR_MAX_LENGTH`.
 const ASSERT_NEVER_REPR_MAX_LENGTH: i64 = 100;
 
+/// `typing.ParamSpecArgs` / `typing.ParamSpecKwargs`: the classes of `P.args`
+/// and `P.kwargs`. Instances carry `__origin__` (the `ParamSpec`) and render
+/// as `~P.args` / `~P.kwargs`, matching CPython.
+fn paramspec_arg_class(kind: &str) -> i64 {
+    let name = if kind == "args" {
+        "ParamSpecArgs"
+    } else {
+        "ParamSpecKwargs"
+    };
+    let repr = entry_method(
+        "_paramspec_arg_repr",
+        &["self"],
+        paramspec_arg_repr_entry as *const () as usize,
+    );
+    value::class_new(name.to_string(), NONE, vec![("__repr__".to_string(), repr)])
+}
+
+extern "C" fn paramspec_arg_repr_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` first.
+    let instance = unsafe { *argv };
+    let origin = value::instance_attr(instance, "__origin__").unwrap_or(NONE);
+    let name = value::instance_attr(origin, "__name__")
+        .and_then(value::as_str)
+        .unwrap_or("?");
+    let suffix = if value::instance_class_name(instance) == Some("ParamSpecKwargs") {
+        "kwargs"
+    } else {
+        "args"
+    };
+    value::str_alloc(format!("~{name}.{suffix}"))
+}
+
 /// An identity-stable empty class cached under `typing.<name>`.
 fn cached_class(name: &str) -> i64 {
     let key = format!("typing.{name}");
@@ -701,6 +774,8 @@ fn cached_class(name: &str) -> i64 {
     let class = match name {
         "_ConcatenateGenericAlias" => concatenate_generic_alias_class(),
         "_GenericAlias" => generic_alias_class(),
+        "ParamSpecArgs" => paramspec_arg_class("args"),
+        "ParamSpecKwargs" => paramspec_arg_class("kwargs"),
         _ => value::class_new(name.to_string(), NONE, Vec::new()),
     };
     crate::core::globals::registry_set(&key, class);
@@ -763,6 +838,64 @@ fn generic_alias_class() -> i64 {
             // like CPython, so interpolation and `print` agree.
             ("__repr__".to_string(), render("_generic_alias_repr")),
             ("__str__".to_string(), render("_generic_alias_str")),
+            // `typing.List[int] == typing.List[int]` compares origin/name and
+            // arguments rather than object identity, so alias values can be
+            // compared, deduplicated and used as `Literal`/`Union` members.
+            (
+                "__eq__".to_string(),
+                entry_method(
+                    "_generic_alias_eq",
+                    &["self", "other"],
+                    alias_eq_entry as *const () as usize,
+                ),
+            ),
+            (
+                "__ne__".to_string(),
+                entry_method(
+                    "_generic_alias_ne",
+                    &["self", "other"],
+                    alias_ne_entry as *const () as usize,
+                ),
+            ),
+            // `alias[params]` substitutes the alias's remaining parameters;
+            // an alias without parameters rejects the subscription, like
+            // CPython's `_GenericAlias.__getitem__`.
+            (
+                "__getitem__".to_string(),
+                entry_method(
+                    "_generic_alias_getitem",
+                    &["self", "index"],
+                    alias_getitem_entry as *const () as usize,
+                ),
+            ),
+            // `alias.copy_with((args...))` keeps the origin and the typing
+            // spelling (`typing.List[str]`) while replacing the arguments.
+            (
+                "copy_with".to_string(),
+                entry_method(
+                    "_generic_alias_copy_with",
+                    &["self", "parameters"],
+                    alias_copy_with_entry as *const () as usize,
+                ),
+            ),
+            // `typing.List[int] | typing.Tuple[int]` composes into a union
+            // even though an alias is not a class value.
+            (
+                "__or__".to_string(),
+                entry_method(
+                    "_generic_alias_or",
+                    &["self", "other"],
+                    alias_or_entry as *const () as usize,
+                ),
+            ),
+            (
+                "__ror__".to_string(),
+                entry_method(
+                    "_generic_alias_ror",
+                    &["self", "other"],
+                    alias_ror_entry as *const () as usize,
+                ),
+            ),
         ],
     )
 }
@@ -772,6 +905,278 @@ extern "C" fn generic_alias_repr_entry(argv: *const i64) -> i64 {
     // SAFETY: the class-call binder passes `self` first (declared signature).
     let instance = unsafe { *argv };
     value::str_alloc(generic_alias_text(instance, 0))
+}
+
+/// The typing spelling recorded on an alias (`List` for `typing.List[int]`),
+/// or `None` for a `types.GenericAlias`-shaped alias over a builtin.
+fn alias_display_name(instance: i64) -> Option<&'static str> {
+    value::instance_attr(instance, "_name").and_then(value::as_str)
+}
+
+/// `_GenericAlias.__eq__`: aliases compare by class, typing name, origin and
+/// argument tuple. A typing alias (`typing.List[int]`) never equals a builtin
+/// alias (`list[int]`), matching CPython.
+extern "C" fn alias_eq_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` then `other`.
+    let left = unsafe { *argv };
+    let right = unsafe { *argv.add(1) };
+    value::bool_value(alias_equals(left, right))
+}
+
+/// `_GenericAlias.__ne__`.
+extern "C" fn alias_ne_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` then `other`.
+    let left = unsafe { *argv };
+    let right = unsafe { *argv.add(1) };
+    value::bool_value(!alias_equals(left, right))
+}
+
+fn alias_equals(left: i64, right: i64) -> bool {
+    let generic = cached_class("_GenericAlias");
+    if value::instance_class_value(left) != Some(generic)
+        || value::instance_class_value(right) != Some(generic)
+    {
+        return left == right;
+    }
+    if alias_display_name(left) != alias_display_name(right) {
+        return false;
+    }
+    let Some(left_origin) = value::instance_attr(left, "__origin__") else {
+        return false;
+    };
+    let Some(right_origin) = value::instance_attr(right, "__origin__") else {
+        return false;
+    };
+    if !container::equals(left_origin, right_origin) {
+        return false;
+    }
+    match (
+        value::instance_attr(left, "__args__"),
+        value::instance_attr(right, "__args__"),
+    ) {
+        (Some(left_args), Some(right_args)) => container::equals(left_args, right_args),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// `_GenericAlias.__getitem__`: substitutes the alias's remaining type
+/// parameters. An alias with no parameters is fully specialized and rejects
+/// the subscription, like CPython (`SimpleMapping[str, Any][str]`).
+extern "C" fn alias_getitem_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` then the index operand.
+    let alias = unsafe { *argv };
+    let index = unsafe { *argv.add(1) };
+    let roots = heap::root_values(&[alias, index]);
+    let result = alias_getitem(alias, index);
+    heap::release_roots(roots);
+    result
+}
+
+fn alias_getitem(alias: i64, index: i64) -> i64 {
+    let Some(params) = value::instance_attr(alias, "__parameters__").and_then(value::as_tuple)
+    else {
+        return type_error("There are no type variables left in the alias");
+    };
+    let params = params.to_vec();
+    if params.is_empty() {
+        return type_error(&format!(
+            "There are no type variables left in {}",
+            generic_alias_text(alias, 0)
+        ));
+    }
+    let items = subscript_args(index);
+    if items.len() != params.len() {
+        return type_error(&format!(
+            "Too many arguments for {}; actual {} expected {}",
+            generic_alias_text(alias, 0),
+            items.len(),
+            params.len()
+        ));
+    }
+    for item in &items {
+        if !is_valid_substitution(*item) {
+            return type_error(&format!(
+                "Subscripted generics cannot be used with class and instance checks: {}",
+                value::repr(*item)
+            ));
+        }
+    }
+    let Some(args) = value::instance_attr(alias, "__args__").and_then(value::as_tuple) else {
+        return type_error("There are no type variables left in the alias");
+    };
+    let args = args.to_vec();
+    let mapping: Vec<(i64, i64)> = params.into_iter().zip(items).collect();
+    let roots = heap::root_values(&[alias]);
+    let mut substituted = Vec::with_capacity(args.len());
+    for item in &args {
+        substituted.push(substitute_type(*item, &mapping, 0));
+        if exc::pending() {
+            heap::release_roots(roots);
+            return NONE;
+        }
+    }
+    let origin = value::instance_attr(alias, "__origin__").unwrap_or(NONE);
+    let name = alias_display_name(alias);
+    let result = generic_alias_build(origin, substituted, name);
+    heap::release_roots(roots);
+    result
+}
+
+/// `alias | other`: build a union; `types::union_new` also accepts aliases.
+extern "C" fn alias_or_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` then the other operand.
+    let left = unsafe { *argv };
+    let right = unsafe { *argv.add(1) };
+    let roots = heap::root_values(&[left, right]);
+    let union = crate::modules::types::union_new(&[left, right]);
+    heap::release_roots(roots);
+    union
+}
+
+/// `other | alias`: the reflected union keeps the operand order.
+extern "C" fn alias_ror_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` then the other operand.
+    let left = unsafe { *argv };
+    let right = unsafe { *argv.add(1) };
+    let roots = heap::root_values(&[left, right]);
+    let union = crate::modules::types::union_new(&[right, left]);
+    heap::release_roots(roots);
+    union
+}
+
+/// `_GenericAlias.copy_with(params)`: the same origin and typing spelling with
+/// the supplied argument list.
+extern "C" fn alias_copy_with_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` then the parameter operand.
+    let alias = unsafe { *argv };
+    let parameters = unsafe { *argv.add(1) };
+    let roots = heap::root_values(&[alias, parameters]);
+    let result = alias_copy_with(alias, parameters);
+    heap::release_roots(roots);
+    result
+}
+
+fn alias_copy_with(alias: i64, parameters: i64) -> i64 {
+    let items = if let Some(items) = value::as_tuple(parameters) {
+        items.to_vec()
+    } else if let Some(items) = value::as_list(parameters) {
+        items.to_vec()
+    } else {
+        subscript_args(parameters)
+    };
+    let origin = value::instance_attr(alias, "__origin__").unwrap_or(NONE);
+    generic_alias_build(origin, items, alias_display_name(alias))
+}
+
+/// Whether `arg` may replace a type parameter. CPython's
+/// `__typing_subst__` rejects tuples, the special forms (`Generic`,
+/// `Protocol`, `Final`, `ClassVar`, `Optional`) and their aliases.
+fn is_valid_substitution(arg: i64) -> bool {
+    if value::as_tuple(arg).is_some() {
+        return false;
+    }
+    if let Some(name) = value::class_display_name(arg) {
+        if CLASSES.contains(&name)
+            && value::as_class(arg).is_some()
+            && placeholder_class(name) == arg
+        {
+            if matches!(
+                name,
+                "Optional" | "Generic" | "Protocol" | "Final" | "ClassVar" | "Union"
+            ) {
+                return false;
+            }
+        }
+    }
+    if let Some(origin) = value::instance_attr(arg, "__origin__") {
+        if let Some(name) = value::class_display_name(origin) {
+            if CLASSES.contains(&name)
+                && placeholder_class(name) == origin
+                && matches!(name, "Optional" | "Generic" | "Protocol" | "Final" | "ClassVar")
+            {
+                return false;
+            }
+        }
+    }
+    value::as_class(arg).is_some()
+        || value::as_function(arg).is_some()
+        || arg == NONE
+        || value::as_str(arg).is_some()
+        || crate::modules::types::is_union(arg)
+        || value::instance_class_value(arg) == Some(cached_class("_GenericAlias"))
+        || is_type_alias_value(arg)
+        || value::instance_class_value(arg) == Some(typevar_class())
+        || value::instance_class_value(arg) == Some(typevar_like_class("ParamSpec"))
+        || value::instance_class_value(arg) == Some(typevar_like_class("TypeVarTuple"))
+        || value::instance_class_value(arg) == Some(forward_ref_class())
+}
+
+/// Replaces the parameter occurrences in one alias argument, rebuilding
+/// nested aliases, unions and annotation metadata.
+fn substitute_type(v: i64, mapping: &[(i64, i64)], depth: usize) -> i64 {
+    if depth > 32 {
+        return v;
+    }
+    if let Some((_, replacement)) = mapping.iter().find(|(key, _)| *key == v) {
+        return *replacement;
+    }
+    if value::instance_class_value(v) == Some(cached_class("_GenericAlias")) {
+        let origin = value::instance_attr(v, "__origin__").unwrap_or(NONE);
+        let roots = heap::root_values(&[v, origin]);
+        if let Some(metadata) = annotated_metadata(v) {
+            let new_origin = substitute_type(origin, mapping, depth + 1);
+            let mut items = Vec::with_capacity(metadata.len() + 1);
+            items.push(new_origin);
+            for item in metadata {
+                items.push(substitute_type(*item, mapping, depth + 1));
+            }
+            let item_roots = heap::root_values(&items);
+            let result = annotated_alias(value::tuple_new(items));
+            heap::release_roots(item_roots);
+            heap::release_roots(roots);
+            return result;
+        }
+        let Some(args) = value::instance_attr(v, "__args__").and_then(value::as_tuple) else {
+            heap::release_roots(roots);
+            return v;
+        };
+        let args = args.to_vec();
+        let mut new_args = Vec::with_capacity(args.len());
+        for item in &args {
+            new_args.push(substitute_type(*item, mapping, depth + 1));
+            if exc::pending() {
+                heap::release_roots(roots);
+                return NONE;
+            }
+        }
+        let arg_roots = heap::root_values(&new_args);
+        let result = generic_alias_build(origin, new_args, alias_display_name(v));
+        heap::release_roots(arg_roots);
+        heap::release_roots(roots);
+        return result;
+    }
+    if crate::modules::types::is_union(v) {
+        let Some(args) = value::instance_attr(v, "__args__").and_then(value::as_tuple) else {
+            return v;
+        };
+        let args = args.to_vec();
+        let roots = heap::root_values(&[v]);
+        let mut new_args = Vec::with_capacity(args.len());
+        for item in &args {
+            new_args.push(substitute_type(*item, mapping, depth + 1));
+            if exc::pending() {
+                heap::release_roots(roots);
+                return NONE;
+            }
+        }
+        let arg_roots = heap::root_values(&new_args);
+        let result = crate::modules::types::union_new(&new_args);
+        heap::release_roots(arg_roots);
+        heap::release_roots(roots);
+        return result;
+    }
+    v
 }
 
 /// Nesting rendered by [`generic_alias_text`] before the remaining arguments
@@ -798,7 +1203,7 @@ fn generic_alias_text(instance: i64, depth: usize) -> String {
     // metadata values.
     if let Some(metadata) = annotated_metadata(instance) {
         let origin = value::instance_attr(instance, "__origin__").unwrap_or(NONE);
-        let mut rendered = String::from("Annotated[");
+        let mut rendered = String::from("typing.Annotated[");
         rendered.push_str(&alias_arg_text(origin, depth + 1));
         for item in metadata {
             rendered.push_str(", ");
@@ -808,11 +1213,22 @@ fn generic_alias_text(instance: i64, depth: usize) -> String {
         return rendered;
     }
     let origin = value::instance_attr(instance, "__origin__").unwrap_or(NONE);
-    let origin_text = alias_origin_text(origin);
+    // A typing alias records its spelling (`typing.List[int]`), while a
+    // `types.GenericAlias`-shaped alias renders through its origin
+    // (`list[int]`).
+    let origin_text = match alias_display_name(instance) {
+        Some(name) => format!("typing.{name}"),
+        None => alias_origin_text(origin),
+    };
     let Some(args) = value::instance_attr(instance, "__args__").and_then(value::as_tuple) else {
         return origin_text;
     };
     if args.is_empty() {
+        // `typing.Tuple[()]` is the one empty-argument alias CPython spells
+        // with an explicit empty tuple.
+        if alias_display_name(instance) == Some("Tuple") {
+            return format!("{origin_text}[()]");
+        }
         return origin_text;
     }
     let mut rendered = String::with_capacity(origin_text.len() + 2);
@@ -850,7 +1266,27 @@ fn alias_arg_text(arg: i64, depth: usize) -> String {
     if value::instance_class_value(arg) == Some(cached_class("_GenericAlias")) {
         return generic_alias_text(arg, depth);
     }
+    if crate::modules::types::is_union(arg) {
+        return value::repr(arg);
+    }
+    // `Callable[[int], str]` stores its parameter list as a list argument;
+    // render the element types rather than their underlying function values.
+    if let Some(items) = value::as_list(arg) {
+        let rendered: Vec<String> = items
+            .iter()
+            .map(|item| alias_arg_text(*item, depth + 1))
+            .collect();
+        return format!("[{}]", rendered.join(", "));
+    }
     if let Some(name) = value::class_display_name(arg) {
+        // A bare typing alias used as an argument keeps its module spelling
+        // (`typing.Final`, `typing.List`), like CPython.
+        if value::as_class(arg).is_some()
+            && CLASSES.contains(&name)
+            && placeholder_class(name) == arg
+        {
+            return format!("typing.{name}");
+        }
         return name.to_string();
     }
     if let Some(function) = value::as_function(arg) {
@@ -1594,7 +2030,36 @@ extern "C" fn typevar_like_init_entry(argv: *const i64) -> i64 {
         value::instance_setattr(instance, name.clone(), *item);
     }
     heap::release_roots(roots);
+    // `P.args` / `P.kwargs`: each is a `ParamSpecArgs`/`ParamSpecKwargs`
+    // instance whose `__origin__` is the owning `ParamSpec`, so
+    // `get_origin(P.args) is P` and specialised aliases can substitute them.
+    let roots = heap::root_values(&[instance]);
+    if value::instance_class_value(instance) == Some(typevar_like_class("ParamSpec")) {
+        let args = paramspec_arg_instance(instance, "args");
+        let args_roots = heap::root_values(&[args]);
+        let kwargs_value = paramspec_arg_instance(instance, "kwargs");
+        let kw_roots = heap::root_values(&[kwargs_value]);
+        value::instance_setattr(instance, "args".to_string(), args);
+        value::instance_setattr(instance, "kwargs".to_string(), kwargs_value);
+        heap::release_roots(kw_roots);
+        heap::release_roots(args_roots);
+    }
+    heap::release_roots(roots);
     NONE
+}
+
+fn paramspec_arg_instance(origin: i64, kind: &str) -> i64 {
+    let class_name = if kind == "args" {
+        "ParamSpecArgs"
+    } else {
+        "ParamSpecKwargs"
+    };
+    let class = cached_class(class_name);
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance, origin]);
+    value::instance_setattr(instance, "__origin__".to_string(), origin);
+    heap::release_roots(roots);
+    instance
 }
 
 /// `repr(ParamSpec('P')) == '~P'`.
@@ -1661,10 +2126,80 @@ fn typevar_class() -> i64 {
         vec![
             ("__init__".to_string(), init),
             ("__repr__".to_string(), repr),
+            // `T.__typing_subst__(arg)` validates and returns the argument;
+            // generic alias subscription uses the same validation.
+            (
+                "__typing_subst__".to_string(),
+                entry_method(
+                    "_typevar_subst",
+                    &["self", "arg"],
+                    typevar_subst_entry as *const () as usize,
+                ),
+            ),
+            (
+                "__or__".to_string(),
+                entry_method(
+                    "_typevar_or",
+                    &["self", "other"],
+                    typevar_or_entry as *const () as usize,
+                ),
+            ),
+            (
+                "__ror__".to_string(),
+                entry_method(
+                    "_typevar_ror",
+                    &["self", "other"],
+                    typevar_ror_entry as *const () as usize,
+                ),
+            ),
         ],
     );
     crate::core::globals::registry_set(key, class);
     class
+}
+
+/// `TypeVar.__typing_subst__(arg)`: `None` becomes `NoneType`; anything that
+/// cannot be a type argument raises `TypeError`.
+extern "C" fn typevar_subst_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` then the argument.
+    let instance = unsafe { *argv };
+    let arg = unsafe { *argv.add(1) };
+    let roots = heap::root_values(&[instance, arg]);
+    let result = if !is_valid_substitution(arg) {
+        type_error(&format!(
+            "Subscripted generics cannot be used with class and instance checks: {}",
+            value::repr(arg)
+        ))
+    } else if arg == NONE {
+        none_type()
+    } else {
+        arg
+    };
+    heap::release_roots(roots);
+    result
+}
+
+/// `T | other`: build a union with the type variable. `types::union_new`
+/// accepts type variables as members (unlike the class-operand `|` path).
+extern "C" fn typevar_or_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` then the other operand.
+    let left = unsafe { *argv };
+    let right = unsafe { *argv.add(1) };
+    let roots = heap::root_values(&[left, right]);
+    let union = crate::modules::types::union_new(&[left, right]);
+    heap::release_roots(roots);
+    union
+}
+
+/// `other | T`: the reflected union keeps the operand order.
+extern "C" fn typevar_ror_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `self` then the other operand.
+    let left = unsafe { *argv };
+    let right = unsafe { *argv.add(1) };
+    let roots = heap::root_values(&[left, right]);
+    let union = crate::modules::types::union_new(&[right, left]);
+    heap::release_roots(roots);
+    union
 }
 
 /// `TypeVar.__init__(self, name, *constraints, **kwargs)`.
@@ -2000,10 +2535,74 @@ fn type_alias_getitem(alias: i64, parameters: i64) -> i64 {
     generic_alias_of(alias, parameters)
 }
 
+/// A module constant cached in the process-wide registry for one heap
+/// generation. The registry is a GC root, so a value only the registry names
+/// stays alive until `heap::reset` invalidates it.
+fn cached_constant(key: &str, build: impl FnOnce() -> i64) -> i64 {
+    let generation_key = format!("{key}.generation");
+    let generation =
+        value::encode_int(i64::try_from(heap::generation()).unwrap_or(i64::MAX)).unwrap_or(NONE);
+    if crate::core::globals::registry_get(&generation_key) == Some(generation) {
+        if let Some(cached) = crate::core::globals::registry_get(key) {
+            return cached;
+        }
+    }
+    let built = build();
+    if exc::pending() {
+        return built;
+    }
+    let roots = heap::root_values(&[built]);
+    crate::core::globals::registry_set(key, built);
+    crate::core::globals::registry_set(&generation_key, generation);
+    heap::release_roots(roots);
+    built
+}
+
+/// `typing._cleanups`: CPython's module-level list of cache-clearing
+/// callbacks. The test suite iterates it (`for f in typing._cleanups: f()`),
+/// so the value is a real, identity-stable list; Hydro registers no lazy
+/// caches of its own, leaving it empty.
+fn cleanups_list() -> i64 {
+    cached_constant("typing._cleanups", || value::list_new(Vec::new()))
+}
+
+/// The pre-defined type variables CPython's `typing` module exports:
+/// `T`, `KT`, `VT` (not in `__all__`) and the constrained `AnyStr`.
+fn typing_typevar_constant(name: &str) -> Option<i64> {
+    if !matches!(name, "T" | "KT" | "VT" | "AnyStr") {
+        return None;
+    }
+    let key = format!("typing.constant.{name}");
+    Some(cached_constant(&key, || {
+        let text = value::str_alloc(name.to_string());
+        let roots = heap::root_values(&[text]);
+        let args = if name == "AnyStr" {
+            vec![
+                text,
+                value::builtin_function_new(Builtin::Str),
+                value::builtin_function_new(Builtin::Bytes),
+            ]
+        } else {
+            vec![text]
+        };
+        let arg_roots = heap::root_values(&args);
+        let instance = new_typevar(&args, &[]);
+        heap::release_roots(arg_roots);
+        heap::release_roots(roots);
+        instance
+    }))
+}
+
 /// Materialises the module constant `name`.
 pub(crate) fn constant(name: &str) -> i64 {
     if name == "TYPE_CHECKING" {
         return FALSE;
+    }
+    if name == "_cleanups" {
+        return cleanups_list();
+    }
+    if let Some(typevar) = typing_typevar_constant(name) {
+        return typevar;
     }
     if name == "ForwardRef" {
         return forward_ref_class();
@@ -2527,10 +3126,16 @@ fn is_param_expr(arg: i64) -> bool {
     if value::as_tuple(arg).is_some() || value::as_list(arg).is_some() {
         return true;
     }
-    if value::instance_class_value(arg) == Some(typevar_like_class("ParamSpec")) {
+    let class = value::instance_class_value(arg);
+    if class == Some(typevar_like_class("ParamSpec")) {
         return true;
     }
-    if value::instance_class_value(arg) == Some(cached_class("_ConcatenateGenericAlias")) {
+    if class == Some(cached_class("ParamSpecArgs"))
+        || class == Some(cached_class("ParamSpecKwargs"))
+    {
+        return true;
+    }
+    if class == Some(cached_class("_ConcatenateGenericAlias")) {
         return true;
     }
     // `...` (the `Ellipsis` singleton) is also a parameter expression.
@@ -2604,15 +3209,33 @@ fn generic_alias_of(origin: i64, parameters: i64) -> i64 {
         Some(items) => items.to_vec(),
         None => vec![parameters],
     };
+    generic_alias_build(origin, items, None)
+}
+
+/// Builds a `_GenericAlias` with an explicit argument list and, for a `typing`
+/// spelling, the recorded display name (`typing.List[int]`). The name also
+/// distinguishes a typing alias from a `types.GenericAlias`-shaped one during
+/// equality and hashing.
+fn generic_alias_build(origin: i64, items: Vec<i64>, name: Option<&str>) -> i64 {
     let class = cached_class("_GenericAlias");
     let args_tuple = value::tuple_new(items);
     let roots = heap::root_values(&[origin, args_tuple, class]);
     let collected = collect_type_vars(args_tuple);
     let parameter_roots = heap::root_values(&[collected]);
+    let display = name.map(|name| {
+        let text = value::str_alloc(name.to_string());
+        (text, heap::root_values(&[text]))
+    });
     let instance = value::instance_new(class);
     value::instance_setattr(instance, "__origin__".to_string(), origin);
     value::instance_setattr(instance, "__args__".to_string(), args_tuple);
     value::instance_setattr(instance, "__parameters__".to_string(), collected);
+    if let Some((text, _)) = display.as_ref() {
+        value::instance_setattr(instance, "_name".to_string(), *text);
+    }
+    if let Some((_, roots)) = display {
+        heap::release_roots(roots);
+    }
     heap::release_roots(parameter_roots);
     heap::release_roots(roots);
     instance
@@ -2685,6 +3308,30 @@ pub(crate) fn generic_class_subscript(class: i64, index: i64) -> Option<i64> {
         if let Some(alias) = special {
             return Some(alias);
         }
+        if CLASSES.contains(&name) && class == placeholder_class(name) {
+            // `typing.Generic[T]`: a generic alias over the `Generic` base.
+            if name == "Generic" {
+                if value::as_tuple(index).is_some_and(|items| items.is_empty()) {
+                    return Some(type_error(
+                        "Too few arguments for typing.Generic; actual 0, expected at least 1",
+                    ));
+                }
+                return Some(typing_named_alias(name, class, index));
+            }
+            // The parameterized typing aliases (`typing.List[int]`,
+            // `typing.Mapping[str, int]`) carry the real origin and the
+            // typing spelling, so `repr`, `get_origin`/`get_args` and
+            // `__parameters__` match CPython.
+            if let Some(origin) = typing_alias_origin(name) {
+                return Some(typing_named_alias(name, origin, index));
+            }
+            // Unparameterized special forms (`Final[int]`, `ClassVar[int]`,
+            // `Unpack[Ts]`, protocol aliases such as `SupportsInt[int]` and
+            // the IO spellings) use the form itself as the origin.
+            if special_form_origin(name) {
+                return Some(typing_named_alias(name, class, index));
+            }
+        }
     }
     let params = match value::class_lookup(class, "__type_params__")? {
         value::ClassEntry::Attr(params) => params,
@@ -2694,6 +3341,110 @@ pub(crate) fn generic_class_subscript(class: i64, index: i64) -> Option<i64> {
         return None;
     }
     Some(generic_alias_of(class, index))
+}
+
+/// Origin value of a bare `typing` parameterized alias (`List` → `list`), or
+/// `None` for a name that is not a container/ABC alias.
+fn typing_alias_origin(name: &str) -> Option<i64> {
+    Some(match name {
+        "List" => value::builtin_function_new(Builtin::List),
+        "Dict" => value::builtin_function_new(Builtin::Dict),
+        "Set" => value::builtin_function_new(Builtin::Set),
+        "FrozenSet" => value::builtin_function_new(Builtin::Frozenset),
+        "Tuple" => value::builtin_function_new(Builtin::Tuple),
+        "Type" => value::builtin_function_new(Builtin::Type),
+        "Callable" => crate::modules::collections_abc::constant("Callable"),
+        "Iterable" => crate::modules::collections_abc::constant("Iterable"),
+        "Iterator" => crate::modules::collections_abc::constant("Iterator"),
+        "Generator" => crate::modules::collections_abc::constant("Generator"),
+        "Reversible" => crate::modules::collections_abc::constant("Reversible"),
+        "Container" => crate::modules::collections_abc::constant("Container"),
+        "Collection" => crate::modules::collections_abc::constant("Collection"),
+        "AbstractSet" => crate::modules::collections_abc::constant("Set"),
+        "MutableSet" => crate::modules::collections_abc::constant("MutableSet"),
+        "Mapping" => crate::modules::collections_abc::constant("Mapping"),
+        "MutableMapping" => crate::modules::collections_abc::constant("MutableMapping"),
+        "Sequence" => crate::modules::collections_abc::constant("Sequence"),
+        "MutableSequence" => crate::modules::collections_abc::constant("MutableSequence"),
+        "MappingView" => crate::modules::collections_abc::constant("MappingView"),
+        "KeysView" => crate::modules::collections_abc::constant("KeysView"),
+        "ItemsView" => crate::modules::collections_abc::constant("ItemsView"),
+        "ValuesView" => crate::modules::collections_abc::constant("ValuesView"),
+        "Hashable" => crate::modules::collections_abc::constant("Hashable"),
+        "Sized" => crate::modules::collections_abc::constant("Sized"),
+        "Awaitable" => crate::modules::collections_abc::constant("Awaitable"),
+        "Coroutine" => crate::modules::collections_abc::constant("Coroutine"),
+        "AsyncIterable" => crate::modules::collections_abc::constant("AsyncIterable"),
+        "AsyncIterator" => crate::modules::collections_abc::constant("AsyncIterator"),
+        "AsyncGenerator" => crate::modules::collections_abc::constant("AsyncGenerator"),
+        "DefaultDict" => crate::modules::module_get_by_name("collections", "defaultdict"),
+        "Deque" => crate::modules::module_get_by_name("collections", "deque"),
+        "Counter" => crate::modules::module_get_by_name("collections", "Counter"),
+        "ChainMap" => crate::modules::module_get_by_name("collections", "ChainMap"),
+        "OrderedDict" => crate::modules::module_get_by_name("collections", "OrderedDict"),
+        "Pattern" => crate::modules::re::constant("Pattern"),
+        "Match" => crate::modules::re::constant("Match"),
+        _ => return None,
+    })
+}
+
+/// Names subscripted through a special form whose alias origin is the form
+/// itself (`Final[int].__origin__ is Final`).
+fn special_form_origin(name: &str) -> bool {
+    matches!(
+        name,
+        "Final"
+            | "ClassVar"
+            | "Required"
+            | "NotRequired"
+            | "ReadOnly"
+            | "Unpack"
+            | "Concatenate"
+            | "TypeGuard"
+            | "TypeIs"
+            | "TypeForm"
+            | "Protocol"
+            | "IO"
+            | "TextIO"
+            | "BinaryIO"
+            | "SupportsAbs"
+            | "SupportsBytes"
+            | "SupportsComplex"
+            | "SupportsFloat"
+            | "SupportsIndex"
+            | "SupportsInt"
+            | "SupportsRound"
+    )
+}
+
+/// `typing.Name[args]`: build the named alias with CPython's argument
+/// conventions (`Callable[[int], str]` stores one list argument and `Tuple[()]`
+/// has no arguments).
+fn typing_named_alias(name: &str, origin: i64, index: i64) -> i64 {
+    let items = match name {
+        "Callable" => match value::as_tuple(index) {
+            Some(pair) if pair.len() == 2 => vec![pair[0], pair[1]],
+            _ => vec![index],
+        },
+        "Tuple" if value::as_tuple(index).is_some_and(|items| items.is_empty()) => Vec::new(),
+        _ => subscript_args(index),
+    };
+    // CPython's `_type_check` turns a string annotation argument into a
+    // `ForwardRef` (`typing.List["int"]`), while `list["int"]` keeps the
+    // string because `types.GenericAlias` does not type-check.
+    let items: Vec<i64> = items.into_iter().map(alias_type_check).collect();
+    generic_alias_build(origin, items, Some(name))
+}
+
+/// A string type argument becomes a `ForwardRef`, matching `_type_check`.
+fn alias_type_check(item: i64) -> i64 {
+    if value::as_str(item).is_none() {
+        return item;
+    }
+    let roots = heap::root_values(&[item]);
+    let result = new_forward_ref(&[item], &[]);
+    heap::release_roots(roots);
+    result
 }
 
 /// One argument list of a class subscription.
@@ -2745,7 +3496,7 @@ fn literal_alias(origin: i64, index: i64) -> i64 {
         }
     }
     let member_roots = heap::root_values(&unique);
-    let alias = generic_alias_of(origin, value::tuple_new(unique));
+    let alias = generic_alias_build(origin, unique, Some("Literal"));
     heap::release_roots(member_roots);
     heap::release_roots(input_roots);
     alias
@@ -2871,10 +3622,14 @@ fn annotated_alias(index: i64) -> i64 {
     let parameters = collect_type_vars(inner);
     let parameter_roots = heap::root_values(&[parameters]);
     let instance = value::instance_new(class);
+    let name = value::str_alloc("Annotated".to_string());
+    let name_roots = heap::root_values(&[name]);
     value::instance_setattr(instance, "__origin__".to_string(), base);
     value::instance_setattr(instance, "__args__".to_string(), inner);
     value::instance_setattr(instance, "__metadata__".to_string(), meta);
     value::instance_setattr(instance, "__parameters__".to_string(), parameters);
+    value::instance_setattr(instance, "_name".to_string(), name);
+    heap::release_roots(name_roots);
     heap::release_roots(parameter_roots);
     heap::release_roots(meta_roots);
     heap::release_roots(inner_roots);
@@ -2994,6 +3749,21 @@ fn alias_origin(value_arg: i64) -> i64 {
     }
     if let Some(origin) = value::instance_attr(value_arg, "__origin__") {
         return origin;
+    }
+    // Bare parameterized aliases report their real origin (`get_origin(List)
+    // is list`, `get_origin(Tuple) is tuple`, `get_origin(Callable) is
+    // collections.abc.Callable`), while `get_origin(Generic) is Generic`.
+    if value::as_class(value_arg).is_some() {
+        if let Some(name) = value::class_display_name(value_arg) {
+            if CLASSES.contains(&name) && placeholder_class(name) == value_arg {
+                if name == "Generic" {
+                    return value_arg;
+                }
+                if let Some(origin) = typing_alias_origin(name) {
+                    return origin;
+                }
+            }
+        }
     }
     NONE
 }
@@ -3229,7 +3999,15 @@ mod tests {
         exc::init();
         let index = crate::core::value::str_alloc("int".to_string());
         let alias = constant("Tuple");
-        assert_eq!(crate::core::container::subscript(alias, index), alias);
+        // `typing.Tuple[int]` is a named generic alias; a plain class stays
+        // the tolerant fallback it always was.
+        let built = crate::core::container::subscript(alias, index);
+        assert!(!exc::pending(), "{:?}", pending_message());
+        assert_eq!(value::repr(built), "typing.Tuple[int]");
+        assert_eq!(
+            call("get_origin", &[built]),
+            value::builtin_function_new(Builtin::Tuple)
+        );
         let class = value::class_new("Plain".to_string(), NONE, Vec::new());
         assert_eq!(crate::core::container::subscript(class, index), class);
         assert!(!exc::pending());
@@ -3249,7 +4027,7 @@ mod tests {
             value::tuple_new(vec![text("a"), text("b")]),
         );
         assert!(!exc::pending(), "{:?}", pending_message());
-        assert_eq!(value::repr(alias), "Literal['a', 'b']");
+        assert_eq!(value::repr(alias), "typing.Literal['a', 'b']");
         assert_eq!(call("get_origin", &[alias]), literal);
         let args = as_tuple(call("get_args", &[alias])).expect("args").to_vec();
         let rendered: Vec<&str> = args
@@ -3272,7 +4050,7 @@ mod tests {
         assert_eq!(value::as_str(args[0]), Some("a"));
         assert_eq!(args[1], one);
         assert_eq!(args[2], TRUE);
-        assert_eq!(value::repr(duplicated), "Literal['a', 1, True]");
+        assert_eq!(value::repr(duplicated), "typing.Literal['a', 1, True]");
 
         // Nested `Literal` arguments are spliced into the outer alias.
         let nested = crate::core::container::subscript(literal, alias);
@@ -3280,7 +4058,7 @@ mod tests {
             .expect("args")
             .to_vec();
         assert_eq!(args.len(), 2);
-        assert_eq!(value::repr(nested), "Literal['a', 'b']");
+        assert_eq!(value::repr(nested), "typing.Literal['a', 'b']");
         assert!(!exc::pending());
     }
 
@@ -3373,7 +4151,7 @@ mod tests {
             value::tuple_new(vec![int_class, text("meta")]),
         );
         assert!(!exc::pending(), "{:?}", pending_message());
-        assert_eq!(value::repr(alias), "Annotated[int, 'meta']");
+        assert_eq!(value::repr(alias), "typing.Annotated[int, 'meta']");
         assert_eq!(call("get_origin", &[alias]), annotated_class);
         assert_eq!(value::instance_attr(alias, "__origin__"), Some(int_class));
         assert_eq!(

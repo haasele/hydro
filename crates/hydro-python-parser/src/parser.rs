@@ -359,21 +359,39 @@ pub fn parse(source: &str, mode: Mode, source_path: &str) -> Result<ast::Mod, Pa
 ///
 /// The returned [`crate::template::ParsedModule`] contains the ordinary
 /// RustPython AST (template literals appear as reserved placeholder `Name`
-/// expressions) plus a side table with the full template structure and source
-/// spans. Parse errors, including malformed template strings and unsupported
-/// concatenation, are returned as tagged `ParseError`s.
+/// expressions) plus the side tables that carry the Python 3.14 syntax the
+/// vendored AST and grammar do not model: the full template structure with
+/// source spans and the PEP 696 type-parameter defaults. Parse errors,
+/// including malformed template strings and unsupported concatenation, are
+/// returned as tagged `ParseError`s.
 pub fn parse_module_with_templates(
     source: &str,
     source_path: &str,
 ) -> Result<crate::template::ParsedModule, ParseError> {
-    let module = parse(source, Mode::Module, source_path)?;
-    crate::template::resolve_module(source, module).map_err(|error| {
+    let (module, type_param_defaults) =
+        lex_rewritten_module(source, Mode::Module, source_path, TextSize::default())?;
+    let mut parsed = crate::template::resolve_module(source, module).map_err(|error| {
         rustpython_parser_core::BaseError {
             error: ParseErrorType::Lexical(error.error),
             offset: error.location,
             source_path: source_path.to_owned(),
         }
-    })
+    })?;
+    parsed.type_param_defaults = type_param_defaults;
+    Ok(parsed)
+}
+
+/// Lex `source`, apply the Python 3.14 token rewrites and parse the result.
+fn lex_rewritten_module(
+    source: &str,
+    mode: Mode,
+    source_path: &str,
+    offset: TextSize,
+) -> Result<(ast::Mod, crate::type_params::TypeParamDefaults), ParseError> {
+    let tokens: Vec<LexResult> = lexer::lex_starts_at(source, mode, offset).collect();
+    let (tokens, defaults) = crate::type_params::rewrite_tokens(source, source_path, offset, tokens);
+    let module = parse_tokens(tokens, mode, source_path)?;
+    Ok((module, defaults))
 }
 
 /// Parse the given Python source code using the specified [`Mode`] and [`Location`].
@@ -404,8 +422,7 @@ pub fn parse_starts_at(
     source_path: &str,
     offset: TextSize,
 ) -> Result<ast::Mod, ParseError> {
-    let lxr = lexer::lex_starts_at(source, mode, offset);
-    parse_tokens(lxr, mode, source_path)
+    lex_rewritten_module(source, mode, source_path, offset).map(|(module, _defaults)| module)
 }
 
 /// Parse an iterator of [`LexResult`]s using the specified [`Mode`].

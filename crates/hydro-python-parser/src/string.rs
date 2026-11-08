@@ -103,7 +103,13 @@ impl<'a> StringParser<'a> {
             }
         }
         match p {
-            0xD800..=0xDFFF => Ok(std::char::REPLACEMENT_CHARACTER),
+            // A lone surrogate is not a Unicode scalar value, so `char` cannot
+            // hold it. The runtime represents one in `str` as the private-use
+            // scalar `U+F0000 + (code - 0xD800)` (U+F0000..=U+F07FF), which the
+            // Python-visible string payload maps back to the surrogate. Encoding
+            // it here keeps `"\ud800"` and `"\U0000dfff"` round-tripping instead
+            // of collapsing to U+FFFD.
+            0xD800..=0xDFFF => char::from_u32(0xF0000 + (p - 0xD800)).ok_or(unicode_error),
             _ => std::char::from_u32(p).ok_or(unicode_error),
         }
     }

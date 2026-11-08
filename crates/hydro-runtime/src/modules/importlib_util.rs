@@ -438,6 +438,19 @@ pub(crate) fn resolve_module_with_path(name: &str, path: Option<&[String]>) -> O
             &default_path
         }
     };
+    // CPython searches a submodule inside its parent package's `__path__`, not
+    // only along `sys.path`. Resolving the parent first keeps submodules of
+    // packages found outside the search path (namespace packages, packages
+    // whose `__path__` was extended) importable.
+    if let Some((parent, leaf)) = name.rsplit_once('.') {
+        if let Some(found_parent) = resolve_module_with_path(parent, path) {
+            if let Some(dirs) = found_parent.search_locations.as_deref() {
+                if let Some(found) = filesystem_leaf_in(name, leaf, dirs) {
+                    return Some(found);
+                }
+            }
+        }
+    }
     if let Some(found) = filesystem_module_in(name, search) {
         return Some(found);
     }
@@ -505,6 +518,45 @@ pub(crate) fn filesystem_spec(name: &str, dirs: &[String]) -> Option<FoundSpec> 
         return None;
     }
     filesystem_module_in(name, dirs)
+}
+
+/// Looks for the single component `leaf` of `name` inside `dirs` (a parent
+/// package's `__path__`), reusing the same file layout rules as
+/// [`filesystem_module_in`].
+fn filesystem_leaf_in(name: &str, leaf: &str, dirs: &[String]) -> Option<FoundSpec> {
+    if leaf.is_empty() {
+        return None;
+    }
+    for dir in dirs {
+        let base = Path::new(dir).join(leaf);
+        let init = base.join("__init__.py");
+        if init.is_file() {
+            return Some(FoundSpec {
+                name: name.to_string(),
+                origin: Some(machinery::absolute(&init.to_string_lossy())),
+                search_locations: Some(vec![base.to_string_lossy().into_owned()]),
+                loader: LoaderKind::Source,
+            });
+        }
+        let source = base.with_extension("py");
+        if source.is_file() {
+            return Some(FoundSpec {
+                name: name.to_string(),
+                origin: Some(machinery::absolute(&source.to_string_lossy())),
+                search_locations: None,
+                loader: LoaderKind::Source,
+            });
+        }
+        if let Some(path) = extension_file(&base) {
+            return Some(FoundSpec {
+                name: name.to_string(),
+                origin: Some(machinery::absolute(&path.to_string_lossy())),
+                search_locations: None,
+                loader: LoaderKind::Extension,
+            });
+        }
+    }
+    None
 }
 
 /// Looks for `name` in `search`, which is the documented `sys.path` order for
@@ -631,6 +683,13 @@ fn find_spec(args: &[i64]) -> i64 {
     if name.is_empty() || name.split('.').any(str::is_empty) {
         return NONE;
     }
+    // `sys.meta_path` is walked in order; Hydro's own finders are implemented
+    // by `spec_for_name`, so only program-defined finders are asked here.
+    if super::registry_lookup(&name).is_none() {
+        if let Some(spec) = super::importlib::meta_path_find_spec(&name) {
+            return spec;
+        }
+    }
     match spec_for_name(&name, None) {
         Ok(spec) => spec,
         Err(raised) => raised,
@@ -750,24 +809,72 @@ fn spec_for_name(name: &str, path: Option<&[String]>) -> Result<i64, i64> {
 
 /// `spec_from_loader(name, loader, *, origin=None, is_package=None)`.
 ///
-/// Builds a bare `ModuleSpec` around an already-constructed loader. The
-/// package flag is honoured when supplied; otherwise the spec is treated as a
-/// module, which is the common `six`/`pkgutil` use.
+/// Mirrors CPython: a loader with `get_filename()` supplies the origin, and a
+/// loader with `is_package()` supplies the package flag, unless the caller
+/// passed them explicitly. A loader that reports neither (a plain object, a
+/// `LazyLoader`) yields a module spec with `origin=None` and no
+/// `submodule_search_locations`, exactly like CPython.
 fn spec_from_loader(args: &[i64]) -> i64 {
     let name = match str_arg(args, 0, "spec_from_loader", "name") {
         Ok(name) => name,
         Err(raised) => return raised,
     };
     let loader = args.get(1).copied().unwrap_or(NONE);
-    let origin = args.get(2).copied().unwrap_or(NONE);
-    let is_package = args.get(3).copied().unwrap_or(NONE);
-    let origin = value::as_str(origin).map(str::to_string);
-    let locations = if is_package == value::TRUE {
+    let mut origin = args.get(2).copied().unwrap_or(NONE);
+    let is_package_arg = args.get(3).copied().unwrap_or(NONE);
+
+    let name_value = value::str_alloc(name.clone());
+    let roots = crate::heap::root_values(&[loader, origin, name_value]);
+    if origin == NONE {
+        if let Some(found) = loader_method(loader, "get_filename", &[name_value]) {
+            if exc::pending() {
+                exc::clear();
+            } else if found != NONE {
+                origin = found;
+            }
+        }
+    }
+    let mut is_package = if is_package_arg == NONE {
+        None
+    } else {
+        Some(value::truthy(is_package_arg))
+    };
+    if is_package.is_none() {
+        if let Some(found) = loader_method(loader, "is_package", &[name_value]) {
+            if exc::pending() {
+                exc::clear();
+            } else if found != NONE {
+                is_package = Some(value::truthy(found));
+            }
+        }
+    }
+    crate::heap::release_roots(roots);
+
+    let origin_text = value::as_str(origin).map(str::to_string);
+    let locations = if is_package == Some(true) {
         Some(Vec::new())
     } else {
         None
     };
-    machinery::new_spec(&name, loader, origin, locations, false)
+    let has_location = origin_text.is_some();
+    machinery::new_spec(&name, loader, origin_text, locations, has_location)
+}
+
+/// `getattr(receiver, name)` as a callable, or `None` when the attribute is
+/// missing. A raised `AttributeError` is consumed; any other pending error is
+/// left for the caller.
+fn loader_method(receiver: i64, name: &str, args: &[i64]) -> Option<i64> {
+    let function = crate::core::methods::getattr(receiver, name.as_ptr(), name.len());
+    if exc::pending() {
+        if exc::pending_tag() == i64::from(ATTRIBUTE_ERROR) {
+            exc::clear();
+        }
+        return None;
+    }
+    if function == NONE {
+        return None;
+    }
+    Some(crate::builtins::call(function, args.len(), args.as_ptr()))
 }
 
 /// `spec_from_file_location(name, location=None, loader=None,
@@ -882,6 +989,19 @@ fn module_from_spec(args: &[i64]) -> i64 {
     // `create_module()` would return exactly this object.
     if let Some(module) = super::registry_lookup(&name) {
         return module;
+    }
+    // `module_from_spec` asks the loader for the module object first; a loader
+    // that returns one (a built-in importer, an extension loader) supplies it.
+    let loader_candidate = value::instance_attr(spec, "loader").unwrap_or(NONE);
+    if loader_candidate != NONE {
+        if let Some(created) = loader_method(loader_candidate, "create_module", &[spec]) {
+            if exc::pending() {
+                return created;
+            }
+            if created != NONE && value::as_module(created).is_some() {
+                return created;
+            }
+        }
     }
     let origin = machinery::spec_origin(spec);
     let has_location = machinery::spec_has_location(spec);
@@ -1240,28 +1360,78 @@ fn native(function: &'static str, arity: usize) -> i64 {
 fn lazy_init(args: &[i64]) -> i64 {
     let receiver = args[0];
     let wrapped = args[1];
-    if value::as_instance(wrapped).is_none() {
+    // CPython's `LazyLoader.__init__` rejects a loader without `exec_module()`
+    // before storing it.
+    if lazy_lookup(wrapped, "exec_module") == NONE {
         return exc::raise_with_message(
             TYPE_ERROR,
-            &format!(
-                "LazyLoader() argument must be a loader instance, not '{}'",
-                value::type_name(wrapped)
-            ),
+            "LazyLoader(loader) requires loader.exec_module()",
         );
     }
     value::instance_setattr(receiver, "loader".to_string(), wrapped);
     NONE
 }
 
+/// `LazyLoader.create_module(spec)`: the wrapped loader supplies the module.
 fn lazy_create_module(args: &[i64]) -> i64 {
+    let receiver = args[0];
     let spec = args[1];
-    machinery::spec_name(spec)
-        .and_then(|name| super::registry_lookup(&name))
-        .unwrap_or(NONE)
+    let loader = value::instance_attr(receiver, "loader").unwrap_or(NONE);
+    if loader == NONE {
+        return NONE;
+    }
+    if let Some(created) = lazy_call(loader, "create_module", &[spec]) {
+        return created;
+    }
+    if exc::pending() {
+        return NONE;
+    }
+    NONE
 }
 
+/// `LazyLoader.exec_module(module)`.
+///
+/// CPython defers the call until the module's first attribute access. Hydro
+/// modules are already initialized when compiled in, so the load happens here:
+/// the wrapped loader's `exec_module` runs (a real no-op for a compiled
+/// module), and anything else reports the missing runtime compiler.
 fn lazy_exec_module(args: &[i64]) -> i64 {
-    machinery::exec_loaded_module(args[1])
+    let receiver = args[0];
+    let module = args[1];
+    let loader = value::instance_attr(receiver, "loader").unwrap_or(NONE);
+    if loader != NONE {
+        if let Some(result) = lazy_call(loader, "exec_module", &[module]) {
+            return result;
+        }
+        if exc::pending() {
+            return NONE;
+        }
+    }
+    machinery::exec_loaded_module(module)
+}
+
+/// `getattr(receiver, name)`, clearing a missing attribute to `NONE`.
+fn lazy_lookup(receiver: i64, name: &str) -> i64 {
+    let found = crate::core::methods::getattr(receiver, name.as_ptr(), name.len());
+    if exc::pending() {
+        if exc::pending_tag() == i64::from(ATTRIBUTE_ERROR) {
+            exc::clear();
+        }
+        return NONE;
+    }
+    found
+}
+
+/// Calls `receiver.name(*args)`, or `None` when the method is missing.
+fn lazy_call(receiver: i64, name: &str, args: &[i64]) -> Option<i64> {
+    let function = lazy_lookup(receiver, name);
+    if exc::pending() {
+        return None;
+    }
+    if function == NONE {
+        return None;
+    }
+    Some(crate::builtins::call(function, args.len(), args.as_ptr()))
 }
 
 #[cfg(test)]

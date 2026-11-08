@@ -21,12 +21,18 @@
 //!
 //! ## Precise unsupported areas (reported, not fabricated)
 //!
-//! * **Code, frame and traceback objects do not exist.** `isframe` and
-//!   `iscode` are therefore always `False`; `currentframe()` returns `None`
-//!   because no frame object can be represented, and `stack()` returns an
-//!   empty list because there are no representable frame contexts.
-//!   `getclosurevars` raises `NotImplementedError`: free/global/builtin name
-//!   references live in a code object the runtime does not reify.
+//! * **Frames and code objects are real; tracebacks are not modelled.**
+//!   `currentframe()` returns the live activation, `isframe`/`iscode` answer
+//!   truthfully, `getfile` reports a frame/code object's real file, and
+//!   `getframeinfo` builds a `FrameInfo` namedtuple with the frame's file,
+//!   line, function name and source context. `getsource` returns the whole
+//!   file for a module and the definition block for a frame/code object;
+//!   function and class values carry no source position, so they raise
+//!   `OSError` exactly like CPython when the source cannot be located.
+//!   `stack()` stays empty (building the full caller chain from the native
+//!   path is not modelled), and `getclosurevars` raises
+//!   `NotImplementedError`: free/global/builtin name references live in a code
+//!   object the runtime does not reify.
 //! * **`getcomments` has no first line number for functions and classes.**
 //!   A Python module is read from its `__file__` and gets CPython's
 //!   top-of-file comment scan; every other object reports `None` instead of
@@ -75,7 +81,7 @@ use hydro_ir::{Builtin, MethodKind, ParamKind};
 use crate::container;
 use crate::core::globals;
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, INDEX_ERROR, NOT_IMPLEMENTED_ERROR, TYPE_ERROR, VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, INDEX_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR, TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::iter;
@@ -2891,6 +2897,12 @@ fn module_file(module: &str) -> Option<String> {
 }
 
 fn getfile_impl(obj: i64) -> i64 {
+    if let Some(state) = value::as_frame(obj) {
+        return text(&state.data.file);
+    }
+    if let Some(state) = value::as_code(obj) {
+        return text(&state.filename);
+    }
     if let Some(module) = value::as_module(obj) {
         return match module_file(module.name()) {
             Some(path) => text(&path),
@@ -3051,6 +3063,196 @@ fn unwrap_with_stop(obj: i64, stop: i64) -> i64 {
             _ => return current,
         }
     }
+}
+
+/// Reads a source file as lines that keep their terminators.
+fn read_file_lines(path: &str) -> Option<Vec<String>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(content.split_inclusive('\n').map(str::to_string).collect())
+}
+
+/// The source file and first line of a module/frame/code object.
+fn source_location(obj: i64) -> Option<(String, usize)> {
+    if let Some(state) = value::as_frame(obj) {
+        return Some((
+            state.data.file.clone(),
+            state.data.first_line.load(std::sync::atomic::Ordering::Relaxed) as usize,
+        ));
+    }
+    if let Some(state) = value::as_code(obj) {
+        return Some((state.filename.clone(), state.first_line as usize));
+    }
+    if let Some(module) = value::as_module(obj) {
+        return module_file(module.name()).map(|file| (file, 1));
+    }
+    None
+}
+
+fn leading_ws_len(line: &str) -> usize {
+    line.len() - line.trim_start_matches([' ', '\t']).len()
+}
+
+/// Net bracket delta of one source line, ignoring comments and quoted text.
+///
+/// Continuation lines inside an open bracket belong to the same statement even
+/// when their indentation is not deeper than the statement's first line
+/// (`def f(\n    a,\n):`), so block extraction tracks this delta.
+fn line_bracket_delta(line: &str) -> i64 {
+    let bytes = line.as_bytes();
+    let mut depth = 0i64;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'#' {
+            break;
+        }
+        if byte == b'\'' || byte == b'"' {
+            let quote = byte;
+            index += 1;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'\\' => index += 2,
+                    current if current == quote => {
+                        index += 1;
+                        break;
+                    }
+                    _ => index += 1,
+                }
+            }
+            continue;
+        }
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    depth
+}
+
+/// The `[start, end)` line range of the block beginning at `first_line`.
+///
+/// The scan includes decorator lines, continuation lines of an open bracket
+/// and the indented body, and stops at the first non-blank line whose
+/// indentation is not deeper than the definition's.
+fn source_block(lines: &[String], first_line: usize) -> (usize, usize) {
+    if lines.is_empty() {
+        return (0, 0);
+    }
+    let mut start = first_line.saturating_sub(1).min(lines.len() - 1);
+    while start > 0 && lines[start - 1].trim_start().starts_with('@') {
+        start -= 1;
+    }
+    let base_indent = leading_ws_len(&lines[start]);
+    let mut depth = line_bracket_delta(&lines[start]);
+    let mut end = start + 1;
+    while end < lines.len() {
+        let line = &lines[end];
+        if depth > 0 {
+            depth += line_bracket_delta(line);
+            end += 1;
+            continue;
+        }
+        if line.trim().is_empty() {
+            end += 1;
+            continue;
+        }
+        if leading_ws_len(line) <= base_indent {
+            break;
+        }
+        depth += line_bracket_delta(line);
+        end += 1;
+    }
+    while end > start + 1 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    (start, end)
+}
+
+/// `inspect.getsource(obj)`: the whole file for a module, the definition block
+/// for a frame/code object.
+fn getsource_impl(obj: i64) -> i64 {
+    let Some((file, first_line)) = source_location(obj) else {
+        return exc::raise_with_message(OS_ERROR, "could not get source code");
+    };
+    let Some(lines) = read_file_lines(&file) else {
+        return exc::raise_with_message(OS_ERROR, "could not get source code");
+    };
+    if value::as_module(obj).is_some() {
+        return text(&lines.concat());
+    }
+    let (start, end) = source_block(&lines, first_line);
+    text(&lines[start..end].concat())
+}
+
+/// `inspect.getframeinfo(frame, context=1)`: a `FrameInfo` namedtuple with the
+/// frame's real file, line, function name and source context.
+fn getframeinfo_impl(args: &[i64]) -> i64 {
+    let Some(&frame) = args.first() else {
+        return type_error("getframeinfo() missing required argument 'frame' (pos 1)");
+    };
+    let context = match args.get(1).copied() {
+        None | Some(NONE) => 1,
+        Some(argument) => match value::as_integer(argument) {
+            Some(number) => number,
+            None => {
+                return type_error(&format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    value::type_name(argument)
+                ))
+            }
+        },
+    };
+    let Some(state) = value::as_frame(frame) else {
+        return type_error(&format!(
+            "{} is not a frame or traceback object",
+            value::repr(frame)
+        ));
+    };
+    let filename = state.data.file.clone();
+    let lineno = state.data.current_line() as i64;
+    let function = state.data.code_name();
+    let class = frame_info_class();
+    let filename_value = text(&filename);
+    let function_value = text(&function);
+    let lineno_value = integer(lineno);
+    // Everything the namedtuple will own stays rooted until after the
+    // instance exists, because building the context list allocates.
+    let roots = heap::root_values(&[class, filename_value, function_value]);
+    let (code_context, index) = if context > 0 {
+        match read_file_lines(&filename) {
+            Some(lines) => {
+                let length = lines.len() as i64;
+                let limit = (length - context).max(0);
+                let start = (lineno - 1 - context / 2).clamp(0, limit);
+                let end = (start + context).min(length);
+                let list = value::list_new(Vec::new());
+                heap::push_scoped_root(list);
+                for line in &lines[start as usize..end as usize] {
+                    let item = text(line);
+                    container::list_append(list, item);
+                }
+                (list, integer(lineno - 1 - start))
+            }
+            None => (NONE, NONE),
+        }
+    } else {
+        (NONE, NONE)
+    };
+    let info = namedtuple_instance(
+        class,
+        &[
+            ("frame", frame),
+            ("filename", filename_value),
+            ("lineno", lineno_value),
+            ("function", function_value),
+            ("code_context", code_context),
+            ("index", index),
+        ],
+    );
+    heap::release_roots(roots);
+    info
 }
 
 fn getmembers_impl(obj: i64, predicate: i64) -> i64 {
@@ -3741,8 +3943,10 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "getmro" => getmro_impl(args[0]),
         "_static_getmro" => static_getmro_impl(args[0]),
         "_get_dunder_dict_of_class" => dunder_dict_of_class_impl(args[0]),
-        // Hydro has no frame, code or traceback objects.
-        "isframe" | "iscode" => FALSE,
+        // Frame and code objects are real runtime values; traceback objects
+        // are not modelled, so `istraceback` answers through `types` above.
+        "isframe" => value::bool_value(value::as_frame(args[0]).is_some()),
+        "iscode" => value::bool_value(value::as_code(args[0]).is_some()),
         "ismethoddescriptor" => value::bool_value(object_is_method_descriptor(args[0])),
         "isdatadescriptor" => value::bool_value(object_is_data_descriptor(args[0])),
         "ismemberdescriptor" | "isgetsetdescriptor" => FALSE,
@@ -3757,6 +3961,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "getmodulename" => getmodulename_impl(args.first().copied().unwrap_or(NONE)),
         "getfile" => getfile_impl(args[0]),
         "getsourcefile" => getsourcefile_impl(args[0]),
+        "getsource" => getsource_impl(args[0]),
+        "getframeinfo" => getframeinfo_impl(args),
         "findsource" | "getsourcelines" => value::tuple_new(vec![
             value::list_new(Vec::new()),
             value::encode_int(0).unwrap_or(NONE),
@@ -3776,6 +3982,10 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "getfullargspec" => getfullargspec_impl(args[0]),
         "getcallargs" => getcallargs_impl(args, &[]),
         "getmembers" => getmembers_impl(args[0], args.get(1).copied().unwrap_or(NONE)),
+        "getmembers_static" => getmembers_impl(args[0], args.get(1).copied().unwrap_or(NONE)),
+        // 3.14 routes `inspect.get_annotations` through annotationlib; the
+        // runtime storage is the same eagerly evaluated `__annotations__`.
+        "get_annotations" => super::annotationlib::call(function, args),
         "getattr_static" => {
             let name = value::as_str(args[1]).unwrap_or("");
             match static_attribute(args[0], name) {
@@ -3865,6 +4075,9 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
     }
     if function == "getcallargs" {
         return getcallargs_impl(args, keywords);
+    }
+    if function == "get_annotations" {
+        return super::annotationlib::call_kw(function, args, keywords);
     }
     // Every declared parameter has been bound into its positional slot by the
     // generic binder, so nothing is left that needs keyword handling.

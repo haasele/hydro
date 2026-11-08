@@ -126,7 +126,60 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "cycle" => cycle(args),
         "accumulate" => accumulate(args),
         "tee" => tee(args),
+        "starmap" => starmap(args),
+        "compress" => compress(args),
+        "batched" => batched(args, NONE),
         _ => attribute_error(function),
+    }
+}
+
+/// Keyword-aware dispatch for the combinators whose documented extra
+/// parameters are keyword-only (`batched`'s `strict`).
+pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if function != "batched" {
+        if let Some((name, _)) = keywords.first() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("itertools.{function}() does not accept keyword arguments '{name}'"),
+            );
+        }
+        return call(function, args);
+    }
+    let mut strict = false;
+    for (name, argument) in keywords {
+        match name.as_str() {
+            "strict" => {
+                strict = value::truthy(*argument);
+                if exc::pending() {
+                    return NONE;
+                }
+            }
+            other => {
+                return type_error(&format!(
+                    "batched() got an unexpected keyword argument '{other}'"
+                ))
+            }
+        }
+    }
+    batched(args, if strict { value::TRUE } else { value::FALSE })
+}
+
+/// Runtime values of the `itertools` internals that are types, not functions:
+/// `_grouper`, `_tee` and `_tee_dataobject`.
+///
+/// They carry no callable surface a Python caller may use (CPython's group
+/// state is produced internally), but `test_itertools` imports them and checks
+/// that the values are immutable, so a native function object — which the
+/// runtime refuses to accept new attributes on — is the right stand-in.
+pub(crate) fn constant(name: &str) -> i64 {
+    match name {
+        "_grouper" => value::native_function_new("itertools", "_grouper", 0),
+        "_tee" => value::native_function_new("itertools", "_tee", 0),
+        "_tee_dataobject" => value::native_function_new("itertools", "_tee_dataobject", 0),
+        _ => exc::raise_with_message(
+            ATTRIBUTE_ERROR,
+            &format!("module 'itertools' has no attribute '{name}'"),
+        ),
     }
 }
 
@@ -475,6 +528,162 @@ fn tee(args: &[i64]) -> i64 {
         push_item(iterators, iterator);
     }
     value::tuple_new(snapshot(iterators))
+}
+
+/// `starmap(function, iterable)`: calls `function(*row)` for every row.
+///
+/// Each row is unpacked through the runtime's iterator protocol, so any
+/// iterable of arguments works, exactly like CPython's `function(*args)`.
+fn starmap(args: &[i64]) -> i64 {
+    let function = args[0];
+    let iterator = iter::iter_of(args[1]);
+    if exc::pending() {
+        return NONE;
+    }
+    let result = value::list_new(Vec::new());
+    let roots = crate::heap::root_values(&[result]);
+    loop {
+        let mut row = NONE;
+        let status = iter::iter_next(iterator, &mut row);
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        let row_iterator = iter::iter_of(row);
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
+        let mut arguments: Vec<i64> = Vec::new();
+        loop {
+            let mut item = NONE;
+            let status = iter::iter_next(row_iterator, &mut item);
+            if exc::pending() {
+                crate::heap::release_roots(roots);
+                return NONE;
+            }
+            if status == 0 {
+                break;
+            }
+            arguments.push(item);
+        }
+        let argument_roots = crate::heap::root_values(&arguments);
+        let outcome = builtins::call(function, arguments.len(), arguments.as_ptr());
+        crate::heap::release_roots(argument_roots);
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
+        push_item(result, outcome);
+    }
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// `compress(data, selectors)`: keeps the elements of `data` whose matching
+/// selector is true, stopping at the shorter of the two inputs.
+fn compress(args: &[i64]) -> i64 {
+    let data_iterator = iter::iter_of(args[0]);
+    if exc::pending() {
+        return NONE;
+    }
+    let selector_iterator = iter::iter_of(args[1]);
+    if exc::pending() {
+        return NONE;
+    }
+    let result = value::list_new(Vec::new());
+    let roots = crate::heap::root_values(&[result]);
+    loop {
+        let mut item = NONE;
+        let data_status = iter::iter_next(data_iterator, &mut item);
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
+        if data_status == 0 {
+            break;
+        }
+        let mut selector = NONE;
+        let selector_status = iter::iter_next(selector_iterator, &mut selector);
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
+        if selector_status == 0 {
+            break;
+        }
+        let keep = value::truthy(selector);
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
+        if keep {
+            push_item(result, item);
+        }
+    }
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// `batched(iterable, n, *, strict=False)`: tuples of at most `n` elements.
+///
+/// With `strict` the last batch must be complete; a shorter trailing batch
+/// raises `ValueError`, like CPython.
+fn batched(args: &[i64], strict: i64) -> i64 {
+    let Some(n) = value::as_integer(args[1]) else {
+        return type_error(&format!(
+            "'{}' object cannot be interpreted as an integer",
+            value::type_name(args[1])
+        ));
+    };
+    if n < 1 {
+        return value_error("n must be at least one");
+    }
+    let strict = strict != NONE && value::truthy(strict);
+    if exc::pending() {
+        return NONE;
+    }
+    let iterator = iter::iter_of(args[0]);
+    if exc::pending() {
+        return NONE;
+    }
+    let result = value::list_new(Vec::new());
+    let batch = value::list_new(Vec::new());
+    let roots = crate::heap::root_values(&[result, batch]);
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
+        if status == 0 {
+            break;
+        }
+        push_item(batch, item);
+        let full = value::as_list(batch).is_some_and(|items| items.len() as i64 >= n);
+        if full {
+            let tuple = value::tuple_new(snapshot(batch));
+            if let Some(mut items) = value::list_items_mut(batch) {
+                items.clear();
+            }
+            push_item(result, tuple);
+        }
+    }
+    let remainder = snapshot(batch);
+    if !remainder.is_empty() {
+        if strict {
+            crate::heap::release_roots(roots);
+            return value_error("batched(): incomplete batch");
+        }
+        let tuple = value::tuple_new(remainder);
+        push_item(result, tuple);
+    }
+    crate::heap::release_roots(roots);
+    result
 }
 
 #[cfg(test)]

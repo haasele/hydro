@@ -434,6 +434,229 @@ fn run(function: &str, args: &[i64], gnu: bool) -> i64 {
     }
 }
 
+// -------------------------------------------------------------------------
+// Internal helpers CPython's `Lib/getopt.py` exposes
+// (`short_has_arg`, `long_has_args`, `do_shorts`, `do_longs`).
+// -------------------------------------------------------------------------
+
+/// Appends `(name, value)` as a two-item tuple to the options list.
+fn push_option_pair(options: i64, name: &str, value: &str) {
+    let name = value::str_alloc(name.to_string());
+    let value = value::str_alloc(value.to_string());
+    let entry = value::tuple_new(vec![name, value]);
+    if let Some(mut items) = value::list_items_mut(options) {
+        items.push(entry);
+        heap::write_barrier_edge(options, entry);
+    }
+}
+
+/// The options list the `do_*` helper mutates: CPython's `opts.append(...)`.
+fn options_list(argument: i64, function: &str) -> Result<i64, i64> {
+    if value::as_list(argument).is_none() {
+        return Err(type_error(&format!(
+            "{function}() argument 'opts' must be a list, not '{}'",
+            value::type_name(argument)
+        )));
+    }
+    Ok(argument)
+}
+
+/// A required `str` argument of one of the helper functions.
+fn helper_str(argument: i64, function: &str, name: &str) -> Result<String, i64> {
+    match value::as_str(argument) {
+        Some(text) => Ok(text.to_string()),
+        None => Err(type_error(&format!(
+            "{function}() argument '{name}' must be str, not '{}'",
+            value::type_name(argument)
+        ))),
+    }
+}
+
+/// `short_has_arg(opt, shortopts)`.
+///
+/// Returns `True` for a required argument, `False` for none and `"?"` for the
+/// optional (`::`) form; an unknown letter raises `GetoptError`. A multi-
+/// character `opt` never matches a single option letter, exactly like
+/// CPython's `opt == shortopts[i] != ':'` test.
+fn short_has_arg_value(args: &[i64]) -> i64 {
+    if args.len() != 2 {
+        return type_error(&format!(
+            "short_has_arg() takes exactly 2 arguments ({} given)",
+            args.len()
+        ));
+    }
+    let option = match helper_str(args[0], "short_has_arg", "opt") {
+        Ok(option) => option,
+        Err(error) => return error,
+    };
+    let shortopts = match helper_str(args[1], "short_has_arg", "shortopts") {
+        Ok(shortopts) => shortopts,
+        Err(error) => return error,
+    };
+    let letters: Vec<char> = shortopts.chars().collect();
+    let mut characters = option.chars();
+    let first = characters.next();
+    let second = characters.next();
+    let Some(letter) = first.filter(|_| second.is_none()) else {
+        return getopt_error(&format!("option -{option} not recognized"), &option);
+    };
+    match short_arg_kind(letter, &letters) {
+        Ok(ArgKind::None) => value::bool_value(false),
+        Ok(ArgKind::Required) => value::bool_value(true),
+        Ok(ArgKind::Optional) => value::str_alloc("?".to_string()),
+        Err(error) => error,
+    }
+}
+
+/// `long_has_args(opt, longopts)`.
+///
+/// Resolves a (possibly abbreviated) long option name and returns
+/// `(has_arg, full_name)`, where `has_arg` is `True`, `False` or `"?"`.
+fn long_has_args_value(args: &[i64]) -> i64 {
+    if args.len() != 2 {
+        return type_error(&format!(
+            "long_has_args() takes exactly 2 arguments ({} given)",
+            args.len()
+        ));
+    }
+    let option = match helper_str(args[0], "long_has_args", "opt") {
+        Ok(option) => option,
+        Err(error) => return error,
+    };
+    let longopts = match long_options(args[1], "long_has_args") {
+        Ok(longopts) => longopts,
+        Err(error) => return error,
+    };
+    match long_arg_kind(&option, &longopts) {
+        Ok((kind, full)) => {
+            let has_arg = match kind {
+                ArgKind::None => value::bool_value(false),
+                ArgKind::Required => value::bool_value(true),
+                ArgKind::Optional => value::str_alloc("?".to_string()),
+            };
+            let full = value::str_alloc(full);
+            value::tuple_new(vec![has_arg, full])
+        }
+        Err(error) => error,
+    }
+}
+
+/// `do_longs(opts, opt, longopts, args)`.
+fn do_longs_value(args: &[i64]) -> i64 {
+    if args.len() != 4 {
+        return type_error(&format!(
+            "do_longs() takes exactly 4 arguments ({} given)",
+            args.len()
+        ));
+    }
+    let opts = match options_list(args[0], "do_longs") {
+        Ok(opts) => opts,
+        Err(error) => return error,
+    };
+    let opt = match helper_str(args[1], "do_longs", "opt") {
+        Ok(opt) => opt,
+        Err(error) => return error,
+    };
+    let longopts = match long_options(args[2], "do_longs") {
+        Ok(longopts) => longopts,
+        Err(error) => return error,
+    };
+    let mut rest = match string_sequence(args[3], "do_longs", "args") {
+        Ok(rest) => rest,
+        Err(error) => return error,
+    };
+    let (name, inline) = match opt.split_once('=') {
+        Some((name, value)) => (name.to_string(), Some(value.to_string())),
+        None => (opt, None),
+    };
+    let (kind, full) = match long_arg_kind(&name, &longopts) {
+        Ok(resolved) => resolved,
+        Err(error) => return error,
+    };
+    let optarg = match kind {
+        ArgKind::Required if inline.is_none() => {
+            if rest.is_empty() {
+                return getopt_error(&format!("option --{full} requires argument"), &full);
+            }
+            rest.remove(0)
+        }
+        ArgKind::Required | ArgKind::Optional => inline.unwrap_or_default(),
+        ArgKind::None => {
+            if inline.is_some() {
+                return getopt_error(
+                    &format!("option --{full} must not have an argument"),
+                    &full,
+                );
+            }
+            String::new()
+        }
+    };
+    push_option_pair(opts, &format!("--{full}"), &optarg);
+    let remaining = strings_list(&rest);
+    value::tuple_new(vec![opts, remaining])
+}
+
+/// `do_shorts(opts, optstring, shortopts, args)`.
+fn do_shorts_value(args: &[i64]) -> i64 {
+    if args.len() != 4 {
+        return type_error(&format!(
+            "do_shorts() takes exactly 4 arguments ({} given)",
+            args.len()
+        ));
+    }
+    let opts = match options_list(args[0], "do_shorts") {
+        Ok(opts) => opts,
+        Err(error) => return error,
+    };
+    let optstring = match helper_str(args[1], "do_shorts", "optstring") {
+        Ok(optstring) => optstring,
+        Err(error) => return error,
+    };
+    let shortopts = match helper_str(args[2], "do_shorts", "shortopts") {
+        Ok(shortopts) => shortopts,
+        Err(error) => return error,
+    };
+    let mut rest = match string_sequence(args[3], "do_shorts", "args") {
+        Ok(rest) => rest,
+        Err(error) => return error,
+    };
+    let letters: Vec<char> = optstring.chars().collect();
+    let shortopts: Vec<char> = shortopts.chars().collect();
+    let mut at = 0usize;
+    while at < letters.len() {
+        let option = letters[at];
+        at += 1;
+        let kind = match short_arg_kind(option, &shortopts) {
+            Ok(kind) => kind,
+            Err(error) => return error,
+        };
+        let optarg = if kind == ArgKind::None {
+            String::new()
+        } else {
+            let attached: String = letters[at..].iter().collect();
+            if !attached.is_empty() {
+                at = letters.len();
+                attached
+            } else if kind == ArgKind::Optional {
+                at = letters.len();
+                String::new()
+            } else {
+                if rest.is_empty() {
+                    return getopt_error(
+                        &format!("option -{option} requires argument"),
+                        &option.to_string(),
+                    );
+                }
+                at = letters.len();
+                rest.remove(0)
+            }
+        };
+        push_option_pair(opts, &format!("-{option}"), &optarg);
+    }
+    let remaining = strings_list(&rest);
+    value::tuple_new(vec![opts, remaining])
+}
+
 /// Materialises a `getopt` module constant: the exception class and its
 /// backward-compatible `error` alias.
 pub(crate) fn constant(name: &str) -> i64 {
@@ -451,6 +674,12 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
         "getopt" => run(function, args, false),
         "gnu_getopt" => run(function, args, true),
+        // The module-level helpers CPython's own implementation exports and
+        // the CPython test suite calls directly.
+        "short_has_arg" => short_has_arg_value(args),
+        "long_has_args" => long_has_args_value(args),
+        "do_shorts" => do_shorts_value(args),
+        "do_longs" => do_longs_value(args),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'getopt' has no attribute '{function}'"),

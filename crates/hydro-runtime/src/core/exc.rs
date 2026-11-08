@@ -201,6 +201,9 @@ pub(crate) const PROCESS_LOOKUP_ERROR: u32 = 66;
 /// `TimeoutError`: an `OSError` subclass (the builtin, not
 /// `asyncio.TimeoutError`).
 pub(crate) const TIMEOUT_ERROR: u32 = 67;
+/// `UnboundLocalError`: a `NameError` subclass raised when a local name is
+/// read before it is bound.
+pub(crate) const UNBOUND_LOCAL_ERROR: u32 = 68;
 
 // CPython's `IOError` and `EnvironmentError` are aliases of `OSError`, so they
 // have no separate tags; `hydro_ir::ExcKind::IOError` and
@@ -229,6 +232,11 @@ pub(crate) fn is_os_error_tag(tag: u32) -> bool {
             | PROCESS_LOOKUP_ERROR
             | TIMEOUT_ERROR
     )
+}
+
+/// Whether `tag` is `SyntaxError` or one of its source-position subclasses.
+pub(crate) fn is_syntax_tag(tag: u32) -> bool {
+    matches!(tag, SYNTAX_ERROR | INDENTATION_ERROR | TAB_ERROR)
 }
 
 pub(crate) fn tag_name(tag: u32) -> &'static str {
@@ -301,6 +309,7 @@ pub(crate) fn tag_name(tag: u32) -> &'static str {
         PERMISSION_ERROR => "PermissionError",
         PROCESS_LOOKUP_ERROR => "ProcessLookupError",
         TIMEOUT_ERROR => "TimeoutError",
+        UNBOUND_LOCAL_ERROR => "UnboundLocalError",
         // Unknown tags are rendered as RuntimeError rather than panicking.
         _ => "RuntimeError",
     }
@@ -348,6 +357,7 @@ pub(crate) fn parents(tag: u32) -> &'static [u32] {
         EXCEPTION_GROUP => &[BASE_EXCEPTION_GROUP, EXCEPTION],
         EXCEPTION => &[BASE_EXCEPTION],
         // Ordinary exceptions.
+        UNBOUND_LOCAL_ERROR => &[NAME_ERROR],
         VALUE_ERROR | TYPE_ERROR | RUNTIME_ERROR | STOP_ITERATION | ATTRIBUTE_ERROR
         | ASSERTION_ERROR | NAME_ERROR | STOP_ASYNC_ITERATION | SYSTEM_ERROR | MEMORY_ERROR
         | EOF_ERROR | BUFFER_ERROR | REFERENCE_ERROR | ARITHMETIC_ERROR | LOOKUP_ERROR
@@ -514,7 +524,7 @@ pub(crate) fn exception_value_with_keywords(
         tag,
         name: tag_name(tag),
         msg: message.to_string(),
-        file: String::new(),
+        file: syntax_file_from_keywords(tag, &keywords),
         line: 0,
         frame: String::new(),
         cause: None,
@@ -529,6 +539,24 @@ pub(crate) fn exception_value_with_keywords(
     })
 }
 
+/// `SyntaxError.filename` supplied through the constructor's `filename`
+/// keyword, or `""` (the accessor then reports `"<string>"`).
+fn syntax_file_from_keywords(tag: u32, keywords: &[(String, i64)]) -> String {
+    if !is_syntax_tag(tag) {
+        return String::new();
+    }
+    keywords
+        .iter()
+        .find_map(|(name, value)| {
+            if name == "filename" {
+                value::as_str(*value).map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
 /// Keyword names accepted by the built-in exception constructor `tag`.
 ///
 /// CPython's `AttributeError` takes `name` and `obj`, `NameError` takes
@@ -538,9 +566,15 @@ pub(crate) fn exception_keyword_names(tag: u32) -> &'static [&'static str] {
     match tag {
         ATTRIBUTE_ERROR => &["name", "obj"],
         NAME_ERROR => &["name"],
-        SYNTAX_ERROR | INDENTATION_ERROR | TAB_ERROR => {
-            &["lineno", "offset", "text", "end_lineno", "end_offset"]
-        }
+        SYNTAX_ERROR | INDENTATION_ERROR | TAB_ERROR => &[
+            "msg",
+            "filename",
+            "lineno",
+            "offset",
+            "text",
+            "end_lineno",
+            "end_offset",
+        ],
         _ => &[],
     }
 }
@@ -564,7 +598,7 @@ pub(crate) fn exception_value_with_arguments(
         tag,
         name: tag_name(tag),
         msg: message.to_string(),
-        file: String::new(),
+        file: syntax_file_from_keywords(tag, &keywords),
         line: 0,
         frame: String::new(),
         cause: None,
@@ -623,6 +657,9 @@ pub(crate) fn exception_value_from_call(
     values: &[i64],
     keywords: &[(String, i64)],
 ) -> i64 {
+    if is_group_tag(tag) {
+        return group_from_call(tag, values, keywords);
+    }
     let allowed = exception_keyword_names(tag);
     for (name, _) in keywords {
         if !allowed.contains(&name.as_str()) {
@@ -870,6 +907,18 @@ fn with_frames<R>(f: impl FnOnce(&mut Vec<Activation>) -> R) -> R {
         return f(unsafe { &mut (*ptr).saved_frames });
     }
     STATE.with(|state| f(&mut state.borrow_mut().frames))
+}
+
+/// Removes and returns the thread's frame chain (`fiber` uses this when a
+/// generator fiber suspends or resumes).
+pub(crate) fn take_thread_frames() -> Vec<Activation> {
+    STATE.with(|state| std::mem::take(&mut state.borrow_mut().frames))
+}
+
+/// Installs `frames` as the thread's frame chain (the resume side of
+/// [`take_thread_frames`]).
+pub(crate) fn install_thread_frames(frames: Vec<Activation>) {
+    STATE.with(|state| state.borrow_mut().frames = frames);
 }
 
 // Source location tracking
@@ -1145,6 +1194,15 @@ pub(crate) fn code_attr(code: i64, name: &str) -> Option<i64> {
         "co_freevars" | "co_cellvars" | "co_names" | "co_consts" => {
             Some(value::tuple_new(Vec::new()))
         }
+        // Hydro keeps no bytecode. The truthful synthetic surface is empty
+        // instruction/line/exception tables, zero stack usage and empty
+        // position iterables, so `dis`/`inspect` observe a code object with no
+        // instructions instead of an `AttributeError`.
+        "co_code" | "co_linetable" | "co_exceptiontable" => {
+            Some(value::bytes_new(Vec::new()))
+        }
+        "co_stacksize" => Some(int(0)),
+        "co_lines" | "co_positions" => Some(value::list_new(Vec::new())),
         "__class__" => Some(value::code_class()),
         _ => None,
     }
@@ -1257,6 +1315,10 @@ pub(crate) fn init() {
     // frees right after this call; dropping the cache prevents a later run
     // from handing out a dangling pointer.
     CLASS_CACHE.with(|cache| cache.borrow_mut().clear());
+    // Sessions and notes hold values (and permanent thread roots) from the
+    // heap that is about to be freed.
+    STAR_SESSIONS.with(|sessions| sessions.borrow_mut().clear());
+    NOTES.with(|notes| notes.borrow_mut().clear());
     value::clear_type_class_cache();
     crate::heap::set_pending_mirror(value::NONE);
     crate::heap::set_handled_mirror(&[]);
@@ -1847,6 +1909,731 @@ pub(crate) fn is_exception_class(candidate: i64) -> bool {
         .is_some_and(|tag| tag_is_subclass(tag, BASE_EXCEPTION))
 }
 
+// Exception groups (PEP 654)
+
+/// Reserved payload slots of an exception group. The names cannot collide with
+/// Python identifiers, so `e.<name>` never exposes them and they survive the
+/// payload copies `raise` makes for implicit chaining.
+const GROUP_EXCEPTIONS_KEY: &str = "$exceptions";
+const GROUP_MESSAGE_KEY: &str = "$message";
+/// Identity of the group an `except*` clause split this one from. Kept on
+/// every derived group so the final re-raise can merge re-raised parts back
+/// into the original nesting (CPython compares traceback/cause/context
+/// identity; Hydro has no traceback object and copies the payload on
+/// re-raise, so an explicit origin marker is exact).
+const GROUP_STAR_ROOT_KEY: &str = "$star_root";
+
+/// Whether `tag` is `BaseExceptionGroup` or `ExceptionGroup`.
+pub(crate) fn is_group_tag(tag: u32) -> bool {
+    tag == EXCEPTION_GROUP || tag == BASE_EXCEPTION_GROUP
+}
+
+fn is_group_value(v: i64) -> bool {
+    value::exception_data(v).is_some_and(|data| is_group_tag(data.tag))
+}
+
+/// Whether `v` is an exception instance (native payload or extension).
+fn is_exception_instance(v: i64) -> bool {
+    value::exception_data(v).is_some() || value::is_ext_exception(v)
+}
+
+/// Whether `v` is an ordinary (`Exception`-derived) exception, which is what
+/// decides between `ExceptionGroup` and `BaseExceptionGroup`.
+fn is_nonbase_exception(v: i64) -> bool {
+    match value::exception_data(v) {
+        Some(data) => tag_is_subclass(data.tag, EXCEPTION),
+        // An extension exception is approximated as an ordinary exception.
+        None => value::is_ext_exception(v),
+    }
+}
+
+fn group_children(data: &ExcData) -> Option<Vec<i64>> {
+    let tuple = keyword_value(data, GROUP_EXCEPTIONS_KEY)?;
+    value::as_tuple(tuple).map(|items| items.to_vec())
+}
+
+/// How a derived group renders `args[1]`: CPython keeps the *original*
+/// constructor argument there, so a list prints as a list and a tuple as a
+/// tuple; `split`/`subgroup`/`derive` always derive from a list.
+#[derive(Clone, Copy)]
+enum GroupSource {
+    List,
+    Tuple,
+    /// The exact object the constructor received.
+    Exact(i64),
+}
+
+/// Builds a group payload with CPython's `BaseExceptionGroup` fields.
+///
+/// `message` must be a `str` value. `children` must be a validated, non-empty
+/// list of exception instances; they are rooted while the payload allocates.
+fn group_value(requested: u32, message: i64, children: &[i64], source: GroupSource) -> i64 {
+    let roots = crate::heap::root_values(children);
+    crate::heap::root_values(std::slice::from_ref(&message));
+    let tag = if requested == EXCEPTION_GROUP || children.iter().all(|&child| is_nonbase_exception(child)) {
+        EXCEPTION_GROUP
+    } else {
+        BASE_EXCEPTION_GROUP
+    };
+    let source_value = match source {
+        GroupSource::List => value::list_new(children.to_vec()),
+        GroupSource::Tuple => value::tuple_new(children.to_vec()),
+        GroupSource::Exact(v) => v,
+    };
+    crate::heap::root_values(std::slice::from_ref(&source_value));
+    let exceptions = match value::as_tuple(source_value) {
+        Some(_) => source_value,
+        None => value::tuple_new(children.to_vec()),
+    };
+    let message_text = value::to_string(message);
+    let count = children.len();
+    let plural = if count > 1 { "s" } else { "" };
+    let msg = format!("{message_text} ({count} sub-exception{plural})");
+    let data = ExcData {
+        tag,
+        name: tag_name(tag),
+        msg,
+        file: String::new(),
+        line: 0,
+        frame: String::new(),
+        cause: None,
+        context: None,
+        suppress_context: false,
+        exit_code: None,
+        args: vec![message_text, value::to_string(source_value)],
+        arg_values: vec![message, source_value],
+        arg_reprs: vec![value::repr(message), value::repr(source_value)],
+        keywords: vec![
+            (GROUP_EXCEPTIONS_KEY.to_string(), exceptions),
+            (GROUP_MESSAGE_KEY.to_string(), message),
+        ],
+        object: None,
+    };
+    let result = value::exception_new(data);
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// Validates the `(message, exceptions)` constructor arguments CPython's
+/// `BaseExceptionGroup.__new__` requires and builds the group payload.
+fn group_from_call(tag: u32, values: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let name = tag_name(tag);
+    if !keywords.is_empty() {
+        return raise_with_message(TYPE_ERROR, &format!("{name}() takes no keyword arguments"));
+    }
+    if values.len() != 2 {
+        return raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{name}() takes exactly 2 arguments ({} given)",
+                values.len()
+            ),
+        );
+    }
+    let message = values[0];
+    if value::as_str(message).is_none() {
+        return raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{name}() argument 1 must be str, not {}",
+                value::type_name(message)
+            ),
+        );
+    }
+    let source = values[1];
+    let children: Vec<i64> = if let Some(items) = value::as_list(source) {
+        items.to_vec()
+    } else if let Some(items) = value::as_tuple(source) {
+        items.to_vec()
+    } else {
+        return raise_with_message(
+            TYPE_ERROR,
+            "second argument (exceptions) must be a sequence",
+        );
+    };
+    if children.is_empty() {
+        return raise_with_message(
+            VALUE_ERROR,
+            "second argument (exceptions) must be a non-empty sequence",
+        );
+    }
+    for (index, &child) in children.iter().enumerate() {
+        if !is_exception_instance(child) {
+            return raise_with_message(
+                VALUE_ERROR,
+                &format!("Item {index} of second argument (exceptions) is not an exception"),
+            );
+        }
+    }
+    let nested_base = children.iter().any(|&child| !is_nonbase_exception(child));
+    if tag == EXCEPTION_GROUP {
+        if nested_base {
+            return raise_with_message(
+                TYPE_ERROR,
+                "Cannot nest BaseExceptions in an ExceptionGroup",
+            );
+        }
+    }
+    group_value(tag, message, &children, GroupSource::Exact(source))
+}
+
+/// Matcher operand of `split`/`subgroup`/`except*`: an exception class, a
+/// tuple of exception classes, or a predicate callable.
+enum GroupMatcher {
+    Types(Vec<i64>),
+    Predicate(i64),
+}
+
+fn class_tag(class: i64) -> Option<u32> {
+    exception_tag_of_class(class).or_else(|| value::exception_tag_of_derived_class(class))
+}
+
+fn is_group_class(class: i64) -> bool {
+    value::as_class(class).is_some()
+        && class_tag(class).is_some_and(|tag| tag_is_subclass(tag, BASE_EXCEPTION_GROUP))
+}
+
+/// Classifies a `split`/`subgroup` matcher, reporting an invalid operand
+/// through the pending `TypeError` exactly like CPython's
+/// `get_matcher_type`. With `star` set, callables are rejected (an `except*`
+/// clause only accepts classes) and `BaseExceptionGroup` subclasses are
+/// reported with their dedicated message.
+fn classify_matcher(matcher: i64, star: bool) -> Result<GroupMatcher, ()> {
+    let invalid = |message: &str| {
+        raise_with_message(TYPE_ERROR, message);
+    };
+    if let Some(items) = value::as_tuple(matcher) {
+        if items.is_empty() {
+            invalid("expected an exception type, a tuple of exception types, or a callable (other than a class)");
+            return Err(());
+        }
+        for &item in items {
+            if !is_exception_class(item) {
+                invalid("expected an exception type, a tuple of exception types, or a callable (other than a class)");
+                return Err(());
+            }
+        }
+        if star && items.iter().any(|&item| is_group_class(item)) {
+            invalid("catching ExceptionGroup with except* is not allowed. Use except instead.");
+            return Err(());
+        }
+        return Ok(GroupMatcher::Types(items.to_vec()));
+    }
+    if is_exception_class(matcher) {
+        if star && is_group_class(matcher) {
+            invalid("catching ExceptionGroup with except* is not allowed. Use except instead.");
+            return Err(());
+        }
+        return Ok(GroupMatcher::Types(vec![matcher]));
+    }
+    if value::as_class(matcher).is_some() {
+        invalid("catching classes that do not inherit from BaseException is not allowed");
+        return Err(());
+    }
+    if star {
+        invalid("catching classes that do not inherit from BaseException is not allowed");
+        return Err(());
+    }
+    if value::as_function(matcher).is_some()
+        || value::as_ext_object(matcher).is_some()
+        || value::as_instance(matcher)
+            .is_some_and(|state| value::class_lookup(state.class, "__call__").is_some())
+    {
+        return Ok(GroupMatcher::Predicate(matcher));
+    }
+    invalid("expected an exception type, a tuple of exception types, or a callable (other than a class)");
+    Err(())
+}
+
+/// Whether `exc` matches `matcher`. `Err(())` means the predicate raised; the
+/// pending exception is already installed.
+fn matcher_matches(exc: i64, matcher: &GroupMatcher) -> Result<bool, ()> {
+    match matcher {
+        GroupMatcher::Types(types) => Ok(value::exception_data(exc).is_some_and(|data| {
+            types.iter().any(|&class| {
+                class_tag(class).is_some_and(|tag| tag_is_subclass(data.tag, tag))
+            })
+        })),
+        GroupMatcher::Predicate(predicate) => {
+            let argv = [exc];
+            let result = crate::builtins::call(*predicate, 1, argv.as_ptr());
+            if pending() {
+                return Err(());
+            }
+            Ok(value::truthy(result))
+        }
+    }
+}
+
+/// `exceptiongroup_subset`: derives a group holding `children` with `orig`'s
+/// message, cause, context and notes. `None` for an empty subset.
+fn group_subset(orig: i64, children: &[i64]) -> Option<i64> {
+    if children.is_empty() {
+        return None;
+    }
+    let data = value::exception_data(orig)?.clone();
+    let message = keyword_value(&data, GROUP_MESSAGE_KEY).unwrap_or_else(|| value::str_alloc(String::new()));
+    let roots = crate::heap::root_values(children);
+    crate::heap::root_values(std::slice::from_ref(&message));
+    let group = group_value(
+        BASE_EXCEPTION_GROUP,
+        message,
+        children,
+        GroupSource::List,
+    );
+    crate::heap::root_values(std::slice::from_ref(&group));
+    let mut group_data = value::exception_data(group)?.clone();
+    group_data.cause = data.cause;
+    group_data.context = data.context;
+    let root = keyword_value(&data, GROUP_STAR_ROOT_KEY).unwrap_or(orig);
+    group_data.keywords.retain(|(key, _)| key != GROUP_STAR_ROOT_KEY);
+    group_data
+        .keywords
+        .push((GROUP_STAR_ROOT_KEY.to_string(), root));
+    let group = value::exception_with_data(group, group_data);
+    if let Some(notes) = notes_of(orig) {
+        if let Some(items) = value::as_list(notes) {
+            let copy = value::list_new(items.to_vec());
+            set_notes(group, copy);
+        }
+    }
+    crate::heap::release_roots(roots);
+    Some(group)
+}
+
+/// `exceptiongroup_split_recursive`: splits `exc` into the part matched by
+/// `matcher` and (when requested) the remainder, preserving nesting.
+fn split_recursive(
+    exc: i64,
+    matcher: &GroupMatcher,
+    construct_rest: bool,
+) -> Result<(Option<i64>, Option<i64>), ()> {
+    if matcher_matches(exc, matcher)? {
+        return Ok((Some(exc), None));
+    }
+    let Some(data) = value::exception_data(exc) else {
+        return Ok((None, construct_rest.then_some(exc)));
+    };
+    if !is_group_tag(data.tag) {
+        return Ok((None, construct_rest.then_some(exc)));
+    }
+    let children = group_children(data).unwrap_or_default();
+    let roots = crate::heap::root_values(&[]);
+    let mut matched: Vec<i64> = Vec::new();
+    let mut rest: Vec<i64> = Vec::new();
+    for child in children {
+        let (child_match, child_rest) = split_recursive(child, matcher, construct_rest)?;
+        if let Some(child) = child_match {
+            crate::heap::push_scoped_root(child);
+            matched.push(child);
+        }
+        if let Some(child) = child_rest {
+            crate::heap::push_scoped_root(child);
+            rest.push(child);
+        }
+    }
+    let match_group = group_subset(exc, &matched);
+    if let Some(group) = match_group {
+        crate::heap::push_scoped_root(group);
+    }
+    let rest_group = if construct_rest {
+        let group = group_subset(exc, &rest);
+        if let Some(group) = group {
+            crate::heap::push_scoped_root(group);
+        }
+        group
+    } else {
+        None
+    };
+    crate::heap::release_roots(roots);
+    Ok((match_group, rest_group))
+}
+
+/// `BaseExceptionGroup.split(matcher)` / `.subgroup(matcher)`.
+fn group_split(object: i64, args: &[i64], keep_rest: bool) -> i64 {
+    let method = if keep_rest { "split" } else { "subgroup" };
+    if args.len() != 1 {
+        return exception_arity(method, 1, args.len());
+    }
+    let Some(data) = value::exception_data(object) else {
+        return raise_with_message(TYPE_ERROR, "split() requires an exception group");
+    };
+    if !is_group_tag(data.tag) {
+        return raise_with_message(TYPE_ERROR, "split() requires an exception group");
+    }
+    let matcher = match classify_matcher(args[0], false) {
+        Ok(matcher) => matcher,
+        Err(()) => return NONE,
+    };
+    let roots = crate::heap::root_values(&[object]);
+    let (matched, rest) = match split_recursive(object, &matcher, keep_rest) {
+        Ok(pair) => pair,
+        Err(()) => {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
+    };
+    let result = if keep_rest {
+        let matched = matched.unwrap_or(NONE);
+        let rest = rest.unwrap_or(NONE);
+        crate::heap::root_values(&[matched, rest]);
+        value::tuple_new(vec![matched, rest])
+    } else {
+        matched.unwrap_or(NONE)
+    };
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// `BaseExceptionGroup.derive(excs)`: CPython's default implementation (a
+/// `BaseExceptionGroup`-built group; the constructor selects the concrete
+/// class from the members).
+fn group_derive(object: i64, args: &[i64]) -> i64 {
+    if args.len() != 1 {
+        return exception_arity("derive", 1, args.len());
+    }
+    let Some(data) = value::exception_data(object) else {
+        return raise_with_message(TYPE_ERROR, "derive() requires an exception group");
+    };
+    let message = keyword_value(data, GROUP_MESSAGE_KEY).unwrap_or_else(|| value::str_alloc(String::new()));
+    let source = args[0];
+    let children: Vec<i64> = if let Some(items) = value::as_list(source) {
+        items.to_vec()
+    } else if let Some(items) = value::as_tuple(source) {
+        items.to_vec()
+    } else {
+        return raise_with_message(TYPE_ERROR, "second argument (exceptions) must be a sequence");
+    };
+    if children.is_empty() {
+        return raise_with_message(
+            VALUE_ERROR,
+            "second argument (exceptions) must be a non-empty sequence",
+        );
+    }
+    for (index, &child) in children.iter().enumerate() {
+        if !is_exception_instance(child) {
+            return raise_with_message(
+                VALUE_ERROR,
+                &format!("Item {index} of second argument (exceptions) is not an exception"),
+            );
+        }
+    }
+    group_value(
+        BASE_EXCEPTION_GROUP,
+        message,
+        &children,
+        GroupSource::Exact(source),
+    )
+}
+
+/// `BaseException.__notes__` storage. Hydro's exception payload is immutable,
+/// so notes live in a thread-local side table keyed by the exception value;
+/// each list is a permanent thread root and the table is cleared by [`init`].
+thread_local! {
+    static NOTES: RefCell<HashMap<i64, i64>> = RefCell::new(HashMap::new());
+}
+
+fn notes_of(object: i64) -> Option<i64> {
+    NOTES.with(|notes| notes.borrow().get(&object).copied())
+}
+
+fn set_notes(object: i64, list: i64) {
+    crate::heap::add_thread_root(list);
+    NOTES.with(|notes| {
+        notes.borrow_mut().insert(object, list);
+    });
+}
+
+/// `BaseException.add_note(note)`: appends to `__notes__`, creating the list on
+/// first use.
+fn add_note(object: i64, args: &[i64]) -> i64 {
+    if args.len() != 1 {
+        return exception_arity("add_note", 1, args.len());
+    }
+    let note = args[0];
+    if value::as_str(note).is_none() {
+        return raise_with_message(
+            TYPE_ERROR,
+            &format!("note must be a str, not {}", value::type_name(note)),
+        );
+    }
+    let list = match notes_of(object) {
+        Some(list) => list,
+        None => {
+            let list = value::list_new(Vec::new());
+            set_notes(object, list);
+            list
+        }
+    };
+    if let Some(mut items) = value::list_items_mut(list) {
+        items.push(note);
+        crate::heap::write_barrier_edge(list, note);
+    }
+    NONE
+}
+
+/// Collects the leaf exceptions of `exc` into `leaves`.
+fn collect_leaves(exc: i64, leaves: &mut Vec<i64>) {
+    match value::exception_data(exc) {
+        Some(data) if is_group_tag(data.tag) => {
+            if let Some(children) = group_children(data) {
+                for child in children {
+                    collect_leaves(child, leaves);
+                }
+            }
+        }
+        _ => leaves.push(exc),
+    }
+}
+
+/// `exception_group_projection`: the sub-group of `orig` holding exactly the
+/// leaves present in `keep`.
+fn group_projection(orig: i64, keep: &[i64]) -> Option<i64> {
+    let mut leaves = Vec::new();
+    for &entry in keep {
+        collect_leaves(entry, &mut leaves);
+    }
+    let roots = crate::heap::root_values(&leaves);
+    let projected = projection_recursive(orig, &leaves);
+    if let Some(group) = projected {
+        crate::heap::push_scoped_root(group);
+    }
+    crate::heap::release_roots(roots);
+    projected
+}
+
+fn projection_recursive(exc: i64, leaves: &[i64]) -> Option<i64> {
+    let Some(data) = value::exception_data(exc) else {
+        return None;
+    };
+    if !is_group_tag(data.tag) {
+        return leaves.contains(&exc).then_some(exc);
+    }
+    let children = group_children(data)?;
+    let roots = crate::heap::root_values(&[]);
+    let mut matched = Vec::new();
+    for child in children {
+        if let Some(child) = projection_recursive(child, leaves) {
+            crate::heap::push_scoped_root(child);
+            matched.push(child);
+        }
+    }
+    let result = group_subset(exc, &matched);
+    if let Some(group) = result {
+        crate::heap::push_scoped_root(group);
+    }
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// `_PyExc_PrepReraiseStar`: computes the exception to raise after the last
+/// `except*` clause.
+///
+/// Re-raised parts (groups derived from `orig`, identified by the origin
+/// marker) are merged back into their original nesting; exceptions raised by
+/// clause bodies are collected into a new `ExceptionGroup("")` together with
+/// the projection, or returned directly when it is the only entry.
+fn prep_reraise_star(orig: i64, results: &[i64]) -> i64 {
+    let present: Vec<i64> = results.iter().copied().filter(|&v| v != NONE).collect();
+    if present.is_empty() {
+        return NONE;
+    }
+    if !is_group_value(orig) {
+        // A naked exception was caught; at most one clause ran.
+        return present[0];
+    }
+    let roots = crate::heap::root_values(&present);
+    crate::heap::root_values(std::slice::from_ref(&orig));
+    let mut raised = Vec::new();
+    let mut reraised = Vec::new();
+    for &entry in &present {
+        let is_reraise = value::exception_data(entry).is_some_and(|data| {
+            is_group_tag(data.tag)
+                && keyword_value(data, GROUP_STAR_ROOT_KEY) == Some(orig)
+        });
+        if is_reraise {
+            reraised.push(entry);
+        } else {
+            crate::heap::push_scoped_root(entry);
+            raised.push(entry);
+        }
+    }
+    let reraised_eg = if reraised.is_empty() {
+        NONE
+    } else {
+        let group = group_projection(orig, &reraised);
+        match group {
+            Some(group) => {
+                crate::heap::push_scoped_root(group);
+                group
+            }
+            None => NONE,
+        }
+    };
+    let result = if raised.is_empty() {
+        reraised_eg
+    } else {
+        if reraised_eg != NONE {
+            crate::heap::push_scoped_root(reraised_eg);
+            raised.push(reraised_eg);
+        }
+        if raised.len() > 1 {
+            raised.retain(|&entry| entry != NONE);
+            let empty = value::str_alloc(String::new());
+            group_value(
+                BASE_EXCEPTION_GROUP,
+                empty,
+                &raised,
+                GroupSource::List,
+            )
+        } else {
+            raised[0]
+        }
+    };
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// One open `except*` session.
+struct StarSession {
+    orig: i64,
+    rest: i64,
+    results: Vec<i64>,
+    roots: usize,
+}
+
+thread_local! {
+    static STAR_SESSIONS: RefCell<Vec<StarSession>> = RefCell::new(Vec::new());
+}
+
+fn star_token(index: usize) -> i64 {
+    // Tagged integer (`payload << 3`); sessions never exceed 2^60.
+    (index as i64) << 3
+}
+
+fn star_index(token: i64) -> Option<usize> {
+    if token & 0b111 != 0 || token < 0 {
+        return None;
+    }
+    let index = (token >> 3) as usize;
+    STAR_SESSIONS.with(|sessions| (index < sessions.borrow().len()).then_some(index))
+}
+
+/// Opens an `except*` split session and returns its tagged token.
+pub(crate) fn star_begin(orig: i64) -> i64 {
+    let roots = crate::heap::root_values(&[orig]);
+    STAR_SESSIONS.with(|sessions| {
+        let mut sessions = sessions.borrow_mut();
+        sessions.push(StarSession {
+            orig,
+            rest: orig,
+            results: Vec::new(),
+            roots,
+        });
+        star_token(sessions.len() - 1)
+    })
+}
+
+/// `except*` handler matching (`_PyEval_ExceptionGroupMatch`): returns the
+/// subset of the current remainder selected by `matcher`, or `None`.
+pub(crate) fn star_match(token: i64, matcher_value: i64) -> i64 {
+    let Some(index) = star_index(token) else {
+        return NONE;
+    };
+    let rest = STAR_SESSIONS.with(|sessions| sessions.borrow()[index].rest);
+    let matcher = match classify_matcher(matcher_value, true) {
+        Ok(matcher) => matcher,
+        Err(()) => return NONE,
+    };
+    let matched;
+    let new_rest;
+    if rest == NONE {
+        matched = NONE;
+        new_rest = NONE;
+    } else {
+        match matcher_matches(rest, &matcher) {
+            Ok(true) => {
+                if is_group_value(rest) {
+                    matched = rest;
+                    new_rest = NONE;
+                } else {
+                    // A naked exception is wrapped in a one-element group.
+                    let empty = value::str_alloc(String::new());
+                    let wrapped = group_value(EXCEPTION_GROUP, empty, &[rest], GroupSource::List);
+                    matched = wrapped;
+                    new_rest = NONE;
+                }
+            }
+            Ok(false) if is_group_value(rest) => {
+                match split_recursive(rest, &matcher, true) {
+                    Ok((Some(part), remainder)) => {
+                        matched = part;
+                        new_rest = remainder.unwrap_or(NONE);
+                    }
+                    Ok((None, remainder)) => {
+                        matched = NONE;
+                        new_rest = remainder.unwrap_or(NONE);
+                    }
+                    Err(()) => return NONE,
+                }
+            }
+            Ok(false) => {
+                matched = NONE;
+                new_rest = rest;
+            }
+            Err(()) => return NONE,
+        }
+    }
+    if matched != NONE {
+        crate::heap::push_scoped_root(matched);
+    }
+    if new_rest != NONE {
+        crate::heap::push_scoped_root(new_rest);
+    }
+    STAR_SESSIONS.with(|sessions| sessions.borrow_mut()[index].rest = new_rest);
+    matched
+}
+
+/// Records the pending exception as raised by a clause body and clears it.
+pub(crate) fn star_raised(token: i64) -> i64 {
+    let Some(index) = star_index(token) else {
+        return NONE;
+    };
+    if pending() {
+        let raised = pending_value();
+        clear();
+        crate::heap::push_scoped_root(raised);
+        STAR_SESSIONS.with(|sessions| sessions.borrow_mut()[index].results.push(raised));
+    }
+    NONE
+}
+
+/// Closes the session and returns the exception to re-raise after the last
+/// clause, or `None`.
+pub(crate) fn star_finish(token: i64) -> i64 {
+    let Some(index) = star_index(token) else {
+        return NONE;
+    };
+    let session = STAR_SESSIONS.with(|sessions| {
+        let mut sessions = sessions.borrow_mut();
+        if index + 1 == sessions.len() {
+            sessions.pop()
+        } else {
+            None
+        }
+    });
+    let Some(session) = session else {
+        return NONE;
+    };
+    let mut results = session.results.clone();
+    if session.rest != NONE {
+        results.push(session.rest);
+    }
+    let result = prep_reraise_star(session.orig, &results);
+    crate::heap::release_roots(session.roots);
+    result
+}
+
 /// Exception attribute surface used by the stdlib: `args`, `__class__`,
 /// `__cause__`, `__context__`, `__suppress_context__`, `__traceback__`, the
 /// `BaseException` methods (`__str__`, `__repr__`, `__setstate__`,
@@ -1883,6 +2670,11 @@ pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
             }
         }
     }
+    // `__notes__` only exists once a note was added; without one CPython
+    // reports `AttributeError`, so a missing entry returns `None` here.
+    if name == "__notes__" {
+        return notes_of(object);
+    }
     Some(match name {
         "args" => args_tuple(data),
         "__class__" => value::type_class(object),
@@ -1891,7 +2683,36 @@ pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
         "__suppress_context__" => value::bool_value(data.suppress_context),
         "__traceback__" => NONE,
         "__str__" | "__repr__" | "__setstate__" | "__reduce__" | "__reduce_ex__"
-        | "with_traceback" => value::bound_method_new(object, name.to_string()),
+        | "with_traceback" | "__init__" | "add_note" => {
+            value::bound_method_new(object, name.to_string())
+        }
+        // The group surface. A user subclass that overrides one of these keeps
+        // its own definition: the runtime reports no attribute and the normal
+        // instance lookup binds the user's method.
+        "message" if is_group_tag(data.tag) => {
+            keyword_value(data, GROUP_MESSAGE_KEY).unwrap_or(NONE)
+        }
+        "exceptions" if is_group_tag(data.tag) => {
+            keyword_value(data, GROUP_EXCEPTIONS_KEY).unwrap_or(NONE)
+        }
+        "derive" | "split" | "subgroup"
+            if is_group_tag(data.tag) && !class_defines(object, name) =>
+        {
+            value::bound_method_new(object, name.to_string())
+        }
+        // `SyntaxError`'s human-readable text and source file. CPython stores
+        // them as members; Hydro derives them from the payload and the raise
+        // location, defaulting the filename to `"<string>"` for a
+        // programmatically built error.
+        "msg" if is_syntax_tag(data.tag) => value::str_alloc(data.msg.clone()),
+        "filename" if is_syntax_tag(data.tag) => {
+            let file = if data.file.is_empty() {
+                "<string>"
+            } else {
+                data.file.as_str()
+            };
+            value::str_alloc(file.to_string())
+        }
         _ => {
             if !exception_keyword_names(data.tag).contains(&name) {
                 return None;
@@ -1899,6 +2720,15 @@ pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
             keyword_value(data, name).unwrap_or(NONE)
         }
     })
+}
+
+/// Whether the receiver's Python class defines `name` itself. Used to keep a
+/// user override of `derive`/`split`/`subgroup` ahead of the native methods:
+/// the exception core is consulted before instance dispatch, so it has to
+/// step aside explicitly.
+fn class_defines(object: i64, name: &str) -> bool {
+    value::as_exc_instance(object)
+        .is_some_and(|state| value::class_lookup(state.class, name).is_some())
 }
 
 /// Calls a `BaseException` method on `object`.
@@ -1930,6 +2760,21 @@ pub(crate) fn exception_method_call(object: i64, method: &str, args: &[i64]) -> 
         }
         "__reduce_ex__" => exception_impl::reduce_ex(object, data, args),
         "with_traceback" => exception_impl::with_traceback(object, args),
+        // `BaseException.__init__` resets `args`; Hydro's payload is immutable,
+        // so it validates the call and keeps the construction-time `args`.
+        "__init__" => exception_impl::init(object, data, args),
+        "add_note" => add_note(object, args),
+        // A user subclass that overrides one of these keeps its own method;
+        // returning `None` lets the instance dispatch find it.
+        "derive" if is_group_tag(data.tag) && !class_defines(object, "derive") => {
+            group_derive(object, args)
+        }
+        "split" if is_group_tag(data.tag) && !class_defines(object, "split") => {
+            group_split(object, args, true)
+        }
+        "subgroup" if is_group_tag(data.tag) && !class_defines(object, "subgroup") => {
+            group_split(object, args, false)
+        }
         _ => return None,
     };
     Some(result)

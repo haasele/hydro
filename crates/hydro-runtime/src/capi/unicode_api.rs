@@ -30,8 +30,10 @@
 //!   storage), as in CPython.
 //! * Unpaired surrogates survive in the UCS storage written by
 //!   `PyUnicode_FromWideChar`, `PyUnicode_DecodeUTF8` (`surrogateescape` /
-//!   `surrogatepass`) and `PyUnicode_FromOrdinal`, but reading such a string
-//!   back as text yields U+FFFD, the shim-wide documented limitation.
+//!   `surrogatepass`) and `PyUnicode_FromOrdinal`, and the `String` payload
+//!   keeps them in the runtime's reversible mirror block (see
+//!   [`crate::value::SURROGATE_STORAGE_BASE`]) rather than replacing them with
+//!   U+FFFD, so reading such a string back yields the original code points.
 //! * The process locale encoding is UTF-8, which is what
 //!   `PyUnicode_DecodeLocale`/`PyUnicode_EncodeLocale` use. Their error
 //!   handlers are limited to the two the wide-character locale codecs accept
@@ -179,7 +181,7 @@ fn string_view(object: *mut ShimObject) -> Result<Option<StringView>, ()> {
                 set_error("MemoryError: cannot allocate the decoded string");
                 return Err(());
             }
-            units.extend(text.chars().map(|character| character as u32));
+            units.extend(text.chars().map(crate::value::storage_char_to_code));
             Ok(Some(StringView {
                 width: width_for_units(&units),
                 units,
@@ -206,26 +208,19 @@ fn require_string_view(object: *mut ShimObject) -> Option<StringView> {
     }
 }
 
-/// Decodes code points into the shim's text payload, replacing lone
-/// surrogates the same way `refresh_raw_unicode` does.
+/// Decodes code points into the shim's text payload.
+///
+/// Lone surrogates use the runtime's reversible mirror block (see
+/// [`crate::value::SURROGATE_STORAGE_BASE`]) instead of being replaced with
+/// U+FFFD, so a string built from UCS storage keeps its code points exactly.
 fn text_from_units(units: &[u32]) -> Result<String, String> {
     let mut capacity = 0usize;
     for &unit in units {
-        let length = if (0xD800..=0xDFFF).contains(&unit) {
-            3
-        } else if unit < 0x80 {
-            1
-        } else if unit < 0x800 {
-            2
-        } else if unit < 0x10000 {
-            3
-        } else if unit <= 0x10FFFF {
-            4
-        } else {
+        let Some(character) = crate::value::code_to_storage_char(unit) else {
             return Err("SystemError: invalid code point in unicode storage".to_string());
         };
         capacity = capacity
-            .checked_add(length)
+            .checked_add(character.len_utf8())
             .ok_or_else(|| "MemoryError: string is too large".to_string())?;
     }
     let mut text = String::new();
@@ -233,9 +228,61 @@ fn text_from_units(units: &[u32]) -> Result<String, String> {
         return Err("MemoryError: cannot allocate the string".to_string());
     }
     for &unit in units {
-        text.push(char::from_u32(unit).unwrap_or(char::REPLACEMENT_CHARACTER));
+        // The code point was validated by the sizing pass above.
+        text.push(crate::value::code_to_storage_char(unit).unwrap_or(char::REPLACEMENT_CHARACTER));
     }
     Ok(text)
+}
+
+/// Rebuilds a string's `text` payload from its UCS storage.
+///
+/// Unlike the generic shim refresh, lone surrogates written through
+/// `PyUnicode_DATA` are kept in the runtime's mirror representation instead of
+/// collapsing to U+FFFD. A failed allocation leaves the payload untouched.
+///
+/// # Safety
+/// `object` must be a live shim object; the caller holds the GIL, which
+/// serialises writes to the raw buffer.
+unsafe fn refresh_text_from_storage(object: *mut ShimObject) {
+    // SAFETY: the caller upholds the liveness contract.
+    let kind = unsafe { kind_mut(object) };
+    let ShimKind::Str {
+        text,
+        c_text,
+        raw: Some(raw),
+    } = kind
+    else {
+        return;
+    };
+    let mut decoded = String::new();
+    if decoded.try_reserve(raw.data.len()).is_err() {
+        return;
+    }
+    let mut push = |unit: u32| decoded.push(
+        crate::value::code_to_storage_char(unit).unwrap_or(char::REPLACEMENT_CHARACTER),
+    );
+    match raw.width {
+        1 => {
+            for &byte in &raw.data {
+                push(byte as u32);
+            }
+        }
+        2 => {
+            for chunk in raw.data.as_chunks::<2>().0 {
+                push(u16::from_le_bytes([chunk[0], chunk[1]]) as u32);
+            }
+        }
+        4 => {
+            for chunk in raw.data.as_chunks::<4>().0 {
+                push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+        }
+        _ => return,
+    }
+    if *text != decoded {
+        *text = decoded;
+    }
+    *c_text = CString::new(text.as_bytes()).ok();
 }
 
 /// Writes one code unit into plain UCS storage.
@@ -298,15 +345,27 @@ fn new_raw_unicode(width: u8, units: &[u32]) -> *mut ShimObject {
     })
 }
 
+/// Whether `unit` must be served from UCS storage because the `String`
+/// payload's surrogate mirror does not round-trip it unchanged.
+///
+/// Surrogates themselves and the two thousand reserved mirror code points both
+/// qualify: keeping their raw units authoritative preserves their exact value
+/// when the string is read back through the C API.
+fn needs_raw_storage(unit: u32) -> bool {
+    crate::value::is_surrogate_code(unit)
+        || crate::value::code_to_storage_char(unit)
+            .is_some_and(|character| crate::value::storage_char_to_code(character) != unit)
+}
+
 /// Builds a string from code points, choosing the storage CPython would use.
 ///
-/// Surrogate code points are kept in UCS storage; ordinary text takes the
-/// `String`-backed representation.
+/// Surrogates (and the code points shadowed by the surrogate mirror) are kept
+/// in UCS storage; ordinary text takes the `String`-backed representation.
 fn new_unicode_from_units(units: &[u32]) -> *mut ShimObject {
     if units.is_empty() {
         return interned().empty_str as *mut ShimObject;
     }
-    if units.iter().any(|&unit| (0xD800..=0xDFFF).contains(&unit)) {
+    if units.iter().any(|&unit| needs_raw_storage(unit)) {
         return new_raw_unicode(width_for_units(units), units);
     }
     match text_from_units(units) {
@@ -684,36 +743,80 @@ pub unsafe extern "C" fn PyUnicode_DecodeLocale(
 
 /// `PyUnicode_EncodeLocale`: encodes a string with the locale encoding.
 ///
-/// The shim's locale encoding is UTF-8, which can encode every scalar value
-/// the shim can hold, so the two accepted handlers (`strict` and
-/// `surrogateescape`) produce identical bytes. Strings holding embedded NULs
-/// are rejected, matching the wide-character encoder CPython routes through.
+/// The shim's locale encoding is UTF-8. `surrogateescape` writes a low
+/// surrogate `U+DC80..=U+DCFF` back as the single byte it stands for (PEP
+/// 383); `strict` raises `UnicodeEncodeError` for any surrogate. Strings
+/// holding embedded NULs are rejected, matching the wide-character encoder
+/// CPython routes through.
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_EncodeLocale(
     unicode: *mut ShimObject,
     errors: *const c_char,
 ) -> *mut ShimObject {
-    let text = match kind_ref(unicode) {
-        Some(ShimKind::Str { text, .. }) => text,
-        _ => {
-            set_error("TypeError: bad argument type for built-in operation");
+    if !matches!(kind_ref(unicode), Some(ShimKind::Str { .. })) {
+        set_error("TypeError: bad argument type for built-in operation");
+        return ptr::null_mut();
+    }
+    let handler = match locale_handler(errors) {
+        Ok(handler) => handler,
+        Err(error) => {
+            set_error(error);
             return ptr::null_mut();
         }
     };
-    if text.contains('\0') {
+    let view = match string_view(unicode) {
+        Ok(Some(view)) => view,
+        Ok(None) => {
+            set_error("TypeError: bad argument type for built-in operation");
+            return ptr::null_mut();
+        }
+        Err(()) => return ptr::null_mut(),
+    };
+    if view.units.contains(&0) {
         set_error("ValueError: embedded null character");
         return ptr::null_mut();
     }
-    if let Err(error) = locale_handler(errors) {
-        set_error(error);
-        return ptr::null_mut();
+    let mut capacity = 0usize;
+    for &unit in &view.units {
+        if crate::value::is_surrogate_code(unit) {
+            capacity += 1;
+        } else {
+            capacity += match unit {
+                0..=0x7F => 1,
+                0x80..=0x7FF => 2,
+                0x800..=0xFFFF => 3,
+                _ => 4,
+            };
+        }
     }
     let mut data = Vec::new();
-    if data.try_reserve_exact(text.len()).is_err() {
+    if data.try_reserve_exact(capacity).is_err() {
         set_error("MemoryError: cannot allocate the encoded bytes");
         return ptr::null_mut();
     }
-    data.extend_from_slice(text.as_bytes());
+    for (position, &unit) in view.units.iter().enumerate() {
+        if crate::value::is_surrogate_code(unit) {
+            let escapable = (0xDC80..=0xDCFF).contains(&unit)
+                && matches!(&handler, Utf8Handler::SurrogateEscape);
+            if escapable {
+                data.push((unit - 0xDC00) as u8);
+            } else {
+                set_error(format!(
+                    "UnicodeEncodeError: 'utf-8' codec can't encode character '\\u{unit:04x}' \
+                     in position {position}: surrogates not allowed"
+                ));
+                return ptr::null_mut();
+            }
+            continue;
+        }
+        // A non-surrogate code point in `0..=0x10FFFF` is always a `char`.
+        let Some(character) = char::from_u32(unit) else {
+            set_error("SystemError: invalid code point in unicode storage");
+            return ptr::null_mut();
+        };
+        let mut buffer = [0u8; 4];
+        data.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+    }
     new_bytes_from_vec(data)
 }
 
@@ -845,7 +948,7 @@ pub unsafe extern "C" fn PyUnicode_CopyCharacters(
     // Refresh the text payload and drop any UTF-8 view cached for the old
     // contents.
     // SAFETY: `to` is a live shim object.
-    unsafe { refresh_raw_unicode(to) };
+    unsafe { refresh_text_from_storage(to) };
     drop_buffer_cache_entry(to as usize);
     if overflowed {
         set_error(format!(
@@ -954,7 +1057,7 @@ pub unsafe extern "C" fn PyUnicode_Resize(unicode: *mut *mut ShimObject, length:
         match resized {
             Some(true) => {
                 // SAFETY: `object` is a live shim object.
-                unsafe { refresh_raw_unicode(object) };
+                unsafe { refresh_text_from_storage(object) };
                 drop_buffer_cache_entry(object as usize);
                 return 0;
             }
@@ -995,7 +1098,7 @@ pub unsafe extern "C" fn PyUnicode_Resize(unicode: *mut *mut ShimObject, length:
         }
     }
     // SAFETY: `object` is a live shim object.
-    unsafe { refresh_raw_unicode(object) };
+    unsafe { refresh_text_from_storage(object) };
     drop_buffer_cache_entry(object as usize);
     0
 }
@@ -1740,6 +1843,18 @@ mod tests {
         };
         assert!(!escaped.is_null(), "{:?}", take_error());
         assert_eq!(units_of(escaped), vec![0x61, 0xDCFF, 0x62]);
+        // PEP 383 round-trip: the mirror survives in the payload and the
+        // encoder writes the original byte back.
+        let round_tripped =
+            unsafe { PyUnicode_EncodeLocale(escaped, c"surrogateescape".as_ptr()) };
+        assert!(!round_tripped.is_null(), "{:?}", take_error());
+        assert_eq!(bytes_of(round_tripped), vec![0x61, 0xFF, 0x62]);
+        dec_ref(round_tripped);
+        let strict = unsafe { PyUnicode_EncodeLocale(escaped, ptr::null()) };
+        assert!(strict.is_null());
+        assert!(take_error()
+            .unwrap_or_default()
+            .contains("surrogates not allowed"));
         dec_ref(escaped);
 
         let bad_handler = unsafe { PyUnicode_DecodeLocale(c"".as_ptr(), c"nope".as_ptr()) };
@@ -1795,7 +1910,12 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(text_of(surrogate), "\u{FFFD}");
+        // The text payload keeps the code point reversibly instead of
+        // replacing it with U+FFFD.
+        assert_eq!(
+            crate::value::str_codes(&text_of(surrogate)).collect::<Vec<_>>(),
+            vec![0xD800]
+        );
         dec_ref(surrogate);
 
         assert!(unsafe { PyUnicode_FromOrdinal(-1) }.is_null());

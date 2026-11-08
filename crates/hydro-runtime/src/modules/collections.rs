@@ -93,13 +93,21 @@ fn defaultdict_collect(source: i64) -> Result<Vec<(i64, i64)>, i64> {
     Ok(pairs)
 }
 
+fn is_callable_value(v: i64) -> bool {
+    if value::as_function(v).is_some() {
+        return true;
+    }
+    value::instance_class_value(v)
+        .is_some_and(|class| value::class_lookup(class, "__call__").is_some())
+}
+
 /// `defaultdict(default_factory=None, /, initial=(), **kwargs)`: the factory
 /// must be callable or `None`, the optional second positional argument is a
 /// mapping or an iterable of key/value pairs, and every keyword is a data key
 /// (the factory name is positional-only in CPython).
 fn defaultdict_construct(args: &[i64], keywords: &[(String, i64)]) -> i64 {
     let factory = args.first().copied().unwrap_or(NONE);
-    if factory != NONE && value::as_function(factory).is_none() {
+    if factory != NONE && !is_callable_value(factory) {
         return type_error(&format!(
             "defaultdict() first argument must be callable or None, not {}",
             value::type_name(factory)
@@ -199,7 +207,10 @@ pub(crate) fn defaultdict_function() -> i64 {
 /// factory is not `None`.
 fn factory_value(factory: i64) -> i64 {
     let Some(function) = value::as_function(factory) else {
-        return type_error("default_factory is not callable");
+        if !is_callable_value(factory) {
+            return type_error("default_factory is not callable");
+        }
+        return crate::builtins::call(factory, 0, std::ptr::null());
     };
     if let FunctionBody::Builtin(builtin) = &function.body {
         match builtin {
@@ -752,6 +763,35 @@ fn userlist_from_items(items: Vec<i64>) -> i64 {
     instance
 }
 
+/// Like [`userlist_from_items`] but keeps the receiver's class, which is what
+/// CPython's `UserList` does for slices, `copy()` and the arithmetic results.
+fn userlist_from_items_of(obj: i64, items: Vec<i64>) -> i64 {
+    let class = value::instance_class_value(obj).unwrap_or_else(userlist_class);
+    let instance = value::instance_new(class);
+    let list = value::list_new(items);
+    let roots = heap::root_values(&[instance, list]);
+    value::instance_setattr(instance, USERLIST_DATA_ATTR.to_string(), list);
+    heap::release_roots(roots);
+    instance
+}
+
+/// Whether `v` is a builtin `slice` object.
+fn is_slice_value(v: i64) -> bool {
+    value::instance_class_value(v) == Some(crate::builtins::slice_class())
+}
+
+/// `(start, stop, step)` of a `slice` object, or `None` for another index type.
+fn slice_value_bounds(v: i64) -> Option<(i64, i64, i64)> {
+    if !is_slice_value(v) {
+        return None;
+    }
+    Some((
+        value::instance_attr(v, "start").unwrap_or(NONE),
+        value::instance_attr(v, "stop").unwrap_or(NONE),
+        value::instance_attr(v, "step").unwrap_or(NONE),
+    ))
+}
+
 /// Normalises a list index, returning `None` when it is out of range.
 fn user_sequence_index(length: usize, raw: i64) -> Option<usize> {
     let len = i64::try_from(length).ok()?;
@@ -870,13 +910,23 @@ fn userlist_method(name: &str, args: &[i64]) -> i64 {
             let Some(&index) = args.get(1) else {
                 return type_error("UserList.__getitem__() missing required argument 'index'");
             };
+            if let Some((start, stop, step)) = slice_value_bounds(index) {
+                let result = container::slice(data, start, stop, step);
+                if exc::pending() {
+                    return NONE;
+                }
+                return match value::as_list(result) {
+                    Some(items) => userlist_from_items_of(obj, items.to_vec()),
+                    None => result,
+                };
+            }
             let item = container::subscript(data, index);
             if exc::pending() {
                 return NONE;
             }
             // A slice yields a plain list; CPython wraps it in the same class.
             match value::as_list(item) {
-                Some(items) => userlist_from_items(items.to_vec()),
+                Some(items) => userlist_from_items_of(obj, items.to_vec()),
                 None => item,
             }
         }
@@ -884,12 +934,18 @@ fn userlist_method(name: &str, args: &[i64]) -> i64 {
             let (Some(&index), Some(&item)) = (args.get(1), args.get(2)) else {
                 return type_error("UserList.__setitem__() requires an index and a value");
             };
+            if let Some((start, stop, step)) = slice_value_bounds(index) {
+                return container::slice_set(data, start, stop, step, item);
+            }
             container::subscript_set(data, index, item)
         }
         "__delitem__" => {
             let Some(&index) = args.get(1) else {
                 return type_error("UserList.__delitem__() missing required argument 'index'");
             };
+            if let Some((start, stop, step)) = slice_value_bounds(index) {
+                return container::delete_slice(data, start, stop, step);
+            }
             container::delete_subscript(data, index)
         }
         "__eq__" => {
@@ -924,7 +980,7 @@ fn userlist_method(name: &str, args: &[i64]) -> i64 {
                 combined.extend(items);
                 items = combined;
             }
-            userlist_from_items(items)
+            userlist_from_items_of(obj, items)
         }
         "__iadd__" | "extend" => {
             let Some(&other) = args.get(1) else {
@@ -972,9 +1028,9 @@ fn userlist_method(name: &str, args: &[i64]) -> i64 {
                 }
                 return obj;
             }
-            userlist_from_items(repeated)
+            userlist_from_items_of(obj, repeated)
         }
-        "__copy__" | "copy" => userlist_from_items(userlist_items(obj)),
+        "__copy__" | "copy" => userlist_from_items_of(obj, userlist_items(obj)),
         "append" => {
             let Some(&item) = args.get(1) else {
                 return type_error("UserList.append() missing required argument 'item'");
@@ -1616,6 +1672,21 @@ pub(crate) fn constant(name: &str) -> i64 {
 
 pub(crate) fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
     match name {
+        // `dd.__missing__(key)`: the factory result without inserting the key.
+        // A `None` factory raises `KeyError(key)` exactly like subscripting.
+        "__missing__" => {
+            if let Some(err) = check_arity(name, args.len(), 1, 1) {
+                return err;
+            }
+            let key = args[0];
+            let Some(factory) = value::as_defaultdict(obj).map(|(_, factory)| factory) else {
+                return attribute_error(name);
+            };
+            if factory == NONE {
+                return exc::raise_with_message(KEY_ERROR, &value::repr(key));
+            }
+            factory_value(factory)
+        }
         "get" => {
             if let Some(err) = check_arity(name, args.len(), 1, 2) {
                 return err;
@@ -3697,6 +3768,1826 @@ extern "C" fn namedtuple_replace(argv: *const i64) -> i64 {
     let result = crate::core::builtins::call(class, values.len(), values.as_ptr());
     heap::release_roots(roots);
     result
+}
+
+// -------------------------------------------------------------------------
+// `collections.deque`
+// -------------------------------------------------------------------------
+
+/// Hidden instance attribute holding the deque's backing list. The leading
+/// NUL keeps the name out of every identifier a program can write.
+const DEQUE_DATA_ATTR: &str = "\u{0}deque_items";
+/// Public, read-only `maxlen` slot (CPython keeps it in the C struct).
+const DEQUE_MAXLEN_ATTR: &str = "maxlen";
+
+fn deque_instance(obj: i64) -> bool {
+    value::instance_class_value(obj)
+        .is_some_and(|class| value::is_subclass_of(class, deque_class()))
+}
+
+fn deque_data(obj: i64) -> Option<i64> {
+    deque_instance(obj).then(|| value::instance_attr(obj, DEQUE_DATA_ATTR))?
+}
+
+fn deque_items(obj: i64) -> Vec<i64> {
+    deque_data(obj)
+        .and_then(value::as_list)
+        .map(|items| items.to_vec())
+        .unwrap_or_default()
+}
+
+fn deque_len(obj: i64) -> usize {
+    deque_data(obj)
+        .and_then(value::as_list)
+        .map_or(0, |items| items.len())
+}
+
+fn deque_maxlen(obj: i64) -> i64 {
+    value::instance_attr(obj, DEQUE_MAXLEN_ATTR).unwrap_or(NONE)
+}
+
+fn deque_limit(obj: i64) -> Option<usize> {
+    match deque_maxlen(obj) {
+        NONE => None,
+        limit => value::as_integer(limit).and_then(|n| usize::try_from(n).ok()),
+    }
+}
+
+/// Allocates an instance of `class` carrying `items` and `maxlen`.
+fn deque_new(class: i64, items: Vec<i64>, maxlen: i64) -> i64 {
+    let instance = value::instance_new(class);
+    let list = value::list_new(items);
+    let roots = heap::root_values(&[instance, list, maxlen]);
+    value::instance_setattr(instance, DEQUE_DATA_ATTR.to_string(), list);
+    value::instance_setattr(instance, DEQUE_MAXLEN_ATTR.to_string(), maxlen);
+    heap::release_roots(roots);
+    instance
+}
+
+/// The backing list, creating it for an instance built through `__new__`.
+fn deque_ensure_data(obj: i64) -> Option<i64> {
+    if let Some(data) = deque_data(obj) {
+        return Some(data);
+    }
+    if !deque_instance(obj) {
+        return None;
+    }
+    let list = value::list_new(Vec::new());
+    let roots = heap::root_values(std::slice::from_ref(&list));
+    value::instance_setattr(obj, DEQUE_DATA_ATTR.to_string(), list);
+    heap::release_roots(roots);
+    Some(list)
+}
+
+/// Replaces the backing list contents in place, so live iterators observe the
+/// mutation exactly like CPython's version counter.
+fn deque_store(obj: i64, items: Vec<i64>) {
+    if let Some(data) = deque_ensure_data(obj) {
+        if let Some(mut current) = value::list_items_mut(data) {
+            current.clear();
+            current.extend(items);
+        }
+    }
+}
+
+fn deque_trim(items: &mut Vec<i64>, limit: Option<usize>) {
+    if let Some(limit) = limit {
+        if items.len() > limit {
+            let excess = items.len() - limit;
+            items.drain(..excess);
+        }
+    }
+}
+
+/// Elements of any iterable, mirroring [`userlist_collect`]. A deque source is
+/// snapshotted first so `d.extend(d)` and `d.extendleft(d)` behave like
+/// CPython instead of tripping the mutation guard.
+fn deque_collect(source: i64) -> Result<Vec<i64>, i64> {
+    if deque_instance(source) {
+        return Ok(deque_items(source));
+    }
+    let iterator = iter::iter_of(source);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    let mut items = Vec::new();
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return Err(NONE);
+        }
+        if status == 0 {
+            return Ok(items);
+        }
+        heap::root_values(&[item]);
+        items.push(item);
+    }
+}
+
+fn deque_push_right(obj: i64, item: i64) -> i64 {
+    let Some(data) = deque_ensure_data(obj) else {
+        return type_error("deque operation on a non-deque object");
+    };
+    let limit = deque_limit(obj);
+    if limit == Some(0) {
+        return NONE;
+    }
+    if let Some(mut items) = value::list_items_mut(data) {
+        items.push(item);
+        heap::write_barrier_edge(data, item);
+        if let Some(limit) = limit {
+            if items.len() > limit {
+                let excess = items.len() - limit;
+                items.drain(..excess);
+            }
+        }
+    }
+    NONE
+}
+
+fn deque_push_left(obj: i64, item: i64) -> i64 {
+    let Some(data) = deque_ensure_data(obj) else {
+        return type_error("deque operation on a non-deque object");
+    };
+    let limit = deque_limit(obj);
+    if limit == Some(0) {
+        return NONE;
+    }
+    if let Some(mut items) = value::list_items_mut(data) {
+        items.insert(0, item);
+        heap::write_barrier_edge(data, item);
+        if let Some(limit) = limit {
+            if items.len() > limit {
+                items.truncate(limit);
+            }
+        }
+    }
+    NONE
+}
+
+fn deque_compare(a: i64, b: i64, op: u32) -> i64 {
+    if !deque_instance(b) {
+        return value::NOT_IMPLEMENTED;
+    }
+    let left = deque_items(a);
+    let right = deque_items(b);
+    let mut index = 0;
+    while index < left.len() && index < right.len() {
+        let equal = ops::binop(ops::OP_EQ, left[index], right[index]);
+        if exc::pending() {
+            return NONE;
+        }
+        if equal != value::TRUE {
+            return ops::binop(op, left[index], right[index]);
+        }
+        index += 1;
+    }
+    let l = ops::int_result(left.len() as i64);
+    let r = ops::int_result(right.len() as i64);
+    ops::binop(op, l, r)
+}
+
+fn deque_equal(a: i64, b: i64) -> bool {
+    let left = deque_items(a);
+    let right = deque_items(b);
+    if left.len() != right.len() {
+        return false;
+    }
+    for (x, y) in left.iter().zip(right.iter()) {
+        if !container::equals(*x, *y) {
+            return false;
+        }
+        if exc::pending() {
+            return false;
+        }
+    }
+    true
+}
+
+fn deque_mutated() -> i64 {
+    exc::raise_with_message(crate::exc::RUNTIME_ERROR, "deque mutated during iteration")
+}
+
+/// `deque.pop(index)` bounds: `None` when the index is out of range.
+fn deque_normalize(length: usize, raw: i64) -> Option<usize> {
+    let len = i64::try_from(length).ok()?;
+    let adjusted = if raw < 0 { raw.checked_add(len)? } else { raw };
+    usize::try_from(adjusted)
+        .ok()
+        .filter(|&index| index < length)
+}
+
+fn deque_int_argument(value: i64, method: &str) -> Result<i64, i64> {
+    match value::as_integer(value) {
+        Some(number) => Ok(number),
+        None => Err(type_error(&format!(
+            "deque.{method}() argument must be an integer, not '{}'",
+            value::type_name(value)
+        ))),
+    }
+}
+
+fn deque_index_bound(argument: i64, length: usize) -> Result<usize, i64> {
+    let raw = deque_int_argument(argument, "index")?;
+    let len = length as i64;
+    Ok(usize::try_from(if raw < 0 {
+        (raw.saturating_add(len)).max(0)
+    } else {
+        raw
+    })
+    .unwrap_or(length)
+    .min(length))
+}
+
+#[derive(Clone, Copy)]
+enum DequeOp {
+    Init,
+    Repr,
+    Len,
+    Iter,
+    Reversed,
+    Contains,
+    GetItem,
+    SetItem,
+    DelItem,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Add,
+    IAdd,
+    Mul,
+    RMul,
+    IMul,
+    Copy,
+    Append,
+    AppendLeft,
+    Extend,
+    ExtendLeft,
+    PopLeft,
+    Pop,
+    Clear,
+    Count,
+    Index,
+    Insert,
+    Remove,
+    Rotate,
+    Reverse,
+    SetAttr,
+}
+
+fn deque_call(op: DequeOp, args: &[i64]) -> i64 {
+    let Some(&obj) = args.first() else {
+        return type_error("deque method missing required argument 'self'");
+    };
+    if !deque_instance(obj) {
+        return type_error(&format!(
+            "descriptor for 'deque' objects doesn't apply to a '{}' object",
+            value::type_name(obj)
+        ));
+    }
+    match op {
+        DequeOp::Init => {
+            let iterable = args.get(1).copied().unwrap_or(NONE);
+            let maxlen_arg = args.get(2).copied().unwrap_or(NONE);
+            let limit = match maxlen_arg {
+                NONE => None,
+                other => match value::as_integer(other) {
+                    Some(number) if number >= 0 => Some(number as usize),
+                    Some(_) => {
+                        return exc::raise_with_message(VALUE_ERROR, "maxlen must be non-negative")
+                    }
+                    None => {
+                        return type_error(&format!(
+                            "'{}' object cannot be interpreted as an integer",
+                            value::type_name(other)
+                        ))
+                    }
+                },
+            };
+            let mut items = if iterable == NONE {
+                Vec::new()
+            } else {
+                match deque_collect(iterable) {
+                    Ok(items) => items,
+                    Err(error) => return error,
+                }
+            };
+            deque_trim(&mut items, limit);
+            if deque_ensure_data(obj).is_none() {
+                return type_error("deque.__init__() called on a non-deque instance");
+            }
+            deque_store(obj, items);
+            let maxlen = match limit {
+                Some(limit) => ops::int_result(limit as i64),
+                None => NONE,
+            };
+            value::instance_setattr(obj, DEQUE_MAXLEN_ATTR.to_string(), maxlen);
+            NONE
+        }
+        DequeOp::Repr => {
+            let items = deque_items(obj);
+            let mut text = String::from("deque([");
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    text.push_str(", ");
+                }
+                if *item == obj {
+                    text.push_str("[...]");
+                } else {
+                    text.push_str(&value::repr(*item));
+                }
+            }
+            text.push(']');
+            let maxlen = deque_maxlen(obj);
+            if maxlen != NONE {
+                text.push_str(", maxlen=");
+                text.push_str(&value::repr(maxlen));
+            }
+            text.push(')');
+            value::str_alloc(text)
+        }
+        DequeOp::Len => ops::int_result(deque_len(obj) as i64),
+        DequeOp::Iter => match deque_ensure_data(obj) {
+            Some(data) => iter::iter_new(data),
+            None => type_error("deque instance has no storage"),
+        },
+        DequeOp::Reversed => {
+            let mut items = deque_items(obj);
+            items.reverse();
+            iter::iter_new(value::list_new(items))
+        }
+        DequeOp::Contains => {
+            let Some(&needle) = args.get(1) else {
+                return FALSE;
+            };
+            let items = deque_items(obj);
+            let length = items.len();
+            for item in &items {
+                if container::equals(*item, needle) {
+                    return value::TRUE;
+                }
+                if exc::pending() {
+                    return NONE;
+                }
+                if deque_len(obj) != length {
+                    return deque_mutated();
+                }
+            }
+            value::FALSE
+        }
+        DequeOp::GetItem => {
+            let Some(&index) = args.get(1) else {
+                return type_error("deque.__getitem__() missing required argument 'index'");
+            };
+            if value::instance_class_value(index) == Some(crate::builtins::slice_class()) {
+                return type_error("sequence index must be integer, not 'slice'");
+            }
+            let Some(raw) = value::as_integer(index) else {
+                return type_error(&format!(
+                    "sequence index must be integer, not '{}'",
+                    value::type_name(index)
+                ));
+            };
+            let items = deque_items(obj);
+            match deque_normalize(items.len(), raw) {
+                Some(position) => items[position],
+                None => exc::raise_with_message(INDEX_ERROR, "deque index out of range"),
+            }
+        }
+        DequeOp::SetItem => {
+            let (Some(&index), Some(&item)) = (args.get(1), args.get(2)) else {
+                return type_error("deque.__setitem__() requires an index and a value");
+            };
+            let Some(raw) = value::as_integer(index) else {
+                return type_error(&format!(
+                    "sequence index must be integer, not '{}'",
+                    value::type_name(index)
+                ));
+            };
+            let Some(data) = deque_ensure_data(obj) else {
+                return type_error("deque instance has no storage");
+            };
+            let position = {
+                let items = deque_items(obj);
+                match deque_normalize(items.len(), raw) {
+                    Some(position) => position,
+                    None => {
+                        return exc::raise_with_message(INDEX_ERROR, "deque index out of range")
+                    }
+                }
+            };
+            if let Some(mut items) = value::list_items_mut(data) {
+                items[position] = item;
+                heap::write_barrier_edge(data, item);
+            }
+            NONE
+        }
+        DequeOp::DelItem => {
+            let Some(&index) = args.get(1) else {
+                return type_error("deque.__delitem__() missing required argument 'index'");
+            };
+            let Some(raw) = value::as_integer(index) else {
+                return type_error(&format!(
+                    "sequence index must be integer, not '{}'",
+                    value::type_name(index)
+                ));
+            };
+            let Some(data) = deque_ensure_data(obj) else {
+                return type_error("deque instance has no storage");
+            };
+            let position = {
+                let items = deque_items(obj);
+                match deque_normalize(items.len(), raw) {
+                    Some(position) => position,
+                    None => {
+                        return exc::raise_with_message(INDEX_ERROR, "deque index out of range")
+                    }
+                }
+            };
+            if let Some(mut items) = value::list_items_mut(data) {
+                items.remove(position);
+            }
+            NONE
+        }
+        DequeOp::Eq | DequeOp::Ne => {
+            let Some(&other) = args.get(1) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            if !deque_instance(other) {
+                return value::bool_value(op_is_ne(op));
+            }
+            value::bool_value(deque_equal(obj, other) != op_is_ne(op))
+        }
+        DequeOp::Lt | DequeOp::Le | DequeOp::Gt | DequeOp::Ge => {
+            let Some(&other) = args.get(1) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let order = match op {
+                DequeOp::Lt => ops::OP_LT,
+                DequeOp::Le => ops::OP_LE,
+                DequeOp::Gt => ops::OP_GT,
+                _ => ops::OP_GE,
+            };
+            deque_compare(obj, other, order)
+        }
+        DequeOp::Add => {
+            let Some(&other) = args.get(1) else {
+                return type_error("deque.__add__() missing required argument 'other'");
+            };
+            if !deque_instance(other) {
+                return type_error(&format!(
+                    "can only concatenate deque (not \"{}\") to deque",
+                    value::type_name(other)
+                ));
+            }
+            let class = value::instance_class_value(obj).unwrap_or_else(deque_class);
+            let mut items = deque_items(obj);
+            items.extend(deque_items(other));
+            let maxlen = deque_maxlen(obj);
+            let limit = deque_limit(obj);
+            deque_trim(&mut items, limit);
+            deque_new(class, items, maxlen)
+        }
+        DequeOp::IAdd => {
+            let Some(&other) = args.get(1) else {
+                return type_error("deque.__iadd__() missing required argument 'other'");
+            };
+            match deque_collect(other) {
+                Ok(mut incoming) => {
+                    let limit = deque_limit(obj);
+                    let mut items = deque_items(obj);
+                    items.append(&mut incoming);
+                    deque_trim(&mut items, limit);
+                    deque_store(obj, items);
+                    obj
+                }
+                Err(error) => error,
+            }
+        }
+        DequeOp::Mul | DequeOp::RMul | DequeOp::IMul => {
+            let Some(&factor) = args.get(1) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            let Some(count) = value::as_integer(factor) else {
+                return type_error(&format!(
+                    "can't multiply sequence by non-int of type '{}'",
+                    value::type_name(factor)
+                ));
+            };
+            let count = usize::try_from(count).unwrap_or(0);
+            let items = deque_items(obj);
+            let mut repeated = Vec::with_capacity(items.len().saturating_mul(count));
+            for _ in 0..count {
+                repeated.extend_from_slice(&items);
+            }
+            let limit = deque_limit(obj);
+            deque_trim(&mut repeated, limit);
+            if matches!(op, DequeOp::IMul) {
+                deque_store(obj, repeated);
+                return obj;
+            }
+            let class = value::instance_class_value(obj).unwrap_or_else(deque_class);
+            deque_new(class, repeated, deque_maxlen(obj))
+        }
+        DequeOp::Copy => {
+            let class = value::instance_class_value(obj).unwrap_or_else(deque_class);
+            deque_new(class, deque_items(obj), deque_maxlen(obj))
+        }
+        DequeOp::Append => {
+            let Some(&item) = args.get(1) else {
+                return type_error("deque.append() missing required argument 'item'");
+            };
+            deque_push_right(obj, item)
+        }
+        DequeOp::AppendLeft => {
+            let Some(&item) = args.get(1) else {
+                return type_error("deque.appendleft() missing required argument 'item'");
+            };
+            deque_push_left(obj, item)
+        }
+        DequeOp::Extend => {
+            let Some(&source) = args.get(1) else {
+                return type_error("deque.extend() missing required argument 'iterable'");
+            };
+            match deque_collect(source) {
+                Ok(incoming) => {
+                    let limit = deque_limit(obj);
+                    let Some(data) = deque_ensure_data(obj) else {
+                        return type_error("deque instance has no storage");
+                    };
+                    if let Some(mut items) = value::list_items_mut(data) {
+                        for item in incoming {
+                            items.push(item);
+                            heap::write_barrier_edge(data, item);
+                            if let Some(limit) = limit {
+                                if items.len() > limit {
+                                    items.remove(0);
+                                }
+                            }
+                        }
+                    }
+                    NONE
+                }
+                Err(error) => error,
+            }
+        }
+        DequeOp::ExtendLeft => {
+            let Some(&source) = args.get(1) else {
+                return type_error("deque.extendleft() missing required argument 'iterable'");
+            };
+            match deque_collect(source) {
+                Ok(incoming) => {
+                    let limit = deque_limit(obj);
+                    let Some(data) = deque_ensure_data(obj) else {
+                        return type_error("deque instance has no storage");
+                    };
+                    if let Some(mut items) = value::list_items_mut(data) {
+                        for item in incoming {
+                            items.insert(0, item);
+                            heap::write_barrier_edge(data, item);
+                            if let Some(limit) = limit {
+                                if items.len() > limit {
+                                    items.truncate(limit);
+                                }
+                            }
+                        }
+                    }
+                    NONE
+                }
+                Err(error) => error,
+            }
+        }
+        DequeOp::PopLeft => {
+            let Some(data) = deque_ensure_data(obj) else {
+                return type_error("deque instance has no storage");
+            };
+            if deque_items(obj).is_empty() {
+                return exc::raise_with_message(INDEX_ERROR, "pop from an empty deque");
+            }
+            let mut popped = NONE;
+            if let Some(mut items) = value::list_items_mut(data) {
+                popped = items.remove(0);
+            }
+            popped
+        }
+        DequeOp::Pop => {
+            let index = args.get(1).copied().unwrap_or(NONE);
+            let Some(data) = deque_ensure_data(obj) else {
+                return type_error("deque instance has no storage");
+            };
+            let items = deque_items(obj);
+            if items.is_empty() {
+                return exc::raise_with_message(INDEX_ERROR, "pop from an empty deque");
+            }
+            let position = if index == NONE {
+                items.len() - 1
+            } else {
+                let Some(raw) = value::as_integer(index) else {
+                    return type_error(&format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        value::type_name(index)
+                    ));
+                };
+                match deque_normalize(items.len(), raw) {
+                    Some(position) => position,
+                    None => return exc::raise_with_message(INDEX_ERROR, "pop index out of range"),
+                }
+            };
+            let mut popped = NONE;
+            if let Some(mut items) = value::list_items_mut(data) {
+                popped = items.remove(position);
+            }
+            popped
+        }
+        DequeOp::Clear => {
+            if let Some(data) = deque_ensure_data(obj) {
+                if let Some(mut items) = value::list_items_mut(data) {
+                    items.clear();
+                }
+            }
+            NONE
+        }
+        DequeOp::Count => {
+            let Some(&needle) = args.get(1) else {
+                return type_error("deque.count() missing required argument 'value'");
+            };
+            let items = deque_items(obj);
+            let length = items.len();
+            let mut count = 0usize;
+            for item in &items {
+                if container::equals(*item, needle) {
+                    count += 1;
+                }
+                if exc::pending() {
+                    return NONE;
+                }
+                if deque_len(obj) != length {
+                    return deque_mutated();
+                }
+            }
+            ops::int_result(count as i64)
+        }
+        DequeOp::Index => {
+            let Some(&needle) = args.get(1) else {
+                return type_error("deque.index() missing required argument 'value'");
+            };
+            let items = deque_items(obj);
+            let length = items.len();
+            let start = match args.get(2).copied() {
+                None | Some(NONE) => 0,
+                Some(argument) => match deque_index_bound(argument, length) {
+                    Ok(start) => start,
+                    Err(error) => return error,
+                },
+            };
+            let stop = match args.get(3).copied() {
+                None | Some(NONE) => length,
+                Some(argument) => match deque_index_bound(argument, length) {
+                    Ok(stop) => stop,
+                    Err(error) => return error,
+                },
+            };
+            for position in start..stop.min(length) {
+                if container::equals(items[position], needle) {
+                    return ops::int_result(position as i64);
+                }
+                if exc::pending() {
+                    return NONE;
+                }
+                if deque_len(obj) != length {
+                    return deque_mutated();
+                }
+            }
+            exc::raise_with_message(VALUE_ERROR, "deque.index(x): x not in deque")
+        }
+        DequeOp::Insert => {
+            let (Some(&index), Some(&item)) = (args.get(1), args.get(2)) else {
+                return type_error("deque.insert() requires an index and a value");
+            };
+            let Some(raw) = value::as_integer(index) else {
+                return type_error(&format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    value::type_name(index)
+                ));
+            };
+            let Some(data) = deque_ensure_data(obj) else {
+                return type_error("deque instance has no storage");
+            };
+            let length = deque_items(obj).len();
+            if let Some(limit) = deque_limit(obj) {
+                if length >= limit {
+                    return exc::raise_with_message(INDEX_ERROR, "deque already at its maximum size");
+                }
+            }
+            let position = if raw < 0 {
+                let len = length as i64;
+                usize::try_from((raw.saturating_add(len)).max(0)).unwrap_or(0)
+            } else {
+                usize::try_from(raw).unwrap_or(length).min(length)
+            };
+            if let Some(mut items) = value::list_items_mut(data) {
+                items.insert(position, item);
+                heap::write_barrier_edge(data, item);
+            }
+            NONE
+        }
+        DequeOp::Remove => {
+            let Some(&needle) = args.get(1) else {
+                return type_error("deque.remove() missing required argument 'value'");
+            };
+            let Some(data) = deque_ensure_data(obj) else {
+                return type_error("deque instance has no storage");
+            };
+            let items = deque_items(obj);
+            let length = items.len();
+            let mut found = None;
+            for (position, item) in items.iter().enumerate() {
+                if container::equals(*item, needle) {
+                    found = Some(position);
+                    break;
+                }
+                if exc::pending() {
+                    return NONE;
+                }
+                if deque_len(obj) != length {
+                    return deque_mutated();
+                }
+            }
+            match found {
+                Some(position) => {
+                    if let Some(mut items) = value::list_items_mut(data) {
+                        items.remove(position);
+                    }
+                    NONE
+                }
+                None => exc::raise_with_message(VALUE_ERROR, "deque.remove(x): x not in deque"),
+            }
+        }
+        DequeOp::Rotate => {
+            let argument = args.get(1).copied().unwrap_or(NONE);
+            let shift = if argument == NONE {
+                1
+            } else {
+                match value::as_integer(argument) {
+                    Some(number) => number,
+                    None => {
+                        return type_error("an integer is required for rotate()");
+                    }
+                }
+            };
+            let Some(data) = deque_ensure_data(obj) else {
+                return type_error("deque instance has no storage");
+            };
+            let length = deque_items(obj).len();
+            if length == 0 {
+                return NONE;
+            }
+            let length_i = match i64::try_from(length) {
+                Ok(length) => length,
+                Err(_) => return NONE,
+            };
+            let normalized = shift.rem_euclid(length_i);
+            if normalized == 0 {
+                return NONE;
+            }
+            if let Some(mut items) = value::list_items_mut(data) {
+                items.rotate_right(normalized as usize);
+            }
+            NONE
+        }
+        DequeOp::Reverse => {
+            let Some(data) = deque_ensure_data(obj) else {
+                return type_error("deque instance has no storage");
+            };
+            if let Some(mut items) = value::list_items_mut(data) {
+                items.reverse();
+            }
+            NONE
+        }
+        DequeOp::SetAttr => {
+            let (Some(&name), Some(&item)) = (args.get(1), args.get(2)) else {
+                return type_error("deque.__setattr__() requires a name and a value");
+            };
+            let name = value::as_str(name).unwrap_or("<unknown>");
+            if value::instance_class_value(obj) == Some(deque_class()) {
+                return exc::raise_with_message(
+                    ATTRIBUTE_ERROR,
+                    &format!("'deque' object has no attribute '{name}'"),
+                );
+            }
+            value::instance_setattr(obj, name.to_string(), item);
+            NONE
+        }
+    }
+}
+
+fn op_is_ne(op: DequeOp) -> bool {
+    matches!(op, DequeOp::Ne)
+}
+
+macro_rules! deque_entry {
+    ($entry:ident, $op:expr, $arity:expr) => {
+        extern "C" fn $entry(argv: *const i64) -> i64 {
+            // SAFETY: the binder passes exactly the signature length.
+            let args = unsafe { std::slice::from_raw_parts(argv, $arity) };
+            deque_call($op, args)
+        }
+    };
+}
+
+deque_entry!(deque_init_entry, DequeOp::Init, 3);
+deque_entry!(deque_repr_entry, DequeOp::Repr, 1);
+deque_entry!(deque_len_entry, DequeOp::Len, 1);
+deque_entry!(deque_iter_entry, DequeOp::Iter, 1);
+deque_entry!(deque_reversed_entry, DequeOp::Reversed, 1);
+deque_entry!(deque_contains_entry, DequeOp::Contains, 2);
+deque_entry!(deque_getitem_entry, DequeOp::GetItem, 2);
+deque_entry!(deque_setitem_entry, DequeOp::SetItem, 3);
+deque_entry!(deque_delitem_entry, DequeOp::DelItem, 2);
+deque_entry!(deque_eq_entry, DequeOp::Eq, 2);
+deque_entry!(deque_ne_entry, DequeOp::Ne, 2);
+deque_entry!(deque_lt_entry, DequeOp::Lt, 2);
+deque_entry!(deque_le_entry, DequeOp::Le, 2);
+deque_entry!(deque_gt_entry, DequeOp::Gt, 2);
+deque_entry!(deque_ge_entry, DequeOp::Ge, 2);
+deque_entry!(deque_add_entry, DequeOp::Add, 2);
+deque_entry!(deque_iadd_entry, DequeOp::IAdd, 2);
+deque_entry!(deque_mul_entry, DequeOp::Mul, 2);
+deque_entry!(deque_rmul_entry, DequeOp::RMul, 2);
+deque_entry!(deque_imul_entry, DequeOp::IMul, 2);
+deque_entry!(deque_copy_entry, DequeOp::Copy, 1);
+deque_entry!(deque_append_entry, DequeOp::Append, 2);
+deque_entry!(deque_appendleft_entry, DequeOp::AppendLeft, 2);
+deque_entry!(deque_extend_entry, DequeOp::Extend, 2);
+deque_entry!(deque_extendleft_entry, DequeOp::ExtendLeft, 2);
+deque_entry!(deque_popleft_entry, DequeOp::PopLeft, 1);
+deque_entry!(deque_pop_entry, DequeOp::Pop, 2);
+deque_entry!(deque_clear_entry, DequeOp::Clear, 1);
+deque_entry!(deque_count_entry, DequeOp::Count, 2);
+deque_entry!(deque_index_entry, DequeOp::Index, 4);
+deque_entry!(deque_insert_entry, DequeOp::Insert, 3);
+deque_entry!(deque_remove_entry, DequeOp::Remove, 2);
+deque_entry!(deque_rotate_entry, DequeOp::Rotate, 2);
+deque_entry!(deque_reverse_entry, DequeOp::Reverse, 1);
+deque_entry!(deque_setattr_entry, DequeOp::SetAttr, 3);
+
+fn deque_native_name(name: &str) -> &'static str {
+    match name {
+        "__init__" => "deque.__init__",
+        "__repr__" => "deque.__repr__",
+        "__len__" => "deque.__len__",
+        "__iter__" => "deque.__iter__",
+        "__reversed__" => "deque.__reversed__",
+        "__contains__" => "deque.__contains__",
+        "__getitem__" => "deque.__getitem__",
+        "__setitem__" => "deque.__setitem__",
+        "__delitem__" => "deque.__delitem__",
+        "__eq__" => "deque.__eq__",
+        "__ne__" => "deque.__ne__",
+        "__lt__" => "deque.__lt__",
+        "__le__" => "deque.__le__",
+        "__gt__" => "deque.__gt__",
+        "__ge__" => "deque.__ge__",
+        "__add__" => "deque.__add__",
+        "__iadd__" => "deque.__iadd__",
+        "__mul__" => "deque.__mul__",
+        "__rmul__" => "deque.__rmul__",
+        "__imul__" => "deque.__imul__",
+        "__copy__" => "deque.__copy__",
+        "__setattr__" => "deque.__setattr__",
+        "append" => "deque.append",
+        "appendleft" => "deque.appendleft",
+        "extend" => "deque.extend",
+        "extendleft" => "deque.extendleft",
+        "popleft" => "deque.popleft",
+        "pop" => "deque.pop",
+        "clear" => "deque.clear",
+        "count" => "deque.count",
+        "index" => "deque.index",
+        "insert" => "deque.insert",
+        "remove" => "deque.remove",
+        "rotate" => "deque.rotate",
+        "reverse" => "deque.reverse",
+        "copy" => "deque.copy",
+        _ => "deque.method",
+    }
+}
+
+fn deque_param(name: &str, kind: ParamKind, optional: bool) -> ParamMeta {
+    ParamMeta {
+        name: name.to_string(),
+        kind,
+        default: if optional { Some(NONE) } else { None },
+    }
+}
+
+fn deque_method(
+    name: &'static str,
+    params: Vec<ParamMeta>,
+    entry: usize,
+) -> (String, i64, MethodKind) {
+    let function = value::native_function_new("collections", deque_native_name(name), params.len());
+    value::function_set_signature(function, params);
+    value::function_set_full_entry(function, entry);
+    (name.to_string(), function, MethodKind::Normal)
+}
+
+/// Identity-stable `collections.deque` class.
+pub(crate) fn deque_class() -> i64 {
+    const KEY: &str = "collections.deque.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let self_only = || vec![deque_param("self", ParamKind::Positional, false)];
+    let mut methods: Vec<(String, i64, MethodKind)> = Vec::new();
+    // `__init__(self, iterable=(), maxlen=None)`: both trailing parameters bind
+    // by keyword like CPython's C constructor.
+    let init = value::native_function_new("collections", "deque.__init__", usize::MAX);
+    value::function_set_signature(
+        init,
+        vec![
+            deque_param("self", ParamKind::Positional, false),
+            deque_param("iterable", ParamKind::Positional, true),
+            deque_param("maxlen", ParamKind::Positional, true),
+        ],
+    );
+    value::function_set_full_entry(init, deque_init_entry as *const () as usize);
+    methods.push(("__init__".to_string(), init, MethodKind::Normal));
+    let specs: Vec<(&'static str, Vec<ParamMeta>, usize)> = vec![
+        ("__repr__", self_only(), deque_repr_entry as *const () as usize),
+        ("__len__", self_only(), deque_len_entry as *const () as usize),
+        ("__iter__", self_only(), deque_iter_entry as *const () as usize),
+        (
+            "__reversed__",
+            self_only(),
+            deque_reversed_entry as *const () as usize,
+        ),
+        (
+            "__contains__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("value", ParamKind::PosOnly, false),
+            ],
+            deque_contains_entry as *const () as usize,
+        ),
+        (
+            "__getitem__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("index", ParamKind::PosOnly, false),
+            ],
+            deque_getitem_entry as *const () as usize,
+        ),
+        (
+            "__setitem__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("index", ParamKind::PosOnly, false),
+                deque_param("value", ParamKind::PosOnly, false),
+            ],
+            deque_setitem_entry as *const () as usize,
+        ),
+        (
+            "__delitem__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("index", ParamKind::PosOnly, false),
+            ],
+            deque_delitem_entry as *const () as usize,
+        ),
+        (
+            "__eq__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("other", ParamKind::PosOnly, false),
+            ],
+            deque_eq_entry as *const () as usize,
+        ),
+        (
+            "__ne__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("other", ParamKind::PosOnly, false),
+            ],
+            deque_ne_entry as *const () as usize,
+        ),
+        (
+            "__lt__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("other", ParamKind::PosOnly, false),
+            ],
+            deque_lt_entry as *const () as usize,
+        ),
+        (
+            "__le__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("other", ParamKind::PosOnly, false),
+            ],
+            deque_le_entry as *const () as usize,
+        ),
+        (
+            "__gt__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("other", ParamKind::PosOnly, false),
+            ],
+            deque_gt_entry as *const () as usize,
+        ),
+        (
+            "__ge__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("other", ParamKind::PosOnly, false),
+            ],
+            deque_ge_entry as *const () as usize,
+        ),
+        (
+            "__add__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("other", ParamKind::PosOnly, false),
+            ],
+            deque_add_entry as *const () as usize,
+        ),
+        (
+            "__iadd__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("other", ParamKind::PosOnly, false),
+            ],
+            deque_iadd_entry as *const () as usize,
+        ),
+        (
+            "__mul__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("n", ParamKind::PosOnly, false),
+            ],
+            deque_mul_entry as *const () as usize,
+        ),
+        (
+            "__rmul__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("n", ParamKind::PosOnly, false),
+            ],
+            deque_rmul_entry as *const () as usize,
+        ),
+        (
+            "__imul__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("n", ParamKind::PosOnly, false),
+            ],
+            deque_imul_entry as *const () as usize,
+        ),
+        (
+            "__copy__",
+            self_only(),
+            deque_copy_entry as *const () as usize,
+        ),
+        (
+            "__setattr__",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("name", ParamKind::PosOnly, false),
+                deque_param("value", ParamKind::PosOnly, false),
+            ],
+            deque_setattr_entry as *const () as usize,
+        ),
+        (
+            "append",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("item", ParamKind::PosOnly, false),
+            ],
+            deque_append_entry as *const () as usize,
+        ),
+        (
+            "appendleft",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("item", ParamKind::PosOnly, false),
+            ],
+            deque_appendleft_entry as *const () as usize,
+        ),
+        (
+            "extend",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("iterable", ParamKind::PosOnly, false),
+            ],
+            deque_extend_entry as *const () as usize,
+        ),
+        (
+            "extendleft",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("iterable", ParamKind::PosOnly, false),
+            ],
+            deque_extendleft_entry as *const () as usize,
+        ),
+        (
+            "popleft",
+            self_only(),
+            deque_popleft_entry as *const () as usize,
+        ),
+        (
+            "pop",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("index", ParamKind::PosOnly, true),
+            ],
+            deque_pop_entry as *const () as usize,
+        ),
+        ("clear", self_only(), deque_clear_entry as *const () as usize),
+        (
+            "count",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("value", ParamKind::PosOnly, false),
+            ],
+            deque_count_entry as *const () as usize,
+        ),
+        (
+            "index",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("value", ParamKind::PosOnly, false),
+                deque_param("start", ParamKind::PosOnly, true),
+                deque_param("stop", ParamKind::PosOnly, true),
+            ],
+            deque_index_entry as *const () as usize,
+        ),
+        (
+            "insert",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("index", ParamKind::PosOnly, false),
+                deque_param("object", ParamKind::PosOnly, false),
+            ],
+            deque_insert_entry as *const () as usize,
+        ),
+        (
+            "remove",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("value", ParamKind::PosOnly, false),
+            ],
+            deque_remove_entry as *const () as usize,
+        ),
+        (
+            "rotate",
+            vec![
+                deque_param("self", ParamKind::Positional, false),
+                deque_param("n", ParamKind::PosOnly, true),
+            ],
+            deque_rotate_entry as *const () as usize,
+        ),
+        (
+            "reverse",
+            self_only(),
+            deque_reverse_entry as *const () as usize,
+        ),
+        ("copy", self_only(), deque_copy_entry as *const () as usize),
+    ];
+    for (name, params, entry) in specs {
+        methods.push(deque_method(name, params, entry));
+    }
+    let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new_full("deque".to_string(), NONE, methods, Vec::new());
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+// -------------------------------------------------------------------------
+// `collections.ChainMap`
+// -------------------------------------------------------------------------
+
+/// Public instance attribute holding the list of chained mappings.
+const CHAINMAP_MAPS_ATTR: &str = "maps";
+
+fn chainmap_instance(obj: i64) -> bool {
+    value::instance_class_value(obj)
+        .is_some_and(|class| value::is_subclass_of(class, chainmap_class()))
+}
+
+fn chainmap_maps(obj: i64) -> Vec<i64> {
+    value::instance_attr(obj, CHAINMAP_MAPS_ATTR)
+        .and_then(value::as_list)
+        .map(|maps| maps.to_vec())
+        .unwrap_or_default()
+}
+
+fn chainmap_set_maps(obj: i64, maps: Vec<i64>) {
+    let list = value::list_new(maps);
+    let roots = heap::root_values(std::slice::from_ref(&list));
+    value::instance_setattr(obj, CHAINMAP_MAPS_ATTR.to_string(), list);
+    heap::release_roots(roots);
+}
+
+fn chainmap_has(map: i64, key: i64) -> bool {
+    value::mapping_pairs(map).is_some_and(|pairs| container::dict_find(pairs, key).is_some())
+}
+
+/// Unique keys in chain order (first map first), CPython's `ChainMap.__iter__`
+/// order.
+fn chainmap_keys(obj: i64) -> Vec<i64> {
+    let mut keys: Vec<i64> = Vec::new();
+    for map in chainmap_maps(obj) {
+        if let Some(pairs) = value::mapping_pairs(map) {
+            for (key, _) in pairs {
+                if !keys
+                    .iter()
+                    .any(|existing| container::equals(*existing, *key) || exc::pending())
+                {
+                    heap::root_values(&[*key]);
+                    keys.push(*key);
+                }
+                if exc::pending() {
+                    return keys;
+                }
+            }
+        }
+    }
+    keys
+}
+
+fn chainmap_lookup(obj: i64, key: i64) -> Option<i64> {
+    for map in chainmap_maps(obj) {
+        if chainmap_has(map, key) {
+            let found = container::subscript(map, key);
+            if exc::pending() {
+                return None;
+            }
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn chainmap_items(obj: i64) -> Vec<(i64, i64)> {
+    let mut items: Vec<(i64, i64)> = Vec::new();
+    for key in chainmap_keys(obj) {
+        if let Some(found) = chainmap_lookup(obj, key) {
+            items.push((key, found));
+        }
+    }
+    items
+}
+
+fn chainmap_new(class: i64, maps: Vec<i64>) -> i64 {
+    let instance = value::instance_new(class);
+    chainmap_set_maps(instance, maps);
+    instance
+}
+
+fn chainmap_class_of(obj: i64) -> i64 {
+    value::instance_class_value(obj).unwrap_or_else(chainmap_class)
+}
+
+/// Unique sentinel for an omitted `ChainMap.pop` default, so an explicit
+/// `None` stays distinguishable from "no default given".
+fn chainmap_missing() -> i64 {
+    const KEY: &str = "collections.ChainMap.missing";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let missing = value::namespace_new(Vec::new());
+    globals::registry_set(KEY, missing);
+    missing
+}
+
+#[derive(Clone, Copy)]
+enum ChainOp {
+    Init,
+    Repr,
+    Eq,
+    Len,
+    Iter,
+    Contains,
+    Bool,
+    GetItem,
+    SetItem,
+    DelItem,
+    Get,
+    Keys,
+    Values,
+    Items,
+    Pop,
+    PopItem,
+    SetDefault,
+    Clear,
+    Copy,
+    NewChild,
+    Parents,
+    FromKeys,
+}
+
+fn chainmap_call(op: ChainOp, args: &[i64]) -> i64 {
+    if matches!(op, ChainOp::FromKeys) {
+        let Some(&class) = args.first() else {
+            return type_error("ChainMap.fromkeys() missing required argument 'cls'");
+        };
+        let Some(&iterable) = args.get(1) else {
+            return type_error("ChainMap.fromkeys() missing required argument 'iterable'");
+        };
+        let item = args.get(2).copied().unwrap_or(NONE);
+        let iterator = iter::iter_of(iterable);
+        if exc::pending() {
+            return NONE;
+        }
+        let mut pairs: Vec<(i64, i64)> = Vec::new();
+        loop {
+            let mut key = NONE;
+            let status = iter::iter_next(iterator, &mut key);
+            if exc::pending() {
+                return NONE;
+            }
+            if status == 0 {
+                break;
+            }
+            heap::root_values(&[key, item]);
+            match container::dict_find(&pairs, key) {
+                Some(position) => pairs[position].1 = item,
+                None => pairs.push((key, item)),
+            }
+        }
+        let map = value::dict_new(pairs);
+        let roots = heap::root_values(std::slice::from_ref(&map));
+        let instance = value::instance_new(class);
+        chainmap_set_maps(instance, vec![map]);
+        heap::release_roots(roots);
+        return instance;
+    }
+    let Some(&obj) = args.first() else {
+        return type_error("ChainMap method missing required argument 'self'");
+    };
+    if !chainmap_instance(obj) {
+        return type_error(&format!(
+            "descriptor for 'ChainMap' objects doesn't apply to a '{}' object",
+            value::type_name(obj)
+        ));
+    }
+    match op {
+        ChainOp::Init => {
+            let sources = args
+                .get(1)
+                .and_then(|value| value::as_list(*value))
+                .map(|maps| maps.to_vec())
+                .unwrap_or_default();
+            let mut maps = sources;
+            if maps.is_empty() {
+                maps.push(value::dict_new(Vec::new()));
+            }
+            chainmap_set_maps(obj, maps);
+            NONE
+        }
+        ChainOp::Repr => {
+            let rendered: Vec<String> = chainmap_maps(obj)
+                .iter()
+                .map(|map| value::repr(*map))
+                .collect();
+            value::str_alloc(format!("ChainMap({})", rendered.join(", ")))
+        }
+        ChainOp::Eq => {
+            let Some(&other) = args.get(1) else {
+                return value::NOT_IMPLEMENTED;
+            };
+            if value::mapping_pairs(other).is_none() {
+                return value::NOT_IMPLEMENTED;
+            }
+            let ours = value::dict_new(chainmap_items(obj));
+            value::bool_value(container::equals(ours, other))
+        }
+        ChainOp::Len => ops::int_result(chainmap_keys(obj).len() as i64),
+        ChainOp::Iter => iter::iter_new(value::list_new(chainmap_keys(obj))),
+        ChainOp::Contains => {
+            let Some(&key) = args.get(1) else {
+                return value::FALSE;
+            };
+            value::bool_value(chainmap_maps(obj).iter().any(|map| chainmap_has(*map, key)))
+        }
+        ChainOp::Bool => value::bool_value(!chainmap_keys(obj).is_empty()),
+        ChainOp::GetItem => {
+            let Some(&key) = args.get(1) else {
+                return type_error("ChainMap.__getitem__() missing required argument 'key'");
+            };
+            match chainmap_lookup(obj, key) {
+                Some(found) => found,
+                None => exc::raise_with_message(KEY_ERROR, &value::repr(key)),
+            }
+        }
+        ChainOp::SetItem => {
+            let (Some(&key), Some(&item)) = (args.get(1), args.get(2)) else {
+                return type_error("ChainMap.__setitem__() requires a key and a value");
+            };
+            let Some(&first) = chainmap_maps(obj).first() else {
+                return type_error("ChainMap has no maps");
+            };
+            container::subscript_set(first, key, item)
+        }
+        ChainOp::DelItem => {
+            let Some(&key) = args.get(1) else {
+                return type_error("ChainMap.__delitem__() missing required argument 'key'");
+            };
+            for map in chainmap_maps(obj) {
+                if chainmap_has(map, key) {
+                    return container::delete_subscript(map, key);
+                }
+            }
+            exc::raise_with_message(KEY_ERROR, &value::repr(key))
+        }
+        ChainOp::Get => {
+            let Some(&key) = args.get(1) else {
+                return type_error("ChainMap.get() missing required argument 'key'");
+            };
+            let default = args.get(2).copied().unwrap_or(NONE);
+            chainmap_lookup(obj, key).unwrap_or(default)
+        }
+        ChainOp::Keys => iter::iter_new(value::list_new(chainmap_keys(obj))),
+        ChainOp::Values => {
+            let values: Vec<i64> = chainmap_items(obj).into_iter().map(|(_, v)| v).collect();
+            iter::iter_new(value::list_new(values))
+        }
+        ChainOp::Items => {
+            let items: Vec<i64> = chainmap_items(obj)
+                .into_iter()
+                .map(|(key, value)| value::tuple_new(vec![key, value]))
+                .collect();
+            iter::iter_new(value::list_new(items))
+        }
+        ChainOp::Pop => {
+            let Some(&key) = args.get(1) else {
+                return type_error("ChainMap.pop() missing required argument 'key'");
+            };
+            for map in chainmap_maps(obj) {
+                if chainmap_has(map, key) {
+                    let popped = container::subscript(map, key);
+                    if exc::pending() {
+                        return NONE;
+                    }
+                    container::delete_subscript(map, key);
+                    if exc::pending() {
+                        return NONE;
+                    }
+                    return popped;
+                }
+            }
+            match args.get(2).copied() {
+                Some(default) if default != chainmap_missing() => default,
+                _ => exc::raise_with_message(KEY_ERROR, &value::repr(key)),
+            }
+        }
+        ChainOp::PopItem => {
+            let Some(&first) = chainmap_maps(obj).first() else {
+                return exc::raise_with_message(KEY_ERROR, "popitem(): dictionary is empty");
+            };
+            let last = value::mapping_pairs(first).and_then(|pairs| pairs.last().copied());
+            let Some((key, item)) = last else {
+                return exc::raise_with_message(KEY_ERROR, "popitem(): dictionary is empty");
+            };
+            let roots = heap::root_values(&[key, item]);
+            container::delete_subscript(first, key);
+            heap::release_roots(roots);
+            value::tuple_new(vec![key, item])
+        }
+        ChainOp::SetDefault => {
+            let Some(&key) = args.get(1) else {
+                return type_error("ChainMap.setdefault() missing required argument 'key'");
+            };
+            let default = args.get(2).copied().unwrap_or(NONE);
+            if let Some(found) = chainmap_lookup(obj, key) {
+                return found;
+            }
+            let Some(&first) = chainmap_maps(obj).first() else {
+                return type_error("ChainMap has no maps");
+            };
+            container::subscript_set(first, key, default);
+            default
+        }
+        ChainOp::Clear => {
+            let Some(&first) = chainmap_maps(obj).first() else {
+                return NONE;
+            };
+            let keys: Vec<i64> = value::mapping_pairs(first)
+                .map(|pairs| pairs.iter().map(|(key, _)| *key).collect())
+                .unwrap_or_default();
+            for key in keys {
+                container::delete_subscript(first, key);
+                if exc::pending() {
+                    return NONE;
+                }
+            }
+            NONE
+        }
+        ChainOp::Copy => {
+            let class = chainmap_class_of(obj);
+            chainmap_new(class, chainmap_maps(obj))
+        }
+        ChainOp::NewChild => {
+            let source = args.get(1).copied().unwrap_or(NONE);
+            let kwargs = args.get(2).copied().unwrap_or(NONE);
+            let mut maps = Vec::new();
+            let child = if source == NONE {
+                value::dict_new(Vec::new())
+            } else {
+                source
+            };
+            let roots = heap::root_values(std::slice::from_ref(&child));
+            if let Some(pairs) = value::mapping_pairs(kwargs) {
+                let entries = pairs.to_vec();
+                for (key, item) in entries {
+                    container::subscript_set(child, key, item);
+                }
+            }
+            maps.push(child);
+            maps.extend(chainmap_maps(obj));
+            let class = chainmap_class_of(obj);
+            let instance = value::instance_new(class);
+            chainmap_set_maps(instance, maps);
+            heap::release_roots(roots);
+            instance
+        }
+        ChainOp::Parents => {
+            let maps = chainmap_maps(obj);
+            let class = chainmap_class_of(obj);
+            let parents = maps.into_iter().skip(1).collect();
+            chainmap_new(class, parents)
+        }
+        ChainOp::FromKeys => value::NOT_IMPLEMENTED,
+    }
+}
+
+macro_rules! chain_entry {
+    ($entry:ident, $op:expr, $arity:expr) => {
+        extern "C" fn $entry(argv: *const i64) -> i64 {
+            // SAFETY: the binder passes exactly the signature length.
+            let args = unsafe { std::slice::from_raw_parts(argv, $arity) };
+            chainmap_call($op, args)
+        }
+    };
+}
+
+chain_entry!(chain_init_entry, ChainOp::Init, 2);
+chain_entry!(chain_repr_entry, ChainOp::Repr, 1);
+chain_entry!(chain_eq_entry, ChainOp::Eq, 2);
+chain_entry!(chain_len_entry, ChainOp::Len, 1);
+chain_entry!(chain_iter_entry, ChainOp::Iter, 1);
+chain_entry!(chain_contains_entry, ChainOp::Contains, 2);
+chain_entry!(chain_bool_entry, ChainOp::Bool, 1);
+chain_entry!(chain_getitem_entry, ChainOp::GetItem, 2);
+chain_entry!(chain_setitem_entry, ChainOp::SetItem, 3);
+chain_entry!(chain_delitem_entry, ChainOp::DelItem, 2);
+chain_entry!(chain_get_entry, ChainOp::Get, 3);
+chain_entry!(chain_keys_entry, ChainOp::Keys, 1);
+chain_entry!(chain_values_entry, ChainOp::Values, 1);
+chain_entry!(chain_items_entry, ChainOp::Items, 1);
+chain_entry!(chain_pop_entry, ChainOp::Pop, 3);
+chain_entry!(chain_popitem_entry, ChainOp::PopItem, 1);
+chain_entry!(chain_setdefault_entry, ChainOp::SetDefault, 3);
+chain_entry!(chain_clear_entry, ChainOp::Clear, 1);
+chain_entry!(chain_copy_entry, ChainOp::Copy, 1);
+chain_entry!(chain_new_child_entry, ChainOp::NewChild, 3);
+chain_entry!(chain_parents_entry, ChainOp::Parents, 1);
+chain_entry!(chain_fromkeys_entry, ChainOp::FromKeys, 3);
+
+fn chainmap_native_name(name: &str) -> &'static str {
+    match name {
+        "__init__" => "ChainMap.__init__",
+        "__repr__" => "ChainMap.__repr__",
+        "__eq__" => "ChainMap.__eq__",
+        "__len__" => "ChainMap.__len__",
+        "__iter__" => "ChainMap.__iter__",
+        "__contains__" => "ChainMap.__contains__",
+        "__bool__" => "ChainMap.__bool__",
+        "__getitem__" => "ChainMap.__getitem__",
+        "__setitem__" => "ChainMap.__setitem__",
+        "__delitem__" => "ChainMap.__delitem__",
+        "get" => "ChainMap.get",
+        "keys" => "ChainMap.keys",
+        "values" => "ChainMap.values",
+        "items" => "ChainMap.items",
+        "pop" => "ChainMap.pop",
+        "popitem" => "ChainMap.popitem",
+        "setdefault" => "ChainMap.setdefault",
+        "clear" => "ChainMap.clear",
+        "copy" => "ChainMap.copy",
+        "new_child" => "ChainMap.new_child",
+        "parents" => "ChainMap.parents",
+        "fromkeys" => "ChainMap.fromkeys",
+        _ => "ChainMap.method",
+    }
+}
+
+fn chainmap_method(
+    name: &'static str,
+    kind: MethodKind,
+    params: Vec<ParamMeta>,
+    entry: usize,
+) -> (String, i64, MethodKind) {
+    let function =
+        value::native_function_new("collections", chainmap_native_name(name), params.len());
+    value::function_set_signature(function, params);
+    value::function_set_full_entry(function, entry);
+    (name.to_string(), function, kind)
+}
+
+/// Identity-stable `collections.ChainMap` class.
+pub(crate) fn chainmap_class() -> i64 {
+    const KEY: &str = "collections.ChainMap.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let this = || deque_param("self", ParamKind::Positional, false);
+    let mut methods: Vec<(String, i64, MethodKind)> = Vec::new();
+    let key_param = || deque_param("key", ParamKind::PosOnly, false);
+    let specs: Vec<(&'static str, MethodKind, Vec<ParamMeta>, usize)> = vec![
+        (
+            "__init__",
+            MethodKind::Normal,
+            vec![
+                this(),
+                deque_param("maps", ParamKind::VarArg, false),
+            ],
+            chain_init_entry as *const () as usize,
+        ),
+        (
+            "__repr__",
+            MethodKind::Normal,
+            vec![this()],
+            chain_repr_entry as *const () as usize,
+        ),
+        (
+            "__eq__",
+            MethodKind::Normal,
+            vec![this(), deque_param("other", ParamKind::PosOnly, false)],
+            chain_eq_entry as *const () as usize,
+        ),
+        (
+            "__len__",
+            MethodKind::Normal,
+            vec![this()],
+            chain_len_entry as *const () as usize,
+        ),
+        (
+            "__iter__",
+            MethodKind::Normal,
+            vec![this()],
+            chain_iter_entry as *const () as usize,
+        ),
+        (
+            "__contains__",
+            MethodKind::Normal,
+            vec![this(), key_param()],
+            chain_contains_entry as *const () as usize,
+        ),
+        (
+            "__bool__",
+            MethodKind::Normal,
+            vec![this()],
+            chain_bool_entry as *const () as usize,
+        ),
+        (
+            "__getitem__",
+            MethodKind::Normal,
+            vec![this(), key_param()],
+            chain_getitem_entry as *const () as usize,
+        ),
+        (
+            "__setitem__",
+            MethodKind::Normal,
+            vec![
+                this(),
+                key_param(),
+                deque_param("value", ParamKind::PosOnly, false),
+            ],
+            chain_setitem_entry as *const () as usize,
+        ),
+        (
+            "__delitem__",
+            MethodKind::Normal,
+            vec![this(), key_param()],
+            chain_delitem_entry as *const () as usize,
+        ),
+        (
+            "get",
+            MethodKind::Normal,
+            vec![
+                this(),
+                key_param(),
+                deque_param("default", ParamKind::PosOnly, true),
+            ],
+            chain_get_entry as *const () as usize,
+        ),
+        (
+            "keys",
+            MethodKind::Normal,
+            vec![this()],
+            chain_keys_entry as *const () as usize,
+        ),
+        (
+            "values",
+            MethodKind::Normal,
+            vec![this()],
+            chain_values_entry as *const () as usize,
+        ),
+        (
+            "items",
+            MethodKind::Normal,
+            vec![this()],
+            chain_items_entry as *const () as usize,
+        ),
+        (
+            "pop",
+            MethodKind::Normal,
+            vec![
+                this(),
+                key_param(),
+                ParamMeta {
+                    name: "default".to_string(),
+                    kind: ParamKind::PosOnly,
+                    default: Some(chainmap_missing()),
+                },
+            ],
+            chain_pop_entry as *const () as usize,
+        ),
+        (
+            "popitem",
+            MethodKind::Normal,
+            vec![this()],
+            chain_popitem_entry as *const () as usize,
+        ),
+        (
+            "setdefault",
+            MethodKind::Normal,
+            vec![
+                this(),
+                key_param(),
+                deque_param("default", ParamKind::PosOnly, true),
+            ],
+            chain_setdefault_entry as *const () as usize,
+        ),
+        (
+            "clear",
+            MethodKind::Normal,
+            vec![this()],
+            chain_clear_entry as *const () as usize,
+        ),
+        (
+            "copy",
+            MethodKind::Normal,
+            vec![this()],
+            chain_copy_entry as *const () as usize,
+        ),
+        (
+            "new_child",
+            MethodKind::Normal,
+            vec![
+                this(),
+                deque_param("m", ParamKind::Positional, true),
+                deque_param("kwargs", ParamKind::KwArg, false),
+            ],
+            chain_new_child_entry as *const () as usize,
+        ),
+        (
+            "parents",
+            MethodKind::Property,
+            vec![this()],
+            chain_parents_entry as *const () as usize,
+        ),
+        (
+            "fromkeys",
+            MethodKind::Classmethod,
+            vec![
+                deque_param("cls", ParamKind::Positional, false),
+                deque_param("iterable", ParamKind::PosOnly, false),
+                deque_param("value", ParamKind::PosOnly, true),
+            ],
+            chain_fromkeys_entry as *const () as usize,
+        ),
+    ];
+    for (name, kind, params, entry) in specs {
+        methods.push(chainmap_method(name, kind, params, entry));
+    }
+    let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let method_roots = heap::root_values(&method_values);
+    let class = value::class_new_full("ChainMap".to_string(), NONE, methods, Vec::new());
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
 }
 
 #[cfg(test)]

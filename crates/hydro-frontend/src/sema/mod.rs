@@ -2130,6 +2130,12 @@ impl<'a> Checker<'a> {
                 handlers,
                 else_body,
                 finally_body,
+            }
+            | HStmtKind::TryStar {
+                body,
+                handlers,
+                else_body,
+                finally_body,
             } => {
                 self.check_stmts(body, f, has_value, has_bare);
                 for handler in handlers {
@@ -3863,6 +3869,10 @@ impl<'a> Checker<'a> {
                     }
                     Ty::Concrete(Type::Str)
                     | Ty::Concrete(Type::Any)
+                    // `format(value, None)` is legal source: CPython only
+                    // rejects the spec when the call runs, so the TypeError is
+                    // raised by the runtime, not by the static check.
+                    | Ty::Concrete(Type::None)
                     | Ty::Concrete(Type::Never) => {}
                     Ty::Concrete(t) => self.error(
                         arg_line,
@@ -4183,12 +4193,13 @@ impl<'a> Checker<'a> {
             }
             Builtin::Tuple => {
                 if count > 1 {
-                    self.error_code(
-                        line,
-                        col,
-                        codes::CALL,
-                        format!("tuple() takes 0 to 1 positional argument(s) ({count} given)"),
-                    );
+                    // CPython rejects extra positional arguments only when the
+                    // call runs (`tuple() takes at most 1 argument (8 given)`).
+                    // A module that merely *defines* such a call still
+                    // imports, so keep the diagnostic at runtime instead of
+                    // refusing the program (CPython's `_code_definitions`
+                    // spells `tuple(a, b, ..., kwargs)` in an unused helper).
+                    self.force_any(out);
                     return;
                 }
                 if count == 1 {
@@ -5469,6 +5480,26 @@ fn emit_stmt(stmt: &HStmt, inf: &mut Infer) -> IrStmt {
             else_body,
             finally_body,
         } => StmtKind::Try {
+            body: emit_stmts(body, inf),
+            handlers: handlers
+                .iter()
+                .map(|h| IrHandler {
+                    exc: h.exc,
+                    exc_expr: h.exc_expr.as_ref().map(|e| emit_expr(e, inf)),
+                    binding: h.binding,
+                    binding_cell: h.binding_cell,
+                    body: emit_stmts(&h.body, inf),
+                })
+                .collect(),
+            else_body: emit_stmts(else_body, inf),
+            finally_body: emit_stmts(finally_body, inf),
+        },
+        HStmtKind::TryStar {
+            body,
+            handlers,
+            else_body,
+            finally_body,
+        } => StmtKind::TryStar {
             body: emit_stmts(body, inf),
             handlers: handlers
                 .iter()

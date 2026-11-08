@@ -14,6 +14,11 @@ regex = "1"
 num-bigint.workspace = true
 num-traits.workspace = true
 hydro-ir.workspace = true
+# Runtime `compile`/`exec`/`eval` parse dynamic source with the workspace
+# CPython-3.14 parser fork. `hydro-frontend` cannot be used here: its typed
+# lowering rejects the unbound-name programs `exec` must accept, and
+# `hydro-interp` already depends on this crate (cycle).
+rustpython-parser = { package = "hydro-python-parser", path = "../hydro-python-parser" }
 # HNA v1 descriptor layout and constants (contract only; no code at runtime).
 hydro-hna = { path = "../hydro-hna" }
 # Pure-Rust TLS for the native `ssl` module. `ring` avoids a system OpenSSL

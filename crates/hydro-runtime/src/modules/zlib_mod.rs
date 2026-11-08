@@ -44,7 +44,9 @@ use std::os::raw::{c_char, c_int, c_uint, c_ulong, c_void};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::core::globals;
-use crate::exc::{self, ATTRIBUTE_ERROR, EXCEPTION, MEMORY_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::exc::{
+    self, ATTRIBUTE_ERROR, EOF_ERROR, EXCEPTION, MEMORY_ERROR, TYPE_ERROR, VALUE_ERROR,
+};
 use crate::heap;
 use crate::value::{self, NONE};
 
@@ -131,6 +133,11 @@ extern "C" {
     fn deflate(strm: *mut ZStream, flush: c_int) -> c_int;
     fn deflateEnd(strm: *mut ZStream) -> c_int;
     fn deflateCopy(dest: *mut ZStream, source: *mut ZStream) -> c_int;
+    fn deflateSetDictionary(
+        strm: *mut ZStream,
+        dictionary: *const u8,
+        length: c_uint,
+    ) -> c_int;
     fn inflateInit2_(
         strm: *mut ZStream,
         window_bits: c_int,
@@ -243,16 +250,45 @@ fn argument(args: &[i64], index: usize) -> i64 {
     args.get(index).copied().unwrap_or(NONE)
 }
 
+/// Converts an integer argument, honouring the `__index__` protocol exactly
+/// like CPython's `PyArg_Parse` integer converters.
+fn index_value(value_arg: i64, name: &str) -> Result<i64, i64> {
+    if let Some(n) = value::as_integer(value_arg) {
+        return Ok(n);
+    }
+    if value::as_instance(value_arg).is_some() {
+        let result = crate::core::methods::call(
+            value_arg,
+            b"__index__".as_ptr(),
+            "__index__".len(),
+            0,
+            std::ptr::null(),
+        );
+        if exc::pending() {
+            if exc::pending_tag() == ATTRIBUTE_ERROR as i64 {
+                exc::clear();
+            } else {
+                return Err(NONE);
+            }
+        } else if let Some(n) = value::as_integer(result) {
+            return Ok(n);
+        } else {
+            return Err(type_error(&format!(
+                "__index__ returned non-int (type {})",
+                value::type_name_of(result)
+            )));
+        }
+    }
+    Err(type_error(&format!(
+        "'{name}' object cannot be interpreted as an integer"
+    )))
+}
+
 fn int_argument(value_arg: i64, name: &str, default: i64) -> Result<i64, i64> {
     if value_arg == NONE {
         return Ok(default);
     }
-    value::as_integer(value_arg).ok_or_else(|| {
-        type_error(&format!(
-            "argument '{name}' must be an integer, not '{}'",
-            value::type_name(value_arg)
-        ))
-    })
+    index_value(value_arg, name)
 }
 
 fn bytes_argument(value_arg: i64, name: &str) -> Result<Vec<u8>, i64> {
@@ -279,23 +315,85 @@ fn cached_class(key: &str, build: impl FnOnce() -> i64) -> i64 {
     class
 }
 
+fn param(name: &str, kind: hydro_ir::ParamKind, default: Option<i64>) -> value::ParamMeta {
+    value::ParamMeta {
+        name: name.to_string(),
+        kind,
+        default,
+    }
+}
+
+/// Builds a class method value with a real signature and full-argv trampoline.
+///
+/// The signature is what lets `call_user_method_kw` bind keywords (and reject
+/// them for positional-only slots) instead of rejecting every named argument;
+/// the trampoline receives the bound slot vector.
+fn method_function(
+    name: &'static str,
+    signature: Vec<value::ParamMeta>,
+    entry: usize,
+) -> i64 {
+    let function = value::native_function_new("zlib", name, usize::MAX);
+    value::function_set_signature(function, signature);
+    value::function_set_full_entry(function, entry);
+    function
+}
+
+fn compress_methods() -> Vec<(String, i64)> {
+    use hydro_ir::ParamKind::PosOnly;
+    vec![
+        (
+            "compress".to_string(),
+            method_function(
+                "_zlib_compress",
+                vec![
+                    param("self", PosOnly, None),
+                    param("data", PosOnly, None),
+                ],
+                compress_method_entry as *const () as usize,
+            ),
+        ),
+        (
+            "flush".to_string(),
+            method_function(
+                "_zlib_flush",
+                vec![
+                    param("self", PosOnly, None),
+                    param("mode", PosOnly, Some(encode_int(Z_FINISH as i64))),
+                ],
+                flush_method_entry as *const () as usize,
+            ),
+        ),
+        (
+            "copy".to_string(),
+            method_function(
+                "_zlib_copy",
+                vec![param("self", PosOnly, None)],
+                copy_method_entry as *const () as usize,
+            ),
+        ),
+        (
+            "__copy__".to_string(),
+            method_function(
+                "_zlib_copy",
+                vec![param("self", PosOnly, None)],
+                copy_method_entry as *const () as usize,
+            ),
+        ),
+        (
+            "__deepcopy__".to_string(),
+            method_function(
+                "_zlib_copy",
+                vec![param("self", PosOnly, None), param("memo", PosOnly, None)],
+                copy_method_entry_deep as *const () as usize,
+            ),
+        ),
+    ]
+}
+
 fn compress_class() -> i64 {
     cached_class("zlib.Compress", || {
-        let methods = vec![
-            (
-                "compress".to_string(),
-                value::native_function_new("zlib", "_zlib_compress", usize::MAX),
-            ),
-            (
-                "flush".to_string(),
-                value::native_function_new("zlib", "_zlib_flush", usize::MAX),
-            ),
-            (
-                "copy".to_string(),
-                value::native_function_new("zlib", "_zlib_copy", usize::MAX),
-            ),
-        ];
-        value::class_new("Compress".to_string(), NONE, methods)
+        value::class_new("Compress".to_string(), NONE, compress_methods())
     })
 }
 
@@ -304,43 +402,69 @@ fn compress_class() -> i64 {
 ///
 /// The `__init__` method carries a real signature (`wbits=MAX_WBITS,
 /// zdict=b''`) so keyword binding works; `decompressobj()` allocates the same
-/// state directly without going through it.
-fn decompress_methods() -> Vec<(String, i64)> {
-    let init = value::native_function_new("zlib", "_zlib_decompress_init", usize::MAX);
-    value::function_set_signature(
-        init,
+/// state directly without going through it. `default_max_length` mirrors the
+/// two C clinics: `zlib.Decompress.decompress(..., max_length=0)` treats 0 as
+/// "no limit", while `_ZlibDecompressor.decompress` defaults to -1 and an
+/// explicit 0 produces no output.
+fn decompress_methods(default_max_length: i64) -> Vec<(String, i64)> {
+    use hydro_ir::ParamKind::{PosOnly, Positional};
+    let init = method_function(
+        "_zlib_decompress_init",
         vec![
-            value::ParamMeta {
-                name: "self".to_string(),
-                kind: hydro_ir::ParamKind::Positional,
-                default: None,
-            },
-            value::ParamMeta {
-                name: "wbits".to_string(),
-                kind: hydro_ir::ParamKind::Positional,
-                default: Some(encode_int(MAX_WBITS)),
-            },
-            value::ParamMeta {
-                name: "zdict".to_string(),
-                kind: hydro_ir::ParamKind::Positional,
-                default: Some(NONE),
-            },
+            param("self", Positional, None),
+            param("wbits", Positional, Some(encode_int(MAX_WBITS))),
+            param("zdict", Positional, Some(NONE)),
         ],
+        decompress_init_entry as *const () as usize,
     );
-    value::function_set_full_entry(init, decompress_init_entry as *const () as usize);
     vec![
         ("__init__".to_string(), init),
         (
             "decompress".to_string(),
-            value::native_function_new("zlib", "_zlib_decompress", usize::MAX),
+            method_function(
+                "_zlib_decompress",
+                vec![
+                    param("self", PosOnly, None),
+                    param("data", PosOnly, None),
+                    param("max_length", Positional, Some(encode_int(default_max_length))),
+                ],
+                decompress_method_entry as *const () as usize,
+            ),
         ),
         (
             "flush".to_string(),
-            value::native_function_new("zlib", "_zlib_decompress_flush", usize::MAX),
+            method_function(
+                "_zlib_decompress_flush",
+                vec![
+                    param("self", PosOnly, None),
+                    param("length", PosOnly, Some(encode_int(DEF_BUF_SIZE as i64))),
+                ],
+                decompress_flush_entry as *const () as usize,
+            ),
         ),
         (
             "copy".to_string(),
-            value::native_function_new("zlib", "_zlib_decompress_copy", usize::MAX),
+            method_function(
+                "_zlib_decompress_copy",
+                vec![param("self", PosOnly, None)],
+                decompress_copy_entry as *const () as usize,
+            ),
+        ),
+        (
+            "__copy__".to_string(),
+            method_function(
+                "_zlib_decompress_copy",
+                vec![param("self", PosOnly, None)],
+                decompress_copy_entry as *const () as usize,
+            ),
+        ),
+        (
+            "__deepcopy__".to_string(),
+            method_function(
+                "_zlib_decompress_copy",
+                vec![param("self", PosOnly, None), param("memo", PosOnly, None)],
+                decompress_copy_entry_deep as *const () as usize,
+            ),
         ),
     ]
 }
@@ -348,7 +472,7 @@ fn decompress_methods() -> Vec<(String, i64)> {
 /// `type(decompressobj())`: CPython names this class `zlib.Decompress`.
 fn decompress_class() -> i64 {
     cached_class("zlib.Decompress", || {
-        value::class_new("Decompress".to_string(), NONE, decompress_methods())
+        value::class_new("Decompress".to_string(), NONE, decompress_methods(0))
     })
 }
 
@@ -356,31 +480,18 @@ fn decompress_class() -> i64 {
 /// `_decomp_factory` (`zlib._ZlibDecompressor(wbits=-MAX_WBITS)`).
 fn private_decompressor_class() -> i64 {
     cached_class("zlib._ZlibDecompressor", || {
-        value::class_new("_ZlibDecompressor".to_string(), NONE, decompress_methods())
+        value::class_new(
+            "_ZlibDecompressor".to_string(),
+            NONE,
+            decompress_methods(-1),
+        )
     })
 }
 
 /// `zlib._ZlibCompressor`: the mirror type for incremental compression.
 fn private_compressor_class() -> i64 {
     cached_class("zlib._ZlibCompressor", || {
-        value::class_new(
-            "_ZlibCompressor".to_string(),
-            NONE,
-            vec![
-                (
-                    "compress".to_string(),
-                    value::native_function_new("zlib", "_zlib_compress", usize::MAX),
-                ),
-                (
-                    "flush".to_string(),
-                    value::native_function_new("zlib", "_zlib_flush", usize::MAX),
-                ),
-                (
-                    "copy".to_string(),
-                    value::native_function_new("zlib", "_zlib_copy", usize::MAX),
-                ),
-            ],
-        )
+        value::class_new("_ZlibCompressor".to_string(), NONE, compress_methods())
     })
 }
 
@@ -433,6 +544,9 @@ impl Drop for DeflateStream {
 struct InflateStream {
     stream: Box<ZStream>,
     eof: bool,
+    /// `flush()` reached the end of the stream, so CPython has released the
+    /// inflate state; `copy()` refuses to duplicate it.
+    finished: bool,
     unused: Vec<u8>,
     tail: Vec<u8>,
     zdict: Vec<u8>,
@@ -507,10 +621,10 @@ fn attribute_snapshot(state: &InflateStream) -> (Vec<u8>, Vec<u8>, bool) {
 /// Stores the derived `Decompress` attributes. The first new string object is
 /// rooted across the second allocation.
 fn store_attributes(instance: i64, unused: Vec<u8>, tail: Vec<u8>, eof: bool) {
-    // `_ZlibDecompressor.needs_input` is true while no unconsumed input is
-    // buffered. Only instances constructed through that class carry the
-    // attribute; `decompressobj()` instances keep CPython's attribute set.
-    let needs_input = tail.is_empty();
+    // CPython's `_ZlibDecompressor` reports `needs_input = 0` once the stream
+    // reached EOF (the remaining data, if any, goes to `unused_data`), and
+    // otherwise true only while no unconsumed input is buffered.
+    let needs_input = !eof && tail.is_empty();
     let unused = value::bytes_new(unused);
     let roots = heap::root_values(&[unused]);
     let tail = value::bytes_new(tail);
@@ -829,7 +943,7 @@ fn decompress(args: &[i64]) -> i64 {
 }
 
 /// `zlib.compressobj(level=-1, method=DEFLATED, wbits=MAX_WBITS,
-/// memLevel=DEF_MEM_LEVEL, strategy=Z_DEFAULT_STRATEGY)`.
+/// memLevel=DEF_MEM_LEVEL, strategy=Z_DEFAULT_STRATEGY, zdict=b'')`.
 fn compressobj(args: &[i64]) -> i64 {
     let level = match int_argument(argument(args, 0), "level", Z_DEFAULT_COMPRESSION) {
         Ok(level) => level,
@@ -851,7 +965,14 @@ fn compressobj(args: &[i64]) -> i64 {
         Ok(strategy) => strategy,
         Err(error) => return error,
     };
-    let stream = match init_deflate(
+    let zdict = match argument(args, 5) {
+        NONE => Vec::new(),
+        value_arg => match bytes_argument(value_arg, "zdict") {
+            Ok(dictionary) => dictionary,
+            Err(error) => return error,
+        },
+    };
+    let mut stream = match init_deflate(
         level as c_int,
         wbits as c_int,
         mem_level as c_int,
@@ -870,6 +991,21 @@ fn compressobj(args: &[i64]) -> i64 {
             };
         }
     };
+    // A preset dictionary must be installed before the first `deflate` call,
+    // for both raw and wrapped streams. libz accepts an empty one as a no-op.
+    if !zdict.is_empty() {
+        // SAFETY: `stream` is initialised and the dictionary buffer outlives
+        // the call.
+        let status = unsafe {
+            deflateSetDictionary(&mut *stream, zdict.as_ptr(), zdict.len() as c_uint)
+        };
+        if status != Z_OK {
+            return match status {
+                Z_STREAM_ERROR => value_error("Invalid dictionary"),
+                _ => value_error("deflateSetDictionary()"),
+            };
+        }
+    }
     let handle = register(Stream::Deflate(DeflateStream {
         stream,
         finished: false,
@@ -935,6 +1071,7 @@ fn inflate_state(wbits: i64, zdict: Vec<u8>) -> Result<u64, i64> {
     let mut state = InflateStream {
         stream,
         eof: false,
+        finished: false,
         unused: Vec::new(),
         tail: Vec::new(),
         zdict,
@@ -1081,7 +1218,7 @@ fn flush_method(args: &[i64]) -> i64 {
     }
 }
 
-/// `Compress.copy()`.
+/// `Compress.copy()` / `__copy__` / `__deepcopy__`.
 fn copy_method(args: &[i64]) -> i64 {
     let instance = argument(args, 0);
     let handle = match handle_of(instance) {
@@ -1090,25 +1227,29 @@ fn copy_method(args: &[i64]) -> i64 {
     };
     let class = value::instance_class_value(instance).unwrap_or_else(compress_class);
     let mut registry = registry();
-    let outcome = match registry.streams.get_mut(&handle) {
+    let outcome: Result<Stream, i64> = match registry.streams.get_mut(&handle) {
         Some(Stream::Deflate(state)) if !state.finished => {
             let mut copy = new_stream();
             // SAFETY: both streams are valid; `deflateCopy` duplicates the
             // internal state owned by `state`.
             let status = unsafe { deflateCopy(&mut *copy, &mut *state.stream) };
-            if status != Z_OK {
-                Err(Failure::from_stream(&state.stream, status))
-            } else {
-                Ok(Stream::Deflate(DeflateStream {
+            match status {
+                Z_OK => Ok(Stream::Deflate(DeflateStream {
                     stream: copy,
                     finished: false,
-                }))
+                })),
+                Z_STREAM_ERROR => Err(value_error("Inconsistent stream state")),
+                Z_MEM_ERROR => Err(exc::raise_with_message(
+                    MEMORY_ERROR,
+                    "Can't allocate memory for compression object",
+                )),
+                _ => Err(stream_error(
+                    &Failure::from_stream(&state.stream, status),
+                    "copying compression object",
+                )),
             }
         }
-        _ => Err(Failure {
-            status: Z_STREAM_ERROR,
-            message: "inconsistent stream state".to_string(),
-        }),
+        _ => Err(value_error("Inconsistent stream state")),
     };
     drop(registry);
     match outcome {
@@ -1118,32 +1259,67 @@ fn copy_method(args: &[i64]) -> i64 {
             attach_handle(instance, handle);
             instance
         }
-        Err(failure) => stream_error(&failure, "copying"),
+        Err(error) => error,
     }
 }
 
-/// `Decompress.decompress(data, max_length=0)`.
+/// `Decompress.decompress(data, max_length=0)` and
+/// `_ZlibDecompressor.decompress(data, max_length=-1)`.
+///
+/// The two C clinics differ: `zlib.Decompress` rejects a negative limit and
+/// maps 0 to "no limit", while `_ZlibDecompressor` accepts negative limits and
+/// an explicit 0 allocates a zero-length output buffer (returning b'' while
+/// buffering the input). It also raises `EOFError` once the stream ended.
 fn decompress_method(args: &[i64]) -> i64 {
     let instance = argument(args, 0);
     let data = match bytes_argument(argument(args, 1), "data") {
         Ok(data) => data,
         Err(error) => return error,
     };
-    let max_length = match int_argument(argument(args, 2), "max_length", 0) {
-        Ok(max_length) => max_length,
-        Err(error) => return error,
+    let is_incremental = value::type_name_of(instance) == "_ZlibDecompressor";
+    let max_arg = argument(args, 2);
+    let max_length = if max_arg == NONE {
+        None
+    } else {
+        match index_value(max_arg, "max_length") {
+            Ok(limit) => Some(limit),
+            Err(error) => return error,
+        }
     };
-    if max_length < 0 {
-        return value_error("max_length must be greater than or equal to zero");
-    }
+    let limit: Option<usize> = if is_incremental {
+        match max_length {
+            Some(limit) if limit > 0 => Some(limit as usize),
+            _ => None,
+        }
+    } else {
+        match max_length {
+            Some(limit) if limit < 0 => {
+                return value_error("max_length must be non-negative")
+            }
+            Some(limit) if limit > 0 => Some(limit as usize),
+            _ => None,
+        }
+    };
+    let buffer_only = is_incremental && max_length == Some(0);
     let handle = match handle_of(instance) {
         Ok(handle) => handle,
         Err(error) => return error,
     };
+    let mut eof_raise = false;
     let (outcome, snapshot) = {
         let mut registry = registry();
         let outcome = match registry.streams.get_mut(&handle) {
-            Some(Stream::Inflate(state)) => decompress_into(state, &data, max_length as usize),
+            Some(Stream::Inflate(state)) => {
+                if state.eof && is_incremental {
+                    eof_raise = true;
+                    Ok(Vec::new())
+                } else if buffer_only {
+                    state.tail.extend_from_slice(&data);
+                    Ok(Vec::new())
+                } else {
+                    decompress_into(state, &data, limit)
+                }
+            }
             _ => Err(Failure {
                 status: Z_STREAM_ERROR,
                 message: "inconsistent stream state".to_string(),
@@ -1155,6 +1331,9 @@ fn decompress_method(args: &[i64]) -> i64 {
         };
         (outcome, snapshot)
     };
+    if eof_raise {
+        return exc::raise_with_message(EOF_ERROR, "End of stream already reached");
+    }
     if let Some((unused, tail, eof)) = snapshot {
         store_attributes(instance, unused, tail, eof);
     }
@@ -1165,10 +1344,11 @@ fn decompress_method(args: &[i64]) -> i64 {
 }
 
 /// Streaming inflate with CPython's `max_length`/`unconsumed_tail` semantics.
+/// `None` means an unlimited call.
 fn decompress_into(
     state: &mut InflateStream,
     data: &[u8],
-    max_length: usize,
+    max_length: Option<usize>,
 ) -> Result<Vec<u8>, Failure> {
     // Data arriving after end-of-stream is preserved as `unused_data`.
     if state.eof {
@@ -1181,7 +1361,7 @@ fn decompress_into(
     let mut cursor = 0usize;
     let mut dictionary_set = false;
     loop {
-        if max_length > 0 && out.len() >= max_length {
+        if max_length.is_some_and(|limit| out.len() >= limit) {
             break;
         }
         if state.stream.avail_in == 0 && cursor < input.len() {
@@ -1191,10 +1371,9 @@ fn decompress_into(
             state.stream.avail_in = take as c_uint;
             cursor += take;
         }
-        let want = if max_length > 0 {
-            (max_length - out.len()).min(OUT_CHUNK)
-        } else {
-            OUT_CHUNK
+        let want = match max_length {
+            Some(limit) => (limit - out.len()).min(OUT_CHUNK),
+            None => OUT_CHUNK,
         };
         let mut buffer = vec![0u8; want];
         state.stream.next_out = buffer.as_mut_ptr();
@@ -1291,6 +1470,9 @@ fn decompress_flush(args: &[i64]) -> i64 {
 
 fn flush_inflate(state: &mut InflateStream, hint: usize) -> Result<Vec<u8>, Failure> {
     if state.eof {
+        // CPython released the inflate state when the stream ended; a second
+        // flush is a no-op.
+        state.finished = true;
         return Ok(Vec::new());
     }
     // `flush` also drains the input a limited `decompress` call left behind.
@@ -1363,13 +1545,14 @@ fn flush_inflate(state: &mut InflateStream, hint: usize) -> Result<Vec<u8>, Fail
         state.unused.extend_from_slice(&leftover);
         state.tail.clear();
         state.eof = true;
+        state.finished = true;
     } else {
         state.tail = leftover;
     }
     Ok(out)
 }
 
-/// `Decompress.copy()`.
+/// `Decompress.copy()` / `__copy__` / `__deepcopy__`.
 fn decompress_copy(args: &[i64]) -> i64 {
     let instance = argument(args, 0);
     let handle = match handle_of(instance) {
@@ -1378,28 +1561,33 @@ fn decompress_copy(args: &[i64]) -> i64 {
     };
     let class = value::instance_class_value(instance).unwrap_or_else(decompress_class);
     let mut registry = registry();
-    let outcome = match registry.streams.get_mut(&handle) {
-        Some(Stream::Inflate(state)) => {
+    let outcome: Result<Stream, i64> = match registry.streams.get_mut(&handle) {
+        Some(Stream::Inflate(state)) if !state.finished => {
             let mut copy = new_stream();
             // SAFETY: both streams are valid; `inflateCopy` duplicates the
             // internal state owned by `state`.
             let status = unsafe { inflateCopy(&mut *copy, &mut *state.stream) };
-            if status != Z_OK {
-                Err(Failure::from_stream(&state.stream, status))
-            } else {
-                Ok(Stream::Inflate(InflateStream {
+            match status {
+                Z_OK => Ok(Stream::Inflate(InflateStream {
                     stream: copy,
                     eof: state.eof,
+                    finished: false,
                     unused: state.unused.clone(),
                     tail: state.tail.clone(),
                     zdict: state.zdict.clone(),
-                }))
+                })),
+                Z_STREAM_ERROR => Err(value_error("Inconsistent stream state")),
+                Z_MEM_ERROR => Err(exc::raise_with_message(
+                    MEMORY_ERROR,
+                    "Can't allocate memory for decompression object",
+                )),
+                _ => Err(stream_error(
+                    &Failure::from_stream(&state.stream, status),
+                    "copying decompression object",
+                )),
             }
         }
-        _ => Err(Failure {
-            status: Z_STREAM_ERROR,
-            message: "inconsistent stream state".to_string(),
-        }),
+        _ => Err(value_error("Inconsistent stream state")),
     };
     drop(registry);
     match outcome {
@@ -1416,8 +1604,54 @@ fn decompress_copy(args: &[i64]) -> i64 {
             }
             instance
         }
-        Err(failure) => stream_error(&failure, "copying"),
+        Err(error) => error,
     }
+}
+
+// -------------------------------------------------------------------------
+// Full-argv trampolines for the class methods
+// -------------------------------------------------------------------------
+
+extern "C" fn compress_method_entry(argv: *const i64) -> i64 {
+    // SAFETY: the bound method call passes the signature's two slots.
+    compress_method(unsafe { std::slice::from_raw_parts(argv, 2) })
+}
+
+extern "C" fn flush_method_entry(argv: *const i64) -> i64 {
+    // SAFETY: the bound method call passes the signature's two slots.
+    flush_method(unsafe { std::slice::from_raw_parts(argv, 2) })
+}
+
+extern "C" fn copy_method_entry(argv: *const i64) -> i64 {
+    // SAFETY: the bound method call passes the receiver slot.
+    copy_method(unsafe { std::slice::from_raw_parts(argv, 1) })
+}
+
+extern "C" fn copy_method_entry_deep(argv: *const i64) -> i64 {
+    // SAFETY: `__deepcopy__` receives the receiver and the memo; `copy_method`
+    // only reads the receiver.
+    copy_method(unsafe { std::slice::from_raw_parts(argv, 2) })
+}
+
+extern "C" fn decompress_method_entry(argv: *const i64) -> i64 {
+    // SAFETY: the bound method call passes self, data and max_length.
+    decompress_method(unsafe { std::slice::from_raw_parts(argv, 3) })
+}
+
+extern "C" fn decompress_flush_entry(argv: *const i64) -> i64 {
+    // SAFETY: the bound method call passes self and length.
+    decompress_flush(unsafe { std::slice::from_raw_parts(argv, 2) })
+}
+
+extern "C" fn decompress_copy_entry(argv: *const i64) -> i64 {
+    // SAFETY: the bound method call passes the receiver slot.
+    decompress_copy(unsafe { std::slice::from_raw_parts(argv, 1) })
+}
+
+extern "C" fn decompress_copy_entry_deep(argv: *const i64) -> i64 {
+    // SAFETY: `__deepcopy__` receives the receiver and the memo; the copy body
+    // only reads the receiver.
+    decompress_copy(unsafe { std::slice::from_raw_parts(argv, 2) })
 }
 
 // -------------------------------------------------------------------------
@@ -1444,6 +1678,7 @@ pub(crate) fn constant(name: &str) -> i64 {
         "Z_DEFAULT_COMPRESSION" => encode_int(Z_DEFAULT_COMPRESSION),
         "DEFLATED" => encode_int(DEFLATED),
         "DEF_MEM_LEVEL" => encode_int(DEF_MEM_LEVEL),
+        "DEF_BUF_SIZE" => encode_int(DEF_BUF_SIZE as i64),
         "MAX_WBITS" => encode_int(MAX_WBITS),
         "Z_DEFAULT_STRATEGY" => encode_int(i64::from(Z_DEFAULT_STRATEGY)),
         "Z_FILTERED" => encode_int(1),

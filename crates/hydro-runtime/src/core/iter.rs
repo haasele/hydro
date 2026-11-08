@@ -126,6 +126,7 @@ pub(crate) fn iter_new(obj: i64) -> i64 {
         || value::as_defaultdict(obj).is_some()
         || value::as_tuple(obj).is_some()
         || value::as_set(obj).is_some()
+        || value::as_namespace(obj).is_some()
         || value::as_range(obj).is_some()
         || value::as_file(obj).is_some()
         || value::as_csv_reader(obj).is_some()
@@ -151,6 +152,47 @@ pub(crate) fn iter_of(obj: i64) -> i64 {
     } else {
         iter_new(obj)
     }
+}
+
+/// Remaining items an ordinary runtime iterator will yield, when its target
+/// exposes a stable length. This powers `operator.length_hint`,
+/// `list_iterator.__length_hint__` and the pre-allocation hints CPython gives
+/// `list()`/`tuple()`.
+///
+/// Callable iterators, exhausted iterators and targets without a known length
+/// return `None`.
+pub(crate) fn length_hint(iter: i64) -> Option<usize> {
+    let state = value::as_iter(iter)?;
+    if state.from_callable {
+        return None;
+    }
+    let target = state.target;
+    let len = if let Some(items) = value::as_list(target) {
+        items.len()
+    } else if let Some(items) = value::as_tuple(target) {
+        items.len()
+    } else if let Some(text) = value::as_str(target) {
+        text.chars().count()
+    } else if let Some(bytes) = value::as_bytes(target) {
+        bytes.len()
+    } else if let Some(view) = value::as_memoryview(target) {
+        view.len()
+    } else if let Some(view) = value::as_dict_view(target) {
+        crate::core::container::dict_view_len(view)
+    } else if let Some(pairs) = value::as_dict(target) {
+        pairs.len()
+    } else if let Some((pairs, _)) = value::as_defaultdict(target) {
+        pairs.len()
+    } else if let Some(items) = value::as_set(target) {
+        items.len()
+    } else if let Some(pairs) = value::as_namespace(target) {
+        pairs.len()
+    } else if let Some((start, stop, step)) = value::as_range(target) {
+        value::range_len(start, stop, step) as usize
+    } else {
+        return None;
+    };
+    Some(len.saturating_sub(state.index))
 }
 
 /// `iter(callable, sentinel)`: an iterator that calls `callable()` on every
@@ -296,6 +338,12 @@ pub(crate) fn iter_next(iter: i64, out: *mut i64) -> i64 {
         bytes
             .get(state.index)
             .map(|byte| crate::ops::int_result(*byte as i64))
+    } else if let Some(pairs) = value::as_namespace(target) {
+        // A native namespace iterates its attribute names (its `__dict__`
+        // keys), like `vars(namespace)`.
+        pairs
+            .get(state.index)
+            .map(|(name, _)| value::str_alloc(name.clone()))
     } else if let Some(pairs) = value::as_dict(target) {
         pairs.get(state.index).map(|(key, _)| *key)
     } else if let Some((pairs, _)) = value::as_defaultdict(target) {

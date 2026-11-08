@@ -58,9 +58,15 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
 }
 
 /// Materialises a `importlib.resources` module constant.
+///
+/// `ResourceReader` and `TraversableResources` are the `importlib.resources.abc`
+/// interfaces CPython 3.14 re-exports/keeps; the class values are shared with
+/// `importlib.abc` so `isinstance` checks work across both spellings.
 pub(crate) fn constant(name: &str) -> i64 {
     match name {
         "Traversable" => traversable_class(),
+        "ResourceReader" => super::importlib_machinery::resource_reader_class(),
+        "TraversableResources" => super::importlib_machinery::traversable_resources_class(),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module '{MODULE}' has no attribute '{name}'"),

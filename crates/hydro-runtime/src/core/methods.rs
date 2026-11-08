@@ -59,6 +59,9 @@ pub(crate) fn call(
     argc: usize,
     argv: *const i64,
 ) -> i64 {
+    let Some(_recursion) = crate::fiber::enter_python_call() else {
+        return crate::fiber::recursion_error();
+    };
     let Some(method) = decode_name(name, name_len) else {
         return attribute_error(obj, "");
     };
@@ -237,6 +240,12 @@ pub(crate) fn call(
             crate::fiber::FiberKind::Coroutine => coroutine_method(obj, &method, &args),
         };
     }
+    if value::as_iter(obj).is_some() {
+        return iter_method(obj, &method, &args);
+    }
+    if value::as_float(obj).is_some() {
+        return float_method(obj, &method, &args);
+    }
     if let Some(s) = value::as_str(obj) {
         // Copy the receiver before any allocation: a reference into a heap
         // object must not be read after an allocation that may collect.
@@ -371,6 +380,32 @@ pub(crate) fn call(
     if is_builtin_type_type(obj) {
         return type_class_method(obj, &method, &args, &[]);
     }
+    // Class-protocol slots of a builtin type spelling reached through a
+    // method call (`int.mro()`), which does not read the attribute first.
+    if let Some(native) = value::builtin_type_class(obj) {
+        match method.as_str() {
+            "mro" => {
+                if let Some(err) = check_arity("type", &method, args.len(), 0, 0) {
+                    return err;
+                }
+                return value::list_new(value::class_mro(native));
+            }
+            "__mro__" => return value::tuple_new(value::class_mro(native)),
+            "__bases__" => {
+                return value::tuple_new(
+                    value::as_class(native)
+                        .map(|class| class.bases.clone())
+                        .unwrap_or_default(),
+                )
+            }
+            "__base__" => {
+                return value::as_class(native)
+                    .and_then(|class| class.bases.first().copied())
+                    .unwrap_or(NONE)
+            }
+            _ => {}
+        }
+    }
     // Unbound methods of builtin type spellings: `str.islower("ABC")`,
     // `list.append(items, 1)`. The first argument is the receiver, exactly
     // like CPython's method descriptors. Only documented method names reach
@@ -424,6 +459,16 @@ pub(crate) fn call(
 /// `__init__` case and, with the C3 linearization, now follows the full MRO
 /// (so diamond hierarchies reach the shared ancestor exactly once).
 fn super_init(obj: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    // Native exception instances carry their `__init__` in the exception core,
+    // not in the frozen class namespace, so `class_lookup_after` would stop at
+    // `object.__init__` and reject the arguments. BaseException.__init__
+    // accepts any positional arguments (it stores them as `self.args`).
+    if value::exception_data(obj).is_some() {
+        if !keywords.is_empty() {
+            return type_error("BaseException.__init__() takes no keyword arguments".to_string());
+        }
+        return crate::exc::exception_method_call(obj, "__init__", args).unwrap_or(NONE);
+    }
     let Some(class) = value::instance_class_value(obj) else {
         return type_error("super(): __self__ is not a class instance".to_string());
     };
@@ -1822,6 +1867,37 @@ pub(crate) fn call_kw(
         }
         return list_method(obj, &method, args.as_slice());
     }
+    if value::as_dict(obj).is_some() {
+        match method.as_str() {
+            // `d.update([source], **kwargs)`: keywords are entries layered on
+            // top of the positional source, with later keys winning.
+            "update" => {
+                if args.len() > 1 {
+                    return type_error(format!(
+                        "update expected at most 1 argument, got {}",
+                        args.len()
+                    ));
+                }
+                if let Some(&source) = args.first() {
+                    let result = dict_method(obj, "update", &[source]);
+                    if exc::pending() {
+                        return result;
+                    }
+                }
+                for (name, item) in &keywords.items {
+                    let key = value::str_alloc(name.clone());
+                    let roots = crate::heap::root_values(&[key, *item]);
+                    let result = container::dict_set(obj, key, *item);
+                    crate::heap::release_roots(roots);
+                    if exc::pending() {
+                        return result;
+                    }
+                }
+                return NONE;
+            }
+            _ => return keywords.reject("dict", &method),
+        }
+    }
     if let Some(s) = value::as_str(obj) {
         return str_method_kw(obj, s.to_string(), &method, &mut args, &keywords);
     }
@@ -2278,7 +2354,8 @@ fn builtin_type_repr(name: &'static str) -> i64 {
 /// `test_index` calls it directly).
 fn builtin_type_method_names(name: &str) -> Option<&'static [&'static str]> {
     /// `bool` inherits `int`'s method surface.
-    const INT_METHODS: &[&str] = &["__index__", "bit_length", "from_bytes", "to_bytes"];
+    const INT_METHODS: &[&str] =
+        &["__index__", "__round__", "bit_length", "from_bytes", "to_bytes"];
     Some(match name {
         "int" | "bool" => INT_METHODS,
         "str" => &[
@@ -2887,6 +2964,15 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
     // because Hydro keeps no module provenance or annotation payload; every
     // other name falls back to the function's live `__dict__`.
     if let Some(function) = value::as_function(obj) {
+        // `@abstractmethod` marks the function in `abc`'s side registry
+        // (CPython stores the flag in the function's `__dict__`). Expose it
+        // as the read-only marker attribute `abc` inspects.
+        if attr == "__isabstractmethod__" {
+            let marked = crate::core::globals::registry_get("abc.abstract")
+                .and_then(value::as_list)
+                .is_some_and(|items| items.contains(&obj));
+            return value::bool_value(marked);
+        }
         // Builtin type values expose the same stable `__repr__` callable as
         // their native classes; `pprint` keys its dispatch table on
         // `dict.__repr__` and compares classes by identity.
@@ -3232,6 +3318,12 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         ) {
             return value::bound_method_new(obj, attr.to_string());
         }
+        // Match data attributes (`.string`, `.re`, `.pos`, `.endpos`,
+        // `.lastindex`, `.lastgroup`, `.regs`) live in the native match
+        // state; `calendar`/`_strptime` read `.string`.
+        if let Some(result) = crate::modules::re::match_attr(obj, attr) {
+            return result;
+        }
         return attribute_error(obj, attr);
     }
     if let Some(class) = value::instance_class_value(obj) {
@@ -3466,6 +3558,17 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         return attribute_error(obj, attr);
     }
     if let Some(state) = value::as_descriptor(obj) {
+        // `classmethod`/`staticmethod` proxy `__isabstractmethod__` from the
+        // callable they wrap, like CPython's descriptor types.
+        if attr == "__isabstractmethod__"
+            && matches!(
+                state.kind,
+                value::DescriptorKind::Classmethod | value::DescriptorKind::Staticmethod
+            )
+        {
+            let target = state.target;
+            return getattr_named(target, attr);
+        }
         // `property` exposes `getter`/`setter`/`deleter` returning new
         // property objects, its `fget`/`fset`/`fdel` slots, the descriptor
         // protocol (`__get__`/`__set__`/`__delete__`, `__set_name__`) and the
@@ -3551,6 +3654,24 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         return match attr {
             "mapping" => view.dict,
             "__len__" | "__iter__" | "__contains__" | "isdisjoint" => {
+                value::bound_method_new(obj, attr.to_string())
+            }
+            _ => attribute_error(obj, attr),
+        };
+    }
+    if value::as_iter(obj).is_some() {
+        return match attr {
+            "__next__" | "__iter__" | "__length_hint__" | "__setstate__" | "__reduce__" => {
+                value::bound_method_new(obj, attr.to_string())
+            }
+            _ => attribute_error(obj, attr),
+        };
+    }
+    if value::as_float(obj).is_some() {
+        return match attr {
+            "real" => obj,
+            "imag" => value::float_new(0.0),
+            "__round__" | "__getnewargs__" | "conjugate" | "is_integer" => {
                 value::bound_method_new(obj, attr.to_string())
             }
             _ => attribute_error(obj, attr),
@@ -4889,8 +5010,37 @@ fn int_method(obj: i64, method: &str, args: &[i64], keywords: &[(String, i64)]) 
         "to_bytes" => int_to_bytes(obj, args, keywords),
         "bit_length" => int_bit_length(obj, args, keywords),
         "__index__" => int_index(obj, args, keywords),
+        "__round__" => int_round(obj, args, keywords),
         _ => attribute_error(obj, method),
     }
+}
+
+/// `int.__round__([ndigits])`: rounds to `ndigits` decimal places, returning an
+/// exact `int` for every `ndigits` (CPython's `int.__round__` never produces a
+/// float). An omitted or `None` `ndigits` returns the integer unchanged.
+fn int_round(obj: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let mut ndigits = NONE;
+    if args.len() > 1 {
+        return type_error(format!(
+            "__round__() takes at most 1 argument ({} given)",
+            args.len()
+        ));
+    }
+    if let Some(&first) = args.first() {
+        ndigits = first;
+    }
+    for (name, item) in keywords {
+        if name != "ndigits" {
+            return type_error(format!(
+                "__round__() got an unexpected keyword argument '{name}'"
+            ));
+        }
+        if !args.is_empty() {
+            return type_error("__round__() got multiple values for argument 'ndigits'".to_string());
+        }
+        ndigits = *item;
+    }
+    builtins::round_value(obj, ndigits)
 }
 
 /// `int.__index__()`: an exact integer is its own index, but `bool` is not an
@@ -5396,6 +5546,137 @@ fn push_casefolded(out: &mut String, ch: char) {
         out.push_str(CASEFOLD_EXCEPTIONS[index].1);
     } else {
         out.extend(ch.to_lowercase());
+    }
+}
+
+/// CPython's `str.isidentifier`: an XID_Start (or underscore) followed by
+/// XID_Continue characters. Rust's `char::is_alphanumeric` covers the
+/// alphabetic and decimal classes Python's identifier grammar uses.
+fn is_python_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(ch) if ch == '_' || ch.is_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+}
+
+/// CPython's `str.istitle`: at least one cased character, every uppercase
+/// followed by an uncased character or the start, every lowercase preceded by
+/// a cased character.
+fn is_title_case(text: &str) -> bool {
+    let mut cased = false;
+    let mut previous_cased = false;
+    for ch in text.chars() {
+        let upper = ch.is_uppercase();
+        let lower = ch.is_lowercase();
+        if upper || lower {
+            if previous_cased {
+                if upper {
+                    return false;
+                }
+            } else if lower {
+                return false;
+            }
+            previous_cased = true;
+            cased = true;
+        } else {
+            previous_cased = false;
+        }
+    }
+    cased
+}
+
+/// Methods of native `float` values: rounding, conjugation, integrality and
+/// pickling support.
+fn float_method(obj: i64, method: &str, args: &[i64]) -> i64 {
+    match method {
+        "__round__" => {
+            if let Some(err) = check_arity("float", method, args.len(), 0, 1) {
+                return err;
+            }
+            builtins::round_value(obj, args.first().copied().unwrap_or(NONE))
+        }
+        "__getnewargs__" => {
+            if let Some(err) = check_arity("float", method, args.len(), 0, 0) {
+                return err;
+            }
+            value::tuple_new(vec![obj])
+        }
+        "conjugate" => {
+            if let Some(err) = check_arity("float", method, args.len(), 0, 0) {
+                return err;
+            }
+            obj
+        }
+        "is_integer" => {
+            if let Some(err) = check_arity("float", method, args.len(), 0, 0) {
+                return err;
+            }
+            let finite = value::as_float(obj).is_some_and(|f| f.is_finite() && f.fract() == 0.0);
+            value::bool_value(finite)
+        }
+        _ => attribute_error(obj, method),
+    }
+}
+
+/// Methods of builtin iterator objects: `__next__`, `__iter__`,
+/// `__length_hint__` (the remaining-item count) and pickle's
+/// `__setstate__`/`__reduce__`.
+fn iter_method(obj: i64, method: &str, args: &[i64]) -> i64 {
+    match method {
+        "__next__" => {
+            if let Some(err) = check_arity("iterator", method, args.len(), 0, 0) {
+                return err;
+            }
+            crate::core::iter::next_value(obj, NONE, false)
+        }
+        "__iter__" => {
+            if let Some(err) = check_arity("iterator", method, args.len(), 0, 0) {
+                return err;
+            }
+            obj
+        }
+        "__length_hint__" => {
+            if let Some(err) = check_arity("iterator", method, args.len(), 0, 0) {
+                return err;
+            }
+            ops::int_result(crate::core::iter::length_hint(obj).unwrap_or(0) as i64)
+        }
+        "__setstate__" => {
+            if let Some(err) = check_arity("iterator", method, args.len(), 1, 1) {
+                return err;
+            }
+            let Some(index) = value::as_integer(args[0]).filter(|index| *index >= 0) else {
+                return type_error("iterator state must be an index".to_string());
+            };
+            match value::iter_state_mut(obj) {
+                Some(state) => {
+                    state.index = index as usize;
+                    state.exhausted = false;
+                    NONE
+                }
+                None => type_error("object is not an iterator".to_string()),
+            }
+        }
+        "__reduce__" => {
+            if let Some(err) = check_arity("iterator", method, args.len(), 0, 0) {
+                return err;
+            }
+            let Some(state) = value::as_iter(obj) else {
+                return type_error("object is not an iterator".to_string());
+            };
+            let target = state.target;
+            let index = ops::int_result(state.index as i64);
+            // `(iter, (target,), state)`; `iter(target)` rebuilds the iterator
+            // and `__setstate__` restores the position.
+            value::tuple_new(vec![
+                value::native_function_new("builtins", "iter", 1),
+                value::tuple_new(vec![target]),
+                index,
+            ])
+        }
+        _ => attribute_error(obj, method),
     }
 }
 
@@ -6077,6 +6358,45 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
             // CPython semantics: every character is at most U+007F. The empty
             // string is ASCII.
             value::bool_value(s.is_ascii())
+        }
+        "isidentifier" => {
+            if let Some(err) = check_arity("str", method, args.len(), 0, 0) {
+                return err;
+            }
+            value::bool_value(is_python_identifier(&s))
+        }
+        "isdecimal" | "isnumeric" => {
+            if let Some(err) = check_arity("str", method, args.len(), 0, 0) {
+                return err;
+            }
+            let decimal = method == "isdecimal";
+            value::bool_value(
+                !s.is_empty()
+                    && s.chars().all(|ch| {
+                        if decimal {
+                            ch.is_ascii_digit()
+                        } else {
+                            ch.is_numeric()
+                        }
+                    }),
+            )
+        }
+        "isprintable" => {
+            if let Some(err) = check_arity("str", method, args.len(), 0, 0) {
+                return err;
+            }
+            // CPython excludes control characters, separators other than the
+            // ASCII space, and unassigned code points.
+            value::bool_value(
+                s.chars()
+                    .all(|ch| ch == ' ' || (!ch.is_control() && ch != '\u{00A0}')),
+            )
+        }
+        "istitle" => {
+            if let Some(err) = check_arity("str", method, args.len(), 0, 0) {
+                return err;
+            }
+            value::bool_value(is_title_case(&s))
         }
         // CPython semantics: at least one cased character, and no character
         // of the opposite case. Uncased characters (digits, punctuation) are
@@ -7580,7 +7900,7 @@ fn copy_set(obj: i64) -> i64 {
 fn set_operand(operand: i64) -> Result<i64, i64> {
     let result = value::set_new(Vec::new());
     for_each_element(operand, |item| {
-        if let Some(err) = check_hashable(item) {
+        if let Some(err) = check_set_hashable(item) {
             return Err(err);
         }
         container::insert_set_item(result, item);
@@ -7594,7 +7914,7 @@ fn set_operand(operand: i64) -> Result<i64, i64> {
 /// earlier elements in place, as in CPython.
 fn set_update_from(target: i64, operand: i64) -> Result<(), i64> {
     for_each_element(operand, |item| {
-        if let Some(err) = check_hashable(item) {
+        if let Some(err) = check_set_hashable(item) {
             return Err(err);
         }
         container::insert_set_item(target, item);
@@ -7665,7 +7985,7 @@ fn set_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 return err;
             }
             let item = args[0];
-            if let Some(err) = check_hashable(item) {
+            if let Some(err) = check_set_hashable(item) {
                 return err;
             }
             let found =
@@ -7683,7 +8003,7 @@ fn set_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 return err;
             }
             let item = args[0];
-            if let Some(err) = check_hashable(item) {
+            if let Some(err) = check_set_hashable(item) {
                 return err;
             }
             container::insert_set_item(obj, item);
@@ -7694,7 +8014,7 @@ fn set_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 return err;
             }
             let item = args[0];
-            if let Some(err) = check_hashable(item) {
+            if let Some(err) = check_set_hashable(item) {
                 return err;
             }
             let position = value::as_set(obj).and_then(|items| container::set_find(items, item));
@@ -7833,7 +8153,7 @@ fn set_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             // Hashability is checked per element and the scan stops at the
             // first shared element, so later operands are never examined.
             let outcome = for_each_element(args[0], |item| {
-                if let Some(err) = check_hashable(item) {
+                if let Some(err) = check_set_hashable(item) {
                     return Err(err);
                 }
                 if container::set_contains(&receiver, item) {
@@ -7980,8 +8300,11 @@ fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             dict_popitem(obj, obj)
         }
         "update" => {
-            if let Some(err) = check_arity("dict", method, args.len(), 1, 1) {
+            if let Some(err) = check_arity("dict", method, args.len(), 0, 1) {
                 return err;
+            }
+            if args.is_empty() {
+                return NONE;
             }
             if let Some(source) = value::as_dict(args[0]) {
                 // Copy before mutating so `d.update(d)` cannot observe a moving
@@ -8434,7 +8757,14 @@ fn dict_update_from_pairs(obj: i64, source: i64) -> i64 {
 /// Rejects dict keys that Python considers unhashable (`list`, `dict`,
 /// `iterator`, a bytes-like mutable/view value, or a tuple containing one).
 fn check_hashable(key: i64) -> Option<i64> {
-    container::unhashable_name(key).map(|name| type_error(container::unhashable_message(name)))
+    container::unhashable_name(key)
+        .map(|_| type_error(container::dict_key_unhashable_message(key)))
+}
+
+/// Rejects unhashable set elements with CPython 3.14's contextual message.
+fn check_set_hashable(item: i64) -> Option<i64> {
+    container::unhashable_name(item)
+        .map(|_| type_error(container::set_element_unhashable_message(item)))
 }
 
 // lock (`_thread.allocate_lock()`)
@@ -9861,6 +10191,19 @@ fn glob_match_chars(pattern: &[char], text: &[char]) -> bool {
 /// value, traceback) is not available.
 fn generator_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     match method {
+        // Generators are their own iterators.
+        "__iter__" => {
+            if let Some(err) = check_arity("generator", method, args.len(), 0, 0) {
+                return err;
+            }
+            obj
+        }
+        "__next__" => {
+            if let Some(err) = check_arity("generator", method, args.len(), 0, 0) {
+                return err;
+            }
+            crate::core::iter::next_value(obj, NONE, false)
+        }
         "send" => {
             if let Some(err) = check_arity("generator", method, args.len(), 1, 1) {
                 return err;

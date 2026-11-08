@@ -3466,6 +3466,37 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         "sys._jit.is_enabled",
         native_member_ret("_jit.is_enabled", 0, 0, hydro_ir::Type::Bool),
     ),
+    // OS members the static table does not list: `getpgid` and the four
+    // extended-attribute calls are real libc operations the runtime owns.
+    ("os.getpgid", native_member("getpgid", 1, 1)),
+    ("os.getxattr", native_member("getxattr", 2, 3)),
+    ("os.setxattr", native_member("setxattr", 3, 5)),
+    ("os.listxattr", native_member("listxattr", 1, 2)),
+    ("os.removexattr", native_member("removexattr", 2, 3)),
+    // Struct-sequence methods (`os.stat_result`, `os.struct_rusage`,
+    // `sys.int_info`). One shared method set; the receiver's class selects
+    // the layout.
+    ("os.structseq.__init__", native_member("structseq.__init__", 1, 3)),
+    ("os.structseq.__len__", native_member("structseq.__len__", 1, 1)),
+    (
+        "os.structseq.__getitem__",
+        native_member("structseq.__getitem__", 2, 2),
+    ),
+    ("os.structseq.__iter__", native_member("structseq.__iter__", 1, 1)),
+    ("os.structseq.__repr__", native_member("structseq.__repr__", 1, 1)),
+    ("os.structseq.__eq__", native_member("structseq.__eq__", 2, 2)),
+    // `os.popen`'s `_wrap_close` surface.
+    ("os.popen.read", native_member("popen.read", 1, 2)),
+    ("os.popen.readline", native_member("popen.readline", 1, 2)),
+    ("os.popen.readlines", native_member("popen.readlines", 1, 2)),
+    ("os.popen.write", native_member("popen.write", 2, 2)),
+    ("os.popen.writelines", native_member("popen.writelines", 2, 2)),
+    ("os.popen.close", native_member("popen.close", 1, 1)),
+    ("os.popen.flush", native_member("popen.flush", 1, 1)),
+    ("os.popen.__enter__", native_member("popen.__enter__", 1, 1)),
+    ("os.popen.__exit__", native_member("popen.__exit__", 4, 4)),
+    ("os.popen.__iter__", native_member("popen.__iter__", 1, 1)),
+    ("os.popen.__next__", native_member("popen.__next__", 1, 1)),
 ];
 
 /// Resolves a [`SUPPLEMENTAL_FUNCTIONS`] entry by module and member name.
@@ -13635,7 +13666,9 @@ fn time_asctime(args: &[i64]) -> i64 {
         };
         numbers[index] = number;
     }
-    let weekday = WEEKDAYS[numbers[6].rem_euclid(7) as usize];
+    // The C `asctime` layout numbers Sunday as 0; Python's `tm_wday`
+    // numbers Monday as 0, so shift the supplied field.
+    let weekday = WEEKDAYS[((numbers[6] + 1).rem_euclid(7)) as usize];
     let month = MONTHS[(numbers[1].rem_euclid(12)) as usize];
     value::str_alloc(format!(
         "{weekday} {month}{:3} {:02}:{:02}:{:02} {}\n",
@@ -13725,7 +13758,7 @@ fn time_mktime(args: &[i64]) -> i64 {
                 1 => tm.tm_hour = field,
                 2 => tm.tm_min = field,
                 3 => tm.tm_sec = field,
-                4 => tm.tm_wday = field,
+                4 => tm.tm_wday = (field + 1).rem_euclid(7),
                 5 => tm.tm_yday = field,
                 _ => tm.tm_isdst = field,
             }
@@ -13756,7 +13789,9 @@ fn struct_time_from_tm(tm: &libc::tm) -> i64 {
         encode_int(i64::from(tm.tm_hour)),
         encode_int(i64::from(tm.tm_min)),
         encode_int(i64::from(tm.tm_sec)),
-        encode_int(i64::from(tm.tm_wday)),
+        // `libc::tm` numbers Sunday as 0; Python's `struct_time.tm_wday`
+        // numbers Monday as 0, so shift it like CPython's `timemodule.c`.
+        encode_int(i64::from((tm.tm_wday + 6).rem_euclid(7))),
         encode_int(i64::from(tm.tm_yday) + 1),
         encode_int(i64::from(tm.tm_isdst)),
     ];
@@ -13849,7 +13884,8 @@ fn tm_from_time_value(argument: i64) -> Result<(libc::tm, Option<CString>), i64>
     tm.tm_hour = cast(values[3]);
     tm.tm_min = cast(values[4]);
     tm.tm_sec = cast(values[5]);
-    tm.tm_wday = cast(values[6]);
+    // Python numbers Monday as 0; the C library numbers Sunday as 0.
+    tm.tm_wday = cast((values[6] + 1).rem_euclid(7));
     tm.tm_yday = cast(values[7] - 1);
     tm.tm_isdst = cast(values[8]);
     Ok((tm, set_tm_zone_and_offset(&mut tm, zone, gmtoff)))
@@ -20257,6 +20293,433 @@ fn os_lstat(args: &[i64]) -> i64 {
     os_stat(&[path, NONE, FALSE])
 }
 
+/// Sequence-field labels plus the named extras of one CPython struct
+/// sequence (`os.stat_result`, `os.struct_rusage`, `sys.int_info`).
+struct StructSeqLayout {
+    /// Dotted spelling used by `repr` and the constructor errors.
+    name: &'static str,
+    /// Native module owning the class (`os`/`sys`).
+    module: &'static str,
+    /// Python type spelling (`stat_result`).
+    type_name: &'static str,
+    /// Labels of the sequence fields, in order.
+    sequence: &'static [&'static str],
+    /// How many of the trailing sequence fields are unnamed (not attributes).
+    unnamed: usize,
+    /// Named fields that follow the sequence and are exposed as attributes.
+    extras: &'static [&'static str],
+}
+
+impl StructSeqLayout {
+    fn n_sequence(&self) -> usize {
+        self.sequence.len()
+    }
+
+    fn n_fields(&self) -> usize {
+        self.sequence.len() + self.extras.len()
+    }
+
+    /// Indexes of the fields that have a Python attribute name.
+    fn named_slots(&self) -> impl Iterator<Item = (usize, &'static str)> {
+        let named_sequence = self.sequence.len() - self.unnamed;
+        self.sequence
+            .iter()
+            .take(named_sequence)
+            .copied()
+            .enumerate()
+            .chain(
+                self.extras
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(move |(index, name)| (named_sequence + index, name)),
+            )
+    }
+
+    fn slot_for(&self, name: &str) -> Option<usize> {
+        self.named_slots()
+            .find_map(|(index, candidate)| (candidate == name).then_some(index))
+    }
+}
+
+/// `os.stat_result`: ten sequence fields, three of them unnamed integer time
+/// aliases, followed by the float/ns time fields and the block/device extras.
+static STAT_RESULT_LAYOUT: StructSeqLayout = StructSeqLayout {
+    name: "os.stat_result",
+    module: "os",
+    type_name: "stat_result",
+    sequence: &[
+        "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size", "st_atime",
+        "st_mtime", "st_ctime",
+    ],
+    unnamed: 3,
+    extras: &[
+        "st_atime",
+        "st_mtime",
+        "st_ctime",
+        "st_atime_ns",
+        "st_mtime_ns",
+        "st_ctime_ns",
+        "st_blksize",
+        "st_blocks",
+        "st_rdev",
+    ],
+};
+
+/// `os.struct_rusage`: the sixteen `getrusage(2)` counters.
+static RUSAGE_LAYOUT: StructSeqLayout = StructSeqLayout {
+    name: "os.struct_rusage",
+    module: "os",
+    type_name: "struct_rusage",
+    sequence: &[
+        "ru_utime",
+        "ru_stime",
+        "ru_maxrss",
+        "ru_ixrss",
+        "ru_idrss",
+        "ru_isrss",
+        "ru_minflt",
+        "ru_majflt",
+        "ru_nswap",
+        "ru_inblock",
+        "ru_oublock",
+        "ru_msgsnd",
+        "ru_msgrcv",
+        "ru_nsignals",
+        "ru_nvcsw",
+        "ru_nivcsw",
+    ],
+    unnamed: 0,
+    extras: &[],
+};
+
+/// `sys.int_info`: the four `PyLong` representation parameters.
+static INT_INFO_LAYOUT: StructSeqLayout = StructSeqLayout {
+    name: "sys.int_info",
+    module: "sys",
+    type_name: "int_info",
+    sequence: &[
+        "bits_per_digit",
+        "sizeof_digit",
+        "default_max_str_digits",
+        "str_digits_check_threshold",
+    ],
+    unnamed: 0,
+    extras: &[],
+};
+
+/// Instance attribute holding a struct sequence's full value tuple (all
+/// fields, including the unnamed and extra ones).
+const STRUCTSEQ_VALUES: &str = "_hydro_structseq_values";
+
+/// Cached class for one struct-sequence layout.
+fn structseq_class(layout: &'static StructSeqLayout) -> i64 {
+    let key = format!("structseq.{}", layout.name);
+    if let Some(cached) = globals::registry_get(&key) {
+        return cached;
+    }
+    let methods = [
+        ("__init__", "structseq.__init__"),
+        ("__len__", "structseq.__len__"),
+        ("__getitem__", "structseq.__getitem__"),
+        ("__iter__", "structseq.__iter__"),
+        ("__repr__", "structseq.__repr__"),
+        ("__eq__", "structseq.__eq__"),
+    ];
+    let mut entries = Vec::with_capacity(methods.len());
+    let mut values = Vec::with_capacity(methods.len());
+    for (attribute, method) in methods {
+        let function = value::native_function_new("os", method, 2);
+        values.push(function);
+        entries.push((attribute.to_string(), function));
+    }
+    let roots = heap::root_values(&values);
+    let class = value::class_new(layout.type_name.to_string(), NONE, entries);
+    let class_roots = heap::root_values(&[class]);
+    value::class_set_attr(
+        class,
+        "n_fields".to_string(),
+        encode_int(layout.n_fields() as i64),
+    );
+    value::class_set_attr(
+        class,
+        "n_sequence_fields".to_string(),
+        encode_int(layout.n_sequence() as i64),
+    );
+    value::class_set_attr(
+        class,
+        "n_unnamed_fields".to_string(),
+        encode_int(layout.unnamed as i64),
+    );
+    // `__match_args__` lists the named sequence fields only.
+    let names: Vec<i64> = layout
+        .sequence
+        .iter()
+        .take(layout.n_sequence() - layout.unnamed)
+        .map(|name| value::str_from_bytes(name.as_bytes()))
+        .collect();
+    let match_args = value::tuple_new(names);
+    let match_roots = heap::root_values(&[match_args]);
+    value::class_set_attr(class, "__match_args__".to_string(), match_args);
+    globals::registry_set(&key, class);
+    heap::release_roots(match_roots);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    class
+}
+
+/// Builds a struct-sequence instance from the full slot vector.
+fn structseq_new(layout: &'static StructSeqLayout, values: Vec<i64>) -> i64 {
+    let class = structseq_class(layout);
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(&[instance]);
+    let tuple = value::tuple_new(values.clone());
+    let all_roots = heap::root_values(&[tuple]);
+    value::instance_setattr(instance, STRUCTSEQ_VALUES.to_string(), tuple);
+    for (index, name) in layout.named_slots() {
+        value::instance_setattr(instance, name.to_string(), values[index]);
+    }
+    heap::release_roots(all_roots);
+    heap::release_roots(roots);
+    instance
+}
+
+/// Reads the full slot vector of a struct-sequence instance.
+fn structseq_values(instance: i64) -> Option<Vec<i64>> {
+    value::instance_attr(instance, STRUCTSEQ_VALUES)
+        .and_then(value::as_tuple)
+        .map(<[i64]>::to_vec)
+}
+
+/// Iterates any Python sequence into a vector, honouring a user object's
+/// `__len__`/`__getitem__` (CPython's structseq constructor does the same).
+fn structseq_sequence(argument: i64) -> Result<Vec<i64>, i64> {
+    if let Some(items) = value::as_tuple(argument) {
+        return Ok(items.to_vec());
+    }
+    if let Some(items) = value::as_list(argument) {
+        return Ok(items.to_vec());
+    }
+    let iterator = iter::iter_new(argument);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    let roots = heap::root_values(&[iterator]);
+    let mut items = Vec::new();
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            heap::release_roots(roots);
+            return Err(NONE);
+        }
+        if status == 0 {
+            break;
+        }
+        items.push(item);
+    }
+    heap::release_roots(roots);
+    Ok(items)
+}
+
+fn structseq_unexpected_fields() -> i64 {
+    exc::raise_with_message(TYPE_ERROR, "got duplicate or unexpected field name(s)")
+}
+
+/// `structseq.__init__(self, sequence, dict=None)` for the native layouts.
+fn structseq_init(layout: &'static StructSeqLayout, args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "structseq() missing self");
+    };
+    let Some(sequence) = args.get(1).copied() else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{}(...) constructor requires a sequence", layout.name),
+        );
+    };
+    let mut items = match structseq_sequence(sequence) {
+        Ok(items) => items,
+        Err(raised) => return raised,
+    };
+    if items.len() < layout.n_sequence() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{}() takes an at least {}-sequence ({}-sequence given)",
+                layout.name,
+                layout.n_sequence(),
+                items.len()
+            ),
+        );
+    }
+    if items.len() > layout.n_fields() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{}() takes an at most {}-sequence ({}-sequence given)",
+                layout.name,
+                layout.n_fields(),
+                items.len()
+            ),
+        );
+    }
+    let positional = items.len();
+    let mut values = items.clone();
+    values.resize(layout.n_fields(), NONE);
+    if let Some(dictionary) = args.get(2).copied() {
+        if dictionary != NONE {
+            let Some(pairs) = value::as_dict(dictionary) else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "{}(...) argument 'dict' must be a dict, not {}",
+                        layout.name,
+                        value::type_name(dictionary)
+                    ),
+                );
+            };
+            for (key, item) in pairs.iter().copied() {
+                let Some(name) = value::as_str(key) else {
+                    return structseq_unexpected_fields();
+                };
+                // `st_atime` etc. appear twice in the field list (unnamed
+                // sequence slot plus named extra); the attribute name maps to
+                // the named extra, which `slot_for` selects.
+                let Some(slot) = layout.slot_for(name) else {
+                    return structseq_unexpected_fields();
+                };
+                if slot < positional {
+                    return structseq_unexpected_fields();
+                }
+                values[slot] = item;
+            }
+        }
+    }
+    // `statresult_new`: an unspecified float time is copied from the integer
+    // sequence slot it mirrors.
+    if std::ptr::eq(layout, &STAT_RESULT_LAYOUT) {
+        for (int_slot, float_slot) in [(7usize, 10usize), (8, 11), (9, 12)] {
+            if values[float_slot] == NONE {
+                values[float_slot] = values[int_slot];
+            }
+        }
+    }
+    let roots = heap::root_values(&values);
+    let tuple = value::tuple_new(values.clone());
+    let tuple_roots = heap::root_values(&[tuple, instance]);
+    value::instance_setattr(instance, STRUCTSEQ_VALUES.to_string(), tuple);
+    for (index, name) in layout.named_slots() {
+        value::instance_setattr(instance, name.to_string(), values[index]);
+    }
+    heap::release_roots(tuple_roots);
+    heap::release_roots(roots);
+    items.clear();
+    NONE
+}
+
+/// Maps a struct-sequence instance back to its layout by class name.
+fn structseq_layout_for(instance: i64) -> Option<&'static StructSeqLayout> {
+    let class = value::instance_class_value(instance)?;
+    let name = value::class_display_name(class)?;
+    [&STAT_RESULT_LAYOUT, &RUSAGE_LAYOUT, &INT_INFO_LAYOUT]
+        .into_iter()
+        .find(|layout| layout.type_name == name)
+}
+
+/// Dispatches the native struct-sequence methods (`structseq.__len__`, ...).
+///
+/// One shared method set serves every layout; the receiver's class selects
+/// the field list, so `os.stat_result` and `sys.int_info` need no separate
+/// function values.
+fn structseq_method_call(module: &str, function: &str, args: &[i64]) -> Option<i64> {
+    if module != "os" {
+        return None;
+    }
+    let method = function.strip_prefix("structseq.")?;
+    let layout = args.first().copied().and_then(structseq_layout_for)?;
+    Some(match method {
+        "__init__" => structseq_init(layout, args),
+        "__len__" => encode_int(layout.n_sequence() as i64),
+        "__getitem__" => {
+            let Some(&instance) = args.first() else {
+                return Some(exc::raise_with_message(
+                    TYPE_ERROR,
+                    "descriptor '__getitem__' requires a struct sequence",
+                ));
+            };
+            let Some(values) = structseq_values(instance) else {
+                return Some(exc::raise_with_message(
+                    TYPE_ERROR,
+                    "descriptor '__getitem__' requires a struct sequence",
+                ));
+            };
+            let Some(&key) = args.get(1) else {
+                return Some(exc::raise_with_message(TYPE_ERROR, "__getitem__() missing key"));
+            };
+            let sequence = value::tuple_new(values[..layout.n_sequence()].to_vec());
+            container::subscript(sequence, key)
+        }
+        "__iter__" => {
+            let Some(values) = args.first().copied().and_then(structseq_values) else {
+                return Some(exc::raise_with_message(
+                    TYPE_ERROR,
+                    "descriptor '__iter__' requires a struct sequence",
+                ));
+            };
+            let sequence = value::tuple_new(values[..layout.n_sequence()].to_vec());
+            iter::iter_of(sequence)
+        }
+        "__repr__" => {
+            let Some(values) = args.first().copied().and_then(structseq_values) else {
+                return Some(exc::raise_with_message(
+                    TYPE_ERROR,
+                    "descriptor '__repr__' requires a struct sequence",
+                ));
+            };
+            let mut text = format!("{}(", layout.name);
+            for (index, name) in layout.sequence.iter().enumerate() {
+                if index > 0 {
+                    text.push_str(", ");
+                }
+                text.push_str(name);
+                text.push('=');
+                text.push_str(&value::to_string(values[index]));
+            }
+            text.push(')');
+            value::str_alloc(text)
+        }
+        "__eq__" => {
+            let Some(left) = args.first().copied().and_then(structseq_values) else {
+                return Some(value::NOT_IMPLEMENTED);
+            };
+            let other = args.get(1).copied().unwrap_or(NONE);
+            let right = if let Some(right) = structseq_values(other) {
+                right
+            } else if let Some(items) = value::as_tuple(other) {
+                items.to_vec()
+            } else if let Some(items) = value::as_list(other) {
+                items.to_vec()
+            } else {
+                return Some(value::NOT_IMPLEMENTED);
+            };
+            if right.len() != layout.n_sequence() {
+                return Some(FALSE);
+            }
+            for index in 0..layout.n_sequence() {
+                let equal = ops::binop(ops::OP_EQ, left[index], right[index]);
+                if exc::pending() {
+                    return Some(NONE);
+                }
+                if !value::truthy(equal) {
+                    return Some(FALSE);
+                }
+            }
+            TRUE
+        }
+        _ => return None,
+    })
+}
+
 /// Appends one `os.stat_result` field to `namespace`.
 ///
 /// The field value is rooted across the mutation so a collection triggered
@@ -20281,8 +20744,11 @@ fn stat_int(number: i128) -> i64 {
     }
 }
 
-/// Builds the `os.stat_result` namespace. The `st_*_ns` names are the exact
-/// integer aliases of the float second fields, like CPython's `stat_result`.
+/// Builds `os.stat_result` from real file metadata.
+///
+/// The first ten slots are the sequence fields; the integer seconds at slots
+/// 7-9 are named `st_atime`/`st_mtime`/`st_ctime` by `repr` but are not
+/// attributes, exactly like CPython's unnamed fields.
 #[cfg(unix)]
 fn stat_result(metadata: &std::fs::Metadata) -> i64 {
     use std::os::unix::fs::MetadataExt;
@@ -20290,38 +20756,31 @@ fn stat_result(metadata: &std::fs::Metadata) -> i64 {
     let mtime_ns = i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
     let ctime_ns = i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec());
     let seconds = |nanos: i128| value::float_new(nanos as f64 / 1_000_000_000.0);
-    let namespace = value::namespace_new(Vec::new());
-    let roots = crate::heap::root_values(&[namespace]);
-    stat_field(namespace, "st_mode", stat_int(i128::from(metadata.mode())));
-    stat_field(namespace, "st_ino", stat_int(i128::from(metadata.ino())));
-    stat_field(namespace, "st_dev", stat_int(i128::from(metadata.dev())));
-    stat_field(
-        namespace,
-        "st_nlink",
-        stat_int(i128::from(metadata.nlink())),
-    );
-    stat_field(namespace, "st_uid", stat_int(i128::from(metadata.uid())));
-    stat_field(namespace, "st_gid", stat_int(i128::from(metadata.gid())));
-    stat_field(namespace, "st_size", stat_int(i128::from(metadata.size())));
-    stat_field(namespace, "st_atime", seconds(atime_ns));
-    stat_field(namespace, "st_mtime", seconds(mtime_ns));
-    stat_field(namespace, "st_ctime", seconds(ctime_ns));
-    stat_field(namespace, "st_atime_ns", stat_int(atime_ns));
-    stat_field(namespace, "st_mtime_ns", stat_int(mtime_ns));
-    stat_field(namespace, "st_ctime_ns", stat_int(ctime_ns));
-    stat_field(namespace, "st_rdev", stat_int(i128::from(metadata.rdev())));
-    stat_field(
-        namespace,
-        "st_blksize",
-        stat_int(i128::from(metadata.blksize())),
-    );
-    stat_field(
-        namespace,
-        "st_blocks",
-        stat_int(i128::from(metadata.blocks())),
-    );
-    crate::heap::release_roots(roots);
-    namespace
+    let whole = |nanos: i128| stat_int(nanos.div_euclid(1_000_000_000));
+    structseq_new(
+        &STAT_RESULT_LAYOUT,
+        vec![
+            stat_int(i128::from(metadata.mode())),
+            stat_int(i128::from(metadata.ino())),
+            stat_int(i128::from(metadata.dev())),
+            stat_int(i128::from(metadata.nlink())),
+            stat_int(i128::from(metadata.uid())),
+            stat_int(i128::from(metadata.gid())),
+            stat_int(i128::from(metadata.size())),
+            whole(atime_ns),
+            whole(mtime_ns),
+            whole(ctime_ns),
+            seconds(atime_ns),
+            seconds(mtime_ns),
+            seconds(ctime_ns),
+            stat_int(atime_ns),
+            stat_int(mtime_ns),
+            stat_int(ctime_ns),
+            stat_int(i128::from(metadata.blksize())),
+            stat_int(i128::from(metadata.blocks())),
+            stat_int(i128::from(metadata.rdev())),
+        ],
+    )
 }
 
 /// Non-Unix `os.stat_result`: the portable metadata fields, with zero for the
@@ -20342,27 +20801,33 @@ fn stat_result(metadata: &std::fs::Metadata) -> i64 {
     } else {
         0o100644
     };
-    let nanos = |seconds: f64| stat_int((seconds * 1_000_000_000.0) as i128);
-    let namespace = value::namespace_new(Vec::new());
-    let roots = crate::heap::root_values(&[namespace]);
-    stat_field(namespace, "st_mode", encode_int(mode));
-    stat_field(namespace, "st_ino", encode_int(0));
-    stat_field(namespace, "st_dev", encode_int(0));
-    stat_field(namespace, "st_nlink", encode_int(1));
-    stat_field(namespace, "st_uid", encode_int(0));
-    stat_field(namespace, "st_gid", encode_int(0));
-    stat_field(namespace, "st_size", stat_int(i128::from(metadata.len())));
-    stat_field(namespace, "st_atime", value::float_new(atime));
-    stat_field(namespace, "st_mtime", value::float_new(mtime));
-    stat_field(namespace, "st_ctime", value::float_new(ctime));
-    stat_field(namespace, "st_atime_ns", nanos(atime));
-    stat_field(namespace, "st_mtime_ns", nanos(mtime));
-    stat_field(namespace, "st_ctime_ns", nanos(ctime));
-    stat_field(namespace, "st_rdev", encode_int(0));
-    stat_field(namespace, "st_blksize", encode_int(4096));
-    stat_field(namespace, "st_blocks", encode_int(0));
-    crate::heap::release_roots(roots);
-    namespace
+    let atime_ns = stat_int((atime * 1_000_000_000.0) as i128);
+    let mtime_ns = stat_int((mtime * 1_000_000_000.0) as i128);
+    let ctime_ns = stat_int((ctime * 1_000_000_000.0) as i128);
+    structseq_new(
+        &STAT_RESULT_LAYOUT,
+        vec![
+            encode_int(mode),
+            encode_int(0),
+            encode_int(0),
+            encode_int(1),
+            encode_int(0),
+            encode_int(0),
+            stat_int(i128::from(metadata.len())),
+            stat_int(atime as i128),
+            stat_int(mtime as i128),
+            stat_int(ctime as i128),
+            value::float_new(atime),
+            value::float_new(mtime),
+            value::float_new(ctime),
+            atime_ns,
+            mtime_ns,
+            ctime_ns,
+            encode_int(4096),
+            encode_int(0),
+            encode_int(0),
+        ],
+    )
 }
 
 /// Raises the OSError subclass matching `error` with CPython's
@@ -22060,6 +22525,843 @@ fn os_mknod(args: &[i64]) -> i64 {
     }
 }
 
+/// `os.getpgrp()`: the process group of the calling process.
+fn os_getpgrp(_args: &[i64]) -> i64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `getpgrp` has no preconditions and cannot fail.
+        return encode_int(i64::from(unsafe { libc::getpgrp() }));
+    }
+    #[cfg(not(unix))]
+    {
+        exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "os.getpgrp unavailable")
+    }
+}
+
+/// `os.getpgid(pid)`: the process group of `pid`.
+fn os_getpgid(args: &[i64]) -> i64 {
+    let Some(pid) = args.first().copied().and_then(value::as_integer) else {
+        let argument = args.first().copied().unwrap_or(NONE);
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "getpgid() argument must be an integer, not {}",
+                value::type_name(argument)
+            ),
+        );
+    };
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return exc::raise_with_message(OVERFLOW_ERROR, "getpgid(): pid is out of range");
+    };
+    #[cfg(unix)]
+    {
+        // SAFETY: `getpgid` accepts any pid value; the kernel reports errors.
+        let result = unsafe { libc::getpgid(pid) };
+        if result == -1 {
+            return os_error_from_io("getpgid", std::io::Error::last_os_error(), None);
+        }
+        return encode_int(i64::from(result));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "os.getpgid unavailable")
+    }
+}
+
+/// `os.mkfifo(path, mode=0o666, *, dir_fd=None)`: creates a FIFO.
+fn os_mkfifo(args: &[i64]) -> i64 {
+    if let Some(&dir_fd) = args.get(2) {
+        if dir_fd != NONE {
+            return exc::raise_with_message(
+                NOT_IMPLEMENTED_ERROR,
+                "os.mkfifo: dir_fd is not supported",
+            );
+        }
+    }
+    let path_value = args.first().copied().unwrap_or(NONE);
+    let Some(path) = os_path_os_string(path_value) else {
+        if exc::pending() {
+            return NONE;
+        }
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "mkfifo() argument must be a path, not {}",
+                value::type_name(path_value)
+            ),
+        );
+    };
+    let mode = match args.get(1).copied() {
+        None | Some(NONE) => 0o666,
+        Some(mode) => match value::as_integer(mode) {
+            Some(mode) => match libc::mode_t::try_from(mode & 0o7777) {
+                Ok(mode) => mode,
+                Err(_) => {
+                    return exc::raise_with_message(OVERFLOW_ERROR, "mkfifo(): mode is out of range")
+                }
+            },
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "mkfifo() mode must be an integer, not {}",
+                        value::type_name(mode)
+                    ),
+                )
+            }
+        },
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+            return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+        };
+        // SAFETY: `c_path` is a valid NUL-terminated path.
+        let result = unsafe { libc::mkfifo(c_path.as_ptr(), mode) };
+        if result != 0 {
+            let shown = path.to_string_lossy().into_owned();
+            return os_error_from_io(
+                "mkfifo",
+                std::io::Error::last_os_error(),
+                Some(&shown),
+            );
+        }
+        NONE
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "os.mkfifo unavailable")
+    }
+}
+
+/// Builds `os.struct_rusage` from a `libc::rusage`.
+#[cfg(unix)]
+fn os_rusage_value(usage: &libc::rusage) -> i64 {
+    let timeval = |time: libc::timeval| {
+        value::float_new(time.tv_sec as f64 + time.tv_usec as f64 / 1_000_000.0)
+    };
+    structseq_new(
+        &RUSAGE_LAYOUT,
+        vec![
+            timeval(usage.ru_utime),
+            timeval(usage.ru_stime),
+            stat_int(i128::from(usage.ru_maxrss)),
+            stat_int(i128::from(usage.ru_ixrss)),
+            stat_int(i128::from(usage.ru_idrss)),
+            stat_int(i128::from(usage.ru_isrss)),
+            stat_int(i128::from(usage.ru_minflt)),
+            stat_int(i128::from(usage.ru_majflt)),
+            stat_int(i128::from(usage.ru_nswap)),
+            stat_int(i128::from(usage.ru_inblock)),
+            stat_int(i128::from(usage.ru_oublock)),
+            stat_int(i128::from(usage.ru_msgsnd)),
+            stat_int(i128::from(usage.ru_msgrcv)),
+            stat_int(i128::from(usage.ru_nsignals)),
+            stat_int(i128::from(usage.ru_nvcsw)),
+            stat_int(i128::from(usage.ru_nivcsw)),
+        ],
+    )
+}
+
+/// Shared body of `os.wait3(options)` and `os.wait4(pid, options)`.
+///
+/// Both return CPython's `(pid, status, rusage)` triple; a `WNOHANG` call
+/// that has no child to report yields `(0, 0, zeroed rusage)`.
+#[cfg(unix)]
+fn os_wait_rusage(pid: Option<i64>, options: i64) -> i64 {
+    let Ok(options) = libc::c_int::try_from(options) else {
+        return exc::raise_with_message(OVERFLOW_ERROR, "wait: options is out of range");
+    };
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let mut status: libc::c_int = 0;
+    // SAFETY: `usage` and `status` are valid writable buffers.
+    let reaped = unsafe {
+        match pid {
+            Some(pid) => {
+                let Ok(pid) = libc::pid_t::try_from(pid) else {
+                    return exc::raise_with_message(OVERFLOW_ERROR, "wait4(): pid is out of range");
+                };
+                libc::wait4(pid, &mut status, options, &mut usage)
+            }
+            None => libc::wait4(-1, &mut status, options, &mut usage),
+        }
+    };
+    if reaped == -1 {
+        return os_error_from_io("wait", std::io::Error::last_os_error(), None);
+    }
+    let reaped = encode_int(i64::from(reaped));
+    let status = encode_int(i64::from(status));
+    let usage = os_rusage_value(&usage);
+    let roots = heap::root_values(&[reaped, status, usage]);
+    let triple = value::tuple_new(vec![reaped, status, usage]);
+    heap::release_roots(roots);
+    triple
+}
+
+#[cfg(unix)]
+fn os_wait3(args: &[i64]) -> i64 {
+    let options = match args.first().copied() {
+        None | Some(NONE) => 0,
+        Some(options) => match value::as_integer(options) {
+            Some(options) => options,
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "wait3() argument must be an integer, not {}",
+                        value::type_name(options)
+                    ),
+                )
+            }
+        },
+    };
+    os_wait_rusage(None, options)
+}
+
+#[cfg(not(unix))]
+fn os_wait3(_args: &[i64]) -> i64 {
+    exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "os.wait3 unavailable")
+}
+
+#[cfg(unix)]
+fn os_wait4(args: &[i64]) -> i64 {
+    let pid = args.first().copied().unwrap_or(NONE);
+    let options = args.get(1).copied().unwrap_or(NONE);
+    let (Some(pid), Some(options)) = (value::as_integer(pid), value::as_integer(options)) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "wait4() arguments must be integers",
+        );
+    };
+    os_wait_rusage(Some(pid), options)
+}
+
+#[cfg(not(unix))]
+fn os_wait4(_args: &[i64]) -> i64 {
+    exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "os.wait4 unavailable")
+}
+
+/// Bytes of an extended-attribute name: `str` is UTF-8 encoded, `bytes` is
+/// used verbatim.
+fn os_xattr_name(argument: i64) -> Option<Vec<u8>> {
+    if let Some(text) = value::as_str(argument) {
+        return Some(text.as_bytes().to_vec());
+    }
+    os_bytes_operand(argument)
+}
+
+/// Path/name/argument triple shared by the extended-attribute calls.
+fn os_xattr_targets(args: &[i64], attribute_slot: Option<usize>) -> Option<(CString, Option<CString>)> {
+    let path_value = args.first().copied().unwrap_or(NONE);
+    let path = os_path_os_string(path_value)?;
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let name = match attribute_slot {
+        Some(slot) => {
+            let argument = args.get(slot).copied().unwrap_or(NONE);
+            let bytes = os_xattr_name(argument)?;
+            Some(CString::new(bytes).ok()?)
+        }
+        None => None,
+    };
+    Some((path, name))
+}
+
+/// `os.getxattr(path, attribute, *, follow_symlinks=True)`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn os_getxattr(args: &[i64]) -> i64 {
+    let Some((path, Some(name))) = os_xattr_targets(args, Some(1)) else {
+        return exc::raise_with_message(TYPE_ERROR, "getxattr() arguments must be str or bytes");
+    };
+    let follow = args.get(2).copied().map_or(true, value::truthy);
+    let call = |buffer: *mut libc::c_void, size: usize| -> isize {
+        // SAFETY: the caller supplies a buffer of `size` bytes (or NULL/0).
+        unsafe {
+            if follow {
+                libc::getxattr(path.as_ptr(), name.as_ptr(), buffer, size)
+            } else {
+                libc::lgetxattr(path.as_ptr(), name.as_ptr(), buffer, size)
+            }
+        }
+    };
+    let size = call(std::ptr::null_mut(), 0);
+    if size < 0 {
+        return os_error_from_io("getxattr", std::io::Error::last_os_error(), None);
+    }
+    let mut buffer = vec![0u8; size as usize];
+    if size > 0 {
+        let read = call(buffer.as_mut_ptr() as *mut libc::c_void, buffer.len());
+        if read < 0 {
+            return os_error_from_io("getxattr", std::io::Error::last_os_error(), None);
+        }
+        buffer.truncate(read as usize);
+    }
+    value::bytes_new(buffer)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn os_getxattr(_args: &[i64]) -> i64 {
+    exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "os.getxattr unavailable")
+}
+
+/// `os.setxattr(path, attribute, value, flags=0, *, follow_symlinks=True)`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn os_setxattr(args: &[i64]) -> i64 {
+    let Some((path, Some(name))) = os_xattr_targets(args, Some(1)) else {
+        return exc::raise_with_message(TYPE_ERROR, "setxattr() arguments must be str or bytes");
+    };
+    let Some(data) = args.get(2).copied().and_then(value::as_bytes) else {
+        return exc::raise_with_message(TYPE_ERROR, "setxattr() value must be bytes");
+    };
+    let flags = args
+        .get(3)
+        .copied()
+        .and_then(value::as_integer)
+        .unwrap_or(0);
+    let Ok(flags) = libc::c_int::try_from(flags) else {
+        return exc::raise_with_message(OVERFLOW_ERROR, "setxattr(): flags is out of range");
+    };
+    let follow = args.get(4).copied().map_or(true, value::truthy);
+    // SAFETY: `data` lives for the call and `path`/`name` are NUL-terminated.
+    let result = unsafe {
+        if follow {
+            libc::setxattr(path.as_ptr(), name.as_ptr(), data.as_ptr().cast(), data.len(), flags)
+        } else {
+            libc::lsetxattr(path.as_ptr(), name.as_ptr(), data.as_ptr().cast(), data.len(), flags)
+        }
+    };
+    if result != 0 {
+        return os_error_from_io("setxattr", std::io::Error::last_os_error(), None);
+    }
+    NONE
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn os_setxattr(_args: &[i64]) -> i64 {
+    exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "os.setxattr unavailable")
+}
+
+/// `os.listxattr(path, *, follow_symlinks=True)`: the attribute names.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn os_listxattr(args: &[i64]) -> i64 {
+    let path_value = args.first().copied().unwrap_or(NONE);
+    let Some(path) = os_path_os_string(path_value) else {
+        if exc::pending() {
+            return NONE;
+        }
+        return exc::raise_with_message(TYPE_ERROR, "listxattr() argument must be a path");
+    };
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
+    };
+    let follow = args.get(1).copied().map_or(true, value::truthy);
+    let call = |buffer: *mut libc::c_char, size: usize| -> isize {
+        // SAFETY: the caller supplies a buffer of `size` bytes (or NULL/0).
+        unsafe {
+            if follow {
+                libc::listxattr(path.as_ptr(), buffer, size)
+            } else {
+                libc::llistxattr(path.as_ptr(), buffer, size)
+            }
+        }
+    };
+    let size = call(std::ptr::null_mut(), 0);
+    if size < 0 {
+        return os_error_from_io("listxattr", std::io::Error::last_os_error(), None);
+    }
+    let mut buffer = vec![0u8; size as usize];
+    if size > 0 {
+        let read = call(buffer.as_mut_ptr() as *mut libc::c_char, buffer.len());
+        if read < 0 {
+            return os_error_from_io("listxattr", std::io::Error::last_os_error(), None);
+        }
+        buffer.truncate(read as usize);
+    }
+    let as_bytes = value::as_bytes(path_value).is_some();
+    let mut items = Vec::new();
+    let mut roots = Vec::new();
+    for name in buffer.split(|byte| *byte == 0).filter(|name| !name.is_empty()) {
+        let item = if as_bytes {
+            value::bytes_new(name.to_vec())
+        } else {
+            value::str_from_bytes(name)
+        };
+        roots.push(heap::root_values(&[item]));
+        items.push(item);
+    }
+    let list = value::list_new(items);
+    for root in roots.into_iter().rev() {
+        heap::release_roots(root);
+    }
+    list
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn os_listxattr(_args: &[i64]) -> i64 {
+    exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "os.listxattr unavailable")
+}
+
+/// `os.removexattr(path, attribute, *, follow_symlinks=True)`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn os_removexattr(args: &[i64]) -> i64 {
+    let Some((path, Some(name))) = os_xattr_targets(args, Some(1)) else {
+        return exc::raise_with_message(TYPE_ERROR, "removexattr() arguments must be str or bytes");
+    };
+    let follow = args.get(2).copied().map_or(true, value::truthy);
+    // SAFETY: `path` and `name` are NUL-terminated C strings.
+    let result = unsafe {
+        if follow {
+            libc::removexattr(path.as_ptr(), name.as_ptr())
+        } else {
+            libc::lremovexattr(path.as_ptr(), name.as_ptr())
+        }
+    };
+    if result != 0 {
+        return os_error_from_io("removexattr", std::io::Error::last_os_error(), None);
+    }
+    NONE
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn os_removexattr(_args: &[i64]) -> i64 {
+    exc::raise_with_message(NOT_IMPLEMENTED_ERROR, "os.removexattr unavailable")
+}
+
+// `os.popen` (CPython's `_wrap_close` semantics)
+//
+// The child is a real POSIX shell process. Its stream is read/written through
+// the runtime's own buffered handles; `close` waits for the process and
+// returns `None` for a zero exit status or the wait status (`code << 8`) for a
+// non-zero one, exactly like `Lib/os.py`'s `popen`.
+
+struct PopenState {
+    child: Option<std::process::Child>,
+    reader: Option<std::io::BufReader<std::process::ChildStdout>>,
+    writer: Option<std::process::ChildStdin>,
+    binary: bool,
+}
+
+static POPENS: LazyLock<Mutex<HashMap<u64, PopenState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static POPEN_IDS: AtomicU64 = AtomicU64::new(1);
+
+fn popen_registry() -> MutexGuard<'static, HashMap<u64, PopenState>> {
+    POPENS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+const POPEN_ID: &str = "_hydro_popen_id";
+
+/// Cached class of the object `os.popen` returns.
+fn popen_class() -> i64 {
+    const KEY: &str = "os.popen.class";
+    if let Some(cached) = globals::registry_get(KEY) {
+        return cached;
+    }
+    let methods = [
+        ("read", "popen.read"),
+        ("readline", "popen.readline"),
+        ("readlines", "popen.readlines"),
+        ("write", "popen.write"),
+        ("writelines", "popen.writelines"),
+        ("close", "popen.close"),
+        ("flush", "popen.flush"),
+        ("__enter__", "popen.__enter__"),
+        ("__exit__", "popen.__exit__"),
+        ("__iter__", "popen.__iter__"),
+        ("__next__", "popen.__next__"),
+    ];
+    let mut entries = Vec::with_capacity(methods.len() + 1);
+    let mut values = Vec::with_capacity(methods.len() + 1);
+    for (method, function_name) in methods {
+        let function = value::native_function_new("os", function_name, 2);
+        values.push(function);
+        entries.push((method.to_string(), function));
+    }
+    let roots = heap::root_values(&values);
+    let class = value::class_new("popen".to_string(), NONE, entries);
+    let class_roots = heap::root_values(&[class]);
+    // `closed` is a real instance attribute the close path updates.
+    value::class_set_attr(class, "closed".to_string(), FALSE);
+    globals::registry_set(KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    class
+}
+
+fn popen_id(instance: i64) -> Option<u64> {
+    value::instance_attr(instance, POPEN_ID)
+        .and_then(value::as_integer)
+        .and_then(|id| u64::try_from(id).ok())
+}
+
+fn popen_is_closed(instance: i64) -> bool {
+    value::instance_attr(instance, "closed").is_some_and(|closed| value::truthy(closed))
+}
+
+fn popen_set_closed(instance: i64) {
+    value::instance_setattr(instance, "closed".to_string(), TRUE);
+}
+
+/// `os.popen(cmd, mode='r', buffering=-1)`: the CPython `_wrap_close` object.
+fn os_popen(args: &[i64]) -> i64 {
+    let command_value = args.first().copied().unwrap_or(NONE);
+    let Some(command) = value::as_str(command_value) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "invalid cmd type ({}, expected string)",
+                value::type_name(command_value)
+            ),
+        );
+    };
+    let mode = match args.get(1).copied() {
+        None | Some(NONE) => "r".to_string(),
+        Some(mode) => match value::as_str(mode) {
+            Some(text) => text.to_string(),
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("invalid mode type ({})", value::type_name(mode)),
+                )
+            }
+        },
+    };
+    if mode != "r" && mode != "w" && mode != "rb" && mode != "wb" {
+        return exc::raise_with_message(VALUE_ERROR, &format!("invalid mode '{mode}'"));
+    }
+    if let Some(buffering) = args.get(2).copied() {
+        if buffering == NONE || value::as_integer(buffering) == Some(0) {
+            return exc::raise_with_message(
+                VALUE_ERROR,
+                "popen() does not support unbuffered streams",
+            );
+        }
+    }
+    const SHELLS: [&str; 2] = ["/bin/sh", "/usr/bin/sh"];
+    let Some(shell) = SHELLS
+        .iter()
+        .find(|shell| std::path::Path::new(shell).exists())
+    else {
+        return os_error_from_io(
+            "popen",
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no shell found"),
+            None,
+        );
+    };
+    let mut command_builder = std::process::Command::new(shell);
+    command_builder.arg("-c").arg(command);
+    let binary = mode.ends_with('b');
+    if mode.starts_with('r') {
+        command_builder.stdout(std::process::Stdio::piped());
+    } else {
+        command_builder.stdin(std::process::Stdio::piped());
+    }
+    let mut child = match command_builder.spawn() {
+        Ok(child) => child,
+        Err(error) => return os_error_from_io("popen", error, None),
+    };
+    let reader = child.stdout.take().map(std::io::BufReader::new);
+    let writer = child.stdin.take();
+    let id = POPEN_IDS.fetch_add(1, Ordering::Relaxed);
+    popen_registry().insert(
+        id,
+        PopenState {
+            child: Some(child),
+            reader,
+            writer,
+            binary,
+        },
+    );
+    let instance = value::instance_new(popen_class());
+    let roots = heap::root_values(&[instance]);
+    value::instance_setattr(
+        instance,
+        POPEN_ID.to_string(),
+        encode_int(id as i64),
+    );
+    value::instance_setattr(instance, "closed".to_string(), FALSE);
+    heap::release_roots(roots);
+    instance
+}
+
+fn popen_io_closed_error() -> i64 {
+    exc::raise_with_message(VALUE_ERROR, "I/O operation on closed file.")
+}
+
+fn popen_read_bytes(instance: i64, size: Option<i64>) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let id = popen_id(instance)?;
+    let mut state = popen_registry();
+    let entry = state.get_mut(&id)?;
+    let mut reader = entry.reader.take()?;
+    let mut data = Vec::new();
+    let result = match size {
+        Some(limit) if limit >= 0 => reader
+            .by_ref()
+            .take(limit as u64)
+            .read_to_end(&mut data)
+            .map(|_| ()),
+        _ => reader.read_to_end(&mut data).map(|_| ()),
+    };
+    entry.reader = Some(reader);
+    match result {
+        Ok(()) => Some(data),
+        Err(error) => {
+            os_error_from_io("popen", error, None);
+            None
+        }
+    }
+}
+
+fn popen_readline_bytes(instance: i64, size: Option<i64>) -> Option<Vec<u8>> {
+    use std::io::BufRead as _;
+    use std::io::Read as _;
+    let id = popen_id(instance)?;
+    let mut state = popen_registry();
+    let entry = state.get_mut(&id)?;
+    let mut reader = entry.reader.take()?;
+    let mut data = Vec::new();
+    let limit = size.filter(|limit| *limit > 0).map(|limit| limit as u64);
+    let result = match limit {
+        Some(limit) => reader.by_ref().take(limit).read_until(b'\n', &mut data).map(|_| ()),
+        None => reader.read_until(b'\n', &mut data).map(|_| ()),
+    };
+    entry.reader = Some(reader);
+    match result {
+        Ok(()) => Some(data),
+        Err(error) => {
+            os_error_from_io("popen", error, None);
+            None
+        }
+    }
+}
+
+fn popen_method(method: &str, args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, &format!("popen.{method}() missing self"));
+    };
+    match method {
+        "__enter__" => instance,
+        "__exit__" => {
+            popen_close(instance);
+            FALSE
+        }
+        "__iter__" => instance,
+        "__next__" => {
+            if popen_is_closed(instance) {
+                return popen_io_closed_error();
+            }
+            let Some(line) = popen_readline_bytes(instance, None) else {
+                return NONE;
+            };
+            if line.is_empty() {
+                return exc::raise_with_message(exc::STOP_ITERATION, "");
+            }
+            popen_text_value(instance, line)
+        }
+        "read" => {
+            if popen_is_closed(instance) {
+                return popen_io_closed_error();
+            }
+            let size = match args.get(1).copied() {
+                None | Some(NONE) => None,
+                Some(size) => match value::as_integer(size) {
+                    Some(size) => Some(size),
+                    None => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            &format!(
+                                "read() argument must be an integer, not {}",
+                                value::type_name(size)
+                            ),
+                        )
+                    }
+                },
+            };
+            let Some(data) = popen_read_bytes(instance, size) else {
+                return NONE;
+            };
+            popen_text_value(instance, data)
+        }
+        "readline" => {
+            if popen_is_closed(instance) {
+                return popen_io_closed_error();
+            }
+            let size = match args.get(1).copied() {
+                None | Some(NONE) => None,
+                Some(size) => match value::as_integer(size) {
+                    Some(size) => Some(size),
+                    None => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            "readline() argument must be an integer",
+                        )
+                    }
+                },
+            };
+            let Some(data) = popen_readline_bytes(instance, size) else {
+                return NONE;
+            };
+            popen_text_value(instance, data)
+        }
+        "readlines" => {
+            if popen_is_closed(instance) {
+                return popen_io_closed_error();
+            }
+            let Some(data) = popen_read_bytes(instance, None) else {
+                return NONE;
+            };
+            let mut items = Vec::new();
+            let mut roots = Vec::new();
+            let mut start = 0;
+            while start < data.len() {
+                let end = data[start..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(data.len(), |offset| start + offset + 1);
+                let item = popen_text_value(instance, data[start..end].to_vec());
+                roots.push(heap::root_values(&[item]));
+                items.push(item);
+                start = end;
+            }
+            let list = value::list_new(items);
+            for root in roots.into_iter().rev() {
+                heap::release_roots(root);
+            }
+            list
+        }
+        "write" | "writelines" => {
+            if popen_is_closed(instance) {
+                return popen_io_closed_error();
+            }
+            let Some(id) = popen_id(instance) else {
+                return popen_io_closed_error();
+            };
+            let entries: Vec<Vec<u8>> = if method == "write" {
+                let Some(text) = args.get(1).copied().and_then(value::as_str) else {
+                    return exc::raise_with_message(TYPE_ERROR, "write() argument must be str");
+                };
+                vec![text.as_bytes().to_vec()]
+            } else {
+                let iterable = args.get(1).copied().unwrap_or(NONE);
+                let mut collected = Vec::new();
+                let iterator = iter::iter_new(iterable);
+                if exc::pending() {
+                    return NONE;
+                }
+                loop {
+                    let mut item = NONE;
+                    if iter::iter_next(iterator, &mut item) == 0 || exc::pending() {
+                        break;
+                    }
+                    let Some(text) = value::as_str(item) else {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            "writelines() argument must be an iterable of str",
+                        );
+                    };
+                    collected.push(text.as_bytes().to_vec());
+                }
+                if exc::pending() {
+                    return NONE;
+                }
+                collected
+            };
+            use std::io::Write as _;
+            let mut state = popen_registry();
+            let Some(entry) = state.get_mut(&id) else {
+                return popen_io_closed_error();
+            };
+            let Some(writer) = entry.writer.as_mut() else {
+                return exc::raise_with_message(OS_ERROR, "popen: stream is not writable");
+            };
+            let mut written = 0;
+            for chunk in entries {
+                match writer.write_all(&chunk) {
+                    Ok(()) => written += chunk.len(),
+                    Err(error) => return os_error_from_io("popen", error, None),
+                }
+            }
+            match writer.flush() {
+                Ok(()) => {
+                    if method == "writelines" {
+                        NONE
+                    } else {
+                        encode_int(written as i64)
+                    }
+                }
+                Err(error) => os_error_from_io("popen", error, None),
+            }
+        }
+        "flush" => {
+            use std::io::Write as _;
+            let Some(id) = popen_id(instance) else {
+                return popen_io_closed_error();
+            };
+            let mut state = popen_registry();
+            let Some(entry) = state.get_mut(&id) else {
+                return popen_io_closed_error();
+            };
+            match entry.writer.as_mut() {
+                Some(writer) => match writer.flush() {
+                    Ok(()) => NONE,
+                    Err(error) => os_error_from_io("popen", error, None),
+                },
+                None => NONE,
+            }
+        }
+        "close" => popen_close(instance),
+        _ => missing_attribute("os", method),
+    }
+}
+
+/// Converts a slice of the child's output into the stream's text or bytes.
+fn popen_text_value(instance: i64, data: Vec<u8>) -> i64 {
+    let binary = popen_id(instance).is_some_and(|id| {
+        popen_registry()
+            .get(&id)
+            .is_some_and(|state| state.binary)
+    });
+    if binary {
+        value::bytes_new(data)
+    } else {
+        value::str_alloc(String::from_utf8_lossy(&data).into_owned())
+    }
+}
+
+/// `close()`: drops the stream, waits for the child and reports the wait
+/// status like `Lib/os.py`'s `_wrap_close`.
+fn popen_close(instance: i64) -> i64 {
+    let Some(id) = popen_id(instance) else {
+        popen_set_closed(instance);
+        return NONE;
+    };
+    let state = popen_registry().remove(&id);
+    popen_set_closed(instance);
+    let Some(mut state) = state else {
+        return NONE;
+    };
+    state.reader = None;
+    state.writer = None;
+    let Some(mut child) = state.child.take() else {
+        return NONE;
+    };
+    match child.wait() {
+        Ok(status) if status.code() == Some(0) => NONE,
+        Ok(status) => {
+            let code = status.code().unwrap_or(-1);
+            encode_int(i64::from(code) << 8)
+        }
+        Err(error) => os_error_from_io("popen", error, None),
+    }
+}
+
 /// `os.remove(path, *, dir_fd=None)` / `os.unlink(path, *, dir_fd=None)`:
 /// removes one file. `dir_fd` is accepted only as `None`; descriptor-relative
 /// lookup has no runtime representation, matching `os.stat`/`os.lstat`.
@@ -22112,7 +23414,23 @@ fn os_rmdir(args: &[i64]) -> i64 {
 }
 
 fn os_call(function: &str, args: &[i64]) -> i64 {
+    if let Some(result) = structseq_method_call("os", function, args) {
+        return result;
+    }
+    if let Some(method) = function.strip_prefix("popen.") {
+        return popen_method(method, args);
+    }
     match function {
+        "getpgrp" => os_getpgrp(args),
+        "getpgid" => os_getpgid(args),
+        "mkfifo" => os_mkfifo(args),
+        "wait3" => os_wait3(args),
+        "wait4" => os_wait4(args),
+        "popen" => os_popen(args),
+        "getxattr" => os_getxattr(args),
+        "setxattr" => os_setxattr(args),
+        "listxattr" => os_listxattr(args),
+        "removexattr" => os_removexattr(args),
         "getpid" => encode_int(i64::from(std::process::id())),
         "getppid" => encode_int(parent_pid()),
         "cpu_count" => encode_int(cpu_count()),
@@ -22408,6 +23726,37 @@ fn os_string_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
 #[cfg(not(unix))]
 fn os_string_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
     std::ffi::OsString::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Resolves a path argument through `os.fspath` semantics to an `OsString`.
+///
+/// `str`, `bytes` and native path values are answered directly; any other
+/// object is asked for `__fspath__` (and a wrong result raises the same
+/// `TypeError` as `os.fspath`). `None` means the value is not path-like and
+/// no exception was raised; a pending exception means `__fspath__` failed.
+fn os_path_os_string(argument: i64) -> Option<std::ffi::OsString> {
+    if let Some(text) = value::as_str(argument) {
+        return Some(std::ffi::OsString::from(text));
+    }
+    if let Some(bytes) = os_bytes_operand(argument) {
+        return Some(os_string_from_bytes(&bytes));
+    }
+    if let Some(state) = value::as_path(argument) {
+        return Some(std::ffi::OsString::from(state.path()));
+    }
+    if value::as_instance(argument).is_some() {
+        let resolved = os_fspath(argument);
+        if exc::pending() {
+            return None;
+        }
+        if let Some(text) = value::as_str(resolved) {
+            return Some(std::ffi::OsString::from(text));
+        }
+        if let Some(bytes) = value::as_bytes(resolved) {
+            return Some(os_string_from_bytes(bytes));
+        }
+    }
+    None
 }
 
 /// Raw bytes of an `OsStr` name, for a bytes-mode `os.listdir`.
@@ -27070,16 +28419,22 @@ fn text_io_wrapper_method(method: &str, args: &[i64]) -> i64 {
 }
 
 pub(crate) fn io_open(args: &[i64]) -> i64 {
-    let Some(path) = value::as_str(args[0]) else {
+    // `io.open` runs every path argument through the filesystem path
+    // protocol: `str`, `bytes` and any `os.PathLike` (a native path value or
+    // an object with `__fspath__`). Bytes paths keep their raw encoding.
+    let Some(path_os) = os_path_os_string(args[0]) else {
+        if exc::pending() {
+            return NONE;
+        }
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
-                "open() argument 'file' must be str, not {}",
+                "expected str, bytes or os.PathLike object, not {}",
                 value::type_name(args[0])
             ),
         );
     };
-    let path = path.to_string();
+    let path = path_os.to_string_lossy().into_owned();
 
     let mode_text = match args.get(1).copied() {
         None | Some(NONE) => "r".to_string(),

@@ -2,9 +2,9 @@
 //! module attribute dictionary.
 //!
 //! The constant table is the Linux (asm-generic) numbering used by the
-//! compatibility corpus. Duplicate values keep the first name in table order
-//! (`EDEADLK` before `EDEADLOCK`, `EAGAIN` before `EWOULDBLOCK`, `ENOTSUP`
-//! before `EOPNOTSUPP`), which makes `errorcode` deterministic.
+//! compatibility corpus. `errorcode` keeps the spelling CPython's
+//! `_errno` produces when several names share a value (`EDEADLOCK` for 35,
+//! `EAGAIN` for 11, `ENOTSUP` for 95); see [`ERRORCODE_ALIAS`].
 
 use std::collections::HashSet;
 
@@ -188,7 +188,27 @@ pub(crate) fn constant_value(name: &str) -> Option<i64> {
     constant(name).map(int_value)
 }
 
-/// `errno.errorcode`: value -> first name with that value.
+/// The name `errno.errorcode` reports for each value shared by several
+/// constants.
+///
+/// CPython's `_errno` inserts every name into `errorcode` in the order of
+/// `Modules/errnomodule.c`, so a later alias replaces an earlier one. On Linux
+/// the only shared values are 11 (`EWOULDBLOCK` then `EAGAIN`), 35 (`EDEADLK`
+/// then `EDEADLOCK`) and 95 (`EOPNOTSUPP` then `ENOTSUP`); the resulting
+/// winners are the entries below. This table is alphabetical, so the
+/// preference has to be stated explicitly.
+const ERRORCODE_ALIAS: &[(i32, &str)] = &[(11, "EAGAIN"), (35, "EDEADLOCK"), (95, "ENOTSUP")];
+
+/// The `errorcode` spelling for a table row: the alias preferred by CPython
+/// when several names share a value, otherwise the row's own name.
+fn errorcode_name(name: &'static str, raw: i32) -> Option<&'static str> {
+    match ERRORCODE_ALIAS.iter().find(|(value, _)| *value == raw) {
+        Some((_, preferred)) if *preferred != name => None,
+        _ => Some(name),
+    }
+}
+
+/// `errno.errorcode`: value -> name with that value.
 ///
 /// The dict is filled incrementally: it is the only owner of the strings
 /// inserted earlier, so every allocation after the first must see it.
@@ -196,6 +216,9 @@ fn errorcode() -> i64 {
     let dict = value::dict_new(Vec::new());
     let mut seen = HashSet::new();
     for &(name, raw) in TABLE {
+        let Some(name) = errorcode_name(name, raw) else {
+            continue;
+        };
         if seen.insert(raw) {
             container::dict_set(dict, int_value(raw), value::str_from_bytes(name.as_bytes()));
         }
@@ -303,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn errorcode_covers_every_constant_and_keeps_the_first_name() {
+    fn errorcode_covers_every_constant_with_cpython_alias_names() {
         let codes = pairs(lookup("errorcode"));
         let name_for = |wanted: i64| {
             codes
@@ -311,8 +334,8 @@ mod tests {
                 .find(|(key, _)| *key == wanted)
                 .and_then(|(_, name)| name_of(*name))
         };
-        // Duplicate values: the first table entry wins.
-        assert_eq!(name_for(code(35)), Some("EDEADLK"));
+        // Shared values keep the name CPython's `_errno` reports.
+        assert_eq!(name_for(code(35)), Some("EDEADLOCK"));
         assert_eq!(name_for(code(11)), Some("EAGAIN"));
         assert_eq!(name_for(code(95)), Some("ENOTSUP"));
         assert_eq!(name_for(code(33)), Some("EDOM"));

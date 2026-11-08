@@ -39,13 +39,13 @@
 //! `\0hydro.registry`, which roots every cached class and is cleared by
 //! `hydro_runtime_init`, so no class value can survive its heap.
 
-use hydro_ir::MethodKind;
+use hydro_ir::{MethodKind, ParamKind};
 
 use crate::core::globals;
 use crate::exc::{self, ATTRIBUTE_ERROR, NOT_IMPLEMENTED_ERROR, TYPE_ERROR};
 use crate::heap;
 use crate::modules::abc;
-use crate::value::{self, FunctionBody, NONE};
+use crate::value::{self, FunctionBody, ParamMeta, NONE};
 
 /// Class name and (optional) single base, in declaration order. CPython's
 /// multi-base classes keep the primary base; see the module docs.
@@ -69,6 +69,10 @@ const CLASSES: &[(&str, Option<&str>)] = &[
     ("Mapping", Some("Collection")),
     ("MutableMapping", Some("Mapping")),
     ("Sequence", Some("Collection")),
+    // `ByteString` is CPython's read-only bytes-sequence ABC: `__getitem__`
+    // and `__len__` are abstract, and `__subclasshook__` matches a candidate
+    // declaring both (see [`bytestring_class`]).
+    ("ByteString", Some("Sequence")),
     ("MutableSequence", Some("Sequence")),
     ("MappingView", Some("Sized")),
     ("KeysView", Some("MappingView")),
@@ -99,6 +103,9 @@ fn is_abc(name: &str) -> bool {
 fn class_for(name: &str) -> i64 {
     if name == "Buffer" {
         return buffer_class();
+    }
+    if name == "ByteString" {
+        return bytestring_class();
     }
     let key = format!("collections.abc.{name}");
     if let Some(cached) = globals::registry_get(&key) {
@@ -214,6 +221,97 @@ pub(crate) fn buffer_instance_supported(value: i64) -> bool {
         return false;
     };
     value::class_lookup(instance.class, "__buffer__").is_some()
+}
+
+/// Registry key of the `ByteString` ABC (also its cache key).
+const BYTESTRING_KEY: &str = "collections.abc.ByteString";
+
+/// `ByteString.__getitem__`/`__len__` abstract bodies and its structural hook.
+///
+/// The functions carry a signature plus a concrete entry so calls bypass the
+/// central `_collections_abc` spec table, which only declares the `register`,
+/// `__buffer__` and `__subclasshook__` bodies.
+extern "C" fn bytestring_getitem_entry(_argv: *const i64) -> i64 {
+    exc::raise_with_message(
+        NOT_IMPLEMENTED_ERROR,
+        "ByteString.__getitem__ is abstract and cannot be called directly",
+    )
+}
+
+extern "C" fn bytestring_len_entry(_argv: *const i64) -> i64 {
+    exc::raise_with_message(
+        NOT_IMPLEMENTED_ERROR,
+        "ByteString.__len__ is abstract and cannot be called directly",
+    )
+}
+
+extern "C" fn bytestring_subclasshook_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `cls` and `candidate`.
+    let candidate = unsafe { *argv.add(1) };
+    value::bool_value(bytestring_subclass_supported(candidate))
+}
+
+/// `ByteString.__subclasshook__(C)` natively: `C` matches when it declares
+/// both `__getitem__` and `__len__` (`_check_methods(C, "__getitem__",
+/// "__len__")` in CPython).
+fn bytestring_subclass_supported(subclass: i64) -> bool {
+    value::class_lookup(subclass, "__getitem__").is_some()
+        && value::class_lookup(subclass, "__len__").is_some()
+}
+
+/// Returns (creating on first use) the `collections.abc.ByteString` class.
+fn bytestring_class() -> i64 {
+    if let Some(cached) = globals::registry_get(BYTESTRING_KEY) {
+        return cached;
+    }
+    let base = class_for("Sequence");
+    let getitem = value::native_function_new("_collections_abc", "ByteString.__getitem__", 2);
+    let len = value::native_function_new("_collections_abc", "ByteString.__len__", 1);
+    let hook = value::native_function_new("_collections_abc", "ByteString.__subclasshook__", 2);
+    let self_param = || ParamMeta {
+        name: "self".to_string(),
+        kind: ParamKind::Positional,
+        default: None,
+    };
+    value::function_set_signature(getitem, vec![self_param(), self_param()]);
+    value::function_set_full_entry(getitem, bytestring_getitem_entry as *const () as usize);
+    value::function_set_signature(len, vec![self_param()]);
+    value::function_set_full_entry(len, bytestring_len_entry as *const () as usize);
+    value::function_set_signature(
+        hook,
+        vec![
+            ParamMeta {
+                name: "cls".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            ParamMeta {
+                name: "candidate".to_string(),
+                kind: ParamKind::PosOnly,
+                default: None,
+            },
+        ],
+    );
+    value::function_set_full_entry(hook, bytestring_subclasshook_entry as *const () as usize);
+    // CPython declares both methods abstract and `__slots__ = ()`.
+    abc::mark_abstract(getitem);
+    abc::mark_abstract(len);
+    let slots = value::tuple_new(Vec::new());
+    let roots = heap::root_values(&[base, getitem, len, hook, slots]);
+    let methods = vec![
+        ("__getitem__".to_string(), getitem, MethodKind::Normal),
+        ("__len__".to_string(), len, MethodKind::Normal),
+        (
+            "__subclasshook__".to_string(),
+            hook,
+            MethodKind::Classmethod,
+        ),
+    ];
+    let attrs = vec![("__slots__".to_string(), slots)];
+    let class = value::class_new_multi("ByteString".to_string(), vec![base], NONE, methods, attrs);
+    heap::release_roots(roots);
+    globals::registry_set(BYTESTRING_KEY, class);
+    class
 }
 
 /// `Buffer.__buffer__(self, flags)`: the abstract body, which raises like

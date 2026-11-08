@@ -38,6 +38,14 @@
 //! from a `__set_name__` call when one happens and otherwise recovers the same
 //! name from the owner class namespace on the first access.
 //!
+//! `lru_cache`/`cache` build a real memoising `_lru_cache_wrapper`: a call is
+//! keyed by its positional and keyword arguments (plus their type spellings
+//! when `typed=True`), a positive `maxsize` evicts the least-recently-used
+//! entries, `maxsize=0` never stores, and the wrapper exposes
+//! `cache_info`/`cache_clear`/`cache_parameters` plus a `__get__` that binds
+//! it as a method. Decorator and direct-decorator spellings are both accepted
+//! (`@cache`, `@lru_cache`, `@lru_cache(maxsize=...)`).
+//!
 //! `singledispatch` builds a real dispatcher object: it keeps the default
 //! implementation in a `registry` mapping, resolves the best implementation
 //! from the argument's class linearization (and from the ABC virtual-subclass
@@ -2508,6 +2516,517 @@ pub(crate) fn total_ordering(class: i64) -> i64 {
     class
 }
 
+// -------------------------------------------------------------------------
+// lru_cache / cache
+// -------------------------------------------------------------------------
+
+const LRU_CACHE: &str = "cache";
+const LRU_ORDER: &str = "_order";
+const LRU_HITS: &str = "_hits";
+const LRU_MISSES: &str = "_misses";
+
+fn ensure_dict_attr(instance: i64, name: &str) -> i64 {
+    if let Some(existing) = instance_attribute(instance, name) {
+        if value::as_dict(existing).is_some() {
+            return existing;
+        }
+    }
+    let created = value::dict_new(Vec::new());
+    let roots = heap::root_values(&[created]);
+    value::instance_setattr(instance, name.to_string(), created);
+    heap::release_roots(roots);
+    created
+}
+
+fn ensure_list_attr(instance: i64, name: &str) -> i64 {
+    if let Some(existing) = instance_attribute(instance, name) {
+        if value::as_list(existing).is_some() {
+            return existing;
+        }
+    }
+    let created = value::list_new(Vec::new());
+    let roots = heap::root_values(&[created]);
+    value::instance_setattr(instance, name.to_string(), created);
+    heap::release_roots(roots);
+    created
+}
+
+fn counter(instance: i64, name: &str) -> i64 {
+    instance_attribute(instance, name)
+        .and_then(value::as_integer)
+        .unwrap_or(0)
+}
+
+fn set_counter(instance: i64, name: &str, amount: i64) {
+    let encoded = crate::core::ops::int_result(amount);
+    let roots = heap::root_values(&[instance, encoded]);
+    value::instance_setattr(instance, name.to_string(), encoded);
+    heap::release_roots(roots);
+}
+
+/// The stable marker separating positional arguments from keyword pairs in a
+/// cache key, like CPython's module-level `_kwd_mark` object.
+fn lru_kwd_mark() -> i64 {
+    let key = "functools._lru_kwd_mark";
+    if let Some(cached) = crate::core::globals::registry_get(key) {
+        return cached;
+    }
+    let mark = value::instance_new(value::object_class());
+    crate::core::globals::registry_set(key, mark);
+    mark
+}
+
+/// Builds the hashable tuple CPython uses as a cache key.
+///
+/// Positional arguments come first, then the marker and the keyword names and
+/// values. A typed cache appends every argument's type spelling, so `f(1)` and
+/// `f(1.0)` occupy different slots.
+fn lru_key(instance: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let typed = instance_attribute(instance, "typed") == Some(value::TRUE);
+    let mark = lru_kwd_mark();
+    let mut items: Vec<i64> = Vec::with_capacity(args.len() * 2 + keywords.len() * 2 + 1);
+    items.extend_from_slice(args);
+    if !keywords.is_empty() {
+        items.push(mark);
+        for (name, item) in keywords {
+            items.push(value::str_alloc(name.clone()));
+            items.push(*item);
+        }
+    }
+    if typed {
+        for (_, item) in keywords {
+            items.push(value::str_alloc(value::type_name(*item).to_string()));
+        }
+        for item in args {
+            items.push(value::str_alloc(value::type_name(*item).to_string()));
+        }
+    }
+    value::tuple_new(items)
+}
+
+fn cache_lookup(cache: i64, key: i64) -> Option<i64> {
+    value::as_dict(cache)?
+        .iter()
+        .find(|(candidate, _)| crate::container::equals(*candidate, key))
+        .map(|(_, stored)| *stored)
+}
+
+/// Moves `key` to the most-recently-used position of the order list.
+fn touch_order(order: i64, key: i64) {
+    if let Some(mut items) = value::list_items_mut(order) {
+        items.retain(|&queued| !crate::container::equals(queued, key));
+        items.push(key);
+    }
+    crate::heap::write_barrier_edge(order, key);
+}
+
+/// Evicts the least-recently-used entries until the cache fits `maxsize`.
+fn trim_cache(cache: i64, order: i64, maxsize: i64) {
+    loop {
+        let Some(items) = value::as_list(order) else {
+            return;
+        };
+        if items.len() as i64 <= maxsize {
+            return;
+        }
+        let oldest = items[0];
+        if let Some(mut queued) = value::list_items_mut(order) {
+            queued.remove(0);
+        }
+        crate::container::delete_subscript(cache, oldest);
+    }
+}
+
+/// `_lru_cache_wrapper.__call__(*args, **kwargs)`.
+fn lru_call(instance: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    let wrapped = match instance_attribute(instance, "__wrapped__") {
+        Some(function) => function,
+        None => {
+            return exc::raise_with_message(
+                RUNTIME_ERROR,
+                "lru_cache wrapper has no wrapped function",
+            )
+        }
+    };
+    let maxsize = instance_attribute(instance, "maxsize").and_then(value::as_integer);
+    let cache = ensure_dict_attr(instance, LRU_CACHE);
+    let order = ensure_list_attr(instance, LRU_ORDER);
+    let key = lru_key(instance, args, keywords);
+    let roots = heap::root_values(&[instance, wrapped, cache, order, key]);
+    if let Some(stored) = cache_lookup(cache, key) {
+        set_counter(instance, LRU_HITS, counter(instance, LRU_HITS) + 1);
+        touch_order(order, key);
+        heap::release_roots(roots);
+        return stored;
+    }
+    set_counter(instance, LRU_MISSES, counter(instance, LRU_MISSES) + 1);
+    // `maxsize=0` never stores, matching CPython's no-cache mode.
+    if maxsize == Some(0) {
+        heap::release_roots(roots);
+        return call_with_keywords(wrapped, args, keywords);
+    }
+    let result = call_with_keywords(wrapped, args, keywords);
+    if exc::pending() {
+        heap::release_roots(roots);
+        return NONE;
+    }
+    let result_roots = heap::root_values(&[result]);
+    crate::container::dict_set(cache, key, result);
+    touch_order(order, key);
+    if let Some(limit) = maxsize {
+        trim_cache(cache, order, limit);
+    }
+    heap::release_roots(result_roots);
+    heap::release_roots(roots);
+    result
+}
+
+extern "C" fn lru_call_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self, args, kwargs]`.
+    let instance = unsafe { *argv };
+    let args = list_items(unsafe { *argv.add(1) });
+    let keywords = dict_keywords(unsafe { *argv.add(2) });
+    lru_call(instance, &args, &keywords)
+}
+
+/// The cached `functools._CacheInfo` class: hits, misses, maxsize and
+/// currsize, readable by attribute and by tuple unpacking.
+fn cache_info_class() -> i64 {
+    if let Some(cached) = crate::core::globals::registry_get("functools._CacheInfo") {
+        return cached;
+    }
+    let iter = method_entry(
+        "functools",
+        "_cache_info_iter",
+        cache_info_iter_entry,
+        vec![self_parameter()],
+    );
+    let len = method_entry(
+        "functools",
+        "_cache_info_len",
+        cache_info_len_entry,
+        vec![self_parameter()],
+    );
+    let getitem = method_entry(
+        "functools",
+        "_cache_info_getitem",
+        cache_info_getitem_entry,
+        vec![self_parameter(), positional_parameter("index")],
+    );
+    let repr = method_entry(
+        "functools",
+        "_cache_info_repr",
+        cache_info_repr_entry,
+        vec![self_parameter()],
+    );
+    let methods: Vec<(String, i64, MethodKind)> = vec![
+        ("__iter__".to_string(), iter, MethodKind::Normal),
+        ("__len__".to_string(), len, MethodKind::Normal),
+        ("__getitem__".to_string(), getitem, MethodKind::Normal),
+        ("__repr__".to_string(), repr, MethodKind::Normal),
+    ];
+    let values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let method_roots = heap::root_values(&values);
+    let class = value::class_new_full("_CacheInfo".to_string(), NONE, methods, Vec::new());
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    crate::core::globals::registry_set("functools._CacheInfo", class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+fn cache_info_fields(instance: i64) -> Vec<i64> {
+    vec![
+        instance_attribute(instance, "hits").unwrap_or(NONE),
+        instance_attribute(instance, "misses").unwrap_or(NONE),
+        instance_attribute(instance, "maxsize").unwrap_or(NONE),
+        instance_attribute(instance, "currsize").unwrap_or(NONE),
+    ]
+}
+
+extern "C" fn cache_info_iter_entry(argv: *const i64) -> i64 {
+    let instance = unsafe { *argv };
+    let fields = cache_info_fields(instance);
+    let roots = heap::root_values(&fields);
+    let list = value::list_new(fields);
+    let list_roots = heap::root_values(&[list]);
+    let iterator = crate::iter::iter_new(list);
+    heap::release_roots(list_roots);
+    heap::release_roots(roots);
+    iterator
+}
+
+extern "C" fn cache_info_len_entry(_argv: *const i64) -> i64 {
+    crate::core::ops::int_result(4)
+}
+
+extern "C" fn cache_info_getitem_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self, index]`.
+    let (instance, index) = unsafe { (*argv, *argv.add(1)) };
+    let fields = cache_info_fields(instance);
+    let position = match value::as_integer(index) {
+        Some(n) if n >= 0 && (n as usize) < fields.len() => n as usize,
+        _ => {
+            return exc::raise_with_message(
+                exc::INDEX_ERROR,
+                "_CacheInfo index out of range",
+            )
+        }
+    };
+    fields[position]
+}
+
+extern "C" fn cache_info_repr_entry(argv: *const i64) -> i64 {
+    let instance = unsafe { *argv };
+    let fields = cache_info_fields(instance);
+    value::str_alloc(format!(
+        "functools._CacheInfo(hits={}, misses={}, maxsize={}, currsize={})",
+        value::repr(fields[0]),
+        value::repr(fields[1]),
+        value::repr(fields[2]),
+        value::repr(fields[3])
+    ))
+}
+
+/// `_lru_cache_wrapper.cache_info()`.
+extern "C" fn lru_cache_info_entry(argv: *const i64) -> i64 {
+    let instance = unsafe { *argv };
+    let class = cache_info_class();
+    let roots = heap::root_values(&[class, instance]);
+    let info = value::instance_new(class);
+    let info_roots = heap::root_values(&[info]);
+    let hits = instance_attribute(instance, LRU_HITS).unwrap_or(NONE);
+    let misses = instance_attribute(instance, LRU_MISSES).unwrap_or(NONE);
+    let maxsize = instance_attribute(instance, "maxsize").unwrap_or(NONE);
+    let cache = ensure_dict_attr(instance, LRU_CACHE);
+    let currsize = crate::core::ops::int_result(
+        value::as_dict(cache).map_or(0, |pairs| pairs.len() as i64),
+    );
+    let values = heap::root_values(&[hits, misses, maxsize, currsize]);
+    value::instance_setattr(info, "hits".to_string(), hits);
+    value::instance_setattr(info, "misses".to_string(), misses);
+    value::instance_setattr(info, "maxsize".to_string(), maxsize);
+    value::instance_setattr(info, "currsize".to_string(), currsize);
+    heap::release_roots(values);
+    heap::release_roots(info_roots);
+    heap::release_roots(roots);
+    info
+}
+
+/// `_lru_cache_wrapper.cache_clear()`.
+extern "C" fn lru_cache_clear_entry(argv: *const i64) -> i64 {
+    let instance = unsafe { *argv };
+    let roots = heap::root_values(&[instance]);
+    let cache = value::dict_new(Vec::new());
+    let order = value::list_new(Vec::new());
+    let fresh = heap::root_values(&[cache, order]);
+    value::instance_setattr(instance, LRU_CACHE.to_string(), cache);
+    value::instance_setattr(instance, LRU_ORDER.to_string(), order);
+    set_counter(instance, LRU_HITS, 0);
+    set_counter(instance, LRU_MISSES, 0);
+    heap::release_roots(fresh);
+    heap::release_roots(roots);
+    NONE
+}
+
+/// `_lru_cache_wrapper.cache_parameters()`.
+extern "C" fn lru_cache_parameters_entry(argv: *const i64) -> i64 {
+    let instance = unsafe { *argv };
+    let maxsize = instance_attribute(instance, "maxsize").unwrap_or(NONE);
+    let typed = instance_attribute(instance, "typed").unwrap_or(value::FALSE);
+    let roots = heap::root_values(&[maxsize, typed]);
+    let pairs = vec![
+        (value::str_alloc("maxsize".to_string()), maxsize),
+        (value::str_alloc("typed".to_string()), typed),
+    ];
+    let pair_roots = heap::root_values(
+        &pairs
+            .iter()
+            .flat_map(|(name, item)| [*name, *item])
+            .collect::<Vec<i64>>(),
+    );
+    let dict = value::dict_new(pairs);
+    heap::release_roots(pair_roots);
+    heap::release_roots(roots);
+    dict
+}
+
+/// `_lru_cache_wrapper.__get__(obj, cls)`: binds the wrapper as a method by
+/// prepending the receiver; class access returns the wrapper itself.
+extern "C" fn lru_get_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self, obj, cls]`.
+    let (instance, obj) = unsafe { (*argv, *argv.add(1)) };
+    if obj == NONE {
+        return instance;
+    }
+    let roots = heap::root_values(&[instance, obj]);
+    let bound = value::partial_new(instance, vec![obj]);
+    heap::release_roots(roots);
+    bound
+}
+
+/// The cached `functools._lru_cache_wrapper` class.
+fn lru_wrapper_class() -> i64 {
+    if let Some(cached) = crate::core::globals::registry_get("functools._lru_cache_wrapper") {
+        return cached;
+    }
+    let call = method_entry(
+        "functools",
+        "_lru_cache_call",
+        lru_call_entry,
+        variadic_parameters(),
+    );
+    let cache_info = method_entry(
+        "functools",
+        "_lru_cache_cache_info",
+        lru_cache_info_entry,
+        vec![self_parameter()],
+    );
+    let cache_clear = method_entry(
+        "functools",
+        "_lru_cache_cache_clear",
+        lru_cache_clear_entry,
+        vec![self_parameter()],
+    );
+    let cache_parameters = method_entry(
+        "functools",
+        "_lru_cache_cache_parameters",
+        lru_cache_parameters_entry,
+        vec![self_parameter()],
+    );
+    let get = method_entry(
+        "functools",
+        "_lru_cache_get",
+        lru_get_entry,
+        vec![
+            self_parameter(),
+            positional_parameter("obj"),
+            optional_parameter("cls"),
+        ],
+    );
+    let methods: Vec<(String, i64, MethodKind)> = vec![
+        ("__call__".to_string(), call, MethodKind::Normal),
+        ("cache_info".to_string(), cache_info, MethodKind::Normal),
+        ("cache_clear".to_string(), cache_clear, MethodKind::Normal),
+        (
+            "cache_parameters".to_string(),
+            cache_parameters,
+            MethodKind::Normal,
+        ),
+        ("__get__".to_string(), get, MethodKind::Normal),
+    ];
+    let values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let method_roots = heap::root_values(&values);
+    let class = value::class_new_full("_lru_cache_wrapper".to_string(), NONE, methods, Vec::new());
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    crate::core::globals::registry_set("functools._lru_cache_wrapper", class);
+    heap::release_roots(class_roots);
+    heap::release_roots(method_roots);
+    class
+}
+
+/// Wraps `user_function` in a real `_lru_cache_wrapper`.
+pub(crate) fn new_lru_cache(user_function: i64, maxsize: Option<i64>, typed: bool) -> i64 {
+    let class = lru_wrapper_class();
+    let roots = heap::root_values(&[class, user_function]);
+    let instance = value::instance_new(class);
+    let inner = heap::root_values(&[instance]);
+    let maxsize_value = match maxsize {
+        Some(limit) => crate::core::ops::int_result(limit),
+        None => NONE,
+    };
+    let cache = value::dict_new(Vec::new());
+    let order = value::list_new(Vec::new());
+    let fields = heap::root_values(&[maxsize_value, cache, order]);
+    value::instance_setattr(instance, "maxsize".to_string(), maxsize_value);
+    value::instance_setattr(instance, "typed".to_string(), value::bool_value(typed));
+    value::instance_setattr(instance, LRU_CACHE.to_string(), cache);
+    value::instance_setattr(instance, LRU_ORDER.to_string(), order);
+    set_counter(instance, LRU_HITS, 0);
+    set_counter(instance, LRU_MISSES, 0);
+    let result = copy_callable_metadata(instance, user_function);
+    heap::release_roots(fields);
+    heap::release_roots(inner);
+    heap::release_roots(roots);
+    if result == NONE && exc::pending() {
+        return NONE;
+    }
+    instance
+}
+
+/// `_lru_cache_decorator(func)`: the object `lru_cache(...)` returns when its
+/// first argument was a size rather than the decorated function.
+extern "C" fn lru_decorator_call_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `[self, func]`.
+    let (instance, func) = unsafe { (*argv, *argv.add(1)) };
+    let maxsize = instance_attribute(instance, "maxsize").and_then(value::as_integer);
+    let typed = instance_attribute(instance, "typed") == Some(value::TRUE);
+    new_lru_cache(func, maxsize, typed)
+}
+
+fn lru_decorator_class() -> i64 {
+    if let Some(cached) = crate::core::globals::registry_get("functools._lru_cache_decorator") {
+        return cached;
+    }
+    let call = method_entry(
+        "functools",
+        "_lru_cache_decorator_call",
+        lru_decorator_call_entry,
+        vec![self_parameter(), positional_parameter("func")],
+    );
+    let methods: Vec<(String, i64, MethodKind)> = vec![("__call__".to_string(), call, MethodKind::Normal)];
+    let class = value::class_new_full("_lru_cache_decorator".to_string(), NONE, methods, Vec::new());
+    crate::core::globals::registry_set("functools._lru_cache_decorator", class);
+    class
+}
+
+fn new_lru_decorator(maxsize: Option<i64>, typed: bool) -> i64 {
+    let class = lru_decorator_class();
+    let roots = heap::root_values(&[class]);
+    let instance = value::instance_new(class);
+    let inner = heap::root_values(&[instance]);
+    let maxsize_value = match maxsize {
+        Some(limit) => crate::core::ops::int_result(limit),
+        None => NONE,
+    };
+    let fields = heap::root_values(&[maxsize_value]);
+    value::instance_setattr(instance, "maxsize".to_string(), maxsize_value);
+    value::instance_setattr(instance, "typed".to_string(), value::bool_value(typed));
+    heap::release_roots(fields);
+    heap::release_roots(inner);
+    heap::release_roots(roots);
+    instance
+}
+
+/// `functools.lru_cache(maxsize=128, typed=False)` with the CPython shorthand
+/// that a callable first argument means the decorator is applied directly.
+fn lru_cache_new(args: &[i64]) -> i64 {
+    let first = args.first().copied();
+    if let Some(candidate) = first {
+        if value::as_integer(candidate).is_none() && candidate != NONE && is_callable_or_descriptor(candidate) {
+            return new_lru_cache(candidate, Some(128), false);
+        }
+    }
+    let maxsize = match first {
+        None => Some(128),
+        Some(item) if item == NONE => None,
+        Some(item) => match value::as_integer(item) {
+            Some(limit) if limit >= 0 => Some(limit),
+            Some(_) => {
+                return exc::raise_with_message(VALUE_ERROR, "maxsize must be non-negative")
+            }
+            None => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "Expected first argument to be an integer, a callable, or None",
+                )
+            }
+        },
+    };
+    let typed = args.get(1).is_some_and(|item| value::truthy(*item));
+    new_lru_decorator(maxsize, typed)
+}
+
 /// Dispatches the `functools` internals, the `partialmethod` class methods and
 /// the native methods of `_singledispatchmethod_get`. Returns `None` for every
 /// other function.
@@ -2550,6 +3069,10 @@ pub(crate) fn call(function: &str, args: &[i64]) -> Option<i64> {
         },
         "_unwrap_partial" => unwrap_partial(args[0]),
         "_unwrap_partialmethod" => unwrap_partialmethod(args[0]),
+        // Real memoising wrappers: positional and keyword calls share one
+        // cache keyed by the arguments (plus the argument types when `typed`).
+        "lru_cache" => lru_cache_new(args),
+        "cache" => new_lru_cache(args[0], None, false),
         "_singledispatchmethod_get" => match args {
             [unbound, obj, cls] => new_get(*unbound, *obj, *cls),
             // `inspect` only needs the class value for `isinstance`; a direct

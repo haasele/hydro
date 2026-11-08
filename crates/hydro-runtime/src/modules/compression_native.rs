@@ -1329,6 +1329,79 @@ fn init_lzma_decoder(
 // `_bz2` classes
 // -------------------------------------------------------------------------
 
+fn param(name: &str, kind: hydro_ir::ParamKind, default: Option<i64>) -> value::ParamMeta {
+    value::ParamMeta {
+        name: name.to_string(),
+        kind,
+        default,
+    }
+}
+
+/// Builds a codec method value with a real signature and full-argv trampoline
+/// so `call_user_method_kw` can bind `max_length`/reject `data=` keywords.
+fn method_function(
+    module: &'static str,
+    name: &'static str,
+    signature: Vec<value::ParamMeta>,
+    entry: usize,
+) -> i64 {
+    let function = value::native_function_new(module, name, usize::MAX);
+    value::function_set_signature(function, signature);
+    value::function_set_full_entry(function, entry);
+    function
+}
+
+fn compressor_methods(
+    module: &'static str,
+    compress: &'static str,
+    flush: &'static str,
+    compress_entry: usize,
+    flush_entry: usize,
+) -> Vec<(String, i64)> {
+    use hydro_ir::ParamKind::PosOnly;
+    vec![
+        (
+            "compress".to_string(),
+            method_function(
+                module,
+                compress,
+                vec![param("self", PosOnly, None), param("data", PosOnly, None)],
+                compress_entry,
+            ),
+        ),
+        (
+            "flush".to_string(),
+            method_function(
+                module,
+                flush,
+                vec![param("self", PosOnly, None)],
+                flush_entry,
+            ),
+        ),
+    ]
+}
+
+fn decompressor_methods(
+    module: &'static str,
+    decompress: &'static str,
+    entry: usize,
+) -> Vec<(String, i64)> {
+    use hydro_ir::ParamKind::{PosOnly, Positional};
+    vec![(
+        "decompress".to_string(),
+        method_function(
+            module,
+            decompress,
+            vec![
+                param("self", PosOnly, None),
+                param("data", Positional, None),
+                param("max_length", Positional, Some(int_constant(-1))),
+            ],
+            entry,
+        ),
+    )]
+}
+
 fn bz2_compressor_class() -> i64 {
     cached_class("_bz2.BZ2Compressor", || {
         let init = value::native_function_new("_bz2", "_bz2_compressor_init", usize::MAX);
@@ -1348,21 +1421,15 @@ fn bz2_compressor_class() -> i64 {
             ],
         );
         value::function_set_full_entry(init, bz2_compressor_init_entry as *const () as usize);
-        value::class_new(
-            "BZ2Compressor".to_string(),
-            NONE,
-            vec![
-                ("__init__".to_string(), init),
-                (
-                    "compress".to_string(),
-                    value::native_function_new("_bz2", "_bz2_compress", usize::MAX),
-                ),
-                (
-                    "flush".to_string(),
-                    value::native_function_new("_bz2", "_bz2_flush", usize::MAX),
-                ),
-            ],
-        )
+        let mut methods = vec![("__init__".to_string(), init)];
+        methods.extend(compressor_methods(
+            "_bz2",
+            "_bz2_compress",
+            "_bz2_flush",
+            bz2_compress_entry as *const () as usize,
+            bz2_flush_entry as *const () as usize,
+        ));
+        value::class_new("BZ2Compressor".to_string(), NONE, methods)
     })
 }
 
@@ -1378,17 +1445,13 @@ fn bz2_decompressor_class() -> i64 {
             }],
         );
         value::function_set_full_entry(init, bz2_decompressor_init_entry as *const () as usize);
-        value::class_new(
-            "BZ2Decompressor".to_string(),
-            NONE,
-            vec![
-                ("__init__".to_string(), init),
-                (
-                    "decompress".to_string(),
-                    value::native_function_new("_bz2", "_bz2_decompress", usize::MAX),
-                ),
-            ],
-        )
+        let mut methods = vec![("__init__".to_string(), init)];
+        methods.extend(decompressor_methods(
+            "_bz2",
+            "_bz2_decompress",
+            bz2_decompress_entry as *const () as usize,
+        ));
+        value::class_new("BZ2Decompressor".to_string(), NONE, methods)
     })
 }
 
@@ -1503,21 +1566,15 @@ fn lzma_compressor_class() -> i64 {
             ],
         );
         value::function_set_full_entry(init, lzma_compressor_init_entry as *const () as usize);
-        value::class_new(
-            "LZMACompressor".to_string(),
-            NONE,
-            vec![
-                ("__init__".to_string(), init),
-                (
-                    "compress".to_string(),
-                    value::native_function_new("_lzma", "_lzma_compress", usize::MAX),
-                ),
-                (
-                    "flush".to_string(),
-                    value::native_function_new("_lzma", "_lzma_flush", usize::MAX),
-                ),
-            ],
-        )
+        let mut methods = vec![("__init__".to_string(), init)];
+        methods.extend(compressor_methods(
+            "_lzma",
+            "_lzma_compress",
+            "_lzma_flush",
+            lzma_compress_entry as *const () as usize,
+            lzma_flush_entry as *const () as usize,
+        ));
+        value::class_new("LZMACompressor".to_string(), NONE, methods)
     })
 }
 
@@ -1550,17 +1607,13 @@ fn lzma_decompressor_class() -> i64 {
             ],
         );
         value::function_set_full_entry(init, lzma_decompressor_init_entry as *const () as usize);
-        value::class_new(
-            "LZMADecompressor".to_string(),
-            NONE,
-            vec![
-                ("__init__".to_string(), init),
-                (
-                    "decompress".to_string(),
-                    value::native_function_new("_lzma", "_lzma_decompress", usize::MAX),
-                ),
-            ],
-        )
+        let mut methods = vec![("__init__".to_string(), init)];
+        methods.extend(decompressor_methods(
+            "_lzma",
+            "_lzma_decompress",
+            lzma_decompress_entry as *const () as usize,
+        ));
+        value::class_new("LZMADecompressor".to_string(), NONE, methods)
     })
 }
 
@@ -1676,6 +1729,40 @@ extern "C" fn lzma_decompressor_init_entry(argv: *const i64) -> i64 {
 }
 
 // -------------------------------------------------------------------------
+// Full-argv trampolines for the codec methods
+// -------------------------------------------------------------------------
+
+extern "C" fn bz2_compress_entry(argv: *const i64) -> i64 {
+    // SAFETY: the bound method call passes self and data.
+    bz2_compress_method(unsafe { std::slice::from_raw_parts(argv, 2) })
+}
+
+extern "C" fn bz2_flush_entry(argv: *const i64) -> i64 {
+    // SAFETY: the bound method call passes the receiver slot.
+    bz2_flush_method(unsafe { std::slice::from_raw_parts(argv, 1) })
+}
+
+extern "C" fn bz2_decompress_entry(argv: *const i64) -> i64 {
+    // SAFETY: the bound method call passes self, data and max_length.
+    bz2_decompress_method(unsafe { std::slice::from_raw_parts(argv, 3) })
+}
+
+extern "C" fn lzma_compress_entry(argv: *const i64) -> i64 {
+    // SAFETY: the bound method call passes self and data.
+    lzma_compress_method(unsafe { std::slice::from_raw_parts(argv, 2) })
+}
+
+extern "C" fn lzma_flush_entry(argv: *const i64) -> i64 {
+    // SAFETY: the bound method call passes the receiver slot.
+    lzma_flush_method(unsafe { std::slice::from_raw_parts(argv, 1) })
+}
+
+extern "C" fn lzma_decompress_entry(argv: *const i64) -> i64 {
+    // SAFETY: the bound method call passes self, data and max_length.
+    lzma_decompress_method(unsafe { std::slice::from_raw_parts(argv, 3) })
+}
+
+// -------------------------------------------------------------------------
 // Method bodies
 // -------------------------------------------------------------------------
 
@@ -1744,9 +1831,16 @@ fn bz2_decompress_method(args: &[i64]) -> i64 {
         Ok(max_length) => max_length,
         Err(error) => return error,
     };
-    let handle = match handle_of(instance) {
-        Ok(handle) => handle,
-        Err(error) => return error,
+    // `BZ2Decompressor.__new__(BZ2Decompressor)` leaves the stream
+    // uninitialised; CPython's empty-input call still returns b''.
+    let handle = match value::instance_attr(instance, STREAM_ATTR).and_then(value::as_integer) {
+        Some(handle) if handle > 0 => handle as u64,
+        _ => {
+            if data.is_empty() && max_length < 0 {
+                return value::bytes_new(Vec::new());
+            }
+            return inconsistent_state();
+        }
     };
     let (outcome, snapshot) = {
         let mut registry = registry();
@@ -1850,9 +1944,16 @@ fn lzma_decompress_method(args: &[i64]) -> i64 {
         Ok(max_length) => max_length,
         Err(error) => return error,
     };
-    let handle = match handle_of(instance) {
-        Ok(handle) => handle,
-        Err(error) => return error,
+    // `LZMADecompressor.__new__(LZMADecompressor)` leaves the stream
+    // uninitialised; CPython's empty-input call still returns b''.
+    let handle = match value::instance_attr(instance, STREAM_ATTR).and_then(value::as_integer) {
+        Some(handle) if handle > 0 => handle as u64,
+        _ => {
+            if data.is_empty() && max_length < 0 {
+                return value::bytes_new(Vec::new());
+            }
+            return inconsistent_state();
+        }
     };
     let (outcome, snapshot) = {
         let mut registry = registry();

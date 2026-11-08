@@ -97,6 +97,17 @@ pub(super) fn reduce_ex(object: i64, data: &ExcData, args: &[i64]) -> i64 {
     reduce(object, data)
 }
 
+/// `BaseException.__init__(*args)`.
+///
+/// CPython stores the positional arguments as `self.args`. Hydro's built-in
+/// exception payload is immutable after construction, so the call is accepted
+/// with any arity and the instance keeps its construction-time `args`; the
+/// method exists so `e.__init__` resolves and `super().__init__(...)` chains do
+/// not report `AttributeError`.
+pub(super) fn init(_object: i64, _data: &ExcData, _args: &[i64]) -> i64 {
+    NONE
+}
+
 /// `BaseException.with_traceback(tb)`: returns the receiver.
 ///
 /// Hydro has no traceback object type (`__traceback__` is always `None`, the

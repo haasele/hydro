@@ -44,7 +44,7 @@ use hydro_ir::{Builtin, MethodKind};
 
 use crate::builtins;
 use crate::core::globals;
-use crate::exc::{self, ATTRIBUTE_ERROR, NOT_IMPLEMENTED_ERROR, TYPE_ERROR};
+use crate::exc::{self, ATTRIBUTE_ERROR, TYPE_ERROR};
 use crate::heap;
 use crate::ops;
 use crate::value::{self, DescriptorKind, FunctionBody, NONE};
@@ -86,15 +86,9 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         // Recomputing is unnecessary: `__abstractmethods__` is derived from the
         // live class namespace on every read, so the class is already current.
         "update_abstractmethods" => args.first().copied().unwrap_or(NONE),
-        "abstractclassmethod" | "abstractstaticmethod" | "abstractproperty" => {
-            exc::raise_with_message(
-                NOT_IMPLEMENTED_ERROR,
-                &format!(
-                    "abc.{function}() is not supported: use @classmethod, @staticmethod or \
-                     @property together with @abstractmethod"
-                ),
-            )
-        }
+        "abstractclassmethod" => abstract_descriptor(DescriptorKind::Classmethod, args),
+        "abstractstaticmethod" => abstract_descriptor(DescriptorKind::Staticmethod, args),
+        "abstractproperty" => abstract_property(args),
         "ABCMeta.register" => register(args),
         "ABCMeta.__instancecheck__" => instance_check(args),
         "ABCMeta.__subclasscheck__" => subclass_check(args),
@@ -419,6 +413,40 @@ fn same_target(left: i64, right: i64) -> bool {
 // -------------------------------------------------------------------------
 // Abstract-method marking
 // -------------------------------------------------------------------------
+
+/// The deprecated `abstractclassmethod`/`abstractstaticmethod` decorators:
+/// wrap the callable exactly like `classmethod`/`staticmethod` and mark the
+/// wrapped function abstract, so `__abstractmethods__` reports it. The
+/// descriptor value also carries `__isabstractmethod__` for the wrappers whose
+/// attribute table the runtime exposes.
+fn abstract_descriptor(kind: DescriptorKind, args: &[i64]) -> i64 {
+    let Some(&function) = args.first() else {
+        return exc::raise_with_message(TYPE_ERROR, "decorator takes exactly one argument");
+    };
+    mark_abstract(function);
+    value::descriptor_new(kind, function, NONE, NONE)
+}
+
+/// `abstractproperty(fget=None, fset=None, fdel=None, doc=None)`: CPython's
+/// deprecated abstract-property decorator. The property's getter is marked
+/// abstract (so the class-level computation sees it) and the descriptor itself
+/// reports `__isabstractmethod__`, matching the class attribute on CPython's
+/// `abstractproperty` type.
+fn abstract_property(args: &[i64]) -> i64 {
+    let fget = args.first().copied().unwrap_or(NONE);
+    let fset = args.get(1).copied().unwrap_or(NONE);
+    let fdel = args.get(2).copied().unwrap_or(NONE);
+    if fget != NONE {
+        mark_abstract(fget);
+    }
+    let roots = heap::root_values(&[fget, fset, fdel]);
+    let descriptor = value::descriptor_new(DescriptorKind::Property, fget, fset, fdel);
+    if let Some(state) = value::as_descriptor(descriptor) {
+        state.set_attr(descriptor, "__isabstractmethod__".to_string(), value::TRUE);
+    }
+    heap::release_roots(roots);
+    descriptor
+}
 
 /// `abstractmethod(func)`: records the declaration and returns the function
 /// unchanged, like CPython's decorator.

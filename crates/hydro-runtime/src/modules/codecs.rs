@@ -27,16 +27,13 @@
 //! the runtime's own handlers use) or a `bytes` replacement, which is
 //! appended verbatim as CPython's encoder protocol specifies.
 //!
-//! `surrogateescape` (PEP 383) needs one representation note. Hydro strings
-//! are UTF-8, so the lone surrogates U+DC80..U+DCFF CPython produces cannot
-//! exist in a runtime string, and the lexer already maps every `\udcXX`
-//! escape to U+FFFD. The codec therefore uses
-//! [`SURROGATE_ESCAPE_STAND_IN`] (U+FFFD) as the stand-in for a lone
-//! surrogate: every undecodable byte becomes that character (so
-//! `b'\xff'.decode('utf-8', 'surrogateescape')` equals the `'\udcff'` literal,
-//! both being U+FFFD here), and encoding the stand-in emits `0xff` again. The
-//! stand-in cannot distinguish two different undecodable bytes, which is the
-//! same lossy limit the rest of the runtime documents for lone surrogates.
+//! Lone surrogates are real Python code points in this runtime: a string
+//! payload keeps `U+D800..U+DFFF` in a reserved private-use mirror block, and
+//! `value::str_codes`/`value::str_from_codes` translate at the boundary.
+//! Every codec path here uses those accessors, so `surrogateescape` maps an
+//! undecodable byte `b` to code point `0xDC00 + b` (and back), `surrogatepass`
+//! emits and accepts the generalized UTF-8 `ED A0..BF ..` forms, and `strict`
+//! reports `UnicodeDecodeError`/`UnicodeEncodeError` with the offending span.
 //!
 //! `escape_encode`/`escape_decode` implement CPython's `unicode_escape`
 //! subset used by the `codecs` module.
@@ -46,7 +43,8 @@ use std::cell::RefCell;
 use crate::builtins as core_builtins;
 use crate::core::globals;
 use crate::exc::{
-    self, LOOKUP_ERROR, TYPE_ERROR, UNICODE_DECODE_ERROR, UNICODE_ENCODE_ERROR, VALUE_ERROR,
+    self, LOOKUP_ERROR, NOT_IMPLEMENTED_ERROR, RUNTIME_ERROR, TYPE_ERROR, UNICODE_DECODE_ERROR,
+    UNICODE_ENCODE_ERROR, UNICODE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::ops;
@@ -64,32 +62,18 @@ enum ErrorMode {
     Strict,
     Ignore,
     Replace,
-    /// PEP 383: undecodable bytes become a stand-in for their lone surrogate
-    /// and the stand-in encodes back to the byte.
+    /// PEP 383: an undecodable byte `b` becomes code point `0xDC00 + b`, and
+    /// that code point encodes back to the byte.
     SurrogateEscape,
+    /// Lone surrogates pass through UTF-8 (and are accepted when decoding).
+    SurrogatePass,
+    /// `\xNN`, `\uNNNN` and `\UNNNNNNNN` escapes.
+    BackslashReplace,
+    /// `\N{NAME}` for encoding, falling back to `\uNNNN`.
+    NameReplace,
+    /// `&#NNN;` for encoding.
+    XmlCharrefReplace,
     Custom(i64),
-}
-
-/// The runtime's stand-in for a lone surrogate produced by `surrogateescape`.
-///
-/// Hydro strings are UTF-8, so U+DC80..U+DCFF cannot be stored and the lexer
-/// already turns every surrogate escape into U+FFFD. `surrogateescape`
-/// decodes each rejected byte to this character and encodes it back to
-/// [`SURROGATE_ESCAPE_BYTE`]. A genuine U+FFFD is therefore not
-/// distinguishable from an escaped byte under this handler.
-const SURROGATE_ESCAPE_STAND_IN: char = '\u{FFFD}';
-
-/// The byte [`SURROGATE_ESCAPE_STAND_IN`] stands for: CPython's surrogate for
-/// `0xff`, the undecodable byte `test.support.os_helper` relies on.
-const SURROGATE_ESCAPE_BYTE: u8 = 0xff;
-
-/// The byte a `surrogateescape` stand-in encodes back to, if `character` is
-/// that stand-in.
-///
-/// A real lone surrogate can never reach this function: Hydro's `char` is a
-/// Unicode scalar value, so U+DC80..U+DCFF do not exist in a runtime string.
-fn surrogate_escape_byte(character: char) -> Option<u8> {
-    (character == SURROGATE_ESCAPE_STAND_IN).then_some(SURROGATE_ESCAPE_BYTE)
 }
 
 /// The codecs the runtime implements natively.
@@ -98,6 +82,29 @@ enum Codec {
     Utf8,
     Ascii,
     Latin1,
+    Utf8Sig,
+    Utf16,
+    Utf16Le,
+    Utf16Be,
+    Utf32,
+    Utf32Le,
+    Utf32Be,
+    Utf7,
+    UnicodeEscape,
+    RawUnicodeEscape,
+    Charmap,
+    Rot13,
+    Undefined,
+    /// A single-byte (or otherwise `iconv`-convertible) codec: the
+    /// `_codecs` programmatic name, the canonical `CodecInfo.name` and the
+    /// `iconv` charset spelling.
+    Charset {
+        prog: &'static str,
+        name: &'static str,
+        charset: &'static str,
+    },
+    /// A codec from [`super::codecs_native`] (CJK and ISO-2022 families).
+    Multibyte { prog: &'static str },
 }
 
 impl Codec {
@@ -107,33 +114,259 @@ impl Codec {
             Codec::Utf8 => "utf-8",
             Codec::Ascii => "ascii",
             Codec::Latin1 => "latin-1",
+            Codec::Utf8Sig => "utf-8-sig",
+            Codec::Utf16 => "utf-16",
+            Codec::Utf16Le => "utf-16-le",
+            Codec::Utf16Be => "utf-16-be",
+            Codec::Utf32 => "utf-32",
+            Codec::Utf32Le => "utf-32-le",
+            Codec::Utf32Be => "utf-32-be",
+            Codec::Utf7 => "utf-7",
+            Codec::UnicodeEscape => "unicode-escape",
+            Codec::RawUnicodeEscape => "raw-unicode-escape",
+            Codec::Charmap => "charmap",
+            Codec::Rot13 => "rot-13",
+            Codec::Undefined => "undefined",
+            Codec::Charset { name, .. } => name,
+            Codec::Multibyte { prog } => prog,
         }
     }
 
-    /// Highest code point the codec can represent.
+    /// The programmatic name `_codecs` uses for the codec's entry points
+    /// (`utf_8_encode`, `gb2312_decode`, ...).
+    fn prog(self) -> &'static str {
+        match self {
+            Codec::Utf8 => "utf_8",
+            Codec::Ascii => "ascii",
+            Codec::Latin1 => "latin_1",
+            Codec::Utf8Sig => "utf_8_sig",
+            Codec::Utf16 => "utf_16",
+            Codec::Utf16Le => "utf_16_le",
+            Codec::Utf16Be => "utf_16_be",
+            Codec::Utf32 => "utf_32",
+            Codec::Utf32Le => "utf_32_le",
+            Codec::Utf32Be => "utf_32_be",
+            Codec::Utf7 => "utf_7",
+            Codec::UnicodeEscape => "unicode_escape",
+            Codec::RawUnicodeEscape => "raw_unicode_escape",
+            Codec::Charmap => "charmap",
+            Codec::Rot13 => "rot_13",
+            Codec::Undefined => "undefined",
+            Codec::Charset { prog, .. } => prog,
+            Codec::Multibyte { prog } => prog,
+        }
+    }
+
+    /// Whether the codec converts text to bytes (`True`) or is a non-text
+    /// codec such as `rot-13` (`False`, the `_is_text_encoding` flag).
+    fn is_text(self) -> bool {
+        !matches!(self, Codec::Rot13)
+    }
+
+    /// Highest code point the codec can represent as one unit.
     fn limit(self) -> u32 {
         match self {
-            Codec::Utf8 => 0x10_FFFF,
+            Codec::Utf8
+            | Codec::Utf8Sig
+            | Codec::Utf16
+            | Codec::Utf16Le
+            | Codec::Utf16Be
+            | Codec::Utf32
+            | Codec::Utf32Le
+            | Codec::Utf32Be
+            | Codec::Utf7
+            | Codec::UnicodeEscape
+            | Codec::RawUnicodeEscape
+            | Codec::Multibyte { .. } => 0x10_FFFF,
             Codec::Ascii => 0x7f,
             Codec::Latin1 => 0xff,
+            // `charmap` with no map accepts every code point below 0x100 on
+            // encode and rejects the rest; the generic engine reports that.
+            Codec::Charmap => 0xff,
+            Codec::Rot13 | Codec::Undefined | Codec::Charset { .. } => 0x10_FFFF,
         }
     }
 }
 
-/// Resolves an encoding name, including the CPython aliases, to a built-in
-/// codec. Names are matched the way CPython normalizes them: surrounding
-/// whitespace is ignored, case is folded and `_` is equivalent to `-`.
+/// Single-byte codecs served through the system `iconv`.
+///
+/// Each entry is `(programmatic name, canonical CodecInfo.name, iconv
+/// charset)`. `codecs.lookup` answers them only when the system `iconv`
+/// actually provides the charset; a missing table is reported as
+/// `LookupError` rather than silently treated as Latin-1.
+const CHARSET_CODECS: &[(&str, &str, &str)] = &[
+    ("cp037", "cp037", "IBM037"),
+    ("cp1006", "cp1006", "IBM1006"),
+    ("cp1026", "cp1026", "IBM1026"),
+    ("cp1125", "cp1125", "CP1125"),
+    ("cp1140", "cp1140", "IBM1140"),
+    ("cp1250", "cp1250", "CP1250"),
+    ("cp1251", "cp1251", "CP1251"),
+    ("cp1252", "cp1252", "CP1252"),
+    ("cp1253", "cp1253", "CP1253"),
+    ("cp1254", "cp1254", "CP1254"),
+    ("cp1255", "cp1255", "CP1255"),
+    ("cp1256", "cp1256", "CP1256"),
+    ("cp1257", "cp1257", "CP1257"),
+    ("cp1258", "cp1258", "CP1258"),
+    ("cp273", "cp273", "IBM273"),
+    ("cp424", "cp424", "IBM424"),
+    ("cp437", "cp437", "CP437"),
+    ("cp500", "cp500", "IBM500"),
+    ("cp720", "cp720", "CP720"),
+    ("cp737", "cp737", "CP737"),
+    ("cp775", "cp775", "CP775"),
+    ("cp850", "cp850", "CP850"),
+    ("cp852", "cp852", "CP852"),
+    ("cp855", "cp855", "CP855"),
+    ("cp856", "cp856", "CP856"),
+    ("cp857", "cp857", "CP857"),
+    ("cp858", "cp858", "CP858"),
+    ("cp860", "cp860", "CP860"),
+    ("cp861", "cp861", "CP861"),
+    ("cp862", "cp862", "CP862"),
+    ("cp863", "cp863", "CP863"),
+    ("cp864", "cp864", "CP864"),
+    ("cp865", "cp865", "CP865"),
+    ("cp866", "cp866", "CP866"),
+    ("cp869", "cp869", "CP869"),
+    ("cp874", "cp874", "CP874"),
+    ("cp875", "cp875", "IBM875"),
+    ("hp_roman8", "hp-roman8", "HP-ROMAN8"),
+    ("iso8859_2", "iso8859-2", "ISO-8859-2"),
+    ("iso8859_3", "iso8859-3", "ISO-8859-3"),
+    ("iso8859_4", "iso8859-4", "ISO-8859-4"),
+    ("iso8859_5", "iso8859-5", "ISO-8859-5"),
+    ("iso8859_6", "iso8859-6", "ISO-8859-6"),
+    ("iso8859_7", "iso8859-7", "ISO-8859-7"),
+    ("iso8859_8", "iso8859-8", "ISO-8859-8"),
+    ("iso8859_9", "iso8859-9", "ISO-8859-9"),
+    ("iso8859_10", "iso8859-10", "ISO-8859-10"),
+    ("iso8859_11", "iso8859-11", "ISO-8859-11"),
+    ("iso8859_13", "iso8859-13", "ISO-8859-13"),
+    ("iso8859_14", "iso8859-14", "ISO-8859-14"),
+    ("iso8859_15", "iso8859-15", "ISO-8859-15"),
+    ("iso8859_16", "iso8859-16", "ISO-8859-16"),
+    ("koi8_r", "koi8-r", "KOI8-R"),
+    ("koi8_t", "koi8-t", "KOI8-T"),
+    ("koi8_u", "koi8-u", "KOI8-U"),
+    ("kz1048", "kz1048", "RK1048"),
+    ("mac_cyrillic", "mac-cyrillic", "MAC-CYRILLIC"),
+    ("mac_greek", "mac-greek", "MAC-GREEK"),
+    ("mac_iceland", "mac-iceland", "MAC-ICELAND"),
+    ("mac_latin2", "mac-latin2", "MAC-CENTRALEUROPE"),
+    ("mac_roman", "mac-roman", "MACINTOSH"),
+    ("mac_turkish", "mac-turkish", "MAC-TURKISH"),
+    ("palmos", "palmos", "PALMOS"),
+    ("ptcp154", "ptcp154", "PT154"),
+    ("tis_620", "tis-620", "TIS-620"),
+];
+
+/// CJK codecs implemented by [`super::codecs_native`].
+const MULTIBYTE_CODECS: &[&str] = &[
+    "big5",
+    "big5hkscs",
+    "cp932",
+    "cp949",
+    "cp950",
+    "euc_jis_2004",
+    "euc_jisx0213",
+    "euc_jp",
+    "euc_kr",
+    "gb18030",
+    "gb2312",
+    "gbk",
+    "hz",
+    "iso2022_jp",
+    "iso2022_jp_1",
+    "iso2022_jp_2",
+    "iso2022_jp_2004",
+    "iso2022_jp_3",
+    "iso2022_jp_ext",
+    "iso2022_kr",
+    "johab",
+    "shift_jis",
+    "shift_jis_2004",
+    "shift_jisx0213",
+];
+
+/// CPython's encoding-name normalization: ASCII alphanumerics are lowercased,
+/// `.` is kept, and every other run of characters becomes a single `_`
+/// (non-ASCII characters contribute nothing).
+fn normalize_encoding(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut punct = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() || character == '.' {
+            if punct && !out.is_empty() {
+                out.push('_');
+            }
+            if character.is_ascii() {
+                out.push(character.to_ascii_lowercase());
+            }
+            punct = false;
+        } else {
+            punct = true;
+        }
+    }
+    out
+}
+
+/// Resolves an encoding name, including the CPython aliases, to a codec the
+/// runtime implements itself. Names are normalized the way `_codecs.lookup`
+/// does before consulting the search-function registry.
 fn codec_for_name(name: &str) -> Option<Codec> {
     if name.contains('\0') {
         return None;
     }
-    let normalized = name.trim_matches(|c: char| c.is_ascii_whitespace());
-    let normalized = normalized.to_ascii_lowercase().replace('_', "-");
-    match normalized.as_str() {
-        "utf-8" | "utf8" | "u8" | "cp65001" => Some(Codec::Utf8),
-        "ascii" | "us-ascii" | "us" | "646" => Some(Codec::Ascii),
-        "latin-1" | "latin1" | "latin" | "iso-8859-1" | "iso8859-1" | "iso-latin-1" | "l1"
-        | "cp819" | "8859" | "819" => Some(Codec::Latin1),
+    let normalized = normalize_encoding(name);
+    if let Some(codec) = fixed_codec(&normalized) {
+        return Some(codec);
+    }
+    if let Some(entry) = CHARSET_CODECS.iter().find(|entry| entry.0 == normalized) {
+        return Some(Codec::Charset {
+            prog: entry.0,
+            name: entry.1,
+            charset: entry.2,
+        });
+    }
+    if let Some(prog) = MULTIBYTE_CODECS.iter().find(|prog| **prog == normalized) {
+        return Some(Codec::Multibyte { prog: *prog });
+    }
+    // The `iso_8859_N` alias of the `iso8859_N` table entries.
+    if let Some(rest) = normalized.strip_prefix("iso_8859_") {
+        let wanted = format!("iso8859_{rest}");
+        if let Some(entry) = CHARSET_CODECS.iter().find(|entry| entry.0 == wanted) {
+            return Some(Codec::Charset {
+                prog: entry.0,
+                name: entry.1,
+                charset: entry.2,
+            });
+        }
+    }
+    None
+}
+
+/// The codecs with fixed names, including the CPython aliases.
+fn fixed_codec(normalized: &str) -> Option<Codec> {
+    match normalized {
+        "utf_8" | "utf8" | "u8" | "cp65001" => Some(Codec::Utf8),
+        "utf_8_sig" | "utf8_sig" => Some(Codec::Utf8Sig),
+        "ascii" | "us_ascii" | "us" | "646" | "ansi_x3.4.1968" => Some(Codec::Ascii),
+        "latin_1" | "latin1" | "latin" | "iso8859_1" | "iso_8859_1" | "iso_latin_1" | "l1"
+        | "cp819" | "8859" | "819" | "iso8859" | "cp28591" => Some(Codec::Latin1),
+        "utf_16" | "utf16" | "u16" | "unicodelittleunmarked" => Some(Codec::Utf16),
+        "utf_16_le" | "utf16_le" | "unicodelittle" => Some(Codec::Utf16Le),
+        "utf_16_be" | "utf16_be" | "unicodebig" | "unicodebigunmarked" => Some(Codec::Utf16Be),
+        "utf_32" | "utf32" | "u32" => Some(Codec::Utf32),
+        "utf_32_le" | "utf32_le" => Some(Codec::Utf32Le),
+        "utf_32_be" | "utf32_be" => Some(Codec::Utf32Be),
+        "utf_7" | "utf7" | "u7" => Some(Codec::Utf7),
+        "unicode_escape" | "unicodeescape" => Some(Codec::UnicodeEscape),
+        "raw_unicode_escape" | "rawunicodeescape" => Some(Codec::RawUnicodeEscape),
+        "charmap" => Some(Codec::Charmap),
+        "rot_13" | "rot13" => Some(Codec::Rot13),
+        "undefined" => Some(Codec::Undefined),
         _ => None,
     }
 }
@@ -282,98 +515,103 @@ fn registered_error(name: &str) -> Option<i64> {
 
 // encode / decode
 
-fn encode(args: &[i64]) -> i64 {
-    let Some(text) = value::as_str(args[0]) else {
-        return type_error(&format!(
-            "encode() argument 'obj' must be str, not {}",
-            value::type_name(args[0])
-        ));
-    };
-    // Validate the encoding and handler before converting: callers rely on
-    // unknown names raising even when the input cannot fail.
-    let codec = match encoding_argument(args, "encode") {
-        Ok(codec) => codec,
-        Err(error) => return error,
-    };
-    let errors = match errors_argument(args, "encode") {
-        Ok(errors) => errors,
-        Err(error) => return error,
-    };
-    let mode = match error_mode(errors) {
-        Ok(mode) => mode,
-        Err(error) => return error,
-    };
-    match encode_text(text, codec, &mode) {
-        Ok(bytes) => value::bytes_new(bytes),
-        Err(error) => error,
-    }
-}
-
-fn decode(args: &[i64]) -> i64 {
-    let data = match bytes_argument("decode", args[0]) {
-        Ok(data) => data,
-        Err(error) => return error,
-    };
-    let codec = match encoding_argument(args, "decode") {
-        Ok(codec) => codec,
-        Err(error) => return error,
-    };
-    let errors = match errors_argument(args, "decode") {
-        Ok(errors) => errors,
-        Err(error) => return error,
-    };
-    let mode = match error_mode(errors) {
-        Ok(mode) => mode,
-        Err(error) => return error,
-    };
-    match decode_bytes(data, codec, &mode) {
-        Ok(text) => value::str_alloc(text),
-        Err(error) => error,
-    }
-}
-
-/// Encodes `text` with `codec`. UTF-8 cannot fail; the single-byte codecs
-/// report the runs they cannot represent.
-fn encode_text(text: &str, codec: Codec, mode: &ErrorMode) -> Result<Vec<u8>, i64> {
-    match codec {
-        Codec::Utf8 => encode_utf8_text(text, mode),
-        Codec::Ascii | Codec::Latin1 => encode_single_byte(text, codec, mode),
-    }
-}
-
-/// Encodes `text` as UTF-8.
+/// `codecs.encode(obj, encoding='utf-8', errors='strict')`.
 ///
-/// Every Unicode scalar value is representable in UTF-8, so `strict`,
-/// `ignore` and `replace` all produce the plain bytes. `surrogateescape` is
-/// the exception: the runtime's stand-in for a lone surrogate
-/// ([`SURROGATE_ESCAPE_STAND_IN`]) is written back as
-/// [`SURROGATE_ESCAPE_BYTE`] instead of its own UTF-8 encoding.
-fn encode_utf8_text(text: &str, mode: &ErrorMode) -> Result<Vec<u8>, i64> {
-    if !matches!(mode, ErrorMode::SurrogateEscape) {
-        return Ok(text.as_bytes().to_vec());
-    }
-    let mut out = Vec::with_capacity(text.len());
-    for character in text.chars() {
-        match surrogate_escape_byte(character) {
-            Some(byte) => out.push(byte),
-            None => {
-                let mut buffer = [0u8; 4];
-                out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+/// Resolution goes through [`lookup`], so a registered search function (the
+/// `encodings` package or a test codec) contributes its own encoder with the
+/// same semantics `str.encode` has in CPython.
+fn encode(args: &[i64]) -> i64 {
+    codec_call(args, "encode")
+}
+
+/// `codecs.decode(obj, encoding='utf-8', errors='strict')`.
+fn decode(args: &[i64]) -> i64 {
+    codec_call(args, "decode")
+}
+
+/// Shared body of [`encode`] and [`decode`]: resolve the codec, then invoke
+/// its `encode`/`decode` entry point.
+fn codec_call(args: &[i64], member: &str) -> i64 {
+    let Some(&object) = args.first() else {
+        return type_error(&format!("{member}() missing required argument 'obj'"));
+    };
+    let encoding = match args.get(1).copied() {
+        None => value::str_alloc("utf-8".to_string()),
+        Some(value) => {
+            if value::as_str(value).is_none() {
+                return type_error(&format!(
+                    "{member}() argument 'encoding' must be str, not {}",
+                    value::type_name(value)
+                ));
             }
+            value
         }
+    };
+    let errors = match args.get(2).copied() {
+        None => value::str_alloc("strict".to_string()),
+        Some(value) => {
+            if value::as_str(value).is_none() {
+                return type_error(&format!(
+                    "{member}() argument 'errors' must be str, not {}",
+                    value::type_name(value)
+                ));
+            }
+            value
+        }
+    };
+    let info = lookup(&[encoding]);
+    if exc::pending() {
+        return NONE;
     }
-    Ok(out)
+    let entry = if value::instance_class_value(info)
+        == Some(crate::modules::codecs_codecinfo_class())
+    {
+        crate::core::methods::getattr(info, member.as_ptr(), member.len())
+    } else if let Some(items) = value::as_tuple(info) {
+        if items.len() != 4 {
+            return type_error("codec registry entry is not a 4-tuple");
+        }
+        if member == "encode" {
+            items[0]
+        } else {
+            items[1]
+        }
+    } else {
+        return type_error("codec registry entry is not a 4-tuple");
+    };
+    if exc::pending() {
+        return NONE;
+    }
+    let roots = heap::root_values(&[info, object, errors, entry]);
+    let result = if value::as_function(entry).is_some() {
+        // A native `_codecs` entry: the decoder takes the trailing `final`
+        // flag the stateless protocol defines.
+        let final_ = value::bool_value(member == "decode");
+        let call_args = [object, errors, final_];
+        core_builtins::call(entry, call_args.len(), call_args.as_ptr())
+    } else {
+        let call_args = [object, errors];
+        core_builtins::call(entry, call_args.len(), call_args.as_ptr())
+    };
+    let output = if exc::pending() {
+        NONE
+    } else if let Some(items) = value::as_tuple(result) {
+        items.first().copied().unwrap_or(NONE)
+    } else {
+        result
+    };
+    heap::release_roots(roots);
+    output
+}
+
+/// Encodes `text` with `codec` under `mode`.
+fn encode_text(text: &str, codec: Codec, mode: &ErrorMode) -> Result<Vec<u8>, i64> {
+    encode_codes(codec, text, mode)
 }
 
 /// Decodes `data` with `codec`, applying `mode` to bytes the codec rejects.
 fn decode_bytes(data: &[u8], codec: Codec, mode: &ErrorMode) -> Result<String, i64> {
-    match codec {
-        Codec::Utf8 => decode_utf8(data, mode, true).map(|(text, _)| text),
-        Codec::Ascii => decode_ascii(data, mode),
-        // Latin-1 is a total mapping: every byte is U+0000..U+00FF, so no
-        // error handler can ever be consulted.
-        Codec::Latin1 => Ok(data.iter().map(|&byte| byte as char).collect()),
-    }
+    decode_codes(codec, data, mode, true).map(|(codes, _)| value::str_from_codes(codes))
 }
 
 // Filesystem names (`os.fsdecode`/`os.fsencode`)
@@ -381,13 +619,10 @@ fn decode_bytes(data: &[u8], codec: Codec, mode: &ErrorMode) -> Result<String, i
 /// Decodes a filesystem name the way POSIX `os.fsdecode` does.
 ///
 /// The filesystem encoding is UTF-8 under `surrogateescape`, which accepts
-/// every byte sequence. Undecodable bytes become the runtime's surrogate
-/// stand-in ([`SURROGATE_ESCAPE_STAND_IN`]); see the module docs for the
-/// documented limit that a stand-in cannot be distinguished from a genuine
-/// U+FFFD.
+/// every byte sequence: an undecodable byte `b` becomes code point `0xDC00+b`.
 pub(crate) fn fsdecode(data: &[u8]) -> String {
-    match decode_utf8(data, &ErrorMode::SurrogateEscape, true) {
-        Ok((text, _)) => text,
+    match decode_codes(Codec::Utf8, data, &ErrorMode::SurrogateEscape, true) {
+        Ok((codes, _)) => value::str_from_codes(codes),
         // `surrogateescape` rejects nothing, so this arm cannot be reached;
         // keep the helper infallible for its `os` callers.
         Err(_) => String::new(),
@@ -396,12 +631,12 @@ pub(crate) fn fsdecode(data: &[u8]) -> String {
 
 /// Encodes a filesystem name the way POSIX `os.fsencode` does.
 ///
-/// The filesystem encoding is UTF-8 under `surrogateescape`, so the runtime's
-/// surrogate stand-in is written back as [`SURROGATE_ESCAPE_BYTE`].
+/// The filesystem encoding is UTF-8 under `surrogateescape`, so code point
+/// `0xDC00+b` is written back as the byte `b`.
 pub(crate) fn fsencode(text: &str) -> Vec<u8> {
-    match encode_utf8_text(text, &ErrorMode::SurrogateEscape) {
+    match encode_codes(Codec::Utf8, text, &ErrorMode::SurrogateEscape) {
         Ok(bytes) => bytes,
-        // `encode_utf8_text` never fails; keep the helper infallible.
+        // `surrogateescape` rejects nothing; keep the helper infallible.
         Err(_) => text.as_bytes().to_vec(),
     }
 }
@@ -473,23 +708,46 @@ fn single_byte_decode(args: &[i64], codec: Codec, function: &str) -> i64 {
 }
 
 fn utf_8_encode(args: &[i64]) -> i64 {
-    let Some(text) = value::as_str(args[0]) else {
-        return type_error(&format!(
-            "utf_8_encode() argument 1 must be str, not {}",
-            value::type_name(args[0])
-        ));
-    };
-    let bytes = value::bytes_new(text.as_bytes().to_vec());
-    let length = ops::int_result(text.chars().count() as i64);
-    value::tuple_new(vec![bytes, length])
+    encode_entry(args, Codec::Utf8, "utf_8_encode")
 }
 
 fn utf_8_decode(args: &[i64]) -> i64 {
-    let data = match bytes_argument("utf_8_decode", args[0]) {
+    decode_entry(args, Codec::Utf8, "utf_8_decode")
+}
+
+/// Shared stateless encoder entry: `(text, errors='strict')` ->
+/// `(bytes, length)`.
+fn encode_entry(args: &[i64], codec: Codec, function: &str) -> i64 {
+    let Some(text) = value::as_str(args[0]) else {
+        return type_error(&format!(
+            "{function}() argument 1 must be str, not {}",
+            value::type_name(args[0])
+        ));
+    };
+    let errors = match optional_errors_argument(args, 1, function) {
+        Ok(errors) => errors,
+        Err(error) => return error,
+    };
+    let mode = match error_mode(errors) {
+        Ok(mode) => mode,
+        Err(error) => return error,
+    };
+    let bytes = match encode_codes(codec, text, &mode) {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
+    let length = ops::int_result(value::str_codes(text).count() as i64);
+    value::tuple_new(vec![value::bytes_new(bytes), length])
+}
+
+/// Shared stateless decoder entry: `(data, errors='strict'[, final])` ->
+/// `(text, consumed)`.
+fn decode_entry(args: &[i64], codec: Codec, function: &str) -> i64 {
+    let data = match bytes_argument(function, args[0]) {
         Ok(data) => data,
         Err(error) => return error,
     };
-    let errors = match optional_errors_argument(args, 1, "utf_8_decode") {
+    let errors = match optional_errors_argument(args, 1, function) {
         Ok(errors) => errors,
         Err(error) => return error,
     };
@@ -498,113 +756,317 @@ fn utf_8_decode(args: &[i64]) -> i64 {
         Err(error) => return error,
     };
     let final_ = args.get(2).copied().map(value::truthy).unwrap_or(false);
-    match decode_utf8(data, &mode, final_) {
-        Ok((text, consumed)) => {
-            let text = value::str_alloc(text);
-            let consumed = ops::int_result(consumed as i64);
-            value::tuple_new(vec![text, consumed])
+    match decode_codes(codec, data, &mode, final_) {
+        Ok((codes, consumed)) => {
+            let text = value::str_from_codes(codes);
+            value::tuple_new(vec![
+                value::str_alloc(text),
+                ops::int_result(consumed as i64),
+            ])
         }
         Err(error) => error,
     }
 }
 
-/// Strict/ignore/replace/custom-handler UTF-8 decoding.
+/// Encodes `text` as UTF-8, including the lone surrogates a runtime string
+/// may hold.
+fn encode_utf8(text: &str, mode: &ErrorMode) -> Result<Vec<u8>, i64> {
+    let codes: Vec<u32> = value::str_codes(text).collect();
+    let mut out = Vec::with_capacity(text.len());
+    let mut index = 0usize;
+    while index < codes.len() {
+        let code = codes[index];
+        if !value::is_surrogate_code(code) {
+            let character = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
+            let mut buffer = [0u8; 4];
+            out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut end = index + 1;
+        match mode {
+            ErrorMode::SurrogatePass => {
+                let (first, second, third) = surrogate_utf8_bytes(code);
+                out.extend_from_slice(&[first, second, third]);
+                index += 1;
+                continue;
+            }
+            ErrorMode::SurrogateEscape => {
+                if (0xDC80..=0xDCFF).contains(&code) {
+                    out.push((code - 0xDC00) as u8);
+                    index += 1;
+                    continue;
+                }
+                return Err(unicode_encode_error(
+                    Codec::Utf8,
+                    text,
+                    start,
+                    end,
+                    "surrogates not allowed",
+                ));
+            }
+            // Consecutive unencodable code points share one report.
+            ErrorMode::Strict | ErrorMode::Ignore | ErrorMode::Replace => {
+                while end < codes.len() && value::is_surrogate_code(codes[end]) {
+                    end += 1;
+                }
+            }
+            _ => {}
+        }
+        match mode {
+            ErrorMode::Strict => {
+                return Err(unicode_encode_error(
+                    Codec::Utf8,
+                    text,
+                    start,
+                    end,
+                    "surrogates not allowed",
+                ));
+            }
+            ErrorMode::Ignore => {}
+            ErrorMode::Replace => out.resize(out.len() + (end - start), b'?'),
+            ErrorMode::BackslashReplace => {
+                for &code in &codes[start..end] {
+                    out.extend_from_slice(escaped_code(code).as_bytes());
+                }
+            }
+            ErrorMode::NameReplace => {
+                for &code in &codes[start..end] {
+                    out.extend_from_slice(escaped_code(code).as_bytes());
+                }
+            }
+            ErrorMode::XmlCharrefReplace => {
+                for &code in &codes[start..end] {
+                    out.extend_from_slice(format!("&#{code};").as_bytes());
+                }
+            }
+            ErrorMode::Custom(handler) => {
+                let exception =
+                    encode_exception_value(Codec::Utf8, text, start, end, "surrogates not allowed");
+                let result = core_builtins::call(*handler, 1, [exception].as_ptr());
+                if exc::pending() {
+                    return Err(result);
+                }
+                let (replacement, position) = encode_handler_result(result)?;
+                match replacement {
+                    EncodeReplacement::Bytes(bytes) => out.extend_from_slice(bytes),
+                    EncodeReplacement::Text(text) => {
+                        for code in value::str_codes(text) {
+                            match char::from_u32(code) {
+                                Some(character) => {
+                                    let mut buffer = [0u8; 4];
+                                    out.extend_from_slice(
+                                        character.encode_utf8(&mut buffer).as_bytes(),
+                                    );
+                                }
+                                None => {
+                                    return Err(unicode_encode_error(
+                                        Codec::Utf8,
+                                        text,
+                                        start,
+                                        end,
+                                        "surrogates not allowed",
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+                if position <= start as i64 || position > codes.len() as i64 {
+                    return Err(exc::raise_with_message(
+                        VALUE_ERROR,
+                        &format!("error handler returned invalid position {position}"),
+                    ));
+                }
+                index = position as usize;
+                continue;
+            }
+            ErrorMode::SurrogatePass | ErrorMode::SurrogateEscape => unreachable!(),
+        }
+        index = end;
+    }
+    Ok(out)
+}
+
+/// The generalized UTF-8 encoding of a lone surrogate, as CPython's
+/// `surrogatepass` handler produces it.
+fn surrogate_utf8_bytes(code: u32) -> (u8, u8, u8) {
+    (
+        0xE0 | ((code >> 12) as u8),
+        0x80 | (((code >> 6) & 0x3F) as u8),
+        0x80 | ((code & 0x3F) as u8),
+    )
+}
+
+/// Decodes `data` as UTF-8 into Python code points.
 ///
-/// Returns `(decoded_text, consumed_bytes)`. With `final == false` an
-/// incomplete trailing sequence is left unconsumed (the incremental decoder
-/// contract); otherwise it raises.
-fn decode_utf8(data: &[u8], mode: &ErrorMode, final_: bool) -> Result<(String, usize), i64> {
-    let mut out = String::with_capacity(data.len());
+/// Returns `(codes, consumed_bytes)`. With `final == false` an incomplete
+/// trailing sequence is left unconsumed; `surrogatepass` accepts the
+/// generalized surrogate forms instead of rejecting them.
+fn decode_utf8(data: &[u8], mode: &ErrorMode, final_: bool) -> Result<(Vec<u32>, usize), i64> {
+    let mut out = Vec::with_capacity(data.len());
     let mut offset = 0usize;
-    loop {
-        if offset == data.len() {
-            return Ok((out, offset));
+    while offset < data.len() {
+        let first = data[offset];
+        if first < 0x80 {
+            out.push(first as u32);
+            offset += 1;
+            continue;
         }
-        match std::str::from_utf8(&data[offset..]) {
-            Ok(text) => {
-                out.push_str(text);
-                return Ok((out, data.len()));
+        let (width, minimum) = match first {
+            0xC2..=0xDF => (2usize, 0x80u32),
+            0xE0..=0xEF => (3, 0x800),
+            0xF0..=0xF4 => (4, 0x10000),
+            _ => (0, 0),
+        };
+        if width == 0 {
+            offset = decode_error(
+                Codec::Utf8,
+                data,
+                offset,
+                offset + 1,
+                decode_reason(first),
+                mode,
+                final_,
+                &mut out,
+            )?;
+            continue;
+        }
+        if offset + width > data.len() {
+            if !final_ {
+                return Ok((out, offset));
             }
-            Err(error) => {
-                let valid = error.valid_up_to();
-                if valid > 0 {
-                    // `valid_up_to` bytes are valid by construction.
-                    out.push_str(std::str::from_utf8(&data[offset..offset + valid]).unwrap_or(""));
-                }
-                let start = offset + valid;
-                match error.error_len() {
-                    None => {
-                        if final_ {
-                            // `surrogateescape` accepts a truncated sequence:
-                            // every remaining byte is escaped.
-                            if let ErrorMode::SurrogateEscape = mode {
-                                for _ in &data[start..] {
-                                    out.push(SURROGATE_ESCAPE_STAND_IN);
-                                }
-                                return Ok((out, data.len()));
-                            }
-                            return Err(unicode_decode_error(
-                                Codec::Utf8,
-                                data,
-                                start,
-                                data.len(),
-                                "unexpected end of data",
-                            ));
-                        }
-                        return Ok((out, start));
-                    }
-                    Some(length) => {
-                        let end = start + length;
-                        let reason = decode_reason(data[start]);
-                        match mode {
-                            ErrorMode::Strict => {
-                                return Err(unicode_decode_error(
-                                    Codec::Utf8,
-                                    data,
-                                    start,
-                                    end,
-                                    reason,
-                                ));
-                            }
-                            ErrorMode::Ignore => {
-                                offset = end;
-                            }
-                            ErrorMode::Replace => {
-                                out.push('\u{FFFD}');
-                                offset = end;
-                            }
-                            ErrorMode::SurrogateEscape => {
-                                // One stand-in per rejected byte, like
-                                // CPython's per-byte surrogate escape.
-                                for _ in &data[start..end] {
-                                    out.push(SURROGATE_ESCAPE_STAND_IN);
-                                }
-                                offset = end;
-                            }
-                            ErrorMode::Custom(handler) => {
-                                let exception =
-                                    decode_exception_value(Codec::Utf8, data, start, end, reason);
-                                let result = core_builtins::call(*handler, 1, [exception].as_ptr());
-                                if exc::pending() {
-                                    return Err(result);
-                                }
-                                let (replacement, position) = error_handler_result(result)?;
-                                if position <= start as i64 || position > data.len() as i64 {
-                                    return Err(exc::raise_with_message(
-                                        VALUE_ERROR,
-                                        &format!(
-                                            "error handler returned invalid position {position}"
-                                        ),
-                                    ));
-                                }
-                                out.push_str(replacement);
-                                offset = position as usize;
-                            }
-                        }
-                    }
-                }
+            offset = decode_error(
+                Codec::Utf8,
+                data,
+                offset,
+                data.len(),
+                "unexpected end of data",
+                mode,
+                final_,
+                &mut out,
+            )?;
+            continue;
+        }
+        let mut code = (first as u32) & (0x7F >> width);
+        let mut valid = true;
+        for step in 1..width {
+            let continuation = data[offset + step];
+            if continuation & 0xC0 != 0x80 {
+                valid = false;
+                break;
+            }
+            code = (code << 6) | (continuation as u32 & 0x3F);
+        }
+        if !valid || code < minimum || code > 0x10_FFFF {
+            offset = decode_error(
+                Codec::Utf8,
+                data,
+                offset,
+                offset + width,
+                decode_reason(first),
+                mode,
+                final_,
+                &mut out,
+            )?;
+            continue;
+        }
+        if value::is_surrogate_code(code) {
+            if !matches!(mode, ErrorMode::SurrogatePass) {
+                offset = decode_error(
+                    Codec::Utf8,
+                    data,
+                    offset,
+                    offset + width,
+                    "invalid continuation byte",
+                    mode,
+                    final_,
+                    &mut out,
+                )?;
+                continue;
             }
         }
+        out.push(code);
+        offset += width;
+    }
+    Ok((out, offset))
+}
+
+/// Applies `mode` to one rejected input span and returns the resume offset.
+///
+/// `final_` only matters for the incomplete-sequence case some codecs report
+/// as `unexpected end of data`.
+fn decode_error(
+    codec: Codec,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+    mode: &ErrorMode,
+    final_: bool,
+    out: &mut Vec<u32>,
+) -> Result<usize, i64> {
+    let _ = final_;
+    let width = end.saturating_sub(start).max(1);
+    match mode {
+        ErrorMode::Strict | ErrorMode::SurrogatePass => {
+            Err(unicode_decode_error(codec, data, start, end, reason))
+        }
+        ErrorMode::Ignore => Ok(end.max(start + 1)),
+        ErrorMode::Replace => {
+            out.push(0xFFFD);
+            Ok(end.max(start + 1))
+        }
+        ErrorMode::SurrogateEscape => {
+            for byte in &data[start..end.max(start + 1)] {
+                out.push(0xDC00 + u32::from(*byte));
+            }
+            Ok(end.max(start + 1))
+        }
+        ErrorMode::BackslashReplace => {
+            for byte in &data[start..end.max(start + 1)] {
+                push_escaped_byte(out, *byte);
+            }
+            Ok(end.max(start + 1))
+        }
+        ErrorMode::NameReplace | ErrorMode::XmlCharrefReplace => Err(type_error(
+            "don't know how to handle UnicodeDecodeError in error callback",
+        )),
+        ErrorMode::Custom(handler) => {
+            let exception = decode_exception_value(codec, data, start, end, reason);
+            let result = core_builtins::call(*handler, 1, [exception].as_ptr());
+            if exc::pending() {
+                return Err(result);
+            }
+            let (replacement, position) = error_handler_result(result)?;
+            if position <= start as i64 || position > data.len() as i64 {
+                return Err(exc::raise_with_message(
+                    VALUE_ERROR,
+                    &format!("error handler returned invalid position {position}"),
+                ));
+            }
+            out.extend(value::str_codes(replacement));
+            let _ = width;
+            Ok(position as usize)
+        }
+    }
+}
+
+/// Appends the `\xNN` escape of one byte to a code-point buffer.
+fn push_escaped_byte(out: &mut Vec<u32>, byte: u8) {
+    out.push(u32::from(b'\\'));
+    out.push(u32::from(b'x'));
+    for nibble in [byte >> 4, byte & 0x0F] {
+        out.push(u32::from(hex_digit(nibble)));
+    }
+}
+
+/// Lowercase hexadecimal digit for `value` (`0..=15`).
+fn hex_digit(value: u8) -> u8 {
+    match value {
+        0..=9 => b'0' + value,
+        _ => b'a' + (value - 10),
     }
 }
 
@@ -612,106 +1074,1020 @@ fn decode_utf8(data: &[u8], mode: &ErrorMode, final_: bool) -> Result<(String, u
 ///
 /// CPython reports every rejected byte on its own, so the error span is
 /// always one byte wide. Latin-1 never reaches this path.
-fn decode_ascii(data: &[u8], mode: &ErrorMode) -> Result<String, i64> {
+fn decode_ascii(data: &[u8], mode: &ErrorMode, final_: bool) -> Result<Vec<u32>, i64> {
     const REASON: &str = "ordinal not in range(128)";
-    let mut out = String::with_capacity(data.len());
+    let mut out = Vec::with_capacity(data.len());
     let mut offset = 0usize;
     while offset < data.len() {
         let byte = data[offset];
         if byte < 0x80 {
-            out.push(byte as char);
+            out.push(u32::from(byte));
             offset += 1;
             continue;
         }
-        let start = offset;
-        let end = start + 1;
+        offset = decode_error(
+            Codec::Ascii,
+            data,
+            offset,
+            offset + 1,
+            REASON,
+            mode,
+            final_,
+            &mut out,
+        )?;
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Cross-codec engines
+// ---------------------------------------------------------------------------
+
+/// The byte a `surrogateescape` code point stands for.
+///
+/// PEP 383 maps undecodable byte `b` to code point `0xDC00 + b`; the byte
+/// range that can be escaped this way is `0x80..=0xFF`.
+fn surrogate_escape_byte(code: u32) -> Option<u8> {
+    (0xDC80..=0xDCFF).contains(&code).then(|| (code - 0xDC00) as u8)
+}
+
+/// Whether this host stores UTF-16/UTF-32 code units big-endian first.
+const NATIVE_BIG_ENDIAN: bool = cfg!(target_endian = "big");
+
+/// Encodes `text` with `codec` under `mode`.
+fn encode_codes(codec: Codec, text: &str, mode: &ErrorMode) -> Result<Vec<u8>, i64> {
+    match codec {
+        Codec::Utf8 => encode_utf8(text, mode),
+        Codec::Utf8Sig => {
+            let mut out = vec![0xEF, 0xBB, 0xBF];
+            out.extend_from_slice(&encode_utf8(text, mode)?);
+            Ok(out)
+        }
+        Codec::Ascii | Codec::Latin1 | Codec::Charmap => encode_single_byte(text, codec, mode),
+        Codec::Utf16 => Ok(encode_utf16(text, NATIVE_BIG_ENDIAN, true)),
+        Codec::Utf16Le => Ok(encode_utf16(text, false, false)),
+        Codec::Utf16Be => Ok(encode_utf16(text, true, false)),
+        Codec::Utf32 => Ok(encode_utf32(text, NATIVE_BIG_ENDIAN, true)),
+        Codec::Utf32Le => Ok(encode_utf32(text, false, false)),
+        Codec::Utf32Be => Ok(encode_utf32(text, true, false)),
+        Codec::Utf7 => iconv_encode("UTF-7", codec, text, mode),
+        Codec::UnicodeEscape => Ok(encode_unicode_escape(text, false)),
+        Codec::RawUnicodeEscape => Ok(encode_unicode_escape(text, true)),
+        Codec::Rot13 => Ok(rot13_bytes(text)),
+        Codec::Undefined => Err(exc::raise_with_message(UNICODE_ERROR, "undefined encoding")),
+        Codec::Charset { charset, .. } => iconv_encode(charset, codec, text, mode),
+        Codec::Multibyte { prog } => multibyte_encode(prog, text, mode),
+    }
+}
+
+/// Decodes `data` with `codec`, applying `mode` to the spans it rejects.
+///
+/// With `final_ == false` an incomplete trailing sequence is left unconsumed,
+/// as the incremental codec contract requires.
+fn decode_codes(
+    codec: Codec,
+    data: &[u8],
+    mode: &ErrorMode,
+    final_: bool,
+) -> Result<(Vec<u32>, usize), i64> {
+    match codec {
+        Codec::Utf8 => decode_utf8(data, mode, final_),
+        Codec::Utf8Sig => decode_utf8_sig(data, mode, final_),
+        Codec::Ascii => decode_ascii(data, mode, final_).map(|codes| (codes, data.len())),
+        // Latin-1 (and the mapping-less `charmap`) is a total byte-to-code
+        // point mapping, so no error handler can be consulted.
+        Codec::Latin1 | Codec::Charmap => Ok((
+            data.iter().map(|byte| u32::from(*byte)).collect(),
+            data.len(),
+        )),
+        Codec::Utf16 => decode_utf16(data, codec, mode, final_, NATIVE_BIG_ENDIAN, true),
+        Codec::Utf16Le => decode_utf16(data, codec, mode, final_, false, false),
+        Codec::Utf16Be => decode_utf16(data, codec, mode, final_, true, false),
+        Codec::Utf32 => decode_utf32(data, codec, mode, final_, NATIVE_BIG_ENDIAN, true),
+        Codec::Utf32Le => decode_utf32(data, codec, mode, final_, false, false),
+        Codec::Utf32Be => decode_utf32(data, codec, mode, final_, true, false),
+        Codec::Utf7 => iconv_decode("UTF-7", codec, data, mode, final_),
+        Codec::UnicodeEscape => decode_unicode_escape(data, codec, false, mode, final_),
+        Codec::RawUnicodeEscape => decode_unicode_escape(data, codec, true, mode, final_),
+        Codec::Rot13 => Ok((rot13_codes(data), data.len())),
+        Codec::Undefined => Err(exc::raise_with_message(UNICODE_ERROR, "undefined encoding")),
+        Codec::Charset { charset, .. } => iconv_decode(charset, codec, data, mode, final_),
+        Codec::Multibyte { prog } => multibyte_decode(prog, data, mode, final_),
+    }
+}
+
+/// Encodes `text` as UTF-16, optionally preceded by a byte-order mark.
+///
+/// UTF-16 represents every code point (including a lone surrogate, written as
+/// its own code unit), so encoding never consults the error mode.
+fn encode_utf16(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() * 2 + 2);
+    if bom {
+        out.extend_from_slice(if big_endian {
+            &[0xFE, 0xFF]
+        } else {
+            &[0xFF, 0xFE]
+        });
+    }
+    for code in value::str_codes(text) {
+        let mut units = [0u16; 2];
+        let count = if code <= 0xFFFF {
+            units[0] = code as u16;
+            1
+        } else {
+            let offset = code - 0x1_0000;
+            units[0] = 0xD800 + ((offset >> 10) as u16 & 0x3FF);
+            units[1] = 0xDC00 + (offset as u16 & 0x3FF);
+            2
+        };
+        for unit in &units[..count] {
+            if big_endian {
+                out.extend_from_slice(&unit.to_be_bytes());
+            } else {
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// Encodes `text` as UTF-32, optionally preceded by a byte-order mark.
+fn encode_utf32(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() * 4 + 4);
+    if bom {
+        out.extend_from_slice(if big_endian {
+            &[0x00, 0x00, 0xFE, 0xFF]
+        } else {
+            &[0xFF, 0xFE, 0x00, 0x00]
+        });
+    }
+    for code in value::str_codes(text) {
+        if big_endian {
+            out.extend_from_slice(&code.to_be_bytes());
+        } else {
+            out.extend_from_slice(&code.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Decodes UTF-16, honouring and stripping a byte-order mark when `bom` is
+/// set (`utf-16`); the explicit endian variants pass their own order.
+fn decode_utf16(
+    data: &[u8],
+    codec: Codec,
+    mode: &ErrorMode,
+    final_: bool,
+    native_big_endian: bool,
+    bom: bool,
+) -> Result<(Vec<u32>, usize), i64> {
+    let mut offset = 0usize;
+    let mut big_endian = native_big_endian;
+    if bom {
+        if data.len() >= 2 {
+            match (data[0], data[1]) {
+                (0xFF, 0xFE) => {
+                    big_endian = false;
+                    offset = 2;
+                }
+                (0xFE, 0xFF) => {
+                    big_endian = true;
+                    offset = 2;
+                }
+                _ => {}
+            }
+        } else if !final_ && data.len() == 1 && (data[0] == 0xFF || data[0] == 0xFE) {
+            // A split byte-order mark stays unconsumed for the next call.
+            return Ok((Vec::new(), 0));
+        }
+    }
+    let unit = |position: usize| -> u16 {
+        let bytes = [data[position], data[position + 1]];
+        if big_endian {
+            u16::from_be_bytes(bytes)
+        } else {
+            u16::from_le_bytes(bytes)
+        }
+    };
+    let mut out = Vec::with_capacity(data.len() / 2);
+    while offset < data.len() {
+        if data.len() - offset < 2 {
+            if !final_ {
+                return Ok((out, offset));
+            }
+            offset = decode_error(
+                codec,
+                data,
+                offset,
+                data.len(),
+                "unexpected end of data",
+                mode,
+                final_,
+                &mut out,
+            )?;
+            continue;
+        }
+        let first = unit(offset);
+        if (0xD800..=0xDBFF).contains(&first) {
+            if data.len() - offset < 4 {
+                if !final_ {
+                    return Ok((out, offset));
+                }
+                offset = decode_error(
+                    codec,
+                    data,
+                    offset,
+                    data.len(),
+                    "unexpected end of data",
+                    mode,
+                    final_,
+                    &mut out,
+                )?;
+                continue;
+            }
+            let second = unit(offset + 2);
+            if (0xDC00..=0xDFFF).contains(&second) {
+                let code = 0x1_0000
+                    + ((u32::from(first) - 0xD800) << 10)
+                    + (u32::from(second) - 0xDC00);
+                out.push(code);
+                offset += 4;
+                continue;
+            }
+            offset = decode_error(
+                codec,
+                data,
+                offset,
+                offset + 2,
+                "illegal UTF-16 surrogate",
+                mode,
+                final_,
+                &mut out,
+            )?;
+            continue;
+        }
+        if (0xDC00..=0xDFFF).contains(&first) {
+            offset = decode_error(
+                codec,
+                data,
+                offset,
+                offset + 2,
+                "illegal UTF-16 surrogate",
+                mode,
+                final_,
+                &mut out,
+            )?;
+            continue;
+        }
+        out.push(u32::from(first));
+        offset += 2;
+    }
+    Ok((out, offset))
+}
+
+/// Decodes UTF-32, honouring and stripping a byte-order mark when `bom` is
+/// set (`utf-32`).
+fn decode_utf32(
+    data: &[u8],
+    codec: Codec,
+    mode: &ErrorMode,
+    final_: bool,
+    native_big_endian: bool,
+    bom: bool,
+) -> Result<(Vec<u32>, usize), i64> {
+    let mut offset = 0usize;
+    let mut big_endian = native_big_endian;
+    if bom {
+        if data.len() >= 4 {
+            match data[..4] {
+                [0xFF, 0xFE, 0x00, 0x00] => {
+                    big_endian = false;
+                    offset = 4;
+                }
+                [0x00, 0x00, 0xFE, 0xFF] => {
+                    big_endian = true;
+                    offset = 4;
+                }
+                _ => {}
+            }
+        } else if !final_ && data.iter().all(|byte| matches!(byte, 0x00 | 0xFE | 0xFF)) {
+            return Ok((Vec::new(), 0));
+        }
+    }
+    let mut out = Vec::with_capacity(data.len() / 4);
+    while offset < data.len() {
+        if data.len() - offset < 4 {
+            if !final_ {
+                return Ok((out, offset));
+            }
+            offset = decode_error(
+                codec,
+                data,
+                offset,
+                data.len(),
+                "unexpected end of data",
+                mode,
+                final_,
+                &mut out,
+            )?;
+            continue;
+        }
+        let bytes = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+        let code = if big_endian {
+            u32::from_be_bytes(bytes)
+        } else {
+            u32::from_le_bytes(bytes)
+        };
+        if code > 0x10_FFFF {
+            offset = decode_error(
+                codec,
+                data,
+                offset,
+                offset + 4,
+                "code point not in range(0x110000)",
+                mode,
+                final_,
+                &mut out,
+            )?;
+            continue;
+        }
+        out.push(code);
+        offset += 4;
+    }
+    Ok((out, offset))
+}
+
+/// Decodes UTF-8-sig: an optional leading byte-order mark is stripped.
+fn decode_utf8_sig(
+    data: &[u8],
+    mode: &ErrorMode,
+    final_: bool,
+) -> Result<(Vec<u32>, usize), i64> {
+    const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+    if data.len() >= 3 {
+        if data[..3] == BOM {
+            let (codes, used) = decode_utf8(&data[3..], mode, final_)?;
+            return Ok((codes, used + 3));
+        }
+    } else if !final_ && BOM.starts_with(data) {
+        // A split byte-order mark stays unconsumed for the next call.
+        return Ok((Vec::new(), 0));
+    }
+    decode_utf8(data, mode, final_)
+}
+
+/// Encodes `text` with the `unicode_escape` or `raw_unicode_escape` codec.
+fn encode_unicode_escape(text: &str, raw: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    for code in value::str_codes(text) {
+        if raw {
+            if code <= 0xFF {
+                out.push(code as u8);
+            } else if code <= 0xFFFF {
+                out.extend_from_slice(format!("\\u{code:04x}").as_bytes());
+            } else {
+                out.extend_from_slice(format!("\\U{code:08x}").as_bytes());
+            }
+            continue;
+        }
+        match code {
+            0x5C => out.extend_from_slice(b"\\\\"),
+            0x0A => out.extend_from_slice(b"\\n"),
+            0x0D => out.extend_from_slice(b"\\r"),
+            0x09 => out.extend_from_slice(b"\\t"),
+            0x20..=0x7E => out.push(code as u8),
+            0x00..=0xFF => out.extend_from_slice(format!("\\x{code:02x}").as_bytes()),
+            0x100..=0xFFFF => out.extend_from_slice(format!("\\u{code:04x}").as_bytes()),
+            _ => out.extend_from_slice(format!("\\U{code:08x}").as_bytes()),
+        }
+    }
+    out
+}
+
+/// Reads `count` hexadecimal digits at `start` into a code point.
+fn read_hex_digits(data: &[u8], start: usize, count: usize) -> Option<u32> {
+    let digits = data.get(start..start + count)?;
+    let mut code = 0u32;
+    for digit in digits {
+        let value = (*digit as char).to_digit(16)?;
+        code = code.checked_mul(16)? + value;
+    }
+    Some(code)
+}
+
+/// Recognizes a `\xNN`/`\uNNNN`/`\UNNNNNNNN` escape at `index`, returning the
+/// code point and the escape's length. `raw_unicode_escape` has no `\xNN`.
+fn hex_escape_at(data: &[u8], index: usize, raw: bool) -> Option<(u32, usize)> {
+    match *data.get(index + 1)? {
+        b'x' if !raw => read_hex_digits(data, index + 2, 2).map(|code| (code, 4)),
+        b'u' => read_hex_digits(data, index + 2, 4).map(|code| (code, 6)),
+        b'U' => read_hex_digits(data, index + 2, 8).map(|code| (code, 10)),
+        _ => None,
+    }
+}
+
+/// Decodes `unicode_escape` / `raw_unicode_escape` input into code points.
+fn decode_unicode_escape(
+    data: &[u8],
+    codec: Codec,
+    raw: bool,
+    mode: &ErrorMode,
+    final_: bool,
+) -> Result<(Vec<u32>, usize), i64> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut index = 0usize;
+    while index < data.len() {
+        let byte = data[index];
+        if byte != b'\\' {
+            out.push(u32::from(byte));
+            index += 1;
+            continue;
+        }
+        if let Some((code, length)) = hex_escape_at(data, index, raw) {
+            out.push(code);
+            index += length;
+            continue;
+        }
+        let Some(&escape) = data.get(index + 1) else {
+            index = decode_error(
+                codec,
+                data,
+                index,
+                data.len(),
+                "\\ at end of string",
+                mode,
+                final_,
+                &mut out,
+            )?;
+            continue;
+        };
+        if raw {
+            // Only `\u`/`\U` escapes exist; anything else stays literal.
+            out.push(u32::from(b'\\'));
+            index += 1;
+            continue;
+        }
+        match escape {
+            b'\\' => {
+                out.push(u32::from(b'\\'));
+                index += 2;
+            }
+            b'\'' => {
+                out.push(u32::from(b'\''));
+                index += 2;
+            }
+            b'"' => {
+                out.push(u32::from(b'"'));
+                index += 2;
+            }
+            b'n' => {
+                out.push(0x0A);
+                index += 2;
+            }
+            b't' => {
+                out.push(0x09);
+                index += 2;
+            }
+            b'r' => {
+                out.push(0x0D);
+                index += 2;
+            }
+            b'a' => {
+                out.push(0x07);
+                index += 2;
+            }
+            b'b' => {
+                out.push(0x08);
+                index += 2;
+            }
+            b'f' => {
+                out.push(0x0C);
+                index += 2;
+            }
+            b'v' => {
+                out.push(0x0B);
+                index += 2;
+            }
+            b'\n' => index += 2,
+            b'0'..=b'7' => {
+                let mut code = 0u32;
+                let mut position = index + 1;
+                let mut digits = 0usize;
+                while digits < 3 && position < data.len() && (b'0'..=b'7').contains(&data[position])
+                {
+                    code = code * 8 + u32::from(data[position] - b'0');
+                    position += 1;
+                    digits += 1;
+                }
+                out.push(code);
+                index = position;
+            }
+            b'x' | b'u' | b'U' => {
+                index = decode_error(
+                    codec,
+                    data,
+                    index,
+                    (index + 2).min(data.len()),
+                    "truncated escape",
+                    mode,
+                    final_,
+                    &mut out,
+                )?;
+            }
+            _ => {
+                // Unknown escapes keep the backslash; the character is
+                // copied on the next iteration.
+                out.push(u32::from(b'\\'));
+                index += 1;
+            }
+        }
+    }
+    Ok((out, index))
+}
+
+/// The `rot-13` byte mapping (ASCII letters only).
+fn rot13_byte(byte: u8) -> u8 {
+    match byte {
+        b'A'..=b'Z' => b'A' + (byte - b'A' + 13) % 26,
+        b'a'..=b'z' => b'a' + (byte - b'a' + 13) % 26,
+        other => other,
+    }
+}
+
+/// Encodes text with `rot-13`, returning the rotated payload's bytes.
+fn rot13_bytes(text: &str) -> Vec<u8> {
+    text.as_bytes().iter().map(|byte| rot13_byte(*byte)).collect()
+}
+
+/// `rot-13` is its own inverse; the rotated payload keeps UTF-8 bytes.
+fn rot13_codes(data: &[u8]) -> Vec<u32> {
+    let rotated: Vec<u8> = data.iter().map(|byte| rot13_byte(*byte)).collect();
+    match std::str::from_utf8(&rotated) {
+        Ok(text) => value::str_codes(text).collect(),
+        Err(_) => rotated.iter().map(|byte| u32::from(*byte)).collect(),
+    }
+}
+
+/// The error-handler spelling `codecs_native`'s codec objects expect.
+fn mode_name(mode: &ErrorMode) -> &'static str {
+    match mode {
+        ErrorMode::Strict => "strict",
+        ErrorMode::Ignore => "ignore",
+        ErrorMode::Replace => "replace",
+        ErrorMode::SurrogateEscape => "surrogateescape",
+        ErrorMode::SurrogatePass => "surrogatepass",
+        ErrorMode::BackslashReplace => "backslashreplace",
+        ErrorMode::NameReplace => "namereplace",
+        ErrorMode::XmlCharrefReplace => "xmlcharrefreplace",
+        // A registered handler has no name the accelerator modules know; the
+        // built-in strict behavior is the honest fallback.
+        ErrorMode::Custom(_) => "strict",
+    }
+}
+
+/// The `_codecs_*` accelerator module that implements a multibyte codec.
+fn multibyte_module(prog: &str) -> &'static str {
+    match prog {
+        "gb2312" | "gbk" | "gb18030" | "hz" => "_codecs_cn",
+        "cp932" | "euc_jis_2004" | "euc_jisx0213" | "euc_jp" | "shift_jis"
+        | "shift_jis_2004" | "shift_jisx0213" => "_codecs_jp",
+        "cp949" | "euc_kr" | "johab" => "_codecs_kr",
+        "big5" | "cp950" => "_codecs_tw",
+        "big5hkscs" => "_codecs_hk",
+        _ => "_codecs_iso2022",
+    }
+}
+
+/// Resolves a multibyte codec to the codec object `codecs_native` builds.
+fn multibyte_codec(prog: &str) -> Result<i64, i64> {
+    let name = value::str_alloc(prog.to_string());
+    let codec = crate::modules::codecs_native::call(multibyte_module(prog), "getcodec", &[name]);
+    if exc::pending() {
+        return Err(codec);
+    }
+    if codec == NONE {
+        return Err(exc::raise_with_message(
+            LOOKUP_ERROR,
+            &format!("unknown encoding: {prog}"),
+        ));
+    }
+    Ok(codec)
+}
+
+/// Encodes through a `codecs_native` codec object.
+fn multibyte_encode(prog: &str, text: &str, mode: &ErrorMode) -> Result<Vec<u8>, i64> {
+    let codec = multibyte_codec(prog)?;
+    let roots = heap::root_values(&[codec]);
+    let encoder = crate::core::methods::getattr(codec, b"encode".as_ptr(), 6);
+    let text_value = value::str_alloc(text.to_string());
+    let errors = value::str_alloc(mode_name(mode).to_string());
+    let result = core_builtins::call(encoder, 2, [text_value, errors].as_ptr());
+    let output = if exc::pending() {
+        Err(result)
+    } else {
+        match value::as_tuple(result).and_then(|items| items.first().copied()) {
+            Some(encoded) => match value::as_bytes(encoded) {
+                Some(bytes) => Ok(bytes.to_vec()),
+                None => Err(type_error("encoder did not return bytes")),
+            },
+            None => Err(type_error("encoder did not return a tuple")),
+        }
+    };
+    heap::release_roots(roots);
+    output
+}
+
+/// Decodes through a `codecs_native` codec object.
+fn multibyte_decode(
+    prog: &str,
+    data: &[u8],
+    mode: &ErrorMode,
+    _final_: bool,
+) -> Result<(Vec<u32>, usize), i64> {
+    let codec = multibyte_codec(prog)?;
+    let roots = heap::root_values(&[codec]);
+    let decoder = crate::core::methods::getattr(codec, b"decode".as_ptr(), 6);
+    let bytes = value::bytes_new(data.to_vec());
+    let errors = value::str_alloc(mode_name(mode).to_string());
+    let result = core_builtins::call(decoder, 2, [bytes, errors].as_ptr());
+    let output = if exc::pending() {
+        Err(result)
+    } else {
+        match value::as_tuple(result).and_then(|items| items.first().copied()) {
+            Some(decoded) => match value::as_str(decoded) {
+                Some(text) => Ok((value::str_codes(text).collect(), data.len())),
+                None => Err(type_error("decoder did not return str")),
+            },
+            None => Err(type_error("decoder did not return a tuple")),
+        }
+    };
+    heap::release_roots(roots);
+    output
+}
+
+// ---------------------------------------------------------------------------
+// iconv conversions (`utf-7` and the single-byte `Charset` codecs)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod iconv_ffi {
+    use std::os::raw::{c_char, c_int, c_void};
+
+    #[cfg_attr(target_vendor = "apple", link(name = "iconv"))]
+    extern "C" {
+        pub fn iconv_open(tocode: *const c_char, fromcode: *const c_char) -> *mut c_void;
+        pub fn iconv(
+            cd: *mut c_void,
+            inbuf: *mut *mut c_char,
+            inbytesleft: *mut usize,
+            outbuf: *mut *mut c_char,
+            outbytesleft: *mut usize,
+        ) -> usize;
+        pub fn iconv_close(cd: *mut c_void) -> c_int;
+    }
+}
+
+/// Why a conversion stopped before consuming all input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConvFault {
+    /// The bytes at this input offset do not form a valid character.
+    Illegal(usize),
+    /// The trailing bytes are a prefix of a character; the offset is the
+    /// consumed prefix.
+    Incomplete(usize),
+    /// iconv failed for a reason other than input validity.
+    Internal,
+}
+
+/// An open iconv descriptor, closed on drop.
+struct Converter {
+    #[cfg(unix)]
+    cd: *mut std::ffi::c_void,
+    #[cfg(not(unix))]
+    _private: (),
+}
+
+impl Converter {
+    fn open(from: &str, to: &str) -> Option<Converter> {
+        #[cfg(unix)]
+        {
+            let from = std::ffi::CString::new(from).ok()?;
+            let to = std::ffi::CString::new(to).ok()?;
+            let cd = unsafe { iconv_ffi::iconv_open(to.as_ptr(), from.as_ptr()) };
+            if cd.is_null() || cd as usize == usize::MAX {
+                return None;
+            }
+            Some(Converter { cd })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (from, to);
+            None
+        }
+    }
+
+    /// Converts `input`, appending the produced bytes to `out`.
+    fn convert_into(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), ConvFault> {
+        #[cfg(unix)]
+        {
+            let mut pos = 0usize;
+            let mut chunk = vec![0u8; input.len().saturating_mul(2).saturating_add(64).max(256)];
+            loop {
+                let mut in_ptr = input[pos..].as_ptr() as *mut std::os::raw::c_char;
+                let mut in_left = input.len() - pos;
+                let mut out_ptr = chunk.as_mut_ptr() as *mut std::os::raw::c_char;
+                let mut out_left = chunk.len();
+                let result = unsafe {
+                    iconv_ffi::iconv(
+                        self.cd,
+                        &mut in_ptr,
+                        &mut in_left,
+                        &mut out_ptr,
+                        &mut out_left,
+                    )
+                };
+                // Read errno before any allocation below can overwrite it.
+                let errno = if result == usize::MAX {
+                    std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EINVAL)
+                } else {
+                    0
+                };
+                let produced = chunk.len() - out_left;
+                out.extend_from_slice(&chunk[..produced]);
+                let consumed = (input.len() - pos) - in_left;
+                pos += consumed;
+                if result != usize::MAX {
+                    if in_left == 0 {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                if errno == libc::E2BIG {
+                    if chunk.len() >= (1 << 28) {
+                        return Err(ConvFault::Internal);
+                    }
+                    chunk.resize(chunk.len().saturating_mul(2), 0);
+                    continue;
+                }
+                if errno == libc::EILSEQ {
+                    return Err(ConvFault::Illegal(pos));
+                }
+                if errno == libc::EINVAL {
+                    return Err(ConvFault::Incomplete(pos));
+                }
+                return Err(ConvFault::Internal);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (input, out);
+            Err(ConvFault::Internal)
+        }
+    }
+}
+
+impl Drop for Converter {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            iconv_ffi::iconv_close(self.cd);
+        }
+    }
+}
+
+/// One-shot conversion, used per code point by the encoder.
+fn convert_oneshot(from: &str, to: &str, input: &[u8]) -> Option<Vec<u8>> {
+    let mut converter = Converter::open(from, to)?;
+    let mut out = Vec::new();
+    converter.convert_into(input, &mut out).ok()?;
+    Some(out)
+}
+
+/// Appends the UTF-8 characters in `bytes` to a code-point buffer.
+fn push_utf8_codes(out: &mut Vec<u32>, bytes: &[u8]) {
+    for character in String::from_utf8_lossy(bytes).chars() {
+        out.push(value::storage_char_to_code(character));
+    }
+}
+
+/// Encodes one code point through the iconv charset, if it is representable.
+fn encode_codepoint(charset: &str, code: u32) -> Option<Vec<u8>> {
+    let character = char::from_u32(code)?;
+    let mut buffer = [0u8; 4];
+    convert_oneshot("UTF-8", charset, character.encode_utf8(&mut buffer).as_bytes())
+}
+
+/// Encodes `text` through an iconv charset, one code point at a time.
+///
+/// `surrogateescape` maps an escaped code point back to its byte; every other
+/// unrepresentable code point goes through the active error mode.
+fn iconv_encode(
+    charset: &str,
+    codec: Codec,
+    text: &str,
+    mode: &ErrorMode,
+) -> Result<Vec<u8>, i64> {
+    const REASON: &str = "illegal multibyte sequence";
+    let codes: Vec<u32> = value::str_codes(text).collect();
+    let mut out = Vec::with_capacity(text.len());
+    let mut index = 0usize;
+    while index < codes.len() {
+        let code = codes[index];
+        if matches!(mode, ErrorMode::SurrogateEscape) {
+            if let Some(byte) = surrogate_escape_byte(code) {
+                out.push(byte);
+                index += 1;
+                continue;
+            }
+        }
+        if let Some(bytes) = encode_codepoint(charset, code) {
+            out.extend_from_slice(&bytes);
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let end = index + 1;
         match mode {
-            ErrorMode::Strict => {
-                return Err(unicode_decode_error(Codec::Ascii, data, start, end, REASON));
+            ErrorMode::Strict | ErrorMode::SurrogateEscape | ErrorMode::SurrogatePass => {
+                return Err(unicode_encode_error(codec, text, start, end, REASON));
             }
             ErrorMode::Ignore => {}
-            ErrorMode::Replace => out.push('\u{FFFD}'),
-            ErrorMode::SurrogateEscape => out.push(SURROGATE_ESCAPE_STAND_IN),
+            ErrorMode::Replace => out.push(b'?'),
+            ErrorMode::BackslashReplace => out.extend_from_slice(escaped_code(code).as_bytes()),
+            ErrorMode::NameReplace => out.extend_from_slice(namereplace_escape(code).as_bytes()),
+            ErrorMode::XmlCharrefReplace => {
+                out.extend_from_slice(format!("&#{code};").as_bytes());
+            }
             ErrorMode::Custom(handler) => {
-                let exception = decode_exception_value(Codec::Ascii, data, start, end, REASON);
+                let exception = encode_exception_value(codec, text, start, end, REASON);
                 let result = core_builtins::call(*handler, 1, [exception].as_ptr());
                 if exc::pending() {
                     return Err(result);
                 }
-                let (replacement, position) = error_handler_result(result)?;
-                if position <= start as i64 || position > data.len() as i64 {
+                let (replacement, position) = encode_handler_result(result)?;
+                if position <= start as i64 || position > codes.len() as i64 {
                     return Err(exc::raise_with_message(
                         VALUE_ERROR,
                         &format!("error handler returned invalid position {position}"),
                     ));
                 }
-                out.push_str(replacement);
-                offset = position as usize;
+                match replacement {
+                    EncodeReplacement::Bytes(bytes) => out.extend_from_slice(bytes),
+                    EncodeReplacement::Text(replacement_text) => {
+                        for replacement_code in value::str_codes(replacement_text) {
+                            match encode_codepoint(charset, replacement_code) {
+                                Some(bytes) => out.extend_from_slice(&bytes),
+                                None => {
+                                    return Err(unicode_encode_error(
+                                        codec, text, start, end, REASON,
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+                index = position as usize;
                 continue;
             }
         }
-        offset = end;
+        index = end;
     }
     Ok(out)
 }
 
-/// Character-index iterator for the single-byte encoder. A custom error
-/// handler may request an arbitrary resume position, so the encoder rebuilds
-/// this iterator from that index.
-fn characters_from(text: &str, index: usize) -> impl Iterator<Item = (usize, char)> + '_ {
-    text.chars().enumerate().skip(index)
+/// Decodes an iconv charset into code points, applying `mode` to rejected
+/// spans.
+fn iconv_decode(
+    charset: &str,
+    codec: Codec,
+    data: &[u8],
+    mode: &ErrorMode,
+    final_: bool,
+) -> Result<(Vec<u32>, usize), i64> {
+    let mut out: Vec<u32> = Vec::with_capacity(data.len());
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let Some(mut converter) = Converter::open(charset, "UTF-8") else {
+            return Err(exc::raise_with_message(
+                LOOKUP_ERROR,
+                &format!("unknown encoding: {}", codec.name()),
+            ));
+        };
+        let mut produced = Vec::new();
+        match converter.convert_into(&data[offset..], &mut produced) {
+            Ok(()) => {
+                push_utf8_codes(&mut out, &produced);
+                return Ok((out, data.len()));
+            }
+            Err(ConvFault::Illegal(position)) => {
+                push_utf8_codes(&mut out, &produced);
+                let start = offset + position.min(data.len() - offset);
+                if start >= data.len() {
+                    return Ok((out, data.len()));
+                }
+                let next = decode_error(
+                    codec,
+                    data,
+                    start,
+                    start + 1,
+                    "illegal multibyte sequence",
+                    mode,
+                    final_,
+                    &mut out,
+                )?;
+                offset = if next > start { next } else { start + 1 };
+            }
+            Err(ConvFault::Incomplete(position)) => {
+                push_utf8_codes(&mut out, &produced);
+                let consumed = (offset + position).min(data.len());
+                if !final_ {
+                    return Ok((out, consumed));
+                }
+                let next = decode_error(
+                    codec,
+                    data,
+                    consumed,
+                    data.len(),
+                    "unexpected end of data",
+                    mode,
+                    final_,
+                    &mut out,
+                )?;
+                if next <= consumed || next >= data.len() {
+                    return Ok((out, data.len()));
+                }
+                offset = next;
+            }
+            Err(ConvFault::Internal) => {
+                return Err(exc::raise_with_message(
+                    RUNTIME_ERROR,
+                    "codec conversion failed",
+                ));
+            }
+        }
+    }
+    Ok((out, offset))
 }
 
-/// Encodes `text` with a single-byte codec.
+/// Encodes `text` with a single-byte codec (`ascii`, `latin-1` or `charmap`
+/// with no mapping).
 ///
-/// Consecutive unrepresentable characters share one error span, matching
-/// CPython's report. The strict/ignore/replace modes stream without an index
-/// buffer; a custom handler can request an arbitrary resume position, so the
-/// iterator is rebuilt from that character index. `surrogateescape` examines
-/// each character on its own: the runtime's surrogate stand-in becomes its
-/// byte and anything else unrepresentable raises.
+/// Consecutive unrepresentable code points share one error span, matching
+/// CPython's report. `surrogateescape` examines each code point on its own:
+/// `0xDC80..=0xDCFF` becomes the byte it stands for and anything else
+/// unrepresentable raises.
 fn encode_single_byte(text: &str, codec: Codec, mode: &ErrorMode) -> Result<Vec<u8>, i64> {
-    debug_assert_ne!(codec, Codec::Utf8);
     let limit = codec.limit();
     let reason = format!("ordinal not in range({})", limit + 1);
-    let character_count = match mode {
-        ErrorMode::Custom(_) => text.chars().count(),
-        _ => 0,
-    };
+    let codes: Vec<u32> = value::str_codes(text).collect();
     let mut out = Vec::with_capacity(text.len());
-    let mut characters = characters_from(text, 0).peekable();
-    while let Some((start, character)) = characters.next() {
-        let code = character as u32;
+    let mut index = 0usize;
+    while index < codes.len() {
+        let code = codes[index];
         if code <= limit {
             out.push(code as u8);
+            index += 1;
             continue;
         }
-        let mut end = start + 1;
-        // `surrogateescape` treats every unrepresentable character on its
-        // own, so it must not lump the adjacent run into one error span.
-        if !matches!(mode, ErrorMode::SurrogateEscape) {
-            while let Some(&(index, next)) = characters.peek() {
-                if (next as u32) <= limit {
-                    break;
-                }
-                end = index + 1;
-                characters.next();
+        if matches!(mode, ErrorMode::SurrogateEscape) && (0xDC80..=0xDCFF).contains(&code) {
+            out.push((code - 0xDC00) as u8);
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut end = index + 1;
+        // `surrogateescape` treats every unrepresentable code point on its
+        // own, so it must not lump the adjacent run into one span.
+        if !matches!(mode, ErrorMode::SurrogateEscape | ErrorMode::Custom(_)) {
+            while end < codes.len() && codes[end] > limit {
+                end += 1;
             }
         }
         match mode {
-            ErrorMode::SurrogateEscape => match surrogate_escape_byte(character) {
-                Some(byte) => out.push(byte),
-                None => {
-                    return Err(unicode_encode_error(codec, text, start, end, &reason));
-                }
-            },
-            ErrorMode::Strict => {
+            ErrorMode::Strict | ErrorMode::SurrogateEscape | ErrorMode::SurrogatePass => {
                 return Err(unicode_encode_error(codec, text, start, end, &reason));
             }
             ErrorMode::Ignore => {}
             ErrorMode::Replace => {
-                // One '?' per unrepresentable character, like CPython.
+                // One '?' per unrepresentable code point, like CPython.
                 out.resize(out.len() + (end - start), b'?');
+            }
+            ErrorMode::BackslashReplace => {
+                for &code in &codes[start..end] {
+                    out.extend_from_slice(escaped_code(code).as_bytes());
+                }
+            }
+            ErrorMode::NameReplace => {
+                for &code in &codes[start..end] {
+                    out.extend_from_slice(namereplace_escape(code).as_bytes());
+                }
+            }
+            ErrorMode::XmlCharrefReplace => {
+                for &code in &codes[start..end] {
+                    out.extend_from_slice(format!("&#{code};").as_bytes());
+                }
             }
             ErrorMode::Custom(handler) => {
                 let exception = encode_exception_value(codec, text, start, end, &reason);
@@ -720,7 +2096,7 @@ fn encode_single_byte(text: &str, codec: Codec, mode: &ErrorMode) -> Result<Vec<
                     return Err(result);
                 }
                 let (replacement, position) = encode_handler_result(result)?;
-                if position <= start as i64 || position > character_count as i64 {
+                if position <= start as i64 || position > codes.len() as i64 {
                     return Err(exc::raise_with_message(
                         VALUE_ERROR,
                         &format!("error handler returned invalid position {position}"),
@@ -730,22 +2106,33 @@ fn encode_single_byte(text: &str, codec: Codec, mode: &ErrorMode) -> Result<Vec<
                     EncodeReplacement::Bytes(bytes) => out.extend_from_slice(bytes),
                     EncodeReplacement::Text(replacement_text) => {
                         // A text replacement is encoded with the same codec; a
-                        // character it cannot represent raises for the original
-                        // span, like CPython.
-                        for replacement_character in replacement_text.chars() {
-                            let replacement_code = replacement_character as u32;
+                        // code point it cannot represent raises for the
+                        // original span, like CPython.
+                        for replacement_code in value::str_codes(replacement_text) {
                             if replacement_code > limit {
-                                return Err(unicode_encode_error(codec, text, start, end, &reason));
+                                return Err(unicode_encode_error(
+                                    codec, text, start, end, &reason,
+                                ));
                             }
                             out.push(replacement_code as u8);
                         }
                     }
                 }
-                characters = characters_from(text, position as usize).peekable();
+                index = position as usize;
+                continue;
             }
         }
+        index = end;
     }
     Ok(out)
+}
+
+/// The `\N{...}` escape for `code`, falling back to `\uNNNN`/`\UNNNNNNNN`.
+///
+/// The runtime has no Unicode name database, so the numeric fallback is the
+/// final answer for unknown names, exactly as CPython treats an unknown name.
+fn namereplace_escape(code: u32) -> String {
+    escaped_code(code)
 }
 
 /// Classifies the first byte of an invalid sequence like CPython's UTF-8
@@ -788,7 +2175,9 @@ fn decode_exception_value(
     );
     let args = vec![
         codec.name().to_string(),
-        format!("b\"{}\"", String::from_utf8_lossy(data)),
+        // The undecodable object, one lone surrogate per byte, so a handler
+        // can recover the rejected span exactly.
+        value::str_from_codes(data.iter().map(|byte| 0xDC00 + u32::from(*byte))),
         start.to_string(),
         end.to_string(),
         reason.to_string(),
@@ -796,15 +2185,15 @@ fn decode_exception_value(
     exc::exception_value(UNICODE_DECODE_ERROR, &message, args)
 }
 
-/// `UnicodeEncodeError` for the character run starting at `start`.
+/// `UnicodeEncodeError` for the code point run starting at `start`.
 fn unicode_encode_error(codec: Codec, text: &str, start: usize, _end: usize, reason: &str) -> i64 {
-    let character = text.chars().nth(start).unwrap_or('\u{0}');
+    let code = value::str_codes(text).nth(start).unwrap_or(0);
     exc::raise_with_message(
         UNICODE_ENCODE_ERROR,
         &format!(
             "'{}' codec can't encode character '{}' in position {start}: {reason}",
             codec.name(),
-            escaped_character(character)
+            escaped_code(code)
         ),
     )
 }
@@ -812,11 +2201,11 @@ fn unicode_encode_error(codec: Codec, text: &str, start: usize, _end: usize, rea
 /// Builds a non-pending `UnicodeEncodeError` value for a custom handler, with
 /// the same `(encoding, object, start, end, reason)` shape CPython uses.
 fn encode_exception_value(codec: Codec, text: &str, start: usize, end: usize, reason: &str) -> i64 {
-    let character = text.chars().nth(start).unwrap_or('\u{0}');
+    let code = value::str_codes(text).nth(start).unwrap_or(0);
     let message = format!(
         "'{}' codec can't encode character '{}' in position {start}: {reason}",
         codec.name(),
-        escaped_character(character)
+        escaped_code(code)
     );
     let args = vec![
         codec.name().to_string(),
@@ -830,8 +2219,7 @@ fn encode_exception_value(codec: Codec, text: &str, start: usize, end: usize, re
 
 /// Renders a code point the way CPython's `UnicodeEncodeError` message does:
 /// `\xNN`, `\uNNNN` or `\UNNNNNNNN`.
-fn escaped_character(character: char) -> String {
-    let code = character as u32;
+fn escaped_code(code: u32) -> String {
     if code <= 0xff {
         format!("\\x{code:02x}")
     } else if code <= 0xffff {
@@ -1152,6 +2540,15 @@ fn codec_info(codec: Codec) -> i64 {
         Codec::Utf8 => ("utf_8_encode", 1, "utf_8_decode", 3),
         Codec::Ascii => ("ascii_encode", 2, "ascii_decode", 2),
         Codec::Latin1 => ("latin_1_encode", 2, "latin_1_decode", 2),
+        // Every other codec uses the generic `{prog}_encode`/`{prog}_decode`
+        // entry points [`call`] dispatches back to this module's engines.
+        other => {
+            let encode: &'static str =
+                Box::leak(format!("{}_encode", other.prog()).into_boxed_str());
+            let decode: &'static str =
+                Box::leak(format!("{}_decode", other.prog()).into_boxed_str());
+            (encode, 2, decode, 3)
+        }
     };
     let encode = value::native_function_new("_codecs", encode_name, encode_arity);
     let decode = value::native_function_new("_codecs", decode_name, decode_arity);
@@ -1375,12 +2772,11 @@ fn error_handler_start(exception: i64) -> Result<i64, i64> {
 /// `surrogateescape_errors(exception)`: the PEP 383 handler returned by
 /// `lookup_error('surrogateescape')`.
 ///
-/// Decoding fails only for bytes that cannot be represented, and Hydro's
-/// strings are UTF-8, so every byte of the rejected span becomes the
-/// [`SURROGATE_ESCAPE_STAND_IN`] the lexer already uses for surrogate
-/// escapes. Encoding maps the stand-in back to
-/// [`SURROGATE_ESCAPE_BYTE`] and re-raises for a character outside it, which
-/// mirrors CPython's re-raise for characters outside U+DC80..U+DCFF.
+/// Decoding fails only for bytes that cannot be represented, so every byte
+/// of the rejected span becomes the lone surrogate `0xDC00 + b` (the state
+/// the decode exception carries as its object). Encoding maps
+/// `0xDC80..=0xDCFF` back to its byte and re-raises for a code point outside
+/// that range, mirroring CPython's PEP 383 handler.
 fn surrogateescape_errors(args: &[i64]) -> i64 {
     let Some(data) = value::exception_data(args[0]) else {
         return type_error(
@@ -1399,8 +2795,17 @@ fn surrogateescape_errors(args: &[i64]) -> i64 {
     };
     let count = (end - start).max(0) as usize;
     if tag == UNICODE_DECODE_ERROR {
-        let replacement = value::str_alloc(SURROGATE_ESCAPE_STAND_IN.to_string().repeat(count));
-        return value::tuple_new(vec![replacement, ops::int_result(end)]);
+        // The decode exception carries the undecodable object as its
+        // surrogate-escaped text, so the rejected span is recoverable.
+        let Some(object) = data.args.get(1) else {
+            return type_error("error handler expects a Unicode error with start/end args");
+        };
+        let codes: Vec<u32> = value::str_codes(object)
+            .skip(start.max(0) as usize)
+            .take(count)
+            .collect();
+        let replacement = value::str_from_codes(codes);
+        return value::tuple_new(vec![value::str_alloc(replacement), ops::int_result(end)]);
     }
     if tag == UNICODE_ENCODE_ERROR {
         // Encode errors carry the source text in `args[1]`, so the rejected
@@ -1410,8 +2815,11 @@ fn surrogateescape_errors(args: &[i64]) -> i64 {
             return type_error("error handler expects a Unicode error with start/end args");
         };
         let mut bytes = Vec::with_capacity(count);
-        for character in text.chars().skip(start.max(0) as usize).take(count) {
-            match surrogate_escape_byte(character) {
+        for code in value::str_codes(text)
+            .skip(start.max(0) as usize)
+            .take(count)
+        {
+            match surrogate_escape_byte(code) {
                 Some(byte) => bytes.push(byte),
                 None => return exc::raise_value(args[0]),
             }

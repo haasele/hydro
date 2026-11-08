@@ -38,7 +38,9 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::exc::{self, ATTRIBUTE_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR};
+use crate::exc::{
+    self, ATTRIBUTE_ERROR, RECURSION_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR,
+};
 use crate::gc::roots::{self, SavedRoots};
 use crate::value::{self, NONE};
 
@@ -385,7 +387,7 @@ pub(crate) struct FiberState {
     pub(crate) saved_roots: SavedRoots,
     /// Root set of the resumer while this fiber runs (null while suspended).
     caller_roots_ptr: *mut SavedRoots,
-    /// Activation records of this fiber while it is suspended.
+    /// Activation records of this fiber's own frames.
     ///
     /// Python frames are thread state, not process state; a suspended fiber's
     /// activations must not appear on the resumer's stack. The records are
@@ -393,7 +395,23 @@ pub(crate) struct FiberState {
     /// `sys._getframe` depths stay within the context that is running. A
     /// record carries the introspection data it materialised, so a retained
     /// frame object of the suspended fiber keeps working.
+    ///
+    /// While the fiber runs, the resumer's records are spliced *below* these
+    /// (see [`FiberState::frame_base`]), so the active chain matches CPython's
+    /// single per-thread stack; they are removed again on suspension.
     pub(crate) saved_frames: Vec<exc::Activation>,
+    /// Number of resumer activations spliced below this fiber's own records
+    /// for the current resume.
+    ///
+    /// CPython keeps one linear frame stack per thread: while a generator
+    /// runs, its frame sits on top of the frame that called `next()`/
+    /// `send()`/`await`, so `f_back`, `sys._getframe(depth)` and tracebacks
+    /// walk across the boundary. [`detach_caller_frames`] removes the prefix
+    /// again when the fiber suspends.
+    frame_base: usize,
+    /// Fiber whose activations were spliced below ours (`null` when the
+    /// resumer ran on the thread's own stack).
+    frame_owner: *mut FiberState,
 }
 
 impl FiberState {
@@ -443,6 +461,8 @@ impl FiberState {
             saved_roots: SavedRoots::default(),
             caller_roots_ptr: std::ptr::null_mut(),
             saved_frames: Vec::new(),
+            frame_base: 0,
+            frame_owner: std::ptr::null_mut(),
         });
         // The three ranges stay valid until `Drop`; registering them once
         // keeps the per-resume path free of global-registry work.
@@ -508,6 +528,11 @@ impl Drop for FiberState {
         // freed. `clear` only drops the vectors: it never dereferences a slot,
         // so a stale frame on a dead fiber stack cannot be scanned here.
         self.saved_roots.clear();
+        // A fiber being collected has no live frames; releasing them here
+        // keeps a retained record from pinning a dead stack's metadata.
+        self.saved_frames.clear();
+        self.frame_base = 0;
+        self.frame_owner = std::ptr::null_mut();
         // The lifetime root ranges must be gone before the stack and the
         // contexts are freed.
         crate::heap::unregister_suspended_stack(self.stack_root_lo, self.stack_root_hi);
@@ -568,6 +593,142 @@ impl Drop for AwaitDepthGuard {
     }
 }
 
+// -------------------------------------------------------------------------
+// Recursion and native stack accounting
+// -------------------------------------------------------------------------
+
+/// Native stack kept free below the running frame. The exception path and
+/// the collector both need headroom, and exceeding the guard page aborts the
+/// process, so a call that would leave less than this raises `RecursionError`
+/// instead.
+pub(crate) const STACK_RESERVE: usize = 128 * 1024;
+
+/// Charges one Python call frame against `sys.getrecursionlimit()`.
+///
+/// The counter is thread state (CPython's `py_recursion_remaining`), shared
+/// by every fiber on the thread: a generator resumed from a Python call runs
+/// on the same native stack chain, so its frames must count on top of the
+/// resumer's. The counter is never swapped with a fiber — only the
+/// *physical* stack (and the `await` chain tracked in `AWAIT_DEPTH`) is.
+///
+/// The guard combines the configured depth with a hard byte budget so a
+/// single pathological Rust frame cannot reach the guard page between two
+/// checks: a raised limit never turns into a stack overflow abort.
+struct CallDepthGuard;
+
+thread_local! {
+    static CALL_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+impl CallDepthGuard {
+    /// Enters one Python call. `None` means the limit was reached; the caller
+    /// raises `RecursionError` (no exception is raised here, so the caller
+    /// stays in control of the message and the frame).
+    fn enter() -> Option<CallDepthGuard> {
+        let depth = CALL_DEPTH.with(|cell| {
+            let depth = cell.get() + 1;
+            cell.set(depth);
+            depth
+        });
+        if depth > crate::modules::recursion_limit() || !stack_has_room(STACK_RESERVE) {
+            CALL_DEPTH.with(|cell| cell.set(depth - 1));
+            return None;
+        }
+        Some(CallDepthGuard)
+    }
+}
+
+impl Drop for CallDepthGuard {
+    fn drop(&mut self) {
+        CALL_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+    }
+}
+
+/// Depth of the Python call chain currently running on this thread, in frames
+/// below the innermost active call.
+///
+/// `sys.setrecursionlimit` (modules/mod.rs) rejects a limit at or below this
+/// value, mirroring CPython's `"cannot set the recursion limit to N at the
+/// recursion depth D"` check; the runtime side of that message currently
+/// hard-codes depth `0`.
+#[allow(dead_code)] // used by modules/mod.rs once the limit check lands there
+pub(crate) fn recursion_depth() -> usize {
+    CALL_DEPTH.with(Cell::get)
+}
+
+/// Checks that one more Python call fits in the configured recursion limit and
+/// in the native stack, returning the guard that unwinds the charge.
+///
+/// The caller raises `RecursionError` with CPython's
+/// `"maximum recursion depth exceeded"` message when this returns `None`. The
+/// JIT call helper (`core::methods::call`) and the interpreter's call arm are
+/// the entry points that must use it; a fiber resume uses it too, because the
+/// resumed body executes on the resumer's native stack chain.
+pub(crate) fn enter_python_call() -> Option<impl Drop> {
+    CallDepthGuard::enter()
+}
+
+/// Address of a live stack slot, used as the current stack pointer.
+///
+/// The stack grows down on every supported target, so the space left in a
+/// context is `sp - low`.
+#[inline(never)]
+fn stack_pointer() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
+}
+
+/// Bytes of native stack still available in the running context: the fiber's
+/// private stack inside a fiber, the thread's stack otherwise.
+pub(crate) fn stack_headroom() -> Option<usize> {
+    let sp = stack_pointer();
+    let (low, high) = match current_stack_bounds() {
+        Some(bounds) => bounds,
+        None => crate::heap::native_stack_bounds_cached()?,
+    };
+    // `sp` outside the range means the bounds describe another stack (or a
+    // custom thread); nothing reliable can be concluded, so stay permissive.
+    if sp <= low || sp > high {
+        return None;
+    }
+    Some(sp - low)
+}
+
+/// Whether at least `need` bytes of native stack remain in this context.
+/// Unknown bounds count as room: the depth counter still bounds the chain.
+pub(crate) fn stack_has_room(need: usize) -> bool {
+    stack_headroom().map(|left| left >= need).unwrap_or(true)
+}
+
+/// The exception every call entry point raises when
+/// [`enter_python_call`] refuses a call (CPython's wording for both the depth
+/// and the stack-headroom limit).
+pub(crate) fn recursion_error() -> i64 {
+    exc::raise_with_message(RECURSION_ERROR, "maximum recursion depth exceeded")
+}
+
+/// Refuses a resume that would overflow the running stack and reports it as a
+/// finished fiber whose body raised `RecursionError`.
+///
+/// # Safety
+///
+/// `ptr` must point at a live fiber.
+unsafe fn refuse_resume(ptr: *mut FiberState) -> bool {
+    // SAFETY: caller contract.
+    unsafe {
+        recursion_error();
+        let error = exc::pending_value();
+        let _ = exc::clear();
+        (*ptr).error = error;
+        // The body was entered (and is now closed): a closed generator no
+        // longer accepts `send` values, matching CPython's gen_send_ex.
+        (*ptr).started = true;
+        (*ptr).done = true;
+        (*ptr).finish_seq = next_finish_seq();
+        true
+    }
+}
+
 /// Completion counter shared by every thread.
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -609,6 +770,45 @@ extern "C" fn fiber_trampoline() {
     unsafe { finish_switch(ptr) };
 }
 
+/// Removes the resumer's activations spliced below this fiber's own records
+/// and hands them back, so a suspended fiber exposes only its own frames.
+///
+/// # Safety
+///
+/// `ptr` must point at the currently running fiber.
+unsafe fn detach_caller_frames(ptr: *mut FiberState) {
+    // SAFETY: caller contract.
+    unsafe {
+        let base = (*ptr).frame_base;
+        // The prefix can only shrink if a body popped more activations than it
+        // pushed; clamping keeps the switch path panic-free (a panic here
+        // would unwind across the context switch).
+        debug_assert!(base <= (*ptr).saved_frames.len(), "frame splice imbalance");
+        let base = base.min((*ptr).saved_frames.len());
+        if base == 0 {
+            (*ptr).frame_base = 0;
+            (*ptr).frame_owner = std::ptr::null_mut();
+            return;
+        }
+        // `split_off` keeps the resumer's prefix in `caller` and leaves this
+        // fiber's own activations in the fiber object.
+        let own = (*ptr).saved_frames.split_off(base);
+        let caller = std::mem::replace(&mut (*ptr).saved_frames, own);
+        let owner = (*ptr).frame_owner;
+        if !owner.is_null() {
+            // SAFETY: the resumer is blocked in `resume_raw`; it cannot have
+            // observed or modified its emptied vector meanwhile.
+            (*owner).saved_frames = caller;
+        } else {
+            // Only a fiber resumer is spliced today; thread frames are left
+            // in the thread state and never reach this path.
+            debug_assert!(caller.is_empty(), "thread frames must not be spliced");
+        }
+        (*ptr).frame_base = 0;
+        (*ptr).frame_owner = std::ptr::null_mut();
+    }
+}
+
 /// Restores the caller's stack bounds, records the fiber as finished and
 /// swaps back. Never returns.
 ///
@@ -629,6 +829,11 @@ unsafe fn finish_switch(ptr: *mut FiberState) {
         (*ptr).caller_roots_ptr = std::ptr::null_mut();
         // The fiber's activations are dead with its stack; restore the
         // resumer's frame stack before its native context runs again.
+        detach_caller_frames(ptr);
+        // A body that unwound without running every `hydro_frame_leave` must
+        // not keep dead activation records (and the `FrameData` they cached)
+        // alive: a finished fiber has no live frames.
+        (*ptr).saved_frames.clear();
         // The context must never be resumed once the body returned. Save the
         // fiber's (dead) continuation into its own slot and switch to the
         // resumer (`caller_ctx`).
@@ -658,6 +863,9 @@ unsafe fn suspend_switch(ptr: *mut FiberState) {
         }
         roots::switch_back((*ptr).caller_roots_ptr);
         (*ptr).caller_roots_ptr = std::ptr::null_mut();
+        // The resumer's activations go back to their owner; a suspended fiber
+        // never exposes its caller's frames.
+        detach_caller_frames(ptr);
         // Save the fiber's continuation into `ctx` and switch back to the
         // resumer (`caller_ctx`).
         switch_from_fiber(ptr);
@@ -680,6 +888,13 @@ pub(crate) unsafe fn resume_raw(ptr: *mut FiberState, value: i64) -> bool {
             // Defensive: a fiber cannot be resumed while it runs.
             return false;
         }
+        // A resume is a Python call: the body runs on this thread's native
+        // stack chain (on a fiber stack when the resumer is itself a fiber).
+        // Refuse instead of switching when the recursion limit or the stack
+        // reserve is reached; the guard page would abort the process.
+        let Some(_call) = enter_python_call() else {
+            return refuse_resume(ptr);
+        };
         // The native caller stack and the fiber's own stack/context ranges
         // are lifetime roots published at fiber creation.
         (*ptr).started = true;
@@ -702,9 +917,28 @@ pub(crate) unsafe fn resume_raw(ptr: *mut FiberState, value: i64) -> bool {
         // suspension). The resumer's roots stay scannable there while its
         // native stack is inactive.
         (*ptr).caller_roots_ptr = roots::switch_to(&mut (*ptr).saved_roots);
-        // Frame records follow the same split: `sys._getframe` inside the
-        // fiber must not observe the resumer's activations. Frame operations
-        // route through `CURRENT`, which is switched below.
+        // Frame records follow the same split, except that CPython exposes a
+        // single frame stack per thread: while the fiber runs, the resumer's
+        // activations sit *below* the fiber's own, so `f_back`,
+        // `sys._getframe(depth)` and tracebacks cross the `next()`/`await`
+        // boundary. The prefix is removed again on suspension
+        // ([`detach_caller_frames`]). `CURRENT` still names the resumer here.
+        match CURRENT.with(Cell::get) {
+            Some(outer) if outer.ptr != ptr => {
+                let mut inherited = std::mem::take(&mut (*outer.ptr).saved_frames);
+                (*ptr).frame_base = inherited.len();
+                inherited.append(&mut (*ptr).saved_frames);
+                (*ptr).saved_frames = inherited;
+                (*ptr).frame_owner = outer.ptr;
+            }
+            _ => {
+                // Resumed from the thread's own stack: the resumer's frames
+                // live in the thread state and stay there (a suspended fiber
+                // must not expose them).
+                (*ptr).frame_base = 0;
+                (*ptr).frame_owner = std::ptr::null_mut();
+            }
+        }
         let outer = CURRENT.with(|cell| cell.replace(Some(CurrentFiber { ptr, value })));
         // Resume: save the caller's continuation into `caller_ctx` and switch
         // to the fiber's `ctx` (the trampoline entry on first resume, the
@@ -1042,7 +1276,7 @@ pub(crate) fn async_generator_aiter(value: i64) -> i64 {
 /// yielded item. The caller has already validated `ptr` and the resume value.
 fn drive_async_generator(agen: i64, ptr: *mut FiberState, first_value: i64) -> i64 {
     let Some(_depth) = AwaitDepthGuard::enter() else {
-        return exc::raise_with_message(RUNTIME_ERROR, "await chain is too deep");
+        return exc::raise_with_message(RECURSION_ERROR, "maximum recursion depth exceeded");
     };
     let mut resume_value = first_value;
     loop {
@@ -1505,7 +1739,7 @@ pub(crate) fn await_value(value: i64) -> i64 {
         return await_scheduled_task(value, ptr);
     }
     let Some(_depth) = AwaitDepthGuard::enter() else {
-        return exc::raise_with_message(RUNTIME_ERROR, "await chain is too deep");
+        return exc::raise_with_message(RECURSION_ERROR, "maximum recursion depth exceeded");
     };
     // SAFETY: `fiber_raw` returned a live fiber payload. The awaited value
     // stays reachable through the awaiting fiber's field while it runs.
@@ -1822,5 +2056,68 @@ mod tests {
             value::to_string(exc::pending_value()),
             "'iterator' object has no attribute 'send'"
         );
+    }
+
+    /// Body of the inner generator: reports the frame chain it observes.
+    extern "C" fn inner_frame_probe(_argv: *const i64) -> i64 {
+        exc::frame_enter_ptr(b"inner".as_ptr(), 5);
+        let name = exc::frame_at(0).map(|frame| frame.code_name());
+        let caller = exc::frame_at(1).map(|frame| frame.code_name());
+        let chain_ends = exc::frame_at(2).is_none();
+        exc::frame_leave();
+        let mut items = Vec::new();
+        let mut roots = Vec::new();
+        for text in [name, caller] {
+            let item = text
+                .map(value::str_alloc)
+                .unwrap_or(NONE);
+            roots.push(crate::heap::root_values(&[item]));
+            items.push(item);
+        }
+        items.push(if chain_ends { value::TRUE } else { value::FALSE });
+        let tuple = value::tuple_new(items);
+        for root in roots.into_iter().rev() {
+            crate::heap::release_roots(root);
+        }
+        tuple
+    }
+
+    /// Body of the outer generator: resumes the inner generator from its own
+    /// activation, so both frames are live on different fiber stacks.
+    extern "C" fn outer_frame_probe(_argv: *const i64) -> i64 {
+        exc::frame_enter_ptr(b"outer".as_ptr(), 5);
+        let inner = value::fiber_generator_new(
+            inner_frame_probe as *const () as usize,
+            "inner".to_string(),
+            Vec::new(),
+        )
+        .expect("inner generator stack");
+        let token = crate::heap::root_values(&[inner]);
+        send_value(inner, NONE);
+        if exc::pending() {
+            exc::clear();
+        }
+        let result = result_value(inner);
+        crate::heap::release_roots(token);
+        exc::frame_leave();
+        result
+    }
+
+    #[test]
+    fn nested_resume_exposes_one_frame_chain() {
+        let outer = generator(outer_frame_probe);
+        send_value(outer, NONE);
+        if exc::pending() {
+            exc::clear();
+        }
+        let items = value::as_tuple(result_value(outer)).expect("probe tuple");
+        assert_eq!(items.len(), 3);
+        // The inner fiber sees its own activation first, then the resumer's:
+        // CPython's per-thread frame stack crosses the `next()` boundary.
+        assert_eq!(value::as_str(items[0]), Some("inner"));
+        assert_eq!(value::as_str(items[1]), Some("outer"));
+        assert_eq!(items[2], value::TRUE);
+        // The outer chain is gone once the inner fiber finished.
+        assert!(exc::frame_at(0).is_none());
     }
 }

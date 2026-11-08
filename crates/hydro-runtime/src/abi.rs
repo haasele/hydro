@@ -1810,6 +1810,34 @@ pub extern "C" fn hydro_exc_matches_value(exception: i64, matcher: i64) -> i32 {
     exc::matches_handler_value(exception, matcher)
 }
 
+/// `except*` protocol: opens a split session for the caught exception `orig`
+/// and returns its opaque tagged token. See `crate::exc::star_begin`.
+#[no_mangle]
+pub extern "C" fn hydro_exc_star_begin(orig: i64) -> i64 {
+    exc::star_begin(orig)
+}
+
+/// `except*` protocol: returns the subset of the current remainder selected by
+/// `matcher` (or `None`) and advances the remainder.
+#[no_mangle]
+pub extern "C" fn hydro_exc_star_match(token: i64, matcher: i64) -> i64 {
+    exc::star_match(token, matcher)
+}
+
+/// `except*` protocol: records the pending exception as raised by a clause
+/// body and clears it.
+#[no_mangle]
+pub extern "C" fn hydro_exc_star_raised(token: i64) -> i64 {
+    exc::star_raised(token)
+}
+
+/// `except*` protocol: closes the session and returns the exception to
+/// re-raise, or `None`.
+#[no_mangle]
+pub extern "C" fn hydro_exc_star_finish(token: i64) -> i64 {
+    exc::star_finish(token)
+}
+
 #[no_mangle]
 pub extern "C" fn hydro_uncaught() -> i64 {
     exc::uncaught()

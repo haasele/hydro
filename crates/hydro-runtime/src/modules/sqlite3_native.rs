@@ -59,7 +59,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_uchar, c_void};
+use std::os::raw::{c_char, c_int, c_uchar, c_uint, c_void};
 use std::ptr;
 use std::sync::{Mutex, MutexGuard};
 use std::thread::ThreadId;
@@ -90,7 +90,7 @@ const CONNECTION_CAPSULE: &str = "hydro.sqlite3.connection";
 const CURSOR_CAPSULE: &str = "hydro.sqlite3.cursor";
 
 /// Positional parameter names of `connect`/`Connection.__init__`.
-const CONNECT_PARAMS: [&str; 8] = [
+const CONNECT_PARAMS: [&str; 9] = [
     "database",
     "timeout",
     "detect_types",
@@ -99,6 +99,7 @@ const CONNECT_PARAMS: [&str; 8] = [
     "factory",
     "cached_statements",
     "uri",
+    "autocommit",
 ];
 
 // -------------------------------------------------------------------------
@@ -146,6 +147,28 @@ type UdfDestroy = Option<UdfDestroyFn>;
 /// `sqlite3_exec` callback (unused: this module always passes `NULL`).
 type ExecCallback =
     Option<unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int>;
+/// Collation comparison callback.
+type CollationCompare = Option<unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int>;
+/// Authorizer callback.
+type AuthorizerCallback = Option<
+    unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+    ) -> c_int,
+>;
+/// Progress-handler callback.
+type ProgressCallback = Option<unsafe extern "C" fn(*mut c_void) -> c_int>;
+/// `sqlite3_trace_v2` callback.
+type TraceCallback =
+    Option<unsafe extern "C" fn(c_uint, *mut c_void, *mut c_void, *mut c_void) -> c_int>;
+/// Aggregate step callback.
+type AggregateStep = Option<unsafe extern "C" fn(*mut SqliteContext, c_int, *mut *mut SqliteValue)>;
+/// Aggregate final callback.
+type AggregateFinal = Option<unsafe extern "C" fn(*mut SqliteContext)>;
 
 // Result codes (`sqlite3.h`).
 const SQLITE_OK: c_int = 0;
@@ -180,6 +203,15 @@ const SQLITE_OPEN_CREATE: c_int = 0x0000_0004;
 const SQLITE_OPEN_URI: c_int = 0x0000_0040;
 const SQLITE_UTF8: c_int = 1;
 const SQLITE_DETERMINISTIC: c_int = 0x0000_0800;
+const SQLITE_TRACE_STMT: c_uint = 0x01;
+const SQLITE_LIMIT_SQL_LENGTH: c_int = 1;
+const SQLITE_DENY: c_int = 1;
+const SQLITE_IGNORE: c_int = 2;
+
+/// `LEGACY_TRANSACTION_CONTROL`: the sentinel `autocommit` value.
+const AUTOCOMMIT_LEGACY: i64 = -1;
+const AUTOCOMMIT_ENABLED: i64 = 1;
+const AUTOCOMMIT_DISABLED: i64 = 0;
 
 const SQLITE_INTEGER: c_int = 1;
 const SQLITE_FLOAT: c_int = 2;
@@ -286,6 +318,42 @@ extern "C" {
         final_function: UdfFinal,
         destroy: UdfDestroy,
     ) -> c_int;
+    fn sqlite3_create_collation_v2(
+        database: *mut Sqlite3,
+        name: *const c_char,
+        text_rep: c_int,
+        application: *mut c_void,
+        compare: CollationCompare,
+        destroy: UdfDestroy,
+    ) -> c_int;
+    fn sqlite3_set_authorizer(
+        database: *mut Sqlite3,
+        callback: AuthorizerCallback,
+        application: *mut c_void,
+    ) -> c_int;
+    fn sqlite3_progress_handler(
+        database: *mut Sqlite3,
+        instructions: c_int,
+        callback: ProgressCallback,
+        application: *mut c_void,
+    );
+    fn sqlite3_trace_v2(
+        database: *mut Sqlite3,
+        mask: c_uint,
+        callback: TraceCallback,
+        application: *mut c_void,
+    ) -> c_int;
+    fn sqlite3_expanded_sql(statement: *mut Sqlite3Stmt) -> *mut c_char;
+    fn sqlite3_sql(statement: *mut Sqlite3Stmt) -> *const c_char;
+    fn sqlite3_free(pointer: *mut c_void);
+    fn sqlite3_aggregate_context(context: *mut SqliteContext, bytes: c_int) -> *mut c_void;
+    fn sqlite3_enable_load_extension(database: *mut Sqlite3, onoff: c_int) -> c_int;
+    fn sqlite3_total_changes(database: *mut Sqlite3) -> c_int;
+    fn sqlite3_interrupt(database: *mut Sqlite3);
+    fn sqlite3_column_decltype(statement: *mut Sqlite3Stmt, index: c_int) -> *const c_char;
+    fn sqlite3_data_count(statement: *mut Sqlite3Stmt) -> c_int;
+    fn sqlite3_stmt_busy(statement: *mut Sqlite3Stmt) -> c_int;
+    fn sqlite3_limit(database: *mut Sqlite3, id: c_int, new_value: c_int) -> c_int;
 }
 
 /// `SQLITE_TRANSIENT`: SQLite copies the buffer before returning.
@@ -392,6 +460,75 @@ fn raise_db_error(database: *mut Sqlite3) -> i64 {
 }
 
 // -------------------------------------------------------------------------
+// Module registries
+// -------------------------------------------------------------------------
+
+/// `detect_types` flags.
+const PARSE_DECLTYPES: i64 = 1;
+const PARSE_COLNAMES: i64 = 2;
+
+const ADAPTERS_KEY: &str = "sqlite3.adapters";
+const CONVERTERS_KEY: &str = "sqlite3.converters";
+const OMITTED_KEY: &str = "sqlite3.omitted";
+const AGGREGATE_LIVE_KEY: &str = "sqlite3.aggregate.live";
+const ROW_KEY: &str = "sqlite3.Row.class";
+const BLOB_KEY: &str = "sqlite3.Blob.class";
+const PREPARE_PROTOCOL_KEY: &str = "sqlite3.PrepareProtocol.class";
+
+/// Whether callback exceptions are printed (`enable_callback_tracebacks`).
+static CALLBACK_TRACEBACKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn callback_tracebacks() -> bool {
+    CALLBACK_TRACEBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The shared `adapters`/`converters` mapping, created on first use and kept
+/// in the module registry so its identity is stable.
+fn registry_dict(key: &str) -> i64 {
+    if let Some(dict) = globals::registry_get(key) {
+        return dict;
+    }
+    let dict = value::dict_new(Vec::new());
+    globals::registry_set(key, dict);
+    dict
+}
+
+fn adapters_dict() -> i64 {
+    registry_dict(ADAPTERS_KEY)
+}
+
+fn converters_dict() -> i64 {
+    registry_dict(CONVERTERS_KEY)
+}
+
+fn aggregate_live_dict() -> i64 {
+    registry_dict(AGGREGATE_LIVE_KEY)
+}
+
+/// Sentinel used as the default of an omitted optional argument, so `None`
+/// supplied explicitly stays distinguishable.
+fn omitted() -> i64 {
+    if let Some(value_arg) = globals::registry_get(OMITTED_KEY) {
+        return value_arg;
+    }
+    let sentinel = value::native_function_new("sqlite3", "<omitted>", 0);
+    globals::registry_set(OMITTED_KEY, sentinel);
+    sentinel
+}
+
+fn is_omitted(value_arg: Option<&i64>) -> bool {
+    value_arg.is_none_or(|candidate| *candidate == omitted())
+}
+
+/// Reads an integer-valued connection attribute.
+fn connection_integer(connection: i64, name: &str, fallback: i64) -> i64 {
+    value::instance_attr(connection, name)
+        .and_then(value::as_integer)
+        .unwrap_or(fallback)
+}
+
+// -------------------------------------------------------------------------
 // Connection and cursor state
 // -------------------------------------------------------------------------
 
@@ -415,6 +552,17 @@ struct ConnectionState {
     thread: ThreadId,
     check_same_thread: bool,
     ops: Mutex<ConnOps>,
+    /// Registered trace/progress/authorizer callables (rooted for the process
+    /// lifetime; cleared when the user passes `None`).
+    callbacks: Mutex<Callbacks>,
+}
+
+/// Python callables installed through the connection hook methods.
+#[derive(Default)]
+struct Callbacks {
+    trace: Option<i64>,
+    progress: Option<i64>,
+    authorizer: Option<i64>,
 }
 
 /// A cursor over one connection. Fields live in `Cell`s and are mutated only
@@ -647,6 +795,11 @@ fn connection_class() -> i64 {
     build_class(CONNECTION_KEY, "Connection", &SPECS)
 }
 
+/// Cached `sqlite3.PrepareProtocol` sentinel class.
+fn prepare_protocol_class() -> i64 {
+    build_class("sqlite3.PrepareProtocol", "PrepareProtocol", &[])
+}
+
 /// Cached `sqlite3.Cursor` class.
 fn cursor_class() -> i64 {
     const SPECS: [(&str, &str, usize); 9] = [
@@ -672,6 +825,9 @@ fn is_callable(candidate: i64) -> bool {
 }
 
 /// Converts the `database` operand to filesystem bytes (UTF-8).
+///
+/// `str`, `bytes` and `os.PathLike` (`__fspath__`) are accepted, matching
+/// CPython's `PyUnicode_FSConverter`.
 fn database_argument(value_arg: i64) -> Result<Vec<u8>, i64> {
     if let Some(text) = value::as_str(value_arg) {
         return Ok(text.as_bytes().to_vec());
@@ -679,8 +835,26 @@ fn database_argument(value_arg: i64) -> Result<Vec<u8>, i64> {
     if let Some(bytes) = value::as_bytes(value_arg) {
         return Ok(bytes.to_vec());
     }
+    // `os.PathLike`: call `__fspath__` and accept str/bytes.
+    let path = crate::core::methods::call(
+        value_arg,
+        b"__fspath__".as_ptr(),
+        b"__fspath__".len(),
+        0,
+        std::ptr::null(),
+    );
+    if exc::pending() {
+        exc::clear();
+    } else if path != NONE {
+        if let Some(text) = value::as_str(path) {
+            return Ok(text.as_bytes().to_vec());
+        }
+        if let Some(bytes) = value::as_bytes(path) {
+            return Ok(bytes.to_vec());
+        }
+    }
     Err(type_error(&format!(
-        "argument 'database' must be str or bytes, not '{}'",
+        "expected str, bytes or os.PathLike object, not '{}'",
         value::type_name(value_arg)
     )))
 }
@@ -754,6 +928,25 @@ struct ConnectOptions {
     factory: Option<i64>,
     cached_statements: i64,
     uri: bool,
+    autocommit: i64,
+}
+
+/// `autocommit` accepts `True`, `False` or `LEGACY_TRANSACTION_CONTROL`.
+fn autocommit_argument(value_arg: i64) -> Result<i64, i64> {
+    if value_arg == TRUE {
+        return Ok(AUTOCOMMIT_ENABLED);
+    }
+    if value_arg == FALSE {
+        return Ok(AUTOCOMMIT_DISABLED);
+    }
+    if let Some(number) = value::as_integer(value_arg) {
+        if number == AUTOCOMMIT_LEGACY {
+            return Ok(AUTOCOMMIT_LEGACY);
+        }
+    }
+    Err(value_error(
+        "autocommit must be True, False, or sqlite3.LEGACY_TRANSACTION_CONTROL",
+    ))
 }
 
 /// Resolves an optional slot in the keyword-call path.
@@ -797,7 +990,7 @@ fn parse_connect_options(
             args.len()
         )));
     }
-    let mut slots: [Option<i64>; 8] = [None; 8];
+    let mut slots: [Option<i64>; 9] = [None; 9];
     for (index, value_arg) in args.iter().enumerate() {
         slots[index] = Some(*value_arg);
     }
@@ -845,6 +1038,10 @@ fn parse_connect_options(
     let uri = effective_slot(slots[7], "uri", keywords)
         .map(truthy_argument)
         .unwrap_or(false);
+    let autocommit = match effective_slot(slots[8], "autocommit", keywords) {
+        Some(value_arg) => autocommit_argument(value_arg)?,
+        None => AUTOCOMMIT_LEGACY,
+    };
     Ok(ConnectOptions {
         database,
         timeout,
@@ -854,6 +1051,7 @@ fn parse_connect_options(
         factory,
         cached_statements,
         uri,
+        autocommit,
     })
 }
 
@@ -862,11 +1060,6 @@ fn parse_connect_options(
 // -------------------------------------------------------------------------
 
 fn init_connection(instance: i64, options: &ConnectOptions) -> Result<(), i64> {
-    if options.detect_types != 0 {
-        return Err(not_supported(
-            "detect_types is not supported by the native sqlite3 module; pass 0",
-        ));
-    }
     let Ok(path) = CString::new(options.database.clone()) else {
         return Err(value_error("embedded null character in database path"));
     };
@@ -920,6 +1113,7 @@ fn init_connection(instance: i64, options: &ConnectOptions) -> Result<(), i64> {
             statements: Vec::new(),
             cursors: Vec::new(),
         }),
+        callbacks: Mutex::new(Callbacks::default()),
     });
     let pointer = Box::into_raw(state) as usize;
     let capsule = value::capsule_new(pointer, Some(CONNECTION_CAPSULE.to_string()));
@@ -930,7 +1124,20 @@ fn init_connection(instance: i64, options: &ConnectOptions) -> Result<(), i64> {
     };
     set_cursor_attr(instance, "isolation_level", isolation);
     set_cursor_attr(instance, "in_transaction", FALSE);
+    set_cursor_attr(instance, "detect_types", ops::int_result(options.detect_types));
+    set_cursor_attr(instance, "autocommit", ops::int_result(options.autocommit));
+    set_cursor_attr(instance, "text_factory", text_factory_default());
+    set_cursor_attr(instance, "row_factory", NONE);
+    set_cursor_attr(instance, "total_changes", ops::int_result(0));
+    if options.autocommit == AUTOCOMMIT_DISABLED {
+        exec_sql(database, "BEGIN")?;
+    }
     Ok(())
+}
+
+/// The default `text_factory`: the `str` type.
+fn text_factory_default() -> i64 {
+    value::builtin_function_new(hydro_ir::Builtin::Str)
 }
 
 /// Initialises a fresh cursor instance around `connection`.
@@ -966,6 +1173,8 @@ fn init_cursor(cursor: i64, connection: i64, state: &'static ConnectionState) ->
     set_cursor_attr(cursor, "rowcount", ops::int_result(-1));
     set_cursor_attr(cursor, "lastrowid", NONE);
     set_cursor_attr(cursor, "arraysize", ops::int_result(1));
+    let row_factory = value::instance_attr(connection, "row_factory").unwrap_or(NONE);
+    set_cursor_attr(cursor, "row_factory", row_factory);
     session.cursors.push(pointer);
     Ok(())
 }
@@ -1035,22 +1244,62 @@ fn prepare_statement(ops: &mut ConnOps, db: usize, sql: &str) -> Result<usize, i
 // Parameter binding
 // -------------------------------------------------------------------------
 
-/// Binds one Python value at the given 1-based index.
-fn bind_value(
+/// Exact-type adapter lookup (`register_adapter`), matching CPython's
+/// microprotocol registry keyed by `(type, PrepareProtocol)`.
+fn adapter_for(operand: i64) -> Option<i64> {
+    let adapters = adapters_dict();
+    let pairs = value::as_dict(adapters)?;
+    if let Some(class) = value::instance_class_value(operand) {
+        return pairs
+            .iter()
+            .find_map(|(key, adapter)| (*key == class).then_some(*adapter));
+    }
+    let token = operand_type_token(operand)?;
+    pairs.iter().find_map(|(key, adapter)| {
+        (value::builtin_type_token(*key) == Some(token)).then_some(*adapter)
+    })
+}
+
+/// Token of a non-instance operand's type, for adapter lookup on builtins.
+fn operand_type_token(operand: i64) -> Option<&'static str> {
+    if operand == TRUE || operand == FALSE {
+        return Some("bool");
+    }
+    if value::as_integer(operand).is_some() {
+        return Some("int");
+    }
+    if value::as_float(operand).is_some() {
+        return Some("float");
+    }
+    if value::as_str(operand).is_some() {
+        return Some("str");
+    }
+    if value::as_bytearray(operand).is_some() {
+        return Some("bytearray");
+    }
+    if value::as_bytes(operand).is_some() {
+        return Some("bytes");
+    }
+    None
+}
+
+/// Binds one of the storage classes `sqlite3_bind_*` accepts directly.
+/// Returns `None` when `operand` is not such a class.
+fn bind_scalar(
     database: *mut Sqlite3,
     statement: usize,
     index: c_int,
     operand: i64,
-) -> Result<(), i64> {
+) -> Option<Result<(), i64>> {
     let statement = statement as *mut Sqlite3Stmt;
     let status = if operand == NONE {
         // SAFETY: the statement handle is live for the duration of the call.
         unsafe { sqlite3_bind_null(statement, index) }
     } else if let Some(integer) = value::to_bigint(operand) {
         let Some(number) = integer.to_i64() else {
-            return Err(overflow_error(
+            return Some(Err(overflow_error(
                 "Python int too large to convert to SQLite INTEGER",
-            ));
+            )));
         };
         // SAFETY: as above.
         unsafe { sqlite3_bind_int64(statement, index, number) }
@@ -1059,7 +1308,7 @@ fn bind_value(
         unsafe { sqlite3_bind_double(statement, index, number) }
     } else if let Some(text) = value::as_str(operand) {
         let Ok(length) = c_int::try_from(text.len()) else {
-            return Err(overflow_error("string longer than INT_MAX bytes"));
+            return Some(Err(overflow_error("string longer than INT_MAX bytes")));
         };
         // SAFETY: `text` is valid UTF-8 of `length` bytes; `SQLITE_TRANSIENT`
         // makes SQLite copy it before the borrow ends.
@@ -1072,9 +1321,26 @@ fn bind_value(
                 transient(),
             )
         }
+    } else if let Some(view) = value::as_memoryview(operand) {
+        let Ok(bytes) = value::memoryview_bytes(view) else {
+            return Some(Err(value_error("operation forbidden on released memoryview object")));
+        };
+        let Ok(length) = c_int::try_from(bytes.len()) else {
+            return Some(Err(overflow_error("BLOB longer than INT_MAX bytes")));
+        };
+        // SAFETY: the buffer is alive; SQLite copies it.
+        unsafe {
+            sqlite3_bind_blob(
+                statement,
+                index,
+                bytes.as_ptr() as *const c_void,
+                length,
+                transient(),
+            )
+        }
     } else if let Some(bytes) = value::as_bytes(operand) {
         let Ok(length) = c_int::try_from(bytes.len()) else {
-            return Err(overflow_error("BLOB longer than INT_MAX bytes"));
+            return Some(Err(overflow_error("BLOB longer than INT_MAX bytes")));
         };
         // SAFETY: as above; SQLite copies the buffer.
         unsafe {
@@ -1087,15 +1353,61 @@ fn bind_value(
             )
         }
     } else {
-        return Err(programming_error(&format!(
-            "Error binding parameter {index}: type '{}' is not supported",
-            value::type_name(operand)
-        )));
+        return None;
     };
     if status != SQLITE_OK {
-        return Err(raise_db_error(database));
+        return Some(Err(raise_db_error(database)));
     }
-    Ok(())
+    Some(Ok(()))
+}
+
+/// Binds one Python value at the given 1-based index, adapting custom objects
+/// through the registered adapters.
+fn bind_value(
+    database: *mut Sqlite3,
+    statement: usize,
+    index: c_int,
+    operand: i64,
+) -> Result<(), i64> {
+    if let Some(result) = bind_scalar(database, statement, index, operand) {
+        return result;
+    }
+    // A registered adapter (or `__conform__`) turns the object into a
+    // supported storage class; the result is bound without re-adapting.
+    if let Some(adapter) = adapter_for(operand) {
+        let adapted = crate::builtins::call(adapter, 1, &operand as *const i64);
+        if exc::pending() {
+            return Err(NONE);
+        }
+        if let Some(result) = bind_scalar(database, statement, index, adapted) {
+            return result;
+        }
+        return Err(programming_error(&format!(
+            "Error binding parameter {index}: type '{}' is not supported",
+            value::type_name(adapted)
+        )));
+    }
+    // `__conform__(PrepareProtocol)` is the last protocol hook.
+    if value::as_instance(operand).is_some() {
+        let protocol = prepare_protocol_class();
+        let conform = crate::core::methods::call(
+            operand,
+            b"__conform__".as_ptr(),
+            b"__conform__".len(),
+            1,
+            &protocol as *const i64,
+        );
+        if !exc::pending() && conform != NONE {
+            if let Some(result) = bind_scalar(database, statement, index, conform) {
+                return result;
+            }
+        }
+        exc::clear();
+    }
+    Err(programming_error(&format!(
+        "Error binding parameter {index}: type '{}' is not supported",
+        value::type_name(operand)
+    )))
 }
 
 /// Reads the name of the 1-based parameter, if SQLite assigned one.
@@ -1229,8 +1541,136 @@ fn column_name(statement: *mut Sqlite3Stmt, index: c_int) -> String {
     c_message(pointer)
 }
 
+/// `sqlite3_column_decltype` for the 1-based column, if SQLite reports one.
+fn column_decltype(statement: *mut Sqlite3Stmt, index: c_int) -> Option<String> {
+    // SAFETY: the statement is live for the duration of the call.
+    let pointer = unsafe { sqlite3_column_decltype(statement, index) };
+    if pointer.is_null() {
+        return None;
+    }
+    Some(c_message(pointer))
+}
+
+/// The descriptor name CPython reports: with `PARSE_COLNAMES`, everything
+/// before the last `[typename]` marker is the column name.
+fn description_name(statement: *mut Sqlite3Stmt, index: c_int, detect_types: i64) -> String {
+    let name = column_name(statement, index);
+    if detect_types & PARSE_COLNAMES == 0 {
+        return name;
+    }
+    let bytes = name.as_bytes();
+    let mut end = bytes.len();
+    if let Some(mut position) = bytes.iter().position(|byte| *byte == b'[') {
+        if position != 0 && bytes[position - 1] == b' ' {
+            position -= 1;
+        }
+        end = position;
+    }
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Look up `key` (case-insensitively, as CPython upper-cases the name) in a
+/// registry-backed dict of converters.
+fn dict_lookup(dict: i64, key: &str) -> Option<i64> {
+    let pairs = value::as_dict(dict)?;
+    let upper = key.to_uppercase();
+    pairs.iter().find_map(|(name, callable)| {
+        value::as_str(*name)
+            .filter(|candidate| *candidate == upper)
+            .map(|_| *callable)
+    })
+}
+
+/// The converter selected for one column, mirroring CPython's row cast map.
+fn column_converter(
+    statement: *mut Sqlite3Stmt,
+    index: c_int,
+    detect_types: i64,
+    converters: i64,
+) -> Option<i64> {
+    if detect_types & PARSE_COLNAMES != 0 {
+        let name = column_name(statement, index);
+        if let Some(start) = name.find('[') {
+            if let Some(end) = name[start + 1..].find(']') {
+                let typename = &name[start + 1..start + 1 + end];
+                if let Some(converter) = dict_lookup(converters, typename) {
+                    return Some(converter);
+                }
+            }
+        }
+    }
+    if detect_types & PARSE_DECLTYPES != 0 {
+        if let Some(decltype) = column_decltype(statement, index) {
+            let end = decltype
+                .find(|character| character == ' ' || character == '(')
+                .unwrap_or(decltype.len());
+            if let Some(converter) = dict_lookup(converters, &decltype[..end]) {
+                return Some(converter);
+            }
+        }
+    }
+    None
+}
+
+/// Every non-NULL value as a Python `bytes` (what converters receive).
+fn column_bytes(statement: *mut Sqlite3Stmt, index: c_int) -> Vec<u8> {
+    // SAFETY: `sqlite3_column_bytes` is called after `column_blob`.
+    let pointer = unsafe { sqlite3_column_blob(statement, index) } as *const u8;
+    let length = unsafe { sqlite3_column_bytes(statement, index) };
+    slice_bytes(pointer, length).to_vec()
+}
+
+/// Applies a registered converter to a column value.
+fn converted_column(
+    statement: *mut Sqlite3Stmt,
+    index: c_int,
+    converter: i64,
+) -> Result<i64, i64> {
+    // SAFETY: the statement is live and positioned on a row.
+    let kind = unsafe { sqlite3_column_type(statement, index) };
+    if kind == SQLITE_NULL {
+        return Ok(NONE);
+    }
+    let bytes = value::bytes_new(column_bytes(statement, index));
+    let roots = heap::root_values(&[bytes]);
+    let converted = crate::builtins::call(converter, 1, &bytes as *const i64);
+    heap::release_roots(roots);
+    if exc::pending() {
+        // CPython lets a converter exception escape from fetch*().
+        return Err(NONE);
+    }
+    Ok(converted)
+}
+
+/// How the connection's `text_factory` turns TEXT bytes into a Python value.
+enum TextFactory {
+    Str,
+    Bytes,
+    ByteArray,
+    Callable(i64),
+}
+
+fn text_factory_kind(factory: i64) -> TextFactory {
+    if factory == NONE || value::builtin_type_token(factory) == Some("str") {
+        return TextFactory::Str;
+    }
+    match value::builtin_type_token(factory) {
+        Some("bytes") => TextFactory::Bytes,
+        Some("bytearray") => TextFactory::ByteArray,
+        _ => TextFactory::Callable(factory),
+    }
+}
+
 /// Converts one result column into a Hydro value.
-fn column_value(statement: *mut Sqlite3Stmt, index: c_int) -> Result<i64, i64> {
+fn column_value(
+    statement: *mut Sqlite3Stmt,
+    index: c_int,
+    converter: Option<i64>,
+    text_factory: i64,
+) -> Result<i64, i64> {
+    if let Some(converter) = converter {
+        return converted_column(statement, index, converter);
+    }
     // SAFETY: the statement is live and positioned on a row.
     let kind = unsafe { sqlite3_column_type(statement, index) };
     match kind {
@@ -1248,16 +1688,27 @@ fn column_value(statement: *mut Sqlite3Stmt, index: c_int) -> Result<i64, i64> {
             let pointer = unsafe { sqlite3_column_text(statement, index) };
             let length = unsafe { sqlite3_column_bytes(statement, index) };
             let bytes = slice_bytes(pointer, length);
-            match std::str::from_utf8(bytes) {
-                Ok(text) => Ok(value::str_alloc(text.to_string())),
-                Err(_) => Err(sqlite_error(
-                    "OperationalError",
-                    &format!(
-                        "Could not decode to UTF-8 column '{}' with text '{}'",
-                        column_name(statement, index),
-                        String::from_utf8_lossy(bytes)
-                    ),
-                )),
+            match text_factory_kind(text_factory) {
+                TextFactory::Str => match std::str::from_utf8(bytes) {
+                    Ok(text) => Ok(value::str_alloc(text.to_string())),
+                    Err(_) => Err(sqlite_error(
+                        "OperationalError",
+                        &format!(
+                            "Could not decode to UTF-8 column '{}' with text '{}'",
+                            column_name(statement, index),
+                            String::from_utf8_lossy(bytes)
+                        ),
+                    )),
+                },
+                TextFactory::Bytes => Ok(value::bytes_new(bytes.to_vec())),
+                TextFactory::ByteArray => Ok(value::bytearray_new(bytes.to_vec())),
+                TextFactory::Callable(factory) => {
+                    let argument = value::bytes_new(bytes.to_vec());
+                    let roots = heap::root_values(&[argument]);
+                    let converted = crate::builtins::call(factory, 1, &argument as *const i64);
+                    heap::release_roots(roots);
+                    Ok(converted)
+                }
             }
         }
         SQLITE_BLOB => {
@@ -1272,13 +1723,23 @@ fn column_value(statement: *mut Sqlite3Stmt, index: c_int) -> Result<i64, i64> {
 
 /// Builds a result row tuple, keeping every fresh element rooted while the
 /// next one is allocated.
-fn build_row(statement: *mut Sqlite3Stmt) -> Result<i64, i64> {
+fn build_row(statement: *mut Sqlite3Stmt, connection: i64) -> Result<i64, i64> {
     // SAFETY: the statement is live.
     let columns = unsafe { sqlite3_column_count(statement) }.max(0);
+    let detect_types = value::instance_attr(connection, "detect_types")
+        .and_then(value::as_integer)
+        .unwrap_or(0);
+    let text_factory = value::instance_attr(connection, "text_factory").unwrap_or_else(text_factory_default);
+    let converters = converters_dict();
     let roots = heap::root_values(&[]);
     let mut values = Vec::with_capacity(columns as usize);
     for index in 0..columns {
-        match column_value(statement, index) {
+        let converter = if detect_types == 0 {
+            None
+        } else {
+            column_converter(statement, index, detect_types, converters)
+        };
+        match column_value(statement, index, converter, text_factory) {
             Ok(value_arg) => {
                 heap::root_values(&[value_arg]);
                 values.push(value_arg);
@@ -1321,7 +1782,7 @@ fn changes(database: *mut Sqlite3) -> i64 {
 }
 
 /// Builds `cursor.description` from the prepared statement's columns.
-fn set_description(cursor: i64, statement: *mut Sqlite3Stmt) {
+fn set_description(cursor: i64, statement: *mut Sqlite3Stmt, detect_types: i64) {
     // SAFETY: the statement is live.
     let columns = unsafe { sqlite3_column_count(statement) }.max(0);
     if columns == 0 {
@@ -1330,7 +1791,7 @@ fn set_description(cursor: i64, statement: *mut Sqlite3Stmt) {
     let roots = heap::root_values(&[]);
     let mut descriptors = Vec::with_capacity(columns as usize);
     for index in 0..columns {
-        let name = value::str_alloc(column_name(statement, index));
+        let name = value::str_alloc(description_name(statement, index, detect_types));
         let descriptor = value::tuple_new(vec![name, NONE, NONE, NONE, NONE, NONE, NONE]);
         heap::root_values(&[descriptor]);
         descriptors.push(descriptor);
@@ -1348,6 +1809,9 @@ fn refresh_in_transaction(connection: i64, database: *mut Sqlite3) {
         "in_transaction",
         if autocommit { FALSE } else { TRUE },
     );
+    // SAFETY: the connection is live.
+    let total = unsafe { sqlite3_total_changes(database) };
+    set_cursor_attr(connection, "total_changes", ops::int_result(total as i64));
 }
 
 /// Finalizes the cursor's current statement in place.
@@ -1399,7 +1863,12 @@ fn run_execute(
         }
     };
     let database = session.db as *mut Sqlite3;
-    if dml && level.is_some() && unsafe { sqlite3_get_autocommit(database) } != 0 {
+    let autocommit = connection_integer(connection, "autocommit", AUTOCOMMIT_LEGACY);
+    if autocommit == AUTOCOMMIT_LEGACY
+        && dml
+        && level.is_some()
+        && unsafe { sqlite3_get_autocommit(database) } != 0
+    {
         if let Err(error) = exec_sql(database, &format!("BEGIN {}", level.unwrap_or_default())) {
             finish_statement(cursor, &mut session);
             set_rowcount(cursor_value, -1);
@@ -1418,10 +1887,12 @@ fn run_execute(
     match status {
         SQLITE_ROW => {
             cursor.at_row.set(true);
-            set_description(cursor_value, statement as *mut Sqlite3Stmt);
+            let detect_types = connection_integer(connection, "detect_types", 0);
+            set_description(cursor_value, statement as *mut Sqlite3Stmt, detect_types);
         }
         SQLITE_DONE => {
-            set_description(cursor_value, statement as *mut Sqlite3Stmt);
+            let detect_types = connection_integer(connection, "detect_types", 0);
+            set_description(cursor_value, statement as *mut Sqlite3Stmt, detect_types);
             if dml {
                 set_rowcount(cursor_value, changes(database));
             }
@@ -1468,7 +1939,11 @@ fn cursor_execute(args: &[i64]) -> i64 {
         return type_error("execute() argument 'sql' must be str");
     };
     let sql = sql.to_string();
-    let parameters = args.get(2).copied();
+    let parameters = if is_omitted(args.get(2)) {
+        None
+    } else {
+        args.get(2).copied()
+    };
     let Some(cursor) = cursor_state(cursor_value) else {
         return programming_error("Base Cursor.__init__ not called.");
     };
@@ -1586,7 +2061,8 @@ fn fetch_one(cursor_value: i64, cursor: &'static CursorState, session: &mut Conn
         return NONE;
     }
     let handle = statement as *mut Sqlite3Stmt;
-    let row = match build_row(handle) {
+    let connection = value::instance_attr(cursor_value, "connection").unwrap_or(NONE);
+    let row = match build_row(handle, connection) {
         Ok(row) => row,
         Err(error) => {
             finish_statement(cursor, session);
@@ -1614,6 +2090,17 @@ fn fetch_one(cursor_value: i64, cursor: &'static CursorState, session: &mut Conn
             heap::release_roots(row_roots);
             return error;
         }
+    }
+    // `row_factory(cursor, row)` runs after the statement advanced, exactly
+    // like CPython's `pysqlite_cursor_iternext`.
+    let factory = value::instance_attr(cursor_value, "row_factory").unwrap_or(NONE);
+    if factory != NONE {
+        let arguments = [cursor_value, row];
+        let roots = heap::root_values(&arguments);
+        let produced = crate::builtins::call(factory, 2, arguments.as_ptr());
+        heap::release_roots(roots);
+        heap::release_roots(row_roots);
+        return produced;
     }
     heap::release_roots(row_roots);
     row

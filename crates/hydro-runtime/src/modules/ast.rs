@@ -1167,6 +1167,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "literal_eval" => literal_eval(args.first().copied().unwrap_or(NONE)),
         "parse" => parse_source(args, &[]),
         "unparse" => unparse(args),
+        "walk" => walk(args),
+        "copy_location" => copy_location(args),
         "fix_missing_locations" => fix_missing_locations(args),
         "_node_visit" => match (args.first(), args.get(1)) {
             (Some(&visitor), Some(&node)) => visit_node(visitor, node),
@@ -2775,6 +2777,91 @@ fn generic_visit(visitor: i64, node: i64) -> i64 {
 
 fn type_error(message: &str) -> i64 {
     exc::raise_with_message(TYPE_ERROR, message)
+}
+
+/// `walk(node)`: every AST node in the tree, breadth-first from `node`.
+///
+/// Matches CPython's `deque`-based `ast.walk`: the root is yielded first and
+/// each node's children (field order, list elements in order) follow. Nodes
+/// reachable from the input are rooted while the result list grows.
+fn walk(args: &[i64]) -> i64 {
+    let result = value::list_new(Vec::new());
+    let roots = heap::root_values(&[result]);
+    let mut queue: Vec<i64> = vec![args.first().copied().unwrap_or(NONE)];
+    let mut cursor = 0usize;
+    while cursor < queue.len() {
+        let node = queue[cursor];
+        cursor += 1;
+        if !is_ast_instance(node) {
+            continue;
+        }
+        if let Some(mut items) = value::list_items_mut(result) {
+            items.push(node);
+            heap::write_barrier_edge(result, node);
+        }
+        let Some(name) = node_name(node) else {
+            continue;
+        };
+        let Some(spec) = NODE_SPECS.iter().find(|spec| spec.name == name) else {
+            continue;
+        };
+        for field_name in spec.fields {
+            let child = field(node, *field_name);
+            if child == NONE {
+                continue;
+            }
+            if is_ast_instance(child) {
+                queue.push(child);
+            } else if let Some(items) = value::as_list(child) {
+                for item in items {
+                    if is_ast_instance(*item) {
+                        queue.push(*item);
+                    }
+                }
+            }
+        }
+    }
+    heap::release_roots(roots);
+    result
+}
+
+/// `copy_location(new_node, old_node)`: copies the four position attributes
+/// (`lineno`, `col_offset`, `end_lineno`, `end_col_offset`) when present.
+fn copy_location(args: &[i64]) -> i64 {
+    let (Some(&new_node), Some(&old_node)) = (args.first(), args.get(1)) else {
+        return type_error("copy_location() requires two nodes");
+    };
+    if !is_ast_instance(new_node) || !is_ast_instance(old_node) {
+        return type_error("copy_location() arguments must be AST nodes");
+    }
+    for name in ["lineno", "col_offset", "end_lineno", "end_col_offset"] {
+        let current = field(old_node, name);
+        if current != NONE {
+            value::instance_setattr(new_node, name.to_string(), current);
+        }
+    }
+    new_node
+}
+
+/// `ast.PyCF_*` compiler flags, from `Include/cpython/compile.h`.
+pub(crate) fn constant(name: &str) -> i64 {
+    let raw: i64 = match name {
+        "PyCF_SOURCE_IS_UTF8" => 0x0100,
+        "PyCF_DONT_IMPLY_DEDENT" => 0x0200,
+        "PyCF_ONLY_AST" => 0x0400,
+        "PyCF_IGNORE_COOKIE" => 0x0800,
+        "PyCF_TYPE_COMMENTS" => 0x1000,
+        "PyCF_ALLOW_TOP_LEVEL_AWAIT" => 0x2000,
+        // `PyCF_OPTIMIZED_AST` is `PyCF_ONLY_AST | 0x8000`.
+        "PyCF_OPTIMIZED_AST" => 0x8400,
+        _ => {
+            return exc::raise_with_message(
+                exc::ATTRIBUTE_ERROR,
+                &format!("module 'ast' has no attribute '{name}'"),
+            )
+        }
+    };
+    value::encode_int(raw).unwrap_or(NONE)
 }
 
 /// `ast.literal_eval(text)`: evaluates a Python literal.

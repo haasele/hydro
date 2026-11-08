@@ -5,6 +5,7 @@
 //! `crate::ops`, ...) through re-exports in `lib.rs`.
 
 pub(crate) mod builtins;
+pub(crate) mod compile_runtime;
 pub(crate) mod container;
 pub(crate) mod exc;
 pub(crate) mod fiber;

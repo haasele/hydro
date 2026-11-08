@@ -353,7 +353,11 @@ fn blocking_error() -> i64 {
 }
 
 fn ssl_error(message: &str) -> i64 {
-    os_error(&format!("[SSL] {message}"))
+    raise_ssl_exception(
+        ssl_exception_class("SSLError"),
+        "SSLError",
+        &format!("[SSL] {message}"),
+    )
 }
 
 fn is_timeout(error: &io::Error) -> bool {
@@ -377,7 +381,20 @@ fn map_net_error(error: io::Error, timeout: Option<Duration>) -> i64 {
                 timeout_error()
             }
         }
-        _ => io_error(error),
+        _ => {
+            let text = error.to_string();
+            if text.contains("[SSL: CERTIFICATE_VERIFY_FAILED]") {
+                return ssl_certificate_error(&text);
+            }
+            if text.starts_with("[SSL] ") {
+                return raise_ssl_exception(
+                    ssl_exception_class("SSLError"),
+                    "SSLError",
+                    &text,
+                );
+            }
+            io_error(error)
+        }
     }
 }
 
@@ -1585,6 +1602,290 @@ fn inet_ntop(args: &[i64]) -> i64 {
     }
 }
 
+/// Converts a `str`/bytes argument to text for the address helpers.
+fn address_text(item: i64, function: &str) -> Result<String, i64> {
+    if let Some(text) = value::as_str(item) {
+        return Ok(text.to_string());
+    }
+    if let Some(bytes) = value::as_bytes(item) {
+        return Ok(String::from_utf8_lossy(bytes).into_owned());
+    }
+    Err(type_error(&format!(
+        "{function}() argument 1 must be str, not {}",
+        value::type_name(item)
+    )))
+}
+
+/// One dotted component of an `inet_aton(3)` address: decimal, `0x`/`0X`
+/// hexadecimal or leading-`0` octal, exactly the radices the C function
+/// accepts.
+fn ipv4_component(part: &str) -> Option<u64> {
+    if part.is_empty() {
+        return None;
+    }
+    let (digits, radix) = if let Some(rest) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        (rest, 16)
+    } else if part.len() > 1 && part.starts_with('0') {
+        (&part[1..], 8)
+    } else {
+        (part, 10)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(digits, radix).ok()
+}
+
+/// Parses the address forms `inet_aton(3)` accepts into four packed bytes.
+///
+/// `a`, `a.b`, `a.b.c` and `a.b.c.d` are the legal shapes, where the last
+/// component fills the remaining low-order bytes; trailing whitespace is
+/// ignored like the C implementation. `None` means the string is not an
+/// address.
+fn parse_ipv4_aton(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim_end();
+    if text.is_empty() {
+        return None;
+    }
+    let mut numbers: Vec<u64> = Vec::with_capacity(4);
+    for part in text.split('.') {
+        numbers.push(ipv4_component(part)?);
+    }
+    let packed = match numbers.as_slice() {
+        [a] if *a <= 0xFFFF_FFFF => *a,
+        [a, b] if *a <= 0xFF && *b <= 0x00FF_FFFF => (a << 24) | b,
+        [a, b, c] if *a <= 0xFF && *b <= 0xFF && *c <= 0xFFFF => (a << 24) | (b << 16) | c,
+        [a, b, c, d] if *a <= 0xFF && *b <= 0xFF && *c <= 0xFF && *d <= 0xFF => {
+            (a << 24) | (b << 16) | (c << 8) | d
+        }
+        _ => return None,
+    };
+    Some((packed as u32).to_be_bytes().to_vec())
+}
+
+/// `socket.inet_aton(ip_string)`: the 4-byte packed IPv4 address.
+///
+/// The conversion follows `inet_aton(3)`, so the short forms CPython accepts
+/// (`"1"`, `"127.1"`) parse identically. An address that does not parse is
+/// the `OSError` CPython raises.
+fn inet_aton(text: &str) -> i64 {
+    match parse_ipv4_aton(text) {
+        Some(bytes) => value::bytes_new(bytes),
+        None => os_error("illegal IP address string passed to inet_aton"),
+    }
+}
+
+/// `socket.inet_ntoa(packed_ip)`: the dotted-quad text of 4 packed bytes.
+fn inet_ntoa(packed: i64) -> i64 {
+    let Some(bytes) = value::as_bytes(packed) else {
+        return type_error(&format!(
+            "inet_ntoa() argument must be bytes-like, not {}",
+            value::type_name(packed)
+        ));
+    };
+    if bytes.len() != 4 {
+        return os_error("packed IP wrong length for inet_ntoa");
+    }
+    value::str_alloc(
+        Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string(),
+    )
+}
+
+/// Builds the `[address, ...]` list of a `gethostby*` result.
+fn host_address_list(addresses: &[String]) -> i64 {
+    let list = value::list_new(Vec::new());
+    let root = heap::root_values(std::slice::from_ref(&list));
+    for address in addresses {
+        let item = value::str_alloc(address.clone());
+        let item_root = heap::root_values(std::slice::from_ref(&item));
+        crate::container::list_append(list, item);
+        heap::release_roots(item_root);
+    }
+    heap::release_roots(root);
+    list
+}
+
+/// Builds `(hostname, aliases, addresses)` with both lists rooted.
+fn host_entry(name: &str, addresses: &[String]) -> i64 {
+    let address_list = host_address_list(addresses);
+    let alias_list = value::list_new(Vec::new());
+    let root = heap::root_values(&[address_list, alias_list]);
+    let entry = value::tuple_new(vec![
+        value::str_alloc(name.to_string()),
+        alias_list,
+        address_list,
+    ]);
+    heap::release_roots(root);
+    entry
+}
+
+/// `socket.gethostbyname_ex(host)`: `(hostname, aliases, IPv4 addresses)`.
+///
+/// The resolver's alias list is not exposed by `getaddrinfo`, so `aliases` is
+/// empty and the canonical name comes from the reverse lookup, exactly like
+/// `getfqdn`'s fallback.
+fn gethostbyname_ex(host: &str) -> i64 {
+    let addrs = match resolve(host, 0, AF_INET) {
+        Ok(addrs) => addrs,
+        Err(_) => return os_error("[Errno -2] Name or service not known"),
+    };
+    let mut addresses: Vec<String> = Vec::new();
+    for addr in &addrs {
+        let text = addr.ip().to_string();
+        if !addresses.contains(&text) {
+            addresses.push(text);
+        }
+    }
+    if addresses.is_empty() {
+        return os_error("[Errno -2] Name or service not known");
+    }
+    let canonical = reverse_lookup(&addresses[0]).unwrap_or_else(|| host.to_string());
+    host_entry(&canonical, &addresses)
+}
+
+/// `socket.gethostbyaddr(host)`: reverse lookup of an IPv4/IPv6 address.
+fn gethostbyaddr(host: &str) -> i64 {
+    let addrs = match resolve(host, 0, AF_UNSPEC) {
+        Ok(addrs) => addrs,
+        Err(_) => return os_error("[Errno 1] Unknown host"),
+    };
+    let mut addresses: Vec<String> = Vec::new();
+    for addr in &addrs {
+        let text = addr.ip().to_string();
+        if !addresses.contains(&text) {
+            addresses.push(text);
+        }
+    }
+    if addresses.is_empty() {
+        return os_error("[Errno 1] Unknown host");
+    }
+    let numeric = addresses[0].as_str();
+    let canonical = match reverse_lookup(numeric) {
+        Some(name) => name,
+        // `NI_NAMEREQD` semantics: a purely numeric answer means the address
+        // has no PTR record, which CPython reports as `herror`.
+        None => return os_error("[Errno 1] Unknown host"),
+    };
+    host_entry(&canonical, &addresses)
+}
+
+/// Reads the optional `protocolname` of `getservbyname`/`getservbyport`.
+#[cfg(unix)]
+fn service_protocol(item: Option<&i64>) -> Result<Option<std::ffi::CString>, i64> {
+    match item {
+        Some(&value) if value != NONE => match value::as_str(value) {
+            Some(text) => std::ffi::CString::new(text)
+                .map(Some)
+                .map_err(|_| os_error("[Errno 22] Invalid argument")),
+            None => Err(type_error(&format!(
+                "protocolname must be str or None, not {}",
+                value::type_name(value)
+            ))),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// `socket.getservbyname(servicename, protocolname=None)`.
+fn getservbyname(service: &str, protocol: Option<&i64>) -> i64 {
+    #[cfg(unix)]
+    {
+        let Ok(name) = std::ffi::CString::new(service) else {
+            return os_error("[Errno 22] Invalid argument");
+        };
+        let proto = match service_protocol(protocol) {
+            Ok(proto) => proto,
+            Err(err) => return err,
+        };
+        let proto_ptr = proto
+            .as_ref()
+            .map(|text| text.as_ptr())
+            .unwrap_or(std::ptr::null());
+        heap::blocking_enter();
+        // SAFETY: both pointers are valid NUL-terminated strings (or null).
+        let entry = unsafe { libc::getservbyname(name.as_ptr(), proto_ptr) };
+        heap::blocking_leave();
+        if entry.is_null() {
+            return os_error("[Errno 2] Servname not supported for ai_socktype");
+        }
+        // SAFETY: a non-null answer points at a static `servent`.
+        let port = unsafe { (*entry).s_port };
+        // `s_port` is a network-order integer in an `int`.
+        encode_int(u16::from_be(port as u16) as i64)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (service, protocol);
+        os_error("[Errno 2] Servname not supported for ai_socktype")
+    }
+}
+
+/// `socket.getservbyport(port, protocolname=None)`.
+fn getservbyport(port: i64, protocol: Option<&i64>) -> i64 {
+    if !(0..=65535).contains(&port) {
+        return exc::raise_with_message(
+            exc::OVERFLOW_ERROR,
+            "getservbyport: port must be 0-65535",
+        );
+    }
+    #[cfg(unix)]
+    {
+        let proto = match service_protocol(protocol) {
+            Ok(proto) => proto,
+            Err(err) => return err,
+        };
+        let proto_ptr = proto
+            .as_ref()
+            .map(|text| text.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let network_port = (port as u16).to_be() as libc::c_int;
+        heap::blocking_enter();
+        // SAFETY: the port is in network byte order and `proto_ptr` is a
+        // valid NUL-terminated string (or null).
+        let entry = unsafe { libc::getservbyport(network_port, proto_ptr) };
+        heap::blocking_leave();
+        if entry.is_null() {
+            return os_error("[Errno 2] Servname not supported for ai_socktype");
+        }
+        // SAFETY: a non-null answer points at a static `servent`.
+        let name = unsafe { (*entry).s_name };
+        if name.is_null() {
+            return os_error("[Errno 2] Servname not supported for ai_socktype");
+        }
+        // SAFETY: `s_name` is a NUL-terminated C string.
+        let name = unsafe { std::ffi::CStr::from_ptr(name) };
+        value::str_alloc(name.to_string_lossy().into_owned())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = protocol;
+        os_error("[Errno 2] Servname not supported for ai_socktype")
+    }
+}
+
+/// `socket.sethostname(name)`: the real `sethostname(2)`.
+fn sethostname(name: &[u8]) -> i64 {
+    #[cfg(unix)]
+    {
+        heap::blocking_enter();
+        // SAFETY: `name` is a valid byte slice of the given length and is not
+        // retained by the kernel after the call.
+        let result = unsafe {
+            libc::sethostname(name.as_ptr() as *const libc::c_char, name.len() as libc::size_t)
+        };
+        heap::blocking_leave();
+        if result == 0 {
+            return NONE;
+        }
+        io_error(io::Error::last_os_error())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = name;
+        os_error("[Errno 95] Operation not supported")
+    }
+}
+
 /// Module-level function dispatch shared by `socket` and `_socket`.
 pub(crate) fn call(module: &str, function: &str, args: &[i64]) -> i64 {
     match function {
@@ -1615,6 +1916,68 @@ pub(crate) fn call(module: &str, function: &str, args: &[i64]) -> i64 {
         },
         "inet_pton" => inet_pton(args),
         "inet_ntop" => inet_ntop(args),
+        "inet_aton" => {
+            match address_text(args.first().copied().unwrap_or(NONE), "inet_aton") {
+                Ok(text) => inet_aton(&text),
+                Err(err) => err,
+            }
+        }
+        "inet_ntoa" => match args.first() {
+            Some(&packed) => inet_ntoa(packed),
+            None => type_error("inet_ntoa() missing required argument 'packed_ip'"),
+        },
+        "gethostbyname_ex" => {
+            match address_text(
+                args.first().copied().unwrap_or(NONE),
+                "gethostbyname_ex",
+            ) {
+                Ok(host) => gethostbyname_ex(&host),
+                Err(err) => err,
+            }
+        }
+        "gethostbyaddr" => {
+            match address_text(args.first().copied().unwrap_or(NONE), "gethostbyaddr") {
+                Ok(host) => gethostbyaddr(&host),
+                Err(err) => err,
+            }
+        }
+        "getservbyname" => {
+            let Some(service) = args.first().and_then(|&v| value::as_str(v)) else {
+                return type_error(&format!(
+                    "getservbyname() argument 1 must be str, not {}",
+                    value::type_name(args.first().copied().unwrap_or(NONE))
+                ));
+            };
+            let service = service.to_string();
+            getservbyname(&service, args.get(1))
+        }
+        "getservbyport" => {
+            let Some(port) = args.first().and_then(|&v| value::as_integer(v)) else {
+                return type_error(&format!(
+                    "getservbyport() argument 1 must be int, not {}",
+                    value::type_name(args.first().copied().unwrap_or(NONE))
+                ));
+            };
+            getservbyport(port, args.get(1))
+        }
+        "sethostname" => {
+            let name = match args.first() {
+                Some(&item) => {
+                    if let Some(text) = value::as_str(item) {
+                        text.as_bytes().to_vec()
+                    } else if let Some(bytes) = value::as_bytes(item) {
+                        bytes.to_vec()
+                    } else {
+                        return type_error(&format!(
+                            "sethostname() argument 1 must be str or bytes, not {}",
+                            value::type_name(item)
+                        ));
+                    }
+                }
+                None => return type_error("sethostname() missing required argument 'name'"),
+            };
+            sethostname(&name)
+        }
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module '{module}' has no attribute '{function}'"),
@@ -2072,6 +2435,12 @@ pub(crate) fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
             }
             detach(state)
         }
+        "makefile" => {
+            if let Some(err) = arity(name, args, 0, 5) {
+                return err;
+            }
+            makefile(obj, args)
+        }
         "dup" => {
             if let Some(err) = arity(name, args, 0, 0) {
                 return err;
@@ -2107,6 +2476,905 @@ pub(crate) fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
             &format!("'socket' object has no attribute '{name}'"),
         ),
     }
+}
+
+// -------------------------------------------------------------------------
+// `socket.makefile()`: buffered binary and text streams
+// -------------------------------------------------------------------------
+//
+// CPython's `socket.socket.makefile` layers `io.BufferedReader`/
+// `BufferedWriter`/`TextIOWrapper` over a `SocketIO` raw object. The runtime
+// has no composable raw-object protocol, so `SocketIO` itself carries the
+// buffering and (for text mode) the codec state. Reads and writes go through
+// the socket object's `recv`/`sendall`, which keeps timeouts, non-blocking
+// semantics and the native TLS session exactly as the socket surface defines
+// them. Closing the stream never closes the socket, matching CPython's
+// `_io_refs` accounting.
+
+/// `io.DEFAULT_BUFFER_SIZE`.
+const SOCKETIO_DEFAULT_BUFFER: i64 = 8192;
+
+fn sock_text(text: &str) -> i64 {
+    value::str_alloc(text.to_string())
+}
+
+fn sio_attr(instance: i64, name: &str) -> i64 {
+    value::instance_attr(instance, name).unwrap_or(NONE)
+}
+
+fn sio_set(instance: i64, name: &str, item: i64) {
+    let root = heap::root_values(std::slice::from_ref(&item));
+    value::instance_setattr(instance, name.to_string(), item);
+    heap::release_roots(root);
+}
+
+fn sio_flag(instance: i64, name: &str) -> bool {
+    value::truthy(sio_attr(instance, name))
+}
+
+fn sio_int(instance: i64, name: &str, default: i64) -> i64 {
+    value::as_integer(sio_attr(instance, name)).unwrap_or(default)
+}
+
+fn sio_buffer(instance: i64, name: &str) -> Vec<u8> {
+    value::as_bytes(sio_attr(instance, name))
+        .map(|bytes| bytes.to_vec())
+        .unwrap_or_default()
+}
+
+fn sio_store_buffer(instance: i64, name: &str, data: &[u8]) {
+    sio_set(instance, name, value::bytes_new(data.to_vec()));
+}
+
+fn sio_closed(instance: i64) -> bool {
+    sio_flag(instance, "_closed")
+}
+
+/// Raises CPython's closed-file error; `Some(err)` means the raised value.
+fn sio_require_open(instance: i64) -> Option<i64> {
+    if sio_closed(instance) {
+        return Some(value_error("I/O operation on closed file"));
+    }
+    None
+}
+
+/// `SocketIO.read` at the socket: one `recv` of at most `amount` bytes.
+fn sio_recv(instance: i64, amount: usize) -> Result<Vec<u8>, i64> {
+    let sock = sio_attr(instance, "_sock");
+    if sock == NONE {
+        return Err(descriptor_error());
+    }
+    let argument = encode_int(amount as i64);
+    let root = heap::root_values(&[sock, argument]);
+    let result = crate::methods::call(sock, b"recv".as_ptr(), 4, 1, &argument as *const i64);
+    heap::release_roots(root);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    Ok(value::as_bytes(result)
+        .map(|bytes| bytes.to_vec())
+        .unwrap_or_default())
+}
+
+/// `sendall` of one fully encoded write.
+fn sio_send_raw(instance: i64, data: &[u8]) -> i64 {
+    let sock = sio_attr(instance, "_sock");
+    if sock == NONE {
+        return descriptor_error();
+    }
+    let payload = value::bytes_new(data.to_vec());
+    let root = heap::root_values(&[sock, payload]);
+    let result = crate::methods::call(sock, b"sendall".as_ptr(), 7, 1, &payload as *const i64);
+    heap::release_roots(root);
+    if exc::pending() {
+        return NONE;
+    }
+    result
+}
+
+/// Binary read with buffering: `read(n)` returns exactly `n` bytes unless the
+/// stream ends first, `read()` drains to EOF.
+fn sio_read_binary(instance: i64, n: i64) -> Result<Vec<u8>, i64> {
+    if let Some(err) = sio_require_open(instance) {
+        return Err(err);
+    }
+    if !sio_flag(instance, "_readable") {
+        return Err(value_error("read"));
+    }
+    let mut data = sio_buffer(instance, "_rbuf");
+    if n < 0 {
+        sio_store_buffer(instance, "_rbuf", &[]);
+        loop {
+            let chunk = sio_recv(instance, SOCKETIO_DEFAULT_BUFFER as usize)?;
+            if chunk.is_empty() {
+                break;
+            }
+            data.extend_from_slice(&chunk);
+        }
+        return Ok(data);
+    }
+    let want = n as usize;
+    while data.len() < want {
+        let chunk = sio_recv(instance, (want - data.len()).max(1))?;
+        if chunk.is_empty() {
+            break;
+        }
+        data.extend_from_slice(&chunk);
+    }
+    let rest = if data.len() > want {
+        data.split_off(want)
+    } else {
+        Vec::new()
+    };
+    sio_store_buffer(instance, "_rbuf", &rest);
+    Ok(data)
+}
+
+fn sio_readline_binary(instance: i64, limit: i64) -> Result<Vec<u8>, i64> {
+    if let Some(err) = sio_require_open(instance) {
+        return Err(err);
+    }
+    if !sio_flag(instance, "_readable") {
+        return Err(value_error("readline"));
+    }
+    let mut data = sio_buffer(instance, "_rbuf");
+    loop {
+        if data.iter().any(|byte| *byte == b'\n') {
+            break;
+        }
+        if limit >= 0 && data.len() as i64 >= limit {
+            break;
+        }
+        let want = if limit < 0 {
+            SOCKETIO_DEFAULT_BUFFER
+        } else {
+            (limit - data.len() as i64).clamp(1, SOCKETIO_DEFAULT_BUFFER)
+        };
+        let chunk = sio_recv(instance, want as usize)?;
+        if chunk.is_empty() {
+            break;
+        }
+        data.extend_from_slice(&chunk);
+    }
+    let mut end = data
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .unwrap_or(data.len());
+    if limit >= 0 && end as i64 > limit {
+        end = limit.max(0) as usize;
+    }
+    let rest = data.split_off(end.min(data.len()));
+    sio_store_buffer(instance, "_rbuf", &rest);
+    Ok(data)
+}
+
+fn sio_read1_binary(instance: i64, n: i64) -> Result<Vec<u8>, i64> {
+    if let Some(err) = sio_require_open(instance) {
+        return Err(err);
+    }
+    if !sio_flag(instance, "_readable") {
+        return Err(value_error("read1"));
+    }
+    let mut data = sio_buffer(instance, "_rbuf");
+    if !data.is_empty() {
+        let take = if n < 0 {
+            data.len()
+        } else {
+            (n as usize).min(data.len())
+        };
+        let rest = data.split_off(take);
+        sio_store_buffer(instance, "_rbuf", &rest);
+        return Ok(data);
+    }
+    let want = if n < 0 { SOCKETIO_DEFAULT_BUFFER } else { n };
+    sio_recv(instance, want.max(1) as usize)
+}
+
+/// `peek(n)`: fill the read buffer and return it without consuming.
+fn sio_peek(instance: i64, n: i64) -> Result<Vec<u8>, i64> {
+    if let Some(err) = sio_require_open(instance) {
+        return Err(err);
+    }
+    if !sio_flag(instance, "_readable") {
+        return Err(value_error("peek"));
+    }
+    let mut data = sio_buffer(instance, "_rbuf");
+    if data.is_empty() {
+        let want = if n < 0 { SOCKETIO_DEFAULT_BUFFER } else { n };
+        if want > 0 {
+            let chunk = sio_recv(instance, want as usize)?;
+            data.extend_from_slice(&chunk);
+            sio_store_buffer(instance, "_rbuf", &data);
+        }
+    }
+    Ok(data)
+}
+
+/// Writable length of a `bytearray` or `memoryview` buffer.
+fn sio_writable_len(buffer: i64) -> Option<usize> {
+    if let Some(bytes) = value::as_bytearray(buffer) {
+        return Some(bytes.len());
+    }
+    if let Some(state) = value::as_memoryview(buffer) {
+        if state.released || state.readonly {
+            return None;
+        }
+        return Some(state.len());
+    }
+    None
+}
+
+/// Copies `data` into a writable buffer, returning the byte count.
+fn sio_write_buffer(buffer: i64, data: &[u8]) -> usize {
+    if let Some(bytes) = value::bytearray_bytes_mut(buffer) {
+        let count = data.len().min(bytes.len());
+        bytes[..count].copy_from_slice(&data[..count]);
+        return count;
+    }
+    let Some(state) = value::as_memoryview(buffer) else {
+        return 0;
+    };
+    if state.released || state.readonly {
+        return 0;
+    }
+    let count = state.len().min(data.len());
+    let offset = state.offset as isize;
+    let stride = state.stride;
+    let exporter = state.buffer;
+    let Some(bytes) = value::bytearray_bytes_mut(exporter) else {
+        return 0;
+    };
+    let mut written = 0;
+    #[allow(clippy::needless_range_loop)]
+    for index in 0..count {
+        let at = offset + stride * index as isize;
+        if at < 0 || at as usize >= bytes.len() {
+            break;
+        }
+        bytes[at as usize] = data[index];
+        written += 1;
+    }
+    written
+}
+
+/// Encodes text for this stream with its `encoding`/`errors` attributes.
+fn sio_encode_text(instance: i64, text: &str) -> Result<Vec<u8>, i64> {
+    let object = sock_text(text);
+    let root = heap::root_values(std::slice::from_ref(&object));
+    let encoding = sio_attr(instance, "_encoding");
+    let errors = sio_attr(instance, "_errors");
+    let mut arguments: Vec<i64> = Vec::new();
+    if encoding != NONE {
+        arguments.push(encoding);
+    }
+    if errors != NONE {
+        if arguments.is_empty() {
+            arguments.push(sock_text("utf-8"));
+        }
+        arguments.push(errors);
+    }
+    let arguments_root = heap::root_values(&arguments);
+    let result = if arguments.is_empty() {
+        crate::methods::call(object, b"encode".as_ptr(), 6, 0, std::ptr::null())
+    } else {
+        crate::methods::call(
+            object,
+            b"encode".as_ptr(),
+            6,
+            arguments.len(),
+            arguments.as_ptr(),
+        )
+    };
+    heap::release_roots(arguments_root);
+    heap::release_roots(root);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    Ok(value::as_bytes(result)
+        .map(|bytes| bytes.to_vec())
+        .unwrap_or_default())
+}
+
+/// Decodes bytes with this stream's `encoding`/`errors` attributes.
+fn sio_decode_text(instance: i64, data: &[u8]) -> Result<String, i64> {
+    let object = value::bytes_new(data.to_vec());
+    let root = heap::root_values(std::slice::from_ref(&object));
+    let encoding = sio_attr(instance, "_encoding");
+    let errors = sio_attr(instance, "_errors");
+    let mut arguments: Vec<i64> = Vec::new();
+    if encoding != NONE {
+        arguments.push(encoding);
+    }
+    if errors != NONE {
+        if arguments.is_empty() {
+            arguments.push(sock_text("utf-8"));
+        }
+        arguments.push(errors);
+    }
+    let arguments_root = heap::root_values(&arguments);
+    let result = if arguments.is_empty() {
+        crate::methods::call(object, b"decode".as_ptr(), 6, 0, std::ptr::null())
+    } else {
+        crate::methods::call(
+            object,
+            b"decode".as_ptr(),
+            6,
+            arguments.len(),
+            arguments.as_ptr(),
+        )
+    };
+    heap::release_roots(arguments_root);
+    heap::release_roots(root);
+    if exc::pending() {
+        return Err(NONE);
+    }
+    Ok(value::as_str(result).map(str::to_string).unwrap_or_default())
+}
+
+/// Universal-newline translation for text reads (`newline=None` only).
+fn sio_read_newlines(instance: i64, text: String) -> String {
+    if sio_attr(instance, "_newline") != NONE {
+        return text;
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Write-side newline translation for text streams.
+fn sio_write_newlines(instance: i64, text: &str) -> String {
+    match value::as_str(sio_attr(instance, "_newline")) {
+        Some("\r") => text.replace('\n', "\r"),
+        Some("\r\n") => text.replace('\n', "\r\n"),
+        // `None` translates to `os.linesep`, which is `"\n"` on this target;
+        // `""` and `"\n"` disable translation.
+        _ => text.to_string(),
+    }
+}
+
+fn sio_text_read(instance: i64, n: i64) -> i64 {
+    let data = match sio_read_binary(instance, n) {
+        Ok(data) => data,
+        Err(err) => return err,
+    };
+    match sio_decode_text(instance, &data) {
+        Ok(text) => sock_text(&sio_read_newlines(instance, text)),
+        Err(err) => err,
+    }
+}
+
+fn sio_text_readline(instance: i64, limit: i64) -> i64 {
+    let data = match sio_readline_binary(instance, limit) {
+        Ok(data) => data,
+        Err(err) => return err,
+    };
+    match sio_decode_text(instance, &data) {
+        Ok(text) => sock_text(&sio_read_newlines(instance, text)),
+        Err(err) => err,
+    }
+}
+
+fn sio_write_bytes(instance: i64, payload: &[u8]) -> i64 {
+    if sio_int(instance, "_buffering", SOCKETIO_DEFAULT_BUFFER) == 0 {
+        sio_send_raw(instance, payload)
+    } else {
+        let mut pending = sio_buffer(instance, "_wbuf");
+        pending.extend_from_slice(payload);
+        sio_store_buffer(instance, "_wbuf", &pending);
+        NONE
+    }
+}
+
+fn sio_flush_pending(instance: i64) -> i64 {
+    let pending = sio_buffer(instance, "_wbuf");
+    if pending.is_empty() {
+        return NONE;
+    }
+    sio_store_buffer(instance, "_wbuf", &[]);
+    sio_send_raw(instance, &pending)
+}
+
+fn sio_write(instance: i64, data: i64) -> i64 {
+    if let Some(err) = sio_require_open(instance) {
+        return err;
+    }
+    if !sio_flag(instance, "_writable") {
+        return value_error("write");
+    }
+    if sio_flag(instance, "_binary") {
+        let Some(bytes) = value::as_bytes(data) else {
+            return type_error(&format!(
+                "a bytes-like object is required, not '{}'",
+                value::type_name(data)
+            ));
+        };
+        let payload = bytes.to_vec();
+        let count = encode_int(payload.len() as i64);
+        let result = sio_write_bytes(instance, &payload);
+        if exc::pending() {
+            return NONE;
+        }
+        let _ = result;
+        count
+    } else {
+        let Some(text) = value::as_str(data) else {
+            return type_error(&format!(
+                "write() argument must be str, not {}",
+                value::type_name(data)
+            ));
+        };
+        let translated = sio_write_newlines(instance, text);
+        let payload = match sio_encode_text(instance, &translated) {
+            Ok(payload) => payload,
+            Err(err) => return err,
+        };
+        let count = encode_int(text.chars().count() as i64);
+        let result = sio_write_bytes(instance, &payload);
+        if exc::pending() {
+            return NONE;
+        }
+        let _ = result;
+        count
+    }
+}
+
+fn sio_close(instance: i64) -> i64 {
+    if sio_closed(instance) {
+        return NONE;
+    }
+    let mut outcome = NONE;
+    if sio_flag(instance, "_writable") {
+        outcome = sio_flush_pending(instance);
+    }
+    sio_set(instance, "_closed", value::TRUE);
+    sio_set(instance, "closed", value::TRUE);
+    sio_store_buffer(instance, "_rbuf", &[]);
+    sio_store_buffer(instance, "_wbuf", &[]);
+    outcome
+}
+
+fn sio_method(
+    name: &'static str,
+    entry: extern "C" fn(*const i64) -> i64,
+    params: Vec<value::ParamMeta>,
+) -> i64 {
+    let arity = params.len();
+    let function = value::native_function_new("socket", name, arity);
+    value::function_set_signature(function, params);
+    value::function_set_full_entry(function, entry as *const () as usize);
+    function
+}
+
+fn sio_param(name: &str, default: Option<i64>) -> value::ParamMeta {
+    value::ParamMeta {
+        name: name.to_string(),
+        kind: hydro_ir::ParamKind::Positional,
+        default,
+    }
+}
+
+fn sio_required(name: &str) -> value::ParamMeta {
+    sio_param(name, None)
+}
+
+fn sio_optional(name: &str, default: i64) -> value::ParamMeta {
+    sio_param(name, Some(default))
+}
+
+/// The cached `socket.SocketIO` class: the object `makefile` returns.
+fn socketio_class() -> i64 {
+    if let Some(class) = globals::registry_get("socket.SocketIO") {
+        return class;
+    }
+    let definitions: Vec<(&'static str, Vec<value::ParamMeta>, extern "C" fn(*const i64) -> i64)> =
+        vec![
+            ("read", vec![sio_optional("size", encode_int(-1))], sio_read_entry),
+            ("read1", vec![sio_optional("size", encode_int(-1))], sio_read1_entry),
+            (
+                "readline",
+                vec![sio_optional("size", encode_int(-1))],
+                sio_readline_entry,
+            ),
+            (
+                "readlines",
+                vec![sio_optional("hint", encode_int(-1))],
+                sio_readlines_entry,
+            ),
+            ("readinto", vec![sio_required("buffer")], sio_readinto_entry),
+            ("peek", vec![sio_optional("size", encode_int(-1))], sio_peek_entry),
+            ("write", vec![sio_required("data")], sio_write_entry),
+            ("writelines", vec![sio_required("lines")], sio_writelines_entry),
+            ("flush", vec![], sio_flush_entry),
+            ("close", vec![], sio_close_entry),
+            ("fileno", vec![], sio_fileno_entry),
+            ("readable", vec![], sio_readable_entry),
+            ("writable", vec![], sio_writable_entry),
+            ("seekable", vec![], sio_seekable_entry),
+            ("isatty", vec![], sio_isatty_entry),
+            ("__enter__", vec![], sio_enter_entry),
+            (
+                "__exit__",
+                vec![
+                    sio_optional("exc_type", NONE),
+                    sio_optional("exc_value", NONE),
+                    sio_optional("traceback", NONE),
+                ],
+                sio_exit_entry,
+            ),
+            ("__iter__", vec![], sio_enter_entry),
+            ("__next__", vec![], sio_next_entry),
+        ];
+    let mut functions = Vec::with_capacity(definitions.len());
+    let mut methods = Vec::with_capacity(definitions.len());
+    for (name, params, entry) in definitions {
+        let function = sio_method(name, entry, params);
+        functions.push(function);
+        methods.push((name.to_string(), function, MethodKind::Normal));
+    }
+    let module = sock_text("socket");
+    let root = heap::root_values(&functions);
+    let extra = heap::root_values(std::slice::from_ref(&module));
+    let class = value::class_new_full(
+        "SocketIO".to_string(),
+        NONE,
+        methods,
+        vec![("__module__".to_string(), module)],
+    );
+    if class != NONE {
+        globals::registry_set("socket.SocketIO", class);
+    }
+    heap::release_roots(extra);
+    heap::release_roots(root);
+    class
+}
+
+/// `socket.makefile(mode="r", buffering=None, *, encoding=None, errors=None,
+/// newline=None)`.
+fn makefile(obj: i64, args: &[i64]) -> i64 {
+    let mode = match args.first() {
+        Some(&item) if item != NONE => match value::as_str(item) {
+            Some(text) => text.to_string(),
+            None => {
+                return type_error(&format!(
+                    "makefile() argument 1 must be str, not {}",
+                    value::type_name(item)
+                ))
+            }
+        },
+        _ => "r".to_string(),
+    };
+    if !mode.chars().all(|ch| matches!(ch, 'r' | 'w' | 'b')) {
+        return value_error(&format!("invalid mode: '{mode}'"));
+    }
+    let writable = mode.contains('w');
+    let readable = mode.contains('r') || !writable;
+    let binary = mode.contains('b');
+    let buffering = match args.get(1) {
+        Some(&item) if item != NONE => match value::as_integer(item) {
+            Some(number) => number,
+            None => {
+                return type_error(&format!(
+                    "an integer is required (got type {})",
+                    value::type_name(item)
+                ))
+            }
+        },
+        _ => -1,
+    };
+    if buffering == 0 && !binary {
+        return value_error("unbuffered streams must be binary");
+    }
+    let encoding = args.get(2).copied().unwrap_or(NONE);
+    let errors = args.get(3).copied().unwrap_or(NONE);
+    let newline = args.get(4).copied().unwrap_or(NONE);
+    if !binary {
+        if encoding != NONE && value::as_str(encoding).is_none() {
+            return type_error("encoding must be str");
+        }
+        if errors != NONE && value::as_str(errors).is_none() {
+            return type_error("errors must be str");
+        }
+        if newline != NONE {
+            let legal = value::as_str(newline)
+                .is_some_and(|text| matches!(text, "" | "\n" | "\r" | "\r\n"));
+            if !legal {
+                return value_error("illegal newline value");
+            }
+        }
+    }
+    let stream = value::instance_new(socketio_class());
+    let root = heap::root_values(&[stream, obj, encoding, errors, newline]);
+    sio_set(stream, "_sock", obj);
+    sio_store_buffer(stream, "_rbuf", &[]);
+    sio_store_buffer(stream, "_wbuf", &[]);
+    sio_set(stream, "_binary", value::bool_value(binary));
+    sio_set(
+        stream,
+        "_encoding",
+        if binary { NONE } else { encoding },
+    );
+    sio_set(stream, "_errors", if binary { NONE } else { errors });
+    sio_set(stream, "_newline", if binary { NONE } else { newline });
+    sio_set(
+        stream,
+        "_buffering",
+        encode_int(if buffering < 0 {
+            SOCKETIO_DEFAULT_BUFFER
+        } else {
+            buffering
+        }),
+    );
+    sio_set(stream, "_readable", value::bool_value(readable));
+    sio_set(stream, "_writable", value::bool_value(writable));
+    sio_set(stream, "_closed", value::FALSE);
+    sio_set(stream, "closed", value::FALSE);
+    let mode_value = sock_text(&mode);
+    let mode_root = heap::root_values(std::slice::from_ref(&mode_value));
+    sio_set(stream, "mode", mode_value);
+    heap::release_roots(mode_root);
+    heap::release_roots(root);
+    stream
+}
+
+extern "C" fn sio_read_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self then `size`.
+    let instance = unsafe { *argv };
+    let n = value::as_integer(unsafe { *argv.add(1) }).unwrap_or(-1);
+    if sio_flag(instance, "_binary") {
+        match sio_read_binary(instance, n) {
+            Ok(data) => value::bytes_new(data),
+            Err(err) => err,
+        }
+    } else {
+        sio_text_read(instance, n)
+    }
+}
+
+extern "C" fn sio_read1_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self then `size`.
+    let instance = unsafe { *argv };
+    let n = value::as_integer(unsafe { *argv.add(1) }).unwrap_or(-1);
+    let data = match sio_read1_binary(instance, n) {
+        Ok(data) => data,
+        Err(err) => return err,
+    };
+    if sio_flag(instance, "_binary") {
+        value::bytes_new(data)
+    } else {
+        match sio_decode_text(instance, &data) {
+            Ok(text) => sock_text(&sio_read_newlines(instance, text)),
+            Err(err) => err,
+        }
+    }
+}
+
+extern "C" fn sio_readline_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self then `size`.
+    let instance = unsafe { *argv };
+    let limit = value::as_integer(unsafe { *argv.add(1) }).unwrap_or(-1);
+    if sio_flag(instance, "_binary") {
+        match sio_readline_binary(instance, limit) {
+            Ok(data) => value::bytes_new(data),
+            Err(err) => err,
+        }
+    } else {
+        sio_text_readline(instance, limit)
+    }
+}
+
+extern "C" fn sio_readlines_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self then `hint`.
+    let instance = unsafe { *argv };
+    let hint = value::as_integer(unsafe { *argv.add(1) }).unwrap_or(-1);
+    let root = heap::root_values(std::slice::from_ref(&instance));
+    let binary = sio_flag(instance, "_binary");
+    let mut items: Vec<i64> = Vec::new();
+    let mut total = 0i64;
+    loop {
+        let line = if binary {
+            match sio_readline_binary(instance, -1) {
+                Ok(data) => value::bytes_new(data),
+                Err(err) => {
+                    heap::release_roots(root);
+                    return err;
+                }
+            }
+        } else {
+            sio_text_readline(instance, -1)
+        };
+        if exc::pending() {
+            heap::release_roots(root);
+            return NONE;
+        }
+        let empty = if binary {
+            value::as_bytes(line).is_some_and(|bytes| bytes.is_empty())
+        } else {
+            value::as_str(line).is_some_and(|text| text.is_empty())
+        };
+        if empty {
+            break;
+        }
+        let length = if binary {
+            value::as_bytes(line).map(|bytes| bytes.len()).unwrap_or(0)
+        } else {
+            value::as_str(line).map(str::len).unwrap_or(0)
+        };
+        total += length as i64;
+        items.push(line);
+        if hint > 0 && total >= hint {
+            break;
+        }
+    }
+    let list = value::list_new(items);
+    heap::release_roots(root);
+    list
+}
+
+extern "C" fn sio_readinto_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self then the buffer.
+    let instance = unsafe { *argv };
+    let buffer = unsafe { *argv.add(1) };
+    if let Some(err) = sio_require_open(instance) {
+        return err;
+    }
+    if !sio_flag(instance, "_binary") {
+        return value_error("readinto");
+    }
+    let Some(capacity) = sio_writable_len(buffer) else {
+        return type_error(&format!(
+            "readinto() argument must be read-write bytes-like object, not {}",
+            value::type_name(buffer)
+        ));
+    };
+    if capacity == 0 {
+        return encode_int(0);
+    }
+    let data = match sio_read_binary(instance, capacity as i64) {
+        Ok(data) => data,
+        Err(err) => return err,
+    };
+    encode_int(sio_write_buffer(buffer, &data) as i64)
+}
+
+extern "C" fn sio_peek_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self then `size`.
+    let instance = unsafe { *argv };
+    let n = value::as_integer(unsafe { *argv.add(1) }).unwrap_or(-1);
+    match sio_peek(instance, n) {
+        Ok(data) => value::bytes_new(data),
+        Err(err) => err,
+    }
+}
+
+extern "C" fn sio_write_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self then the data.
+    let instance = unsafe { *argv };
+    let data = unsafe { *argv.add(1) };
+    let root = heap::root_values(&[instance, data]);
+    let result = sio_write(instance, data);
+    heap::release_roots(root);
+    result
+}
+
+extern "C" fn sio_writelines_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self then the iterable.
+    let instance = unsafe { *argv };
+    let lines = unsafe { *argv.add(1) };
+    let root = heap::root_values(&[instance, lines]);
+    let items: Vec<i64> = if let Some(items) = value::as_list(lines) {
+        items.to_vec()
+    } else if let Some(items) = value::as_tuple(lines) {
+        items.to_vec()
+    } else {
+        heap::release_roots(root);
+        return type_error(&format!(
+            "writelines() argument must be a sequence, not {}",
+            value::type_name(lines)
+        ));
+    };
+    for line in items {
+        let inner = heap::root_values(&[line]);
+        let result = sio_write(instance, line);
+        heap::release_roots(inner);
+        if exc::pending() {
+            let _ = result;
+            heap::release_roots(root);
+            return NONE;
+        }
+    }
+    heap::release_roots(root);
+    NONE
+}
+
+extern "C" fn sio_flush_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self.
+    let instance = unsafe { *argv };
+    if let Some(err) = sio_require_open(instance) {
+        return err;
+    }
+    if !sio_flag(instance, "_writable") {
+        return NONE;
+    }
+    sio_flush_pending(instance)
+}
+
+extern "C" fn sio_close_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self.
+    let instance = unsafe { *argv };
+    sio_close(instance)
+}
+
+extern "C" fn sio_fileno_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self.
+    let instance = unsafe { *argv };
+    if let Some(err) = sio_require_open(instance) {
+        return err;
+    }
+    let sock = sio_attr(instance, "_sock");
+    if sock == NONE {
+        return descriptor_error();
+    }
+    let root = heap::root_values(std::slice::from_ref(&sock));
+    let result = crate::methods::call(sock, b"fileno".as_ptr(), 6, 0, std::ptr::null());
+    heap::release_roots(root);
+    result
+}
+
+extern "C" fn sio_readable_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self.
+    let instance = unsafe { *argv };
+    value::bool_value(!sio_closed(instance) && sio_flag(instance, "_readable"))
+}
+
+extern "C" fn sio_writable_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self.
+    let instance = unsafe { *argv };
+    value::bool_value(!sio_closed(instance) && sio_flag(instance, "_writable"))
+}
+
+extern "C" fn sio_seekable_entry(argv: *const i64) -> i64 {
+    value::FALSE
+}
+
+extern "C" fn sio_isatty_entry(argv: *const i64) -> i64 {
+    value::FALSE
+}
+
+extern "C" fn sio_enter_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self.
+    unsafe { *argv }
+}
+
+extern "C" fn sio_exit_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self and the exc info.
+    let instance = unsafe { *argv };
+    sio_close(instance);
+    NONE
+}
+
+extern "C" fn sio_next_entry(argv: *const i64) -> i64 {
+    // SAFETY: bound method call passes self.
+    let instance = unsafe { *argv };
+    let binary = sio_flag(instance, "_binary");
+    let line = if binary {
+        match sio_readline_binary(instance, -1) {
+            Ok(data) => value::bytes_new(data),
+            Err(err) => return err,
+        }
+    } else {
+        sio_text_readline(instance, -1)
+    };
+    if exc::pending() {
+        return NONE;
+    }
+    let empty = if binary {
+        value::as_bytes(line).is_some_and(|bytes| bytes.is_empty())
+    } else {
+        value::as_str(line).is_some_and(|text| text.is_empty())
+    };
+    if empty {
+        return exc::raise_with_message(exc::STOP_ITERATION, "");
+    }
+    line
 }
 
 fn libc_einval() -> i64 {
@@ -3392,6 +4660,9 @@ impl ServerCertVerifier for NoCertificateVerification {
 }
 
 fn tls_io_error(error: rustls::Error) -> io::Error {
+    if matches!(error, rustls::Error::InvalidCertificate(_)) {
+        return io::Error::other(format!("[SSL: CERTIFICATE_VERIFY_FAILED] {error}"));
+    }
     io::Error::other(format!("[SSL] {error}"))
 }
 
@@ -3834,6 +5105,11 @@ fn ssl_context_class() -> i64 {
         (
             "set_alpn_protocols".to_string(),
             ssl_method(set_alpn_protocols, 2, "set_alpn_protocols"),
+            MethodKind::Normal,
+        ),
+        (
+            "wrap_bio".to_string(),
+            ssl_varargs_method(wrap_bio_entry, "wrap_bio"),
             MethodKind::Normal,
         ),
     ];
@@ -4340,6 +5616,494 @@ fn ssl_wrap_socket(args: &[i64]) -> i64 {
     wrap_tls(context, sock, hostname)
 }
 
+// -------------------------------------------------------------------------
+// `ssl` exceptions, enums and in-memory BIOs
+// -------------------------------------------------------------------------
+
+/// CPython's `ssl` exception hierarchy:
+///
+/// ```text
+/// SSLError(OSError)
+///   SSLZeroReturnError, SSLWantReadError, SSLWantWriteError,
+///   SSLSyscallError, SSLEOFError, SSLCertVerificationError(OSError, ValueError)
+/// CertificateError = SSLCertVerificationError
+/// ```
+fn ssl_exception_class(name: &'static str) -> i64 {
+    let key = format!("ssl.{name}.class");
+    if let Some(class) = globals::registry_get(&key) {
+        return class;
+    }
+    let class = match name {
+        "SSLError" => {
+            value::class_new(name.to_string(), exc::exception_class(OS_ERROR), Vec::new())
+        }
+        "SSLCertVerificationError" | "CertificateError" => {
+            let bases = vec![
+                exc::exception_class(OS_ERROR),
+                exc::exception_class(VALUE_ERROR),
+            ];
+            value::class_new_multi(
+                "SSLCertVerificationError".to_string(),
+                bases,
+                NONE,
+                Vec::new(),
+                Vec::new(),
+            )
+        }
+        _ => value::class_new(
+            name.to_string(),
+            ssl_exception_class("SSLError"),
+            Vec::new(),
+        ),
+    };
+    let root = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(&key, class);
+    if matches!(name, "SSLCertVerificationError" | "CertificateError") {
+        globals::registry_set("ssl.SSLCertVerificationError.class", class);
+        globals::registry_set("ssl.CertificateError.class", class);
+    }
+    heap::release_roots(root);
+    class
+}
+
+/// Raises `class(message)` carrying the `OSError` handler tag.
+fn raise_ssl_exception(class: i64, name: &'static str, message: &str) -> i64 {
+    let argument = value::str_alloc(message.to_string());
+    let root = heap::root_values(std::slice::from_ref(&argument));
+    let rendered = value::repr(argument);
+    let data = exc::ExcData {
+        tag: OS_ERROR,
+        name,
+        msg: message.to_string(),
+        file: String::new(),
+        line: 0,
+        frame: String::new(),
+        cause: None,
+        context: None,
+        suppress_context: false,
+        exit_code: None,
+        args: vec![message.to_string()],
+        arg_values: vec![argument],
+        arg_reprs: vec![rendered],
+        keywords: Vec::new(),
+        object: None,
+    };
+    let instance = value::exc_instance_new(class, data);
+    let result = exc::raise_value(instance);
+    heap::release_roots(root);
+    result
+}
+
+/// A certificate verification failure (`ssl.CertificateError`).
+fn ssl_certificate_error(message: &str) -> i64 {
+    raise_ssl_exception(
+        ssl_exception_class("SSLCertVerificationError"),
+        "SSLCertVerificationError",
+        message,
+    )
+}
+
+/// Builds an IntEnum-like class: an `int` subclass whose members carry
+/// `name`/`value` attributes, the shape the stdlib reads from an enum.
+fn ssl_enum_class(name: &'static str, members: &[(&'static str, i64)]) -> i64 {
+    let key = format!("ssl.{name}.class");
+    if let Some(class) = globals::registry_get(&key) {
+        return class;
+    }
+    let class = value::class_new_full(
+        name.to_string(),
+        value::native_class("int"),
+        Vec::new(),
+        Vec::new(),
+    );
+    let class_root = heap::root_values(std::slice::from_ref(&class));
+    for (member_name, number) in members {
+        let number_value = encode_int(*number);
+        let number_root = heap::root_values(std::slice::from_ref(&number_value));
+        let member = crate::core::builtins::scalar_instance_new(
+            class,
+            1,
+            std::slice::from_ref(&number_value).as_ptr(),
+        )
+        .unwrap_or(NONE);
+        let member_root = heap::root_values(std::slice::from_ref(&member));
+        value::instance_setattr(member, "name".to_string(), sock_text(member_name));
+        value::instance_setattr(member, "value".to_string(), number_value);
+        value::class_set_attr(class, member_name.to_string(), member);
+        heap::release_roots(member_root);
+        heap::release_roots(number_root);
+    }
+    globals::registry_set(&key, class);
+    heap::release_roots(class_root);
+    class
+}
+
+fn ssl_method_class() -> i64 {
+    ssl_enum_class(
+        "_SSLMethod",
+        &[
+            ("PROTOCOL_TLS", PROTOCOL_TLS),
+            ("PROTOCOL_SSLv23", PROTOCOL_TLS),
+            ("PROTOCOL_TLS_CLIENT", PROTOCOL_TLS_CLIENT),
+            ("PROTOCOL_TLS_SERVER", PROTOCOL_TLS_SERVER),
+            ("PROTOCOL_TLSv1", 3),
+            ("PROTOCOL_TLSv1_1", 4),
+            ("PROTOCOL_TLSv1_2", 5),
+        ],
+    )
+}
+
+fn ssl_tls_version_class() -> i64 {
+    ssl_enum_class(
+        "TLSVersion",
+        &[
+            ("MINIMUM_SUPPORTED", -2),
+            ("SSLv3", 0x300),
+            ("TLSv1", 0x301),
+            ("TLSv1_1", 0x302),
+            ("TLSv1_2", 0x303),
+            ("TLSv1_3", 0x304),
+            ("MAXIMUM_SUPPORTED", -1),
+        ],
+    )
+}
+
+fn ssl_verify_mode_class() -> i64 {
+    ssl_enum_class(
+        "VerifyMode",
+        &[
+            ("CERT_NONE", CERT_NONE),
+            ("CERT_OPTIONAL", CERT_OPTIONAL),
+            ("CERT_REQUIRED", CERT_REQUIRED),
+        ],
+    )
+}
+
+fn ssl_verify_flags_class() -> i64 {
+    ssl_enum_class(
+        "VerifyFlags",
+        &[
+            ("VERIFY_DEFAULT", 0),
+            ("VERIFY_CRL_CHECK_LEAF", 4),
+            ("VERIFY_CRL_CHECK_CHAIN", 12),
+            ("VERIFY_X509_STRICT", 32),
+            ("VERIFY_X509_TRUSTED_FIRST", 32768),
+            ("VERIFY_X509_PARTIAL_CHAIN", 0x80000),
+        ],
+    )
+}
+
+fn ssl_options_class() -> i64 {
+    ssl_enum_class(
+        "Options",
+        &[
+            ("OP_ALL", OP_ALL),
+            ("OP_NO_SSLv2", 0),
+            ("OP_NO_SSLv3", 0x02000000),
+            ("OP_NO_TLSv1", 0x04000000),
+            ("OP_NO_TLSv1_1", 0x10000000),
+            ("OP_NO_TLSv1_2", 0x08000000),
+            ("OP_NO_TLSv1_3", 0x20000000),
+            ("OP_CIPHER_SERVER_PREFERENCE", 0x400000),
+            ("OP_SINGLE_DH_USE", 0x100000),
+            ("OP_SINGLE_ECDH_USE", 0x080000),
+            ("OP_NO_COMPRESSION", 0x20000),
+        ],
+    )
+}
+
+fn ssl_content_type_class() -> i64 {
+    ssl_enum_class(
+        "_TLSContentType",
+        &[
+            ("CHANGE_CIPHER_SPEC", 20),
+            ("ALERT", 21),
+            ("HANDSHAKE", 22),
+            ("APPLICATION_DATA", 23),
+            ("HEADER", 0x100),
+            ("INNER_CONTENT_TYPE", 0x101),
+        ],
+    )
+}
+
+fn ssl_message_type_class() -> i64 {
+    ssl_enum_class(
+        "_TLSMessageType",
+        &[
+            ("HELLO_REQUEST", 0),
+            ("CLIENT_HELLO", 1),
+            ("SERVER_HELLO", 2),
+            ("HELLO_VERIFY_REQUEST", 3),
+            ("NEWSESSION_TICKET", 4),
+            ("END_OF_EARLY_DATA", 5),
+            ("HELLO_RETRY_REQUEST", 6),
+            ("ENCRYPTED_EXTENSIONS", 8),
+            ("CERTIFICATE", 11),
+            ("SERVER_KEY_EXCHANGE", 12),
+            ("CERTIFICATE_REQUEST", 13),
+            ("SERVER_DONE", 14),
+            ("CERTIFICATE_VERIFY", 15),
+            ("CLIENT_KEY_EXCHANGE", 16),
+            ("FINISHED", 20),
+            ("CERTIFICATE_URL", 21),
+            ("CERTIFICATE_STATUS", 22),
+            ("SUPPLEMENTAL_DATA", 23),
+            ("KEY_UPDATE", 24),
+            ("NEXT_PROTO", 67),
+            ("MESSAGE_HASH", 254),
+            ("CHANGE_CIPHER_SPEC", 0x0101),
+        ],
+    )
+}
+
+fn ssl_alert_type_class() -> i64 {
+    ssl_enum_class(
+        "_TLSAlertType",
+        &[
+            ("CLOSE_NOTIFY", 0),
+            ("UNEXPECTED_MESSAGE", 10),
+            ("BAD_RECORD_MAC", 20),
+            ("DECRYPTION_FAILED", 21),
+            ("RECORD_OVERFLOW", 22),
+            ("DECOMPRESSION_FAILURE", 30),
+            ("HANDSHAKE_FAILURE", 40),
+            ("NO_CERTIFICATE", 41),
+            ("BAD_CERTIFICATE", 42),
+            ("UNSUPPORTED_CERTIFICATE", 43),
+            ("CERTIFICATE_REVOKED", 44),
+            ("CERTIFICATE_EXPIRED", 45),
+            ("CERTIFICATE_UNKNOWN", 46),
+            ("ILLEGAL_PARAMETER", 47),
+            ("UNKNOWN_CA", 48),
+            ("ACCESS_DENIED", 49),
+            ("DECODE_ERROR", 50),
+            ("DECRYPT_ERROR", 51),
+            ("EXPORT_RESTRICTION", 60),
+            ("PROTOCOL_VERSION", 70),
+            ("INSUFFICIENT_SECURITY", 71),
+            ("INTERNAL_ERROR", 80),
+            ("INAPPROPRIATE_FALLBACK", 86),
+            ("USER_CANCELED", 90),
+            ("NO_RENEGOTIATION", 100),
+            ("MISSING_EXTENSION", 109),
+            ("UNSUPPORTED_EXTENSION", 110),
+            ("CERTIFICATE_UNOBTAINABLE", 111),
+            ("UNRECOGNIZED_NAME", 112),
+            ("BAD_CERTIFICATE_STATUS_RESPONSE", 113),
+            ("BAD_CERTIFICATE_HASH_VALUE", 114),
+            ("UNKNOWN_PSK_IDENTITY", 115),
+            ("CERTIFICATE_REQUIRED", 116),
+            ("NO_APPLICATION_PROTOCOL", 120),
+        ],
+    )
+}
+
+/// `ssl._PROTOCOL_NAMES`: the `_SSLMethod` members keyed by their value.
+fn ssl_protocol_names() -> i64 {
+    if let Some(cached) = globals::registry_get("ssl._PROTOCOL_NAMES") {
+        return cached;
+    }
+    let pairs: Vec<(i64, i64)> = [
+        (PROTOCOL_TLS, "PROTOCOL_TLS"),
+        (PROTOCOL_TLS_CLIENT, "PROTOCOL_TLS_CLIENT"),
+        (PROTOCOL_TLS_SERVER, "PROTOCOL_TLS_SERVER"),
+        (3, "PROTOCOL_TLSv1"),
+        (4, "PROTOCOL_TLSv1_1"),
+        (5, "PROTOCOL_TLSv1_2"),
+    ]
+    .into_iter()
+    .map(|(number, name)| (encode_int(number), sock_text(name)))
+    .collect();
+    let pairs_root = heap::root_values(&pairs.iter().flat_map(|(k, v)| [*k, *v]).collect::<Vec<_>>());
+    let mapping = value::dict_new(pairs);
+    let root = heap::root_values(std::slice::from_ref(&mapping));
+    globals::registry_set("ssl._PROTOCOL_NAMES", mapping);
+    heap::release_roots(root);
+    heap::release_roots(pairs_root);
+    mapping
+}
+
+/// The cached `ssl.MemoryBIO` class: an in-memory byte buffer with the
+/// `write`/`read`/`pending`/`eof` surface `SSLObject` users drive.
+fn memory_bio_class() -> i64 {
+    if let Some(class) = globals::registry_get("ssl.MemoryBIO") {
+        return class;
+    }
+    let self_only = || vec![sio_required("self")];
+    let definitions: Vec<(&'static str, Vec<value::ParamMeta>, extern "C" fn(*const i64) -> i64)> =
+        vec![
+            ("__init__", self_only(), bio_init_entry),
+            ("write", vec![sio_required("self"), sio_required("b")], bio_write_entry),
+            ("read", vec![sio_required("self"), sio_optional("n", encode_int(-1))], bio_read_entry),
+            (
+                "read_into",
+                vec![sio_required("self"), sio_required("b")],
+                bio_read_into_entry,
+            ),
+        ];
+    let mut methods = Vec::new();
+    let mut functions = Vec::new();
+    for (name, params, entry) in definitions {
+        let function = sio_method(name, entry, params);
+        functions.push(function);
+        methods.push((name.to_string(), function, MethodKind::Normal));
+    }
+    let pending = value::native_function_new("ssl", "MemoryBIO.pending", 1);
+    value::function_set_signature(pending, self_only());
+    value::function_set_full_entry(pending, bio_pending_get_entry as *const () as usize);
+    functions.push(pending);
+    let eof_get = value::native_function_new("ssl", "MemoryBIO.eof", 1);
+    value::function_set_signature(eof_get, self_only());
+    value::function_set_full_entry(eof_get, bio_eof_get_entry as *const () as usize);
+    functions.push(eof_get);
+    let eof_set = value::native_function_new("ssl", "MemoryBIO.eof", 2);
+    value::function_set_signature(eof_set, vec![sio_required("self"), sio_required("value")]);
+    value::function_set_full_entry(eof_set, bio_eof_set_entry as *const () as usize);
+    functions.push(eof_set);
+    methods.push((
+        "pending".to_string(),
+        value::property_new(pending, NONE, NONE),
+        MethodKind::Normal,
+    ));
+    methods.push((
+        "eof".to_string(),
+        value::property_new(eof_get, eof_set, NONE),
+        MethodKind::Normal,
+    ));
+    let root = heap::root_values(&functions);
+    let class = value::class_new_full("MemoryBIO".to_string(), NONE, methods, Vec::new());
+    if class != NONE {
+        globals::registry_set("ssl.MemoryBIO", class);
+    }
+    heap::release_roots(root);
+    class
+}
+
+extern "C" fn bio_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    sio_store_buffer(instance, "_buf", &[]);
+    sio_set(instance, "_eof", value::FALSE);
+    NONE
+}
+
+/// `ssl.MemoryBIO()`: a fresh, empty BIO.
+fn memory_bio_new() -> i64 {
+    let instance = value::instance_new(memory_bio_class());
+    if instance != NONE {
+        sio_store_buffer(instance, "_buf", &[]);
+        sio_set(instance, "_eof", value::FALSE);
+    }
+    instance
+}
+
+extern "C" fn bio_write_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, bytes).
+    let instance = unsafe { *argv };
+    let data = unsafe { *argv.add(1) };
+    let Some(bytes) = value::as_bytes(data) else {
+        return type_error(&format!(
+            "a bytes-like object is required, not '{}'",
+            value::type_name(data)
+        ));
+    };
+    let root = heap::root_values(&[instance, data]);
+    let mut buffer = sio_buffer(instance, "_buf");
+    buffer.extend_from_slice(bytes);
+    sio_store_buffer(instance, "_buf", &buffer);
+    heap::release_roots(root);
+    encode_int(bytes.len() as i64)
+}
+
+extern "C" fn bio_read_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, n).
+    let instance = unsafe { *argv };
+    let n = value::as_integer(unsafe { *argv.add(1) }).unwrap_or(-1);
+    let mut buffer = sio_buffer(instance, "_buf");
+    let end = if n < 0 {
+        buffer.len()
+    } else {
+        (n as usize).min(buffer.len())
+    };
+    let rest = buffer.split_off(end);
+    sio_store_buffer(instance, "_buf", &rest);
+    value::bytes_new(buffer)
+}
+
+extern "C" fn bio_read_into_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, buffer).
+    let instance = unsafe { *argv };
+    let target = unsafe { *argv.add(1) };
+    let Some(capacity) = sio_writable_len(target) else {
+        return type_error(&format!(
+            "read_into() argument must be read-write bytes-like object, not {}",
+            value::type_name(target)
+        ));
+    };
+    let mut buffer = sio_buffer(instance, "_buf");
+    let end = capacity.min(buffer.len());
+    let rest = buffer.split_off(end);
+    sio_store_buffer(instance, "_buf", &rest);
+    encode_int(sio_write_buffer(target, &buffer) as i64)
+}
+
+extern "C" fn bio_pending_get_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    encode_int(sio_buffer(instance, "_buf").len() as i64)
+}
+
+extern "C" fn bio_eof_get_entry(argv: *const i64) -> i64 {
+    // SAFETY: one declared parameter slot (self).
+    let instance = unsafe { *argv };
+    value::bool_value(value::truthy(sio_attr(instance, "_eof")))
+}
+
+extern "C" fn bio_eof_set_entry(argv: *const i64) -> i64 {
+    // SAFETY: two declared parameter slots (self, value).
+    let instance = unsafe { *argv };
+    let enabled = value::truthy(unsafe { *argv.add(1) });
+    sio_set(instance, "_eof", value::bool_value(enabled));
+    NONE
+}
+
+/// The cached `ssl.SSLObject` class.
+///
+/// CPython only produces these through `SSLContext.wrap_bio`; this runtime
+/// implements TLS on connected sockets (`wrap_socket`), so a direct
+/// constructor reports the same `TypeError` CPython's C type does and
+/// `wrap_bio` reports the documented limitation instead of faking a handshake.
+fn ssl_object_class() -> i64 {
+    if let Some(class) = globals::registry_get("ssl.SSLObject") {
+        return class;
+    }
+    let mut init = value::native_function_new("ssl", "SSLObject.__init__", 1);
+    value::function_set_signature(init, vec![sio_required("self")]);
+    value::function_set_full_entry(init, ssl_object_init_entry as *const () as usize);
+    let methods = vec![(
+        "__init__".to_string(),
+        init,
+        MethodKind::Normal,
+    )];
+    let root = heap::root_values(&[init]);
+    let class = value::class_new_full("SSLObject".to_string(), NONE, methods, Vec::new());
+    heap::release_roots(root);
+    let root = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set("ssl.SSLObject", class);
+    heap::release_roots(root);
+    class
+}
+
+/// Direct `ssl.SSLObject()` construction, which CPython forbids.
+extern "C" fn ssl_object_init_entry(_argv: *const i64) -> i64 {
+    type_error("cannot create 'SSLObject' instances")
+}
+
+/// `SSLContext.wrap_bio(...)`: report the runtime's documented limitation.
+extern "C" fn wrap_bio_entry(_argv: *const i64) -> i64 {
+    ssl_error("wrap_bio() is not supported: this runtime implements TLS on connected sockets")
+}
+
 /// Module-level `ssl` dispatch.
 pub(crate) fn ssl_call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -4347,6 +6111,8 @@ pub(crate) fn ssl_call(function: &str, args: &[i64]) -> i64 {
         "create_default_context" | "_create_default_https_context" => create_default_context(args),
         "_create_stdlib_context" | "_create_unverified_context" => create_stdlib_context(args),
         "wrap_socket" => ssl_wrap_socket(args),
+        "MemoryBIO" => memory_bio_new(),
+        "SSLObject" => type_error("cannot create 'SSLObject' instances"),
         "_ssl_context_wrap_socket" => {
             let hostname = args.get(2).copied().unwrap_or(NONE);
             wrap_tls(args[0], args[1], hostname)
@@ -4419,10 +6185,57 @@ pub(crate) fn ssl_constant(name: &str) -> i64 {
         // currently prefers the spec function, so `mod.rs` needs a
         // class-value hook to expose this (see the hand-off notes).
         "SSLContext" => ssl_context_class(),
-        // No dedicated `SSLError` tag exists; the closest catchable class is
-        // `OSError`, which is what every TLS failure in this runtime raises.
-        "SSLError" => exc::exception_class(OS_ERROR),
+        "SSLError" => ssl_exception_class("SSLError"),
+        "SSLZeroReturnError" => ssl_exception_class("SSLZeroReturnError"),
+        "SSLWantReadError" => ssl_exception_class("SSLWantReadError"),
+        "SSLWantWriteError" => ssl_exception_class("SSLWantWriteError"),
+        "SSLSyscallError" => ssl_exception_class("SSLSyscallError"),
+        "SSLEOFError" => ssl_exception_class("SSLEOFError"),
+        "SSLCertVerificationError" | "CertificateError" => {
+            ssl_exception_class("SSLCertVerificationError")
+        }
+        "_SSLContext" => ssl_context_class(),
+        "_SSLSocket" => ssl_socket_class(),
+        "SSLObject" => ssl_object_class(),
+        "MemoryBIO" => memory_bio_class(),
+        "VerifyMode" => ssl_verify_mode_class(),
+        "VerifyFlags" => ssl_verify_flags_class(),
+        "Options" => ssl_options_class(),
+        "TLSVersion" => ssl_tls_version_class(),
+        "_SSLMethod" => ssl_method_class(),
+        "_TLSContentType" => ssl_content_type_class(),
+        "_TLSMessageType" => ssl_message_type_class(),
+        "_TLSAlertType" => ssl_alert_type_class(),
+        "_PROTOCOL_NAMES" => ssl_protocol_names(),
+        "PROTOCOL_SSLv23" => encode_int(PROTOCOL_TLS),
+        "PROTOCOL_TLSv1" => encode_int(3),
+        "PROTOCOL_TLSv1_1" => encode_int(4),
+        "HAS_ECDH" => value::TRUE,
+        "HAS_TLSv1_2" => value::TRUE,
+        "HAS_PHA" => value::TRUE,
+        "CHANNEL_BINDING_TYPES" => {
+            value::list_new(vec![value::str_alloc("tls-unique".to_string())])
+        }
+        "OP_CIPHER_SERVER_PREFERENCE" => encode_int(0x400000),
+        "OP_SINGLE_DH_USE" => encode_int(0x100000),
+        "OP_SINGLE_ECDH_USE" => encode_int(0x080000),
+        "OP_NO_COMPRESSION" => encode_int(0x20000),
+        "OP_NO_SSLv2" => encode_int(0),
+        "OP_NO_SSLv3" => encode_int(0x02000000),
+        "OP_NO_TLSv1" => encode_int(0x04000000),
+        "OP_NO_TLSv1_1" => encode_int(0x10000000),
+        "OP_NO_TLSv1_2" => encode_int(0x08000000),
+        "OP_NO_TLSv1_3" => encode_int(0x20000000),
         "OPENSSL_VERSION" => value::str_alloc("rustls 0.23".to_string()),
+        "OPENSSL_VERSION_INFO" => {
+            value::tuple_new(vec![encode_int(0), encode_int(0), encode_int(0), encode_int(0), encode_int(0)])
+        }
+        "OPENSSL_VERSION_NUMBER" => encode_int(0),
+        "_OPENSSL_API_VERSION" => {
+            value::tuple_new(vec![encode_int(0), encode_int(0), encode_int(0), encode_int(0), encode_int(0)])
+        }
+        "PEM_HEADER" => value::str_alloc("-----BEGIN CERTIFICATE-----".to_string()),
+        "PEM_FOOTER" => value::str_alloc("-----END CERTIFICATE-----".to_string()),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'ssl' has no attribute '{name}'"),
