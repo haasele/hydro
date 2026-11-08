@@ -368,10 +368,9 @@ fn augmented_subscript_assignment_typechecks_and_emits_stores() {
 fn call_arity_uses_the_call_code() {
     let diags = check_diags("def f(x: int) -> int:\n    return x\nprint(f())\n");
     assert_eq!(diags[0].code, codes::CALL);
-    assert!(
-        diags[0].message.contains("missing required argument 'x'"),
-        "{}",
-        diags[0].message
+    assert_eq!(
+        diags[0].message,
+        "f() missing 1 required positional argument: 'x'"
     );
 }
 
@@ -472,13 +471,13 @@ fn user_call_rejects_missing_required_arguments_end_to_end() {
     let errors = check_errors("def f(a, b=None):\n    return a\nf()\n");
     assert_eq!(
         errors,
-        vec!["f() missing required argument 'a'"],
+        vec!["f() missing 1 required positional argument: 'a'"],
         "{errors:?}"
     );
     let errors = check_errors("def f(a, *, b):\n    return a\nf(1)\n");
     assert_eq!(
         errors,
-        vec!["f() missing required keyword-only argument 'b'"],
+        vec!["f() missing 1 required keyword-only argument: 'b'"],
         "{errors:?}"
     );
 }
@@ -2434,13 +2433,14 @@ fn asyncio_sleep_and_gather_typecheck() {
 
 #[test]
 fn asyncio_unsupported_members_are_rejected() {
-    let diags = check_diags("import asyncio\nasyncio.wait_for(1, 2)\n");
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::ATTRIBUTE);
-    assert_eq!(
-        diags[0].message,
-        "module 'asyncio' has no attribute 'wait_for'"
-    );
+    // The name is historical: `wait_for` is part of the supported asyncio
+    // surface now, so the call links to the native member instead of
+    // reporting an unsupported attribute.
+    assert!(check_errors("import asyncio\nasyncio.wait_for(1, 2)\n").is_empty());
+
+    // `asyncio` is a Python-source module: a member its curated table does not
+    // list stays a runtime read, where an absent name raises `AttributeError`.
+    assert!(check_errors("import asyncio\nasyncio.nonexistent_member\n").is_empty());
 }
 
 #[test]

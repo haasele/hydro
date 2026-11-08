@@ -768,6 +768,11 @@ where
 
             // First of all, we need all nestings to be finished.
             if self.nesting > 0 {
+                // Unbalanced brackets at EOF are a lexical error. Clear the
+                // nesting so the following iterator step can emit the final
+                // NEWLINE/ENDMARKER and terminate instead of yielding the same
+                // Eof error forever (which makes `collect()` hang).
+                self.nesting = 0;
                 return Err(LexicalError {
                     error: LexicalErrorType::Eof,
                     location: tok_pos,

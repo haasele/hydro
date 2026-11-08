@@ -4717,13 +4717,26 @@ fn del_of_a_declared_global_lowers_to_a_global_target() {
 
 #[test]
 fn deleting_an_unknown_name_is_a_compile_error() {
+    // The name is historical: `del name` is a binding operation in CPython's
+    // symbol table, so `del missing` makes `missing` local and compiles to
+    // `DELETE_FAST`; the `UnboundLocalError` only happens at runtime.
     let source = "def f():\n    del missing\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    let local = f
+        .locals
+        .iter()
+        .position(|local| local.name == "missing")
+        .expect("`del` binds a local slot") as LocalId;
+    let HStmtKind::Delete { targets } = &f.body[0].kind else {
+        panic!("expected a delete statement, got {:?}", f.body[0].kind);
+    };
+    assert_eq!(targets.len(), 1);
     assert!(
-        diags.iter().any(|diag| diag
-            .message
-            .contains("cannot delete unknown name 'missing'")),
-        "{diags:?}"
+        matches!(&targets[0], HDeleteTarget::Name(target) if *target == local),
+        "the unknown name deletes its local slot: {:?}",
+        targets[0]
     );
 }
 
@@ -9788,18 +9801,46 @@ fn nested_function_rebinding_its_own_name_does_not_capture_a_cell() {
 
 #[test]
 fn recursive_nested_function_with_a_global_binding_still_reports_the_slot_error() {
-    // `global helper` gives the enclosing function no slot for the `def`, so
-    // recursion support cannot invent one; the declaration error stands.
+    // The name is historical: `global helper` gives the enclosing function no
+    // local slot, so the definition creates the closure in a hidden local and
+    // publishes it through the runtime global table. The nested body's
+    // recursive call reads that global back, exactly like CPython's
+    // `STORE_GLOBAL`/`LOAD_GLOBAL` pair.
     let source = "def outer():\n    global helper\n    def helper(n):\n        return helper(n - 1)\n    return helper\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let outer = function(&hir, "outer");
+    let HStmtKind::If { then_body, .. } = &outer.body[0].kind else {
+        panic!(
+            "the global `def` lowers through an `if True:` block: {:?}",
+            outer.body
+        );
+    };
     assert!(
-        diags[0]
-            .message
-            .contains("nested function 'helper' has no local slot"),
-        "{diags:?}"
+        then_body.iter().any(|stmt| matches!(
+            &stmt.kind,
+            HStmtKind::GlobalSet { name, .. } if name == "helper"
+        )),
+        "the definition publishes through the global table: {then_body:?}"
     );
-    assert_eq!(diags[0].code, codes::DECL);
+
+    let inner = function(&hir, "outer.helper");
+    let HStmtKind::Return(Some(value)) = &inner.body[0].kind else {
+        panic!("expected a return, got {:?}", inner.body[0].kind);
+    };
+    let HExprKind::IndirectCall { callee, .. } = &value.kind else {
+        panic!("expected an indirect call, got {:?}", value.kind);
+    };
+    assert!(
+        matches!(
+            &callee.kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "helper"
+        ),
+        "recursion resolves through the module globals: {:?}",
+        callee.kind
+    );
 }
 
 #[test]
@@ -11637,6 +11678,67 @@ fn known_user_module_members_keep_their_static_path() {
         }
         other => panic!("expected a module global read, got {other:?}"),
     }
+}
+
+#[test]
+fn module_import_bindings_do_not_claim_a_local_slot() {
+    // A module body resolves imports through the compile-time binding tables
+    // and, in a unit that does not mirror its namespace, the import statement
+    // emits no IR at all. A module-local slot for an import-only name would
+    // therefore shadow the binding and stay uninitialized in the entry module,
+    // so the reads must keep using the binding tables and the call must stay a
+    // direct link.
+    let source = "from helper import VALUE, add\nx = VALUE\ny = add(1, 2)\n";
+    let mut infer = Infer::new();
+    let mut lowerer = lowerer_with_user_module(
+        source,
+        &mut infer,
+        "helper",
+        HashMap::from([
+            ("add".to_string(), UserExport::Function(1)),
+            ("VALUE".to_string(), UserExport::Global),
+        ]),
+    );
+    let hir = lowerer.lower_module(&parse(source));
+    let diags = std::mem::take(&mut lowerer.diags);
+    drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        !hir.functions[0]
+            .locals
+            .iter()
+            .any(|local| local.name == "VALUE" || local.name == "add"),
+        "import-only names must not claim module locals: {:?}",
+        hir.functions[0].locals
+    );
+    assert!(
+        matches!(
+            &assigned(&hir, "x").kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "helper" && name == "VALUE"
+        ),
+        "the value read must resolve through the module table: {:?}",
+        assigned(&hir, "x")
+    );
+    // A linked import keeps the direct function value in the call, whether it
+    // is the narrow `Call`/`Callee::Function` shape or the `CallKw` shape the
+    // import binder uses when the callee's signature is not available here.
+    let direct_link = matches!(
+        &assigned(&hir, "y").kind,
+        HExprKind::Call {
+            callee: Callee::Function(1),
+            ..
+        }
+    ) || matches!(
+        &assigned(&hir, "y").kind,
+        HExprKind::CallKw { callee, .. }
+            if matches!(&callee.kind, HExprKind::FunctionRef(1))
+    );
+    assert!(
+        direct_link,
+        "the imported function must stay a direct link: {:?}",
+        assigned(&hir, "y")
+    );
 }
 
 #[test]
@@ -14968,30 +15070,33 @@ fn malformed_match_patterns_are_diagnosed() {
 
 #[test]
 fn except_star_lowers_to_an_explicit_unsupported_error() {
+    // The name is historical: `except*` is implemented now. It lowers to
+    // `HStmtKind::TryStar`, whose runtime splits the raised exception group
+    // and dispatches every `except*` clause.
     let source = "\
 def f():
     try:
         raise ValueError('x')
     except* ValueError as group:
-        return group
+        pass
 ";
-    let hir = lower_ok(source);
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
     let body = &function(&hir, "f").body;
-    let try_stmt = body
-        .iter()
-        .find_map(|stmt| match &stmt.kind {
-            HStmtKind::Try { handlers, .. } => Some(handlers),
-            _ => None,
-        })
-        .expect("except* lowers to a Try with one explicit handler");
-    assert_eq!(try_stmt.len(), 1);
-    assert!(matches!(
-        try_stmt[0].body[0].kind,
-        HStmtKind::Raise {
-            exc: Some(ExcKind::NotImplementedError),
-            ..
-        }
-    ));
+    let HStmtKind::TryStar { handlers, .. } = &body[0].kind else {
+        panic!("except* lowers to a TryStar, got {:?}", body[0].kind);
+    };
+    assert_eq!(handlers.len(), 1);
+    assert!(
+        matches!(
+            handlers[0].exc_expr.as_ref().map(|expr| &expr.kind),
+            Some(HExprKind::ExceptionClass(ExcKind::ValueError))
+        ),
+        "the clause keeps its runtime matcher: {:?}",
+        handlers[0].exc_expr
+    );
+    let binding = handlers[0].binding.expect("the `as group` binding");
+    assert_eq!(function(&hir, "f").locals[binding as usize].name, "group");
 }
 
 #[test]
@@ -18230,16 +18335,37 @@ fn pep695_declarations_lower_without_diagnostics() {
 
 #[test]
 fn function_type_parameter_constraints_are_rejected() {
+    // The name is historical: `[T: (int, str)]` is PEP 695's constraint
+    // spelling, equivalent to `TypeVar("T", int, str)`. The tuple is accepted
+    // and reaches the runtime constructor as the `bound` value.
     let source = "def f[T: (int, str)](x: T) -> T:\n    return x\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::SYNTAX);
-    assert!(
-        diags[0]
-            .message
-            .contains("constraints with type parameter syntax"),
-        "{diags:?}"
-    );
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Assign { value, .. } = &hir.functions[0].body[0].kind else {
+        panic!(
+            "expected the type-parameter setup: {:?}",
+            hir.functions[0].body
+        );
+    };
+    let HExprKind::ModuleCall {
+        module,
+        function,
+        args,
+        keywords,
+    } = &value.kind
+    else {
+        panic!("expected a TypeVar call: {value:?}");
+    };
+    assert_eq!((module.as_str(), function.as_str()), ("typing", "TypeVar"));
+    assert!(matches!(&args[0].kind, HExprKind::Const(Const::Str(name)) if name == "T"));
+    assert_eq!(keywords.len(), 1);
+    assert_eq!(keywords[0].0, "bound");
+    let HExprKind::Tuple(items) = &keywords[0].1.kind else {
+        panic!("a tuple constraint lowers to a tuple: {:?}", keywords[0].1);
+    };
+    assert_eq!(items.len(), 2);
+    assert!(matches!(&items[0].kind, HExprKind::BuiltinRef(Builtin::Int)));
+    assert!(matches!(&items[1].kind, HExprKind::BuiltinRef(Builtin::Str)));
 }
 
 #[test]

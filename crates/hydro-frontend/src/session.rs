@@ -1004,15 +1004,19 @@ mod tests {
 
     #[test]
     fn incomplete_input_is_detected() {
-        assert!(is_incomplete("def f():\n", "<stdin>"));
-        assert!(is_incomplete("if True:\n", "<stdin>"));
-        assert!(!is_incomplete("if True:\n    x = 1\n", "<stdin>"));
-        assert!(is_incomplete("x = [1, 2\n", "<stdin>"));
-        assert!(is_incomplete("x = (1,\n", "<stdin>"));
-        assert!(is_incomplete("x = '''abc\n", "<stdin>"));
-        assert!(!is_incomplete("x = 1\n", "<stdin>"));
-        assert!(!is_incomplete("def f():\n    pass\n", "<stdin>"));
-        assert!(!is_incomplete("def broken(:\n    pass\n", "<stdin>"));
-        assert!(!is_incomplete("x = )\n", "<stdin>"));
+        for (source, expected) in [
+            ("def f():\n", true),
+            ("if True:\n", true),
+            ("if True:\n    x = 1\n", false),
+            ("x = [1, 2\n", true),
+            ("x = (1,\n", true),
+            ("x = '''abc\n", true),
+            ("x = 1\n", false),
+            ("def f():\n    pass\n", false),
+            ("def broken(:\n    pass\n", false),
+            ("x = )\n", false),
+        ] {
+            assert_eq!(is_incomplete(source, "<stdin>"), expected, "{source:?}");
+        }
     }
 }

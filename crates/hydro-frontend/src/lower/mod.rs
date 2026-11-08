@@ -1241,6 +1241,22 @@ fn module_member(module: &'static ModuleSpec, name: &str) -> Option<ModuleMember
     }
 }
 
+/// The native submodule `parent.member` (`os.path`, `collections.abc`), if the
+/// stdlib table declares one.
+///
+/// Scans the module table instead of building the dotted name: attribute reads
+/// on native modules are frequent, and the table is the only source of nested
+/// specs.
+fn nested_module(parent: &str, member: &str) -> Option<&'static ModuleSpec> {
+    stdlib::MODULES.iter().copied().find(|module| {
+        module
+            .name
+            .strip_prefix(parent)
+            .and_then(|rest| rest.strip_prefix('.'))
+            == Some(member)
+    })
+}
+
 /// Kind of compiled artifact a lookup resolved.
 ///
 /// Both kinds are passed to codegen as a plain artifact path; the runtime
@@ -3171,8 +3187,12 @@ impl<'a> Lowerer<'a> {
 
         // 3. Module locals are known before we lower any function body; this
         //    lets us explain why a module-level name is not visible there.
+        //    Module imports are absent here on purpose: their statements emit
+        //    no IR in a unit that does not mirror its namespace, so an
+        //    import-only local slot would shadow the compile-time binding and
+        //    stay uninitialized in the entry module.
         let mut module_names = Vec::new();
-        collect_names(&module.body, &mut module_names, false);
+        collect_names(&module.body, &mut module_names, false, false);
         // A decorated function's binding is the decorator's result, so the
         // name needs an ordinary module local slot.
         for name in self.decorated_functions.keys() {
@@ -7833,7 +7853,7 @@ impl<'a> Lowerer<'a> {
         collect_scope_globals(decl.body, &mut scope_globals);
         let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
         let mut assigned = Vec::new();
-        collect_names(decl.body, &mut assigned, true);
+        collect_names(decl.body, &mut assigned, true, true);
         bound.extend(assigned);
         collect_import_bindings(decl.body, &mut bound);
         bound.retain(|name| !scope_globals.contains(name) && !nonlocal_names.contains(name));
@@ -9275,7 +9295,7 @@ impl<'a> Lowerer<'a> {
     /// registered, so `await`/`yield` lowering only has to read them.
     fn lower_function_body(&mut self, fid: FunctionId, body: &[ast::Stmt]) -> Vec<HStmt> {
         let mut names = Vec::new();
-        collect_names(body, &mut names, true);
+        collect_names(body, &mut names, true, true);
         // Assignment expressions inside generator expressions bind in this
         // scope; their closure cells are planned in
         // `create_function_with_captures`, which needs an actual slot here.
@@ -9500,7 +9520,7 @@ impl<'a> Lowerer<'a> {
         // Names that belong to the nested function itself never become
         // captures: parameters and everything `collect_names` sees as a local.
         let mut nested_names = Vec::new();
-        collect_names(decl.body, &mut nested_names, true);
+        collect_names(decl.body, &mut nested_names, true, true);
         let mut nested_locals: HashSet<String> = nested_names.into_iter().collect();
         // An assignment expression inside a generator expression in this body
         // binds in this function, not in the enclosing one, so it must not be
@@ -18668,14 +18688,15 @@ impl<'a> Lowerer<'a> {
             ast::Expr::Attribute(a) => {
                 if let Some(module) = self.resolve_module_chain(&a.value, fs) {
                     let member = a.attr.as_str();
+                    // A nested native module (`os.path`, `collections.abc`)
+                    // is itself a first-class module value. It must win over
+                    // the parent's `python_source_module` fallback, which would
+                    // otherwise read it as a plain attribute of the parent.
+                    if let Some(spec) = nested_module(module.name, member) {
+                        return self.module_ref_expr(spec.name, line, col);
+                    }
                     if let Some(expr) = self.module_spec_attr_expr(module, member, line, col) {
                         return expr;
-                    }
-                    // A nested native module (`os.path`, `collections.abc`)
-                    // is itself a first-class module value.
-                    let nested = format!("{}.{}", module.name, member);
-                    if let Some(spec) = stdlib::module(&nested) {
-                        return self.module_ref_expr(spec.name, line, col);
                     }
                     self.error_unknown_member(a.range, module, member);
                     return self.error_expr(e.range());
@@ -21858,20 +21879,46 @@ impl<'a> Lowerer<'a> {
             };
         }
 
-        if !fs.is_module && self.module_local_names.contains(name) {
-            self.error_at_code(
-                call.range,
-                codes::NAME,
-                format!("name '{name}' is not visible inside a function; pass it as a parameter"),
-            );
-        } else {
-            self.error_name(
-                name_expr.range,
-                name,
-                fs,
-                format!("name '{name}' is not defined"),
-            );
+        if !fs.is_module {
+            if self.module_local_names.contains(name) {
+                // A module local a function cannot see stays a compile-time
+                // scope error worth reporting statically.
+                self.error_at_code(
+                    call.range,
+                    codes::NAME,
+                    format!(
+                        "name '{name}' is not visible inside a function; pass it as a parameter"
+                    ),
+                );
+                return self.error_expr(call.range);
+            }
+            // A callee that resolves to nothing in a *function* body is a
+            // runtime `LOAD_GLOBAL`: CPython raises `NameError` only when the
+            // call executes, and the name may be installed at runtime
+            // (`globals()[...]`, a decorator, `exec`, or a module-level
+            // `global` write from another function). Read it from the module's
+            // global table and call the value through the runtime protocol.
+            self.used_globals.insert(name.to_string());
+            let (callee_line, callee_col) = self.span(name_expr.range);
+            let callee = HExpr {
+                kind: HExprKind::GlobalGet {
+                    module: self.dunder_name.clone(),
+                    name: name.to_string(),
+                },
+                ty: Ty::Concrete(Type::Any),
+                line: callee_line,
+                col: callee_col,
+            };
+            return self.lower_dynamic_callee_call(callee, call, fs, line, col);
         }
+        // A module body's whole namespace is statically known, so a typo there
+        // keeps its compile-time diagnostic.
+        self.error_name(
+            name_expr.range,
+            name,
+            fs,
+            format!("name '{name}' is not defined"),
+        );
         self.error_expr(call.range)
     }
 
@@ -22627,27 +22674,51 @@ impl<'a> Lowerer<'a> {
         }
 
         let mut args = Vec::with_capacity(fixed);
+        let mut missing_positional: Vec<String> = Vec::new();
+        let mut missing_keyword_only: Vec<String> = Vec::new();
         for (index, slot) in slots.into_iter().enumerate() {
-            let (name, default, _) = &signature.params[index + 1];
+            let (name, default, kind) = &signature.params[index + 1];
             match slot {
                 Some(value) => args.push(value),
-                None => match default.clone() {
-                    Some(default) => args.push(HExpr {
-                        kind: HExprKind::Const(default),
-                        ty: Ty::Concrete(Type::Any),
-                        line,
-                        col,
-                    }),
-                    None => {
-                        self.error_at_code(
-                            call.range,
-                            codes::CALL,
-                            format!("{class}() missing required argument '{name}'"),
-                        );
-                        return None;
+                None => {
+                    // A source-level default is stored as the expression the
+                    // definition evaluated, exactly like the direct
+                    // function-call binder; the literal fallback covers
+                    // synthesized signatures (a dataclass field's non-literal
+                    // default is a `None` placeholder its body replaces).
+                    if let Some(expression) = signature
+                        .default_exprs
+                        .get(index + 1)
+                        .and_then(|expression| expression.clone())
+                    {
+                        args.push(expression);
+                        continue;
                     }
-                },
+                    match default.clone() {
+                        Some(default) => args.push(HExpr {
+                            kind: HExprKind::Const(default),
+                            ty: Ty::Concrete(Type::Any),
+                            line,
+                            col,
+                        }),
+                        None => {
+                            if *kind == ParamKind::KwOnly {
+                                missing_keyword_only.push(name.clone());
+                            } else {
+                                missing_positional.push(name.clone());
+                            }
+                        }
+                    }
+                }
             }
+        }
+        // Report every missing required argument at once, in signature order,
+        // with CPython's wording.
+        if let Some(message) =
+            missing_arguments_message(class, &missing_positional, &missing_keyword_only)
+        {
+            self.error_at_code(call.range, codes::CALL, message);
+            return None;
         }
         Some(args)
     }
@@ -22810,7 +22881,9 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        // Fill positional and keyword-only slots with their literal defaults.
+        // Fill positional and keyword-only slots with their defaults.
+        let mut missing_positional: Vec<String> = Vec::new();
+        let mut missing_keyword_only: Vec<String> = Vec::new();
         for (index, (name, default, kind)) in params.iter().enumerate() {
             if !kind.is_positional() && *kind != ParamKind::KwOnly {
                 continue;
@@ -22827,12 +22900,12 @@ impl<'a> Lowerer<'a> {
                 continue;
             }
             let Some(default) = default.clone() else {
-                self.error_at_code(
-                    call.range,
-                    codes::CALL,
-                    format!("{class}() missing required argument '{name}'"),
-                );
-                return None;
+                if *kind == ParamKind::KwOnly {
+                    missing_keyword_only.push(name.clone());
+                } else {
+                    missing_positional.push(name.clone());
+                }
+                continue;
             };
             slots[index] = Some(HExpr {
                 kind: HExprKind::Const(default),
@@ -22840,6 +22913,14 @@ impl<'a> Lowerer<'a> {
                 line,
                 col,
             });
+        }
+        // Report every missing required argument at once, in signature order,
+        // with CPython's wording.
+        if let Some(message) =
+            missing_arguments_message(class, &missing_positional, &missing_keyword_only)
+        {
+            self.error_at_code(call.range, codes::CALL, message);
+            return None;
         }
 
         // Explicit keyword names that bind no parameter belong to the
@@ -26561,7 +26642,7 @@ fn missing_arguments_message(
         } else {
             "arguments"
         };
-        format!("{} {noun} {label}: {rendered}", names.len())
+        format!("{} required {label} {noun}: {rendered}", names.len())
     }
 
     let mut groups = Vec::new();
@@ -26574,7 +26655,25 @@ fn missing_arguments_message(
     (!groups.is_empty()).then(|| format!("{callable}() missing {}", groups.join(" and ")))
 }
 
-fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool) {
+/// Names bound by `stmts` in the current scope.
+///
+/// `include_defs` binds nested `def` names (true for function bodies, false for
+/// the module body, where functions live in the function table).
+///
+/// `include_bindings` adds `del name` targets, which CPython's symbol table
+/// binds in the scope (a nested `nonlocal frame` must find a `del frame`). The
+/// module body passes false: module imports resolve through the compile-time
+/// binding tables and a module-level `del` targets the runtime global
+/// namespace. Import bindings are never reported here; callers that need them
+/// add them from `collect_import_bindings`, because a local slot for an
+/// import-only name would shadow the static binding while the import
+/// statement itself emits no IR in a unit that does not mirror its namespace.
+fn collect_names(
+    stmts: &[ast::Stmt],
+    out: &mut Vec<String>,
+    include_defs: bool,
+    include_bindings: bool,
+) {
     for stmt in stmts {
         match stmt {
             ast::Stmt::FunctionDef(s) => {
@@ -26608,60 +26707,43 @@ fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool)
                     out.push(name.id.to_string());
                 }
             }
-            // `import x as y` binds `y` in the current scope, and `del name`
-            // is a binding operation too: both make the name local, exactly
-            // like CPython's symbol table (`del frame` in a function makes
-            // `frame` local, so a nested `nonlocal frame` finds it).
-            ast::Stmt::Import(s) => {
-                for alias in &s.names {
-                    let bound = alias.asname.as_ref().map_or_else(
-                        || alias.name.split('.').next().unwrap_or(alias.name.as_str()),
-                        |asname| asname.as_str(),
-                    );
-                    out.push(bound.to_string());
-                }
-            }
-            ast::Stmt::ImportFrom(s) => {
-                for alias in &s.names {
-                    if alias.name.as_str() == "*" {
-                        continue;
-                    }
-                    let bound = alias
-                        .asname
-                        .as_ref()
-                        .map_or_else(|| alias.name.as_str(), |asname| asname.as_str());
-                    out.push(bound.to_string());
-                }
-            }
-            ast::Stmt::Delete(s) => {
+            // `del name` is a binding operation: CPython's symbol table makes
+            // the name local, so `del frame` in a function lets a nested
+            // `nonlocal frame` find it. Imports are *not* collected here even
+            // though `import x as y` also binds `y`: every caller that needs
+            // the import bindings adds them from `collect_import_bindings`,
+            // and a module body must never give an import-only name a local
+            // slot (its import statement emits no IR, so the slot would shadow
+            // the compile-time binding and stay uninitialized).
+            ast::Stmt::Delete(s) if include_bindings => {
                 for target in &s.targets {
                     collect_target_names(target, out);
                 }
             }
             ast::Stmt::For(s) => {
                 collect_target_names(&s.target, out);
-                collect_names(&s.body, out, include_defs);
-                collect_names(&s.orelse, out, include_defs);
+                collect_names(&s.body, out, include_defs, include_bindings);
+                collect_names(&s.orelse, out, include_defs, include_bindings);
             }
             ast::Stmt::While(s) => {
-                collect_names(&s.body, out, include_defs);
-                collect_names(&s.orelse, out, include_defs);
+                collect_names(&s.body, out, include_defs, include_bindings);
+                collect_names(&s.orelse, out, include_defs, include_bindings);
             }
             ast::Stmt::If(s) => {
-                collect_names(&s.body, out, include_defs);
-                collect_names(&s.orelse, out, include_defs);
+                collect_names(&s.body, out, include_defs, include_bindings);
+                collect_names(&s.orelse, out, include_defs, include_bindings);
             }
             ast::Stmt::Try(s) => {
-                collect_names(&s.body, out, include_defs);
+                collect_names(&s.body, out, include_defs, include_bindings);
                 for handler in &s.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
                     if let Some(name) = &h.name {
                         out.push(name.to_string());
                     }
-                    collect_names(&h.body, out, include_defs);
+                    collect_names(&h.body, out, include_defs, include_bindings);
                 }
-                collect_names(&s.orelse, out, include_defs);
-                collect_names(&s.finalbody, out, include_defs);
+                collect_names(&s.orelse, out, include_defs, include_bindings);
+                collect_names(&s.finalbody, out, include_defs, include_bindings);
             }
             ast::Stmt::With(s) => {
                 for item in &s.items {
@@ -26669,12 +26751,12 @@ fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool)
                         collect_target_names(target, out);
                     }
                 }
-                collect_names(&s.body, out, include_defs);
+                collect_names(&s.body, out, include_defs, include_bindings);
             }
             ast::Stmt::AsyncFor(s) => {
                 collect_target_names(&s.target, out);
-                collect_names(&s.body, out, include_defs);
-                collect_names(&s.orelse, out, include_defs);
+                collect_names(&s.body, out, include_defs, include_bindings);
+                collect_names(&s.orelse, out, include_defs, include_bindings);
             }
             ast::Stmt::AsyncWith(s) => {
                 for item in &s.items {
@@ -26682,25 +26764,25 @@ fn collect_names(stmts: &[ast::Stmt], out: &mut Vec<String>, include_defs: bool)
                         collect_target_names(target, out);
                     }
                 }
-                collect_names(&s.body, out, include_defs);
+                collect_names(&s.body, out, include_defs, include_bindings);
             }
             ast::Stmt::Match(s) => {
                 for case in &s.cases {
                     collect_pattern_binding_names(&case.pattern, out);
-                    collect_names(&case.body, out, include_defs);
+                    collect_names(&case.body, out, include_defs, include_bindings);
                 }
             }
             ast::Stmt::TryStar(s) => {
-                collect_names(&s.body, out, include_defs);
+                collect_names(&s.body, out, include_defs, include_bindings);
                 for handler in &s.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
                     if let Some(name) = &h.name {
                         out.push(name.to_string());
                     }
-                    collect_names(&h.body, out, include_defs);
+                    collect_names(&h.body, out, include_defs, include_bindings);
                 }
-                collect_names(&s.orelse, out, include_defs);
-                collect_names(&s.finalbody, out, include_defs);
+                collect_names(&s.orelse, out, include_defs, include_bindings);
+                collect_names(&s.finalbody, out, include_defs, include_bindings);
             }
             _ => {}
         }
@@ -26941,7 +27023,7 @@ fn class_free_names(c: &ast::StmtClassDef) -> Vec<String> {
         walk_free_expr(decorator, &empty, &mut out, &mut seen);
     }
     let mut names = Vec::new();
-    collect_names(&c.body, &mut names, true);
+    collect_names(&c.body, &mut names, true, true);
     let mut bound: HashSet<String> = names.into_iter().collect();
     bound.extend(header_scope.iter().cloned());
     for stmt in &c.body {
@@ -26986,7 +27068,7 @@ fn function_free_names(body: &[ast::Stmt], args: &ast::Arguments) -> Vec<String>
         locals.insert(kwarg.arg.to_string());
     }
     let mut names = Vec::new();
-    collect_names(body, &mut names, true);
+    collect_names(body, &mut names, true, true);
     locals.extend(names);
     // An import binds the name in this scope, so it is not a free name of the
     // enclosing function (imports are resolved through the module tables).
