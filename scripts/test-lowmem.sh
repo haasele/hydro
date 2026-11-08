@@ -82,6 +82,8 @@ PID=$!
     done
 ) &
 WATCH=$!
+trap 'kill -TERM "$PID" 2>/dev/null || true; pkill -TERM -f "cargo nextest run" 2>/dev/null || true; rm -f "$RAW"' EXIT
+trap 'exit 130' INT TERM
 wait "$PID"
 STATUS=$?
 wait "$WATCH" 2>/dev/null || true
