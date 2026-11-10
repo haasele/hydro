@@ -1509,11 +1509,9 @@ fn deferred_checks_use_the_type_at_the_call_site() {
 }
 
 #[test]
-fn sum_start_and_enumerate_start_are_checked() {
-    assert_eq!(
-        check_errors("x = sum([1, 2], 'x')\n"),
-        vec!["sum() start argument must be a number, not str"]
-    );
+fn sum_start_is_runtime_typed_and_enumerate_start_is_checked() {
+    assert!(check_errors("x = sum([[1], [2]], [])\n").is_empty());
+    assert!(check_errors("x = sum([1, 2], 'x')\n").is_empty());
     assert_eq!(
         check_errors("x = enumerate([1], 'x')\n"),
         vec!["enumerate() start argument must be int, not str"]

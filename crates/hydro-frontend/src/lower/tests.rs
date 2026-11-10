@@ -15475,6 +15475,14 @@ fn class_keywords_with_an_explicit_metaclass_are_forwarded() {
 }
 
 #[test]
+fn format_builtin_defaults_the_specification() {
+    // CPython: `format(value, format_spec='')`.
+    let source = "x = format(7)\n";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
 fn super_init_accepts_any_receiver_parameter_name() {
     // CPython does not require the receiver to be called `self`.
     let source = "\

@@ -3853,17 +3853,18 @@ impl<'a> Checker<'a> {
                 // The spec is a `str` in either case: a static literal for the
                 // common path, a runtime expression when the f-string spec has
                 // nested replacement fields.
-                if !(2..=3).contains(&count) {
+                if !(1..=3).contains(&count) {
                     self.error_code(
                         line,
                         col,
                         codes::CALL,
-                        format!("format() takes 2 arguments ({count} given)"),
+                        format!("format() takes 1 to 3 arguments ({count} given)"),
                     );
                     return;
                 }
-                let (ty, arg_line, arg_col) = args[1];
-                match self.inf.resolve(ty) {
+                if count >= 2 {
+                    let (ty, arg_line, arg_col) = args[1];
+                    match self.inf.resolve(ty) {
                     Ty::Var(_) => {
                         let _ = self.inf.unify(ty, Ty::Concrete(Type::Str));
                     }
@@ -3879,6 +3880,7 @@ impl<'a> Checker<'a> {
                         arg_col,
                         format!("format() argument 2 must be str, not {}", t.name()),
                     ),
+                }
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Str));
             }
@@ -4264,20 +4266,8 @@ impl<'a> Checker<'a> {
                         self.error(arg_line, arg_col, "sum() argument must be iterable")
                     }
                 }
-                if let Some((ty, arg_line, arg_col)) = args.get(1) {
-                    match self.inf.resolve(*ty) {
-                        Ty::Concrete(t) if t.is_numeric() || t == Type::Any || t == Type::Never => {
-                        }
-                        Ty::Var(_) => {
-                            let _ = self.inf.unify(*ty, Ty::Concrete(Type::Int));
-                        }
-                        Ty::Concrete(t) => self.error(
-                            *arg_line,
-                            *arg_col,
-                            format!("sum() start argument must be a number, not {}", t.name()),
-                        ),
-                    }
-                }
+                // CPython accepts any start value (`sum([[1], [2]], [])`
+                // concatenates lists); the addition is checked at runtime.
                 let result = if range_input { Type::Int } else { Type::Any };
                 let _ = self.inf.unify(out, Ty::Concrete(result));
             }
