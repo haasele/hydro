@@ -300,6 +300,10 @@ pub(crate) enum FunctionBody {
     /// Native bound method (`obj.method` without a call). The receiver is a
     /// traced GC edge; keyword arguments are not supported by this value form.
     BoundMethod { receiver: i64, method: String },
+    /// `_GeneratorContextManager.__call__(func)`: a decorator wrapper that
+    /// enters the context manager, calls `function`, and exits it. Both the
+    /// manager and the decorated function are traced GC edges.
+    ContextFunction { manager: i64, function: i64 },
     /// Identity callable used by `functools.cache` and by the decorator value
     /// returned from `lru_cache`: returns its single argument. Holds no Hydro
     /// values.
@@ -7732,6 +7736,7 @@ pub(crate) fn partial_new_with_keywords(
             | FunctionBody::Host { .. }
             | FunctionBody::Hna { .. }
             | FunctionBody::Partial { .. }
+            | FunctionBody::ContextFunction { .. }
             | FunctionBody::Identity
             | FunctionBody::Exec { .. }
             | FunctionBody::AttributeGetter { .. }
@@ -7877,6 +7882,7 @@ pub(crate) fn function_has_attributes(function: i64) -> bool {
             FunctionBody::Wrapper { .. }
                 | FunctionBody::Host { .. }
                 | FunctionBody::Partial { .. }
+                | FunctionBody::ContextFunction { .. }
                 | FunctionBody::Identity
                 | FunctionBody::Exec { .. }
         ),
@@ -8082,6 +8088,23 @@ pub(crate) fn bound_method_new(receiver: i64, method: String) -> i64 {
             },
             arity: usize::MAX,
             name: method,
+            flags: 0,
+            full_entry: 0,
+            signature: Vec::new(),
+            metadata: FunctionMetadata::default(),
+            params: Vec::new(),
+        }),
+    )
+}
+
+/// Allocates the callable returned by `_GeneratorContextManager.__call__`.
+pub(crate) fn context_function_new(manager: i64, function: i64) -> i64 {
+    alloc(
+        KIND_FUNCTION,
+        ObjData::Function(FunctionObj {
+            body: FunctionBody::ContextFunction { manager, function },
+            arity: usize::MAX,
+            name: "contextmanager".to_string(),
             flags: 0,
             full_entry: 0,
             signature: Vec::new(),

@@ -5507,6 +5507,7 @@ pub static CONTEXTLIB: ModuleSpec = ModuleSpec {
         f("_nullcontext_enter", 1, 1, Type::Any),
         f("_nullcontext_exit", 4, 4, Type::Bool),
         kw_dynamic("_contextmanager_call", 1, usize::MAX, Type::Any, &[]),
+        f("_contextmanager_decorate", 2, 2, Type::Any),
         f("_contextmanager_enter", 1, 1, Type::Any),
         f("_contextmanager_exit", 4, 4, Type::Bool),
         // `closing(thing)`: a context manager whose `__exit__` closes the
@@ -9022,7 +9023,11 @@ mod tests {
         assert_eq!(call.min_args, 1);
         assert_eq!(call.max_args, usize::MAX);
         assert!(call.dynamic_keywords);
-        for (name, arity) in [("_contextmanager_enter", 1), ("_contextmanager_exit", 4)] {
+        for (name, arity) in [
+            ("_contextmanager_decorate", 2),
+            ("_contextmanager_enter", 1),
+            ("_contextmanager_exit", 4),
+        ] {
             let spec = function("contextlib", name).expect(name);
             assert_eq!((spec.min_args, spec.max_args), (arity, arity));
         }

@@ -43,9 +43,13 @@ initial state of the first runnable core.
 - `sys.float_repr_style`, `sys.gettotalrefcount`/`getobjects` probes and the
   private `opcode` tables (`_inline_cache_entries`, `opmap`, `opname`) now
   resolve far enough for guarded support code to compile and run.
+- `_GeneratorContextManager.__call__` works as a decorator, entering the
+  context around the decorated function and binding `self` for methods; format
+  specs reject oversized fields and invalid comma/type combinations like
+  CPython.
 - C3 class construction, `super()` defining-class tracking, regex flags
   (`re.U` implied for `str` patterns) and the workspace clippy/fmt gates are
-  green. Canonical workspace count: 3256 tests run, 1 skipped.
+  green. Canonical workspace count: 3257 tests run, 1 skipped.
 
 ### Compatibility — `__class__`
 

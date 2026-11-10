@@ -228,6 +228,7 @@ fn start_spawn(process: &ProcessState) -> Result<(), String> {
         | FunctionBody::MethodCaller { .. }
         | FunctionBody::Partial { .. }
         | FunctionBody::BoundMethod { .. }
+        | FunctionBody::ContextFunction { .. }
         | FunctionBody::Host { .. }
         | FunctionBody::Hna { .. }
         | FunctionBody::Identity

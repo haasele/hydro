@@ -371,6 +371,7 @@ fn validate_callable(function: i64) -> Result<(), String> {
         | value::FunctionBody::MethodCaller { .. }
         | value::FunctionBody::Partial { .. }
         | value::FunctionBody::BoundMethod { .. }
+        | value::FunctionBody::ContextFunction { .. }
         | value::FunctionBody::Host { .. }
         | value::FunctionBody::Hna { .. }
         | value::FunctionBody::Identity

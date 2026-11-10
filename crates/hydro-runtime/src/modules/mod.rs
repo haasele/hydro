@@ -9670,6 +9670,13 @@ fn contextlib_call(function: &str, args: &[i64]) -> i64 {
                 "contextlib._contextmanager_call() missing the decorated function",
             ),
         },
+        "_contextmanager_decorate" => match args {
+            [manager, function] => value::context_function_new(*manager, *function),
+            _ => exc::raise_with_message(
+                TYPE_ERROR,
+                "_GeneratorContextManager.__call__() takes exactly 2 arguments",
+            ),
+        },
         "_contextmanager_enter" => contextmanager_enter(args[0]),
         "_contextmanager_exit" => contextmanager_exit(args[0], args[1], args[2], args[3]),
         "closing" => closing_new(args[0]),
@@ -10158,6 +10165,38 @@ fn contextmanager_wrap(function: i64, args: &[i64], keywords: &[(String, i64)]) 
     manager
 }
 
+/// Runs a `_GeneratorContextManager` used as a decorator: enter the context,
+/// call the decorated function, then exit (including exception suppression).
+pub(crate) fn contextmanager_run(
+    manager: i64,
+    function: i64,
+    argc: usize,
+    argv: *const i64,
+) -> i64 {
+    let _ = contextmanager_enter(manager);
+    if exc::pending() {
+        return NONE;
+    }
+    let result = crate::core::builtins::call(function, argc, argv);
+    if exc::pending() {
+        let error = exc::pending_value();
+        exc::clear();
+        let exit = contextmanager_exit(manager, NONE, error, NONE);
+        if exc::pending() {
+            return NONE;
+        }
+        if value::truthy(exit) {
+            return NONE;
+        }
+        return exc::raise_value(error);
+    }
+    let _ = contextmanager_exit(manager, NONE, NONE, NONE);
+    if exc::pending() {
+        return NONE;
+    }
+    result
+}
+
 /// The cached `_GeneratorContextManager` class returned by the
 /// `contextmanager` decorator.
 fn context_manager_class() -> i64 {
@@ -10167,11 +10206,13 @@ fn context_manager_class() -> i64 {
     }
     let enter = value::native_function_new("contextlib", "_contextmanager_enter", 1);
     let exit = value::native_function_new("contextlib", "_contextmanager_exit", 4);
+    let call = value::native_function_new("contextlib", "_contextmanager_decorate", 2);
     let methods = vec![
         ("__enter__".to_string(), enter),
         ("__exit__".to_string(), exit),
+        ("__call__".to_string(), call),
     ];
-    let method_roots = heap::root_values(&[enter, exit]);
+    let method_roots = heap::root_values(&[enter, exit, call]);
     let class = value::class_new("_GeneratorContextManager".to_string(), NONE, methods);
     let class_roots = heap::root_values(std::slice::from_ref(&class));
     crate::core::globals::registry_set(KEY, class);
@@ -15186,6 +15227,7 @@ fn spawn_arity_error(function: i64, argc: usize) -> Option<String> {
         // HNA functions store `min_args` in `arity`.
         value::FunctionBody::Hna { .. } => (func.arity != argc)
             .then(|| format!("function takes {} arguments ({argc} given)", func.arity)),
+        value::FunctionBody::ContextFunction { .. } => None,
         // Getter and identity callables also have an exact arity; a partial
         // validates the combined argument list when it calls its target.
         value::FunctionBody::AttributeGetter { .. }

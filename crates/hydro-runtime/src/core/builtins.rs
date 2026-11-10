@@ -2075,6 +2075,9 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
         FunctionBody::BoundMethod { receiver, method } => {
             crate::core::methods::call(*receiver, method.as_ptr(), method.len(), argc, argv)
         }
+        FunctionBody::ContextFunction { manager, function } => {
+            crate::modules::contextmanager_run(*manager, *function, argc, argv)
+        }
         FunctionBody::Builtin(builtin) => call_builtin(*builtin, argc, argv),
         FunctionBody::AttributeGetter { names } => attribute_getter_call(names, argc, argv),
         FunctionBody::ItemGetter { keys } => item_getter_call(keys, argc, argv),
@@ -7569,10 +7572,32 @@ pub(crate) fn format_builtin(value: i64, spec: i64, conversion: u8) -> i64 {
             ),
         );
     };
+    if let Some(message) = invalid_format_spec(spec_text) {
+        return exc::raise_with_message(VALUE_ERROR, &message);
+    }
     match format::format_value(value, spec_text, conversion) {
         Ok(text) => value::str_alloc(text),
         Err(error) => exc::raise_with_message(error.tag, &error.message),
     }
+}
+
+/// Rejects the CPython-specific invalid format-spec cases: widths/precisions
+/// too large for the C `long` parser and thousands separators incompatible
+/// with `x`/`X`/`o`/`b`/`n`/`s`.
+fn invalid_format_spec(spec: &str) -> Option<String> {
+    if spec.contains(',') {
+        if let Some(last) = spec.chars().last() {
+            if matches!(last, 'x' | 'X' | 'o' | 'b' | 'n' | 's') {
+                return Some(format!("Cannot specify ',' with '{last}'."));
+            }
+        }
+    }
+    for run in spec.split(|c: char| !c.is_ascii_digit()) {
+        if run.len() > 19 && run.parse::<u64>().is_err() {
+            return Some("format specifier field is too large".to_string());
+        }
+    }
+    None
 }
 
 /// `isinstance(value, target)`: `target` is a native type (an `int`, `float`,

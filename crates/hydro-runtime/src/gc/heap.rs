@@ -3860,6 +3860,10 @@ unsafe fn trace(addr: usize) {
                                 mark_value(*value);
                             }
                         }
+                        FunctionBody::ContextFunction { manager, function } => {
+                            mark_value(*manager);
+                            mark_value(*function);
+                        }
                         FunctionBody::BoundMethod { receiver, .. } => {
                             mark_value(*receiver);
                         }

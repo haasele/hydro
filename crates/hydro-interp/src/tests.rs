@@ -81,6 +81,28 @@ assert seen == {'name': 'test'}
 }
 
 #[test]
+fn contextmanager_object_is_a_decorator() {
+    run_source(
+        "\
+import contextlib
+@contextlib.contextmanager
+def cm():
+    yield
+@cm()
+def f():
+    return 3
+assert f() == 3
+class T:
+    @cm()
+    def m(self):
+        return self
+t = T()
+assert t.m() is t
+",
+    );
+}
+
+#[test]
 fn zero_argument_float_constructor() {
     run_source("assert float() == 0.0\n");
 }

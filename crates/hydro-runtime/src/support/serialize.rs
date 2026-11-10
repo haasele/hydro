@@ -240,6 +240,7 @@ fn encode_value(
             | FunctionBody::MethodCaller { .. }
             | FunctionBody::Partial { .. }
             | FunctionBody::BoundMethod { .. }
+            | FunctionBody::ContextFunction { .. }
             | FunctionBody::Host { .. }
             | FunctionBody::Hna { .. }
             | FunctionBody::Identity
@@ -697,6 +698,7 @@ mod tests {
             | crate::value::FunctionBody::MethodCaller { .. }
             | crate::value::FunctionBody::Partial { .. }
             | crate::value::FunctionBody::BoundMethod { .. }
+            | crate::value::FunctionBody::ContextFunction { .. }
             | crate::value::FunctionBody::Host { .. }
             | crate::value::FunctionBody::Hna { .. }
             | crate::value::FunctionBody::Identity
