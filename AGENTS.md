@@ -252,23 +252,15 @@ python3 scripts/check_benchmarks.py
 - Do not change contracts (IR/ABI) on your own authority; report deviations.
 - The orchestrator builds, tests, formats and dispatches fix-ups.
 
-## Recent milestones (2026-10-25)
+## Recent milestones (2026-11-10)
 
 See `CHANGELOG.md` for details; this is only the resume pointer.
 
-- BigInt exact integers (tagged i64 fast path + heap promotion) across IR,
-  ABI, arithmetic, formatting, JSON, keys and HYD1 serialization.
-- Implicit `__context__` exception chaining with `__suppress_context__`;
-  tracebacks render "During handling ..." deepest-first.
-- CLI `--verbose`/`--quiet` (conflicts exit 2), phase timings/cache decisions,
-  multi-character semantic spans and an ICE classification test; diagnostic
-  catalog (`docs/DIAGNOSTICS.md`) and manpage refreshed.
-- Deterministic container/GC property tests (SplitMix64 models, no new deps)
-  and dependency-free fuzz smoke tests for the frontend and runtime ABI.
-- Same-host AOT reproducibility lives in the Tea repository
-  (Tea repository: `docs/REPRODUCIBLE.md`, `scripts/repro_check.sh`).
-- Hyperfine adapter, engine comparison, explicit threshold `--check` +
-  deterministic gate tests, non-blocking CI threshold report, tag-driven
-  `release.yml` for Linux x64.
-- Stdlib import matrix advanced to 60/297 (html/contextlib included); full
-  `bench_all.py` runs under Hydro with a raised GC threshold.
+- Stdlib import matrix is **288/288 CPython-comparable modules**; the nine
+  remaining failures also fail under CPython 3.14.9 on this host.
+- Function-local native imports now shadow module aliases, `math` covers the
+  CPython 3.14 scalar/iterable surface, and `opcode`/`code`/`tty` resolve to
+  their pure CPython modules; `ast` exposes its compile flags through `_ast`.
+- Workspace gate: **3259 tests run (3259 passed, 1 skipped)**; clippy and fmt
+  are clean. The current report set is regenerated in
+  `benchmarks/compat/latest.json` and `docs/COMPATIBILITY.md`.
