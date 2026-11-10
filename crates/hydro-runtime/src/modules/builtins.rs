@@ -194,14 +194,11 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "id" => id_value(args[0]),
         "dir" => dir(args),
         "vars" => vars(args),
-        "globals" | "locals" => exc::raise_with_message(
-            RUNTIME_ERROR,
-            &format!("{function}() is not supported: Hydro has no frame namespace"),
-        ),
-        "compile" => exc::raise_with_message(
-            NOT_IMPLEMENTED_ERROR,
-            "compile() is not supported: Hydro has no bytecode compiler",
-        ),
+        "globals" => {
+            core_builtins::call_builtin(Builtin::Globals, args.len(), args.as_ptr())
+        }
+        "locals" => core_builtins::call_builtin(Builtin::Locals, args.len(), args.as_ptr()),
+        "compile" => core_builtins::call_builtin(Builtin::Compile, args.len(), args.as_ptr()),
         "issubclass" => core_builtins::call_builtin(Builtin::Issubclass, args.len(), args.as_ptr()),
         _ => missing_attribute(function),
     }

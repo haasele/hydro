@@ -533,7 +533,8 @@ fn regex_compile_pattern_methods_and_escape() {
 fn regex_errors_are_python_exceptions() {
     hydro_runtime_init();
     module("re", "search", &[text("("), text("text")]);
-    expect_error(VALUE_ERROR);
+    // CPython 3.14 raises re.PatternError (tag 12), not ValueError.
+    expect_error(12);
     module("re", "search", &[text("a"), int(1)]);
     expect_error(TYPE_ERROR);
 }

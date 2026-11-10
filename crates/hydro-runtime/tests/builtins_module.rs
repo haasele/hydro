@@ -217,8 +217,9 @@ fn unsupported_names_raise_tagged_errors() {
     let source = text("1 + 1");
     let filename = text("<test>");
     let mode = text("eval");
-    let _ = module("builtins", "compile", &[source, filename, mode]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
+    let code = module("builtins", "compile", &[source, filename, mode]);
+    assert_no_error();
+    assert_ne!(code, hydro_none());
 
     // `type(name, bases, dict)` is a real class constructor through the
     // `builtins` module as well as through a first-class `type` value.

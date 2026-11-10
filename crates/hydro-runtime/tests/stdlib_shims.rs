@@ -177,16 +177,18 @@ fn imp_unsupported_operations_raise_tagged_errors() {
 fn opcode_exposes_only_the_specialization_flags() {
     let _guard = test_guard();
     hydro_runtime_init();
-    assert_int(module_get("_opcode", "ENABLE_SPECIALIZATION"), 0);
-    assert_int(module_get("_opcode", "ENABLE_SPECIALIZATION_FT"), 0);
+    assert_int(module_get("_opcode", "ENABLE_SPECIALIZATION"), 1);
+    assert_int(module_get("_opcode", "ENABLE_SPECIALIZATION_FT"), 1);
 
-    // `stack_effect` exists for CPython 3.14's `opcode.py` import surface but
-    // Hydro has no bytecode, so calling it must fail explicitly.
+    // `stack_effect` exposes the real CPython 3.14 table: opcode 1 is
+    // BINARY_SLICE (-2) and opcode 31 is POP_TOP (-1). Verified against the
+    // 3.14.9 reference interpreter (`_opcode.stack_effect`).
     let stack_effect = module_get("_opcode", "stack_effect");
     assert_no_error();
     assert!(hydro_binop(OP_IS, stack_effect, hydro_none()) == hydro_false());
-    let _ = module("_opcode", "stack_effect", &[int(1)]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
+    let effect = module("_opcode", "stack_effect", &[int(1)]);
+    assert_int(effect, -2);
+    assert_int(module("_opcode", "stack_effect", &[int(31)]), -1);
 }
 
 // -------------------------------------------------------------------------

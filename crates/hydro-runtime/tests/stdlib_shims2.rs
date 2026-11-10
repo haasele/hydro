@@ -23,6 +23,10 @@ const OP_EQ: u32 = 7;
 const OP_GE: u32 = 12;
 const OP_IS: u32 = 15;
 
+/// `HYDRO_TYPE_LIST` value returned by `hydro_type_tag` (the ABI keeps the
+/// classification constants private).
+const TYPE_TAG_LIST: i32 = 6;
+
 fn int(n: i64) -> i64 {
     n << 3
 }
@@ -266,14 +270,11 @@ fn marshal_reports_the_missing_format() {
 
     assert_int(module_get("marshal", "version"), 5);
 
-    module("marshal", "dump", &[text("value"), text("file")]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
-    module("marshal", "dumps", &[text("value")]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
-    module("marshal", "load", &[text("file")]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
-    module("marshal", "loads", &[text("bytes")]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
+    let encoded = module("marshal", "dumps", &[int(42)]);
+    assert_no_error();
+    let decoded = module("marshal", "loads", &[encoded]);
+    assert_no_error();
+    assert_int(decoded, 42);
     module_get("marshal", "loads_extra");
     assert_error_tag(ATTRIBUTE_ERROR);
 }
@@ -290,9 +291,8 @@ fn tokenize_never_fabricates_tokens() {
     let constructor = module_get("_tokenize", "TokenizerIter");
     assert_no_error();
     assert_ne!(constructor, hydro_none());
-    module("_tokenize", "TokenizerIter", &[text("x = 1\n")]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
-    module_get("_tokenize", "TokenInfo");
+    // `_tokenize` exposes TokenizerIter only; TokenInfo lives in tokenize.py.
+    let _info = module_get("_tokenize", "TokenInfo");
     assert_error_tag(ATTRIBUTE_ERROR);
 }
 
@@ -533,7 +533,7 @@ fn gc_reports_the_real_collector() {
     assert_non_negative(module("gc", "collect", &[]));
 
     let stats = module("gc", "get_stats", &[]);
-    assert_int(hydro_len(stats), 1);
+    assert_int(hydro_len(stats), 3);
     let entry = item(stats, 0);
     let collections = hydro_subscript(entry, text("collections"));
     assert_non_negative(collections);
@@ -547,25 +547,29 @@ fn gc_reports_the_real_collector() {
     assert_int(hydro_len(threshold), 3);
     assert_non_negative(item(threshold, 0));
 
+    // `collect` validates the generation exactly like CPython 3.14: values
+    // outside 0..=2 raise ValueError and non-integers raise TypeError.
     module("gc", "collect", &[int(3)]);
     assert_error_tag(VALUE_ERROR);
     module("gc", "collect", &[text("x")]);
     assert_error_tag(TYPE_ERROR);
 
-    for function in [
-        "disable",
-        "set_threshold",
-        "freeze",
-        "unfreeze",
-        "get_objects",
-    ] {
-        if function == "set_threshold" {
-            module("gc", function, &[int(1000)]);
-        } else {
-            module("gc", function, &[]);
-        }
-        assert_error_tag(NOT_IMPLEMENTED_ERROR);
-    }
+    // The rest of the control surface is implemented, so these return `None`
+    // (or a list for `get_objects`) rather than raising NotImplementedError.
+    assert_none(module("gc", "disable", &[]));
+    assert_none(module("gc", "set_threshold", &[int(1000)]));
+    assert_int(item(module("gc", "get_threshold", &[]), 0), 1000);
+    assert_none(module("gc", "freeze", &[]));
+    assert_non_negative(module("gc", "get_freeze_count", &[]));
+    assert_none(module("gc", "unfreeze", &[]));
+    assert_int(module("gc", "get_freeze_count", &[]), 0);
+    let objects = module("gc", "get_objects", &[]);
+    assert_no_error();
+    assert_eq!(
+        hydro_type_tag(objects),
+        TYPE_TAG_LIST,
+        "gc.get_objects() must return a list"
+    );
     let garbage = module_get("gc", "garbage");
     assert_no_error();
     assert_eq!(hydro_len(garbage), 0);

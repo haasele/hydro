@@ -52,15 +52,15 @@ fi
 
 CMD=(cargo nextest run --no-fail-fast --test-threads "$NEXTEST_TEST_THREADS" "$@")
 TIMEOUT_CMD=()
-if command -v timeout >/dev/null 2>&1; then
-    TIMEOUT_CMD=(timeout --foreground --kill-after=10s --signal=INT "${HYDRO_TEST_TIMEOUT:-300}s")
+if [[ -x /usr/bin/timeout ]]; then
+    TIMEOUT_CMD=(/usr/bin/timeout --foreground --kill-after=10s --signal=INT "${HYDRO_TEST_TIMEOUT:-300}s")
 fi
 RAW="$LOG.raw"
 MIN_AVAIL="${HYDRO_MIN_AVAIL_MB:-1500}"
 : > "$METRICS"
 RUN=()
-if command -v setsid >/dev/null 2>&1; then
-    RUN=(setsid)
+if [[ -x /usr/bin/setsid ]]; then
+    RUN=(/usr/bin/setsid)
 fi
 set +e
 "${RUN[@]}" "${TIMEOUT_CMD[@]}" "${CMD[@]}" >"$RAW" 2>&1 &
