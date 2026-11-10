@@ -148,7 +148,8 @@ type UdfDestroy = Option<UdfDestroyFn>;
 type ExecCallback =
     Option<unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int>;
 /// Collation comparison callback.
-type CollationCompare = Option<unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int>;
+type CollationCompare =
+    Option<unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int>;
 /// Authorizer callback.
 type AuthorizerCallback = Option<
     unsafe extern "C" fn(
@@ -1124,7 +1125,11 @@ fn init_connection(instance: i64, options: &ConnectOptions) -> Result<(), i64> {
     };
     set_cursor_attr(instance, "isolation_level", isolation);
     set_cursor_attr(instance, "in_transaction", FALSE);
-    set_cursor_attr(instance, "detect_types", ops::int_result(options.detect_types));
+    set_cursor_attr(
+        instance,
+        "detect_types",
+        ops::int_result(options.detect_types),
+    );
     set_cursor_attr(instance, "autocommit", ops::int_result(options.autocommit));
     set_cursor_attr(instance, "text_factory", text_factory_default());
     set_cursor_attr(instance, "row_factory", NONE);
@@ -1323,7 +1328,9 @@ fn bind_scalar(
         }
     } else if let Some(view) = value::as_memoryview(operand) {
         let Ok(bytes) = value::memoryview_bytes(view) else {
-            return Some(Err(value_error("operation forbidden on released memoryview object")));
+            return Some(Err(value_error(
+                "operation forbidden on released memoryview object",
+            )));
         };
         let Ok(length) = c_int::try_from(bytes.len()) else {
             return Some(Err(overflow_error("BLOB longer than INT_MAX bytes")));
@@ -1338,7 +1345,8 @@ fn bind_scalar(
                 transient(),
             )
         }
-    } else if let Some(bytes) = value::as_bytes(operand) {
+    } else {
+        let bytes = value::as_bytes(operand)?;
         let Ok(length) = c_int::try_from(bytes.len()) else {
             return Some(Err(overflow_error("BLOB longer than INT_MAX bytes")));
         };
@@ -1352,8 +1360,6 @@ fn bind_scalar(
                 transient(),
             )
         }
-    } else {
-        return None;
     };
     if status != SQLITE_OK {
         return Some(Err(raise_db_error(database)));
@@ -1601,9 +1607,7 @@ fn column_converter(
     }
     if detect_types & PARSE_DECLTYPES != 0 {
         if let Some(decltype) = column_decltype(statement, index) {
-            let end = decltype
-                .find(|character| character == ' ' || character == '(')
-                .unwrap_or(decltype.len());
+            let end = decltype.find([' ', '(']).unwrap_or(decltype.len());
             if let Some(converter) = dict_lookup(converters, &decltype[..end]) {
                 return Some(converter);
             }
@@ -1621,11 +1625,7 @@ fn column_bytes(statement: *mut Sqlite3Stmt, index: c_int) -> Vec<u8> {
 }
 
 /// Applies a registered converter to a column value.
-fn converted_column(
-    statement: *mut Sqlite3Stmt,
-    index: c_int,
-    converter: i64,
-) -> Result<i64, i64> {
+fn converted_column(statement: *mut Sqlite3Stmt, index: c_int, converter: i64) -> Result<i64, i64> {
     // SAFETY: the statement is live and positioned on a row.
     let kind = unsafe { sqlite3_column_type(statement, index) };
     if kind == SQLITE_NULL {
@@ -1729,7 +1729,8 @@ fn build_row(statement: *mut Sqlite3Stmt, connection: i64) -> Result<i64, i64> {
     let detect_types = value::instance_attr(connection, "detect_types")
         .and_then(value::as_integer)
         .unwrap_or(0);
-    let text_factory = value::instance_attr(connection, "text_factory").unwrap_or_else(text_factory_default);
+    let text_factory =
+        value::instance_attr(connection, "text_factory").unwrap_or_else(text_factory_default);
     let converters = converters_dict();
     let roots = heap::root_values(&[]);
     let mut values = Vec::with_capacity(columns as usize);

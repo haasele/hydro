@@ -20,9 +20,7 @@
 use std::ffi::CStr;
 use std::sync::{Mutex, MutexGuard};
 
-use crate::exc::{
-    self, ATTRIBUTE_ERROR, KEY_ERROR, OS_ERROR, TYPE_ERROR, VALUE_ERROR,
-};
+use crate::exc::{self, ATTRIBUTE_ERROR, KEY_ERROR, OS_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::heap;
 use crate::value;
 

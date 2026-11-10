@@ -2766,12 +2766,7 @@ extern "C" fn cache_info_getitem_entry(argv: *const i64) -> i64 {
     let fields = cache_info_fields(instance);
     let position = match value::as_integer(index) {
         Some(n) if n >= 0 && (n as usize) < fields.len() => n as usize,
-        _ => {
-            return exc::raise_with_message(
-                exc::INDEX_ERROR,
-                "_CacheInfo index out of range",
-            )
-        }
+        _ => return exc::raise_with_message(exc::INDEX_ERROR, "_CacheInfo index out of range"),
     };
     fields[position]
 }
@@ -2799,9 +2794,8 @@ extern "C" fn lru_cache_info_entry(argv: *const i64) -> i64 {
     let misses = instance_attribute(instance, LRU_MISSES).unwrap_or(NONE);
     let maxsize = instance_attribute(instance, "maxsize").unwrap_or(NONE);
     let cache = ensure_dict_attr(instance, LRU_CACHE);
-    let currsize = crate::core::ops::int_result(
-        value::as_dict(cache).map_or(0, |pairs| pairs.len() as i64),
-    );
+    let currsize =
+        crate::core::ops::int_result(value::as_dict(cache).map_or(0, |pairs| pairs.len() as i64));
     let values = heap::root_values(&[hits, misses, maxsize, currsize]);
     value::instance_setattr(info, "hits".to_string(), hits);
     value::instance_setattr(info, "misses".to_string(), misses);
@@ -2974,8 +2968,14 @@ fn lru_decorator_class() -> i64 {
         lru_decorator_call_entry,
         vec![self_parameter(), positional_parameter("func")],
     );
-    let methods: Vec<(String, i64, MethodKind)> = vec![("__call__".to_string(), call, MethodKind::Normal)];
-    let class = value::class_new_full("_lru_cache_decorator".to_string(), NONE, methods, Vec::new());
+    let methods: Vec<(String, i64, MethodKind)> =
+        vec![("__call__".to_string(), call, MethodKind::Normal)];
+    let class = value::class_new_full(
+        "_lru_cache_decorator".to_string(),
+        NONE,
+        methods,
+        Vec::new(),
+    );
     crate::core::globals::registry_set("functools._lru_cache_decorator", class);
     class
 }
@@ -3003,7 +3003,10 @@ fn new_lru_decorator(maxsize: Option<i64>, typed: bool) -> i64 {
 fn lru_cache_new(args: &[i64]) -> i64 {
     let first = args.first().copied();
     if let Some(candidate) = first {
-        if value::as_integer(candidate).is_none() && candidate != NONE && is_callable_or_descriptor(candidate) {
+        if value::as_integer(candidate).is_none()
+            && candidate != NONE
+            && is_callable_or_descriptor(candidate)
+        {
             return new_lru_cache(candidate, Some(128), false);
         }
     }
@@ -3012,9 +3015,7 @@ fn lru_cache_new(args: &[i64]) -> i64 {
         Some(item) if item == NONE => None,
         Some(item) => match value::as_integer(item) {
             Some(limit) if limit >= 0 => Some(limit),
-            Some(_) => {
-                return exc::raise_with_message(VALUE_ERROR, "maxsize must be non-negative")
-            }
+            Some(_) => return exc::raise_with_message(VALUE_ERROR, "maxsize must be non-negative"),
             None => {
                 return exc::raise_with_message(
                     TYPE_ERROR,

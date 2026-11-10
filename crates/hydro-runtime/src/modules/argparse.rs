@@ -402,7 +402,7 @@ fn argparse_all_names() -> i64 {
         "BooleanOptionalAction",
         "SUPPRESS",
     ];
-    let values = names.iter().map(|name| text_value(*name)).collect();
+    let values = names.iter().map(|name| text_value(name)).collect();
     let list = value::list_new(values);
     globals::registry_set(KEY, list);
     list
@@ -429,7 +429,10 @@ pub(crate) fn get_action_name(argument: i64) -> i64 {
     }
     if let Some(options) = try_action_attr(argument, "option_strings") {
         if let Some(items) = value::as_list(options) {
-            let names: Vec<&str> = items.iter().filter_map(|&item| value::as_str(item)).collect();
+            let names: Vec<&str> = items
+                .iter()
+                .filter_map(|&item| value::as_str(item))
+                .collect();
             if !names.is_empty() {
                 return text_value(&names.join("/"));
             }

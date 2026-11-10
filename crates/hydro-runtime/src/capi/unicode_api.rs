@@ -258,9 +258,10 @@ unsafe fn refresh_text_from_storage(object: *mut ShimObject) {
     if decoded.try_reserve(raw.data.len()).is_err() {
         return;
     }
-    let mut push = |unit: u32| decoded.push(
-        crate::value::code_to_storage_char(unit).unwrap_or(char::REPLACEMENT_CHARACTER),
-    );
+    let mut push = |unit: u32| {
+        decoded
+            .push(crate::value::code_to_storage_char(unit).unwrap_or(char::REPLACEMENT_CHARACTER))
+    };
     match raw.width {
         1 => {
             for &byte in &raw.data {
@@ -1845,8 +1846,7 @@ mod tests {
         assert_eq!(units_of(escaped), vec![0x61, 0xDCFF, 0x62]);
         // PEP 383 round-trip: the mirror survives in the payload and the
         // encoder writes the original byte back.
-        let round_tripped =
-            unsafe { PyUnicode_EncodeLocale(escaped, c"surrogateescape".as_ptr()) };
+        let round_tripped = unsafe { PyUnicode_EncodeLocale(escaped, c"surrogateescape".as_ptr()) };
         assert!(!round_tripped.is_null(), "{:?}", take_error());
         assert_eq!(bytes_of(round_tripped), vec![0x61, 0xFF, 0x62]);
         dec_ref(round_tripped);

@@ -613,10 +613,10 @@ const MAXLINESIZE: usize = 76;
 /// `b2a_qp(data, quotetabs=False, istext=True, header=False)`, a direct port
 /// of `binascii_b2a_qp_impl`.
 fn qp_encode(data: &[u8], quotetabs: bool, istext: bool, header: bool) -> Vec<u8> {
-    let crlf = match data.iter().position(|&byte| byte == b'\n') {
-        Some(index) if index > 0 && data[index - 1] == b'\r' => true,
-        _ => false,
-    };
+    let crlf = data
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .is_some_and(|index| index > 0 && data[index - 1] == b'\r');
     let mut out: Vec<u8> = Vec::with_capacity(data.len());
     let mut linelen = 0usize;
     let mut index = 0usize;
@@ -628,8 +628,7 @@ fn qp_encode(data: &[u8], quotetabs: bool, istext: bool, header: bool) -> Vec<u8
             || (header && byte == b'_')
             || (byte == b'.'
                 && linelen == 0
-                && (index + 1 == len
-                    || matches!(data[index + 1], b'\n' | b'\r' | 0)))
+                && (index + 1 == len || matches!(data[index + 1], b'\n' | b'\r' | 0)))
             || (!istext && matches!(byte, b'\r' | b'\n'))
             || (matches!(byte, b'\t' | b' ') && index + 1 == len)
             || (byte < 33
@@ -649,8 +648,7 @@ fn qp_encode(data: &[u8], quotetabs: bool, istext: bool, header: bool) -> Vec<u8
             index += 1;
             linelen += 3;
         } else if istext
-            && (byte == b'\n'
-                || (index + 1 < len && byte == b'\r' && data[index + 1] == b'\n'))
+            && (byte == b'\n' || (index + 1 < len && byte == b'\r' && data[index + 1] == b'\n'))
         {
             linelen = 0;
             if let Some(&last) = out.last() {

@@ -1206,12 +1206,12 @@ pub(crate) fn frame_setattr(frame: i64, name: &str, new_value: i64) -> Option<i6
             VALUE_ERROR,
             "f_lineno can only be set in a trace function",
         )),
-        "f_back" | "f_code" | "f_globals" | "f_locals" | "f_lasti" | "f_builtins" => Some(
-            raise_with_message(
+        "f_back" | "f_code" | "f_globals" | "f_locals" | "f_lasti" | "f_builtins" => {
+            Some(raise_with_message(
                 ATTRIBUTE_ERROR,
                 &format!("attribute '{name}' of 'frame' objects is not writable"),
-            ),
-        ),
+            ))
+        }
         _ => None,
     }
 }
@@ -1308,9 +1308,7 @@ pub(crate) fn code_attr(code: i64, name: &str) -> Option<i64> {
         // instruction/line/exception tables, zero stack usage and empty
         // position iterables, so `dis`/`inspect` observe a code object with no
         // instructions instead of an `AttributeError`.
-        "co_code" | "co_linetable" | "co_exceptiontable" => {
-            Some(value::bytes_new(Vec::new()))
-        }
+        "co_code" | "co_linetable" | "co_exceptiontable" => Some(value::bytes_new(Vec::new())),
         "co_stacksize" => Some(int(0)),
         "co_lines" | "co_positions" => Some(value::list_new(Vec::new())),
         "__class__" => Some(value::code_class()),
@@ -2080,7 +2078,9 @@ enum GroupSource {
 fn group_value(requested: u32, message: i64, children: &[i64], source: GroupSource) -> i64 {
     let roots = crate::heap::root_values(children);
     crate::heap::root_values(std::slice::from_ref(&message));
-    let tag = if requested == EXCEPTION_GROUP || children.iter().all(|&child| is_nonbase_exception(child)) {
+    let tag = if requested == EXCEPTION_GROUP
+        || children.iter().all(|&child| is_nonbase_exception(child))
+    {
         EXCEPTION_GROUP
     } else {
         BASE_EXCEPTION_GROUP
@@ -2176,13 +2176,11 @@ fn group_from_call(tag: u32, values: &[i64], keywords: &[(String, i64)]) -> i64 
         }
     }
     let nested_base = children.iter().any(|&child| !is_nonbase_exception(child));
-    if tag == EXCEPTION_GROUP {
-        if nested_base {
-            return raise_with_message(
-                TYPE_ERROR,
-                "Cannot nest BaseExceptions in an ExceptionGroup",
-            );
-        }
+    if tag == EXCEPTION_GROUP && nested_base {
+        return raise_with_message(
+            TYPE_ERROR,
+            "Cannot nest BaseExceptions in an ExceptionGroup",
+        );
     }
     group_value(tag, message, &children, GroupSource::Exact(source))
 }
@@ -2260,9 +2258,9 @@ fn classify_matcher(matcher: i64, star: bool) -> Result<GroupMatcher, ()> {
 fn matcher_matches(exc: i64, matcher: &GroupMatcher) -> Result<bool, ()> {
     match matcher {
         GroupMatcher::Types(types) => Ok(value::exception_data(exc).is_some_and(|data| {
-            types.iter().any(|&class| {
-                class_tag(class).is_some_and(|tag| tag_is_subclass(data.tag, tag))
-            })
+            types
+                .iter()
+                .any(|&class| class_tag(class).is_some_and(|tag| tag_is_subclass(data.tag, tag)))
         })),
         GroupMatcher::Predicate(predicate) => {
             let argv = [exc];
@@ -2282,21 +2280,19 @@ fn group_subset(orig: i64, children: &[i64]) -> Option<i64> {
         return None;
     }
     let data = value::exception_data(orig)?.clone();
-    let message = keyword_value(&data, GROUP_MESSAGE_KEY).unwrap_or_else(|| value::str_alloc(String::new()));
+    let message =
+        keyword_value(&data, GROUP_MESSAGE_KEY).unwrap_or_else(|| value::str_alloc(String::new()));
     let roots = crate::heap::root_values(children);
     crate::heap::root_values(std::slice::from_ref(&message));
-    let group = group_value(
-        BASE_EXCEPTION_GROUP,
-        message,
-        children,
-        GroupSource::List,
-    );
+    let group = group_value(BASE_EXCEPTION_GROUP, message, children, GroupSource::List);
     crate::heap::root_values(std::slice::from_ref(&group));
     let mut group_data = value::exception_data(group)?.clone();
     group_data.cause = data.cause;
     group_data.context = data.context;
     let root = keyword_value(&data, GROUP_STAR_ROOT_KEY).unwrap_or(orig);
-    group_data.keywords.retain(|(key, _)| key != GROUP_STAR_ROOT_KEY);
+    group_data
+        .keywords
+        .retain(|(key, _)| key != GROUP_STAR_ROOT_KEY);
     group_data
         .keywords
         .push((GROUP_STAR_ROOT_KEY.to_string(), root));
@@ -2405,14 +2401,18 @@ fn group_derive(object: i64, args: &[i64]) -> i64 {
     let Some(data) = value::exception_data(object) else {
         return raise_with_message(TYPE_ERROR, "derive() requires an exception group");
     };
-    let message = keyword_value(data, GROUP_MESSAGE_KEY).unwrap_or_else(|| value::str_alloc(String::new()));
+    let message =
+        keyword_value(data, GROUP_MESSAGE_KEY).unwrap_or_else(|| value::str_alloc(String::new()));
     let source = args[0];
     let children: Vec<i64> = if let Some(items) = value::as_list(source) {
         items.to_vec()
     } else if let Some(items) = value::as_tuple(source) {
         items.to_vec()
     } else {
-        return raise_with_message(TYPE_ERROR, "second argument (exceptions) must be a sequence");
+        return raise_with_message(
+            TYPE_ERROR,
+            "second argument (exceptions) must be a sequence",
+        );
     };
     if children.is_empty() {
         return raise_with_message(
@@ -2436,9 +2436,9 @@ fn group_derive(object: i64, args: &[i64]) -> i64 {
     )
 }
 
-/// `BaseException.__notes__` storage. Hydro's exception payload is immutable,
-/// so notes live in a thread-local side table keyed by the exception value;
-/// each list is a permanent thread root and the table is cleared by [`init`].
+// `BaseException.__notes__` storage. Hydro's exception payload is immutable,
+// so notes live in a thread-local side table keyed by the exception value;
+// each list is a permanent thread root and the table is cleared by `init`.
 thread_local! {
     static NOTES: RefCell<HashMap<i64, i64>> = RefCell::new(HashMap::new());
 }
@@ -2513,9 +2513,7 @@ fn group_projection(orig: i64, keep: &[i64]) -> Option<i64> {
 }
 
 fn projection_recursive(exc: i64, leaves: &[i64]) -> Option<i64> {
-    let Some(data) = value::exception_data(exc) else {
-        return None;
-    };
+    let data = value::exception_data(exc)?;
     if !is_group_tag(data.tag) {
         return leaves.contains(&exc).then_some(exc);
     }
@@ -2558,8 +2556,7 @@ fn prep_reraise_star(orig: i64, results: &[i64]) -> i64 {
     let mut reraised = Vec::new();
     for &entry in &present {
         let is_reraise = value::exception_data(entry).is_some_and(|data| {
-            is_group_tag(data.tag)
-                && keyword_value(data, GROUP_STAR_ROOT_KEY) == Some(orig)
+            is_group_tag(data.tag) && keyword_value(data, GROUP_STAR_ROOT_KEY) == Some(orig)
         });
         if is_reraise {
             reraised.push(entry);
@@ -2590,12 +2587,7 @@ fn prep_reraise_star(orig: i64, results: &[i64]) -> i64 {
         if raised.len() > 1 {
             raised.retain(|&entry| entry != NONE);
             let empty = value::str_alloc(String::new());
-            group_value(
-                BASE_EXCEPTION_GROUP,
-                empty,
-                &raised,
-                GroupSource::List,
-            )
+            group_value(BASE_EXCEPTION_GROUP, empty, &raised, GroupSource::List)
         } else {
             raised[0]
         }
@@ -2613,7 +2605,7 @@ struct StarSession {
 }
 
 thread_local! {
-    static STAR_SESSIONS: RefCell<Vec<StarSession>> = RefCell::new(Vec::new());
+    static STAR_SESSIONS: RefCell<Vec<StarSession>> = const { RefCell::new(Vec::new()) };
 }
 
 fn star_token(index: usize) -> i64 {
@@ -2674,19 +2666,17 @@ pub(crate) fn star_match(token: i64, matcher_value: i64) -> i64 {
                     new_rest = NONE;
                 }
             }
-            Ok(false) if is_group_value(rest) => {
-                match split_recursive(rest, &matcher, true) {
-                    Ok((Some(part), remainder)) => {
-                        matched = part;
-                        new_rest = remainder.unwrap_or(NONE);
-                    }
-                    Ok((None, remainder)) => {
-                        matched = NONE;
-                        new_rest = remainder.unwrap_or(NONE);
-                    }
-                    Err(()) => return NONE,
+            Ok(false) if is_group_value(rest) => match split_recursive(rest, &matcher, true) {
+                Ok((Some(part), remainder)) => {
+                    matched = part;
+                    new_rest = remainder.unwrap_or(NONE);
                 }
-            }
+                Ok((None, remainder)) => {
+                    matched = NONE;
+                    new_rest = remainder.unwrap_or(NONE);
+                }
+                Err(()) => return NONE,
+            },
             Ok(false) => {
                 matched = NONE;
                 new_rest = rest;

@@ -16,9 +16,9 @@
 //! (integer out of range); no user input can panic. On non-Unix platforms
 //! every function raises `RuntimeError`.
 
-use crate::exc::{self, ATTRIBUTE_ERROR, OS_ERROR, OVERFLOW_ERROR, TYPE_ERROR, VALUE_ERROR};
 #[cfg(unix)]
 use crate::core::methods;
+use crate::exc::{self, ATTRIBUTE_ERROR, OS_ERROR, OVERFLOW_ERROR, TYPE_ERROR, VALUE_ERROR};
 #[cfg(unix)]
 use crate::value::{self, NONE};
 
@@ -82,12 +82,7 @@ fn int32_arg(function: &str, args: &[i64], index: usize, name: &str) -> Option<l
 
 /// Parses a descriptor argument: an integer or an object with `fileno()`.
 #[cfg(unix)]
-fn descriptor_arg(
-    function: &str,
-    args: &[i64],
-    index: usize,
-    name: &str,
-) -> Option<libc::c_int> {
+fn descriptor_arg(function: &str, args: &[i64], index: usize, name: &str) -> Option<libc::c_int> {
     let Some(&argument) = args.get(index) else {
         type_error(&format!(
             "{function}() missing required argument '{name}' (pos {})",
@@ -718,7 +713,10 @@ mod tests {
         let getfd = constant("F_GETFD").expect("F_GETFD");
         assert_eq!(call("fcntl", &[int(closed), getfd]), NONE);
         assert_eq!(exc::pending_tag(), i64::from(VALUE_ERROR));
-        assert_eq!(message(), "file descriptor cannot be a negative integer (-1)");
+        assert_eq!(
+            message(),
+            "file descriptor cannot be a negative integer (-1)"
+        );
         exc::init();
 
         // A terminal query on a non-terminal descriptor is an errno failure.

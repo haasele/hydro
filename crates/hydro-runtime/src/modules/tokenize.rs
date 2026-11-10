@@ -1,16 +1,16 @@
-//! `_tokenize`: the CPython C tokenizer surface, deliberately unimplemented.
+//! `_tokenize`: the CPython tokenizer accelerator, implemented here.
 //!
-//! CPython 3.14's accelerator exposes one name, `TokenizerIter`, which turns
-//! a source string into `tokenize.TokenInfo` records. Hydro's parser is not
-//! the CPython tokenizer and there is no `TokenInfo` type in this runtime, so
-//! constructing the iterator raises `NotImplementedError`; no token is ever
-//! fabricated. Pure-Python `tokenize` code that calls
-//! `_generate_tokens_from_c_tokenizer` therefore fails loudly instead of
-//! producing tokens that do not describe the compiled program.
+//! CPython 3.14's accelerator exposes one class, `TokenizerIter`, which turns
+//! a `readline` callable (or a source string) into the 5-tuples
+//! `tokenize.TokenInfo._make` consumes. [`Lexer`] is a full Python lexer
+//! (indentation stack, implicit line joining, f/t-string nesting, number and
+//! string literal forms, the `MAXINDENT`/`MAXLEVEL`/`MAXFSTRINGLEVEL` limits)
+//! driven by `_tokenizeriter_next`; `tokenize.tokenize`/`generate_tokens` from
+//! `Lib/tokenize.py` therefore work on top of it.
 //!
-//! The module itself is importable so probe code (`import _tokenize`) and the
-//! `from _tokenize import TokenizerIter` import in `Lib/tokenize.py` resolve;
-//! every other name stays absent and raises `AttributeError`.
+//! Lexical errors become the `SyntaxError`/`IndentationError` CPython raises
+//! with the C tokenizer's messages, which `tokenize._transform_msg` maps to
+//! `TokenError` for the pure-Python API.
 //!
 //! This file also owns the data behind the separate `token` module: the
 //! numeric constants from CPython's `Lib/token.py`, `tok_name`,
@@ -324,13 +324,8 @@ fn is_printable(ch: char) -> bool {
     }
     !matches!(
         ch,
-        '\u{a0}' | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
+        '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
     )
 }
 
@@ -496,8 +491,7 @@ impl Lexer {
 
     fn check_null_bytes(&mut self) -> bool {
         if self.src[self.line_start.min(self.src.len())..self.line_end.min(self.src.len())]
-            .iter()
-            .any(|ch| *ch == '\0')
+            .contains(&'\0')
         {
             self.set_error(
                 exc::SYNTAX_ERROR,
@@ -1149,7 +1143,7 @@ impl Lexer {
                         has_escaped_quote = true;
                     }
                     if c == Some('\r') {
-                        c = self.nextc();
+                        self.nextc();
                     }
                 }
             }
@@ -1474,7 +1468,11 @@ impl Lexer {
                 blankline = true;
             }
             if !blankline && self.level == 0 {
-                let col = if cont_line_col != 0 { cont_line_col } else { col };
+                let col = if cont_line_col != 0 {
+                    cont_line_col
+                } else {
+                    col
+                };
                 let altcol = if cont_line_col != 0 {
                     cont_line_col
                 } else {
@@ -1570,7 +1568,11 @@ impl Lexer {
                     break;
                 }
             }
-            self.start = if c.is_some() { Some(self.pos - 1) } else { None };
+            self.start = if c.is_some() {
+                Some(self.pos - 1)
+            } else {
+                None
+            };
 
             if c == Some('#') {
                 while !matches!(c, None | Some('\n') | Some('\r')) {
@@ -1649,9 +1651,7 @@ impl Lexer {
                     let start = self.start.unwrap_or(0);
                     let stop = self.pos;
                     let name: String = self.src[start..stop].iter().collect();
-                    if let Some(bad) =
-                        name.chars().find(|ch| *ch != '_' && !ch.is_alphanumeric())
-                    {
+                    if let Some(bad) = name.chars().find(|ch| *ch != '_' && !ch.is_alphanumeric()) {
                         if is_printable(bad) {
                             self.syntax_error(format!(
                                 "invalid character '{bad}' (U+{:04X})",
@@ -1812,9 +1812,8 @@ impl Lexer {
                         && ch == '}'
                     {
                         let prefix = self.fstring_prefix();
-                        return self.fstring_error(format!(
-                            "{prefix}-string: single '}}' is not allowed"
-                        ));
+                        return self
+                            .fstring_error(format!("{prefix}-string: single '}}' is not allowed"));
                     }
                     if !self.extra && self.level == 0 {
                         self.syntax_error(format!("unmatched '{ch}'"));
@@ -1844,9 +1843,8 @@ impl Lexer {
                         self.modes[index].curly_bracket_depth -= 1;
                         if self.modes[index].curly_bracket_depth < 0 {
                             let prefix = self.fstring_prefix();
-                            return self.fstring_error(format!(
-                                "{prefix}-string: unmatched '{ch}'"
-                            ));
+                            return self
+                                .fstring_error(format!("{prefix}-string: unmatched '{ch}'"));
                         }
                         if ch == '}'
                             && self.modes[index].curly_bracket_depth
@@ -2002,7 +2000,7 @@ fn decode_utf16(bytes: &[u8]) -> String {
         (cfg!(target_endian = "little"), bytes)
     };
     let mut units: Vec<u16> = Vec::with_capacity(body.len() / 2);
-    for pair in body.chunks_exact(2) {
+    for pair in body.as_chunks::<2>().0 {
         units.push(if little_endian {
             u16::from_le_bytes([pair[0], pair[1]])
         } else {
@@ -2010,7 +2008,7 @@ fn decode_utf16(bytes: &[u8]) -> String {
         });
     }
     let mut out = String::new();
-    for unit in std::char::decode_utf16(units.into_iter()) {
+    for unit in std::char::decode_utf16(units) {
         out.push(unit.unwrap_or('\u{fffd}'));
     }
     out
@@ -2168,11 +2166,7 @@ fn store_tokens(
         SOURCE_ATTR.to_string(),
         value::str_alloc(source.to_string()),
     );
-    value::instance_setattr(
-        instance,
-        EXTRA_ATTR.to_string(),
-        value::bool_value(extra),
-    );
+    value::instance_setattr(instance, EXTRA_ATTR.to_string(), value::bool_value(extra));
     heap::release_roots(error_roots);
     heap::release_roots(roots);
 }

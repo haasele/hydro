@@ -985,13 +985,7 @@ pub static OS: ModuleSpec = ModuleSpec {
             Type::None,
             &["path", "attribute", "value", "flags", "follow_symlinks"],
         ),
-        kw(
-            "listxattr",
-            0,
-            2,
-            Type::List,
-            &["path", "follow_symlinks"],
-        ),
+        kw("listxattr", 0, 2, Type::List, &["path", "follow_symlinks"]),
         kw(
             "removexattr",
             2,
@@ -2653,7 +2647,13 @@ const SOCKET_FUNCTIONS: &[FunctionSpec] = &[
     f("inet_ntoa", 1, 1, Type::Str),
     // `getservbyname(servicename, protocolname=None)` /
     // `getservbyport(port, protocolname=None)`.
-    kw("getservbyname", 1, 2, Type::Int, &["servicename", "protocolname"]),
+    kw(
+        "getservbyname",
+        1,
+        2,
+        Type::Int,
+        &["servicename", "protocolname"],
+    ),
     kw("getservbyport", 1, 2, Type::Str, &["port", "protocolname"]),
     // `gethostbyname_ex(name)` / `gethostbyaddr(ip_address)` return the
     // `(name, aliases, addresses)` triple.
@@ -5615,8 +5615,20 @@ pub static CODECS: ModuleSpec = ModuleSpec {
         f("getincrementaldecoder", 1, 1, Type::Any),
         f("getincrementalencoder", 1, 1, Type::Any),
         // `iterencode`/`iterdecode`: streaming (generator) codecs.
-        kw_dynamic("iterencode", 2, 3, Type::Any, &["iterator", "encoding", "errors"]),
-        kw_dynamic("iterdecode", 2, 3, Type::Any, &["iterator", "encoding", "errors"]),
+        kw_dynamic(
+            "iterencode",
+            2,
+            3,
+            Type::Any,
+            &["iterator", "encoding", "errors"],
+        ),
+        kw_dynamic(
+            "iterdecode",
+            2,
+            3,
+            Type::Any,
+            &["iterator", "encoding", "errors"],
+        ),
         // `open(filename, mode='r', encoding=None, errors='strict',
         // buffering=-1)`: the transparent encoded-file wrapper.
         kw(
@@ -6425,22 +6437,16 @@ pub static LOCALE: ModuleSpec = ModuleSpec {
         f("atoi", 1, 1, Type::Int),
         f("str", 1, 1, Type::Str),
         f("delocalize", 1, 1, Type::Str),
-        kw("localize", 1, 3, Type::Str, &["string", "grouping", "monetary"]),
+        kw(
+            "localize",
+            1,
+            3,
+            Type::Str,
+            &["string", "grouping", "monetary"],
+        ),
         // Locale-name/default resolution helpers.
-        kw(
-            "getdefaultlocale",
-            0,
-            1,
-            Type::Tuple,
-            &["envvars"],
-        ),
-        kw(
-            "_getdefaultlocale",
-            0,
-            1,
-            Type::Tuple,
-            &["envvars"],
-        ),
+        kw("getdefaultlocale", 0, 1, Type::Tuple, &["envvars"]),
+        kw("_getdefaultlocale", 0, 1, Type::Tuple, &["envvars"]),
         f("_parse_localename", 1, 1, Type::Tuple),
         f("_build_localename", 1, 1, Type::Any),
     ],
@@ -7136,7 +7142,13 @@ pub static INSPECT: ModuleSpec = ModuleSpec {
         kw_dynamic("get_annotations", 1, 1, Type::Dict, &["obj"]),
         // `getmembers_static(object, predicate=None)`: like `getmembers`, but
         // without triggering the descriptor protocol.
-        kw("getmembers_static", 1, 2, Type::List, &["object", "predicate"]),
+        kw(
+            "getmembers_static",
+            1,
+            2,
+            Type::List,
+            &["object", "predicate"],
+        ),
         kw("unwrap", 1, 2, Type::Any, &["func", "stop"]),
         // Signature construction and argument binding.
         kw(
@@ -8466,7 +8478,13 @@ pub static GZIP: ModuleSpec = ModuleSpec {
             ],
         ),
         // `compress(data, compresslevel=9, *, mtime=0)` / `decompress(data)`.
-        kw("compress", 1, 3, Type::Bytes, &["data", "compresslevel", "mtime"]),
+        kw(
+            "compress",
+            1,
+            3,
+            Type::Bytes,
+            &["data", "compresslevel", "mtime"],
+        ),
         f("decompress", 1, 1, Type::Bytes),
         // `_read_gzip_header(fp)`: `(magic, method, flags, mtime)`.
         f("_read_gzip_header", 1, 1, Type::Tuple),
@@ -8604,15 +8622,13 @@ pub static UUID: ModuleSpec = ModuleSpec {
 /// empty and the predicates answer `False`, but the names resolve.
 pub static OPCODE: ModuleSpec = ModuleSpec {
     name: "opcode",
-    functions: &[
-        kw(
-            "stack_effect",
-            1,
-            3,
-            Type::Int,
-            &["opcode", "oparg", "jump"],
-        ),
-    ],
+    functions: &[kw(
+        "stack_effect",
+        1,
+        3,
+        Type::Int,
+        &["opcode", "oparg", "jump"],
+    )],
     constants: &[
         c("opmap", Type::Dict),
         c("opname", Type::List),

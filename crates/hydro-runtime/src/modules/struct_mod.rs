@@ -113,7 +113,11 @@ const fn native_entry(code: u8) -> Option<Entry> {
         b'D' => (16, 8, false),
         _ => return None,
     };
-    Some(Entry { size, align, signed })
+    Some(Entry {
+        size,
+        align,
+        signed,
+    })
 }
 
 const fn standard_entry(code: u8) -> Option<Entry> {
@@ -313,7 +317,9 @@ fn parse_format(format: &[u8]) -> Result<Parsed, String> {
         let end = match code {
             b's' | b'p' => {
                 length = length.checked_add(1).ok_or_else(|| OVERFLOW.to_string())?;
-                let end = aligned.checked_add(count).ok_or_else(|| OVERFLOW.to_string())?;
+                let end = aligned
+                    .checked_add(count)
+                    .ok_or_else(|| OVERFLOW.to_string())?;
                 items.push(Item {
                     code,
                     count: count as usize,
@@ -321,13 +327,19 @@ fn parse_format(format: &[u8]) -> Result<Parsed, String> {
                 });
                 end
             }
-            b'x' => aligned.checked_add(count).ok_or_else(|| OVERFLOW.to_string())?,
+            b'x' => aligned
+                .checked_add(count)
+                .ok_or_else(|| OVERFLOW.to_string())?,
             _ => {
-                length = length.checked_add(count).ok_or_else(|| OVERFLOW.to_string())?;
+                length = length
+                    .checked_add(count)
+                    .ok_or_else(|| OVERFLOW.to_string())?;
                 let bytes = count
                     .checked_mul(entry.size as i128)
                     .ok_or_else(|| OVERFLOW.to_string())?;
-                let end = aligned.checked_add(bytes).ok_or_else(|| OVERFLOW.to_string())?;
+                let end = aligned
+                    .checked_add(bytes)
+                    .ok_or_else(|| OVERFLOW.to_string())?;
                 if count > 0 {
                     items.push(Item {
                         code,
@@ -609,7 +621,13 @@ fn unpack_half(bits: u16) -> f64 {
 }
 
 /// Packs one float item, propagating CPython's `OverflowError` texts.
-fn pack_float(buffer: &mut [u8], offset: usize, code: u8, number: f64, order: Order) -> Result<(), i64> {
+fn pack_float(
+    buffer: &mut [u8],
+    offset: usize,
+    code: u8,
+    number: f64,
+    order: Order,
+) -> Result<(), i64> {
     match code {
         b'e' => match pack_half(number) {
             Ok(bits) => {
@@ -691,7 +709,8 @@ fn pack_values(parsed: &Parsed, values: &[i64]) -> Result<Vec<u8>, i64> {
                         length = item.count;
                     }
                     if length > 0 {
-                        buffer[item.offset..item.offset + length].copy_from_slice(&source[..length]);
+                        buffer[item.offset..item.offset + length]
+                            .copy_from_slice(&source[..length]);
                     }
                 }
             }
@@ -853,10 +872,8 @@ fn unpack_values(parsed: &Parsed, buffer: &[u8], start: usize) -> Vec<i64> {
                             values.push(value::float_new(f64::from_bits(bits)));
                         }
                         b'F' => {
-                            let real =
-                                read_uint(buffer, offset, 4, parsed.order) as u32;
-                            let imag =
-                                read_uint(buffer, offset + 4, 4, parsed.order) as u32;
+                            let real = read_uint(buffer, offset, 4, parsed.order) as u32;
+                            let imag = read_uint(buffer, offset + 4, 4, parsed.order) as u32;
                             values.push(crate::builtins::build_complex(
                                 f64::from(f32::from_bits(real)),
                                 f64::from(f32::from_bits(imag)),
@@ -879,8 +896,7 @@ fn unpack_values(parsed: &Parsed, buffer: &[u8], start: usize) -> Vec<i64> {
                                     parsed.order,
                                 )));
                             } else {
-                                let raw =
-                                    read_uint(buffer, offset, entry.size, parsed.order);
+                                let raw = read_uint(buffer, offset, entry.size, parsed.order);
                                 values.push(unsigned_result(raw));
                             }
                         }
@@ -907,7 +923,10 @@ fn buffer_bytes(value_arg: i64) -> Result<Vec<u8>, i64> {
     }
     if let Some(view) = value::as_memoryview(value_arg) {
         if view.released {
-            return Err(exc::raise_with_message(VALUE_ERROR, value::MEMORYVIEW_RELEASED));
+            return Err(exc::raise_with_message(
+                VALUE_ERROR,
+                value::MEMORYVIEW_RELEASED,
+            ));
         }
         if view.stride != 1 && view.len() > 1 {
             return Err(non_contiguous_buffer());
@@ -944,7 +963,10 @@ fn buffer_write(value_arg: i64, start: usize, payload: &[u8]) -> Result<(), i64>
     }
     if let Some(view) = value::as_memoryview(value_arg) {
         if view.released {
-            return Err(exc::raise_with_message(VALUE_ERROR, value::MEMORYVIEW_RELEASED));
+            return Err(exc::raise_with_message(
+                VALUE_ERROR,
+                value::MEMORYVIEW_RELEASED,
+            ));
         }
         if view.readonly {
             return Err(type_error("memoryview: underlying buffer is read-only"));
@@ -989,10 +1011,7 @@ fn offset_argument(value_arg: i64) -> Result<i64, i64> {
         )));
     };
     number.to_i64().ok_or_else(|| {
-        exc::raise_with_message(
-            INDEX_ERROR,
-            "cannot fit 'int' into an index-sized integer",
-        )
+        exc::raise_with_message(INDEX_ERROR, "cannot fit 'int' into an index-sized integer")
     })
 }
 
@@ -1137,9 +1156,7 @@ fn pack_into_call(instance: i64, rest: &[i64]) -> i64 {
     let mut start = offset;
     if start < 0 {
         if start.saturating_add(size) > 0 {
-            return struct_error(&format!(
-                "no space to pack {size} bytes at offset {start}"
-            ));
+            return struct_error(&format!("no space to pack {size} bytes at offset {start}"));
         }
         if start + (length as i64) < 0 {
             return struct_error(&format!(
@@ -1234,7 +1251,10 @@ fn struct_repr(instance: i64) -> i64 {
 /// `Struct.*` method entries.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "pack" => pack_call(args.first().copied().unwrap_or(NONE), &args[1.min(args.len())..]),
+        "pack" => pack_call(
+            args.first().copied().unwrap_or(NONE),
+            &args[1.min(args.len())..],
+        ),
         "Struct.pack" => {
             let Some(instance) = args.first().copied() else {
                 return type_error("pack() missing self");

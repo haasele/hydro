@@ -3582,21 +3582,39 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
     // Struct-sequence methods (`os.stat_result`, `os.struct_rusage`,
     // `sys.int_info`). One shared method set; the receiver's class selects
     // the layout.
-    ("os.structseq.__init__", native_member("structseq.__init__", 1, 3)),
-    ("os.structseq.__len__", native_member("structseq.__len__", 1, 1)),
+    (
+        "os.structseq.__init__",
+        native_member("structseq.__init__", 1, 3),
+    ),
+    (
+        "os.structseq.__len__",
+        native_member("structseq.__len__", 1, 1),
+    ),
     (
         "os.structseq.__getitem__",
         native_member("structseq.__getitem__", 2, 2),
     ),
-    ("os.structseq.__iter__", native_member("structseq.__iter__", 1, 1)),
-    ("os.structseq.__repr__", native_member("structseq.__repr__", 1, 1)),
-    ("os.structseq.__eq__", native_member("structseq.__eq__", 2, 2)),
+    (
+        "os.structseq.__iter__",
+        native_member("structseq.__iter__", 1, 1),
+    ),
+    (
+        "os.structseq.__repr__",
+        native_member("structseq.__repr__", 1, 1),
+    ),
+    (
+        "os.structseq.__eq__",
+        native_member("structseq.__eq__", 2, 2),
+    ),
     // `os.popen`'s `_wrap_close` surface.
     ("os.popen.read", native_member("popen.read", 1, 2)),
     ("os.popen.readline", native_member("popen.readline", 1, 2)),
     ("os.popen.readlines", native_member("popen.readlines", 1, 2)),
     ("os.popen.write", native_member("popen.write", 2, 2)),
-    ("os.popen.writelines", native_member("popen.writelines", 2, 2)),
+    (
+        "os.popen.writelines",
+        native_member("popen.writelines", 2, 2),
+    ),
     ("os.popen.close", native_member("popen.close", 1, 1)),
     ("os.popen.flush", native_member("popen.flush", 1, 1)),
     ("os.popen.__enter__", native_member("popen.__enter__", 1, 1)),
@@ -3607,29 +3625,104 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
     // (`ndarray`/`Py_buffer`); their method values carry these dotted names,
     // so the central table must know them even though they are not
     // Python-visible module functions.
-    ("_testbuffer.ndarray.__init__", native_dynamic_member("ndarray.__init__", 1, 8,
-        &["self","obj","shape","strides","offset","format","flags","getbuf"])),
-    ("_testbuffer.ndarray.tolist", native_member_ret("ndarray.tolist", 1, 1, hydro_ir::Type::List)),
-    ("_testbuffer.ndarray.tobytes", native_member_ret("ndarray.tobytes", 1, 1, hydro_ir::Type::Bytes)),
-    ("_testbuffer.ndarray.push", native_dynamic_member("ndarray.push", 2, 7,
-        &["self","items","shape","strides","offset","format","flags"])),
-    ("_testbuffer.ndarray.pop", native_member_ret("ndarray.pop", 1, 1, hydro_ir::Type::None)),
-    ("_testbuffer.ndarray.add_suboffsets", native_member_ret("ndarray.add_suboffsets", 1, 1, hydro_ir::Type::None)),
-    ("_testbuffer.ndarray.memoryview_from_buffer", native_member("ndarray.memoryview_from_buffer", 1, 1)),
-    ("_testbuffer.ndarray.getbuffer", native_member("ndarray.getbuffer", 1, 2)),
-    ("_testbuffer.ndarray.releasebuffer", native_member_ret("ndarray.releasebuffer", 1, 2, hydro_ir::Type::None)),
-    ("_testbuffer.ndarray.__buffer__", native_member("ndarray.__buffer__", 1, 2)),
-    ("_testbuffer.ndarray.__release_buffer__", native_member_ret("ndarray.__release_buffer__", 1, 2, hydro_ir::Type::None)),
-    ("_testbuffer.ndarray.__getitem__", native_member("ndarray.__getitem__", 2, 2)),
-    ("_testbuffer.ndarray.__setitem__", native_member_ret("ndarray.__setitem__", 3, 3, hydro_ir::Type::None)),
-    ("_testbuffer.ndarray.__len__", native_member_ret("ndarray.__len__", 1, 1, hydro_ir::Type::Int)),
-    ("_testbuffer.ndarray.__repr__", native_member_ret("ndarray.__repr__", 1, 1, hydro_ir::Type::Str)),
-    ("_testbuffer.ndarray.__eq__", native_member("ndarray.__eq__", 2, 2)),
-    ("_testbuffer.ndarray.__hash__", native_member_ret("ndarray.__hash__", 1, 1, hydro_ir::Type::Int)),
-    ("_testbuffer.Py_buffer.release", native_member_ret("Py_buffer.release", 1, 1, hydro_ir::Type::None)),
-    ("_testbuffer.Py_buffer.buf", native_member("Py_buffer.buf", 1, 1)),
-    ("_testbuffer.Py_buffer.ptr", native_member("Py_buffer.ptr", 1, 1)),
-    ("_testbuffer.Py_buffer.__repr__", native_member_ret("Py_buffer.__repr__", 1, 1, hydro_ir::Type::Str)),
+    (
+        "_testbuffer.ndarray.__init__",
+        native_dynamic_member(
+            "ndarray.__init__",
+            1,
+            8,
+            &[
+                "self", "obj", "shape", "strides", "offset", "format", "flags", "getbuf",
+            ],
+        ),
+    ),
+    (
+        "_testbuffer.ndarray.tolist",
+        native_member_ret("ndarray.tolist", 1, 1, hydro_ir::Type::List),
+    ),
+    (
+        "_testbuffer.ndarray.tobytes",
+        native_member_ret("ndarray.tobytes", 1, 1, hydro_ir::Type::Bytes),
+    ),
+    (
+        "_testbuffer.ndarray.push",
+        native_dynamic_member(
+            "ndarray.push",
+            2,
+            7,
+            &[
+                "self", "items", "shape", "strides", "offset", "format", "flags",
+            ],
+        ),
+    ),
+    (
+        "_testbuffer.ndarray.pop",
+        native_member_ret("ndarray.pop", 1, 1, hydro_ir::Type::None),
+    ),
+    (
+        "_testbuffer.ndarray.add_suboffsets",
+        native_member_ret("ndarray.add_suboffsets", 1, 1, hydro_ir::Type::None),
+    ),
+    (
+        "_testbuffer.ndarray.memoryview_from_buffer",
+        native_member("ndarray.memoryview_from_buffer", 1, 1),
+    ),
+    (
+        "_testbuffer.ndarray.getbuffer",
+        native_member("ndarray.getbuffer", 1, 2),
+    ),
+    (
+        "_testbuffer.ndarray.releasebuffer",
+        native_member_ret("ndarray.releasebuffer", 1, 2, hydro_ir::Type::None),
+    ),
+    (
+        "_testbuffer.ndarray.__buffer__",
+        native_member("ndarray.__buffer__", 1, 2),
+    ),
+    (
+        "_testbuffer.ndarray.__release_buffer__",
+        native_member_ret("ndarray.__release_buffer__", 1, 2, hydro_ir::Type::None),
+    ),
+    (
+        "_testbuffer.ndarray.__getitem__",
+        native_member("ndarray.__getitem__", 2, 2),
+    ),
+    (
+        "_testbuffer.ndarray.__setitem__",
+        native_member_ret("ndarray.__setitem__", 3, 3, hydro_ir::Type::None),
+    ),
+    (
+        "_testbuffer.ndarray.__len__",
+        native_member_ret("ndarray.__len__", 1, 1, hydro_ir::Type::Int),
+    ),
+    (
+        "_testbuffer.ndarray.__repr__",
+        native_member_ret("ndarray.__repr__", 1, 1, hydro_ir::Type::Str),
+    ),
+    (
+        "_testbuffer.ndarray.__eq__",
+        native_member("ndarray.__eq__", 2, 2),
+    ),
+    (
+        "_testbuffer.ndarray.__hash__",
+        native_member_ret("ndarray.__hash__", 1, 1, hydro_ir::Type::Int),
+    ),
+    (
+        "_testbuffer.Py_buffer.release",
+        native_member_ret("Py_buffer.release", 1, 1, hydro_ir::Type::None),
+    ),
+    (
+        "_testbuffer.Py_buffer.buf",
+        native_member("Py_buffer.buf", 1, 1),
+    ),
+    (
+        "_testbuffer.Py_buffer.ptr",
+        native_member("Py_buffer.ptr", 1, 1),
+    ),
+    (
+        "_testbuffer.Py_buffer.__repr__",
+        native_member_ret("Py_buffer.__repr__", 1, 1, hydro_ir::Type::Str),
+    ),
 ];
 
 /// Resolves a [`SUPPLEMENTAL_FUNCTIONS`] entry by module and member name.
@@ -4487,9 +4580,7 @@ fn supplemental_value(module: &str, name: &str) -> Option<i64> {
         // `sys._current_frames` is declared in `SUPPLEMENTAL_FUNCTIONS` (it
         // postdates the static table); reading the attribute must produce the
         // same builtin function the call path resolves.
-        ("sys", "_current_frames") => {
-            Some(value::native_function_new("sys", "_current_frames", 0))
-        }
+        ("sys", "_current_frames") => Some(value::native_function_new("sys", "_current_frames", 0)),
         // OS helpers used by the stdlib path modules but absent from the
         // static `os` table.
         ("os", "readlink") => Some(value::native_function_new("os", "readlink", 2)),
@@ -20807,7 +20898,10 @@ fn structseq_method_call(module: &str, function: &str, args: &[i64]) -> Option<i
                 ));
             };
             let Some(&key) = args.get(1) else {
-                return Some(exc::raise_with_message(TYPE_ERROR, "__getitem__() missing key"));
+                return Some(exc::raise_with_message(
+                    TYPE_ERROR,
+                    "__getitem__() missing key",
+                ));
             };
             let sequence = value::tuple_new(values[..layout.n_sequence()].to_vec());
             container::subscript(sequence, key)
@@ -22663,7 +22757,7 @@ fn os_getpgrp(_args: &[i64]) -> i64 {
     #[cfg(unix)]
     {
         // SAFETY: `getpgrp` has no preconditions and cannot fail.
-        return encode_int(i64::from(unsafe { libc::getpgrp() }));
+        encode_int(i64::from(unsafe { libc::getpgrp() }))
     }
     #[cfg(not(unix))]
     {
@@ -22693,7 +22787,7 @@ fn os_getpgid(args: &[i64]) -> i64 {
         if result == -1 {
             return os_error_from_io("getpgid", std::io::Error::last_os_error(), None);
         }
-        return encode_int(i64::from(result));
+        encode_int(i64::from(result))
     }
     #[cfg(not(unix))]
     {
@@ -22731,7 +22825,10 @@ fn os_mkfifo(args: &[i64]) -> i64 {
             Some(mode) => match libc::mode_t::try_from(mode & 0o7777) {
                 Ok(mode) => mode,
                 Err(_) => {
-                    return exc::raise_with_message(OVERFLOW_ERROR, "mkfifo(): mode is out of range")
+                    return exc::raise_with_message(
+                        OVERFLOW_ERROR,
+                        "mkfifo(): mode is out of range",
+                    )
                 }
             },
             None => {
@@ -22755,11 +22852,7 @@ fn os_mkfifo(args: &[i64]) -> i64 {
         let result = unsafe { libc::mkfifo(c_path.as_ptr(), mode) };
         if result != 0 {
             let shown = path.to_string_lossy().into_owned();
-            return os_error_from_io(
-                "mkfifo",
-                std::io::Error::last_os_error(),
-                Some(&shown),
-            );
+            return os_error_from_io("mkfifo", std::io::Error::last_os_error(), Some(&shown));
         }
         NONE
     }
@@ -22864,10 +22957,7 @@ fn os_wait4(args: &[i64]) -> i64 {
     let pid = args.first().copied().unwrap_or(NONE);
     let options = args.get(1).copied().unwrap_or(NONE);
     let (Some(pid), Some(options)) = (value::as_integer(pid), value::as_integer(options)) else {
-        return exc::raise_with_message(
-            TYPE_ERROR,
-            "wait4() arguments must be integers",
-        );
+        return exc::raise_with_message(TYPE_ERROR, "wait4() arguments must be integers");
     };
     os_wait_rusage(Some(pid), options)
 }
@@ -22887,7 +22977,10 @@ fn os_xattr_name(argument: i64) -> Option<Vec<u8>> {
 }
 
 /// Path/name/argument triple shared by the extended-attribute calls.
-fn os_xattr_targets(args: &[i64], attribute_slot: Option<usize>) -> Option<(CString, Option<CString>)> {
+fn os_xattr_targets(
+    args: &[i64],
+    attribute_slot: Option<usize>,
+) -> Option<(CString, Option<CString>)> {
     let path_value = args.first().copied().unwrap_or(NONE);
     let path = os_path_os_string(path_value)?;
     use std::os::unix::ffi::OsStrExt;
@@ -22909,7 +23002,7 @@ fn os_getxattr(args: &[i64]) -> i64 {
     let Some((path, Some(name))) = os_xattr_targets(args, Some(1)) else {
         return exc::raise_with_message(TYPE_ERROR, "getxattr() arguments must be str or bytes");
     };
-    let follow = args.get(2).copied().map_or(true, value::truthy);
+    let follow = args.get(2).copied().is_none_or(value::truthy);
     let call = |buffer: *mut libc::c_void, size: usize| -> isize {
         // SAFETY: the caller supplies a buffer of `size` bytes (or NULL/0).
         unsafe {
@@ -22957,13 +23050,25 @@ fn os_setxattr(args: &[i64]) -> i64 {
     let Ok(flags) = libc::c_int::try_from(flags) else {
         return exc::raise_with_message(OVERFLOW_ERROR, "setxattr(): flags is out of range");
     };
-    let follow = args.get(4).copied().map_or(true, value::truthy);
+    let follow = args.get(4).copied().is_none_or(value::truthy);
     // SAFETY: `data` lives for the call and `path`/`name` are NUL-terminated.
     let result = unsafe {
         if follow {
-            libc::setxattr(path.as_ptr(), name.as_ptr(), data.as_ptr().cast(), data.len(), flags)
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                data.as_ptr().cast(),
+                data.len(),
+                flags,
+            )
         } else {
-            libc::lsetxattr(path.as_ptr(), name.as_ptr(), data.as_ptr().cast(), data.len(), flags)
+            libc::lsetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                data.as_ptr().cast(),
+                data.len(),
+                flags,
+            )
         }
     };
     if result != 0 {
@@ -22991,7 +23096,7 @@ fn os_listxattr(args: &[i64]) -> i64 {
     let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
         return exc::raise_with_message(VALUE_ERROR, "embedded null byte");
     };
-    let follow = args.get(1).copied().map_or(true, value::truthy);
+    let follow = args.get(1).copied().is_none_or(value::truthy);
     let call = |buffer: *mut libc::c_char, size: usize| -> isize {
         // SAFETY: the caller supplies a buffer of `size` bytes (or NULL/0).
         unsafe {
@@ -23017,7 +23122,10 @@ fn os_listxattr(args: &[i64]) -> i64 {
     let as_bytes = value::as_bytes(path_value).is_some();
     let mut items = Vec::new();
     let mut roots = Vec::new();
-    for name in buffer.split(|byte| *byte == 0).filter(|name| !name.is_empty()) {
+    for name in buffer
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
         let item = if as_bytes {
             value::bytes_new(name.to_vec())
         } else {
@@ -23044,7 +23152,7 @@ fn os_removexattr(args: &[i64]) -> i64 {
     let Some((path, Some(name))) = os_xattr_targets(args, Some(1)) else {
         return exc::raise_with_message(TYPE_ERROR, "removexattr() arguments must be str or bytes");
     };
-    let follow = args.get(2).copied().map_or(true, value::truthy);
+    let follow = args.get(2).copied().is_none_or(value::truthy);
     // SAFETY: `path` and `name` are NUL-terminated C strings.
     let result = unsafe {
         if follow {
@@ -23134,7 +23242,7 @@ fn popen_id(instance: i64) -> Option<u64> {
 }
 
 fn popen_is_closed(instance: i64) -> bool {
-    value::instance_attr(instance, "closed").is_some_and(|closed| value::truthy(closed))
+    value::instance_attr(instance, "closed").is_some_and(value::truthy)
 }
 
 fn popen_set_closed(instance: i64) {
@@ -23213,11 +23321,7 @@ fn os_popen(args: &[i64]) -> i64 {
     );
     let instance = value::instance_new(popen_class());
     let roots = heap::root_values(&[instance]);
-    value::instance_setattr(
-        instance,
-        POPEN_ID.to_string(),
-        encode_int(id as i64),
-    );
+    value::instance_setattr(instance, POPEN_ID.to_string(), encode_int(id as i64));
     value::instance_setattr(instance, "closed".to_string(), FALSE);
     heap::release_roots(roots);
     instance
@@ -23262,7 +23366,11 @@ fn popen_readline_bytes(instance: i64, size: Option<i64>) -> Option<Vec<u8>> {
     let mut data = Vec::new();
     let limit = size.filter(|limit| *limit > 0).map(|limit| limit as u64);
     let result = match limit {
-        Some(limit) => reader.by_ref().take(limit).read_until(b'\n', &mut data).map(|_| ()),
+        Some(limit) => reader
+            .by_ref()
+            .take(limit)
+            .read_until(b'\n', &mut data)
+            .map(|_| ()),
         None => reader.read_until(b'\n', &mut data).map(|_| ()),
     };
     entry.reader = Some(reader);
@@ -23456,11 +23564,8 @@ fn popen_method(method: &str, args: &[i64]) -> i64 {
 
 /// Converts a slice of the child's output into the stream's text or bytes.
 fn popen_text_value(instance: i64, data: Vec<u8>) -> i64 {
-    let binary = popen_id(instance).is_some_and(|id| {
-        popen_registry()
-            .get(&id)
-            .is_some_and(|state| state.binary)
-    });
+    let binary = popen_id(instance)
+        .is_some_and(|id| popen_registry().get(&id).is_some_and(|state| state.binary));
     if binary {
         value::bytes_new(data)
     } else {
@@ -30443,10 +30548,7 @@ mod tests {
         slots[3] = back_name;
         // `f_back` and `sys._getframe(1)` must describe the same frame; the two
         // strings are separate allocations, so compare their text.
-        assert_eq!(
-            value::as_str(back_name),
-            value::as_str(name_of_back(frame))
-        );
+        assert_eq!(value::as_str(back_name), value::as_str(name_of_back(frame)));
 
         // Depth 2 is truly past the end of the thread's frame chain.
         let _ = crate::abi::hydro_module_call(
@@ -30800,7 +30902,10 @@ mod tests {
             value::as_str(frame_attr(frame_attr(frame, "f_code"), "co_name")),
             Some("probe")
         );
-        assert_eq!(locals_entry(frame_attr(frame, "f_locals"), "a"), Some(int(1)));
+        assert_eq!(
+            locals_entry(frame_attr(frame, "f_locals"), "a"),
+            Some(int(1))
+        );
 
         crate::abi::hydro_frame_leave();
         crate::abi::hydro_gc_frame_pop(token);
@@ -30878,7 +30983,10 @@ mod tests {
         crate::methods::call(frame, b"clear".as_ptr(), 5, 0, std::ptr::null());
         assert!(!exc::pending());
         assert_eq!(frame_attr(frame, "f_trace"), NONE);
-        assert_eq!(value::as_dict(frame_attr(frame, "f_locals")).map(|d| d.len()), Some(0));
+        assert_eq!(
+            value::as_dict(frame_attr(frame, "f_locals")).map(|d| d.len()),
+            Some(0)
+        );
         exc::init();
     }
 

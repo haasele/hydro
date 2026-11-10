@@ -538,7 +538,10 @@ fn config_dict() -> i64 {
         ("safe_path", num(0)),
         ("pathconfig_warnings", num(1)),
         ("use_frozen_modules", num(0)),
-        ("check_hash_pycs_mode", value::str_alloc("default".to_string())),
+        (
+            "check_hash_pycs_mode",
+            value::str_alloc("default".to_string()),
+        ),
         ("stdio_encoding", value::str_alloc("utf-8".to_string())),
         ("stdio_errors", value::str_alloc("strict".to_string())),
         ("program_name", value::str_alloc("hydro".to_string())),
@@ -672,7 +675,9 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             RARE_SET_EVAL_FRAME_FUNC.fetch_add(1, Ordering::Relaxed);
             NONE
         }
-        "has_inline_values" | "has_split_table" | "has_deferred_refcount"
+        "has_inline_values"
+        | "has_split_table"
+        | "has_deferred_refcount"
         | "is_static_immortal" => value::FALSE,
         "get_static_builtin_types" | "identify_type_slot_wrappers" => list_of(Vec::new()),
         "write_perf_map_entry" => write_perf_map_entry(args),
@@ -713,10 +718,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                     VALUE_ERROR,
                     &format!("interpreter id {id} is not valid"),
                 ),
-                None => exc::raise_with_message(
-                    TYPE_ERROR,
-                    "interpreter id must be an integer",
-                ),
+                None => exc::raise_with_message(TYPE_ERROR, "interpreter id must be an integer"),
             }
         }
         "get_interpreter_refcount" => match interpreter_id(argument(args, 0)) {
@@ -735,17 +737,17 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             Some(id) => interpreter_refcount_linked(id),
             None => exc::raise_with_message(TYPE_ERROR, "interpreter id must be an integer"),
         },
-        "get_interp_settings" => {
-            match interpreter_id(argument(args, 0)) {
-                Some(0) => interp_settings(),
-                Some(id) => exc::raise_with_message(
-                    VALUE_ERROR,
-                    &format!("interpreter id {id} does not exist in this runtime"),
-                ),
-                None => exc::raise_with_message(TYPE_ERROR, "interpreter id must be an integer"),
-            }
-        }
-        "create_interpreter" | "destroy_interpreter" | "exec_interpreter"
+        "get_interp_settings" => match interpreter_id(argument(args, 0)) {
+            Some(0) => interp_settings(),
+            Some(id) => exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("interpreter id {id} does not exist in this runtime"),
+            ),
+            None => exc::raise_with_message(TYPE_ERROR, "interpreter id must be an integer"),
+        },
+        "create_interpreter"
+        | "destroy_interpreter"
+        | "exec_interpreter"
         | "run_in_subinterp_with_config" => exc::raise_with_message(
             NOT_IMPLEMENTED_ERROR,
             "Hydro runs a single interpreter: modules are linked statically and \

@@ -35,12 +35,12 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::builtins;
 use crate::container;
+use crate::core::globals;
 use crate::exc::{
     self, ASSERTION_ERROR, ATTRIBUTE_ERROR, KEY_ERROR, LOOKUP_ERROR, NOT_IMPLEMENTED_ERROR,
     OS_ERROR, RUNTIME_ERROR, SKIPPED, STOP_ITERATION, TYPE_ERROR, XFAILED,
 };
 use crate::fiber;
-use crate::core::globals;
 use crate::heap;
 use crate::iter;
 use crate::methods;
@@ -588,11 +588,7 @@ fn fixture_builtin(args: &[i64]) -> i64 {
 /// Builds (and caches in the runtime registry) one fixture support class.
 /// `methods` pairs the Python attribute name with the native dispatcher name
 /// and its arity (the receiver counts).
-fn fixture_class(
-    key: &str,
-    name: &str,
-    methods: &[(&'static str, &'static str, usize)],
-) -> i64 {
+fn fixture_class(key: &str, name: &str, methods: &[(&'static str, &'static str, usize)]) -> i64 {
     fixture_class_with_attrs(key, name, methods, &[])
 }
 
@@ -667,7 +663,9 @@ fn invoke(object: i64, name: &str, args: &[i64]) -> i64 {
 }
 
 fn list_snapshot(list: i64) -> Vec<i64> {
-    value::as_list(list).map(|items| items.to_vec()).unwrap_or_default()
+    value::as_list(list)
+        .map(|items| items.to_vec())
+        .unwrap_or_default()
 }
 
 fn instance_index(instance: i64, key: &str) -> Option<usize> {
@@ -744,11 +742,7 @@ fn request_new() -> i64 {
     let roots = heap::root_values(&[instance, node, config]);
     let name = current_test();
     value::instance_setattr(node, "name".to_string(), value::str_alloc(name.clone()));
-    value::instance_setattr(
-        node,
-        "nodeid".to_string(),
-        value::str_alloc(name.clone()),
-    );
+    value::instance_setattr(node, "nodeid".to_string(), value::str_alloc(name.clone()));
     let source = source_path();
     value::instance_setattr(node, "fspath".to_string(), source);
     value::instance_setattr(node, "path".to_string(), source);
@@ -776,7 +770,11 @@ fn request_new() -> i64 {
     value::instance_setattr(instance, "cls".to_string(), NONE);
     value::instance_setattr(instance, "instance".to_string(), NONE);
     value::instance_setattr(instance, "module".to_string(), NONE);
-    value::instance_setattr(instance, "keywords".to_string(), value::dict_new(Vec::new()));
+    value::instance_setattr(
+        instance,
+        "keywords".to_string(),
+        value::dict_new(Vec::new()),
+    );
     value::instance_setattr(
         instance,
         "fixturenames".to_string(),
@@ -957,7 +955,11 @@ fn monkeypatch_setattr(args: &[i64]) -> i64 {
     let name_value = value::str_alloc(attribute.clone());
     let existed_value = value::bool_value(existed);
     let record_roots = heap::root_values(&[name_value, existed_value, old]);
-    monkeypatch_record(this, UNDO_ATTRIBUTE, [target, name_value, existed_value, old]);
+    monkeypatch_record(
+        this,
+        UNDO_ATTRIBUTE,
+        [target, name_value, existed_value, old],
+    );
     heap::release_roots(record_roots);
     let written = setter(target, &attribute, new_value);
     heap::release_roots(roots);
@@ -1340,8 +1342,14 @@ fn capsys_new() -> i64 {
 fn capture_begin() -> Result<usize, String> {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir();
-    let out_path = directory.join(format!("hydro-capsys-out-{}-{sequence}", std::process::id()));
-    let err_path = directory.join(format!("hydro-capsys-err-{}-{sequence}", std::process::id()));
+    let out_path = directory.join(format!(
+        "hydro-capsys-out-{}-{sequence}",
+        std::process::id()
+    ));
+    let err_path = directory.join(format!(
+        "hydro-capsys-err-{}-{sequence}",
+        std::process::id()
+    ));
     let out_file = std::fs::File::create(&out_path).map_err(|error| {
         format!(
             "pytest fixture 'capsys': cannot create {}: {error}",
@@ -1514,11 +1522,7 @@ fn caplog_at_level_class() -> i64 {
         ("__enter__", "_caplog_at_enter", 1),
         ("__exit__", "_caplog_at_exit", 4),
     ];
-    fixture_class(
-        "pytest._AtLevelContext.class",
-        "_AtLevelContext",
-        &METHODS,
-    )
+    fixture_class("pytest._AtLevelContext.class", "_AtLevelContext", &METHODS)
 }
 
 /// `caplog`: installs a capturing handler on the root logger through the

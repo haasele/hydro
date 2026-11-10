@@ -39,8 +39,7 @@ use crate::builtins as core_builtins;
 use crate::container;
 use crate::core::globals;
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, IMPORT_ERROR, KEY_ERROR, NOT_IMPLEMENTED_ERROR, RUNTIME_ERROR,
-    TYPE_ERROR, VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, IMPORT_ERROR, KEY_ERROR, NOT_IMPLEMENTED_ERROR, TYPE_ERROR, VALUE_ERROR,
 };
 use crate::methods;
 use crate::modules;
@@ -194,9 +193,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "id" => id_value(args[0]),
         "dir" => dir(args),
         "vars" => vars(args),
-        "globals" => {
-            core_builtins::call_builtin(Builtin::Globals, args.len(), args.as_ptr())
-        }
+        "globals" => core_builtins::call_builtin(Builtin::Globals, args.len(), args.as_ptr()),
         "locals" => core_builtins::call_builtin(Builtin::Locals, args.len(), args.as_ptr()),
         "compile" => core_builtins::call_builtin(Builtin::Compile, args.len(), args.as_ptr()),
         "issubclass" => core_builtins::call_builtin(Builtin::Issubclass, args.len(), args.as_ptr()),

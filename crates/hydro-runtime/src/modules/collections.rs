@@ -4451,8 +4451,8 @@ fn deque_call(op: DequeOp, args: &[i64]) -> i64 {
                     Err(error) => return error,
                 },
             };
-            for position in start..stop.min(length) {
-                if container::equals(items[position], needle) {
+            for (position, item) in items.iter().enumerate().take(stop.min(length)).skip(start) {
+                if container::equals(*item, needle) {
                     return ops::int_result(position as i64);
                 }
                 if exc::pending() {
@@ -4480,7 +4480,10 @@ fn deque_call(op: DequeOp, args: &[i64]) -> i64 {
             let length = deque_items(obj).len();
             if let Some(limit) = deque_limit(obj) {
                 if length >= limit {
-                    return exc::raise_with_message(INDEX_ERROR, "deque already at its maximum size");
+                    return exc::raise_with_message(
+                        INDEX_ERROR,
+                        "deque already at its maximum size",
+                    );
                 }
             }
             let position = if raw < 0 {
@@ -4718,9 +4721,21 @@ pub(crate) fn deque_class() -> i64 {
     value::function_set_full_entry(init, deque_init_entry as *const () as usize);
     methods.push(("__init__".to_string(), init, MethodKind::Normal));
     let specs: Vec<(&'static str, Vec<ParamMeta>, usize)> = vec![
-        ("__repr__", self_only(), deque_repr_entry as *const () as usize),
-        ("__len__", self_only(), deque_len_entry as *const () as usize),
-        ("__iter__", self_only(), deque_iter_entry as *const () as usize),
+        (
+            "__repr__",
+            self_only(),
+            deque_repr_entry as *const () as usize,
+        ),
+        (
+            "__len__",
+            self_only(),
+            deque_len_entry as *const () as usize,
+        ),
+        (
+            "__iter__",
+            self_only(),
+            deque_iter_entry as *const () as usize,
+        ),
         (
             "__reversed__",
             self_only(),
@@ -4906,7 +4921,11 @@ pub(crate) fn deque_class() -> i64 {
             ],
             deque_pop_entry as *const () as usize,
         ),
-        ("clear", self_only(), deque_clear_entry as *const () as usize),
+        (
+            "clear",
+            self_only(),
+            deque_clear_entry as *const () as usize,
+        ),
         (
             "count",
             vec![
@@ -5416,10 +5435,7 @@ pub(crate) fn chainmap_class() -> i64 {
         (
             "__init__",
             MethodKind::Normal,
-            vec![
-                this(),
-                deque_param("maps", ParamKind::VarArg, false),
-            ],
+            vec![this(), deque_param("maps", ParamKind::VarArg, false)],
             chain_init_entry as *const () as usize,
         ),
         (

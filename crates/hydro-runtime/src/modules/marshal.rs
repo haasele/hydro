@@ -316,7 +316,12 @@ impl<'a> Decoder<'a> {
             .checked_add(count)
             .ok_or_else(|| value_error("bad marshal data (string size out of range)"))?;
         if end > self.data.len() {
-            return Err(value_error("EOF read where object expected"));
+            // `r_string` reports a short `loads()` buffer as `EOFError`;
+            // `marshal.loads()`-truncated data is the documented trigger.
+            return Err(exc::raise_with_message(
+                exc::EOF_ERROR,
+                "marshal data too short",
+            ));
         }
         let slice = &self.data[self.position..end];
         self.position = end;
@@ -353,8 +358,8 @@ impl<'a> Decoder<'a> {
     fn float_text(&mut self) -> Result<f64, i64> {
         let length = usize::from(self.short()?);
         let bytes = self.read(length)?;
-        let text = std::str::from_utf8(bytes)
-            .map_err(|_| value_error("bad marshal data (float text)"))?;
+        let text =
+            std::str::from_utf8(bytes).map_err(|_| value_error("bad marshal data (float text)"))?;
         text.parse::<f64>()
             .map_err(|_| value_error("bad marshal data (float text)"))
     }
@@ -371,10 +376,8 @@ impl<'a> Decoder<'a> {
             let digit = self.short()?;
             magnitude = (magnitude << 15u32) + BigUint::from(u32::from(digit));
         }
-        let number = BigInt::from_biguint(
-            if negative { Sign::Minus } else { Sign::Plus },
-            magnitude,
-        );
+        let number =
+            BigInt::from_biguint(if negative { Sign::Minus } else { Sign::Plus }, magnitude);
         Ok(match number.to_i64() {
             Some(small) => ops::int_result(small),
             None => value::bigint_new(number),

@@ -24,8 +24,8 @@ use crate::builtins;
 use crate::container;
 use crate::core::globals;
 use crate::exc::{
-    self, ASSERTION_ERROR, ATTRIBUTE_ERROR, BASE_EXCEPTION, EXCEPTION, KEYBOARD_INTERRUPT,
-    SKIPPED, TYPE_ERROR, VALUE_ERROR,
+    self, ASSERTION_ERROR, ATTRIBUTE_ERROR, BASE_EXCEPTION, EXCEPTION, KEYBOARD_INTERRUPT, SKIPPED,
+    TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::iter;
@@ -117,9 +117,7 @@ pub(crate) fn module_cleanups() -> i64 {
 /// `__init_subclass__`; the runtime creates it lazily so a subclass never
 /// inherits and drains its base class' cleanups.
 fn class_cleanups_list(class: i64) -> Option<i64> {
-    if value::as_class(class).is_none() {
-        return None;
-    }
+    value::as_class(class)?;
     if let Some(value::ClassEntry::Attr(list)) = value::class_own_lookup(class, "_class_cleanups") {
         if value::as_list(list).is_some() {
             return Some(list);
@@ -531,7 +529,11 @@ pub(crate) fn test_case() -> i64 {
         ("_callTearDown", "TestCase._callTearDown", 1),
         ("_callCleanup", "TestCase._callCleanup", 2),
         ("_addDuration", "TestCase._addDuration", 3),
-        ("_getAssertEqualityFunc", "TestCase._getAssertEqualityFunc", 3),
+        (
+            "_getAssertEqualityFunc",
+            "TestCase._getAssertEqualityFunc",
+            3,
+        ),
         ("countTestCases", "TestCase.countTestCases", 1),
         ("defaultTestResult", "TestCase.defaultTestResult", 1),
         ("_formatMessage", "TestCase._formatMessage", 3),
@@ -580,9 +582,17 @@ pub(crate) fn test_case() -> i64 {
     );
     value::class_set_attr(class, "longMessage".to_string(), TRUE);
     value::class_set_attr(class, "maxDiff".to_string(), encode_int(80 * 8));
-    value::class_set_attr(class, "_diffThreshold".to_string(), encode_int(2i64.pow(16)));
+    value::class_set_attr(
+        class,
+        "_diffThreshold".to_string(),
+        encode_int(2i64.pow(16)),
+    );
     value::class_set_attr(class, "_classSetupFailed".to_string(), FALSE);
-    value::class_set_attr(class, "tearDown_exceptions".to_string(), value::list_new(Vec::new()));
+    value::class_set_attr(
+        class,
+        "tearDown_exceptions".to_string(),
+        value::list_new(Vec::new()),
+    );
     let _ = class_cleanups_list(class);
     // Class-scoped hooks are classmethods, so `TestCase.addClassCleanup(fn)`
     // and `Cls.doClassCleanups()` receive the owner class exactly as CPython's
@@ -683,7 +693,11 @@ pub(crate) fn text_test_result_class() -> i64 {
         ("addFailure", "TextTestResult.addFailure", 3),
         ("addSkip", "TextTestResult.addSkip", 3),
         ("addExpectedFailure", "TextTestResult.addExpectedFailure", 3),
-        ("addUnexpectedSuccess", "TextTestResult.addUnexpectedSuccess", 2),
+        (
+            "addUnexpectedSuccess",
+            "TextTestResult.addUnexpectedSuccess",
+            2,
+        ),
         ("printErrors", "TextTestResult.printErrors", 1),
         ("printErrorList", "TextTestResult.printErrorList", 3),
     ];
@@ -714,11 +728,7 @@ pub(crate) fn text_test_runner_class() -> i64 {
         ("run", "TextTestRunner.run", 2),
     ];
     let class = cached_class(TEXT_RUNNER_KEY, "TextTestRunner", NONE, &METHODS);
-    value::class_set_attr(
-        class,
-        "resultclass".to_string(),
-        text_test_result_class(),
-    );
+    value::class_set_attr(class, "resultclass".to_string(), text_test_result_class());
     class
 }
 
@@ -901,10 +911,7 @@ fn writeln_decorator_method(method: &str, args: &[i64]) -> i64 {
             };
             let requested = value::as_str(name).unwrap_or("");
             if requested == "stream" || requested == "__getstate__" {
-                return exc::raise_with_message(
-                    ATTRIBUTE_ERROR,
-                    &format!("'{requested}'"),
-                );
+                return exc::raise_with_message(ATTRIBUTE_ERROR, &format!("'{requested}'"));
             }
             let stream = value::instance_attr(instance, "stream").unwrap_or(NONE);
             methods::getattr(stream, requested.as_ptr(), requested.len())
@@ -1066,7 +1073,12 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>
         // Constructors bind their documented keyword arguments into the
         // positional slots the native initializers read.
         "TestResult.__init__" => {
-            let slots = bind_named_slots(args, &keywords, &["stream", "descriptions", "verbosity"], function);
+            let slots = bind_named_slots(
+                args,
+                &keywords,
+                &["stream", "descriptions", "verbosity"],
+                function,
+            );
             dispatch(function, &slots)
         }
         "TextTestRunner.__init__" => {
@@ -1101,9 +1113,9 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>
             );
             dispatch(function, &slots)
         }
-        "TextTestRunner.run"
-        | "TestProgram.__init__"
-        | "TestLoader.__init__" => call(function, args),
+        "TextTestRunner.run" | "TestProgram.__init__" | "TestLoader.__init__" => {
+            call(function, args)
+        }
         _ => {
             // Dynamic assertion methods (`assertWarns`, `assertIsSubclass`,
             // ...) live in their own module; only names the table does not
@@ -1947,7 +1959,11 @@ fn warn_runtime(message: &str) {
 /// (CPython's legacy-result compatibility path).
 fn result_add_skip(result: i64, test: i64, reason: &str) {
     if has_method(result, "addSkip") {
-        call_method(result, "addSkip", &[test, value::str_alloc(reason.to_string())]);
+        call_method(
+            result,
+            "addSkip",
+            &[test, value::str_alloc(reason.to_string())],
+        );
     } else {
         warn_runtime("TestResult has no addSkip method, skips not reported");
         call_method(result, "addSuccess", &[test]);
@@ -1958,9 +1974,7 @@ fn result_add_expected_failure(result: i64, test: i64, error: i64) {
     if has_method(result, "addExpectedFailure") {
         call_method(result, "addExpectedFailure", &[test, error_tuple(error)]);
     } else {
-        warn_runtime(
-            "TestResult has no addExpectedFailure method, reporting as passes",
-        );
+        warn_runtime("TestResult has no addExpectedFailure method, reporting as passes");
         call_method(result, "addSuccess", &[test]);
     }
 }
@@ -1969,9 +1983,7 @@ fn result_add_unexpected_success(result: i64, test: i64) {
     if has_method(result, "addUnexpectedSuccess") {
         call_method(result, "addUnexpectedSuccess", &[test]);
     } else {
-        warn_runtime(
-            "TestResult has no addUnexpectedSuccess method, reporting as failure",
-        );
+        warn_runtime("TestResult has no addUnexpectedSuccess method, reporting as failure");
         let failure = builtins::call(unexpected_success_class(), 0, std::ptr::null());
         call_method(result, "addFailure", &[test, error_tuple(failure)]);
     }
@@ -2062,8 +2074,8 @@ fn add_cleanup(args: &[i64]) -> i64 {
 /// exception goes through the same failure/error classification as a test
 /// outcome. Every cleanup runs even after an earlier one failed.
 fn do_cleanups(instance: i64) -> bool {
-    let Some(cleanups) = value::instance_attr(instance, "_cleanups")
-        .filter(|list| value::as_list(*list).is_some())
+    let Some(cleanups) =
+        value::instance_attr(instance, "_cleanups").filter(|list| value::as_list(*list).is_some())
     else {
         return true;
     };
@@ -2217,8 +2229,7 @@ fn warn_deprecated_return(instance: i64, name: &str, returned: i64) {
 }
 
 fn test_case_add_duration(args: &[i64]) -> i64 {
-    let (Some(&instance), Some(&result), Some(&elapsed)) =
-        (args.first(), args.get(1), args.get(2))
+    let (Some(&instance), Some(&result), Some(&elapsed)) = (args.first(), args.get(1), args.get(2))
     else {
         return missing_arguments("TestCase._addDuration");
     };
@@ -2240,8 +2251,7 @@ fn test_case_add_duration(args: &[i64]) -> i64 {
 }
 
 fn test_case_get_equality_func(args: &[i64]) -> i64 {
-    let (Some(&instance), Some(&first), Some(&second)) =
-        (args.first(), args.get(1), args.get(2))
+    let (Some(&instance), Some(&first), Some(&second)) = (args.first(), args.get(1), args.get(2))
     else {
         return missing_arguments("TestCase._getAssertEqualityFunc");
     };
@@ -2250,8 +2260,8 @@ fn test_case_get_equality_func(args: &[i64]) -> i64 {
             return entry;
         }
     }
-    let base = value::native_function_new("unittest", "TestCase._baseAssertEqual", 4);
-    base
+
+    value::native_function_new("unittest", "TestCase._baseAssertEqual", 4)
 }
 
 fn short_description(args: &[i64]) -> i64 {
@@ -2281,10 +2291,7 @@ fn test_case_str(args: &[i64]) -> i64 {
         .and_then(value::as_str)
         .map(str::to_string)
         .unwrap_or_default();
-    value::str_alloc(format!(
-        "{name} ({}.{name})",
-        qualified_class_text(class)
-    ))
+    value::str_alloc(format!("{name} ({}.{name})", qualified_class_text(class)))
 }
 
 fn test_case_repr(args: &[i64]) -> i64 {
@@ -2319,8 +2326,7 @@ fn fail(args: &[i64]) -> i64 {
 }
 
 fn assert_equal(args: &[i64]) -> i64 {
-    let (Some(&instance), Some(&first), Some(&second)) =
-        (args.first(), args.get(1), args.get(2))
+    let (Some(&instance), Some(&first), Some(&second)) = (args.first(), args.get(1), args.get(2))
     else {
         return missing_arguments("assertEqual");
     };
@@ -2396,8 +2402,7 @@ fn format_message(args: &[i64]) -> i64 {
 
 /// `self._baseAssertEqual(first, second, msg)`: plain `==`, no type dispatch.
 fn base_assert_equal(args: &[i64]) -> i64 {
-    let (Some(&instance), Some(&first), Some(&second)) =
-        (args.first(), args.get(1), args.get(2))
+    let (Some(&instance), Some(&first), Some(&second)) = (args.first(), args.get(1), args.get(2))
     else {
         return missing_arguments("TestCase._baseAssertEqual");
     };
@@ -2437,9 +2442,7 @@ fn truncate_message_text(instance: i64, message: String, diff: String) -> String
     if i64::try_from(length).unwrap_or(i64::MAX) <= limit {
         format!("{message}{diff}")
     } else {
-        format!(
-            "{message}\nDiff is {length} characters long. Set self.maxDiff to None to see it."
-        )
+        format!("{message}\nDiff is {length} characters long. Set self.maxDiff to None to see it.")
     }
 }
 
@@ -2650,8 +2653,7 @@ fn splitlines_keepends(text: i64) -> Vec<i64> {
 
 /// `assertSequenceEqual(seq1, seq2, msg=None, seq_type=None)`.
 fn assert_sequence_equal(args: &[i64], seq_type_name: Option<&str>) -> i64 {
-    let (Some(&instance), Some(&seq1), Some(&seq2)) =
-        (args.first(), args.get(1), args.get(2))
+    let (Some(&instance), Some(&seq1), Some(&seq2)) = (args.first(), args.get(1), args.get(2))
     else {
         return missing_arguments("assertSequenceEqual");
     };
@@ -2767,8 +2769,7 @@ fn assert_sequence_equal(args: &[i64], seq_type_name: Option<&str>) -> i64 {
 
 /// `assertSetEqual(set1, set2, msg=None)`.
 fn assert_set_equal(args: &[i64]) -> i64 {
-    let (Some(&instance), Some(&set1), Some(&set2)) =
-        (args.first(), args.get(1), args.get(2))
+    let (Some(&instance), Some(&set1), Some(&set2)) = (args.first(), args.get(1), args.get(2))
     else {
         return missing_arguments("assertSetEqual");
     };
@@ -2809,8 +2810,7 @@ fn assert_set_equal(args: &[i64]) -> i64 {
 
 /// `assertDictEqual(d1, d2, msg=None)`.
 fn assert_dict_equal(args: &[i64]) -> i64 {
-    let (Some(&instance), Some(&first), Some(&second)) =
-        (args.first(), args.get(1), args.get(2))
+    let (Some(&instance), Some(&first), Some(&second)) = (args.first(), args.get(1), args.get(2))
     else {
         return missing_arguments("assertDictEqual");
     };
@@ -2848,8 +2848,7 @@ fn assert_dict_equal(args: &[i64]) -> i64 {
 
 /// `assertMultiLineEqual(first, second, msg=None)`.
 fn assert_multi_line_equal(args: &[i64]) -> i64 {
-    let (Some(&instance), Some(&first), Some(&second)) =
-        (args.first(), args.get(1), args.get(2))
+    let (Some(&instance), Some(&first), Some(&second)) = (args.first(), args.get(1), args.get(2))
     else {
         return missing_arguments("assertMultiLineEqual");
     };
@@ -2877,9 +2876,7 @@ fn assert_multi_line_equal(args: &[i64]) -> i64 {
     let threshold = self_attribute(instance, "_diffThreshold")
         .and_then(value::as_integer)
         .unwrap_or(2i64.pow(16));
-    let too_long = i64::try_from(first_text.chars().count())
-        .unwrap_or(i64::MAX)
-        > threshold
+    let too_long = i64::try_from(first_text.chars().count()).unwrap_or(i64::MAX) > threshold
         || i64::try_from(second_text.chars().count()).unwrap_or(i64::MAX) > threshold;
     if !too_long {
         // Append a newline to either side that lacks one so the diff shows the
@@ -2917,8 +2914,7 @@ fn assert_multi_line_equal(args: &[i64]) -> i64 {
                         text.push_str(line);
                     }
                 }
-                let Some(standard) =
-                    truncate_via_instance(instance, standard, format!("\n{text}"))
+                let Some(standard) = truncate_via_instance(instance, standard, format!("\n{text}"))
                 else {
                     return NONE;
                 };
@@ -3077,7 +3073,11 @@ fn assert_is_instance(args: &[i64], expected: bool) -> i64 {
     raise_assertion(assertion_message(
         args,
         3,
-        format!("{} is an instance of {}", value::repr(expression), value::repr(matched)),
+        format!(
+            "{} is an instance of {}",
+            value::repr(expression),
+            value::repr(matched)
+        ),
     ))
 }
 
@@ -3116,7 +3116,11 @@ fn assert_almost_equal(args: &[i64], expected: bool) -> i64 {
             raise_assertion(assertion_message(
                 args,
                 4,
-                format!("{} == {} within 7 places", value::repr(first), value::repr(second)),
+                format!(
+                    "{} == {} within 7 places",
+                    value::repr(first),
+                    value::repr(second)
+                ),
             ))
         };
     }
@@ -3224,8 +3228,7 @@ fn assert_regex(args: &[i64], expected: bool) -> i64 {
 }
 
 fn assert_count_equal(args: &[i64]) -> i64 {
-    let (Some(&instance), Some(&first), Some(&second)) =
-        (args.first(), args.get(1), args.get(2))
+    let (Some(&instance), Some(&first), Some(&second)) = (args.first(), args.get(1), args.get(2))
     else {
         return missing_arguments("assertCountEqual");
     };
@@ -3331,13 +3334,7 @@ fn assert_raises_with_keywords(args: &[i64], keywords: &[(String, i64)], with_re
     if let Some(&callable) = args.get(callable_index) {
         let call_args = &args[callable_index + 1..];
         return assert_raises_callable(
-            instance,
-            expected,
-            regex,
-            callable,
-            call_args,
-            keywords,
-            with_regex,
+            instance, expected, regex, callable, call_args, keywords, with_regex,
         );
     }
     let mut msg = NONE;
@@ -3443,9 +3440,9 @@ fn validate_exception_type(expected: i64, with_regex: bool) -> bool {
     let base = exc::exception_class(BASE_EXCEPTION);
     let valid = if let Some(items) = value::as_tuple(expected) {
         !items.is_empty()
-            && items.iter().all(|item| {
-                value::as_class(*item).is_some() && value::is_subclass_of(*item, base)
-            })
+            && items
+                .iter()
+                .all(|item| value::as_class(*item).is_some() && value::is_subclass_of(*item, base))
     } else {
         value::as_class(expected).is_some() && value::is_subclass_of(expected, base)
     };
@@ -3495,7 +3492,9 @@ fn callable_name(callable: i64) -> String {
         exc::clear();
         return value::to_string(callable);
     }
-    value::as_str(name).map(str::to_string).unwrap_or_else(|| value::to_string(callable))
+    value::as_str(name)
+        .map(str::to_string)
+        .unwrap_or_else(|| value::to_string(callable))
 }
 
 fn missing_exception_message_for(expected: i64, obj_name: Option<&str>) -> String {
@@ -3682,8 +3681,16 @@ fn text_test_result_method(method: &str, args: &[i64]) -> i64 {
                 .copied()
                 .and_then(value::as_integer)
                 .unwrap_or(1);
-            value::instance_setattr(result, "showAll".to_string(), value::bool_value(verbosity > 1));
-            value::instance_setattr(result, "dots".to_string(), value::bool_value(verbosity == 1));
+            value::instance_setattr(
+                result,
+                "showAll".to_string(),
+                value::bool_value(verbosity > 1),
+            );
+            value::instance_setattr(
+                result,
+                "dots".to_string(),
+                value::bool_value(verbosity == 1),
+            );
             value::instance_setattr(result, "_newline".to_string(), TRUE);
             NONE
         }
@@ -3703,7 +3710,7 @@ fn text_test_result_method(method: &str, args: &[i64]) -> i64 {
             }
         }
         "startTest" => {
-            let (Some(&result), Some(&test)) = (args.first(), args.get(1)) else {
+            let (Some(&result), Some(&_test)) = (args.first(), args.get(1)) else {
                 return missing_arguments("TextTestResult.startTest");
             };
             test_result_method("startTest", args);
@@ -3735,11 +3742,7 @@ fn text_test_result_method(method: &str, args: &[i64]) -> i64 {
             if error != NONE {
                 let failure = error_is_failure(error, subtest);
                 if result_attr_truthy(result, "showAll") {
-                    write_status(
-                        result,
-                        subtest,
-                        if failure { "FAIL" } else { "ERROR" },
-                    );
+                    write_status(result, subtest, if failure { "FAIL" } else { "ERROR" });
                 } else if result_attr_truthy(result, "dots") {
                     stream_write(
                         value::instance_attr(result, "stream").unwrap_or(NONE),
@@ -3855,7 +3858,8 @@ fn text_test_result_method(method: &str, args: &[i64]) -> i64 {
                         .unwrap_or_default();
                     stream_writeln(stream, &separator);
                     for &test in items {
-                        let description = text_test_result_method("getDescription", &[result, test]);
+                        let description =
+                            text_test_result_method("getDescription", &[result, test]);
                         stream_writeln(
                             stream,
                             &format!("UNEXPECTED SUCCESS: {}", value::to_string(description)),
@@ -4197,8 +4201,8 @@ fn runner_method(method: &str, args: &[i64]) -> i64 {
             let class = resultclass.unwrap_or_else(text_test_result_class);
             let stream = value::instance_attr(runner, "stream").unwrap_or(NONE);
             let descriptions = value::instance_attr(runner, "descriptions").unwrap_or(TRUE);
-            let verbosity = value::instance_attr(runner, "verbosity")
-                .unwrap_or_else(|| encode_int(1));
+            let verbosity =
+                value::instance_attr(runner, "verbosity").unwrap_or_else(|| encode_int(1));
             let call_args = [stream, descriptions, verbosity];
             let result = builtins::call(class, call_args.len(), call_args.as_ptr());
             if exc::pending() {
@@ -4385,7 +4389,10 @@ fn failed_test_method(method: &str, args: &[i64]) -> i64 {
                 .first()
                 .and_then(|instance| value::instance_attr(*instance, "_testMethodName"))
                 .unwrap_or(NONE);
-            value::str_alloc(format!("unittest.loader._FailedTest.{}", value::to_string(name)))
+            value::str_alloc(format!(
+                "unittest.loader._FailedTest.{}",
+                value::to_string(name)
+            ))
         }
         "shortDescription" => NONE,
         "__repr__" => {
@@ -4400,15 +4407,10 @@ fn failed_test_method(method: &str, args: &[i64]) -> i64 {
 }
 
 /// Builds CPython's failed-test suite and records the message on the loader.
-fn make_failed_test(
-    loader: i64,
-    method_name: &str,
-    error: i64,
-    message: String,
-) -> i64 {
-    if let Some(errors) = value::instance_attr(loader, "errors").filter(|list| {
-        value::as_list(*list).is_some()
-    }) {
+fn make_failed_test(loader: i64, method_name: &str, error: i64, message: String) -> i64 {
+    if let Some(errors) =
+        value::instance_attr(loader, "errors").filter(|list| value::as_list(*list).is_some())
+    {
         let text = value::str_alloc(message);
         let roots = heap::root_values(&[text]);
         container::list_append(errors, text);
@@ -4484,12 +4486,7 @@ fn is_callable(item: i64) -> bool {
 }
 
 /// CPython's `loadTestsFromName` object classification.
-fn suite_from_object(
-    loader: i64,
-    object: i64,
-    parent: i64,
-    last_name: &str,
-) -> i64 {
+fn suite_from_object(loader: i64, object: i64, parent: i64, last_name: &str) -> i64 {
     let test_case = test_case();
     if value::as_module(object).is_some() {
         return loader_method("loadTestsFromModule", &[loader, object, NONE]);
@@ -4552,7 +4549,7 @@ fn load_tests_from_name(loader: i64, name_value: i64, module_value: i64) -> i64 
         return exc::raise_with_message(VALUE_ERROR, "Empty module name");
     }
     let parts: Vec<String> = name.split('.').map(str::to_string).collect();
-    let (mut object, mut consumed, mut error_case, mut error_message) = if module_value != NONE {
+    let (mut object, consumed, error_case, error_message) = if module_value != NONE {
         if value::as_module(module_value).is_none() {
             return exc::raise_with_message(TYPE_ERROR, "module argument must be a module");
         }
@@ -4573,10 +4570,7 @@ fn load_tests_from_name(loader: i64, name_value: i64, module_value: i64) -> i64 
                 None => {
                     let error = take_pending();
                     error_case = make_failed_import_test(loader, &parts[count - 1], error);
-                    error_message = format!(
-                        "Failed to import test module: {}",
-                        parts[count - 1]
-                    );
+                    error_message = format!("Failed to import test module: {}", parts[count - 1]);
                     if count == 1 {
                         return error_case;
                     }
@@ -4590,7 +4584,7 @@ fn load_tests_from_name(loader: i64, name_value: i64, module_value: i64) -> i64 
     };
     let mut parent = NONE;
     for part in parts.iter().skip(consumed) {
-        let current = if parent == NONE { object } else { object };
+        let current = object;
         let next = traverse_attr(current, part);
         if exc::pending() {
             let error = take_pending();
@@ -4631,7 +4625,10 @@ fn discover_tests(loader: i64, start_dir: i64, pattern: i64) -> i64 {
         let error = take_pending();
         return make_failed_import_test(loader, &start, error);
     };
-    let mut suites = vec![loader_method("loadTestsFromModule", &[loader, module, NONE])];
+    let mut suites = vec![loader_method(
+        "loadTestsFromModule",
+        &[loader, module, NONE],
+    )];
     let prefix = format!("{start}.");
     for name in globals::module_names() {
         if !name.starts_with(&prefix) {
@@ -4717,7 +4714,10 @@ fn discover_directory(loader: i64, start_dir: &str, pattern: &str) -> i64 {
             }
             match import_module_value(&name) {
                 Some(module) => {
-                    suites.push(loader_method("loadTestsFromModule", &[loader, module, NONE]));
+                    suites.push(loader_method(
+                        "loadTestsFromModule",
+                        &[loader, module, NONE],
+                    ));
                 }
                 None => {
                     let error = take_pending();
@@ -4732,7 +4732,10 @@ fn discover_directory(loader: i64, start_dir: &str, pattern: &str) -> i64 {
         let module_name = name.trim_end_matches(".py").to_string();
         match import_module_value(&module_name) {
             Some(module) => {
-                suites.push(loader_method("loadTestsFromModule", &[loader, module, NONE]));
+                suites.push(loader_method(
+                    "loadTestsFromModule",
+                    &[loader, module, NONE],
+                ));
             }
             None => {
                 let error = take_pending();
@@ -4824,8 +4827,7 @@ fn loader_method(method: &str, args: &[i64]) -> i64 {
                     heap::release_roots(roots);
                     if exc::pending() {
                         let error = take_pending();
-                        let message =
-                            format!("Failed to call load_tests:\n{}", error_text(error));
+                        let message = format!("Failed to call load_tests:\n{}", error_text(error));
                         return make_failed_test(loader, &name, error, message);
                     }
                     returned
@@ -5064,9 +5066,7 @@ fn subtest_description(instance: i64) -> String {
         if !params.is_empty() {
             let rendered = params
                 .iter()
-                .map(|(key, item)| {
-                    format!("{}={}", value::to_string(*key), value::repr(*item))
-                })
+                .map(|(key, item)| format!("{}={}", value::to_string(*key), value::repr(*item)))
                 .collect::<Vec<_>>()
                 .join(", ");
             parts.push(format!("({rendered})"));
@@ -5100,7 +5100,11 @@ fn subtest_method(method: &str, args: &[i64]) -> i64 {
             };
             let test = value::instance_attr(instance, "test_case").unwrap_or(NONE);
             let described = call_method(test, "id", &[]);
-            value::str_alloc(format!("{} {}", value::to_string(described), subtest_description(instance)))
+            value::str_alloc(format!(
+                "{} {}",
+                value::to_string(described),
+                subtest_description(instance)
+            ))
         }
         "shortDescription" => {
             let Some(&instance) = args.first() else {
@@ -5162,13 +5166,9 @@ fn subtest_exit(args: &[i64]) -> i64 {
     if value::instance_attr(test, "_unittest_expecting").is_some_and(value::truthy) {
         exc::clear();
         if value::instance_attr(test, "_unittest_expected_failure")
-            .map_or(true, |stored| stored == NONE)
+            .is_none_or(|stored| stored == NONE)
         {
-            value::instance_setattr(
-                test,
-                "_unittest_expected_failure".to_string(),
-                error,
-            );
+            value::instance_setattr(test, "_unittest_expected_failure".to_string(), error);
         }
         // CPython stops the test body once the expected failure is known.
         raise_should_stop();
@@ -5318,10 +5318,10 @@ fn count_diff_all_purpose(args: &[i64]) -> i64 {
             continue;
         };
         let mut actual_count = 0i64;
-        for later in index..actual.len() {
-            if actual[later].is_some_and(|candidate| container::equals(candidate, item)) {
+        for slot in actual.iter_mut().skip(index) {
+            if slot.is_some_and(|candidate| container::equals(candidate, item)) {
                 actual_count += 1;
-                actual[later] = None;
+                *slot = None;
             }
         }
         let mut expected_count = 0i64;
@@ -5841,12 +5841,7 @@ fn sys_module_value(name: &str) -> Option<i64> {
 
 /// Reports a class/module-level fixture failure under CPython's
 /// `_ErrorHolder` description (`"setUpClass (module.Class)"`).
-fn report_fixture_exception(
-    result: i64,
-    error: i64,
-    description: String,
-    info: Option<i64>,
-) {
+fn report_fixture_exception(result: i64, error: i64, description: String, info: Option<i64>) {
     let holder = value::instance_new(error_holder_class());
     let text = value::str_alloc(description);
     let roots = heap::root_values(&[holder, text]);
@@ -5906,17 +5901,11 @@ fn tear_down_previous_class(test: i64, result: i64) {
         methods::call(previous, b"tearDownClass".as_ptr(), 13, 0, std::ptr::null());
         if exc::pending() {
             let error = take_pending();
-            report_fixture_exception(
-                result,
-                error,
-                format!("tearDownClass ({parent})"),
-                None,
-            );
+            report_fixture_exception(result, error, format!("tearDownClass ({parent})"), None);
         }
     }
     do_class_cleanups_core(previous);
-    if let Some(exceptions) = class_attr_list(previous, "tearDown_exceptions")
-    {
+    if let Some(exceptions) = class_attr_list(previous, "tearDown_exceptions") {
         for info in exceptions {
             let error = value::as_tuple(info)
                 .and_then(|parts| parts.get(1).copied())
@@ -5954,8 +5943,7 @@ fn handle_class_setup(test: i64, result: i64) {
         value::class_set_attr(class, "_classSetupFailed".to_string(), TRUE);
         report_fixture_exception(result, error, format!("setUpClass ({parent})"), None);
         do_class_cleanups_core(class);
-        if let Some(exceptions) = class_attr_list(class, "tearDown_exceptions")
-        {
+        if let Some(exceptions) = class_attr_list(class, "tearDown_exceptions") {
             for info in exceptions {
                 let error = value::as_tuple(info)
                     .and_then(|parts| parts.get(1).copied())
@@ -6005,23 +5993,13 @@ fn handle_module_fixture(test: i64, result: i64) {
     if exc::pending() {
         let error = take_pending();
         value::instance_setattr(result, "_moduleSetUpFailed".to_string(), TRUE);
-        report_fixture_exception(
-            result,
-            error,
-            format!("setUpModule ({module})"),
-            None,
-        );
+        report_fixture_exception(result, error, format!("setUpModule ({module})"), None);
         // CPython still runs module cleanups after a failed setUpModule.
         let cleanup_error = do_module_cleanups(&[]);
         if exc::pending() {
             let error = take_pending();
             let _ = cleanup_error;
-            report_fixture_exception(
-                result,
-                error,
-                format!("setUpModule ({module})"),
-                None,
-            );
+            report_fixture_exception(result, error, format!("setUpModule ({module})"), None);
         }
     }
 }
@@ -6040,23 +6018,13 @@ fn handle_module_teardown(result: i64) {
         heap::release_roots(roots);
         if exc::pending() {
             let error = take_pending();
-            report_fixture_exception(
-                result,
-                error,
-                format!("tearDownModule ({module})"),
-                None,
-            );
+            report_fixture_exception(result, error, format!("tearDownModule ({module})"), None);
         }
     }
     let _ = do_module_cleanups(&[]);
     if exc::pending() {
         let error = take_pending();
-        report_fixture_exception(
-            result,
-            error,
-            format!("tearDownModule ({module})"),
-            None,
-        );
+        report_fixture_exception(result, error, format!("tearDownModule ({module})"), None);
     }
 }
 

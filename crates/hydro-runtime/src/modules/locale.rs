@@ -279,7 +279,7 @@ fn getencoding(_args: &[i64]) -> i64 {
                 return value::str_alloc(text);
             }
         }
-        return value::str_alloc("utf-8".to_string());
+        value::str_alloc("utf-8".to_string())
     }
     #[cfg(not(unix))]
     {
@@ -538,7 +538,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
 /// formatting helpers (which read their separators from this dict).
 fn localeconv() -> i64 {
     let dict = base_localeconv();
-    let Some(overrides) = crate::core::globals::attribute_override("locale", "_override_localeconv")
+    let Some(overrides) =
+        crate::core::globals::attribute_override("locale", "_override_localeconv")
     else {
         return dict;
     };
@@ -782,10 +783,7 @@ fn group_digits(value: &str, fields: &ConvFields, monetary: bool) -> Result<(Str
     groups.reverse();
     let joined = groups.join(separator);
     let separators = separator.chars().count() * groups.len().saturating_sub(1);
-    Ok((
-        format!("{left_spaces}{joined}{right_spaces}"),
-        separators,
-    ))
+    Ok((format!("{left_spaces}{joined}{right_spaces}"), separators))
 }
 
 /// `_strip_padding`: removes at most `amount` spaces from either end.
@@ -845,7 +843,10 @@ fn localize_number(
 
 /// Whether a `%` conversion localizes its result (`_format`'s conversion set).
 fn localizing_conversion(conversion: char) -> bool {
-    matches!(conversion, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'd' | 'i' | 'u')
+    matches!(
+        conversion,
+        'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'd' | 'i' | 'u'
+    )
 }
 
 /// Splits `format` into the template whose conversions become `%s` and the
@@ -925,11 +926,7 @@ fn format_string(args: &[i64]) -> i64 {
                 push(value::str_from_bytes(b"%"));
                 continue;
             }
-            let formatted = ops::binop(
-                ops::OP_MOD,
-                value::str_alloc(spec.clone()),
-                value_arg,
-            );
+            let formatted = ops::binop(ops::OP_MOD, value::str_alloc(spec.clone()), value_arg);
             if exc::pending() {
                 crate::heap::release_roots(roots);
                 return NONE;
@@ -969,8 +966,7 @@ fn format_string(args: &[i64]) -> i64 {
             } else {
                 value::tuple_new(items[index..index + 1 + stars].to_vec())
             };
-            let formatted =
-                ops::binop(ops::OP_MOD, value::str_alloc(spec.clone()), argument);
+            let formatted = ops::binop(ops::OP_MOD, value::str_alloc(spec.clone()), argument);
             if exc::pending() {
                 crate::heap::release_roots(roots);
                 return NONE;
@@ -1014,7 +1010,7 @@ fn nl_langinfo(args: &[i64]) -> i64 {
         let text = unsafe { CStr::from_ptr(pointer) }
             .to_string_lossy()
             .into_owned();
-        return value::str_alloc(text);
+        value::str_alloc(text)
     }
     #[cfg(not(unix))]
     {
@@ -1059,7 +1055,7 @@ fn localize(args: &[i64]) -> i64 {
 
 /// `atof(string, func=float)`: parses a locale-formatted number.
 fn atof(args: &[i64]) -> i64 {
-    let Some(text) = value::as_str(args[0]) else {
+    let Some(_text) = value::as_str(args[0]) else {
         return exc::raise_with_message(TYPE_ERROR, "atof() argument must be str");
     };
     let delocalized = delocalize(&[args[0]]);
@@ -1105,11 +1101,7 @@ fn atoi(args: &[i64]) -> i64 {
 
 /// `str(val)`: `_format("%.12g", val)`.
 fn locale_str(args: &[i64]) -> i64 {
-    let formatted = ops::binop(
-        ops::OP_MOD,
-        value::str_from_bytes(b"%.12g"),
-        args[0],
-    );
+    let formatted = ops::binop(ops::OP_MOD, value::str_from_bytes(b"%.12g"), args[0]);
     if exc::pending() {
         return NONE;
     }
@@ -1121,7 +1113,7 @@ fn locale_str(args: &[i64]) -> i64 {
 fn currency(args: &[i64]) -> i64 {
     let dict = localeconv();
     let international = args.get(3).is_some_and(|item| value::truthy(*item));
-    let symbol = args.get(1).map_or(true, |item| value::truthy(*item));
+    let symbol = args.get(1).is_none_or(|item| value::truthy(*item));
     let grouping = args.get(2).is_some_and(|item| value::truthy(*item));
     if exc::pending() {
         return NONE;
@@ -1201,7 +1193,11 @@ fn currency(args: &[i64]) -> i64 {
     }
     let sign_position = dict_int(
         dict,
-        if negative { "n_sign_posn" } else { "p_sign_posn" },
+        if negative {
+            "n_sign_posn"
+        } else {
+            "p_sign_posn"
+        },
     );
     let sign = dict_string(
         dict,
@@ -1219,7 +1215,7 @@ fn currency(args: &[i64]) -> i64 {
         4 => text.replace('>', &sign),
         _ => format!("{sign}{text}"),
     };
-    value::str_alloc(text.replace('<', "").replace('>', ""))
+    value::str_alloc(text.replace(['<', '>'], ""))
 }
 
 /// The POSIX env-var search behind `getdefaultlocale`.

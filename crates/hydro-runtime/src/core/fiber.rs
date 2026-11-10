@@ -2077,13 +2077,15 @@ mod tests {
         let mut items = Vec::new();
         let mut roots = Vec::new();
         for text in [name, caller] {
-            let item = text
-                .map(value::str_alloc)
-                .unwrap_or(NONE);
+            let item = text.map(value::str_alloc).unwrap_or(NONE);
             roots.push(crate::heap::root_values(&[item]));
             items.push(item);
         }
-        items.push(if chain_ends { value::TRUE } else { value::FALSE });
+        items.push(if chain_ends {
+            value::TRUE
+        } else {
+            value::FALSE
+        });
         let tuple = value::tuple_new(items);
         for root in roots.into_iter().rev() {
             crate::heap::release_roots(root);

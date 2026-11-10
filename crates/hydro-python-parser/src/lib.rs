@@ -134,12 +134,12 @@ pub use parser::{
     ParseErrorType,
 };
 pub use string::FStringErrorType;
-pub use type_params::TypeParamDefaults;
 pub use template::{
     is_template_placeholder, template_placeholder_id, template_placeholder_range, Interpolation,
     ParsedModule, TemplateConstant, TemplateErrorType, TemplateString,
 };
 pub use token::{StringKind, Tok};
+pub use type_params::TypeParamDefaults;
 
 #[allow(deprecated)]
 pub use parser::{parse_expression, parse_expression_starts_at, parse_program};

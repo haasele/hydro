@@ -285,6 +285,7 @@ fn matching_close(slots: &Slots, start: usize) -> Option<usize> {
 fn token_depths(slots: &Slots, start: usize, close: usize) -> Vec<i32> {
     let mut depth = vec![0i32; close + 1];
     let mut level = 0i32;
+    #[allow(clippy::needless_range_loop)] // index into both `depth` and `slots`
     for index in start..=close {
         if matches!(slots.tok(index), Some(tok) if is_close(tok)) {
             level -= 1;
@@ -312,6 +313,7 @@ fn emit_type_param(
 ) {
     let param_start = slots.start(start);
     let mut equals = None;
+    #[allow(clippy::needless_range_loop)] // index into both `depth` and `slots`
     for index in start..end {
         if depth[index] == 1 && matches!(slots.tok(index), Some(Tok::Equal)) {
             equals = Some(index);
@@ -321,16 +323,18 @@ fn emit_type_param(
 
     // A default needs an expression after the `=`; anything else is a genuine
     // syntax error and is left for the parser to report.
-    let default = equals.filter(|equals| *equals + 1 < end).and_then(|equals| {
-        let range_start = slots.start(equals + 1)?;
-        let range_end = slots.range(end - 1)?.end();
-        let slice_start = usize::from(range_start.checked_sub(offset)?);
-        let slice_end = usize::from(range_end.checked_sub(offset)?);
-        let slice = source.get(slice_start..slice_end)?;
-        ast::Expr::parse_starts_at(slice, source_path, range_start)
-            .ok()
-            .map(|expr| (equals, expr))
-    });
+    let default = equals
+        .filter(|equals| *equals + 1 < end)
+        .and_then(|equals| {
+            let range_start = slots.start(equals + 1)?;
+            let range_end = slots.range(end - 1)?.end();
+            let slice_start = usize::from(range_start.checked_sub(offset)?);
+            let slice_end = usize::from(range_end.checked_sub(offset)?);
+            let slice = source.get(slice_start..slice_end)?;
+            ast::Expr::parse_starts_at(slice, source_path, range_start)
+                .ok()
+                .map(|expr| (equals, expr))
+        });
 
     let Some((equals, expr)) = default else {
         for index in start..end {

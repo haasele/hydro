@@ -588,8 +588,9 @@ fn path_dirs(path: i64) -> Option<Vec<String>> {
 /// path entry of its own.
 pub(crate) fn parent_finder_path(name: &str) -> Option<Vec<String>> {
     let (parent, _) = name.rsplit_once('.')?;
-    let dirs = module_path_dirs(parent)
-        .or_else(|| resolve_module_with_path(parent, None).and_then(|found| found.search_locations))?;
+    let dirs = module_path_dirs(parent).or_else(|| {
+        resolve_module_with_path(parent, None).and_then(|found| found.search_locations)
+    })?;
     (!dirs.is_empty()).then_some(dirs)
 }
 
@@ -880,7 +881,7 @@ fn meta_path_match(name: &str, path: Option<&[String]>) -> Option<MetaMatch> {
     let builtin = machinery::builtin_importer_class();
     let frozen = machinery::frozen_importer_class();
     let path_finder = machinery::path_finder_class();
-    let has_path_finder = finders.iter().any(|finder| *finder == path_finder);
+    let has_path_finder = finders.contains(&path_finder);
     let mut path_roots = None;
     let path_value = match path {
         Some(dirs) => {
@@ -1343,12 +1344,8 @@ pub(crate) fn module_from_spec_value(spec: i64) -> i64 {
     }
     let created_roots = crate::heap::root_values(&[created]);
     let metadata = module_metadata(spec, &name);
-    let metadata_roots = crate::heap::root_values(
-        &metadata
-            .iter()
-            .map(|(_, value)| *value)
-            .collect::<Vec<_>>(),
-    );
+    let metadata_roots =
+        crate::heap::root_values(&metadata.iter().map(|(_, value)| *value).collect::<Vec<_>>());
     let module = if created != NONE {
         initialize_module(created, metadata);
         created

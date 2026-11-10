@@ -811,7 +811,10 @@ pub(crate) fn builtin_importer_class() -> i64 {
             ),
         ],
         // `spec_from_loader` reads `_ORIGIN`, exactly like CPython.
-        vec![("_ORIGIN".to_string(), value::str_alloc("built-in".to_string()))],
+        vec![(
+            "_ORIGIN".to_string(),
+            value::str_alloc("built-in".to_string()),
+        )],
     )
 }
 
@@ -844,7 +847,10 @@ pub(crate) fn frozen_importer_class() -> i64 {
                 MethodKind::Classmethod,
             ),
         ],
-        vec![("_ORIGIN".to_string(), value::str_alloc("frozen".to_string()))],
+        vec![(
+            "_ORIGIN".to_string(),
+            value::str_alloc("frozen".to_string()),
+        )],
     )
 }
 
@@ -1892,10 +1898,7 @@ fn source_get_source(args: &[i64]) -> i64 {
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(_) => {
-            return exc::raise_with_message(
-                IMPORT_ERROR,
-                "source not available through get_data()",
-            )
+            return exc::raise_with_message(IMPORT_ERROR, "source not available through get_data()")
         }
     };
     let source = value::bytes_new(bytes);
@@ -1926,7 +1929,11 @@ fn source_get_code(args: &[i64]) -> i64 {
 
 /// `SourceLoader.source_to_code(data, path='<string>')`.
 fn source_to_code(args: &[i64]) -> i64 {
-    let path = args.get(1).copied().and_then(value::as_str).unwrap_or("<string>");
+    let path = args
+        .get(1)
+        .copied()
+        .and_then(value::as_str)
+        .unwrap_or("<string>");
     exc::raise_with_message(
         NOT_IMPLEMENTED_ERROR,
         &format!(
@@ -2073,8 +2080,7 @@ fn extension_is_package(args: &[i64]) -> i64 {
     let suffixes = constant("EXTENSION_SUFFIXES");
     let matches = value::as_list(suffixes).is_some_and(|suffixes| {
         suffixes.iter().any(|suffix| {
-            value::as_str(*suffix)
-                .is_some_and(|suffix| filename == format!("__init__{suffix}"))
+            value::as_str(*suffix).is_some_and(|suffix| filename == format!("__init__{suffix}"))
         })
     });
     if exc::pending() {
@@ -2151,10 +2157,7 @@ fn read_central_directory(archive: &str) -> Result<Vec<ZipEntry>, String> {
     let mut directory_offset = u64::from(u32_at(&tail, eocd + 16).ok_or("truncated directory")?);
     let eocd_file_offset = length - tail_len + eocd as u64;
 
-    if count == 0xFFFF
-        || directory_size == 0xFFFF_FFFF
-        || directory_offset == 0xFFFF_FFFF
-    {
+    if count == 0xFFFF || directory_size == 0xFFFF_FFFF || directory_offset == 0xFFFF_FFFF {
         // ZIP64: the locator precedes the classic record.
         if eocd_file_offset >= 20 {
             let mut locator = [0u8; 20];
@@ -2195,7 +2198,8 @@ fn read_central_directory(archive: &str) -> Result<Vec<ZipEntry>, String> {
         let time = u16_at(&directory, position + 12).ok_or("truncated entry")?;
         let date = u16_at(&directory, position + 14).ok_or("truncated entry")?;
         let crc = u32_at(&directory, position + 16).ok_or("truncated entry")?;
-        let mut compress_size = u64::from(u32_at(&directory, position + 20).ok_or("truncated entry")?);
+        let mut compress_size =
+            u64::from(u32_at(&directory, position + 20).ok_or("truncated entry")?);
         let mut file_size = u64::from(u32_at(&directory, position + 24).ok_or("truncated entry")?);
         let name_len = u16_at(&directory, position + 28).ok_or("truncated entry")? as usize;
         let extra_len = u16_at(&directory, position + 30).ok_or("truncated entry")? as usize;
@@ -2459,7 +2463,9 @@ fn zip_key(prefix: &str, fullname: &str) -> String {
 }
 
 fn zip_entry_named(archive: &str, name: &str) -> Result<Option<ZipEntry>, String> {
-    Ok(zip_entries(archive)?.into_iter().find(|entry| entry.name == name))
+    Ok(zip_entries(archive)?
+        .into_iter()
+        .find(|entry| entry.name == name))
 }
 
 /// `zipimporter(archivepath)`.
@@ -2488,11 +2494,7 @@ fn zipimporter_init(args: &[i64]) -> i64 {
         return raise_zip_error(message);
     }
     for (field, text) in [("archive", archive.clone()), ("prefix", prefix)] {
-        value::instance_setattr(
-            receiver,
-            field.to_string(),
-            value::str_alloc(text),
-        );
+        value::instance_setattr(receiver, field.to_string(), value::str_alloc(text));
     }
     NONE
 }
@@ -2570,13 +2572,7 @@ fn zipimporter_find_spec(args: &[i64]) -> i64 {
         let package_dir = key.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
         vec![format!("{archive}/{package_dir}")]
     });
-    new_spec(
-        fullname,
-        importer,
-        Some(origin),
-        search_locations,
-        true,
-    )
+    new_spec(fullname, importer, Some(origin), search_locations, true)
 }
 
 fn zipimporter_is_package(args: &[i64]) -> i64 {
@@ -2704,10 +2700,7 @@ fn zipimporter_get_data(args: &[i64]) -> i64 {
             Ok(bytes) => value::bytes_new(bytes),
             Err(message) => raise_zip_error(message),
         },
-        Ok(None) => exc::raise_with_message(
-            OS_ERROR,
-            &format!("can't find {path:?} in {archive}"),
-        ),
+        Ok(None) => exc::raise_with_message(OS_ERROR, &format!("can't find {path:?} in {archive}")),
         Err(message) => raise_zip_error(message),
     }
 }

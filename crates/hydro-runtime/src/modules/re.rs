@@ -128,10 +128,37 @@ fn all_names() -> i64 {
         return list;
     }
     let names = [
-        "match", "fullmatch", "search", "sub", "subn", "split", "findall", "finditer",
-        "compile", "purge", "escape", "error", "Pattern", "Match", "A", "I", "L", "M",
-        "S", "X", "U", "ASCII", "IGNORECASE", "LOCALE", "MULTILINE", "DOTALL",
-        "VERBOSE", "UNICODE", "NOFLAG", "RegexFlag", "PatternError",
+        "match",
+        "fullmatch",
+        "search",
+        "sub",
+        "subn",
+        "split",
+        "findall",
+        "finditer",
+        "compile",
+        "purge",
+        "escape",
+        "error",
+        "Pattern",
+        "Match",
+        "A",
+        "I",
+        "L",
+        "M",
+        "S",
+        "X",
+        "U",
+        "ASCII",
+        "IGNORECASE",
+        "LOCALE",
+        "MULTILINE",
+        "DOTALL",
+        "VERBOSE",
+        "UNICODE",
+        "NOFLAG",
+        "RegexFlag",
+        "PatternError",
     ];
     let values = names
         .iter()
@@ -345,7 +372,11 @@ fn ascii_shorthand(pattern: &str) -> String {
             let next = chars.get(index + 1).copied();
             match next {
                 Some('w') => {
-                    out.push_str(if in_class { "0-9A-Za-z_" } else { "[0-9A-Za-z_]" });
+                    out.push_str(if in_class {
+                        "0-9A-Za-z_"
+                    } else {
+                        "[0-9A-Za-z_]"
+                    });
                     index += 2;
                     continue;
                 }
@@ -1907,9 +1938,8 @@ fn is_callable(item: i64) -> bool {
     if value::as_function(item).is_some() || value::as_class(item).is_some() {
         return true;
     }
-    value::as_instance(item).is_some_and(|instance| {
-        value::class_lookup(instance.class, "__call__").is_some()
-    })
+    value::as_instance(item)
+        .is_some_and(|instance| value::class_lookup(instance.class, "__call__").is_some())
 }
 
 /// `Scanner(lexicon, flags=0)`: combines every phrase into one pattern (group
@@ -2510,10 +2540,7 @@ pub(crate) fn match_method(obj: i64, name: &str, args: &[i64]) -> i64 {
             return value::bytes_new(latin1_bytes(&expanded));
         }
         let Some(template) = value::as_str(args[0]) else {
-            return type_error(&format!(
-                "expected str, got {}",
-                value::type_name(args[0])
-            ));
+            return type_error(&format!("expected str, got {}", value::type_name(args[0])));
         };
         return value::str_alloc(expand_template(state, template, false));
     }

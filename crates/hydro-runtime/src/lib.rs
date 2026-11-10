@@ -28,6 +28,10 @@
 //! - `profile`: process-global function-entry counters for profile-guided
 //!   codegen (exposed through [`abi`]).
 
+// The compatibility surface is under active construction: helpers and typed
+// IR values are wired in as their callers land, so unused items are expected.
+#![allow(dead_code)]
+
 mod capi;
 mod concurrency;
 mod core;

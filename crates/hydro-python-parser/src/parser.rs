@@ -389,7 +389,8 @@ fn lex_rewritten_module(
     offset: TextSize,
 ) -> Result<(ast::Mod, crate::type_params::TypeParamDefaults), ParseError> {
     let tokens: Vec<LexResult> = lexer::lex_starts_at(source, mode, offset).collect();
-    let (tokens, defaults) = crate::type_params::rewrite_tokens(source, source_path, offset, tokens);
+    let (tokens, defaults) =
+        crate::type_params::rewrite_tokens(source, source_path, offset, tokens);
     let module = parse_tokens(tokens, mode, source_path)?;
     Ok((module, defaults))
 }

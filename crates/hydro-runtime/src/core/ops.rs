@@ -543,19 +543,24 @@ fn contains(left: i64, right: i64, negate: bool) -> i64 {
         container::set_contains(items, left)
     } else if let Some(pairs) = value::as_dict(right) {
         if container::unhashable_name(left).is_some() {
-            return exc::raise_with_message(TYPE_ERROR, &container::dict_key_unhashable_message(left));
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &container::dict_key_unhashable_message(left),
+            );
         }
         container::dict_find(pairs, left).is_some()
     } else if let Some((pairs, _)) = value::as_defaultdict(right) {
         if container::unhashable_name(left).is_some() {
-            return exc::raise_with_message(TYPE_ERROR, &container::dict_key_unhashable_message(left));
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &container::dict_key_unhashable_message(left),
+            );
         }
         container::dict_find(pairs, left).is_some()
     } else if let Some(pairs) = value::as_namespace(right) {
         // `argparse.Namespace.__contains__` tests its attribute dictionary.
-        let found = value::as_str(left).is_some_and(|key| {
-            pairs.iter().any(|(name, _)| name.as_str() == key)
-        });
+        let found = value::as_str(left)
+            .is_some_and(|key| pairs.iter().any(|(name, _)| name.as_str() == key));
         found
     } else if let Some(s) = value::as_str(right) {
         let Some(needle) = value::as_str(left) else {
@@ -610,13 +615,11 @@ fn contains(left: i64, right: i64, negate: bool) -> i64 {
         found
     } else if let Some(view) = value::as_dict_view(right) {
         // Keys and items require a hashable operand, like a dict lookup.
-        if view.kind != value::DictViewKind::Values {
-            if container::unhashable_name(left).is_some() {
-                return exc::raise_with_message(
-                    TYPE_ERROR,
-                    &container::dict_key_unhashable_message(left),
-                );
-            }
+        if view.kind != value::DictViewKind::Values && container::unhashable_name(left).is_some() {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &container::dict_key_unhashable_message(left),
+            );
         }
         container::dict_view_contains(view, left)
     } else if let Some(items) = value::as_set(right) {

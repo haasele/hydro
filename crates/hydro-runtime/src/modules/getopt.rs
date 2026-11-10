@@ -583,10 +583,7 @@ fn do_longs_value(args: &[i64]) -> i64 {
         ArgKind::Required | ArgKind::Optional => inline.unwrap_or_default(),
         ArgKind::None => {
             if inline.is_some() {
-                return getopt_error(
-                    &format!("option --{full} must not have an argument"),
-                    &full,
-                );
+                return getopt_error(&format!("option --{full} must not have an argument"), &full);
             }
             String::new()
         }

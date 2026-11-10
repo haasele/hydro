@@ -28,9 +28,9 @@ use crate::value::{self, FALSE, NONE};
 /// mode.
 pub(crate) fn constant(name: &str) -> i64 {
     match name {
-        "pyc_magic_number_token" => crate::ops::int_result(
-            crate::modules::importlib_util::PYC_MAGIC_NUMBER_TOKEN as i64,
-        ),
+        "pyc_magic_number_token" => {
+            crate::ops::int_result(crate::modules::importlib_util::PYC_MAGIC_NUMBER_TOKEN as i64)
+        }
         "check_hash_based_pycs" => value::str_alloc("default".to_string()),
         "_frozen_module_names" => value::list_new(Vec::new()),
         _ => exc::raise_with_message(
@@ -57,10 +57,9 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         // The import lock is process-wide and is never held while user code
         // runs, so this thread's answer is always `False`.
         "lock_held" => FALSE,
-        "init_frozen" => exc::raise_with_message(
-            IMPORT_ERROR,
-            "frozen modules are not available in Hydro",
-        ),
+        "init_frozen" => {
+            exc::raise_with_message(IMPORT_ERROR, "frozen modules are not available in Hydro")
+        }
         "is_builtin" => match module_name(function, args[0]) {
             Some(name) => value::bool_value(stdlib::module(name).is_some()),
             None => NONE,

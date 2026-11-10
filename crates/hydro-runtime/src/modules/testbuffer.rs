@@ -129,9 +129,7 @@ fn attr(obj: i64, name: &str) -> Option<i64> {
 }
 
 fn int_attr(obj: i64, name: &str) -> i64 {
-    attr(obj, name)
-        .and_then(value::as_integer)
-        .unwrap_or(0)
+    attr(obj, name).and_then(value::as_integer).unwrap_or(0)
 }
 
 fn bool_attr(obj: i64, name: &str) -> bool {
@@ -141,7 +139,12 @@ fn bool_attr(obj: i64, name: &str) -> bool {
 fn ints_attr(obj: i64, name: &str) -> Vec<i64> {
     attr(obj, name)
         .and_then(value::as_tuple)
-        .map(|items| items.iter().filter_map(|&item| value::as_integer(item)).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|&item| value::as_integer(item))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -298,6 +301,7 @@ fn f_contiguous(shape: &[i64], strides: &[i64], suboffsets: &[i64], itemsize: i6
     strides_match(shape, strides, &f_strides(shape, itemsize))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_structure(
     obj: i64,
     data: i64,
@@ -402,7 +406,10 @@ fn pack_item(format: &str, count: usize, item: i64) -> Result<Vec<u8>, i64> {
     let mut arguments = Vec::with_capacity(count + 1);
     arguments.push(format_value);
     if count == 1 {
-        if value::as_list(item).or_else(|| value::as_tuple(item)).is_some() {
+        if value::as_list(item)
+            .or_else(|| value::as_tuple(item))
+            .is_some()
+        {
             return Err(value_error(
                 "invalid items: a single-field format takes a scalar item",
             ));
@@ -410,10 +417,14 @@ fn pack_item(format: &str, count: usize, item: i64) -> Result<Vec<u8>, i64> {
         arguments.push(item);
     } else {
         let Some(values) = value::as_list(item).or_else(|| value::as_tuple(item)) else {
-            return Err(value_error("invalid items: expected a tuple for a multi-field format"));
+            return Err(value_error(
+                "invalid items: expected a tuple for a multi-field format",
+            ));
         };
         if values.len() != count {
-            return Err(value_error("invalid items: item count does not match the format"));
+            return Err(value_error(
+                "invalid items: item count does not match the format",
+            ));
         }
         arguments.extend_from_slice(values);
     }
@@ -591,7 +602,11 @@ pub(crate) fn ndarray_class() -> i64 {
         method("push", "ndarray.push", 6),
         method("pop", "ndarray.pop", 1),
         method("add_suboffsets", "ndarray.add_suboffsets", 1),
-        method("memoryview_from_buffer", "ndarray.memoryview_from_buffer", 1),
+        method(
+            "memoryview_from_buffer",
+            "ndarray.memoryview_from_buffer",
+            1,
+        ),
         method("getbuffer", "ndarray.getbuffer", 2),
         method("releasebuffer", "ndarray.releasebuffer", 2),
         method("__buffer__", "ndarray.__buffer__", 2),
@@ -724,7 +739,9 @@ fn validate_getbuf(source: i64, flags: i64) -> Result<(), i64> {
         return Err(buffer_error("ndarray is not contiguous"));
     }
     if !request_indirect(flags) && has_suboffsets(&suboffsets) {
-        return Err(buffer_error("ndarray cannot be represented without suboffsets"));
+        return Err(buffer_error(
+            "ndarray cannot be represented without suboffsets",
+        ));
     }
     if !request_strides(flags) && !c_contiguous(&shape, &strides, &suboffsets, itemsize) {
         return Err(buffer_error("ndarray is not C-contiguous"));
@@ -747,7 +764,11 @@ fn buffer_from(source: i64, flags: i64) -> i64 {
             set_attr(buffer, "format", attr(source, "format").unwrap_or(NONE));
             set_attr(buffer, "shape", attr(source, "shape").unwrap_or(NONE));
             set_attr(buffer, "strides", attr(source, "strides").unwrap_or(NONE));
-            set_attr(buffer, "suboffsets", attr(source, "suboffsets").unwrap_or(NONE));
+            set_attr(
+                buffer,
+                "suboffsets",
+                attr(source, "suboffsets").unwrap_or(NONE),
+            );
             set_int_attr(buffer, "nbytes", int_attr(source, "nbytes"));
             set_attr(buffer, "_source", source);
             heap::release_roots(source_root);
@@ -978,7 +999,7 @@ fn slice_bounds(slice: i64, length: i64) -> Result<(i64, i64, i64), i64> {
             }
         }
     };
-    let slicelen = if step > 0 {
+    let _slicelen = if step > 0 {
         if stop > start {
             (stop - start + step - 1) / step
         } else {
@@ -989,11 +1010,9 @@ fn slice_bounds(slice: i64, length: i64) -> Result<(i64, i64, i64), i64> {
     } else {
         0
     };
-    let clamp = |number: i128| i64::try_from(number).unwrap_or(if number < 0 {
-        i64::MIN
-    } else {
-        i64::MAX
-    });
+    let clamp = |number: i128| {
+        i64::try_from(number).unwrap_or(if number < 0 { i64::MIN } else { i64::MAX })
+    };
     Ok((clamp(start), clamp(stop), clamp(step)))
 }
 
@@ -1004,9 +1023,7 @@ fn indexed_position(obj: i64, indices: &[i64]) -> Result<i64, i64> {
 fn getitem(obj: i64, key: i64) -> i64 {
     let shape = shape_of(obj);
     if shape.is_empty() {
-        if is_ellipsis(key)
-            || (value::as_tuple(key).is_some_and(|items| items.is_empty()))
-        {
+        if is_ellipsis(key) || (value::as_tuple(key).is_some_and(|items| items.is_empty())) {
             return read_item(obj, offset_of(obj));
         }
         return type_error("invalid indexing of scalar");
@@ -1453,7 +1470,9 @@ fn init_impl(args: &[i64], keywords: &[(String, i64)]) -> i64 {
         return type_error("getbuf argument only valid for construction from exporter object");
     }
     let Some(shape_value) = spec.shape else {
-        return type_error("shape is a required argument when constructing from list, tuple or scalar");
+        return type_error(
+            "shape is a required argument when constructing from list, tuple or scalar",
+        );
     };
     let flags = spec.flags;
     let varyexport = flags & ND_VAREXPORT != 0;
@@ -1617,13 +1636,21 @@ fn ndarray_push(args: &[i64], keywords: &[(String, i64)]) -> i64 {
         items: args.get(1).copied(),
         shape: args.get(2).copied().filter(|&v| v != NONE),
         strides: args.get(3).copied().filter(|&v| v != NONE),
-        offset: args.get(4).copied().and_then(value::as_integer).unwrap_or(0),
+        offset: args
+            .get(4)
+            .copied()
+            .and_then(value::as_integer)
+            .unwrap_or(0),
         format: args
             .get(5)
             .copied()
             .filter(|&v| v != NONE)
             .unwrap_or_else(|| value::str_alloc("B".to_string())),
-        flags: args.get(6).copied().and_then(value::as_integer).unwrap_or(0),
+        flags: args
+            .get(6)
+            .copied()
+            .and_then(value::as_integer)
+            .unwrap_or(0),
         getbuf: GETBUF_UNSET,
     };
     for (name, value_arg) in keywords {
@@ -1810,12 +1837,14 @@ fn ndarray_memoryview_from_buffer(args: &[i64]) -> i64 {
         return value_error("ndarray: ndim is too large for a memoryview");
     }
     let data = attr(obj, ATTR_DATA).unwrap_or(NONE);
-    if itemsize_of(obj) == 1 && c_contiguous(
-        &shape_of(obj),
-        &strides_of(obj),
-        &suboffsets_of(obj),
-        itemsize_of(obj),
-    ) {
+    if itemsize_of(obj) == 1
+        && c_contiguous(
+            &shape_of(obj),
+            &strides_of(obj),
+            &suboffsets_of(obj),
+            itemsize_of(obj),
+        )
+    {
         return value::memoryview_abi(data);
     }
     let snapshot = tobytes(obj);
@@ -1953,18 +1982,26 @@ fn cmp_contig(args: &[i64]) -> i64 {
         if exc::pending() {
             return NONE;
         }
-        value::as_bytes(bytes).map(|bytes| bytes.to_vec()).unwrap_or_default()
+        value::as_bytes(bytes)
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default()
     } else {
-        value::as_bytes(left).map(|bytes| bytes.to_vec()).unwrap_or_default()
+        value::as_bytes(left)
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default()
     };
     let right_bytes = if is_ndarray(right) {
         let bytes = tobytes(right);
         if exc::pending() {
             return NONE;
         }
-        value::as_bytes(bytes).map(|bytes| bytes.to_vec()).unwrap_or_default()
+        value::as_bytes(bytes)
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default()
     } else {
-        value::as_bytes(right).map(|bytes| bytes.to_vec()).unwrap_or_default()
+        value::as_bytes(right)
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default()
     };
     value::bool_value(left_bytes == right_bytes)
 }
@@ -2143,8 +2180,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                 && format_attr(left) == format_attr(right)
                 && itemsize_of(left) == itemsize_of(right);
             value::bool_value(
-                same_structure
-                    && value::as_bytes(left_bytes) == value::as_bytes(right_bytes),
+                same_structure && value::as_bytes(left_bytes) == value::as_bytes(right_bytes),
             )
         }
         "ndarray.__hash__" => {

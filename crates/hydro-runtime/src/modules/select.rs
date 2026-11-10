@@ -428,20 +428,11 @@ fn select_call(args: &[i64]) -> i64 {
     let mut read_pairs: Vec<(i64, i32)> = Vec::new();
     let mut write_pairs: Vec<(i64, i32)> = Vec::new();
     let mut exception_pairs: Vec<(i64, i32)> = Vec::new();
-    if let Err(err) = collect_descriptors(
-        &readables,
-        POLLIN as i16,
-        &mut events,
-        &mut read_pairs,
-    ) {
+    if let Err(err) = collect_descriptors(&readables, POLLIN as i16, &mut events, &mut read_pairs) {
         return err;
     }
-    if let Err(err) = collect_descriptors(
-        &writables,
-        POLLOUT as i16,
-        &mut events,
-        &mut write_pairs,
-    ) {
+    if let Err(err) = collect_descriptors(&writables, POLLOUT as i16, &mut events, &mut write_pairs)
+    {
         return err;
     }
     if let Err(err) = collect_descriptors(
@@ -690,7 +681,8 @@ fn epoll_class() -> i64 {
     if let Some(class) = crate::core::globals::registry_get(KEY) {
         return class;
     }
-    let native = |name: &'static str, arity: usize| value::native_function_new("select", name, arity);
+    let native =
+        |name: &'static str, arity: usize| value::native_function_new("select", name, arity);
     let methods = vec![
         ("__init__".to_string(), native("_epoll_init", 3)),
         ("register".to_string(), native("_epoll_register", 3)),
@@ -767,7 +759,7 @@ fn epoll_timeout(value_arg: i64) -> Result<i32, i64> {
     let Some(seconds) = value::as_float(value_arg) else {
         return Err(type_error("timeout must be an int, float or None"));
     };
-    if !(seconds > 0.0) {
+    if seconds <= 0.0 || seconds.is_nan() {
         return Ok(-1);
     }
     let millis = (seconds * 1000.0).ceil();
@@ -787,10 +779,7 @@ fn epoll_init(args: &[i64]) -> i64 {
         if argument != NONE {
             let Some(number) = value::as_integer(argument) else {
                 if value::as_bigint(argument).is_some() {
-                    return exc::raise_with_message(
-                        OVERFLOW_ERROR,
-                        "sizehint is out of range",
-                    );
+                    return exc::raise_with_message(OVERFLOW_ERROR, "sizehint is out of range");
                 }
                 return type_error(&format!(
                     "argument 1 must be an integer, not {}",
@@ -808,10 +797,7 @@ fn epoll_init(args: &[i64]) -> i64 {
         if argument != NONE {
             let Some(number) = value::as_integer(argument) else {
                 if value::as_bigint(argument).is_some() {
-                    return exc::raise_with_message(
-                        OVERFLOW_ERROR,
-                        "flags is out of range",
-                    );
+                    return exc::raise_with_message(OVERFLOW_ERROR, "flags is out of range");
                 }
                 return type_error(&format!(
                     "argument 2 must be an integer, not {}",
@@ -859,8 +845,7 @@ fn epoll_register(args: &[i64]) -> i64 {
         u64: target as u64,
     };
     // SAFETY: `event` is a valid, fully initialised `epoll_event`.
-    let result =
-        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, target, &mut event) };
+    let result = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, target, &mut event) };
     if result < 0 {
         return epoll_io_error(std::io::Error::last_os_error());
     }
@@ -888,8 +873,7 @@ fn epoll_modify(args: &[i64]) -> i64 {
         u64: target as u64,
     };
     // SAFETY: `event` is a valid, fully initialised `epoll_event`.
-    let result =
-        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, target, &mut event) };
+    let result = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, target, &mut event) };
     if result < 0 {
         return epoll_io_error(std::io::Error::last_os_error());
     }
@@ -910,9 +894,8 @@ fn epoll_unregister(args: &[i64]) -> i64 {
     };
     // SAFETY: `EPOLL_CTL_DEL` ignores the event argument on Linux; a null
     // pointer is accepted (kernel >= 2.6.9).
-    let result = unsafe {
-        libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, target, std::ptr::null_mut())
-    };
+    let result =
+        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, target, std::ptr::null_mut()) };
     if result < 0 {
         return epoll_io_error(std::io::Error::last_os_error());
     }
@@ -938,10 +921,7 @@ fn epoll_poll(args: &[i64]) -> i64 {
         Some(&argument) if argument != NONE => {
             let Some(number) = value::as_integer(argument) else {
                 if value::as_bigint(argument).is_some() {
-                    return exc::raise_with_message(
-                        OVERFLOW_ERROR,
-                        "maxevents is out of range",
-                    );
+                    return exc::raise_with_message(OVERFLOW_ERROR, "maxevents is out of range");
                 }
                 return type_error(&format!(
                     "maxevents must be an integer, not {}",
@@ -961,14 +941,8 @@ fn epoll_poll(args: &[i64]) -> i64 {
         heap::blocking_enter();
     }
     // SAFETY: `events` has room for `maxevents` entries.
-    let count = unsafe {
-        libc::epoll_wait(
-            epfd,
-            events.as_mut_ptr(),
-            maxevents as libc::c_int,
-            timeout,
-        )
-    };
+    let count =
+        unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), maxevents as libc::c_int, timeout) };
     if blocking {
         heap::blocking_leave();
     }

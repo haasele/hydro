@@ -1451,9 +1451,8 @@ unsafe fn refresh_raw_unicode(object: *mut ShimObject) {
     };
     let mut decoded = String::with_capacity(raw.data.len());
     let mut push = |code: u32| {
-        decoded.push(
-            crate::value::code_to_storage_char(code).unwrap_or(char::REPLACEMENT_CHARACTER),
-        );
+        decoded
+            .push(crate::value::code_to_storage_char(code).unwrap_or(char::REPLACEMENT_CHARACTER));
     };
     match raw.width {
         1 => {

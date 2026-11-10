@@ -4157,8 +4157,7 @@ pub(crate) fn class_lookup_after_owner(
     // linearization (or is the receiver): CPython's `super()` starts after the
     // named class, and `object` has nothing after it.
     if class != object_class() && !state.mro.contains(&object_class()) {
-        return class_own_lookup(object_class(), name)
-            .map(|entry| (object_class(), entry));
+        return class_own_lookup(object_class(), name).map(|entry| (object_class(), entry));
     }
     object_protocol_slot(name).map(|entry| (object_class(), entry))
 }
@@ -5381,10 +5380,7 @@ fn wtf8_text(bytes: &[u8]) -> Option<String> {
         let code = ((first as u32 & 0x0F) << 12)
             | ((sequence[1] as u32 & 0x3F) << 6)
             | (sequence[2] as u32 & 0x3F);
-        if !is_surrogate_code(code)
-            || sequence[1] & 0xC0 != 0x80
-            || sequence[2] & 0xC0 != 0x80
-        {
+        if !is_surrogate_code(code) || sequence[1] & 0xC0 != 0x80 || sequence[2] & 0xC0 != 0x80 {
             return None;
         }
         str_push_code(&mut out, code);
@@ -6524,7 +6520,15 @@ fn create_class(
             class_attrs.retain(|(attr_name, _)| attr_name.as_str() != "__classcell__");
         }
         created = allocate_class(
-            name, base, bases, mro, resolved, methods, class_attrs, slots, has_dict,
+            name,
+            base,
+            bases,
+            mro,
+            resolved,
+            methods,
+            class_attrs,
+            slots,
+            has_dict,
         );
         if let Some(cell) = class_cell {
             cell_set(cell, created);

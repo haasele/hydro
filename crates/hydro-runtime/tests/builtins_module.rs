@@ -21,7 +21,6 @@ const VALUE_ERROR: i64 = 0;
 const TYPE_ERROR: i64 = 1;
 const RUNTIME_ERROR: i64 = 3;
 const ATTRIBUTE_ERROR: i64 = 9;
-const NOT_IMPLEMENTED_ERROR: i64 = 32;
 
 const OP_EQ: u32 = 7;
 const OP_IS: u32 = 15;

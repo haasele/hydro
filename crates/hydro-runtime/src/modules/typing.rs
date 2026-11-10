@@ -1080,20 +1080,22 @@ fn is_valid_substitution(arg: i64) -> bool {
         if CLASSES.contains(&name)
             && value::as_class(arg).is_some()
             && placeholder_class(name) == arg
-        {
-            if matches!(
+            && matches!(
                 name,
                 "Optional" | "Generic" | "Protocol" | "Final" | "ClassVar" | "Union"
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
     }
     if let Some(origin) = value::instance_attr(arg, "__origin__") {
         if let Some(name) = value::class_display_name(origin) {
             if CLASSES.contains(&name)
                 && placeholder_class(name) == origin
-                && matches!(name, "Optional" | "Generic" | "Protocol" | "Final" | "ClassVar")
+                && matches!(
+                    name,
+                    "Optional" | "Generic" | "Protocol" | "Final" | "ClassVar"
+                )
             {
                 return false;
             }

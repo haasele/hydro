@@ -145,8 +145,7 @@ struct RegisteredDef {
 static DEFS: LazyLock<Mutex<Vec<Arc<RegisteredDef>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn defs_lock() -> std::sync::MutexGuard<'static, Vec<Arc<RegisteredDef>>> {
-    DEFS.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    DEFS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Control transfer out of a statement list.
@@ -339,8 +338,9 @@ fn decode_source_bytes(bytes: &[u8]) -> Result<String, String> {
         }
     }
     match normalize_encoding(&encoding).ok_or_else(|| format!("unknown encoding: {encoding}"))? {
-        "utf-8" => String::from_utf8(data.to_vec())
-            .map_err(|_| "invalid utf-8 in source code".to_string()),
+        "utf-8" => {
+            String::from_utf8(data.to_vec()).map_err(|_| "invalid utf-8 in source code".to_string())
+        }
         "latin-1" => Ok(data.iter().map(|byte| *byte as char).collect()),
         _ => {
             if data.iter().all(|byte| *byte < 0x80) {
@@ -372,8 +372,8 @@ fn normalize_encoding(name: &str) -> Option<&'static str> {
     let lower = name.trim().to_ascii_lowercase();
     match lower.as_str() {
         "utf-8" | "utf8" | "utf_8" | "utf-8-sig" | "u8" => Some("utf-8"),
-        "latin-1" | "latin1" | "latin_1" | "iso-8859-1" | "iso8859-1" | "iso_8859_1"
-        | "8859" | "cp819" | "l1" => Some("latin-1"),
+        "latin-1" | "latin1" | "latin_1" | "iso-8859-1" | "iso8859-1" | "iso_8859_1" | "8859"
+        | "cp819" | "l1" => Some("latin-1"),
         "ascii" | "us-ascii" | "646" => Some("ascii"),
         _ => None,
     }
@@ -579,7 +579,10 @@ impl Interp {
         if self.global_names.iter().any(|candidate| candidate == name) {
             let _ = dict_set_str(self.globals, &mut self.roots, name, item);
             self.mirror(name, item);
-        } else if self.nonlocal_names.iter().any(|candidate| candidate == name)
+        } else if self
+            .nonlocal_names
+            .iter()
+            .any(|candidate| candidate == name)
             && !self.captures.is_empty()
         {
             let target = self.captures[0];
@@ -677,8 +680,12 @@ impl Interp {
                     args: (*node.args).clone(),
                     body: node.body.clone(),
                 };
-                let function =
-                    self.make_function(def, node.name.to_string(), &node.args, &node.decorator_list)?;
+                let function = self.make_function(
+                    def,
+                    node.name.to_string(),
+                    &node.args,
+                    &node.decorator_list,
+                )?;
                 self.bind(&node.name, function);
                 Ok(())
             }
@@ -769,10 +776,6 @@ impl Interp {
                 ExcKind::NotImplementedError,
                 "type statement inside runtime-compiled source",
             )),
-            _ => Err(raise_tag(
-                ExcKind::NotImplementedError,
-                "this statement form inside runtime-compiled source",
-            )),
         }
     }
 
@@ -809,10 +812,7 @@ impl Interp {
         }
         self.roots.push(iterator);
         let mut broke = false;
-        loop {
-            let Some(item) = self.next_item(iterator)? else {
-                break;
-            };
+        while let Some(item) = self.next_item(iterator)? {
             self.assign(&node.target, item)?;
             match self.exec_stmts(&node.body) {
                 Ok(()) => {}
@@ -1284,10 +1284,7 @@ impl Interp {
         let mut class = if keywords.is_empty() {
             runtime_builtins::type_new(value::NONE, name_value, bases, namespace)
         } else {
-            runtime_builtins::type_build_keywords(
-                &[name_value, bases, namespace],
-                &keywords,
-            )
+            runtime_builtins::type_build_keywords(&[name_value, bases, namespace], &keywords)
         };
         if exc::pending() {
             return Err(Flow::Raise);
@@ -1379,7 +1376,7 @@ impl Interp {
             }
             signature.push(value::ParamMeta {
                 name: param_name.clone(),
-                kind: kind.clone(),
+                kind: *kind,
                 default: default_value,
             });
         }
@@ -1570,13 +1567,7 @@ impl Interp {
             ast::Expr::Await(_) => Err(raise_tag(ExcKind::NotImplementedError, "await")),
             ast::Expr::Yield(_) => Err(raise_tag(ExcKind::NotImplementedError, "yield")),
             ast::Expr::YieldFrom(_) => Err(raise_tag(ExcKind::NotImplementedError, "yield from")),
-            ast::Expr::Slice(_) => Err(raise_syntax(
-                "a slice is only valid inside a subscript",
-            )),
-            _ => Err(raise_tag(
-                ExcKind::NotImplementedError,
-                "this expression form inside runtime-compiled source",
-            )),
+            ast::Expr::Slice(_) => Err(raise_syntax("a slice is only valid inside a subscript")),
         }
     }
 
@@ -1588,9 +1579,7 @@ impl Interp {
             ast::Constant::Bytes(bytes) => value::bytes_new(bytes.clone()),
             ast::Constant::Int(integer) => integer_literal(&integer.to_string()),
             ast::Constant::Float(float) => value::float_new(*float),
-            ast::Constant::Complex { real, imag } => {
-                runtime_builtins::build_complex(*real, *imag)
-            }
+            ast::Constant::Complex { real, imag } => runtime_builtins::build_complex(*real, *imag),
             ast::Constant::Tuple(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -1656,10 +1645,7 @@ impl Interp {
                         let Some(argument) = value::as_str(key) else {
                             return Err(type_error("keywords must be strings"));
                         };
-                        if keywords
-                            .iter()
-                            .any(|(existing, _)| existing == argument)
-                        {
+                        if keywords.iter().any(|(existing, _)| existing == argument) {
                             return Err(type_error(&format!(
                                 "got multiple values for keyword argument '{argument}'"
                             )));
@@ -1759,9 +1745,7 @@ impl Interp {
                     self.roots.push(text);
                     match value::as_str(text) {
                         Some(text) => out.push_str(text),
-                        None => {
-                            return Err(type_error("f-string component did not render to str"))
-                        }
+                        None => return Err(type_error("f-string component did not render to str")),
                     }
                 }
                 other => {
@@ -1861,10 +1845,7 @@ impl Interp {
             return Err(Flow::Raise);
         }
         self.roots.push(iterator);
-        loop {
-            let Some(item) = self.next_item(iterator)? else {
-                break;
-            };
+        while let Some(item) = self.next_item(iterator)? {
             self.assign(&generator.target, item)?;
             let mut keep = true;
             for condition in &generator.ifs {
@@ -1902,10 +1883,7 @@ impl Interp {
         }
         self.roots.push(iterator);
         let mut items = Vec::new();
-        loop {
-            let Some(item) = self.next_item(iterator)? else {
-                break;
-            };
+        while let Some(item) = self.next_item(iterator)? {
             self.roots.push(item);
             items.push(item);
         }
@@ -1981,12 +1959,8 @@ impl Interp {
                 let object = self.eval(&attribute.value)?;
                 self.roots.push(object);
                 self.roots.push(item);
-                let _ = methods::setattr(
-                    object,
-                    attribute.attr.as_ptr(),
-                    attribute.attr.len(),
-                    item,
-                );
+                let _ =
+                    methods::setattr(object, attribute.attr.as_ptr(), attribute.attr.len(), item);
                 if exc::pending() {
                     return Err(Flow::Raise);
                 }
@@ -2125,12 +2099,7 @@ fn parse_mode(mode: UnitMode) -> Mode {
     }
 }
 
-fn run_unit(
-    unit: &Unit,
-    globals_ns: i64,
-    locals_ns: i64,
-    mirror: Option<String>,
-) -> EvalResult {
+fn run_unit(unit: &Unit, globals_ns: i64, locals_ns: i64, mirror: Option<String>) -> EvalResult {
     let mut interp = Interp::new(
         globals_ns,
         locals_ns,
@@ -2287,7 +2256,10 @@ pub(crate) fn builtin_compile(args: &[i64]) -> i64 {
     // `dont_inherit` and `optimize` are validated but do not change the
     // executed semantics: the evaluator keeps asserts and annotations as
     // written, exactly like `optimize=-1`.
-    let _dont_inherit = args.get(4).map(|item| value::truthy(*item)).unwrap_or(false);
+    let _dont_inherit = args
+        .get(4)
+        .map(|item| value::truthy(*item))
+        .unwrap_or(false);
     if let Some(optimize) = args.get(5) {
         if *optimize != value::NONE && value::as_integer(*optimize).is_none() {
             return exc::raise_with_message(
@@ -2337,11 +2309,11 @@ pub(crate) fn builtin_exec(args: &[i64]) -> i64 {
     }
     let globals_arg = args.get(1).copied().unwrap_or(value::NONE);
     let locals_arg = args.get(2).copied().unwrap_or(value::NONE);
-    let (globals_ns, locals_ns, mirror) =
-        match resolve_namespaces(globals_arg, locals_arg, "exec") {
-            Ok(namespaces) => namespaces,
-            Err(raised) => return raised,
-        };
+    let (globals_ns, locals_ns, mirror) = match resolve_namespaces(globals_arg, locals_arg, "exec")
+    {
+        Ok(namespaces) => namespaces,
+        Err(raised) => return raised,
+    };
     let result = if value::as_code(args[0]).is_some() {
         match unit_for_code(args[0]) {
             Some(unit) => run_unit(&unit, globals_ns, locals_ns, mirror),
@@ -2384,11 +2356,11 @@ pub(crate) fn builtin_eval(args: &[i64]) -> i64 {
     }
     let globals_arg = args.get(1).copied().unwrap_or(value::NONE);
     let locals_arg = args.get(2).copied().unwrap_or(value::NONE);
-    let (globals_ns, locals_ns, mirror) =
-        match resolve_namespaces(globals_arg, locals_arg, "eval") {
-            Ok(namespaces) => namespaces,
-            Err(raised) => return raised,
-        };
+    let (globals_ns, locals_ns, mirror) = match resolve_namespaces(globals_arg, locals_arg, "eval")
+    {
+        Ok(namespaces) => namespaces,
+        Err(raised) => return raised,
+    };
     let result = if value::as_code(args[0]).is_some() {
         match unit_for_code(args[0]) {
             Some(unit) => run_unit(&unit, globals_ns, locals_ns, mirror),

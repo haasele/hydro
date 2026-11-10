@@ -43,8 +43,8 @@ use std::cell::RefCell;
 use crate::builtins as core_builtins;
 use crate::core::globals;
 use crate::exc::{
-    self, LOOKUP_ERROR, NOT_IMPLEMENTED_ERROR, RUNTIME_ERROR, TYPE_ERROR, UNICODE_DECODE_ERROR,
-    UNICODE_ENCODE_ERROR, UNICODE_ERROR, VALUE_ERROR,
+    self, LOOKUP_ERROR, RUNTIME_ERROR, TYPE_ERROR, UNICODE_DECODE_ERROR, UNICODE_ENCODE_ERROR,
+    UNICODE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::ops;
@@ -104,7 +104,9 @@ enum Codec {
         charset: &'static str,
     },
     /// A codec from [`super::codecs_native`] (CJK and ISO-2022 families).
-    Multibyte { prog: &'static str },
+    Multibyte {
+        prog: &'static str,
+    },
 }
 
 impl Codec {
@@ -331,7 +333,7 @@ fn codec_for_name(name: &str) -> Option<Codec> {
         });
     }
     if let Some(prog) = MULTIBYTE_CODECS.iter().find(|prog| **prog == normalized) {
-        return Some(Codec::Multibyte { prog: *prog });
+        return Some(Codec::Multibyte { prog });
     }
     // The `iso_8859_N` alias of the `iso8859_N` table entries.
     if let Some(rest) = normalized.strip_prefix("iso_8859_") {
@@ -595,22 +597,21 @@ fn codec_call(args: &[i64], member: &str) -> i64 {
     if exc::pending() {
         return NONE;
     }
-    let entry = if value::instance_class_value(info)
-        == Some(crate::modules::codecs_codecinfo_class())
-    {
-        crate::core::methods::getattr(info, member.as_ptr(), member.len())
-    } else if let Some(items) = value::as_tuple(info) {
-        if items.len() != 4 {
-            return type_error("codec registry entry is not a 4-tuple");
-        }
-        if member == "encode" {
-            items[0]
+    let entry =
+        if value::instance_class_value(info) == Some(crate::modules::codecs_codecinfo_class()) {
+            crate::core::methods::getattr(info, member.as_ptr(), member.len())
+        } else if let Some(items) = value::as_tuple(info) {
+            if items.len() != 4 {
+                return type_error("codec registry entry is not a 4-tuple");
+            }
+            if member == "encode" {
+                items[0]
+            } else {
+                items[1]
+            }
         } else {
-            items[1]
-        }
-    } else {
-        return type_error("codec registry entry is not a 4-tuple");
-    };
+            return type_error("codec registry entry is not a 4-tuple");
+        };
     if exc::pending() {
         return NONE;
     }
@@ -1014,20 +1015,18 @@ fn decode_utf8(data: &[u8], mode: &ErrorMode, final_: bool) -> Result<(Vec<u32>,
             )?;
             continue;
         }
-        if value::is_surrogate_code(code) {
-            if !matches!(mode, ErrorMode::SurrogatePass) {
-                offset = decode_error(
-                    Codec::Utf8,
-                    data,
-                    offset,
-                    offset + width,
-                    "invalid continuation byte",
-                    mode,
-                    final_,
-                    &mut out,
-                )?;
-                continue;
-            }
+        if value::is_surrogate_code(code) && !matches!(mode, ErrorMode::SurrogatePass) {
+            offset = decode_error(
+                Codec::Utf8,
+                data,
+                offset,
+                offset + width,
+                "invalid continuation byte",
+                mode,
+                final_,
+                &mut out,
+            )?;
+            continue;
         }
         out.push(code);
         offset += width;
@@ -1039,6 +1038,7 @@ fn decode_utf8(data: &[u8], mode: &ErrorMode, final_: bool) -> Result<(Vec<u32>,
 ///
 /// `final_` only matters for the incomplete-sequence case some codecs report
 /// as `unexpected end of data`.
+#[allow(clippy::too_many_arguments)]
 fn decode_error(
     codec: Codec,
     data: &[u8],
@@ -1150,7 +1150,9 @@ fn decode_ascii(data: &[u8], mode: &ErrorMode, final_: bool) -> Result<Vec<u32>,
 /// PEP 383 maps undecodable byte `b` to code point `0xDC00 + b`; the byte
 /// range that can be escaped this way is `0x80..=0xFF`.
 fn surrogate_escape_byte(code: u32) -> Option<u8> {
-    (0xDC80..=0xDCFF).contains(&code).then(|| (code - 0xDC00) as u8)
+    (0xDC80..=0xDCFF)
+        .contains(&code)
+        .then(|| (code - 0xDC00) as u8)
 }
 
 /// Whether this host stores UTF-16/UTF-32 code units big-endian first.
@@ -1349,9 +1351,8 @@ fn decode_utf16(
             }
             let second = unit(offset + 2);
             if (0xDC00..=0xDFFF).contains(&second) {
-                let code = 0x1_0000
-                    + ((u32::from(first) - 0xD800) << 10)
-                    + (u32::from(second) - 0xDC00);
+                let code =
+                    0x1_0000 + ((u32::from(first) - 0xD800) << 10) + (u32::from(second) - 0xDC00);
                 out.push(code);
                 offset += 4;
                 continue;
@@ -1434,7 +1435,12 @@ fn decode_utf32(
             )?;
             continue;
         }
-        let bytes = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+        let bytes = [
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ];
         let code = if big_endian {
             u32::from_be_bytes(bytes)
         } else {
@@ -1460,11 +1466,7 @@ fn decode_utf32(
 }
 
 /// Decodes UTF-8-sig: an optional leading byte-order mark is stripped.
-fn decode_utf8_sig(
-    data: &[u8],
-    mode: &ErrorMode,
-    final_: bool,
-) -> Result<(Vec<u32>, usize), i64> {
+fn decode_utf8_sig(data: &[u8], mode: &ErrorMode, final_: bool) -> Result<(Vec<u32>, usize), i64> {
     const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
     if data.len() >= 3 {
         if data[..3] == BOM {
@@ -1658,7 +1660,10 @@ fn rot13_byte(byte: u8) -> u8 {
 
 /// Encodes text with `rot-13`, returning the rotated payload's bytes.
 fn rot13_bytes(text: &str) -> Vec<u8> {
-    text.as_bytes().iter().map(|byte| rot13_byte(*byte)).collect()
+    text.as_bytes()
+        .iter()
+        .map(|byte| rot13_byte(*byte))
+        .collect()
 }
 
 /// `rot-13` is its own inverse; the rotated payload keeps UTF-8 bytes.
@@ -1691,8 +1696,8 @@ fn mode_name(mode: &ErrorMode) -> &'static str {
 fn multibyte_module(prog: &str) -> &'static str {
     match prog {
         "gb2312" | "gbk" | "gb18030" | "hz" => "_codecs_cn",
-        "cp932" | "euc_jis_2004" | "euc_jisx0213" | "euc_jp" | "shift_jis"
-        | "shift_jis_2004" | "shift_jisx0213" => "_codecs_jp",
+        "cp932" | "euc_jis_2004" | "euc_jisx0213" | "euc_jp" | "shift_jis" | "shift_jis_2004"
+        | "shift_jisx0213" => "_codecs_jp",
         "cp949" | "euc_kr" | "johab" => "_codecs_kr",
         "big5" | "cp950" => "_codecs_tw",
         "big5hkscs" => "_codecs_hk",
@@ -1918,19 +1923,18 @@ fn push_utf8_codes(out: &mut Vec<u32>, bytes: &[u8]) {
 fn encode_codepoint(charset: &str, code: u32) -> Option<Vec<u8>> {
     let character = char::from_u32(code)?;
     let mut buffer = [0u8; 4];
-    convert_oneshot("UTF-8", charset, character.encode_utf8(&mut buffer).as_bytes())
+    convert_oneshot(
+        "UTF-8",
+        charset,
+        character.encode_utf8(&mut buffer).as_bytes(),
+    )
 }
 
 /// Encodes `text` through an iconv charset, one code point at a time.
 ///
 /// `surrogateescape` maps an escaped code point back to its byte; every other
 /// unrepresentable code point goes through the active error mode.
-fn iconv_encode(
-    charset: &str,
-    codec: Codec,
-    text: &str,
-    mode: &ErrorMode,
-) -> Result<Vec<u8>, i64> {
+fn iconv_encode(charset: &str, codec: Codec, text: &str, mode: &ErrorMode) -> Result<Vec<u8>, i64> {
     const REASON: &str = "illegal multibyte sequence";
     let codes: Vec<u32> = value::str_codes(text).collect();
     let mut out = Vec::with_capacity(text.len());
@@ -2152,9 +2156,7 @@ fn encode_single_byte(text: &str, codec: Codec, mode: &ErrorMode) -> Result<Vec<
                         // original span, like CPython.
                         for replacement_code in value::str_codes(replacement_text) {
                             if replacement_code > limit {
-                                return Err(unicode_encode_error(
-                                    codec, text, start, end, &reason,
-                                ));
+                                return Err(unicode_encode_error(codec, text, start, end, &reason));
                             }
                             out.push(replacement_code as u8);
                         }

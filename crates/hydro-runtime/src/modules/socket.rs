@@ -387,11 +387,7 @@ fn map_net_error(error: io::Error, timeout: Option<Duration>) -> i64 {
                 return ssl_certificate_error(&text);
             }
             if text.starts_with("[SSL] ") {
-                return raise_ssl_exception(
-                    ssl_exception_class("SSLError"),
-                    "SSLError",
-                    &text,
-                );
+                return raise_ssl_exception(ssl_exception_class("SSLError"), "SSLError", &text);
             }
             io_error(error)
         }
@@ -1623,13 +1619,14 @@ fn ipv4_component(part: &str) -> Option<u64> {
     if part.is_empty() {
         return None;
     }
-    let (digits, radix) = if let Some(rest) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
-        (rest, 16)
-    } else if part.len() > 1 && part.starts_with('0') {
-        (&part[1..], 8)
-    } else {
-        (part, 10)
-    };
+    let (digits, radix) =
+        if let Some(rest) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            (rest, 16)
+        } else if part.len() > 1 && part.starts_with('0') {
+            (&part[1..], 8)
+        } else {
+            (part, 10)
+        };
     if digits.is_empty() {
         return None;
     }
@@ -1686,9 +1683,7 @@ fn inet_ntoa(packed: i64) -> i64 {
     if bytes.len() != 4 {
         return os_error("packed IP wrong length for inet_ntoa");
     }
-    value::str_alloc(
-        Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string(),
-    )
+    value::str_alloc(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string())
 }
 
 /// Builds the `[address, ...]` list of a `gethostby*` result.
@@ -1823,10 +1818,7 @@ fn getservbyname(service: &str, protocol: Option<&i64>) -> i64 {
 /// `socket.getservbyport(port, protocolname=None)`.
 fn getservbyport(port: i64, protocol: Option<&i64>) -> i64 {
     if !(0..=65535).contains(&port) {
-        return exc::raise_with_message(
-            exc::OVERFLOW_ERROR,
-            "getservbyport: port must be 0-65535",
-        );
+        return exc::raise_with_message(exc::OVERFLOW_ERROR, "getservbyport: port must be 0-65535");
     }
     #[cfg(unix)]
     {
@@ -1871,7 +1863,10 @@ fn sethostname(name: &[u8]) -> i64 {
         // SAFETY: `name` is a valid byte slice of the given length and is not
         // retained by the kernel after the call.
         let result = unsafe {
-            libc::sethostname(name.as_ptr() as *const libc::c_char, name.len() as libc::size_t)
+            libc::sethostname(
+                name.as_ptr() as *const libc::c_char,
+                name.len() as libc::size_t,
+            )
         };
         heap::blocking_leave();
         if result == 0 {
@@ -1916,21 +1911,16 @@ pub(crate) fn call(module: &str, function: &str, args: &[i64]) -> i64 {
         },
         "inet_pton" => inet_pton(args),
         "inet_ntop" => inet_ntop(args),
-        "inet_aton" => {
-            match address_text(args.first().copied().unwrap_or(NONE), "inet_aton") {
-                Ok(text) => inet_aton(&text),
-                Err(err) => err,
-            }
-        }
+        "inet_aton" => match address_text(args.first().copied().unwrap_or(NONE), "inet_aton") {
+            Ok(text) => inet_aton(&text),
+            Err(err) => err,
+        },
         "inet_ntoa" => match args.first() {
             Some(&packed) => inet_ntoa(packed),
             None => type_error("inet_ntoa() missing required argument 'packed_ip'"),
         },
         "gethostbyname_ex" => {
-            match address_text(
-                args.first().copied().unwrap_or(NONE),
-                "gethostbyname_ex",
-            ) {
+            match address_text(args.first().copied().unwrap_or(NONE), "gethostbyname_ex") {
                 Ok(host) => gethostbyname_ex(&host),
                 Err(err) => err,
             }
@@ -2619,7 +2609,7 @@ fn sio_readline_binary(instance: i64, limit: i64) -> Result<Vec<u8>, i64> {
     }
     let mut data = sio_buffer(instance, "_rbuf");
     loop {
-        if data.iter().any(|byte| *byte == b'\n') {
+        if data.contains(&b'\n') {
             break;
         }
         if limit >= 0 && data.len() as i64 >= limit {
@@ -2809,7 +2799,9 @@ fn sio_decode_text(instance: i64, data: &[u8]) -> Result<String, i64> {
     if exc::pending() {
         return Err(NONE);
     }
-    Ok(value::as_str(result).map(str::to_string).unwrap_or_default())
+    Ok(value::as_str(result)
+        .map(str::to_string)
+        .unwrap_or_default())
 }
 
 /// Universal-newline translation for text reads (`newline=None` only).
@@ -2965,44 +2957,63 @@ fn socketio_class() -> i64 {
     if let Some(class) = globals::registry_get("socket.SocketIO") {
         return class;
     }
-    let definitions: Vec<(&'static str, Vec<value::ParamMeta>, extern "C" fn(*const i64) -> i64)> =
-        vec![
-            ("read", vec![sio_optional("size", encode_int(-1))], sio_read_entry),
-            ("read1", vec![sio_optional("size", encode_int(-1))], sio_read1_entry),
-            (
-                "readline",
-                vec![sio_optional("size", encode_int(-1))],
-                sio_readline_entry,
-            ),
-            (
-                "readlines",
-                vec![sio_optional("hint", encode_int(-1))],
-                sio_readlines_entry,
-            ),
-            ("readinto", vec![sio_required("buffer")], sio_readinto_entry),
-            ("peek", vec![sio_optional("size", encode_int(-1))], sio_peek_entry),
-            ("write", vec![sio_required("data")], sio_write_entry),
-            ("writelines", vec![sio_required("lines")], sio_writelines_entry),
-            ("flush", vec![], sio_flush_entry),
-            ("close", vec![], sio_close_entry),
-            ("fileno", vec![], sio_fileno_entry),
-            ("readable", vec![], sio_readable_entry),
-            ("writable", vec![], sio_writable_entry),
-            ("seekable", vec![], sio_seekable_entry),
-            ("isatty", vec![], sio_isatty_entry),
-            ("__enter__", vec![], sio_enter_entry),
-            (
-                "__exit__",
-                vec![
-                    sio_optional("exc_type", NONE),
-                    sio_optional("exc_value", NONE),
-                    sio_optional("traceback", NONE),
-                ],
-                sio_exit_entry,
-            ),
-            ("__iter__", vec![], sio_enter_entry),
-            ("__next__", vec![], sio_next_entry),
-        ];
+    let definitions: Vec<(
+        &'static str,
+        Vec<value::ParamMeta>,
+        extern "C" fn(*const i64) -> i64,
+    )> = vec![
+        (
+            "read",
+            vec![sio_optional("size", encode_int(-1))],
+            sio_read_entry,
+        ),
+        (
+            "read1",
+            vec![sio_optional("size", encode_int(-1))],
+            sio_read1_entry,
+        ),
+        (
+            "readline",
+            vec![sio_optional("size", encode_int(-1))],
+            sio_readline_entry,
+        ),
+        (
+            "readlines",
+            vec![sio_optional("hint", encode_int(-1))],
+            sio_readlines_entry,
+        ),
+        ("readinto", vec![sio_required("buffer")], sio_readinto_entry),
+        (
+            "peek",
+            vec![sio_optional("size", encode_int(-1))],
+            sio_peek_entry,
+        ),
+        ("write", vec![sio_required("data")], sio_write_entry),
+        (
+            "writelines",
+            vec![sio_required("lines")],
+            sio_writelines_entry,
+        ),
+        ("flush", vec![], sio_flush_entry),
+        ("close", vec![], sio_close_entry),
+        ("fileno", vec![], sio_fileno_entry),
+        ("readable", vec![], sio_readable_entry),
+        ("writable", vec![], sio_writable_entry),
+        ("seekable", vec![], sio_seekable_entry),
+        ("isatty", vec![], sio_isatty_entry),
+        ("__enter__", vec![], sio_enter_entry),
+        (
+            "__exit__",
+            vec![
+                sio_optional("exc_type", NONE),
+                sio_optional("exc_value", NONE),
+                sio_optional("traceback", NONE),
+            ],
+            sio_exit_entry,
+        ),
+        ("__iter__", vec![], sio_enter_entry),
+        ("__next__", vec![], sio_next_entry),
+    ];
     let mut functions = Vec::with_capacity(definitions.len());
     let mut methods = Vec::with_capacity(definitions.len());
     for (name, params, entry) in definitions {
@@ -3087,11 +3098,7 @@ fn makefile(obj: i64, args: &[i64]) -> i64 {
     sio_store_buffer(stream, "_rbuf", &[]);
     sio_store_buffer(stream, "_wbuf", &[]);
     sio_set(stream, "_binary", value::bool_value(binary));
-    sio_set(
-        stream,
-        "_encoding",
-        if binary { NONE } else { encoding },
-    );
+    sio_set(stream, "_encoding", if binary { NONE } else { encoding });
     sio_set(stream, "_errors", if binary { NONE } else { errors });
     sio_set(stream, "_newline", if binary { NONE } else { newline });
     sio_set(
@@ -3331,11 +3338,11 @@ extern "C" fn sio_writable_entry(argv: *const i64) -> i64 {
     value::bool_value(!sio_closed(instance) && sio_flag(instance, "_writable"))
 }
 
-extern "C" fn sio_seekable_entry(argv: *const i64) -> i64 {
+extern "C" fn sio_seekable_entry(_argv: *const i64) -> i64 {
     value::FALSE
 }
 
-extern "C" fn sio_isatty_entry(argv: *const i64) -> i64 {
+extern "C" fn sio_isatty_entry(_argv: *const i64) -> i64 {
     value::FALSE
 }
 
@@ -5914,7 +5921,8 @@ fn ssl_protocol_names() -> i64 {
     .into_iter()
     .map(|(number, name)| (encode_int(number), sock_text(name)))
     .collect();
-    let pairs_root = heap::root_values(&pairs.iter().flat_map(|(k, v)| [*k, *v]).collect::<Vec<_>>());
+    let pairs_root =
+        heap::root_values(&pairs.iter().flat_map(|(k, v)| [*k, *v]).collect::<Vec<_>>());
     let mapping = value::dict_new(pairs);
     let root = heap::root_values(std::slice::from_ref(&mapping));
     globals::registry_set("ssl._PROTOCOL_NAMES", mapping);
@@ -5930,17 +5938,28 @@ fn memory_bio_class() -> i64 {
         return class;
     }
     let self_only = || vec![sio_required("self")];
-    let definitions: Vec<(&'static str, Vec<value::ParamMeta>, extern "C" fn(*const i64) -> i64)> =
-        vec![
-            ("__init__", self_only(), bio_init_entry),
-            ("write", vec![sio_required("self"), sio_required("b")], bio_write_entry),
-            ("read", vec![sio_required("self"), sio_optional("n", encode_int(-1))], bio_read_entry),
-            (
-                "read_into",
-                vec![sio_required("self"), sio_required("b")],
-                bio_read_into_entry,
-            ),
-        ];
+    let definitions: Vec<(
+        &'static str,
+        Vec<value::ParamMeta>,
+        extern "C" fn(*const i64) -> i64,
+    )> = vec![
+        ("__init__", self_only(), bio_init_entry),
+        (
+            "write",
+            vec![sio_required("self"), sio_required("b")],
+            bio_write_entry,
+        ),
+        (
+            "read",
+            vec![sio_required("self"), sio_optional("n", encode_int(-1))],
+            bio_read_entry,
+        ),
+        (
+            "read_into",
+            vec![sio_required("self"), sio_required("b")],
+            bio_read_into_entry,
+        ),
+    ];
     let mut methods = Vec::new();
     let mut functions = Vec::new();
     for (name, params, entry) in definitions {
@@ -6077,14 +6096,10 @@ fn ssl_object_class() -> i64 {
     if let Some(class) = globals::registry_get("ssl.SSLObject") {
         return class;
     }
-    let mut init = value::native_function_new("ssl", "SSLObject.__init__", 1);
+    let init = value::native_function_new("ssl", "SSLObject.__init__", 1);
     value::function_set_signature(init, vec![sio_required("self")]);
     value::function_set_full_entry(init, ssl_object_init_entry as *const () as usize);
-    let methods = vec![(
-        "__init__".to_string(),
-        init,
-        MethodKind::Normal,
-    )];
+    let methods = vec![("__init__".to_string(), init, MethodKind::Normal)];
     let root = heap::root_values(&[init]);
     let class = value::class_new_full("SSLObject".to_string(), NONE, methods, Vec::new());
     heap::release_roots(root);
@@ -6227,13 +6242,21 @@ pub(crate) fn ssl_constant(name: &str) -> i64 {
         "OP_NO_TLSv1_2" => encode_int(0x08000000),
         "OP_NO_TLSv1_3" => encode_int(0x20000000),
         "OPENSSL_VERSION" => value::str_alloc("rustls 0.23".to_string()),
-        "OPENSSL_VERSION_INFO" => {
-            value::tuple_new(vec![encode_int(0), encode_int(0), encode_int(0), encode_int(0), encode_int(0)])
-        }
+        "OPENSSL_VERSION_INFO" => value::tuple_new(vec![
+            encode_int(0),
+            encode_int(0),
+            encode_int(0),
+            encode_int(0),
+            encode_int(0),
+        ]),
         "OPENSSL_VERSION_NUMBER" => encode_int(0),
-        "_OPENSSL_API_VERSION" => {
-            value::tuple_new(vec![encode_int(0), encode_int(0), encode_int(0), encode_int(0), encode_int(0)])
-        }
+        "_OPENSSL_API_VERSION" => value::tuple_new(vec![
+            encode_int(0),
+            encode_int(0),
+            encode_int(0),
+            encode_int(0),
+            encode_int(0),
+        ]),
         "PEM_HEADER" => value::str_alloc("-----BEGIN CERTIFICATE-----".to_string()),
         "PEM_FOOTER" => value::str_alloc("-----END CERTIFICATE-----".to_string()),
         _ => exc::raise_with_message(

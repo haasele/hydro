@@ -136,7 +136,8 @@ const ABI_TAG: &str = hydro_ir::PYTHON_ABI_TAG;
 fn versioned_stdlib_name() -> String {
     format!(
         "python{}.{}",
-        hydro_ir::PYTHON_VERSION.0, hydro_ir::PYTHON_VERSION.1
+        hydro_ir::PYTHON_VERSION.0,
+        hydro_ir::PYTHON_VERSION.1
     )
 }
 
@@ -282,7 +283,10 @@ fn push_dynload_layouts(base: &Path, roots: &mut Vec<PathBuf>, seen: &mut HashSe
         base.join("lib").join(&versioned),
         base.join("lib").join(&versioned).join("lib-dynload"),
         base.join("..").join("lib").join(&versioned),
-        base.join("..").join("lib").join(&versioned).join("lib-dynload"),
+        base.join("..")
+            .join("lib")
+            .join(&versioned)
+            .join("lib-dynload"),
     ];
     if let Ok(entries) = std::fs::read_dir(base.join("..").join("build")) {
         let mut builds: Vec<PathBuf> = entries
@@ -491,7 +495,10 @@ fn not_found_message(name: &str, incompatible: &[PathBuf], roots: &[PathBuf]) ->
             message.push_str(&format!(" and {} more", incompatible.len() - 1));
         }
     } else {
-        message.push_str(&format!(": no extension artifact in {}", describe_roots(roots)));
+        message.push_str(&format!(
+            ": no extension artifact in {}",
+            describe_roots(roots)
+        ));
     }
     message
 }
@@ -517,10 +524,7 @@ fn named_artifacts(name: &str) -> (Vec<Artifact>, Vec<PathBuf>, Vec<PathBuf>) {
 }
 
 /// Matching artifacts for a suffix-less path relative to every root.
-fn artifacts_for_relative(
-    relative: &Path,
-    roots: &[PathBuf],
-) -> (Vec<Artifact>, Vec<PathBuf>) {
+fn artifacts_for_relative(relative: &Path, roots: &[PathBuf]) -> (Vec<Artifact>, Vec<PathBuf>) {
     let mut loadable = Vec::new();
     let mut incompatible = Vec::new();
     for root in roots {
@@ -639,9 +643,9 @@ fn load_named(name: &str) -> Result<(String, u64), LoadFailure> {
             }
         }
     }
-    Err(LoadFailure::Load(
-        first_error.unwrap_or_else(|| not_found_message(name, &incompatible, &roots)),
-    ))
+    Err(LoadFailure::Load(first_error.unwrap_or_else(|| {
+        not_found_message(name, &incompatible, &roots)
+    })))
 }
 
 /// Runtime importer fallback: loads a compiled extension by import name.
@@ -2365,7 +2369,10 @@ mod tests {
             error.starts_with("No module named 'hydro_missing_extension_probe'"),
             "{error}"
         );
-        assert!(error.contains("artifact") || error.contains("extension"), "{error}");
+        assert!(
+            error.contains("artifact") || error.contains("extension"),
+            "{error}"
+        );
 
         // Without a candidate the importer falls through to the caller's own
         // `ModuleNotFoundError` and leaves no pending exception behind.
@@ -2378,7 +2385,10 @@ mod tests {
         let path = PathBuf::from("/tmp/_probe.cpython-313-x86_64-linux-gnu.so");
         let message = not_found_message("_probe", std::slice::from_ref(&path), &[]);
         assert!(message.starts_with("No module named '_probe'"), "{message}");
-        assert!(message.contains(path.to_string_lossy().as_ref()), "{message}");
+        assert!(
+            message.contains(path.to_string_lossy().as_ref()),
+            "{message}"
+        );
         assert!(message.contains("different CPython ABI"), "{message}");
     }
 }

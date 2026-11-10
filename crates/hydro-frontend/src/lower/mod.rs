@@ -1267,7 +1267,7 @@ fn python_source_env() -> Vec<Option<std::ffi::OsString>> {
         "HYDRO_STDLIB",
     ]
     .into_iter()
-    .map(|key| std::env::var_os(key))
+    .map(std::env::var_os)
     .collect()
 }
 
@@ -12075,7 +12075,9 @@ impl<'a> Lowerer<'a> {
                         .collect();
                     if exprs.len() == 1 {
                         // `handler_matcher` never returns an empty kind list.
-                        exprs.pop().unwrap_or_else(|| self.error_expr(handler.range))
+                        exprs
+                            .pop()
+                            .unwrap_or_else(|| self.error_expr(handler.range))
                     } else {
                         HExpr {
                             kind: HExprKind::Tuple(exprs),
@@ -13137,8 +13139,7 @@ impl<'a> Lowerer<'a> {
                 },
             );
         }
-        let stmt =
-            self.lower_nested_class_stmt(s, plan, fs, target, type_params, line, col)?;
+        let stmt = self.lower_nested_class_stmt(s, plan, fs, target, type_params, line, col)?;
         if !global_binding {
             return Some(stmt);
         }
@@ -28371,30 +28372,23 @@ fn except_star_control_flow(body: &[ast::Stmt], in_loop: bool) -> Option<TextRan
                 | ast::Stmt::AsyncFunctionDef(_)
                 | ast::Stmt::ClassDef(_) => {}
                 ast::Stmt::If(s) => {
-                    if let Some(range) =
-                        walk(&s.body, in_loop).or_else(|| walk(&s.orelse, in_loop))
+                    if let Some(range) = walk(&s.body, in_loop).or_else(|| walk(&s.orelse, in_loop))
                     {
                         return Some(range);
                     }
                 }
                 ast::Stmt::While(s) => {
-                    if let Some(range) =
-                        walk(&s.body, true).or_else(|| walk(&s.orelse, in_loop))
-                    {
+                    if let Some(range) = walk(&s.body, true).or_else(|| walk(&s.orelse, in_loop)) {
                         return Some(range);
                     }
                 }
                 ast::Stmt::For(s) => {
-                    if let Some(range) =
-                        walk(&s.body, true).or_else(|| walk(&s.orelse, in_loop))
-                    {
+                    if let Some(range) = walk(&s.body, true).or_else(|| walk(&s.orelse, in_loop)) {
                         return Some(range);
                     }
                 }
                 ast::Stmt::AsyncFor(s) => {
-                    if let Some(range) =
-                        walk(&s.body, true).or_else(|| walk(&s.orelse, in_loop))
-                    {
+                    if let Some(range) = walk(&s.body, true).or_else(|| walk(&s.orelse, in_loop)) {
                         return Some(range);
                     }
                 }

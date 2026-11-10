@@ -115,7 +115,7 @@ fn rlim_to_value(limit: libc::rlim_t) -> i64 {
     if limit == libc::RLIM_INFINITY {
         return -1;
     }
-    let raw = limit as u64;
+    let raw = limit;
     match i64::try_from(raw) {
         Ok(value) => value,
         Err(_) => value::bigint_new(num_bigint::BigInt::from(raw)),

@@ -432,10 +432,9 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "_contextvars_var_reset" => var_reset(args),
         "_contextvars_var_repr" => var_repr(args),
         "_contextvars_var_setattr" => var_setattr(args),
-        "_contextvars_token_init" => exc::raise_with_message(
-            RUNTIME_ERROR,
-            "Tokens can only be created by ContextVars",
-        ),
+        "_contextvars_token_init" => {
+            exc::raise_with_message(RUNTIME_ERROR, "Tokens can only be created by ContextVars")
+        }
         "_contextvars_token_repr" => token_repr(args),
         "_contextvars_token_enter" => args.first().copied().unwrap_or(NONE),
         "_contextvars_token_exit" => token_exit(args),
@@ -576,10 +575,7 @@ fn check_key(key: i64) -> Option<i64> {
     }
     Some(exc::raise_with_message(
         TYPE_ERROR,
-        &format!(
-            "a ContextVar key was expected, got {}",
-            value::repr(key)
-        ),
+        &format!("a ContextVar key was expected, got {}", value::repr(key)),
     ))
 }
 
@@ -806,10 +802,7 @@ fn var_setattr(args: &[i64]) -> i64 {
 /// `Context()` accepts no arguments (the data dict is created lazily).
 fn ctx_init(args: &[i64]) -> i64 {
     if args.len() > 1 {
-        return exc::raise_with_message(
-            TYPE_ERROR,
-            "Context() does not accept any arguments",
-        );
+        return exc::raise_with_message(TYPE_ERROR, "Context() does not accept any arguments");
     }
     NONE
 }
@@ -820,10 +813,7 @@ extern "C" fn ctx_init_entry(argv: *const i64) -> i64 {
     let no_args = value::as_list(args).is_none_or(|items| items.is_empty());
     let no_keywords = value::as_dict(keywords).is_none_or(|pairs| pairs.is_empty());
     if !no_args || !no_keywords {
-        return exc::raise_with_message(
-            TYPE_ERROR,
-            "Context() does not accept any arguments",
-        );
+        return exc::raise_with_message(TYPE_ERROR, "Context() does not accept any arguments");
     }
     NONE
 }
@@ -843,9 +833,8 @@ fn ctx_run(args: &[i64]) -> i64 {
 
 extern "C" fn ctx_run_entry(argv: *const i64) -> i64 {
     // SAFETY: the binder passes `[self, callable, args, kwargs]`.
-    let (context, callable, rest, keywords) = unsafe {
-        (*argv, *argv.add(1), *argv.add(2), *argv.add(3))
-    };
+    let (context, callable, rest, keywords) =
+        unsafe { (*argv, *argv.add(1), *argv.add(2), *argv.add(3)) };
     let positional: Vec<i64> = value::as_list(rest)
         .map(|items| items.to_vec())
         .unwrap_or_default();

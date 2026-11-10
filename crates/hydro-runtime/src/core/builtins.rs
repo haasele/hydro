@@ -7,11 +7,12 @@ use std::io::Write as _;
 use hydro_ir::{stdlib, BinOp, Builtin, MethodKind, ParamKind, UnOp};
 use num_bigint::BigInt;
 
+use super::compile_runtime;
 use crate::container;
 use crate::core::globals;
 use crate::exc::{
     self, ATTRIBUTE_ERROR, IMPORT_ERROR, NAME_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR,
-    OVERFLOW_ERROR, RUNTIME_ERROR, SYNTAX_ERROR, TYPE_ERROR, VALUE_ERROR, ZERO_DIVISION_ERROR,
+    OVERFLOW_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR, ZERO_DIVISION_ERROR,
 };
 use crate::format;
 use crate::iter;
@@ -19,7 +20,6 @@ use crate::methods;
 use crate::modules;
 use crate::ops;
 use crate::value::{self, FunctionBody, NONE};
-use super::compile_runtime;
 
 /// `2^63` as `f64`, the first float outside the `i64` range.
 const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
@@ -4838,8 +4838,8 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
         };
         // Record the class whose body owns this initializer so a
         // zero-argument `super()` inside it starts after that class.
-        let _defining_guard = value::class_lookup_owner(class, "__init__")
-            .map(methods::DefiningClassGuard::enter);
+        let _defining_guard =
+            value::class_lookup_owner(class, "__init__").map(methods::DefiningClassGuard::enter);
         let _ = methods::call_user_method(instance, class, kind, init, "__init__", &call_args, &[]);
         return if exc::pending() { NONE } else { instance };
     }
@@ -6498,10 +6498,7 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             [stop] => range_new(ops::int_result(0), *stop, ops::int_result(1)),
             [start, stop] => range_new(*start, *stop, ops::int_result(1)),
             [start, stop, step] => range_new(*start, *stop, *step),
-            [] => exc::raise_with_message(
-                TYPE_ERROR,
-                "range expected at least 1 argument, got 0",
-            ),
+            [] => exc::raise_with_message(TYPE_ERROR, "range expected at least 1 argument, got 0"),
             _ => exc::raise_with_message(
                 TYPE_ERROR,
                 &format!("range expected at most 3 arguments, got {argc}"),

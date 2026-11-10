@@ -43,7 +43,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hydro_ir::MethodKind;
 
 use crate::core::globals;
-use crate::exc::{self, ATTRIBUTE_ERROR, OVERFLOW_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::exc::{
+    self, ATTRIBUTE_ERROR, OVERFLOW_ERROR, TYPE_ERROR, VALUE_ERROR, ZERO_DIVISION_ERROR,
+};
 use crate::value::{self, NONE};
 
 /// Module name used for native function values.
@@ -96,6 +98,7 @@ const TZNAME_METHOD: &str = "_datetime_tzname";
 const TZINFO_UTCOFFSET_METHOD: &str = "_datetime_tzinfo_utcoffset";
 const TZINFO_DST_METHOD: &str = "_datetime_tzinfo_dst";
 const TZINFO_TZNAME_METHOD: &str = "_datetime_tzinfo_tzname";
+const TZINFO_FROMUTC_METHOD: &str = "_datetime_tzinfo_fromutc";
 const TIMEZONE_UTCOFFSET_METHOD: &str = "_datetime_timezone_utcoffset";
 const TIMEZONE_DST_METHOD: &str = "_datetime_timezone_dst";
 const TIMEZONE_TZNAME_METHOD: &str = "_datetime_timezone_tzname";
@@ -111,6 +114,15 @@ const GE_METHOD: &str = "_datetime_ge";
 const ADD_METHOD: &str = "_datetime_add";
 const RADDMETHOD: &str = "_datetime_radd";
 const SUB_METHOD: &str = "_datetime_sub";
+const TD_NEG_METHOD: &str = "_datetime_td_neg";
+const TD_POS_METHOD: &str = "_datetime_td_pos";
+const TD_ABS_METHOD: &str = "_datetime_td_abs";
+const TD_RSUB_METHOD: &str = "_datetime_td_rsub";
+const TD_MUL_METHOD: &str = "_datetime_td_mul";
+const TD_TRUEDIV_METHOD: &str = "_datetime_td_truediv";
+const TD_FLOORDIV_METHOD: &str = "_datetime_td_floordiv";
+const TD_MOD_METHOD: &str = "_datetime_td_mod";
+const TD_DIVMOD_METHOD: &str = "_datetime_td_divmod";
 
 /// `datetime.MINYEAR`/`datetime.MAXYEAR`.
 const MINYEAR: i64 = 1;
@@ -469,7 +481,12 @@ fn date_class() -> i64 {
             3,
             MethodKind::Staticmethod,
         ),
-        entry("strptime", DATE_STRPTIME_METHOD, 2, MethodKind::Staticmethod),
+        entry(
+            "strptime",
+            DATE_STRPTIME_METHOD,
+            2,
+            MethodKind::Staticmethod,
+        ),
         entry("isocalendar", ISOCALENDAR_METHOD, 1, MethodKind::Normal),
         entry("__repr__", REPR_METHOD, 1, MethodKind::Normal),
         entry("__str__", STR_METHOD, 1, MethodKind::Normal),
@@ -680,6 +697,16 @@ fn timedelta_class() -> i64 {
         entry("__add__", ADD_METHOD, 2, MethodKind::Normal),
         entry("__radd__", RADDMETHOD, 2, MethodKind::Normal),
         entry("__sub__", SUB_METHOD, 2, MethodKind::Normal),
+        entry("__rsub__", TD_RSUB_METHOD, 2, MethodKind::Normal),
+        entry("__neg__", TD_NEG_METHOD, 1, MethodKind::Normal),
+        entry("__pos__", TD_POS_METHOD, 1, MethodKind::Normal),
+        entry("__abs__", TD_ABS_METHOD, 1, MethodKind::Normal),
+        entry("__mul__", TD_MUL_METHOD, 2, MethodKind::Normal),
+        entry("__rmul__", TD_MUL_METHOD, 2, MethodKind::Normal),
+        entry("__truediv__", TD_TRUEDIV_METHOD, 2, MethodKind::Normal),
+        entry("__floordiv__", TD_FLOORDIV_METHOD, 2, MethodKind::Normal),
+        entry("__mod__", TD_MOD_METHOD, 2, MethodKind::Normal),
+        entry("__divmod__", TD_DIVMOD_METHOD, 2, MethodKind::Normal),
     ];
     let class = build_class(TIMEDELTA_CLASS, NONE, &methods);
     globals::registry_set(TIMEDELTA_KEY, class);
@@ -706,6 +733,7 @@ fn tzinfo_class() -> i64 {
         entry("utcoffset", TZINFO_UTCOFFSET_METHOD, 2, MethodKind::Normal),
         entry("dst", TZINFO_DST_METHOD, 2, MethodKind::Normal),
         entry("tzname", TZINFO_TZNAME_METHOD, 2, MethodKind::Normal),
+        entry("fromutc", TZINFO_FROMUTC_METHOD, 2, MethodKind::Normal),
         entry("__repr__", REPR_METHOD, 1, MethodKind::Normal),
         entry("__str__", STR_METHOD, 1, MethodKind::Normal),
     ];
@@ -1165,33 +1193,6 @@ fn validate_time(hour: i64, minute: i64, second: i64, microsecond: i64) -> Resul
     })
 }
 
-/// Decodes one `timedelta` component into microseconds.
-fn delta_component(candidate: i64, label: &str, scale: i128) -> Result<i128, i64> {
-    if let Some(number) = value::as_integer(candidate) {
-        return Ok(i128::from(number) * scale);
-    }
-    if value::is_bigint(candidate) {
-        return Err(exc::raise_with_message(
-            OVERFLOW_ERROR,
-            "Python int too large to convert to C int",
-        ));
-    }
-    let Some(number) = value::as_float(candidate) else {
-        return Err(type_error(&format!(
-            "unsupported type for timedelta {label} component: {}",
-            value::type_name(candidate)
-        )));
-    };
-    let scaled = number * scale as f64;
-    if !scaled.is_finite() {
-        return Err(exc::raise_with_message(
-            OVERFLOW_ERROR,
-            &format!("timedelta {label} component is out of range"),
-        ));
-    }
-    Ok(scaled.round_ties_even() as i128)
-}
-
 fn delta_from_total(total: i128) -> Result<Delta, i64> {
     let days = total.div_euclid(MICROS_PER_DAY);
     if days.abs() > MAX_TIMEDELTA_DAYS {
@@ -1251,12 +1252,52 @@ fn timedelta_from_slots(slots: &[Option<i64>]) -> Result<Delta, i64> {
         ("weeks", 7 * MICROS_PER_DAY),
     ];
     let mut total: i128 = 0;
+    let mut leftover: f64 = 0.0;
     for (index, (label, scale)) in units.iter().enumerate() {
         let Some(candidate) = slots[index] else {
             continue;
         };
-        total += delta_component(candidate, label, *scale)?;
+        if let Some(number) = value::as_integer(candidate) {
+            total = total
+                .checked_add(i128::from(number) * scale)
+                .ok_or_else(|| {
+                    exc::raise_with_message(OVERFLOW_ERROR, "timedelta value out of range")
+                })?;
+            continue;
+        }
+        if value::is_bigint(candidate) {
+            return Err(exc::raise_with_message(
+                OVERFLOW_ERROR,
+                "Python int too large to convert to C int",
+            ));
+        }
+        let Some(number) = value::as_float(candidate) else {
+            return Err(type_error(&format!(
+                "unsupported type for timedelta {label} component: {}",
+                value::type_name(candidate)
+            )));
+        };
+        let scaled = number * *scale as f64;
+        if !scaled.is_finite() || !leftover.is_finite() {
+            return Err(exc::raise_with_message(
+                OVERFLOW_ERROR,
+                &format!("timedelta {label} component is out of range"),
+            ));
+        }
+        leftover += scaled;
     }
+    // CPython accumulates every float contribution and rounds the sum once
+    // (half to even); `timedelta(days=.4/us_per_day, hours=.2/us_per_hour)`
+    // therefore equals one microsecond.
+    if !leftover.is_finite() {
+        return Err(exc::raise_with_message(
+            OVERFLOW_ERROR,
+            "timedelta value out of range",
+        ));
+    }
+    total = total
+        .checked_add(leftover.round_ties_even() as i128)
+        .ok_or_else(|| exc::raise_with_message(OVERFLOW_ERROR, "timedelta value out of range"))?;
     delta_from_total(total)
 }
 
@@ -1616,11 +1657,7 @@ fn directive(
             ' ',
         ),
         'B' => Piece::padded(MONTH_NAMES[parts.month as usize - 1].to_string(), 0, ' '),
-        'z' => Piece::padded(
-            offset.map(offset_compact_text).unwrap_or_default(),
-            0,
-            ' ',
-        ),
+        'z' => Piece::padded(offset.map(offset_compact_text).unwrap_or_default(), 0, ' '),
         'Z' => Piece::padded(name.unwrap_or("").to_string(), 0, ' '),
         's' => {
             let base = unix_seconds(parts);
@@ -1642,11 +1679,7 @@ fn directive(
             let week = (day_of_year(parts) as i64 + 6 - weekday as i64).div_euclid(7);
             Piece::number(week, 2)
         }
-        'c' => Piece::padded(
-            format(parts, "%a %b %e %H:%M:%S %Y", offset, name),
-            0,
-            ' ',
-        ),
+        'c' => Piece::padded(format(parts, "%a %b %e %H:%M:%S %Y", offset, name), 0, ' '),
         'x' => Piece::padded(format(parts, "%m/%d/%y", offset, name), 0, ' '),
         'X' => Piece::padded(format(parts, "%H:%M:%S", offset, name), 0, ' '),
         'D' => Piece::padded(format(parts, "%m/%d/%y", offset, name), 0, ' '),
@@ -1679,12 +1712,7 @@ fn padded(text: &str, width: usize, pad: char) -> String {
 }
 
 /// Renders a datetime with a `strftime`-style format.
-fn format(
-    parts: &Parts,
-    pattern: &str,
-    offset: Option<i128>,
-    name: Option<&str>,
-) -> String {
+fn format(parts: &Parts, pattern: &str, offset: Option<i128>, name: Option<&str>) -> String {
     let mut out = String::with_capacity(pattern.len() + 8);
     let mut rest = pattern;
     while let Some(character) = rest.chars().next() {
@@ -1821,11 +1849,20 @@ fn offset_compact_text(offset: i128) -> String {
     }
 }
 
-/// `tzinfo.utcoffset(receiver)` as microseconds, `None` when the zone reports
-/// no offset.
-fn utc_offset(receiver: i64, tzinfo: i64) -> Result<Option<i128>, i64> {
-    let name = b"utcoffset";
-    let args = [receiver];
+/// CPython's `_check_utc_offset`: a zone's `utcoffset`/`dst` result must be
+/// `None` or a `timedelta` strictly inside one day.
+///
+/// `Err` carries the pending exception (the raised `ValueError` or the
+/// original error when the zone method itself failed).
+fn checked_zone_offset(receiver: i64, tzinfo: i64, method: &str) -> Result<Option<i128>, i64> {
+    let name = method.as_bytes();
+    // A `time`'s zone receives `None`; a `datetime` receives the value itself.
+    let argument = if kind_of(receiver) == Some(Kind::Time) {
+        NONE
+    } else {
+        receiver
+    };
+    let args = [argument];
     let result = crate::methods::call(tzinfo, name.as_ptr(), name.len(), 1, args.as_ptr());
     if exc::pending() {
         return Err(NONE);
@@ -1833,9 +1870,43 @@ fn utc_offset(receiver: i64, tzinfo: i64) -> Result<Option<i128>, i64> {
     if result == NONE {
         return Ok(None);
     }
-    match delta_from_instance(result) {
-        Some(delta) => Ok(Some(delta.0)),
-        None => Err(type_error("utcoffset() must return None or a timedelta")),
+    let Some(delta) = delta_from_instance(result) else {
+        return Err(type_error(&format!(
+            "tzinfo.{method}() must return None or timedelta, not '{}'",
+            value::type_name(result)
+        )));
+    };
+    if delta.0 <= -MICROS_PER_DAY || delta.0 >= MICROS_PER_DAY {
+        return Err(invalid_instance(&format!(
+            "offset must be a timedelta strictly between -timedelta(hours=24) and \
+             timedelta(hours=24), not {}",
+            delta_repr(delta)
+        )));
+    }
+    Ok(Some(delta.0))
+}
+
+/// The zone's `tzname`, checked like CPython's `_check_tzname`.
+fn checked_zone_name(receiver: i64, tzinfo: i64) -> Result<Option<String>, i64> {
+    let argument = if kind_of(receiver) == Some(Kind::Time) {
+        NONE
+    } else {
+        receiver
+    };
+    let args = [argument];
+    let result = crate::methods::call(tzinfo, b"tzname".as_ptr(), 6, 1, args.as_ptr());
+    if exc::pending() {
+        return Err(NONE);
+    }
+    if result == NONE {
+        return Ok(None);
+    }
+    match value::as_str(result) {
+        Some(name) => Ok(Some(name.to_string())),
+        None => Err(type_error(&format!(
+            "tzinfo.tzname() must return None or a string, not '{}'",
+            value::type_name(result)
+        ))),
     }
 }
 
@@ -1845,7 +1916,7 @@ fn offset_of(receiver: i64) -> Result<Option<i128>, i64> {
     if tzinfo == NONE {
         return Ok(None);
     }
-    utc_offset(receiver, tzinfo)
+    checked_zone_offset(receiver, tzinfo, "utcoffset")
 }
 
 /// The `%z`/`%Z` view of a value: UTC offset in microseconds and zone name.
@@ -1861,13 +1932,8 @@ fn zone_text(receiver: i64) -> Result<(Option<i128>, Option<String>), i64> {
         return Ok((None, None));
     }
     let offset = offset_of(receiver)?;
-    let name = b"tzname";
-    let args = [receiver];
-    let raw = crate::methods::call(tzinfo, name.as_ptr(), name.len(), 1, args.as_ptr());
-    if exc::pending() {
-        return Err(NONE);
-    }
-    Ok((offset, value::as_str(raw).map(str::to_string)))
+    let name = checked_zone_name(receiver, tzinfo)?;
+    Ok((offset, name))
 }
 
 fn date_text(date: Date) -> String {
@@ -2066,58 +2132,51 @@ fn render(candidate: i64, repr: bool) -> Option<String> {
 // Comparison and arithmetic
 // -------------------------------------------------------------------------
 
-/// Ordering key of a `date`/`datetime` instance (day number plus wall time).
-fn instant_key(instance: i64) -> Option<(i64, u32, u32, u32, u32)> {
+/// Wall-clock ordering key of a `date`/`datetime` instance.
+fn wall_key(instance: i64) -> Option<(i64, i64, i64, i64, i64, i64, i64)> {
     let date = date_from_instance(instance)?;
     let time = time_from_instance(instance)?;
     Some((
-        days_from_civil(date.year, date.month, date.day),
-        time.hour,
-        time.minute,
-        time.second,
-        time.microsecond,
+        date.year,
+        i64::from(date.month),
+        i64::from(date.day),
+        i64::from(time.hour),
+        i64::from(time.minute),
+        i64::from(time.second),
+        i64::from(time.microsecond),
     ))
 }
 
-/// Python ordering for two values of the same module class family. Different
-/// classes return `None`, which the dunders report as `NotImplemented`.
-fn ordering_of(a: i64, b: i64) -> Option<Ordering> {
-    let kind = kind_of(a)?;
-    if kind_of(b)? != kind {
-        return None;
+/// The UTC offset the receiver's zone reports for its stored fields (a
+/// `time`'s zone is called with `None`, like CPython).
+fn zone_offset(instance: i64) -> Result<Option<i128>, i64> {
+    let tzinfo = tzinfo_of(instance);
+    if tzinfo == NONE {
+        return Ok(None);
     }
-    match kind {
-        Kind::Date => {
-            let left = date_from_instance(a)?;
-            let right = date_from_instance(b)?;
-            Some((left.year, left.month, left.day).cmp(&(right.year, right.month, right.day)))
-        }
-        Kind::DateTime => Some(instant_key(a)?.cmp(&instant_key(b)?)),
-        Kind::Time => {
-            let left = time_from_instance(a)?;
-            let right = time_from_instance(b)?;
-            Some(
-                (left.hour, left.minute, left.second, left.microsecond).cmp(&(
-                    right.hour,
-                    right.minute,
-                    right.second,
-                    right.microsecond,
-                )),
-            )
-        }
-        Kind::Timedelta => Some(delta_from_instance(a)?.cmp(&delta_from_instance(b)?)),
-        // `timezone` defines only `__eq__`; ordering is not supported.
-        Kind::TzInfo | Kind::TimeZone => None,
-    }
+    checked_zone_offset(instance, tzinfo, "utcoffset")
 }
 
-fn compare_method(args: &[i64], op: u8) -> i64 {
-    let (Some(left), Some(right)) = (args.first().copied(), args.get(1).copied()) else {
-        return arity_error("comparison", "exactly 2", args.len());
+/// Whether the value's UTC offset depends on its stored `fold`, i.e. the wall
+/// clock is ambiguous. CPython's `==` treats such values as unequal to any
+/// differently zoned value.
+fn fold_sensitive(instance: i64) -> Result<bool, i64> {
+    let (Some(date), Some(time)) = (date_from_instance(instance), time_from_instance(instance))
+    else {
+        return Ok(false);
     };
-    let Some(ordering) = ordering_of(left, right) else {
-        return value::NOT_IMPLEMENTED;
-    };
+    let tzinfo = tzinfo_of(instance);
+    if tzinfo == NONE {
+        return Ok(false);
+    }
+    let current = checked_zone_offset(instance, tzinfo, "utcoffset")?;
+    let flipped = new_datetime(date, time, tzinfo, 1 - fold_of(instance));
+    let other = checked_zone_offset(flipped, tzinfo, "utcoffset")?;
+    Ok(current != other)
+}
+
+/// Maps an ordering to the boolean one rich comparison reports.
+fn comparison_result(op: u8, ordering: Ordering) -> i64 {
     let result = match op {
         OP_EQ => ordering == Ordering::Equal,
         OP_LT => ordering == Ordering::Less,
@@ -2126,6 +2185,135 @@ fn compare_method(args: &[i64], op: u8) -> i64 {
         _ => ordering != Ordering::Less,
     };
     value::bool_value(result)
+}
+
+/// CPython's `datetime._cmp`: wall clock when the zones agree (or both offsets
+/// are equal), UTC instants otherwise. `==` never raises for a naive/aware
+/// mix, while the ordering operators do.
+fn compare_datetime(left: i64, right: i64, op: u8) -> i64 {
+    let (Some(left_key), Some(right_key)) = (wall_key(left), wall_key(right)) else {
+        return invalid_instance("invalid datetime object");
+    };
+    let ordering = if tzinfo_of(left) == tzinfo_of(right) {
+        left_key.cmp(&right_key)
+    } else {
+        let (myoff, otoff) = match (zone_offset(left), zone_offset(right)) {
+            (Ok(myoff), Ok(otoff)) => (myoff, otoff),
+            (Err(error), _) | (_, Err(error)) => return error,
+        };
+        if op == OP_EQ {
+            match (fold_sensitive(left), fold_sensitive(right)) {
+                (Ok(true), _) | (_, Ok(true)) => return value::FALSE,
+                (Err(error), _) | (_, Err(error)) => return error,
+                _ => {}
+            }
+        }
+        if myoff == otoff {
+            left_key.cmp(&right_key)
+        } else {
+            match (myoff, otoff) {
+                (Some(myoff), Some(otoff)) => {
+                    let (Some(left_micros), Some(right_micros)) =
+                        (instant_micros(left), instant_micros(right))
+                    else {
+                        return invalid_instance("invalid datetime object");
+                    };
+                    (left_micros - myoff).cmp(&(right_micros - otoff))
+                }
+                _ => {
+                    if op == OP_EQ {
+                        return value::FALSE;
+                    }
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "can't compare offset-naive and offset-aware datetimes",
+                    );
+                }
+            }
+        }
+    };
+    comparison_result(op, ordering)
+}
+
+/// CPython's `time._cmp`: same zone objects compare their wall clock, distinct
+/// zones compare offsets first and then an offset-shifted hour/minute.
+fn compare_time(left: i64, right: i64, op: u8) -> i64 {
+    let (Some(left_time), Some(right_time)) = (time_from_instance(left), time_from_instance(right))
+    else {
+        return invalid_instance("invalid time object");
+    };
+    let key = |time: Time| (time.hour, time.minute, time.second, time.microsecond);
+    let ordering = if tzinfo_of(left) == tzinfo_of(right) {
+        key(left_time).cmp(&key(right_time))
+    } else {
+        let (myoff, otoff) = match (zone_offset(left), zone_offset(right)) {
+            (Ok(myoff), Ok(otoff)) => (myoff, otoff),
+            (Err(error), _) | (_, Err(error)) => return error,
+        };
+        if myoff == otoff {
+            key(left_time).cmp(&key(right_time))
+        } else {
+            match (myoff, otoff) {
+                (Some(myoff), Some(otoff)) => {
+                    let minutes = |time: Time, offset: i128| {
+                        i64::from(time.hour) * 60 + i64::from(time.minute)
+                            - (offset.div_euclid(60 * i128::from(MICROS_PER_SECOND))) as i64
+                    };
+                    (
+                        minutes(left_time, myoff),
+                        left_time.second,
+                        left_time.microsecond,
+                    )
+                        .cmp(&(
+                            minutes(right_time, otoff),
+                            right_time.second,
+                            right_time.microsecond,
+                        ))
+                }
+                _ => {
+                    if op == OP_EQ {
+                        return value::FALSE;
+                    }
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        "can't compare offset-naive and offset-aware times",
+                    );
+                }
+            }
+        }
+    };
+    comparison_result(op, ordering)
+}
+
+fn compare_method(args: &[i64], op: u8) -> i64 {
+    let (Some(left), Some(right)) = (args.first().copied(), args.get(1).copied()) else {
+        return arity_error("comparison", "exactly 2", args.len());
+    };
+    match (kind_of(left), kind_of(right)) {
+        (Some(Kind::Date), Some(Kind::Date)) => {
+            let (Some(left), Some(right)) = (date_from_instance(left), date_from_instance(right))
+            else {
+                return invalid_instance("invalid date object");
+            };
+            let ordering =
+                (left.year, left.month, left.day).cmp(&(right.year, right.month, right.day));
+            comparison_result(op, ordering)
+        }
+        (Some(Kind::DateTime), Some(Kind::DateTime)) => compare_datetime(left, right, op),
+        (Some(Kind::Time), Some(Kind::Time)) => compare_time(left, right, op),
+        (Some(Kind::Timedelta), Some(Kind::Timedelta)) => {
+            let (Some(left), Some(right)) = (delta_from_instance(left), delta_from_instance(right))
+            else {
+                return invalid_instance("invalid timedelta object");
+            };
+            let ordering = left.cmp(&right);
+            comparison_result(op, ordering)
+        }
+        // Different classes (including `date` vs `datetime`) and the tzinfo
+        // classes have no ordering; the runtime then raises for `<`/`>` and
+        // falls back to `False` for `==`.
+        _ => value::NOT_IMPLEMENTED,
+    }
 }
 
 /// Shifts a `date` by whole days.
@@ -2178,7 +2366,9 @@ fn datetime_shift(instance: i64, micros: i128) -> i64 {
             microsecond: parts.microsecond,
         },
         tzinfo_of(instance),
-        fold_of(instance),
+        // `datetime ± timedelta` rebuilds through `combine`, which drops the
+        // fold flag (CPython's C implementation matches).
+        0,
     )
 }
 
@@ -2282,7 +2472,27 @@ fn sub_method(args: &[i64]) -> i64 {
                 else {
                     return invalid_instance("invalid datetime object");
                 };
-                return match delta_from_total(left - right) {
+                let mut total = left - right;
+                // Different zones: CPython converts both wall clocks to UTC.
+                // Equal offsets keep the plain difference.
+                if tzinfo_of(receiver) != tzinfo_of(other) {
+                    let (myoff, otoff) = match (zone_offset(receiver), zone_offset(other)) {
+                        (Ok(myoff), Ok(otoff)) => (myoff, otoff),
+                        (Err(error), _) | (_, Err(error)) => return error,
+                    };
+                    if myoff != otoff {
+                        match (myoff, otoff) {
+                            (Some(myoff), Some(otoff)) => total = total + otoff - myoff,
+                            _ => {
+                                return exc::raise_with_message(
+                                    TYPE_ERROR,
+                                    "can't subtract offset-naive and offset-aware datetimes",
+                                )
+                            }
+                        }
+                    }
+                }
+                return match delta_from_total(total) {
                     Ok(delta) => new_timedelta(delta),
                     Err(err) => err,
                 };
@@ -2300,8 +2510,300 @@ fn sub_method(args: &[i64]) -> i64 {
 }
 
 // -------------------------------------------------------------------------
+// `timedelta` arithmetic
+// -------------------------------------------------------------------------
+
+/// Python's `divmod` pair: the quotient floors towards negative infinity and
+/// the remainder takes the divisor's sign.
+fn py_divmod(a: i128, b: i128) -> (i128, i128) {
+    let mut quotient = a / b;
+    let mut remainder = a % b;
+    if remainder != 0 && ((remainder < 0) != (b < 0)) {
+        quotient -= 1;
+        remainder += b;
+    }
+    (quotient, remainder)
+}
+
+/// Tags an `i128` count, promoting it to a heap `BigInt` when it does not fit
+/// the immediate integer representation.
+fn encode_i128(n: i128) -> i64 {
+    match i64::try_from(n) {
+        Ok(n) => encode(n),
+        Err(_) => value::bigint_new(num_bigint::BigInt::from(n)),
+    }
+}
+
+/// Exact `(numerator, denominator)` of a finite float, like
+/// `float.as_integer_ratio()`; `None` for NaN/Infinity.
+fn float_ratio(value: f64) -> Option<(num_bigint::BigInt, num_bigint::BigInt)> {
+    use num_bigint::BigInt;
+    if !value.is_finite() {
+        return None;
+    }
+    let bits = value.to_bits();
+    let negative = (bits >> 63) != 0;
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = BigInt::from(bits & ((1u64 << 52) - 1));
+    let (mut mantissa, exponent) = if exponent_bits == 0 {
+        (fraction, -1074)
+    } else {
+        (
+            fraction + (BigInt::from(1) << 52),
+            exponent_bits - 1023 - 52,
+        )
+    };
+    if negative {
+        mantissa = -mantissa;
+    }
+    if exponent >= 0 {
+        Some((mantissa << exponent as usize, BigInt::from(1)))
+    } else {
+        Some((mantissa, BigInt::from(1) << (-exponent) as usize))
+    }
+}
+
+/// `_pydatetime._divide_and_round` with arbitrary-precision integers: `a / b`
+/// floors and ties round to even.
+fn big_divide_and_round(a: &num_bigint::BigInt, b: &num_bigint::BigInt) -> num_bigint::BigInt {
+    use num_bigint::{BigInt, Sign};
+    let quotient = a / b;
+    let remainder = a % b;
+    let (quotient, remainder) = if remainder.sign() != Sign::NoSign
+        && ((remainder.sign() == Sign::Minus) != (b.sign() == Sign::Minus))
+    {
+        (quotient - 1, remainder + b)
+    } else {
+        (quotient, remainder)
+    };
+    let twice = &remainder * 2;
+    let magnitude = if b.sign() == Sign::Minus {
+        -b
+    } else {
+        b.clone()
+    };
+    let odd = (&quotient % BigInt::from(2)).sign() != Sign::NoSign;
+    if twice > magnitude || (twice == magnitude && odd) {
+        quotient + 1
+    } else {
+        quotient
+    }
+}
+
+fn overflow_error() -> i64 {
+    exc::raise_with_message(OVERFLOW_ERROR, "timedelta value out of range")
+}
+
+/// Converts a big-integer microsecond count back into a duration.
+fn delta_from_big(total: &num_bigint::BigInt) -> i64 {
+    match i128::try_from(total.clone()) {
+        Ok(total) => delta_from_total(total)
+            .map(new_timedelta)
+            .unwrap_or_else(|err| err),
+        Err(_) => overflow_error(),
+    }
+}
+
+/// `timedelta * float` / `float * timedelta` scaled by a float.
+fn scale_by_float(total: i128, value: f64) -> i64 {
+    let Some((numerator, denominator)) = float_ratio(value) else {
+        return overflow_error();
+    };
+    let product = num_bigint::BigInt::from(total) * numerator;
+    delta_from_big(&big_divide_and_round(&product, &denominator))
+}
+
+/// `timedelta / float` (the float is the divisor).
+fn divide_by_float(total: i128, value: f64) -> i64 {
+    if value == 0.0 {
+        return exc::raise_with_message(ZERO_DIVISION_ERROR, "float division by zero");
+    }
+    let Some((numerator, denominator)) = float_ratio(value) else {
+        return exc::raise_with_message(ZERO_DIVISION_ERROR, "float division by zero");
+    };
+    if numerator.sign() == num_bigint::Sign::NoSign {
+        return exc::raise_with_message(ZERO_DIVISION_ERROR, "division by zero");
+    }
+    let product = num_bigint::BigInt::from(total) * denominator;
+    delta_from_big(&big_divide_and_round(&product, &numerator))
+}
+
+fn td_neg_method(args: &[i64]) -> i64 {
+    match delta_from_instance(args[0]) {
+        Some(delta) => delta_from_total(-delta.0)
+            .map(new_timedelta)
+            .unwrap_or_else(|err| err),
+        None => invalid_instance("invalid timedelta object"),
+    }
+}
+
+fn td_pos_method(args: &[i64]) -> i64 {
+    match delta_from_instance(args[0]) {
+        Some(_) => args[0],
+        None => invalid_instance("invalid timedelta object"),
+    }
+}
+
+fn td_abs_method(args: &[i64]) -> i64 {
+    match delta_from_instance(args[0]) {
+        Some(delta) => delta_from_total(delta.0.abs())
+            .map(new_timedelta)
+            .unwrap_or_else(|err| err),
+        None => invalid_instance("invalid timedelta object"),
+    }
+}
+
+fn td_rsub_method(args: &[i64]) -> i64 {
+    let Some(receiver) = delta_from_instance(args[0]) else {
+        return invalid_instance("invalid timedelta object");
+    };
+    let Some(other) = delta_from_instance(args[1]) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    delta_from_total(other.0 - receiver.0)
+        .map(new_timedelta)
+        .unwrap_or_else(|err| err)
+}
+
+fn td_mul_method(args: &[i64]) -> i64 {
+    let Some(receiver) = delta_from_instance(args[0]) else {
+        return invalid_instance("invalid timedelta object");
+    };
+    let other = args[1];
+    if let Some(integer) = value::as_integer(other) {
+        return match receiver.0.checked_mul(i128::from(integer)) {
+            Some(total) => delta_from_total(total)
+                .map(new_timedelta)
+                .unwrap_or_else(|err| err),
+            None => overflow_error(),
+        };
+    }
+    if value::is_bigint(other) {
+        return overflow_error();
+    }
+    match value::as_float(other) {
+        Some(float) => scale_by_float(receiver.0, float),
+        None => value::NOT_IMPLEMENTED,
+    }
+}
+
+fn td_truediv_method(args: &[i64]) -> i64 {
+    let Some(receiver) = delta_from_instance(args[0]) else {
+        return invalid_instance("invalid timedelta object");
+    };
+    let other = args[1];
+    if let Some(divisor) = delta_from_instance(other) {
+        if divisor.0 == 0 {
+            return exc::raise_with_message(ZERO_DIVISION_ERROR, "division by zero");
+        }
+        return value::float_new(receiver.0 as f64 / divisor.0 as f64);
+    }
+    if let Some(integer) = value::as_integer(other) {
+        if integer == 0 {
+            return exc::raise_with_message(ZERO_DIVISION_ERROR, "division by zero");
+        }
+        return delta_from_big(&big_divide_and_round(
+            &num_bigint::BigInt::from(receiver.0),
+            &num_bigint::BigInt::from(integer),
+        ));
+    }
+    if value::is_bigint(other) {
+        return exc::raise_with_message(ZERO_DIVISION_ERROR, "division by zero");
+    }
+    match value::as_float(other) {
+        Some(float) => divide_by_float(receiver.0, float),
+        None => value::NOT_IMPLEMENTED,
+    }
+}
+
+fn td_floordiv_method(args: &[i64]) -> i64 {
+    let Some(receiver) = delta_from_instance(args[0]) else {
+        return invalid_instance("invalid timedelta object");
+    };
+    let other = args[1];
+    if let Some(divisor) = delta_from_instance(other) {
+        if divisor.0 == 0 {
+            return exc::raise_with_message(
+                ZERO_DIVISION_ERROR,
+                "integer division or modulo by zero",
+            );
+        }
+        return encode_i128(py_divmod(receiver.0, divisor.0).0);
+    }
+    if let Some(integer) = value::as_integer(other) {
+        if integer == 0 {
+            return exc::raise_with_message(
+                ZERO_DIVISION_ERROR,
+                "integer division or modulo by zero",
+            );
+        }
+        return delta_from_total(receiver.0.div_euclid(i128::from(integer)))
+            .map(new_timedelta)
+            .unwrap_or_else(|err| err);
+    }
+    value::NOT_IMPLEMENTED
+}
+
+fn td_mod_method(args: &[i64]) -> i64 {
+    let Some(receiver) = delta_from_instance(args[0]) else {
+        return invalid_instance("invalid timedelta object");
+    };
+    let Some(divisor) = delta_from_instance(args[1]) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    if divisor.0 == 0 {
+        return exc::raise_with_message(ZERO_DIVISION_ERROR, "integer division or modulo by zero");
+    }
+    delta_from_total(py_divmod(receiver.0, divisor.0).1)
+        .map(new_timedelta)
+        .unwrap_or_else(|err| err)
+}
+
+fn td_divmod_method(args: &[i64]) -> i64 {
+    let Some(receiver) = delta_from_instance(args[0]) else {
+        return invalid_instance("invalid timedelta object");
+    };
+    let Some(divisor) = delta_from_instance(args[1]) else {
+        return value::NOT_IMPLEMENTED;
+    };
+    if divisor.0 == 0 {
+        return exc::raise_with_message(ZERO_DIVISION_ERROR, "integer division or modulo by zero");
+    }
+    let (quotient, remainder) = py_divmod(receiver.0, divisor.0);
+    let remainder = match delta_from_total(remainder) {
+        Ok(delta) => new_timedelta(delta),
+        Err(err) => return err,
+    };
+    value::tuple_new(vec![encode_i128(quotient), remainder])
+}
+
+// -------------------------------------------------------------------------
 // Methods
 // -------------------------------------------------------------------------
+
+/// Builds a `datetime` for a UTC wall clock, converting it through
+/// `tzinfo.fromutc` when a zone is given (CPython's `fromtimestamp(t, tz)` and
+/// `now(tz)` both end here).
+fn datetime_in_zone(parts: &Parts, tzinfo: i64) -> i64 {
+    let date = Date {
+        year: parts.year,
+        month: parts.month,
+        day: parts.day,
+    };
+    let time = Time {
+        hour: parts.hour,
+        minute: parts.minute,
+        second: parts.second,
+        microsecond: parts.microsecond,
+    };
+    if tzinfo == NONE {
+        return new_datetime(date, time, NONE, 0);
+    }
+    let utc = new_datetime(date, time, tzinfo, 0);
+    let name = b"fromutc";
+    let args = [utc];
+    crate::methods::call(tzinfo, name.as_ptr(), name.len(), 1, args.as_ptr())
+}
 
 /// `datetime.now(tz=None)`/`datetime.utcnow()`: the current UTC wall clock.
 fn now_method(args: &[i64]) -> i64 {
@@ -2316,21 +2818,9 @@ fn now_method(args: &[i64]) -> i64 {
         },
     };
     let parts = now_parts();
-    new_datetime(
-        Date {
-            year: parts.year,
-            month: parts.month,
-            day: parts.day,
-        },
-        Time {
-            hour: parts.hour,
-            minute: parts.minute,
-            second: parts.second,
-            microsecond: parts.microsecond,
-        },
-        tzinfo,
-        0,
-    )
+    // `now(tz)` is `fromtimestamp(time.time(), tz)`, so an aware result is
+    // shifted into the zone rather than just tagged with it.
+    datetime_in_zone(&parts, tzinfo)
 }
 
 fn utcnow_method(args: &[i64]) -> i64 {
@@ -2396,21 +2886,7 @@ fn fromtimestamp_method(args: &[i64]) -> i64 {
         Ok(parts) => parts,
         Err(err) => return err,
     };
-    new_datetime(
-        Date {
-            year: parts.year,
-            month: parts.month,
-            day: parts.day,
-        },
-        Time {
-            hour: parts.hour,
-            minute: parts.minute,
-            second: parts.second,
-            microsecond: parts.microsecond,
-        },
-        tzinfo,
-        0,
-    )
+    datetime_in_zone(&parts, tzinfo)
 }
 
 fn combine_method(args: &[i64]) -> i64 {
@@ -2592,7 +3068,11 @@ fn strptime_method(args: &[i64], class_name: &str) -> i64 {
         if exc::pending() {
             return NONE;
         }
-        let class = if is_date { date_class() } else { datetime_class() };
+        let class = if is_date {
+            date_class()
+        } else {
+            datetime_class()
+        };
         let argv = [class, args[0], args[1]];
         return crate::builtins::call(function, 3, argv.as_ptr());
     }
@@ -2610,8 +3090,11 @@ fn strptime_method(args: &[i64], class_name: &str) -> i64 {
     let component = |name: &str| {
         value::as_integer(value::instance_attr(parsed, name).unwrap_or(NONE)).unwrap_or(0)
     };
-    let date = match validate_date(component("tm_year"), component("tm_mon"), component("tm_mday"))
-    {
+    let date = match validate_date(
+        component("tm_year"),
+        component("tm_mon"),
+        component("tm_mday"),
+    ) {
         Ok(date) => date,
         Err(err) => return err,
     };
@@ -2989,7 +3472,8 @@ fn replace_datetime(receiver: i64, keywords: &[(String, i64)]) -> i64 {
     new_datetime(date, time, tzinfo, fold)
 }
 
-/// `dt.utcoffset()`/`dt.dst()`/`dt.tzname()`: delegates to the stored zone.
+/// `dt.utcoffset()`/`dt.dst()`/`dt.tzname()`: delegates to the stored zone and
+/// checks the result the way CPython does (a `time` passes `None` down).
 fn zone_method(args: &[i64], method: &str) -> i64 {
     let Some(receiver) = args.first().copied() else {
         return arity_error(method, "exactly 1", args.len());
@@ -3001,17 +3485,77 @@ fn zone_method(args: &[i64], method: &str) -> i64 {
     if tzinfo == NONE {
         return NONE;
     }
-    let name = method.as_bytes();
-    let args = [receiver];
-    crate::methods::call(tzinfo, name.as_ptr(), name.len(), 1, args.as_ptr())
+    if method == "tzname" {
+        return match checked_zone_name(receiver, tzinfo) {
+            Ok(Some(name)) => value::str_alloc(name),
+            Ok(None) => NONE,
+            Err(error) => error,
+        };
+    }
+    match checked_zone_offset(receiver, tzinfo, method) {
+        Ok(Some(offset)) => new_timedelta(Delta(offset)),
+        Ok(None) => NONE,
+        Err(error) => error,
+    }
 }
 
-/// `tzinfo`'s base methods report an unknown zone.
-fn unknown_zone_method(args: &[i64]) -> i64 {
+/// `tzinfo`'s base methods report an unimplemented zone, exactly like
+/// CPython's abstract base.
+fn unknown_zone_method(args: &[i64], method: &str) -> i64 {
     if args.is_empty() {
         return arity_error("tzinfo method", "at least 1", 0);
     }
-    NONE
+    exc::raise_with_message(
+        exc::NOT_IMPLEMENTED_ERROR,
+        &format!("a tzinfo subclass must implement {method}()"),
+    )
+}
+
+/// The base `tzinfo.fromutc`: convert a UTC wall clock into this zone's local
+/// time. CPython's implementation lives on the base class, so a subclass that
+/// only overrides `utcoffset`/`dst`/`tzname` still gets it.
+fn tzinfo_fromutc_method(args: &[i64]) -> i64 {
+    if args.len() != 2 {
+        return arity_error("fromutc", "exactly 1", args.len().saturating_sub(1));
+    }
+    let receiver = args[0];
+    let dt = args[1];
+    if kind_of(dt) != Some(Kind::DateTime) {
+        return type_error("fromutc() requires a datetime argument");
+    }
+    if tzinfo_of(dt) != receiver {
+        return invalid_instance("dt.tzinfo is not self");
+    }
+    let Some(offset) = (match checked_zone_offset(dt, receiver, "utcoffset") {
+        Ok(offset) => offset,
+        Err(error) => return error,
+    }) else {
+        return invalid_instance("fromutc() requires a non-None utcoffset() result");
+    };
+    let Some(mut dst) = (match checked_zone_offset(dt, receiver, "dst") {
+        Ok(offset) => offset,
+        Err(error) => return error,
+    }) else {
+        return invalid_instance("fromutc() requires a non-None dst() result");
+    };
+    let mut local = dt;
+    let delta = offset - dst;
+    if delta != 0 {
+        local = datetime_shift(dt, delta);
+        if exc::pending() {
+            return local;
+        }
+        dst = match checked_zone_offset(local, receiver, "dst") {
+            Ok(Some(dst)) => dst,
+            Ok(None) => {
+                return invalid_instance(
+                    "fromutc(): dt.dst gave inconsistent results; cannot convert",
+                )
+            }
+            Err(error) => return error,
+        };
+    }
+    datetime_shift(local, dst)
 }
 
 /// `timezone.utcoffset(dt)`/`dst(dt)`/`tzname(dt)`.
@@ -3146,9 +3690,10 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         UTCOFFSET_METHOD => zone_method(args, "utcoffset"),
         DST_METHOD => zone_method(args, "dst"),
         TZNAME_METHOD => zone_method(args, "tzname"),
-        TZINFO_UTCOFFSET_METHOD | TZINFO_DST_METHOD | TZINFO_TZNAME_METHOD => {
-            unknown_zone_method(args)
-        }
+        TZINFO_UTCOFFSET_METHOD => unknown_zone_method(args, "utcoffset"),
+        TZINFO_DST_METHOD => unknown_zone_method(args, "dst"),
+        TZINFO_TZNAME_METHOD => unknown_zone_method(args, "tzname"),
+        TZINFO_FROMUTC_METHOD => tzinfo_fromutc_method(args),
         TIMEZONE_UTCOFFSET_METHOD => timezone_zone_method(args, "utcoffset"),
         TIMEZONE_DST_METHOD => timezone_zone_method(args, "dst"),
         TIMEZONE_TZNAME_METHOD => timezone_zone_method(args, "tzname"),
@@ -3164,6 +3709,15 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         ADD_METHOD => add_method(args),
         RADDMETHOD => radd_method(args),
         SUB_METHOD => sub_method(args),
+        TD_NEG_METHOD => td_neg_method(args),
+        TD_POS_METHOD => td_pos_method(args),
+        TD_ABS_METHOD => td_abs_method(args),
+        TD_RSUB_METHOD => td_rsub_method(args),
+        TD_MUL_METHOD => td_mul_method(args),
+        TD_TRUEDIV_METHOD => td_truediv_method(args),
+        TD_FLOORDIV_METHOD => td_floordiv_method(args),
+        TD_MOD_METHOD => td_mod_method(args),
+        TD_DIVMOD_METHOD => td_divmod_method(args),
         REPLACE_METHOD => replace_method(args, &[]),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
@@ -3296,8 +3850,14 @@ mod tests {
     #[test]
     fn formats_known_timestamp() {
         let parts = sample();
-        assert_eq!(format(&parts, "%Y-%m-%d %H:%M:%S", None, None), "2023-11-14 22:13:20");
-        assert_eq!(format(&parts, "%Y%m%d-%H%M%S", None, None), "20231114-221320");
+        assert_eq!(
+            format(&parts, "%Y-%m-%d %H:%M:%S", None, None),
+            "2023-11-14 22:13:20"
+        );
+        assert_eq!(
+            format(&parts, "%Y%m%d-%H%M%S", None, None),
+            "20231114-221320"
+        );
         assert_eq!(format(&parts, "%f", None, None), "123456");
         assert_eq!(format(&parts, "%a %A", None, None), "Tue Tuesday");
         assert_eq!(format(&parts, "%b %B", None, None), "Nov November");
@@ -3325,7 +3885,10 @@ mod tests {
             format(&epoch, "%Y-%m-%dT%H:%M:%S.%f", None, None),
             "1970-01-01T00:00:00.000000"
         );
-        assert_eq!(format(&epoch, "%a %j %p %w %u", None, None), "Thu 001 AM 4 4");
+        assert_eq!(
+            format(&epoch, "%a %j %p %w %u", None, None),
+            "Thu 001 AM 4 4"
+        );
         assert_eq!(format(&epoch, "%-d/%_m/%0H", None, None), "1/ 1/00");
         assert_eq!(format(&epoch, "%^a", None, None), "THU");
         assert_eq!(format(&epoch, "%Q", None, None), "%Q");

@@ -1794,7 +1794,13 @@ fn fromfile_method(args: &[i64]) -> i64 {
     let count_value = ops::int_result(bytes_requested as i64);
     let roots = heap::root_values(std::slice::from_ref(&count_value));
     let read = b"read";
-    let data = crate::methods::call(file, read.as_ptr(), read.len(), 1, &count_value as *const i64);
+    let data = crate::methods::call(
+        file,
+        read.as_ptr(),
+        read.len(),
+        1,
+        &count_value as *const i64,
+    );
     heap::release_roots(roots);
     if exc::pending() {
         return NONE;
@@ -1892,7 +1898,7 @@ fn iadd_method(args: &[i64]) -> i64 {
 
 /// `a *= n`.
 fn imul_method(args: &[i64]) -> i64 {
-    let Ok((obj, descr)) = receiver(args, "array.__imul__") else {
+    let Ok((obj, _descr)) = receiver(args, "array.__imul__") else {
         return NONE;
     };
     let Some(&factor) = args.get(1) else {
@@ -1980,8 +1986,7 @@ fn compare_method(args: &[i64], op: u8) -> i64 {
     if ordering == std::cmp::Ordering::Equal
         && left.len() / descr.itemsize != right.len() / other_descr.itemsize
     {
-        ordering = (left.len() / descr.itemsize)
-            .cmp(&(right.len() / other_descr.itemsize));
+        ordering = (left.len() / descr.itemsize).cmp(&(right.len() / other_descr.itemsize));
     }
     let result = match op {
         0 => ordering == std::cmp::Ordering::Less,
@@ -2112,7 +2117,7 @@ fn reconstruct(args: &[i64]) -> i64 {
         return value_error("string length not a multiple of item size");
     }
     match mformat {
-        14 | 15 | 16 | 17 => {
+        14..=17 => {
             // IEEE floats: decode into a list of Python floats.
             let little = mformat % 2 == 0;
             let mut values = Vec::with_capacity(data.len() / item_size);
@@ -2223,7 +2228,11 @@ fn reduce_ex_method(args: &[i64]) -> i64 {
     let Ok((obj, descr)) = receiver(args, "array.__reduce_ex__") else {
         return NONE;
     };
-    let protocol = args.get(1).copied().and_then(value::as_integer).unwrap_or(0);
+    let protocol = args
+        .get(1)
+        .copied()
+        .and_then(value::as_integer)
+        .unwrap_or(0);
     let typecode = value::str_alloc(descr.code.to_string());
     let roots = heap::root_values(std::slice::from_ref(&typecode));
     if protocol < 3 {

@@ -2505,8 +2505,13 @@ fn builtin_type_repr(name: &'static str) -> i64 {
 /// `test_index` calls it directly).
 fn builtin_type_method_names(name: &str) -> Option<&'static [&'static str]> {
     /// `bool` inherits `int`'s method surface.
-    const INT_METHODS: &[&str] =
-        &["__index__", "__round__", "bit_length", "from_bytes", "to_bytes"];
+    const INT_METHODS: &[&str] = &[
+        "__index__",
+        "__round__",
+        "bit_length",
+        "from_bytes",
+        "to_bytes",
+    ];
     Some(match name {
         "int" | "bool" => INT_METHODS,
         "str" => &[
@@ -5201,7 +5206,9 @@ fn int_round(obj: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
             ));
         }
         if !args.is_empty() {
-            return type_error("__round__() got multiple values for argument 'ndigits'".to_string());
+            return type_error(
+                "__round__() got multiple values for argument 'ndigits'".to_string(),
+            );
         }
         ndigits = *item;
     }
@@ -7615,10 +7622,10 @@ fn dict_view_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             if let Some(err) = check_arity(view.kind.type_name(), method, args.len(), 1, 1) {
                 return err;
             }
-            if view.kind != value::DictViewKind::Values {
-                if container::unhashable_name(args[0]).is_some() {
-                    return type_error(container::dict_key_unhashable_message(args[0]));
-                }
+            if view.kind != value::DictViewKind::Values
+                && container::unhashable_name(args[0]).is_some()
+            {
+                return type_error(container::dict_key_unhashable_message(args[0]));
             }
             value::bool_value(container::dict_view_contains(view, args[0]))
         }
@@ -8922,8 +8929,7 @@ fn dict_update_from_pairs(obj: i64, source: i64) -> i64 {
 /// Rejects dict keys that Python considers unhashable (`list`, `dict`,
 /// `iterator`, a bytes-like mutable/view value, or a tuple containing one).
 fn check_hashable(key: i64) -> Option<i64> {
-    container::unhashable_name(key)
-        .map(|_| type_error(container::dict_key_unhashable_message(key)))
+    container::unhashable_name(key).map(|_| type_error(container::dict_key_unhashable_message(key)))
 }
 
 /// Rejects unhashable set elements with CPython 3.14's contextual message.

@@ -789,30 +789,15 @@ impl Runtime {
             // `except*` split sessions (see `RuntimeFns`): every argument and
             // result is a tagged value; the token returned by `begin` is a
             // tagged integer identifying the session.
-            exc_star_begin: declare_runtime(
-                module,
-                "hydro_exc_star_begin",
-                &[i64t],
-                Some(i64t),
-            )?,
+            exc_star_begin: declare_runtime(module, "hydro_exc_star_begin", &[i64t], Some(i64t))?,
             exc_star_match: declare_runtime(
                 module,
                 "hydro_exc_star_match",
                 &[i64t, i64t],
                 Some(i64t),
             )?,
-            exc_star_raised: declare_runtime(
-                module,
-                "hydro_exc_star_raised",
-                &[i64t],
-                Some(i64t),
-            )?,
-            exc_star_finish: declare_runtime(
-                module,
-                "hydro_exc_star_finish",
-                &[i64t],
-                Some(i64t),
-            )?,
+            exc_star_raised: declare_runtime(module, "hydro_exc_star_raised", &[i64t], Some(i64t))?,
+            exc_star_finish: declare_runtime(module, "hydro_exc_star_finish", &[i64t], Some(i64t))?,
             uncaught: declare_runtime(module, "hydro_uncaught", &[], Some(i64t))?,
             runtime_init: declare_runtime(module, "hydro_runtime_init", &[], None)?,
             register_function: declare_runtime(
@@ -4719,7 +4704,10 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
         self.emit_exc_check()?;
         let done = self.builder.create_block();
         let reraise = self.builder.create_block();
-        let is_none = self.builder.ins().icmp_imm(IntCC::Equal, remainder, NONE_TAG);
+        let is_none = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, remainder, NONE_TAG);
         self.builder.ins().brif(is_none, done, &[], reraise, &[]);
 
         self.switch_to(reraise);

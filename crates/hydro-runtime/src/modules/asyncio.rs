@@ -46,8 +46,8 @@ use std::time::{Duration, Instant};
 
 use crate::core::globals;
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, CANCELLED_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, TIMEOUT_ERROR, TYPE_ERROR,
-    VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, CANCELLED_ERROR, OVERFLOW_ERROR, RUNTIME_ERROR, TIMEOUT_ERROR,
+    TYPE_ERROR, VALUE_ERROR,
 };
 use crate::fiber::{self, FiberKind, WaitRequest};
 use crate::iter;
@@ -930,8 +930,8 @@ fn collect_results(items: i64) -> i64 {
 // wait_for, Timeout, Runner and asyncio.staggered
 // -------------------------------------------------------------------------
 
-/// Monotonic origin for the integer deadlines stored on native timeout
-/// objects (instance attributes can only hold tagged values).
+// Monotonic origin for the integer deadlines stored on native timeout
+// objects (instance attributes can only hold tagged values).
 thread_local! {
     static MONOTONIC_EPOCH: Instant = Instant::now();
 }
@@ -997,9 +997,7 @@ fn wait_for(args: &[i64]) -> i64 {
         match super::number(timeout_value) {
             Ok(seconds) => match deadline_from_seconds(seconds) {
                 Some(deadline) => Some(deadline),
-                None => {
-                    return exc::raise_with_message(VALUE_ERROR, "invalid timeout")
-                }
+                None => return exc::raise_with_message(VALUE_ERROR, "invalid timeout"),
             },
             Err(err) => return err,
         }
@@ -1032,8 +1030,8 @@ fn wait_for(args: &[i64]) -> i64 {
             fiber::cancel_value(awaitable);
             return exc::raise_with_message(TIMEOUT_ERROR, "");
         }
-        let remaining = Duration::from_nanos((deadline - now).max(1) as u64)
-            .min(Duration::from_millis(1));
+        let remaining =
+            Duration::from_nanos((deadline - now).max(1) as u64).min(Duration::from_millis(1));
         fiber::suspend_current(Some(WaitRequest::Sleep(remaining)));
         if exc::pending() {
             return NONE;
@@ -1278,10 +1276,7 @@ fn staggered_race(args: &[i64]) -> i64 {
         match super::number(delay) {
             Ok(seconds) if seconds.is_finite() && seconds >= 0.0 => Some(seconds),
             Ok(_) => {
-                return exc::raise_with_message(
-                    VALUE_ERROR,
-                    "delay must be a non-negative number",
-                )
+                return exc::raise_with_message(VALUE_ERROR, "delay must be a non-negative number")
             }
             Err(err) => return err,
         }

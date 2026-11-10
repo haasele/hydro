@@ -3076,7 +3076,10 @@ fn source_location(obj: i64) -> Option<(String, usize)> {
     if let Some(state) = value::as_frame(obj) {
         return Some((
             state.data.file.clone(),
-            state.data.first_line.load(std::sync::atomic::Ordering::Relaxed) as usize,
+            state
+                .data
+                .first_line
+                .load(std::sync::atomic::Ordering::Relaxed) as usize,
         ));
     }
     if let Some(state) = value::as_code(obj) {

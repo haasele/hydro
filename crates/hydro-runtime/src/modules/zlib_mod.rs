@@ -133,11 +133,7 @@ extern "C" {
     fn deflate(strm: *mut ZStream, flush: c_int) -> c_int;
     fn deflateEnd(strm: *mut ZStream) -> c_int;
     fn deflateCopy(dest: *mut ZStream, source: *mut ZStream) -> c_int;
-    fn deflateSetDictionary(
-        strm: *mut ZStream,
-        dictionary: *const u8,
-        length: c_uint,
-    ) -> c_int;
+    fn deflateSetDictionary(strm: *mut ZStream, dictionary: *const u8, length: c_uint) -> c_int;
     fn inflateInit2_(
         strm: *mut ZStream,
         window_bits: c_int,
@@ -328,11 +324,7 @@ fn param(name: &str, kind: hydro_ir::ParamKind, default: Option<i64>) -> value::
 /// The signature is what lets `call_user_method_kw` bind keywords (and reject
 /// them for positional-only slots) instead of rejecting every named argument;
 /// the trampoline receives the bound slot vector.
-fn method_function(
-    name: &'static str,
-    signature: Vec<value::ParamMeta>,
-    entry: usize,
-) -> i64 {
+fn method_function(name: &'static str, signature: Vec<value::ParamMeta>, entry: usize) -> i64 {
     let function = value::native_function_new("zlib", name, usize::MAX);
     value::function_set_signature(function, signature);
     value::function_set_full_entry(function, entry);
@@ -346,10 +338,7 @@ fn compress_methods() -> Vec<(String, i64)> {
             "compress".to_string(),
             method_function(
                 "_zlib_compress",
-                vec![
-                    param("self", PosOnly, None),
-                    param("data", PosOnly, None),
-                ],
+                vec![param("self", PosOnly, None), param("data", PosOnly, None)],
                 compress_method_entry as *const () as usize,
             ),
         ),
@@ -426,7 +415,11 @@ fn decompress_methods(default_max_length: i64) -> Vec<(String, i64)> {
                 vec![
                     param("self", PosOnly, None),
                     param("data", PosOnly, None),
-                    param("max_length", Positional, Some(encode_int(default_max_length))),
+                    param(
+                        "max_length",
+                        Positional,
+                        Some(encode_int(default_max_length)),
+                    ),
                 ],
                 decompress_method_entry as *const () as usize,
             ),
@@ -996,9 +989,8 @@ fn compressobj(args: &[i64]) -> i64 {
     if !zdict.is_empty() {
         // SAFETY: `stream` is initialised and the dictionary buffer outlives
         // the call.
-        let status = unsafe {
-            deflateSetDictionary(&mut *stream, zdict.as_ptr(), zdict.len() as c_uint)
-        };
+        let status =
+            unsafe { deflateSetDictionary(&mut *stream, zdict.as_ptr(), zdict.len() as c_uint) };
         if status != Z_OK {
             return match status {
                 Z_STREAM_ERROR => value_error("Invalid dictionary"),
@@ -1293,9 +1285,7 @@ fn decompress_method(args: &[i64]) -> i64 {
         }
     } else {
         match max_length {
-            Some(limit) if limit < 0 => {
-                return value_error("max_length must be non-negative")
-            }
+            Some(limit) if limit < 0 => return value_error("max_length must be non-negative"),
             Some(limit) if limit > 0 => Some(limit as usize),
             _ => None,
         }

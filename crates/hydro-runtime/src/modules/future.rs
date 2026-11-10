@@ -15,8 +15,8 @@
 //! CPython's values.
 
 use crate::container;
-use crate::exc::{self, ATTRIBUTE_ERROR};
 use crate::core::globals;
+use crate::exc::{self, ATTRIBUTE_ERROR};
 use crate::heap;
 use crate::ops;
 use crate::value::{self, NONE};
@@ -159,7 +159,10 @@ fn cached_feature(name: &str) -> Option<i64> {
 }
 
 fn cache_feature(name: &str, instance: i64) {
-    globals::registry_set(cache_generation_key(), ops::int_result(heap::generation() as i64));
+    globals::registry_set(
+        cache_generation_key(),
+        ops::int_result(heap::generation() as i64),
+    );
     globals::registry_set(&format!("__future__.feature.{name}"), instance);
 }
 

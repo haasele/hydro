@@ -26,7 +26,6 @@ const STRICT_TYPES_TEXT: &str = ".js=text/javascript .mjs=text/javascript .epub=
 /// CPython's built-in non-standard `common_types` (used when `strict=False`).
 const COMMON_TYPES_TEXT: &str = ".rtf=application/rtf .apk=application/vnd.android.package-archive .midi=audio/midi .mid=audio/midi .jpg=image/jpg .pict=image/pict .pct=image/pict .pic=image/pict .xul=text/xul";
 
-
 /// `suffix_map`: compound suffixes rewritten before the type lookup.
 const SUFFIX_MAP: &[(&str, &str)] = &[
     (".svgz", ".svg.gz"),
@@ -180,19 +179,98 @@ fn string_argument(raw: i64, name: &str) -> Result<String, i64> {
     }
 }
 
-/// A path argument: `str`, or `bytes` decoded lossily (CPython uses
-/// `os.fsdecode`).
+/// A path argument: `str`, `bytes`, `pathlib.Path` or any object whose
+/// `__fspath__()` returns one of those (CPython's `os.fspath`/`os.fsdecode`).
 fn path_argument(raw: i64, name: &str) -> Result<String, i64> {
     if let Some(text) = value::as_str(raw) {
         return Ok(text.to_string());
     }
+    if let Some(state) = value::as_path(raw) {
+        return Ok(state.path().to_string());
+    }
     if let Some(bytes) = value::as_bytes(raw) {
-        return Ok(String::from_utf8_lossy(bytes).into_owned());
+        return Ok(decode_surrogateescape(bytes));
+    }
+    if let Some(instance) = value::as_instance(raw) {
+        if let Some(value::ClassEntry::Method(kind, function)) =
+            value::class_lookup(instance.class, "__fspath__")
+        {
+            // Special methods follow the descriptor protocol.
+            let argv: Vec<i64> = match kind {
+                hydro_ir::MethodKind::Classmethod => vec![instance.class],
+                hydro_ir::MethodKind::Staticmethod => Vec::new(),
+                _ => vec![raw],
+            };
+            let result = crate::builtins::call(function, argv.len(), argv.as_ptr());
+            if exc::pending() {
+                return Err(NONE);
+            }
+            if let Some(text) = value::as_str(result) {
+                return Ok(text.to_string());
+            }
+            if let Some(state) = value::as_path(result) {
+                return Ok(state.path().to_string());
+            }
+            if let Some(bytes) = value::as_bytes(result) {
+                return Ok(decode_surrogateescape(bytes));
+            }
+            return Err(exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "expected __fspath__() to return str or bytes, not {}",
+                    value::type_name(result)
+                ),
+            ));
+        }
     }
     Err(exc::raise_with_message(
         TYPE_ERROR,
-        &format!("{name} must be str or bytes, not {}", value::type_name(raw)),
+        &format!(
+            "{name} must be str, bytes or os.PathLike object, not {}",
+            value::type_name(raw)
+        ),
     ))
+}
+
+/// CPython's `utf-8` decoder with `errors='surrogateescape'`: every byte that
+/// is not part of a valid UTF-8 sequence becomes the lone surrogate
+/// `U+DC80 + byte`. The runtime stores lone surrogates in its mirror block
+/// (see `value::str_from_codes`), so the result round-trips through
+/// `str.encode('utf-8', 'surrogateescape')`.
+fn decode_surrogateescape(bytes: &[u8]) -> String {
+    let mut codes: Vec<u32> = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match std::str::from_utf8(&bytes[index..]) {
+            Ok(text) => {
+                codes.extend(text.chars().map(|character| character as u32));
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                // SAFETY: `valid_up_to` bytes are a valid UTF-8 prefix.
+                let prefix = std::str::from_utf8(&bytes[index..index + valid]).unwrap_or("");
+                codes.extend(prefix.chars().map(|character| character as u32));
+                index += valid;
+                // Every undecodable byte becomes its own escape surrogate.
+                match error.error_len() {
+                    Some(length) => {
+                        for &byte in &bytes[index..index + length] {
+                            codes.push(0xDC00 + u32::from(byte));
+                        }
+                        index += length;
+                    }
+                    None => {
+                        for &byte in &bytes[index..] {
+                            codes.push(0xDC00 + u32::from(byte));
+                        }
+                        index = bytes.len();
+                    }
+                }
+            }
+        }
+    }
+    value::str_from_codes(codes)
 }
 
 fn strict_argument(args: &[i64], index: usize) -> bool {
@@ -392,12 +470,87 @@ fn all_names_value() -> i64 {
 /// Reads a `mime.types`-format file into `db`. Returns false when the file
 /// cannot be read (CPython's `init` skips those).
 fn read_file_into(path: &str, db: &mut MimeDb, strict: bool) -> bool {
-    let Ok(data) = std::fs::read(path) else {
-        return false;
+    match open_text(path) {
+        Ok(text) => {
+            parse_mime_text(&text, db, strict);
+            true
+        }
+        Err(_) => {
+            // `init` skips unreadable files; drop the exception it raised.
+            if exc::pending() {
+                exc::clear();
+            }
+            false
+        }
+    }
+}
+
+/// `MimeTypes.read`: `read_file_into` that keeps a read failure pending, so
+/// `MimeTypes().read("missing")` raises `FileNotFoundError` like CPython.
+fn read_file_into_strict(path: &str, db: &mut MimeDb, strict: bool) -> i64 {
+    match open_text(path) {
+        Ok(text) => {
+            parse_mime_text(&text, db, strict);
+            NONE
+        }
+        Err(error) => error,
+    }
+}
+
+/// Reads a text file the way `Lib/mimetypes.py` does:
+/// `open(filename, encoding='utf-8', errors='surrogateescape')`.
+///
+/// A program that installs its own module-level `open` (the test suite mocks
+/// `mimetypes.open`) is honoured, because `read_mime_types` resolves `open`
+/// from the module namespace. Otherwise the bytes are read directly and
+/// decoded with `surrogateescape`, so a non-UTF-8 comment or suffix keeps its
+/// bytes instead of being replaced with `U+FFFD`.
+fn open_text(path: &str) -> Result<String, i64> {
+    if let Some(open) = globals::attribute_override("mimetypes", "open") {
+        if open != NONE {
+            let filename = value::str_alloc(path.to_string());
+            let encoding_name = value::str_alloc("encoding".to_string());
+            let encoding = value::str_alloc("utf-8".to_string());
+            let errors_name = value::str_alloc("errors".to_string());
+            let errors = value::str_alloc("surrogateescape".to_string());
+            let roots =
+                crate::heap::root_values(&[filename, encoding_name, encoding, errors_name, errors]);
+            let words = [encoding_name, encoding, errors_name, errors];
+            let handle =
+                crate::core::builtins::call_kw(open, 1, &filename as *const i64, 2, words.as_ptr());
+            if exc::pending() {
+                crate::heap::release_roots(roots);
+                return Err(NONE);
+            }
+            let handle_roots = crate::heap::root_values(&[handle]);
+            let data = crate::core::methods::call(handle, b"read".as_ptr(), 4, 0, std::ptr::null());
+            let pending = exc::pending();
+            // Leave the stream closed even when reading raised, like `with f:`.
+            let _ = crate::core::methods::call(handle, b"close".as_ptr(), 5, 0, std::ptr::null());
+            crate::heap::release_roots(handle_roots);
+            crate::heap::release_roots(roots);
+            if pending {
+                return Err(NONE);
+            }
+            return match value::as_str(data) {
+                Some(text) => Ok(text.to_string()),
+                None => match value::as_bytes(data) {
+                    Some(bytes) => Ok(decode_surrogateescape(bytes)),
+                    None => Err(exc::raise_with_message(
+                        TYPE_ERROR,
+                        "read() did not return str or bytes",
+                    )),
+                },
+            };
+        }
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Err(exc::raise_with_message(
+            crate::exc::FILE_NOT_FOUND_ERROR,
+            &format!("[Errno 2] No such file or directory: '{path}'"),
+        ));
     };
-    let text = String::from_utf8_lossy(&data);
-    parse_mime_text(&text, db, strict);
-    true
+    Ok(decode_surrogateescape(&bytes))
 }
 
 /// Parses `mime.types` lines: `type suffix [suffix ...]`, with `#` comments.
@@ -454,10 +607,13 @@ fn read_mime_types_value(raw: i64) -> i64 {
     let Ok(path) = path_argument(raw, "file") else {
         return NONE;
     };
-    let Ok(data) = std::fs::read(&path) else {
+    let Ok(text) = open_text(&path) else {
+        // CPython returns None for an unreadable file; drop the OSError.
+        if exc::pending() {
+            exc::clear();
+        }
         return NONE;
     };
-    let text = String::from_utf8_lossy(&data);
     let mut db = MimeDb::new();
     parse_mime_text(&text, &mut db, true);
     make_dict(db.strict)
@@ -609,7 +765,12 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                 ("lenient".to_string(), value::bool_value(lenient)),
                 (
                     "type".to_string(),
-                    value::list_new(types.iter().map(|item| value::str_alloc(item.clone())).collect()),
+                    value::list_new(
+                        types
+                            .iter()
+                            .map(|item| value::str_alloc(item.clone()))
+                            .collect(),
+                    ),
                 ),
             ]);
             let help = value::str_alloc(help);
@@ -738,7 +899,10 @@ fn require_args<'a>(args: &'a [i64], count: usize, name: &str) -> Option<&'a [i6
     if args.len() < count {
         exc::raise_with_message(
             TYPE_ERROR,
-            &format!("{name}() takes at least {count} argument(s) ({} given)", args.len()),
+            &format!(
+                "{name}() takes at least {count} argument(s) ({} given)",
+                args.len()
+            ),
         );
         return None;
     }
@@ -753,15 +917,20 @@ fn mime_types_method(function: &str, args: &[i64]) -> i64 {
     match function {
         "MimeTypes.__init__" => {
             let id = new_instance_db();
-            value::instance_setattr(instance, "_mime_db".to_string(), crate::ops::int_result(id as i64));
+            value::instance_setattr(
+                instance,
+                "_mime_db".to_string(),
+                crate::ops::int_result(id as i64),
+            );
             let filenames = args.get(1).copied().unwrap_or(NONE);
             let strict = strict_argument(args, 2);
             for file in string_list(filenames) {
                 with_instance_db(instance, |db| {
-                    if std::path::Path::new(&file).is_file() {
-                        read_file_into(&file, db, strict);
-                    }
+                    let _ = read_file_into_strict(&file, db, strict);
                 });
+                if exc::pending() {
+                    return NONE;
+                }
             }
             NONE
         }
@@ -834,7 +1003,7 @@ fn mime_types_method(function: &str, args: &[i64]) -> i64 {
             };
             let strict = strict_argument(args, 2);
             with_instance_db(instance, |db| {
-                let _ = read_file_into(&path, db, strict);
+                let _ = read_file_into_strict(&path, db, strict);
             });
             NONE
         }
@@ -843,13 +1012,8 @@ fn mime_types_method(function: &str, args: &[i64]) -> i64 {
                 return NONE;
             };
             let strict = strict_argument(args, 2);
-            let data = crate::core::methods::call(
-                args[1],
-                b"read".as_ptr(),
-                4,
-                0,
-                std::ptr::null(),
-            );
+            let data =
+                crate::core::methods::call(args[1], b"read".as_ptr(), 4, 0, std::ptr::null());
             if exc::pending() {
                 return NONE;
             }
@@ -915,7 +1079,11 @@ fn main_results(extension: bool, lenient: bool, types: &[String]) -> i64 {
     let mut results = Vec::new();
     for entry in types {
         if extension {
-            match database().extensions(&entry.to_lowercase(), strict).into_iter().next() {
+            match database()
+                .extensions(&entry.to_lowercase(), strict)
+                .into_iter()
+                .next()
+            {
                 Some(ext) => results.push(value::str_alloc(ext)),
                 None => results.push(value::str_alloc(format!("error: unknown type {entry}"))),
             }

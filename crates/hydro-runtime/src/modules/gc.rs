@@ -208,7 +208,7 @@ fn get_threshold() -> i64 {
 
 /// `gc.set_threshold(threshold0[, threshold1[, threshold2]])`.
 fn set_threshold(args: &[i64]) -> i64 {
-    if args.first().is_none() {
+    if args.is_empty() {
         return exc::raise_with_message(
             TYPE_ERROR,
             "set_threshold() missing required argument 'threshold0' (pos 1)",
@@ -248,7 +248,10 @@ fn set_debug(argument: i64) -> i64 {
         }
         None => exc::raise_with_message(
             TYPE_ERROR,
-            &format!("set_debug() argument must be int, not {}", value::type_name(argument)),
+            &format!(
+                "set_debug() argument must be int, not {}",
+                value::type_name(argument)
+            ),
         ),
     }
 }
@@ -263,14 +266,9 @@ fn get_objects(args: &[i64]) -> i64 {
         Some(argument) => match value::as_integer(argument) {
             Some(generation @ 0..=2) => Some(generation as usize),
             Some(_) => {
-                return exc::raise_with_message(
-                    VALUE_ERROR,
-                    "generation must be one of 0, 1 or 2",
-                )
+                return exc::raise_with_message(VALUE_ERROR, "generation must be one of 0, 1 or 2")
             }
-            None => {
-                return exc::raise_with_message(TYPE_ERROR, "generation must be an integer")
-            }
+            None => return exc::raise_with_message(TYPE_ERROR, "generation must be an integer"),
         },
     };
     if matches!(generation, Some(1 | 2)) {
@@ -315,7 +313,11 @@ fn referents_of(obj: i64) -> Vec<i64> {
     if value::as_class(obj).is_some() {
         let mut items = Vec::new();
         for ancestor in value::class_mro(obj) {
-            items.extend(value::class_namespace(ancestor).into_iter().map(|(_, item)| item));
+            items.extend(
+                value::class_namespace(ancestor)
+                    .into_iter()
+                    .map(|(_, item)| item),
+            );
         }
         return items;
     }

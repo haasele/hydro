@@ -18364,8 +18364,14 @@ fn function_type_parameter_constraints_are_rejected() {
         panic!("a tuple constraint lowers to a tuple: {:?}", keywords[0].1);
     };
     assert_eq!(items.len(), 2);
-    assert!(matches!(&items[0].kind, HExprKind::BuiltinRef(Builtin::Int)));
-    assert!(matches!(&items[1].kind, HExprKind::BuiltinRef(Builtin::Str)));
+    assert!(matches!(
+        &items[0].kind,
+        HExprKind::BuiltinRef(Builtin::Int)
+    ));
+    assert!(matches!(
+        &items[1].kind,
+        HExprKind::BuiltinRef(Builtin::Str)
+    ));
 }
 
 #[test]

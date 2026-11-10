@@ -1050,7 +1050,13 @@ fn textwrapper_split(args: &[i64]) -> i64 {
     };
     let options = options_of(instance);
     let munged = options.munge_whitespace(&text);
-    value::list_new(options.split(&munged).into_iter().map(value::str_alloc).collect())
+    value::list_new(
+        options
+            .split(&munged)
+            .into_iter()
+            .map(value::str_alloc)
+            .collect(),
+    )
 }
 
 #[cfg(test)]
