@@ -38,6 +38,9 @@ initial state of the first runnable core.
   `_BytesIO`, ...) as the same cached classes as `io`; `import a.b` registers
   the dotted submodule; runtime-compiled absolute imports use their real AST
   level instead of being misclassified as relative.
+- `sys.float_repr_style`, `sys.gettotalrefcount`/`getobjects` probes and the
+  private `opcode` tables (`_inline_cache_entries`, `opmap`, `opname`) now
+  resolve far enough for guarded support code to compile and run.
 - C3 class construction, `super()` defining-class tracking, regex flags
   (`re.U` implied for `str` patterns) and the workspace clippy/fmt gates are
   green. Canonical workspace count: 3253 tests run, 1 skipped.

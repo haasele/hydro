@@ -8669,6 +8669,7 @@ pub static OPCODE: ModuleSpec = ModuleSpec {
         c("hasfree", Type::List),
         c("haslocal", Type::List),
         c("hasexc", Type::List),
+        c("_inline_cache_entries", Type::Dict),
         c("_specializations", Type::Dict),
         c("_specialized_opmap", Type::Dict),
         c("_intrinsic_1_descs", Type::List),

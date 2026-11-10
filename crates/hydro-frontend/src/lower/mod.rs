@@ -1330,8 +1330,21 @@ fn module_source_exists(name: &str, roots: &[PathBuf]) -> bool {
 fn runtime_conditional_member(module: &str, name: &str) -> bool {
     matches!(
         (module, name),
-        ("sys", "pypy_version_info")
-            | ("os", "O_BINARY" | "startfile")
+        (
+            "sys",
+            "pypy_version_info" | "gettotalrefcount" | "getobjects" | "float_repr_style"
+        ) | (
+            "opcode",
+            "_inline_cache_entries"
+                | "_nb_ops"
+                | "_cache_format"
+                | "_specializations"
+                | "_specialized_opmap"
+                | "_common_constants"
+                | "_intrinsic_1_descs"
+                | "_intrinsic_2_descs"
+                | "_special_method_names"
+        ) | ("os", "O_BINARY" | "startfile")
             | (
                 "ctypes",
                 "windll" | "oledll" | "WinDLL" | "WinError" | "pythonapi"

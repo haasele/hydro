@@ -4105,6 +4105,22 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     }
     // `errno` attributes are platform-defined names resolved on demand; the
     // static spec table cannot enumerate them.
+    // The native `opcode` shim exposes the public tables; the private
+    // dictionaries `dis`/`test.support` inspect are filled by the pure
+    // `opcode.py` in CPython. Empty equivalents keep those imports and
+    // guarded probes working.
+    if module == "opcode" {
+        match name {
+            "_inline_cache_entries" | "opmap" | "_specializations" | "_specialized_opmap" => {
+                return value::dict_new(Vec::new())
+            }
+            "opname" | "hascompare" | "hasarg" | "hasconst" | "hasname" | "hasjump" | "hasjrel"
+            | "hasjabs" | "hasfree" | "haslocal" | "hasexc" | "__all__" => {
+                return value::list_new(Vec::new())
+            }
+            _ => {}
+        }
+    }
     if module == "errno" {
         if let Some(value) = errno::constant_value(name) {
             return value;
@@ -7874,6 +7890,7 @@ fn runtime_extra_constant(module: &str, name: &str) -> Option<i64> {
         // `sys.path_hooks`: the mutable list `pkgutil` iterates when it scans
         // `sys.path`. Hydro installs no path hooks, so the cached list is
         // permanently empty (and identity-stable, like `sys.path`).
+        "sys" if name == "float_repr_style" => Some(value::str_alloc("short".to_string())),
         "sys" if name == "float_info" => Some(sys_float_info()),
         "sys" if name == "stdlib_module_names" => Some(sys_stdlib_module_names()),
         "sys" if name == "path_hooks" => Some(sys_path_hooks()),
