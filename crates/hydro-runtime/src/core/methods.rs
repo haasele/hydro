@@ -3851,9 +3851,8 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
     if let Some(view) = value::as_dict_view(obj) {
         return match attr {
             "mapping" => view.dict,
-            "__len__" | "__iter__" | "__contains__" | "isdisjoint" => {
-                value::bound_method_new(obj, attr.to_string())
-            }
+            "__len__" | "__iter__" | "__contains__" | "isdisjoint" | "__reduce__"
+            | "__reduce_ex__" => value::bound_method_new(obj, attr.to_string()),
             _ => attribute_error(obj, attr),
         };
     }
@@ -7653,6 +7652,12 @@ fn dict_view_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 return err;
             }
             value::iter_new(obj)
+        }
+        "__reduce__" | "__reduce_ex__" => {
+            if let Some(err) = check_arity(view.kind.type_name(), method, args.len(), 0, 0) {
+                return err;
+            }
+            type_error(format!("cannot pickle '{}' object", view.kind.type_name()))
         }
         "__contains__" => {
             if let Some(err) = check_arity(view.kind.type_name(), method, args.len(), 1, 1) {
