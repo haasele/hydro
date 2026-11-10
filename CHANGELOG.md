@@ -8,6 +8,31 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-11-10 class/import/runtime slice
+
+- Classes defined inside functions now lower their method bodies. Previously
+  `def factory(): class A: def f(self): return 42` produced a class whose
+  methods returned `None`; nested methods now bind `self`, close over enclosing
+  locals and pass through `getattr`. Regression tests cover HIR bodies and
+  end-to-end execution.
+- `unittest.main()` modules are no longer treated as pytest collections: free
+  `test*` factory helpers such as `test_factory(abc_ABCMeta, token)` keep their
+  ordinary parameters instead of reporting missing pytest fixtures.
+- `unittest` result accounting now classifies native and Python test methods
+  correctly (success, expected failure, skip), and `TestCase.run` uses the
+  binding-aware `setUp`/`tearDown` path.
+- Fiber/thread frame chains now splice the resumer prefix below a fiber's
+  activations; `sys._getframe`, `sys._current_frames`, frame `f_trace`/`clear`,
+  read-only frame attributes and live recursion depth match CPython.
+- Stdlib modules and packages materialize their namespaces on demand; `_io`
+  exposes CPython's underscore class aliases (`_TextIOBase`, `_IOBase`,
+  `_BytesIO`, ...) as the same cached classes as `io`; `import a.b` registers
+  the dotted submodule; runtime-compiled absolute imports use their real AST
+  level instead of being misclassified as relative.
+- C3 class construction, `super()` defining-class tracking, regex flags
+  (`re.U` implied for `str` patterns) and the workspace clippy/fmt gates are
+  green. Canonical workspace count: 3251 tests run, 1 skipped.
+
 ### Compatibility — `__class__`
 
 - Every value answers `__class__` with exactly `type(value)`: plain instances,
