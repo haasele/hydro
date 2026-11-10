@@ -6477,10 +6477,15 @@ fn create_class(
     // keywords belong to `__init_subclass__`. Its default (`object`) refuses
     // every keyword.
     if !keywords.is_empty() && !has_new && init_subclass.is_none() {
-        return crate::exc::raise_with_message(
-            crate::exc::TYPE_ERROR,
-            &format!("{name}.__init_subclass__() takes no keyword arguments"),
-        );
+        // CPython's typing internals use the private `_root` class keyword to
+        // create their special-form mixins; the native `typing` shim has no
+        // `_Final.__init_subclass__`, so accept that reserved keyword here.
+        if !keywords.iter().all(|(name, _)| name == "_root") {
+            return crate::exc::raise_with_message(
+                crate::exc::TYPE_ERROR,
+                &format!("{name}.__init_subclass__() takes no keyword arguments"),
+            );
+        }
     }
     // A class statement runs the metaclass's `__prepare__` before the body
     // and passes its returned mapping to `__new__`/`__init__`. The compiled
@@ -6670,8 +6675,13 @@ fn call_init_subclass(
     }
     // Native hooks (including `object.__init_subclass__`, which Hydro installs
     // as a classmethod on its native `object` class) accept the class
-    // positionally and refuse the class-header keywords.
+    // positionally and refuse the class-header keywords. CPython's typing
+    // internals use the private `_root` keyword for their special-form
+    // mixins; the native typing shim has no `_Final.__init_subclass__`.
     if !keywords.is_empty() {
+        if keywords.iter().all(|(name, _)| name == "_root") {
+            return NONE;
+        }
         return crate::exc::raise_with_message(
             crate::exc::TYPE_ERROR,
             &format!(

@@ -6,9 +6,8 @@ the pinned CPython 3.14.9 oracle, under Hydro JIT (`tea infuse`) and under a
 Hydro AOT binary (`tea build`), and all three processes must exit 0.
 
 The gate runs the pinned NumPy 2.5.0, pandas 3.1.0, pydantic 2.14.1 and
-pydantic-core 2.50.1 wheels from a site-packages tree (default
-`.hydro/ecosystem/site` from `pins.json`; override with `--site` or
-`$HYDRO_ECOSYSTEM_SITE_PACKAGES`). Exact versions and
+pydantic-core 2.50.1 wheels from a site-packages tree (default `/tmp/pkgs`,
+override with `--site` or `$HYDRO_ECOSYSTEM_SITE_PACKAGES`). Exact versions and
 dist-info RECORD digests are pinned in `benchmarks/ecosystem/pins.json`; a
 version or RECORD mismatch fails the gate. Wheel digests are `null` until the
 original artifacts are pinned and are never reported as verified.
@@ -54,38 +53,6 @@ a missing pytest installation is a failure. No upstream result is claimed until
 such a run exists: the generated block only contains an upstream section after a
 real `--tests` run.
 
-## Current status
-
-The pinned tree is installed under `.hydro/ecosystem/site` with:
-
-```sh
-uv pip install --target .hydro/ecosystem/site \
-  numpy==2.5.0 pandas==3.1.0 pydantic==2.14.1 pydantic-core==2.50.1 \
-  python-dateutil==3.0.0 six==1.17.0 typing-extensions==4.16.0 \
-  typing-inspection==0.4.4 annotated-types==0.8.0 tzdata==2026.5
-```
-
-`HYDRO_STDLIB` defaults to the oracle's CPython 3.14.9 `Lib` tree (or
-`--stdlib`/the environment). The checked-in report is the **2026-10-28 import
-suite** (`benchmarks/ecosystem/latest.json`): it passes pydantic/pydantic-core
-and six dependencies; NumPy stops on `numpy.exceptions`, pandas on
-`dataclasses.is_dataclass`, six on `importlib.util.spec_from_loader`, and
-annotated-types on a native-method attribute. The link-time ABI inventory is
-complete (0 missing symbols); these are semantic/dynamic-import blockers.
-Smoke/AOT/upstream runs are not claimed until the runner observes them.
-
-**Status note (2026-10-30):** the report below was *not* regenerated for the
-HNA v1/bindgen/sidecar/packaging work or for the CPython-compatible
-handle/tuple/list layout. The generated table therefore remains the honest
-last observed evidence, not the current state of every case. Current known
-blockers beyond that table: `pydantic_core` loads through the real extension,
-but importing `pydantic` stops at native-scalar subclass allocation for
-`IntEnum` (`AnnotationSource.ANY`); NumPy
-2.5 passes `sys.flags`/`PyType_Ready`/`PyContextVar_New`/`Py_BuildValue`/
-`PyErr_Format` and stops on a DType/ArrayMethod check; pandas is not reached.
-No "all ecosystem" claim is made; there is no passing upstream-suite record
-yet.
-
 <!-- BEGIN GENERATED ECOSYSTEM RESULTS -->
 
 Environment: CPython 3.14.9 (`/home/aura/.local/share/uv/python/cpython-3.14.9-linux-x86_64-gnu/bin/python3.14`) · Hydro `tea 0.1.0` · binary `/mnt/Vault/GitHub/tea/target/release/tea` · site `/mnt/Vault/GitHub/hydro/.hydro/ecosystem/site`
@@ -112,8 +79,8 @@ Versions and dist-info RECORD digests are verified before any case runs.
 | Status | Cases |
 | --- | ---: |
 | aot_build_error | 2 |
-| pass | 9 |
-| runtime_error | 2 |
+| pass | 5 |
+| runtime_error | 6 |
 | **Total** | 13 |
 
 A case passes only when the oracle, Hydro JIT and (unless `--no-aot`) the AOT binary all exit 0 with byte-identical stdout.
@@ -124,14 +91,14 @@ A case passes only when the oracle, Hydro JIT and (unless `--no-aot`) the AOT bi
 | --- | --- | --- | --- | --- | --- |
 | `numpy:import` | ok | exit 1 | exit 1 | runtime_error | jit: NameError: name '_NoValue' is not defined |
 | `numpy:smoke` | ok | exit 1 | exit 1 | runtime_error | jit: NameError: name '_NoValue' is not defined |
-| `pandas:import` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0201]: error[HYD0201]: module 'sqlite3' has no attribute 'register_adapter' |
-| `pandas:smoke` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0201]: error[HYD0201]: module 'sqlite3' has no attribute 'register_adapter' |
-| `pydantic:import` | ok | ok | ok | pass | - |
-| `pydantic:smoke` | ok | ok | ok | pass | - |
-| `pydantic-core:import` | ok | ok | ok | pass | - |
+| `pandas:import` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0103]: error[HYD0103]: writer() got an unexpected keyword argument 'lineterminator' |
+| `pandas:smoke` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0103]: error[HYD0103]: writer() got an unexpected keyword argument 'lineterminator' |
+| `pydantic:import` | ok | exit 1 | exit 1 | runtime_error | jit: AttributeError: module 'typing' has no attribute '_generic_alias_eq' |
+| `pydantic:smoke` | ok | exit 1 | exit 1 | runtime_error | jit: AttributeError: module 'typing' has no attribute '_generic_alias_eq' |
+| `pydantic-core:import` | ok | ok | exit 1 | runtime_error | aot: ValueError: invalid literal for int() with base 10: 'keep' |
 | `python-dateutil:import` | ok | ok | ok | pass | - |
 | `six:import` | ok | ok | ok | pass | - |
-| `typing-extensions:import` | ok | ok | ok | pass | - |
+| `typing-extensions:import` | ok | ok | exit 1 | runtime_error | aot: ValueError: invalid literal for int() with base 10: 'keep' |
 | `typing-inspection:import` | ok | ok | ok | pass | - |
 | `annotated-types:import` | ok | ok | ok | pass | - |
 | `tzdata:import` | ok | ok | ok | pass | - |

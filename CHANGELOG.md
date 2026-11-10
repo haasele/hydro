@@ -27,6 +27,12 @@ initial state of the first runnable core.
 - Sema treats a `None`-typed local reassigned on one path as a dynamic slot,
   and ordering comparisons with a possibly-`None` operand defer to the
   runtime, so guarded code such as `x is not None and x < y` compiles.
+- Ecosystem differential re-measured on 2026-11-10: **5/13 cases** pass under
+  JIT and AOT. Python-dateutil, six, typing-inspection, annotated-types and
+  tzdata pass; typing-extensions and pydantic-core pass JIT but AOT stops in
+  `enum._proto_member.__set_name__`, pydantic JIT misses
+  `typing._generic_alias_eq`, NumPy still hits `_NoValue`, and pandas AOT
+  hits the `lineterminator` keyword.
 - Classes defined inside functions now lower their method bodies. Previously
   `def factory(): class A: def f(self): return 42` produced a class whose
   methods returned `None`; nested methods now bind `self`, close over enclosing

@@ -33,15 +33,16 @@ compatibility program).
 Official `Lib/test` runs are a release gate; the offline manifest check runs
 in `scripts/verify.sh`/CI. LTS is policy only (P4-12).
 
-**2026-10-30 ecosystem checkpoint:** the pinned CPython-3.14 wheels for NumPy
+**2026-11-10 ecosystem checkpoint:** the pinned CPython-3.14 wheels for NumPy
 2.5.0, pandas 3.1.0, pydantic 2.14.1 and pydantic-core 2.50.1 install into
-`.hydro/ecosystem/site`. The ecosystem gate now passes **9/13 cases** under
-JIT and AOT: pydantic import + model smoke, pydantic-core, python-dateutil,
-six, typing-extensions, typing-inspection, annotated-types and tzdata. The
-remaining cases are NumPy import/smoke (the `_multiarray_umath` ArrayMethod
-DType check) and pandas import/smoke (AOT compilation now stops on the dynamic
-`except tuple(...)` handler in `pandas/io/common.py`). The ABI inventory
-reports **0 missing required symbols** across 68 extension modules. Recent
+`.hydro/ecosystem/site`. The differential gate passes **5/13 cases** under
+JIT and AOT: python-dateutil, six, typing-inspection, annotated-types and
+tzdata. Typing-extensions and pydantic-core pass under JIT but their AOT
+builds stop in `enum._proto_member.__set_name__` with
+`int('keep')`; pydantic's JIT import misses `typing._generic_alias_eq`.
+NumPy still stops on `_NoValue`; pandas AOT stops on
+`writer() got an unexpected keyword argument 'lineterminator'`. The ABI
+inventory reports **0 missing required symbols** across 68 extension modules. Recent
 unblockers: variadic `map`, `os` link/chown/utime/sync/affinity/lseek and seek
 constants, `importlib.util.spec_from_loader`, `types.ClassType`/`ModuleType`,
 six's `raise_from` exec shape, `open`/`__path__` in modules, multiple `*`/`**`
@@ -112,11 +113,12 @@ Other docs must link here instead of repeating the total.
   `hydro_fail`, 58 `expected_fail`, 3 `timeout`, 2 watchdog `memkill`
   (`test_zipfile64`, `test_zlib` at the 580 MB threshold) and 1
   `cpython_fail`.
-- **Ecosystem:** **9/13 cases pass** under JIT and AOT. Pydantic 2.14.1,
-  pydantic-core, python-dateutil, six, typing-extensions,
-  typing-inspection, annotated-types and tzdata pass. NumPy 2.5 stops on the
-  `_multiarray_umath` missing-`_NoValue` path; pandas AOT compilation now
-  stops on missing `sqlite3.register_adapter`. The official test runner's
+- **Ecosystem:** **5/13 cases pass** under JIT and AOT (python-dateutil,
+  six, typing-inspection, annotated-types, tzdata). Typing-extensions and
+  pydantic-core pass JIT but AOT stops in `enum._proto_member.__set_name__`
+  (`int('keep')`); pydantic JIT misses `typing._generic_alias_eq`. NumPy 2.5
+  stops on the `_multiarray_umath` missing-`_NoValue` path; pandas AOT stops
+  on `writer(..., lineterminator=...)`. The official test runner's
   shared import blockers (`platform.win32_is_iot`, `ctypes.windll`,
   `subprocess._args_from_interpreter_flags`) are fixed, and `test.support`
   now imports after platform-branch folding, dead-import bindings, lambda
