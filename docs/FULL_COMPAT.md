@@ -69,15 +69,13 @@ The four timeouts are `test_bisect.py`, `test_imaplib.py`, `test_queue.py` and
 `test_zlib.py` and `test_zstd.py` at the 1500 MB available-memory threshold.
 The three `cpython_fail` entries are `test_extcall.py`, `test_unpack.py` and
 `test_unpack_ex.py`: Hydro passed while the oracle failed, so they are not
-Hydro passes and cannot be counted as parity. Four previously pinned passes
-(`test_dictviews.py`, `test_plistlib.py`, `test_poll.py`, `test_yield_from.py`)
-fail on the current binary and must be recovered before the manifest gate can
-be claimed green.
+Hydro passes and cannot be counted as parity. A post-run recheck recovered
+`test_dictviews.py` (current known total **37**); three previously pinned
+passes (`test_plistlib.py`, `test_poll.py`, `test_yield_from.py`) still fail
+and must be recovered before the manifest gate can be claimed green.
 
 ### Immediate regression recovery (manifest gate)
 
-- `test_dictviews.py`: dict-view set operations against tuples/iterators and
-  recursive `repr` recursion depth.
 - `test_plistlib.py`: `_SubTest` construction calls
   `builtins.__object_init__` with two arguments; the `object.__init__`
   binding/spec path must reject/accept exactly CPython's receiver-only shape.
@@ -182,7 +180,7 @@ Observed current families:
   argument (`test_dict.py`), list/tuple keyword constructors, unhashable set
   behavior (`test_set.py`, `test_pprint.py`), dict-view ABC registration,
   comparison errors and copy protocols, recursive view reprs
-  (`test_dictviews.py`), iterator/unpacking errors (`test_iter.py`), sequence
+  (all `test_dictviews.py` cases pass now), iterator/unpacking errors (`test_iter.py`), sequence
   index/protocol behavior (`test_index.py`, `test_bigaddrspace.py`), and
   ordered comparison type errors.
 - **Numbers:** BigInt exponent/convert paths (`test_pow.py`, `test_long.py`),

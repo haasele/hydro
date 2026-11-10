@@ -40,8 +40,8 @@ Current state of work (Cargo version 0.1.0, no public release yet): the runtime
 monorepo carries the unit/integration suites; CLI/E2E/AOT tests live in Tea.
 Compatibility target: **CPython 3.14.9**; the last full official `Lib/test`
 run is **36/398** harness exits (some imported-harness files still run 0
-tests); four previously pinned passes regressed and are listed in the gap
-inventory, tracked in
+tests); three previously pinned passes remain regressed (`test_plistlib`,
+`test_poll`, `test_yield_from`) while `test_dictviews` recovered, tracked in
 [`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md). The generated stdlib import
 matrix is **288/297** ([`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).
 Hydro JIT (`tea infuse`) and AOT (`tea build`) share this runtime and IR.

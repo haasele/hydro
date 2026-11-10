@@ -116,11 +116,11 @@ Other docs must link here instead of repeating the total.
   `expected_fail`, 4 `timeout` (`test_bisect`, `test_imaplib`, `test_queue`,
   `test_signal`), 3 watchdog `memkill` (`test_zipfile64`, `test_zlib`,
   `test_zstd` at the 1500 MB threshold) and 3 `cpython_fail`
-  (`test_extcall`, `test_unpack`, `test_unpack_ex`). The offline manifest
-  still pins **33 verified passes**:
-  four older pins (`test_dictviews`, `test_plistlib`, `test_poll`,
-  `test_yield_from`) regressed and must be recovered; the full inventory is
-  [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md).
+  (`test_extcall`, `test_unpack`, `test_unpack_ex`). A post-run recheck
+  recovered `test_dictviews.py`, so the current known total is **37**.
+  The offline manifest still pins **33 verified passes**; three older pins
+  (`test_plistlib`, `test_poll`, `test_yield_from`) remain regressed. The full
+  inventory is [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md).
 - **Ecosystem:** **5/13 cases pass** under JIT and AOT (python-dateutil,
   six, typing-inspection, annotated-types, tzdata). Typing-extensions and
   pydantic-core pass JIT but AOT stops in `enum._proto_member.__set_name__`

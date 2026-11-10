@@ -71,10 +71,10 @@ initial state of the first runnable core.
   `hydro_pass`** (296 `hydro_fail`, 56 `expected_fail`, 4 timeouts, 3 watchdog
   memkills, 3 `cpython_fail`). Seven tests newly passed
   (`test_descrtut`, `test_genexps`, `test_lltrace`, `test_metaclass`,
-  `test_monitoring`, `test_pep646_syntax`, `test_textwrap`), but four older
-  pins (`test_dictviews`, `test_plistlib`, `test_poll`, `test_yield_from`)
-  regressed; the manifest stays at 33 verified passes until they are
-  recovered.
+  `test_monitoring`, `test_pep646_syntax`, `test_textwrap`), but three older
+  pins (`test_plistlib`, `test_poll`, `test_yield_from`) remain regressed after
+  the `test_dictviews` recovery; the manifest stays at 33 verified passes
+  until they are recovered.
 - Added [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md): the authoritative
   hand-maintained inventory of every remaining workstream on the road to
   100 % CPython 3.14.9 test-suite coverage, with the strict gate definition and
