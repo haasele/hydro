@@ -1705,7 +1705,10 @@ impl<'a> Checker<'a> {
                     // annotated slot.
                     self.force_any(value_ty);
                 } else if (expected == Type::None) != (got == Type::None) {
-                    self.force_any(value_ty);
+                    // A `None` slot on one path may hold a value on another;
+                    // mark the slot dynamic so later reads do not keep the
+                    // `None` type.
+                    self.widened.insert(local);
                 } else {
                     // The annotation is not enforced: the slot keeps holding
                     // a value of another type from here on.
@@ -3550,6 +3553,14 @@ impl<'a> Checker<'a> {
     }
 
     fn unsupported(&mut self, op: BinOp, a: Type, b: Type, line: u32, col: u32) {
+        // Ordering comparisons with a possibly-`None` operand are checked by
+        // the runtime; guarded code like `x is not None and x < y` must not be
+        // rejected because one path stores `None`.
+        if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+            && (matches!(a, Type::None) || matches!(b, Type::None))
+        {
+            return;
+        }
         self.error(
             line,
             col,

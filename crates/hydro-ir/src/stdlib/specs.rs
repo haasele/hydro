@@ -24,7 +24,28 @@ pub static MATH: ModuleSpec = ModuleSpec {
         f("hypot", 0, usize::MAX, Type::Float),
         f("exp", 1, 1, Type::Float),
         f("exp2", 1, 1, Type::Float),
-        f("log", 1, 1, Type::Float),
+        f("cbrt", 1, 1, Type::Float),
+        f("cosh", 1, 1, Type::Float),
+        f("sinh", 1, 1, Type::Float),
+        f("tanh", 1, 1, Type::Float),
+        f("expm1", 1, 1, Type::Float),
+        f("log1p", 1, 1, Type::Float),
+        f("erf", 1, 1, Type::Float),
+        f("erfc", 1, 1, Type::Float),
+        f("gamma", 1, 1, Type::Float),
+        f("lgamma", 1, 1, Type::Float),
+        f("fmod", 2, 2, Type::Float),
+        f("remainder", 2, 2, Type::Float),
+        f("fma", 3, 3, Type::Float),
+        f("ulp", 1, 1, Type::Float),
+        f("frexp", 1, 1, Type::Tuple),
+        f("factorial", 1, 1, Type::Int),
+        f("comb", 2, 2, Type::Int),
+        f("perm", 2, 2, Type::Int),
+        f("lcm", 0, usize::MAX, Type::Int),
+        f("dist", 2, 2, Type::Float),
+        f("sumprod", 2, 2, Type::Float),
+        f("log", 1, 2, Type::Float),
         f("log10", 1, 1, Type::Float),
         f("log2", 1, 1, Type::Float),
         f("pow", 2, 2, Type::Float),
@@ -8536,39 +8557,6 @@ pub static GZIP: ModuleSpec = ModuleSpec {
     ],
 };
 
-/// `code`: the interactive-interpreter helpers.
-pub static CODE: ModuleSpec = ModuleSpec {
-    name: "code",
-    functions: &[
-        kw("InteractiveInterpreter", 0, 1, Type::Any, &["locals"]),
-        kw(
-            "InteractiveConsole",
-            0,
-            2,
-            Type::Any,
-            &["locals", "local_exit"],
-        ),
-        kw(
-            "interact",
-            0,
-            5,
-            Type::None,
-            &["banner", "readfunc", "local", "exitmsg", "local_exit"],
-        ),
-        // `compile_command(source, filename='<input>', symbol='single')` and
-        // its stateful `CommandCompiler` wrapper.
-        kw(
-            "compile_command",
-            1,
-            3,
-            Type::Any,
-            &["source", "filename", "symbol"],
-        ),
-        kw("CommandCompiler", 0, 0, Type::Any, &[]),
-    ],
-    constants: &[c("Quitter", Type::Any), c("__all__", Type::List)],
-};
-
 /// `tty`: terminal mode helpers built on `termios`.
 pub static TTY: ModuleSpec = ModuleSpec {
     name: "tty",
@@ -8641,50 +8629,6 @@ pub static UUID: ModuleSpec = ModuleSpec {
         c("_has_stable_extractable_node", Type::Bool),
         c("_last_timestamp_v7", Type::Any),
         c("_last_counter_v7", Type::Int),
-        c("__all__", Type::List),
-    ],
-};
-
-/// `opcode`: the public opcode tables `dis` builds on.
-///
-/// CPython 3.14 splits the tables between `_opcode_metadata` and `_opcode`;
-/// `opcode.py` re-exports them here. Hydro has no bytecode, so the tables are
-/// empty and the predicates answer `False`, but the names resolve.
-pub static OPCODE: ModuleSpec = ModuleSpec {
-    name: "opcode",
-    functions: &[kw(
-        "stack_effect",
-        1,
-        3,
-        Type::Int,
-        &["opcode", "oparg", "jump"],
-    )],
-    constants: &[
-        c("opmap", Type::Dict),
-        c("opname", Type::List),
-        c("HAVE_ARGUMENT", Type::Int),
-        c("EXTENDED_ARG", Type::Int),
-        c("MIN_INSTRUMENTED_OPCODE", Type::Int),
-        c("cmp_op", Type::Tuple),
-        c("hascompare", Type::List),
-        c("hasarg", Type::List),
-        c("hasconst", Type::List),
-        c("hasname", Type::List),
-        c("hasjump", Type::List),
-        c("hasjrel", Type::List),
-        c("hasjabs", Type::List),
-        c("hasfree", Type::List),
-        c("haslocal", Type::List),
-        c("hasexc", Type::List),
-        c("_inline_cache_entries", Type::Dict),
-        c("_specializations", Type::Dict),
-        c("_specialized_opmap", Type::Dict),
-        c("_intrinsic_1_descs", Type::List),
-        c("_intrinsic_2_descs", Type::List),
-        c("_special_method_names", Type::Dict),
-        c("_common_constants", Type::List),
-        c("_nb_ops", Type::List),
-        c("_cache_format", Type::Dict),
         c("__all__", Type::List),
     ],
 };
@@ -9927,7 +9871,8 @@ mod tests {
     fn math_log2_is_registered_as_a_float_function() {
         for name in ["log", "log10", "log2"] {
             let spec = function("math", name).unwrap_or_else(|| panic!("math.{name}"));
-            assert_eq!((spec.min_args, spec.max_args), (1, 1), "{name}");
+            let arity = if name == "log" { (1, 2) } else { (1, 1) };
+            assert_eq!((spec.min_args, spec.max_args), arity, "{name}");
             assert_eq!(spec.ret, Type::Float, "{name}");
         }
     }

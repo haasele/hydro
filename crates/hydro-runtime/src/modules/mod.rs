@@ -4115,33 +4115,6 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if module == "sys" && name == "pycache_prefix" {
         return NONE;
     }
-    if module == "opcode" {
-        match name {
-            "_cache_format"
-            | "_inline_cache_entries"
-            | "opmap"
-            | "_specializations"
-            | "_specialized_opmap"
-            | "_special_method_names" => return value::dict_new(Vec::new()),
-            "opname" | "hascompare" | "hasarg" | "hasconst" | "hasname" | "hasjump" | "hasjrel"
-            | "hasjabs" | "hasfree" | "haslocal" | "hasexc" | "__all__" | "_nb_ops"
-            | "_common_constants" | "_intrinsic_1_descs" | "_intrinsic_2_descs" => {
-                return value::list_new(Vec::new())
-            }
-            "HAVE_ARGUMENT" => return encode_int(43),
-            "EXTENDED_ARG" => return encode_int(69),
-            "MIN_INSTRUMENTED_OPCODE" => return encode_int(234),
-            "cmp_op" => {
-                return value::tuple_new(
-                    ["<", "<=", "==", "!=", ">", ">="]
-                        .iter()
-                        .map(|name| value::str_alloc(name.to_string()))
-                        .collect(),
-                )
-            }
-            _ => {}
-        }
-    }
     if module == "errno" {
         if let Some(value) = errno::constant_value(name) {
             return value;
@@ -12556,6 +12529,196 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
             }
             Err(err) => err,
         },
+        "cbrt" => match number(args[0]) {
+            Ok(x) => value::float_new(x.cbrt()),
+            Err(err) => err,
+        },
+        "cosh" => match number(args[0]) {
+            Ok(x) => value::float_new(x.cosh()),
+            Err(err) => err,
+        },
+        "sinh" => match number(args[0]) {
+            Ok(x) => value::float_new(x.sinh()),
+            Err(err) => err,
+        },
+        "tanh" => match number(args[0]) {
+            Ok(x) => value::float_new(x.tanh()),
+            Err(err) => err,
+        },
+        "expm1" => match number(args[0]) {
+            Ok(x) => value::float_new(x.exp_m1()),
+            Err(err) => err,
+        },
+        "log1p" => match number(args[0]) {
+            Ok(x) => value::float_new(x.ln_1p()),
+            Err(err) => err,
+        },
+        "erf" => match number(args[0]) {
+            Ok(x) => value::float_new(libm::erf(x)),
+            Err(err) => err,
+        },
+        "erfc" => match number(args[0]) {
+            Ok(x) => value::float_new(libm::erfc(x)),
+            Err(err) => err,
+        },
+        "gamma" => match number(args[0]) {
+            Ok(x) => value::float_new(libm::tgamma(x)),
+            Err(err) => err,
+        },
+        "lgamma" => match number(args[0]) {
+            Ok(x) => value::float_new(libm::lgamma(x)),
+            Err(err) => err,
+        },
+        "fmod" => match (number(args[0]), number(args[1])) {
+            (Ok(x), Ok(y)) => value::float_new(libm::fmod(x, y)),
+            (Err(err), _) | (_, Err(err)) => err,
+        },
+        "remainder" => match (number(args[0]), number(args[1])) {
+            (Ok(x), Ok(y)) => value::float_new(libm::remainder(x, y)),
+            (Err(err), _) | (_, Err(err)) => err,
+        },
+        "fma" => match (number(args[0]), number(args[1]), number(args[2])) {
+            (Ok(x), Ok(y), Ok(z)) => value::float_new(x.mul_add(y, z)),
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => err,
+        },
+        "nextafter" => {
+            let x = match number(args[0]) {
+                Ok(x) => x,
+                Err(err) => return err,
+            };
+            let y = match number(args[1]) {
+                Ok(y) => y,
+                Err(err) => return err,
+            };
+            let steps = if args.len() > 2 {
+                match value::as_integer(args[2]) {
+                    Some(n) => n,
+                    None => {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            "nextafter() steps must be an integer",
+                        )
+                    }
+                }
+            } else {
+                1
+            };
+            let mut result = x;
+            if steps >= 0 {
+                for _ in 0..steps {
+                    result = libm::nextafter(result, y);
+                }
+            } else {
+                for _ in steps..0 {
+                    result = libm::nextafter(result, y);
+                }
+            }
+            value::float_new(result)
+        }
+        "ulp" => match number(args[0]) {
+            Ok(x) if x.is_nan() || x.is_infinite() || x == 0.0 => {
+                value::float_new(x.abs().max(f64::from_bits(1)))
+            }
+            Ok(x) => {
+                let magnitude = x.abs();
+                value::float_new(libm::nextafter(magnitude, f64::INFINITY) - magnitude)
+            }
+            Err(err) => err,
+        },
+        "frexp" => match number(args[0]) {
+            Ok(x) => {
+                let (mantissa, exponent) = libm::frexp(x);
+                value::tuple_new(vec![
+                    value::float_new(mantissa),
+                    ops::int_result(exponent as i64),
+                ])
+            }
+            Err(err) => err,
+        },
+        "factorial" => match math_bigint_arg(args[0]) {
+            Ok(n) if n >= BigInt::zero() => {
+                let mut result = BigInt::one();
+                let mut index = BigInt::one();
+                while index <= n {
+                    result *= &index;
+                    index += 1;
+                }
+                math_bigint_result(result)
+            }
+            Ok(_) => {
+                exc::raise_with_message(VALUE_ERROR, "factorial() not defined for negative values")
+            }
+            Err(err) => err,
+        },
+        "comb" | "perm" => {
+            let (n, k) = match (math_bigint_arg(args[0]), math_bigint_arg(args[1])) {
+                (Ok(n), Ok(k)) => (n, k),
+                (Err(err), _) | (_, Err(err)) => return err,
+            };
+            if n < BigInt::zero() || k < BigInt::zero() || k > n {
+                return exc::raise_with_message(
+                    VALUE_ERROR,
+                    "comb/perm arguments must satisfy 0 <= k <= n",
+                );
+            }
+            let mut result = BigInt::one();
+            let mut index = BigInt::zero();
+            while index < k {
+                result *= &n - &index;
+                if function == "comb" {
+                    result /= &index + 1;
+                }
+                index += 1;
+            }
+            math_bigint_result(result)
+        }
+        "lcm" => {
+            let mut result = BigInt::one();
+            for &arg in args {
+                let value = match math_bigint_arg(arg) {
+                    Ok(value) => value,
+                    Err(err) => return err,
+                };
+                if value.is_zero() {
+                    result = BigInt::zero();
+                    continue;
+                }
+                result = (&result / gcd_bigint(result.clone(), value.clone())) * value;
+            }
+            math_bigint_result(result.abs())
+        }
+        "fsum" => {
+            let iterator = iter::iter_new(args[0]);
+            if failed() {
+                return NONE;
+            }
+            let mut sum = 0.0f64;
+            let mut compensation = 0.0f64;
+            loop {
+                let mut item = NONE;
+                let status = iter::iter_next(iterator, &mut item);
+                if failed() {
+                    return NONE;
+                }
+                if status == 0 {
+                    break;
+                }
+                let x = match number(item) {
+                    Ok(x) => x,
+                    Err(err) => return err,
+                };
+                let t = sum + x;
+                if sum.abs() >= x.abs() {
+                    compensation += (sum - t) + x;
+                } else {
+                    compensation += (x - t) + sum;
+                }
+                sum = t;
+            }
+            value::float_new(sum + compensation)
+        }
+        "dist" => math_dist(args[0], args[1]),
+        "sumprod" => math_sumprod(args[0], args[1]),
         "acosh" => match number(args[0]) {
             Ok(x) => value::float_new(x.acosh()),
             Err(err) => err,
@@ -12626,11 +12789,18 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
         "log" | "log10" | "log2" => match number(args[0]) {
             Ok(x) if !x.is_nan() && x <= 0.0 => domain_error(),
             Ok(x) => {
-                let result = match function {
+                let mut result = match function {
                     "log" => x.ln(),
                     "log10" => x.log10(),
                     _ => x.log2(),
                 };
+                if function == "log" && args.len() > 1 {
+                    match number(args[1]) {
+                        Ok(base) if !base.is_nan() && base <= 0.0 => return domain_error(),
+                        Ok(base) => result /= base.ln(),
+                        Err(err) => return err,
+                    }
+                }
                 value::float_new(result)
             }
             Err(err) => err,
@@ -12917,6 +13087,89 @@ fn math_call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>) -> i
             &format!("math.{function}() does not accept keyword arguments"),
         ),
     }
+}
+
+fn math_bigint_arg(value_arg: i64) -> Result<BigInt, i64> {
+    if let Some(n) = value::as_integer(value_arg) {
+        return Ok(BigInt::from(n));
+    }
+    match value::as_bigint(value_arg) {
+        Some(n) => Ok(n.clone()),
+        None => Err(exc::raise_with_message(
+            TYPE_ERROR,
+            "math function argument must be an integer",
+        )),
+    }
+}
+
+fn math_bigint_result(value: BigInt) -> i64 {
+    if let Some(n) = value.to_i64() {
+        if let Some(tagged) = value::encode_int(n) {
+            return tagged;
+        }
+    }
+    value::bigint_new(value)
+}
+
+fn math_float_items(iterable: i64) -> Result<Vec<f64>, i64> {
+    let iterator = iter::iter_new(iterable);
+    if failed() {
+        return Err(NONE);
+    }
+    let mut items = Vec::new();
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if failed() {
+            return Err(NONE);
+        }
+        if status == 0 {
+            break;
+        }
+        items.push(number(item)?);
+    }
+    Ok(items)
+}
+
+fn math_dist(left: i64, right: i64) -> i64 {
+    let left = match math_float_items(left) {
+        Ok(items) => items,
+        Err(err) => return err,
+    };
+    let right = match math_float_items(right) {
+        Ok(items) => items,
+        Err(err) => return err,
+    };
+    if left.len() != right.len() {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "dist() requires two points of the same dimension",
+        );
+    }
+    let mut sum = 0.0f64;
+    for (a, b) in left.iter().zip(&right) {
+        let difference = a - b;
+        sum += difference * difference;
+    }
+    value::float_new(sum.sqrt())
+}
+
+fn math_sumprod(left: i64, right: i64) -> i64 {
+    let left = match math_float_items(left) {
+        Ok(items) => items,
+        Err(err) => return err,
+    };
+    let right = match math_float_items(right) {
+        Ok(items) => items,
+        Err(err) => return err,
+    };
+    if left.len() != right.len() {
+        return exc::raise_with_message(
+            VALUE_ERROR,
+            "sumprod() requires inputs of the same length",
+        );
+    }
+    value::float_new(left.iter().zip(&right).map(|(a, b)| a * b).sum())
 }
 
 /// `math.prod(iterable, *, start=1)`: multiplies every element into `start`

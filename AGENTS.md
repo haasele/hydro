@@ -79,9 +79,8 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-11-10: **3258 tests run
-(3258 passed, 1 skipped)**; the per-crate breakdown below sums to 3259
-(the skipped test is not included in the listed binaries):
+`cargo nextest run --workspace` on 2026-11-10: **3259 tests run
+(3259 passed, 1 skipped)**; the per-crate breakdown below sums to 3259:
 
 | Crate | Tests |
 |---|---:|

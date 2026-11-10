@@ -5890,7 +5890,12 @@ impl<'a> Lowerer<'a> {
                     Some(name) => name.as_str(),
                     None => member,
                 };
-                if !self.claim_import_binding(binding, nested) {
+                if nested {
+                    // A native function or constant imported inside a function
+                    // must still be collected when a module-level `import`
+                    // already claimed the same spelling; the local binding
+                    // shadows that module alias at the use site.
+                } else if !self.claim_import_binding(binding, nested) {
                     continue;
                 }
                 match module_member(module, member) {
@@ -9964,6 +9969,86 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Binds `from module import name` inside a function as a local value.
+    ///
+    /// Collection records the member globally; without a local binding a
+    /// function-local import would be shadowed by an unrelated module-level
+    /// `import module` of the same spelling.
+    fn lower_function_import_from(
+        &mut self,
+        s: &ast::StmtImportFrom,
+        fs: &mut FuncState,
+        line: u32,
+        col: u32,
+    ) -> Option<HStmt> {
+        let level = s.level.as_ref().map(|level| level.to_u32()).unwrap_or(0);
+        let module_name = resolve_import_name(
+            level,
+            s.module.as_ref().map(|module| module.as_str()),
+            &self.package,
+        )
+        .ok()?;
+        // Only native modules have a compile-time member value to bind. A
+        // deferred user import keeps its existing late-binding path.
+        stdlib::module(&module_name)?;
+        let mut body = Vec::new();
+        for alias in &s.names {
+            if alias.name.as_str() == "*" {
+                continue;
+            }
+            let binding = match &alias.asname {
+                Some(name) => name.as_str(),
+                None => alias.name.as_str(),
+            };
+            let value = if let Some((module, function)) =
+                self.imported_functions.get(binding).copied()
+            {
+                HExpr {
+                    kind: HExprKind::ModuleAttr {
+                        module: module.name.to_string(),
+                        name: function.name.to_string(),
+                    },
+                    ty: Ty::Concrete(Type::Function),
+                    line,
+                    col,
+                }
+            } else if let Some((module, constant)) = self.imported_constants.get(binding).copied() {
+                HExpr {
+                    kind: HExprKind::ModuleAttr {
+                        module: module.name.to_string(),
+                        name: constant.name.to_string(),
+                    },
+                    ty: Ty::Concrete(constant.ty),
+                    line,
+                    col,
+                }
+            } else {
+                continue;
+            };
+            let local = self.walrus_local(fs, binding);
+            body.push(HStmt {
+                kind: HStmtKind::Assign {
+                    target: local,
+                    value,
+                },
+                line,
+                col,
+            });
+        }
+        if body.is_empty() {
+            return None;
+        }
+        Some(HStmt {
+            kind: HStmtKind::If {
+                cond: self.bool_const(true, line, col),
+                then_body: body,
+                else_body: Vec::new(),
+            },
+            line,
+            col,
+        })
+    }
+
     fn lower_stmt(&mut self, stmt: &ast::Stmt, fs: &mut FuncState) -> Option<HStmt> {
         let (line, col) = self.span(stmt.range());
         let kind = match stmt {
@@ -10440,7 +10525,7 @@ impl<'a> Lowerer<'a> {
                     return self.lower_optional_import(statement, fs, line, col);
                 }
                 if !fs.is_module {
-                    return None;
+                    return self.lower_function_import_from(s, fs, line, col);
                 }
                 return self.lower_session_import_from(s, fs, line, col);
             }
@@ -21602,9 +21687,10 @@ impl<'a> Lowerer<'a> {
             return self.extension_call(&path, &member, call, fs, line, col);
         }
 
-        if self.module_aliases.contains_key(name)
-            || self.user_module_aliases.contains_key(name)
-            || self.extension_aliases.contains_key(name)
+        if fs.lookup(name).is_none()
+            && (self.module_aliases.contains_key(name)
+                || self.user_module_aliases.contains_key(name)
+                || self.extension_aliases.contains_key(name))
         {
             self.error_at_code(
                 name_expr.range,

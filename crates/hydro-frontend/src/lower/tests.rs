@@ -578,6 +578,19 @@ fn imports_inside_functions_bind_names() {
 }
 
 #[test]
+fn function_local_import_shadows_module_alias() {
+    let source = "import random\ndef f():\n    from random import random\n    return random()\n";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = function_body(&hir, "f");
+    assert!(body.iter().any(|stmt| matches!(
+        &stmt.kind,
+        HStmtKind::If { then_body, .. }
+            if then_body.iter().any(|stmt| matches!(stmt.kind, HStmtKind::Assign { .. }))
+    )));
+}
+
+#[test]
 fn imports_inside_functions_bind_deferred_names() {
     let source = "def f():\n    from helper import add\n    return add(1, 2)\n";
     let (hir, _, diags) = lower_source(source, &parse(source));

@@ -10,6 +10,22 @@ initial state of the first runnable core.
 
 ### Compatibility — 2026-11-10 class/import/runtime slice
 
+- Function-local `from <module> import <name>` statements now bind a real
+  local value, so they shadow a module-level `import <module>` alias of the
+  same spelling. Nested imports are collected even when a top-level import
+  already claimed the name; native module functions and constants are bound
+  through their module attribute.
+- `opcode` and `code` now resolve to CPython's pure modules instead of empty
+  native shims. `dis` gets the real `CONVERT_VALUE`/`opmap` tables from
+  `_opcode_metadata`, and `code.InteractiveConsole` is a class object, so
+  importing `doctest`/`pdb` no longer fails at import time.
+- `math` gained `cbrt`, `cosh`, `sinh`, `tanh`, `erf`, `erfc`, `gamma`,
+  `lgamma`, `fmod`, `remainder`, `fma`, `nextafter`, `ulp`, `frexp`,
+  `factorial`, `comb`, `perm`, `lcm`, `fsum`, `dist` and `sumprod`; `log`
+  accepts the optional base argument.
+- Sema treats a `None`-typed local reassigned on one path as a dynamic slot,
+  and ordering comparisons with a possibly-`None` operand defer to the
+  runtime, so guarded code such as `x is not None and x < y` compiles.
 - Classes defined inside functions now lower their method bodies. Previously
   `def factory(): class A: def f(self): return 42` produced a class whose
   methods returned `None`; nested methods now bind `self`, close over enclosing
