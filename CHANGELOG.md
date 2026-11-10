@@ -45,7 +45,10 @@ initial state of the first runnable core.
   operand type(s)` error. `dict_keys` and `dict_items` also compare by their
   set elements regardless of view kind, and direct construction of the
   `dict_keys`/`dict_items`/`dict_values` classes now raises CPython's
-  `cannot create '...' instances` TypeError.
+  `cannot create '...' instances` TypeError. The native views also satisfy
+  `collections.abc`'s `KeysView`/`ItemsView`/`ValuesView`, `MappingView`,
+  `Set` (keys/items), `Collection`, `Sized`, `Iterable` and `Container`
+  checks.
 - Latest official differential run (2026-11-10T17:20:05Z) reached **36/398
   `hydro_pass`** (296 `hydro_fail`, 56 `expected_fail`, 4 timeouts, 3 watchdog
   memkills, 3 `cpython_fail`). Seven tests newly passed

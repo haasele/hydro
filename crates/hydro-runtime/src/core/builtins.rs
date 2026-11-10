@@ -7916,6 +7916,25 @@ fn type_check(value: i64, target: i64) -> Option<bool> {
         return Some(result == value::bool_value(true));
     }
     if value::as_class(target).is_some() {
+        // The concrete `collections.abc` mapping-view classes are structural
+        // in CPython: the native dict views satisfy KeysView/ItemsView/
+        // ValuesView without being registered as virtual subclasses.
+        if let (Some(name), Some(view)) = (
+            value::class_display_name(target),
+            value::as_dict_view(value),
+        ) {
+            let matches = match name {
+                "KeysView" => view.kind == value::DictViewKind::Keys,
+                "ItemsView" => view.kind == value::DictViewKind::Items,
+                "ValuesView" => view.kind == value::DictViewKind::Values,
+                "MappingView" | "Collection" | "Sized" | "Iterable" | "Container" => true,
+                "Set" => view.kind != value::DictViewKind::Values,
+                _ => false,
+            };
+            if matches {
+                return Some(true);
+            }
+        }
         // A metaclass `__instancecheck__` decides for its classes before the
         // default hierarchy walk (CPython's `isinstance` dispatches through
         // it); `test_typechecks.py`'s `ABC` relies on it.
