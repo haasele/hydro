@@ -768,7 +768,9 @@ fn check_output(args: &[i64]) -> i64 {
         Ok(timeout) => timeout,
         Err(error) => return error,
     };
-    let text = flag(argument(args, 6));
+    let encoding = argument(args, 8);
+    let errors = argument(args, 9);
+    let text = flag(argument(args, 6)) || encoding != NONE || errors != NONE;
     let env = match env_option(argument(args, 7)) {
         Ok(env) => env,
         Err(error) => return error,

@@ -3989,10 +3989,11 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
         kw(
             "check_output",
             1,
-            8,
+            10,
             Type::Any,
             &[
-                "args", "stdin", "input", "stderr", "cwd", "timeout", "text", "env",
+                "args", "stdin", "input", "stderr", "cwd", "timeout", "text", "env", "encoding",
+                "errors",
             ],
         ),
         // CPython-private relaunch helpers; Hydro starts with no interpreter
