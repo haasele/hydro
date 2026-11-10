@@ -39,6 +39,10 @@ initial state of the first runnable core.
   `dict_merge` now accepts mapping pairs from subclasses/defaultdicts.
   In-place `dict |=` still lowers as a rebind (the generic AugAssign path has
   no in-place ABI yet); that remains open.
+- Set operators now accept an arbitrary iterable right operand (`set & tuple`,
+  `dict_keys & iterator`) and reflected dict-view operations (`[] & d.keys()`),
+  while non-iterable operands still fall through to CPython's `unsupported
+  operand type(s)` error.
 - Latest official differential run (2026-11-10T17:20:05Z) reached **36/398
   `hydro_pass`** (296 `hydro_fail`, 56 `expected_fail`, 4 timeouts, 3 watchdog
   memkills, 3 `cpython_fail`). Seven tests newly passed
@@ -119,7 +123,7 @@ initial state of the first runnable core.
   CPython.
 - C3 class construction, `super()` defining-class tracking, regex flags
   (`re.U` implied for `str` patterns) and the workspace clippy/fmt gates are
-  green. Canonical workspace count: 3261 tests run, 1 skipped.
+  green. Canonical workspace count: 3262 tests run, 1 skipped.
 
 ### Compatibility — `__class__`
 

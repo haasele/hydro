@@ -82,12 +82,12 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-11-10: **3261 tests run
-(3261 passed, 1 skipped)**; the per-crate breakdown below sums to 3261:
+`cargo nextest run --workspace` on 2026-11-10: **3262 tests run
+(3262 passed, 1 skipped)**; the per-crate breakdown below sums to 3262:
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 2106 |
+| runtime (unit + integration) | 2107 |
 | frontend | 910 |
 | codegen | 79 |
 | IR | 71 |
@@ -278,6 +278,6 @@ See `CHANGELOG.md` for details; this is only the resume pointer.
 - Function-local native imports now shadow module aliases, `math` covers the
   CPython 3.14 scalar/iterable surface, and `opcode`/`code`/`tty` resolve to
   their pure CPython modules; `ast` exposes its compile flags through `_ast`.
-- Workspace gate: **3261 tests run (3261 passed, 1 skipped)**; clippy and fmt
+- Workspace gate: **3262 tests run (3262 passed, 1 skipped)**; clippy and fmt
   are clean. The current report set is regenerated in
   `benchmarks/compat/latest.json` and `docs/COMPATIBILITY.md`.

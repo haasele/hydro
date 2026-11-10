@@ -56,7 +56,7 @@ checkout with the pinned oracle:
 | First-error families | **259** distinct rows | collapse by root cause; do not patch one error per test |
 | Stdlib imports | **288/297**; **288/288** comparable | behavioral tests for every module |
 | Ecosystem differential | **5/13** refreshed 2026-11-10; pydantic now reaches `annotationlib.__eq__` | 8 cases, then upstream suites |
-| Workspace | **3261 passed, 1 skipped**; clippy/fmt green | keep green through the compatibility work |
+| Workspace | **3262 passed, 1 skipped**; clippy/fmt green | keep green through the compatibility work |
 
 Post-baseline fixes since this run: variadic decorator receiver binding and
 PEP 584 `dict | dict`/subclass union, both covered by workspace tests and
@@ -175,10 +175,11 @@ Observed current families:
 - **Containers/iteration:** `dict | dict` now works for exact dicts and
   subclasses (right-hand entries win, plain-dict result); in-place
   `dict |=` still rebinds through the generic AugAssign path and needs an
-  in-place ABI. Also open: `dict.update` with no positional argument
-  (`test_dict.py`), list/tuple keyword constructors, unhashable set behavior
-  (`test_set.py`, `test_pprint.py`), dict-view set operations against
-  arbitrary iterables, recursive view reprs and copying
+  in-place ABI. Set operators now accept arbitrary iterable right operands
+  and reflected dict-view operands. Also open: `dict.update` with no positional
+  argument (`test_dict.py`), list/tuple keyword constructors, unhashable set
+  behavior (`test_set.py`, `test_pprint.py`), dict-view ABC registration,
+  comparison errors and copy protocols, recursive view reprs
   (`test_dictviews.py`), iterator/unpacking errors (`test_iter.py`), sequence
   index/protocol behavior (`test_index.py`, `test_bigaddrspace.py`), and
   ordered comparison type errors.

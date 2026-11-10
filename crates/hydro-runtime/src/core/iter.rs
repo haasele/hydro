@@ -15,6 +15,18 @@
 use crate::exc::{self, TYPE_ERROR};
 use crate::value;
 
+/// Whether `obj` implements the iteration protocol. A failed `__iter__`
+/// lookup is cleared so callers can fall back to their own operator error.
+pub(crate) fn is_iterable(obj: i64) -> bool {
+    let _ = iter_new(obj);
+    if exc::pending() {
+        exc::clear();
+        false
+    } else {
+        true
+    }
+}
+
 /// `hydro_iter_new`: creates an iterator for a list, string, dict, tuple, set,
 /// range, text file, CSV reader or a generator object.
 pub(crate) fn iter_new(obj: i64) -> i64 {

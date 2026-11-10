@@ -407,9 +407,42 @@ pub(crate) fn binop(op: u32, a: i64, b: i64) -> i64 {
         return crate::core::builtins::dict_merge(a, b);
     }
     // Set operators over sets and live `dict` views (`dict_keys`/`dict_items`).
+    // The right operand may be any iterable (`set & tuple`, `dict_keys &
+    // iterator`), matching CPython's set protocol rather than requiring two
+    // set-like values.
+    if matches!(op, OP_BIT_AND | OP_BIT_OR | OP_BIT_XOR | OP_SUB) && container::is_set_like(a) {
+        let set_op = match op {
+            OP_BIT_AND => container::SetOp::And,
+            OP_BIT_OR => container::SetOp::Or,
+            OP_SUB => container::SetOp::Sub,
+            _ => container::SetOp::Xor,
+        };
+        if container::is_set_like(b) {
+            if let Some(result) = container::set_operation(set_op, a, b) {
+                return result;
+            }
+        } else if crate::core::iter::is_iterable(b) {
+            let values = match crate::core::builtins::star_sequence(b) {
+                Ok(values) => values,
+                Err(error) => return error,
+            };
+            let value_roots = crate::heap::root_values(&values);
+            let right = value::set_new(values);
+            let right_roots = crate::heap::root_values(std::slice::from_ref(&right));
+            let result = container::set_operation(set_op, a, right);
+            crate::heap::release_roots(right_roots);
+            crate::heap::release_roots(value_roots);
+            if let Some(result) = result {
+                return result;
+            }
+        }
+    }
+    // `[] & d.keys()`: the dict view supplies the reflected set operation
+    // even though the left operand is a plain iterable.
     if matches!(op, OP_BIT_AND | OP_BIT_OR | OP_BIT_XOR | OP_SUB)
-        && container::is_set_like(a)
-        && container::is_set_like(b)
+        && !container::is_set_like(a)
+        && crate::core::iter::is_iterable(a)
+        && value::as_dict_view(b).is_some()
     {
         let set_op = match op {
             OP_BIT_AND => container::SetOp::And,
@@ -417,7 +450,17 @@ pub(crate) fn binop(op: u32, a: i64, b: i64) -> i64 {
             OP_SUB => container::SetOp::Sub,
             _ => container::SetOp::Xor,
         };
-        if let Some(result) = container::set_operation(set_op, a, b) {
+        let values = match crate::core::builtins::star_sequence(a) {
+            Ok(values) => values,
+            Err(error) => return error,
+        };
+        let value_roots = crate::heap::root_values(&values);
+        let left = value::set_new(values);
+        let left_roots = crate::heap::root_values(std::slice::from_ref(&left));
+        let result = container::set_operation(set_op, left, b);
+        crate::heap::release_roots(left_roots);
+        crate::heap::release_roots(value_roots);
+        if let Some(result) = result {
             return result;
         }
     }
@@ -2072,6 +2115,16 @@ mod tests {
         assert_eq!(as_int(binop(OP_POW, int(0), int(0))), 1);
         assert_eq!(as_int(binop(OP_POW, int(-2), int(3))), -8);
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn set_operation_accepts_iterable_operand() {
+        exc::init();
+        let left = value::set_new(vec![int(1), int(2)]);
+        let right = value::tuple_new(vec![int(2), int(3)]);
+        let result = binop(OP_BIT_AND, left, right);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::to_string(result), "{2}");
     }
 
     #[test]
