@@ -81,6 +81,11 @@ assert seen == {'name': 'test'}
 }
 
 #[test]
+fn zero_argument_float_constructor() {
+    run_source("assert float() == 0.0\n");
+}
+
+#[test]
 fn literals_operators_and_assignments() {
     run_source(
         "\
