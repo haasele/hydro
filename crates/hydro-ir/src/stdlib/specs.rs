@@ -2302,6 +2302,7 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         // module dispatcher must be able to resolve a bound method value.
         f("__object_new__", 0, 1, Type::Any),
         f("__object_init__", 0, 1, Type::None),
+        f("__exception_init__", 0, usize::MAX, Type::None),
         f("__object_str__", 1, 1, Type::Str),
         f("__object_repr__", 1, 1, Type::Str),
         f("__object_format__", 1, 2, Type::Str),
@@ -4442,6 +4443,7 @@ pub static DATETIME: ModuleSpec = ModuleSpec {
         f("_datetime_date", 1, 1, Type::Any),
         f("_datetime_time", 1, 1, Type::Any),
         f("_datetime_timestamp", 1, 1, Type::Float),
+        f("_datetime_astimezone", 1, 2, Type::Any),
         f("_datetime_weekday", 1, 1, Type::Int),
         f("_datetime_isoweekday", 1, 1, Type::Int),
         f("_datetime_toordinal", 1, 1, Type::Int),

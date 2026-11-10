@@ -17227,18 +17227,10 @@ impl<'a> Lowerer<'a> {
                         if let Some(kind) = ExcKind::from_name(n.id.as_str()) {
                             let message = self.expr(&call.args[0], fs);
                             (Some(kind), Some(message))
-                        } else if self.is_user_exception_name(n.id.as_str()) {
-                            let message = self.expr(&call.args[0], fs);
-                            (
-                                Some(ExcKind::RuntimeError),
-                                Some(self.user_exception_message(
-                                    n.id.as_str(),
-                                    Some(message),
-                                    line,
-                                    col,
-                                )),
-                            )
                         } else {
+                            // User and imported exception classes are real
+                            // class values: instantiate them so the raised
+                            // object keeps its class identity.
                             let value = self.raise_constructor_value(call, fs, line, col);
                             return Some(self.raise_value_expr(
                                 value,
@@ -17264,10 +17256,16 @@ impl<'a> Lowerer<'a> {
                         let message = self.expr(&call.args[0], fs);
                         match ExcKind::from_name(&name) {
                             Some(kind) => (Some(kind), Some(message)),
-                            None => (
-                                Some(ExcKind::RuntimeError),
-                                Some(self.user_exception_message(&name, Some(message), line, col)),
-                            ),
+                            None => {
+                                let value = self.raise_constructor_value(call, fs, line, col);
+                                return Some(self.raise_value_expr(
+                                    value,
+                                    s.cause.as_deref(),
+                                    fs,
+                                    line,
+                                    col,
+                                ));
+                            }
                         }
                     } else {
                         let value = self.raise_constructor_value(call, fs, line, col);
@@ -17360,61 +17358,15 @@ impl<'a> Lowerer<'a> {
         self.raise_value_expr(value, cause, fs, line, col)
     }
 
-    /// Builds the documented fallback message of `raise <user class>(message)`:
-    /// `"<ClassName>: <message>"`, with the message rendered by `str()`.
-    fn user_exception_message(
-        &mut self,
-        name: &str,
-        message: Option<HExpr>,
-        line: u32,
-        col: u32,
-    ) -> HExpr {
-        let ty = Ty::Concrete(Type::Str);
-        let Some(message) = message else {
-            return HExpr {
-                kind: HExprKind::Const(Const::Str(name.to_string())),
-                ty,
-                line,
-                col,
-            };
-        };
-        let prefix = HExpr {
-            kind: HExprKind::Const(Const::Str(format!("{name}: "))),
-            ty,
-            line,
-            col,
-        };
-        let rendered = HExpr {
-            kind: HExprKind::Call {
-                callee: Callee::Builtin(Builtin::Str),
-                args: vec![message],
-            },
-            ty,
-            line,
-            col,
-        };
-        HExpr {
-            kind: HExprKind::Bin {
-                op: BinOp::Add,
-                lhs: Box::new(prefix),
-                rhs: Box::new(rendered),
-            },
-            ty,
-            line,
-            col,
-        }
-    }
-
     /// Resolves how an `except` handler matches the pending exception.
     ///
-    /// Builtin names keep their tag, and user/imported classes keep the
-    /// documented [`ExcKind::RuntimeError`] approximation (like `raise`), so
-    /// their handlers also catch other user-class raises. A tuple of such
-    /// static elements expands into one tag per element. Every other shape —
-    /// a call (`except tuple(types):`), a subscript, an alias name bound to a
-    /// class, a mixed tuple — is left as a runtime expression: codegen and the
-    /// interpreter evaluate it when the arm is reached and match the value
-    /// with `isinstance`, which walks the same CPython hierarchy.
+    /// Builtin names keep their tag, and bare user/imported class names keep
+    /// the documented [`ExcKind::RuntimeError`] approximation. Dotted classes
+    /// (`except struct.error:`) and every other shape — a call, a subscript,
+    /// an alias name bound to a class, a mixed tuple — are left as a runtime
+    /// expression: codegen and the interpreter evaluate it when the arm is
+    /// reached and match the value with `isinstance`, preserving class
+    /// identity instead of catching the whole built-in ancestor.
     ///
     /// Returns `None` after reporting an unsupported handler expression.
     fn handler_matcher(
@@ -17429,15 +17381,9 @@ impl<'a> Lowerer<'a> {
                     self.dynamic_handler_expr(type_expr, fs),
                 )),
             },
-            ast::Expr::Attribute(_) => {
-                if dotted_expr_name(type_expr).is_some() {
-                    Some(HandlerMatcher::Kinds(vec![ExcKind::RuntimeError]))
-                } else {
-                    Some(HandlerMatcher::Dynamic(
-                        self.dynamic_handler_expr(type_expr, fs),
-                    ))
-                }
-            }
+            ast::Expr::Attribute(_) => Some(HandlerMatcher::Dynamic(
+                self.dynamic_handler_expr(type_expr, fs),
+            )),
             ast::Expr::Tuple(tuple) => {
                 if tuple.elts.is_empty() {
                     self.error_at_code(
@@ -17458,8 +17404,10 @@ impl<'a> Lowerer<'a> {
                                 ))
                             }
                         },
-                        ast::Expr::Attribute(_) if dotted_expr_name(elt).is_some() => {
-                            kinds.push(ExcKind::RuntimeError);
+                        ast::Expr::Attribute(_) => {
+                            return Some(HandlerMatcher::Dynamic(
+                                self.dynamic_handler_expr(type_expr, fs),
+                            ))
                         }
                         _ => {
                             return Some(HandlerMatcher::Dynamic(

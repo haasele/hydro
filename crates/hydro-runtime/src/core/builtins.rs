@@ -587,7 +587,17 @@ fn to_int_base(value_arg: i64, base_arg: i64) -> i64 {
             (10, digits)
         }
     } else {
-        (base as u32, digits)
+        // An explicit base still accepts the matching radix prefix:
+        // `int("0xa", 16)`, `int("0o10", 8)` and `int("0b10", 2)` are valid.
+        // A non-matching prefix is left in place (`0b10` is a hex literal
+        // when the base is 16).
+        let radix = base as u32;
+        match radix {
+            16 if digits.starts_with("0x") || digits.starts_with("0X") => (16, &digits[2..]),
+            8 if digits.starts_with("0o") || digits.starts_with("0O") => (8, &digits[2..]),
+            2 if digits.starts_with("0b") || digits.starts_with("0B") => (2, &digits[2..]),
+            _ => (radix, digits),
+        }
     };
     if digits.is_empty() {
         return exc::raise_with_message(
@@ -8099,6 +8109,7 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
             // defaultdict) without creating anything.
             value::mapping_pairs(value).is_some()
                 || crate::modules::collections::is_counter_instance(value)
+                || crate::modules::collections::is_ordereddict_instance(value)
         }
         "tuple" => {
             value::as_tuple(value).is_some()
@@ -8156,6 +8167,11 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
 ///   `type` matches every class value.
 fn instance_of(value: i64, class: i64) -> bool {
     if value::is_object_class(class) {
+        return true;
+    }
+    // Modules are native objects whose type is the cached `types.ModuleType`
+    // class; they are not `KIND_INSTANCE` values.
+    if value::class_display_name(class) == Some("module") && value::type_name(value) == "module" {
         return true;
     }
     // Instances (and native scalars registered through their builtin spelling)
@@ -9139,6 +9155,24 @@ mod tests {
         exc::init();
         assert_eq!(to_int(NONE), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+
+        // Explicit bases accept their own radix prefix but not another one.
+        assert_eq!(
+            value::as_integer(to_int_base(string("0xa"), int(16))),
+            Some(10)
+        );
+        assert_eq!(
+            value::as_integer(to_int_base(string("0o10"), int(8))),
+            Some(8)
+        );
+        assert_eq!(
+            value::as_integer(to_int_base(string("0b10"), int(2))),
+            Some(2)
+        );
+        assert_eq!(
+            value::as_integer(to_int_base(string("0b10"), int(16))),
+            Some(0xb10)
+        );
     }
 
     #[test]

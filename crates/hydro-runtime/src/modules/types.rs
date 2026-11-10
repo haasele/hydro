@@ -147,7 +147,7 @@ pub(crate) fn module_type_class() -> i64 {
     }
     let init = value::native_function_new("types", "ModuleType.__init__", 3);
     let class = value::class_new_full(
-        "ModuleType".to_string(),
+        "module".to_string(),
         NONE,
         vec![("__init__".to_string(), init, MethodKind::Normal)],
         Vec::new(),

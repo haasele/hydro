@@ -518,16 +518,23 @@ fn zoneinfo_reads_the_system_database() {
 
     let utc = call(zone_info, &[text("UTC")]);
     assert_str(getattr(utc, "key"), "UTC");
-    assert_int(method(utc, "utcoffset", &[now]), 0);
+    let utc_offset = method(utc, "utcoffset", &[now]);
+    assert_no_error();
+    assert_true(hydro_binop(
+        OP_EQ,
+        method(utc_offset, "total_seconds", &[]),
+        num(0),
+    ));
     assert_str(method(utc, "tzname", &[now]), "UTC");
 
     let new_york = call(zone_info, &[text("America/New_York")]);
     assert_str(getattr(new_york, "key"), "America/New_York");
     let offset = method(new_york, "utcoffset", &[now]);
     assert_no_error();
+    let offset_seconds = method(offset, "total_seconds", &[]);
     // EST (-5h) or EDT (-4h).
-    assert_true(hydro_binop(OP_GE, offset, num(-18_000)));
-    assert_true(hydro_binop(OP_LT, offset, num(-14_000)));
+    assert_true(hydro_binop(OP_GE, offset_seconds, num(-18_000)));
+    assert_true(hydro_binop(OP_LT, offset_seconds, num(-14_000)));
 
     let zones = module("zoneinfo", "available_timezones", &[]);
     assert_no_error();

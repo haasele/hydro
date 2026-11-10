@@ -7948,7 +7948,17 @@ pub(crate) fn function_doc(function: i64) -> i64 {
 
 /// The assigned `__module__`, or `None` when the slot is absent.
 pub(crate) fn function_module(function: i64) -> Option<i64> {
-    as_function(function).and_then(|func| func.metadata.lock().module)
+    let func = as_function(function)?;
+    if let Some(module) = func.metadata.lock().module {
+        return Some(module);
+    }
+    // Native/builtin functions carry their defining module in the body; expose
+    // it as `__module__` so `test.support.check__all__` can tell imported
+    // helpers (for example `plistlib.ParserCreate`) from module APIs.
+    match &func.body {
+        FunctionBody::Native { module, .. } => Some(str_alloc((*module).to_string())),
+        _ => None,
+    }
 }
 
 /// The assigned `__annotations__`, or `None` when the slot is absent.
@@ -8751,6 +8761,9 @@ pub(crate) fn mapping_pairs(v: i64) -> Option<&'static [(i64, i64)]> {
     if let Some(dict) = as_dict_data(v) {
         return Some(dict.entries());
     }
+    if let Some(pairs) = crate::modules::collections::ordereddict_mapping_pairs(v) {
+        return Some(pairs);
+    }
     if let Some((pairs, _)) = as_defaultdict(v) {
         return Some(pairs);
     }
@@ -9431,6 +9444,11 @@ pub(crate) fn type_class(v: i64) -> i64 {
     // than creating a second class with the same name.
     if name == "object" {
         object_class()
+    } else if name == "module" {
+        // `types.ModuleType` is the same class object as `type(sys)`, as in
+        // CPython, so `isinstance(sys, types.ModuleType)` and identity checks
+        // in `test.support.check__all__` hold.
+        crate::modules::types::module_type_class()
     } else {
         native_class(&name)
     }

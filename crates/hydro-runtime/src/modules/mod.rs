@@ -27062,9 +27062,20 @@ fn in_memory_class(name: &str, base: i64, methods: Vec<(String, i64)>) -> i64 {
     }
     // The method table holds freshly allocated native functions; root them
     // while the class object itself is being allocated and registered.
-    let method_values: Vec<i64> = methods.iter().map(|(_, value)| *value).collect();
+    let mut method_values: Vec<i64> = methods.iter().map(|(_, value)| *value).collect();
+    let module = value::str_alloc("io".to_string());
+    method_values.push(module);
     let method_roots = heap::root_values(&method_values);
-    let class = value::class_new(name.to_string(), base, methods);
+    let methods = methods
+        .into_iter()
+        .map(|(name, function)| (name, function, hydro_ir::MethodKind::Normal))
+        .collect();
+    let class = value::class_new_full(
+        name.to_string(),
+        base,
+        methods,
+        vec![("__module__".to_string(), module)],
+    );
     let class_roots = heap::root_values(&[class]);
     globals::registry_set(&key, class);
     heap::release_roots(class_roots);
@@ -27748,19 +27759,33 @@ fn io_size_arg(value: i64) -> Result<i64, i64> {
     }
 }
 
+/// `io` seek offset: a heap `BigInt` is an integer but does not fit the
+/// platform position type, so it raises `OverflowError` like CPython rather
+/// than the generic "expected integer" `TypeError`.
+fn io_seek_int(value: i64) -> Result<i64, i64> {
+    if let Some(integer) = value::as_integer(value) {
+        return Ok(integer);
+    }
+    if value::as_bigint(value).is_some() {
+        return Err(exc::raise_with_message(
+            OVERFLOW_ERROR,
+            "Python int too large to convert to C ssize_t",
+        ));
+    }
+    Err(exc::raise_with_message(
+        TYPE_ERROR,
+        &format!("integer argument expected, got {}", value::type_name(value)),
+    ))
+}
+
 fn io_seek(instance: i64, args: &[i64], length: usize) -> i64 {
     if let Some(error) = io_open_check(instance) {
         return error;
     }
     let offset = match args.get(1).copied() {
-        Some(value) => match value::as_integer(value) {
-            Some(offset) => offset,
-            None => {
-                return exc::raise_with_message(
-                    TYPE_ERROR,
-                    &format!("integer argument expected, got {}", value::type_name(value)),
-                )
-            }
+        Some(value) => match io_seek_int(value) {
+            Ok(offset) => offset,
+            Err(error) => return error,
         },
         None => {
             return exc::raise_with_message(TYPE_ERROR, "seek() missing required argument 'pos'")
@@ -27768,14 +27793,9 @@ fn io_seek(instance: i64, args: &[i64], length: usize) -> i64 {
     };
     let whence = match args.get(2).copied() {
         None | Some(NONE) => 0,
-        Some(value) => match value::as_integer(value) {
-            Some(whence) => whence,
-            None => {
-                return exc::raise_with_message(
-                    TYPE_ERROR,
-                    &format!("integer argument expected, got {}", value::type_name(value)),
-                )
-            }
+        Some(value) => match io_seek_int(value) {
+            Ok(whence) => whence,
+            Err(error) => return error,
         },
     };
     let base = match whence {

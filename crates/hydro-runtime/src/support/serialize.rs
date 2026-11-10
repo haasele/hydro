@@ -60,6 +60,9 @@ const TAG_BYTES: u8 = 14;
 /// Arbitrary-precision `int` (heap `BigInt`): sign byte (`0` non-negative,
 /// `1` negative), `u32` magnitude byte count, big-endian magnitude bytes.
 const TAG_BIGINT: u8 = 15;
+/// A non-primitive instance rebuilt from `__reduce__`: defining module and
+/// qualified class name, constructor arguments, and optional state.
+const TAG_REDUCED: u8 = 16;
 
 /// Reason a value could not be serialized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,7 +280,75 @@ fn encode_value(
             return Ok(());
         }
     }
+    // User instances participate through `__reduce__`, the same protocol
+    // CPython's pickler consults. Multiprocessing's spawn transport keeps its
+    // narrower value set; only `pickle.dumps` takes this route.
+    if !spawn && value::as_instance(value).is_some() {
+        if let Some(reduced) = reduced_instance_parts(value) {
+            let (module, qualname, args, state) = reduced;
+            let roots = crate::heap::root_values(&[args, state]);
+            let result = (|| -> Result<(), PickleError> {
+                out.push(TAG_REDUCED);
+                write_len(out, module.len())?;
+                out.extend_from_slice(module.as_bytes());
+                write_len(out, qualname.len())?;
+                out.extend_from_slice(qualname.as_bytes());
+                encode_value(args, depth + 1, spawn, out)?;
+                encode_value(state, depth + 1, spawn, out)?;
+                Ok(())
+            })();
+            crate::heap::release_roots(roots);
+            return result;
+        }
+    }
     Err(PickleError::Unsupported(value::type_name(value)))
+}
+
+/// Calls `value.__reduce__()` and returns `(module, qualname, args, state)`
+/// when it yields the two/three-item form this transport understands.
+fn reduced_instance_parts(value: i64) -> Option<(String, String, i64, i64)> {
+    let reduce = crate::core::methods::getattr(value, b"__reduce__".as_ptr(), 10);
+    if crate::exc::pending() {
+        crate::exc::clear();
+        return None;
+    }
+    if reduce == NONE || value::as_function(reduce).is_none() {
+        return None;
+    }
+    let reduced = crate::core::builtins::call(reduce, 0, std::ptr::null());
+    if crate::exc::pending() {
+        crate::exc::clear();
+        return None;
+    }
+    let roots = crate::heap::root_values(std::slice::from_ref(&reduced));
+    let parts = (|| {
+        let items = value::as_tuple(reduced)?;
+        if items.len() < 2 {
+            return None;
+        }
+        value::as_class(items[0])?;
+        let class = items[0];
+        let args = items[1];
+        value::as_tuple(args)?;
+        let state = items.get(2).copied().unwrap_or(NONE);
+        let module =
+            qualified_class_part(class, "__module__", 10).unwrap_or_else(|| "builtins".to_string());
+        let qualname = qualified_class_part(class, "__qualname__", 12)
+            .or_else(|| value::class_display_name(class).map(str::to_owned))?;
+        Some((module, qualname, args, state))
+    })();
+    crate::heap::release_roots(roots);
+    parts
+}
+
+/// Reads a string-valued class attribute (`__module__`, `__qualname__`).
+fn qualified_class_part(class: i64, name: &str, len: usize) -> Option<String> {
+    let part = crate::core::methods::getattr(class, name.as_ptr(), len);
+    if crate::exc::pending() {
+        crate::exc::clear();
+        return None;
+    }
+    value::as_str(part).map(str::to_owned)
 }
 
 // Decoding
@@ -485,6 +556,49 @@ fn decode_value(reader: &mut Reader<'_>, depth: usize, spawn: bool) -> Result<i6
             }
             Ok(value::function_new(wrapper, arity, name))
         }
+        TAG_REDUCED => {
+            if spawn {
+                return Err(PickleError::Corrupt);
+            }
+            let module_name = reader.string()?;
+            let qualname = reader.string()?;
+            let args = decode_value(reader, depth + 1, spawn)?;
+            let state = decode_value(reader, depth + 1, spawn)?;
+            let module_value = value::str_alloc(module_name);
+            let module_roots = crate::heap::root_values(&[module_value, args, state]);
+            let module = crate::modules::builtins::import_from_core(&[module_value]);
+            if crate::exc::pending() {
+                crate::heap::release_roots(module_roots);
+                return Err(PickleError::Unsupported("class"));
+            }
+            let Some(class) = resolve_qualified(module, &qualname) else {
+                crate::heap::release_roots(module_roots);
+                return Err(PickleError::Corrupt);
+            };
+            let Some(items) = value::as_tuple(args) else {
+                crate::heap::release_roots(module_roots);
+                return Err(PickleError::Corrupt);
+            };
+            let call_roots = crate::heap::root_values(&[args, state, class]);
+            let instance = crate::core::builtins::call(class, items.len(), items.as_ptr());
+            if crate::exc::pending() {
+                crate::heap::release_roots(call_roots);
+                crate::heap::release_roots(module_roots);
+                return Err(PickleError::Unsupported("class"));
+            }
+            if state != NONE {
+                if let Some(pairs) = value::as_dict(state) {
+                    for &(key, item) in pairs {
+                        if let Some(name) = value::as_str(key) {
+                            value::instance_setattr(instance, name.to_string(), item);
+                        }
+                    }
+                }
+            }
+            crate::heap::release_roots(call_roots);
+            crate::heap::release_roots(module_roots);
+            Ok(instance)
+        }
         TAG_MP_QUEUE => {
             if !spawn {
                 return Err(PickleError::Corrupt);
@@ -498,6 +612,18 @@ fn decode_value(reader: &mut Reader<'_>, depth: usize, spawn: bool) -> Result<i6
         }
         _ => Err(PickleError::Corrupt),
     }
+}
+
+/// Resolves a dotted `__qualname__` below an already imported module/class.
+fn resolve_qualified(mut value: i64, qualname: &str) -> Option<i64> {
+    for part in qualname.split('.') {
+        value = crate::core::methods::getattr(value, part.as_ptr(), part.len());
+        if crate::exc::pending() {
+            crate::exc::clear();
+            return None;
+        }
+    }
+    Some(value)
 }
 
 fn read_into_list(reader: &mut Reader<'_>, depth: usize, spawn: bool) -> Result<i64, PickleError> {

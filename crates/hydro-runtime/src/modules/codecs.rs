@@ -358,11 +358,13 @@ fn fixed_codec(normalized: &str) -> Option<Codec> {
         "latin_1" | "latin1" | "latin" | "iso8859_1" | "iso_8859_1" | "iso_latin_1" | "l1"
         | "cp819" | "8859" | "819" | "iso8859" | "cp28591" => Some(Codec::Latin1),
         "utf_16" | "utf16" | "u16" | "unicodelittleunmarked" => Some(Codec::Utf16),
-        "utf_16_le" | "utf16_le" | "unicodelittle" => Some(Codec::Utf16Le),
-        "utf_16_be" | "utf16_be" | "unicodebig" | "unicodebigunmarked" => Some(Codec::Utf16Be),
+        "utf_16_le" | "utf16_le" | "utf_16le" | "utf16le" | "unicodelittle" => Some(Codec::Utf16Le),
+        "utf_16_be" | "utf16_be" | "utf_16be" | "utf16be" | "unicodebig" | "unicodebigunmarked" => {
+            Some(Codec::Utf16Be)
+        }
         "utf_32" | "utf32" | "u32" => Some(Codec::Utf32),
-        "utf_32_le" | "utf32_le" => Some(Codec::Utf32Le),
-        "utf_32_be" | "utf32_be" => Some(Codec::Utf32Be),
+        "utf_32_le" | "utf32_le" | "utf_32le" | "utf32le" => Some(Codec::Utf32Le),
+        "utf_32_be" | "utf32_be" | "utf_32be" | "utf32be" => Some(Codec::Utf32Be),
         "utf_7" | "utf7" | "u7" => Some(Codec::Utf7),
         "unicode_escape" | "unicodeescape" => Some(Codec::UnicodeEscape),
         "raw_unicode_escape" | "rawunicodeescape" => Some(Codec::RawUnicodeEscape),
@@ -1168,9 +1170,9 @@ fn encode_codes(codec: Codec, text: &str, mode: &ErrorMode) -> Result<Vec<u8>, i
             Ok(out)
         }
         Codec::Ascii | Codec::Latin1 | Codec::Charmap => encode_single_byte(text, codec, mode),
-        Codec::Utf16 => Ok(encode_utf16(text, NATIVE_BIG_ENDIAN, true)),
-        Codec::Utf16Le => Ok(encode_utf16(text, false, false)),
-        Codec::Utf16Be => Ok(encode_utf16(text, true, false)),
+        Codec::Utf16 => encode_utf16(codec, text, NATIVE_BIG_ENDIAN, true, mode),
+        Codec::Utf16Le => encode_utf16(codec, text, false, false, mode),
+        Codec::Utf16Be => encode_utf16(codec, text, true, false, mode),
         Codec::Utf32 => Ok(encode_utf32(text, NATIVE_BIG_ENDIAN, true)),
         Codec::Utf32Le => Ok(encode_utf32(text, false, false)),
         Codec::Utf32Be => Ok(encode_utf32(text, true, false)),
@@ -1222,9 +1224,15 @@ fn decode_codes(
 
 /// Encodes `text` as UTF-16, optionally preceded by a byte-order mark.
 ///
-/// UTF-16 represents every code point (including a lone surrogate, written as
-/// its own code unit), so encoding never consults the error mode.
-fn encode_utf16(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+/// UTF-16 strict encoding rejects lone surrogates, matching CPython's
+/// `UnicodeEncodeError`; `surrogatepass` still writes them as code units.
+fn encode_utf16(
+    codec: Codec,
+    text: &str,
+    big_endian: bool,
+    bom: bool,
+    mode: &ErrorMode,
+) -> Result<Vec<u8>, i64> {
     let mut out = Vec::with_capacity(text.len() * 2 + 2);
     if bom {
         out.extend_from_slice(if big_endian {
@@ -1233,7 +1241,19 @@ fn encode_utf16(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
             &[0xFF, 0xFE]
         });
     }
-    for code in value::str_codes(text) {
+    let codes: Vec<u32> = value::str_codes(text).collect();
+    let mut index = 0usize;
+    while index < codes.len() {
+        let code = codes[index];
+        if value::is_surrogate_code(code) && matches!(mode, ErrorMode::Strict) {
+            return Err(unicode_encode_error(
+                codec,
+                text,
+                index,
+                index + 1,
+                "surrogates not allowed",
+            ));
+        }
         let mut units = [0u16; 2];
         let count = if code <= 0xFFFF {
             units[0] = code as u16;
@@ -1251,8 +1271,9 @@ fn encode_utf16(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
                 out.extend_from_slice(&unit.to_le_bytes());
             }
         }
+        index += 1;
     }
-    out
+    Ok(out)
 }
 
 /// Encodes `text` as UTF-32, optionally preceded by a byte-order mark.
@@ -3068,6 +3089,8 @@ mod tests {
             ("ascii", "ascii_encode", "ascii_decode"),
             ("latin_1", "latin_1_encode", "latin_1_decode"),
             ("iso-8859-1", "latin_1_encode", "latin_1_decode"),
+            ("utf-16be", "utf_16_be_encode", "utf_16_be_decode"),
+            ("utf-32le", "utf_32_le_encode", "utf_32_le_decode"),
         ] {
             let encode = info_entry(alias, 0);
             assert_eq!(

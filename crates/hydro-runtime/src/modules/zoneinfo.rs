@@ -8,8 +8,8 @@
 //!
 //! # Return values
 //!
-//! Hydro has no `datetime.timedelta` type, so `utcoffset()` and `dst()` return
-//! the offset in **seconds** (an `int`) instead of a `timedelta`. `tzname()`
+//! `utcoffset()` and `dst()` return a `datetime.timedelta`, matching CPython.
+//! `tzname()`
 //! returns the abbreviation string. `fromutc()` shifts the components of a
 //! native `datetime` instance and returns a new instance of the same class.
 //! A missing zone raises `ZoneInfoNotFoundError` (a `KeyError` subclass).
@@ -24,6 +24,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use hydro_ir::MethodKind;
 
 use crate::exc::{self, ATTRIBUTE_ERROR, KEY_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::modules::datetime::timedelta_from_seconds;
 use crate::value::{self, NONE};
 
 const MODULE: &str = "zoneinfo";
@@ -547,7 +548,7 @@ fn utcoffset(args: &[i64]) -> i64 {
     let Some(dt) = datetime_from_value(args[1]) else {
         return type_error("utcoffset() requires a datetime instance or None");
     };
-    encode(zone.offset_at_local(timestamp_of(dt)))
+    timedelta_from_seconds(zone.offset_at_local(timestamp_of(dt)))
 }
 
 fn dst(args: &[i64]) -> i64 {
@@ -563,7 +564,7 @@ fn dst(args: &[i64]) -> i64 {
     };
     let local = timestamp_of(dt);
     let offset = zone.offset_at_local(local);
-    encode(zone.dst_at(local.saturating_sub(offset)))
+    timedelta_from_seconds(zone.dst_at(local.saturating_sub(offset)))
 }
 
 fn tzname(args: &[i64]) -> i64 {

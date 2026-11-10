@@ -87,6 +87,7 @@ const ISOFORMAT_METHOD: &str = "_datetime_isoformat";
 const DATE_METHOD: &str = "_datetime_date";
 const TIME_METHOD: &str = "_datetime_time";
 const TIMESTAMP_METHOD: &str = "_datetime_timestamp";
+const ASTIMEZONE_METHOD: &str = "_datetime_astimezone";
 const WEEKDAY_METHOD: &str = "_datetime_weekday";
 const ISOWEEKDAY_METHOD: &str = "_datetime_isoweekday";
 const TOORDINAL_METHOD: &str = "_datetime_toordinal";
@@ -618,6 +619,7 @@ fn datetime_class() -> i64 {
         entry("date", DATE_METHOD, 1, MethodKind::Normal),
         entry("time", TIME_METHOD, 1, MethodKind::Normal),
         entry("timestamp", TIMESTAMP_METHOD, 1, MethodKind::Normal),
+        entry("astimezone", ASTIMEZONE_METHOD, 2, MethodKind::Normal),
         entry("weekday", WEEKDAY_METHOD, 1, MethodKind::Normal),
         entry("isoweekday", ISOWEEKDAY_METHOD, 1, MethodKind::Normal),
         entry("toordinal", TOORDINAL_METHOD, 1, MethodKind::Normal),
@@ -1488,6 +1490,14 @@ fn unix_parts(time: SystemTime) -> (i64, u32) {
 fn now_parts() -> Parts {
     let (seconds, microsecond) = unix_parts(SystemTime::now());
     from_unix(seconds, microsecond)
+}
+
+/// Constructs a `datetime.timedelta` from a whole number of seconds.
+///
+/// Fixed-offset zones (`zoneinfo`) expose offsets in seconds internally but
+/// must return `timedelta` objects to Python callers.
+pub(crate) fn timedelta_from_seconds(seconds: i64) -> i64 {
+    new_timedelta(Delta(i128::from(seconds) * 1_000_000))
 }
 
 /// Builds [`Parts`] from a count of microseconds since the Unix epoch.
@@ -3267,6 +3277,41 @@ fn timestamp_method(args: &[i64]) -> i64 {
     value::float_new(seconds)
 }
 
+/// `datetime.astimezone(tz=None)`: convert an aware value to the target zone,
+/// or treat a naive value as UTC (the machine timezone in this environment).
+fn astimezone_method(args: &[i64]) -> i64 {
+    let Some(receiver) = args.first().copied() else {
+        return arity_error("astimezone", "1 to 2", args.len());
+    };
+    if args.len() > 2 {
+        return arity_error("astimezone", "1 to 2", args.len());
+    }
+    if kind_of(receiver) != Some(Kind::DateTime) {
+        return type_error("astimezone() requires a datetime object");
+    }
+    let tzinfo = match args.get(1).copied() {
+        Some(candidate) => match tzinfo_argument(candidate) {
+            Ok(tzinfo) => tzinfo,
+            Err(err) => return err,
+        },
+        None => globals::registry_get(TIMEZONE_UTC_KEY).unwrap_or(NONE),
+    };
+    let Some(parts) = parts_of(receiver) else {
+        return invalid_instance("invalid datetime object");
+    };
+    let mut micros = i128::from(unix_seconds(&parts)) * 1_000_000 + i128::from(parts.microsecond);
+    match offset_of(receiver) {
+        Ok(Some(offset)) => micros -= offset,
+        Ok(None) => {}
+        Err(err) => return err,
+    }
+    let parts = match parts_from_micros(micros) {
+        Ok(parts) => parts,
+        Err(err) => return err,
+    };
+    datetime_in_zone(&parts, tzinfo)
+}
+
 /// The calendar date of a `date`/`datetime` receiver.
 fn receiver_date(receiver: i64) -> Result<Date, i64> {
     match date_from_instance(receiver) {
@@ -3683,6 +3728,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         DATE_METHOD => date_method(args),
         TIME_METHOD => time_method(args),
         TIMESTAMP_METHOD => timestamp_method(args),
+        ASTIMEZONE_METHOD => astimezone_method(args),
         WEEKDAY_METHOD => weekday_method(args),
         ISOWEEKDAY_METHOD => isoweekday_method(args),
         TOORDINAL_METHOD => toordinal_method(args),

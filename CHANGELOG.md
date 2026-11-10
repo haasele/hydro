@@ -8,6 +8,25 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-11-10 plistlib and native-exception slice
+
+- `test_plistlib.py` now passes **71/71** and is recorded as `hydro_pass`.
+  The slice added `bytes.expandtabs`, compact `utf-16be`/`utf-32le` aliases,
+  strict lone-surrogate rejection in UTF-16 encoding, `datetime.astimezone`,
+  `zoneinfo` offsets as real `timedelta` values, prefixed `int(text, base)`
+  forms, file methods as bound attributes, `types.ModuleType` identity for
+  native modules, `OrderedDict` as a real `dict` subclass/mapping, and
+  `__reduce__`-based instance pickling (`plistlib.UID` round-trips on every
+  protocol).
+- Native exception classes now carry a real `__init__` and `except
+  struct.error:` matches by class identity instead of mapping the class to
+  `Exception`; dotted handler expressions are evaluated dynamically. Object
+  identity hashing no longer re-enters itself, and exception-class creation
+  parks an active pending exception so lazy class allocation cannot fail.
+- Workspace suite: **3262 passed, 1 skipped**. Official known total is **38**
+  (36 full-run + `test_dictviews` + `test_plistlib`); `test_poll` and
+  `test_yield_from` remain the two pinned regressions.
+
 ### Compatibility — 2026-11-10 class/import/runtime slice
 
 - Native keyword routing now honors every declared `ModuleSpec` parameter name,
@@ -71,10 +90,11 @@ initial state of the first runnable core.
   `hydro_pass`** (296 `hydro_fail`, 56 `expected_fail`, 4 timeouts, 3 watchdog
   memkills, 3 `cpython_fail`). Seven tests newly passed
   (`test_descrtut`, `test_genexps`, `test_lltrace`, `test_metaclass`,
-  `test_monitoring`, `test_pep646_syntax`, `test_textwrap`), but three older
-  pins (`test_plistlib`, `test_poll`, `test_yield_from`) remain regressed after
-  the `test_dictviews` recovery; the manifest stays at 33 verified passes
-  until they are recovered.
+  `test_monitoring`, `test_pep646_syntax`, `test_textwrap`), but at that point
+  three older pins (`test_plistlib`, `test_poll`, `test_yield_from`) remained
+  regressed after the `test_dictviews` recovery; `test_plistlib` has since
+  recovered, leaving two pins and the manifest at 33 verified passes until
+  they are recovered.
 - Added [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md): the authoritative
   hand-maintained inventory of every remaining workstream on the road to
   100 % CPython 3.14.9 test-suite coverage, with the strict gate definition and

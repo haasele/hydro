@@ -56,7 +56,7 @@ checkout with the pinned oracle:
 | First-error families | **259** distinct rows | collapse by root cause; do not patch one error per test |
 | Stdlib imports | **288/297**; **288/288** comparable | behavioral tests for every module |
 | Ecosystem differential | **5/13** refreshed 2026-11-10; pydantic now reaches `annotationlib.__eq__` | 8 cases, then upstream suites |
-| Workspace | **3261 passed, 1 skipped**; clippy/fmt green | keep green through the compatibility work |
+| Workspace | **3262 passed, 1 skipped**; clippy/fmt green | keep green through the compatibility work |
 
 Post-baseline fixes since this run: variadic decorator receiver binding,
 PEP 584 `dict | dict`/subclass union, iterable set operands (including
@@ -70,15 +70,12 @@ The four timeouts are `test_bisect.py`, `test_imaplib.py`, `test_queue.py` and
 The three `cpython_fail` entries are `test_extcall.py`, `test_unpack.py` and
 `test_unpack_ex.py`: Hydro passed while the oracle failed, so they are not
 Hydro passes and cannot be counted as parity. A post-run recheck recovered
-`test_dictviews.py` (current known total **37**); three previously pinned
-passes (`test_plistlib.py`, `test_poll.py`, `test_yield_from.py`) still fail
-and must be recovered before the manifest gate can be claimed green.
+`test_dictviews.py` and `test_plistlib.py` (current known total **38**); two
+previously pinned passes (`test_poll.py`, `test_yield_from.py`) still fail and
+must be recovered before the manifest gate can be claimed green.
 
 ### Immediate regression recovery (manifest gate)
 
-- `test_plistlib.py`: `_SubTest` construction calls
-  `builtins.__object_init__` with two arguments; the `object.__init__`
-  binding/spec path must reject/accept exactly CPython's receiver-only shape.
 - `test_poll.py`: `poll.register(..., eventmask=...)` and threaded poll calls
   still route keywords through a native callable that rejects them; the
   `select.poll` method specs need their declared keyword names.

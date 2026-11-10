@@ -2232,9 +2232,9 @@ fn single_element_exception_tuple_expands() {
 }
 
 #[test]
-fn tuple_handler_approximates_user_classes_and_evaluates_runtime_elements() {
-    // A name that names a user class and a dotted name approximate
-    // RuntimeError; builtin tags stay exact.
+fn tuple_handler_with_a_dotted_element_is_fully_dynamic() {
+    // A dotted class element forces the whole tuple to be evaluated at
+    // runtime so each class keeps its identity.
     let source = "\
 class ColorParseError(Exception):
     pass
@@ -2247,15 +2247,8 @@ except (ValueError, ColorParseError, ex.Error):
     assert!(diags.is_empty(), "{diags:?}");
     let handlers = try_handlers(&hir);
     let kinds: Vec<_> = handlers.iter().map(|handler| handler.exc).collect();
-    assert_eq!(
-        kinds,
-        vec![
-            Some(ExcKind::ValueError),
-            Some(ExcKind::RuntimeError),
-            Some(ExcKind::RuntimeError)
-        ]
-    );
-    assert!(handlers.iter().all(|handler| handler.exc_expr.is_none()));
+    assert_eq!(kinds, vec![None]);
+    assert!(handlers[0].exc_expr.is_some());
 
     // A tuple with a non-name element is not rejected: the whole tuple is
     // evaluated at handler entry and matched at runtime.
@@ -14013,7 +14006,7 @@ q = partial(func=f, angular=False)
 }
 
 #[test]
-fn user_exception_raise_lowers_to_runtime_error_with_the_class_name() {
+fn user_exception_raise_preserves_the_class_value() {
     let source = "class ReprError(Exception):\n\
                   \x20   pass\n\
                   \n\
@@ -14031,23 +14024,11 @@ fn user_exception_raise_lowers_to_runtime_error_with_the_class_name() {
             _ => None,
         })
         .expect("raise statement");
-    assert_eq!(raise.0, Some(ExcKind::RuntimeError));
+    // The constructor call is evaluated as a value, preserving `ReprError`
+    // instead of synthesizing `RuntimeError`.
+    assert_eq!(raise.0, None);
+    assert!(raise.1.is_some());
     assert!(raise.2.is_some(), "the `from None` cause must be preserved");
-    let HExprKind::Bin { op, lhs, rhs } = &raise.1.as_ref().expect("message").kind else {
-        panic!("expected the prefixed message concatenation");
-    };
-    assert_eq!(*op, BinOp::Add);
-    assert!(matches!(
-        &lhs.kind,
-        HExprKind::Const(Const::Str(prefix)) if prefix == "ReprError: "
-    ));
-    assert!(matches!(
-        &rhs.kind,
-        HExprKind::Call {
-            callee: Callee::Builtin(Builtin::Str),
-            ..
-        }
-    ));
 
     assert!(crate::sema::check(&hir, &mut infer, "test.py").is_ok());
 }
@@ -14087,7 +14068,7 @@ fn not_implemented_lowers_to_the_reserved_constant() {
 }
 
 #[test]
-fn dotted_raise_lowers_to_the_runtime_error_fallback() {
+fn dotted_raise_lowers_to_a_value_raise() {
     let source = "def fail():\n    raise errors.StyleSyntaxError('bad') from None\n";
     let (hir, _, diags) = lower_source(source, &parse(source));
     assert!(diags.is_empty(), "{diags:?}");
@@ -14100,23 +14081,18 @@ fn dotted_raise_lowers_to_the_runtime_error_fallback() {
             _ => None,
         })
         .expect("raise statement");
-    assert_eq!(raise.0, Some(ExcKind::RuntimeError));
+    // A dotted exception class is a real value; the constructor runs and the
+    // raised object keeps its class instead of becoming `RuntimeError`.
+    assert_eq!(raise.0, None);
+    assert!(raise.1.is_some());
     assert!(raise.2.is_some(), "the `from None` cause must be preserved");
-    let HExprKind::Bin { op, lhs, .. } = &raise.1.as_ref().expect("message").kind else {
-        panic!("expected the prefixed message concatenation");
-    };
-    assert_eq!(*op, BinOp::Add);
-    assert!(matches!(
-        &lhs.kind,
-        HExprKind::Const(Const::Str(prefix)) if prefix == "errors.StyleSyntaxError: "
-    ));
 }
 
 #[test]
-fn user_and_dotted_handlers_approximate_runtime_error() {
-    // A user exception class declared in the unit and a dotted class name
-    // keep the documented RuntimeError approximation (their `raise` forms use
-    // that tag too); a builtin keeps its exact tag.
+fn user_and_dotted_handlers_choose_the_expected_matcher() {
+    // A dotted class is evaluated at runtime so class identity survives; a
+    // bare user class keeps the documented RuntimeError approximation; a
+    // builtin keeps its exact tag.
     let source = "\
 class ColorParseError(Exception):
     pass
@@ -14135,12 +14111,9 @@ except ValueError:
     let kinds: Vec<_> = handlers.iter().map(|handler| handler.exc).collect();
     assert_eq!(
         kinds,
-        vec![
-            Some(ExcKind::RuntimeError),
-            Some(ExcKind::RuntimeError),
-            Some(ExcKind::ValueError)
-        ]
+        vec![None, Some(ExcKind::RuntimeError), Some(ExcKind::ValueError)]
     );
+    assert!(handlers[0].exc_expr.is_some(), "dotted class is dynamic");
 }
 
 #[test]

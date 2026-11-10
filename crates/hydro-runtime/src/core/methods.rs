@@ -4344,6 +4344,25 @@ fn file_attr(obj: i64, attr: &str) -> i64 {
     let mode = file.mode();
     let binary = file.binary();
     let closed = file.closed();
+    // File methods are real bound attributes, not only entries in the native
+    // call dispatch; `getattr(fp, "read")` and `xml.parsers.expat.ParseFile`
+    // both read them.
+    if matches!(
+        attr,
+        "close"
+            | "read"
+            | "readline"
+            | "readlines"
+            | "write"
+            | "writelines"
+            | "flush"
+            | "tell"
+            | "seek"
+            | "__enter__"
+            | "__exit__"
+    ) {
+        return value::bound_method_new(obj, attr.to_string());
+    }
     match attr {
         "name" => value::str_alloc(path),
         "mode" => value::str_alloc(format!("{mode}{}", if binary { "b" } else { "" })),
@@ -4528,6 +4547,22 @@ fn int_arg(v: i64) -> Result<i64, i64> {
             value::type_name(v)
         ))
     })
+}
+
+/// Converts a `seek` offset or whence: a heap `BigInt` is a real integer but
+/// cannot fit the OS position type, so it raises `OverflowError` (which
+/// `plistlib` wraps in `InvalidFileException`) rather than `TypeError`.
+fn seek_int_arg(v: i64) -> Result<i64, i64> {
+    if let Some(integer) = value::as_integer(v) {
+        return Ok(integer);
+    }
+    if value::as_bigint(v).is_some() {
+        return Err(exc::raise_with_message(
+            OVERFLOW_ERROR,
+            "Python int too large to convert to C ssize_t",
+        ));
+    }
+    int_arg(v)
 }
 
 /// Resolves an optional `start`/`end` bound of a searching method to an
@@ -7029,6 +7064,44 @@ fn bytes_method(obj: i64, data: Vec<u8>, method: &str, args: &[i64]) -> i64 {
                 return err;
             }
             value::str_alloc(hex_bytes(&data))
+        }
+        "expandtabs" => {
+            if let Some(err) = check_arity("bytes", method, args.len(), 0, 1) {
+                return err;
+            }
+            let tabsize = match args.first() {
+                Some(arg) => match int_arg(*arg) {
+                    Ok(n) => n.max(0) as usize,
+                    Err(err) => return err,
+                },
+                None => 8,
+            };
+            // CPython treats a non-positive tabsize as "delete tabs" and
+            // resets the column on every LF or CR byte.
+            let mut out = Vec::with_capacity(data.len());
+            let mut column = 0usize;
+            for byte in data {
+                match byte {
+                    b'\t' => {
+                        let padding = if tabsize == 0 {
+                            0
+                        } else {
+                            tabsize - column % tabsize
+                        };
+                        out.extend(std::iter::repeat_n(b' ', padding));
+                        column = column.saturating_add(padding);
+                    }
+                    b'\n' | b'\r' => {
+                        out.push(byte);
+                        column = 0;
+                    }
+                    _ => {
+                        out.push(byte);
+                        column = column.saturating_add(1);
+                    }
+                }
+            }
+            value::bytes_new(out)
         }
         "count" => {
             if let Some(err) = check_arity("bytes", method, args.len(), 1, 3) {
@@ -9852,13 +9925,13 @@ fn file_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             if let Some(err) = check_arity("file", method, args.len(), 1, 2) {
                 return err;
             }
-            let offset = match int_arg(args[0]) {
+            let offset = match seek_int_arg(args[0]) {
                 Ok(offset) => offset,
                 Err(err) => return err,
             };
             let whence = match args.get(1).copied() {
                 None | Some(NONE) => 0,
-                Some(arg) => match int_arg(arg) {
+                Some(arg) => match seek_int_arg(arg) {
                     Ok(whence) => whence,
                     Err(err) => return err,
                 },
@@ -10975,6 +11048,25 @@ mod tests {
         let needle = value::bytes_new(b"na".to_vec());
         assert_eq!(invoke(data, "count", &[needle, int(0), int(4)]), int(1));
         assert_eq!(invoke(data, "count", &[needle, int(-2)]), int(1));
+    }
+
+    #[test]
+    fn bytes_expandtabs_matches_cpython() {
+        reset();
+        let data = value::bytes_new(b"ab\tc\td\ne\rf".to_vec());
+        assert_eq!(
+            value::as_bytes(invoke(data, "expandtabs", &[int(4)])),
+            Some(&b"ab  c   d\ne\rf"[..])
+        );
+        assert_eq!(
+            value::as_bytes(invoke(data, "expandtabs", &[])),
+            Some(&b"ab      c       d\ne\rf"[..])
+        );
+        // Non-positive sizes delete tabs, and 0x0b/0x0c do not reset columns.
+        assert_eq!(
+            value::as_bytes(invoke(data, "expandtabs", &[int(-1)])),
+            Some(&b"abcd\ne\rf"[..])
+        );
     }
 
     #[test]

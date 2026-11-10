@@ -104,6 +104,12 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             value::instance_new(class)
         }
         "__object_init__" => NONE,
+        "__exception_init__" => match args.split_first() {
+            Some((receiver, rest)) => {
+                crate::exc::exception_method_call(*receiver, "__init__", rest).unwrap_or(NONE)
+            }
+            None => NONE,
+        },
         "__object_str__" => core_builtins::call_builtin(Builtin::Str, args.len(), args.as_ptr()),
         "__object_repr__" => core_builtins::call_builtin(Builtin::Repr, args.len(), args.as_ptr()),
         "__object_format__" => {
@@ -142,7 +148,17 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             };
             value::bool_value(!equal)
         }
-        "__object_hash__" => core_builtins::call_builtin(Builtin::Hash, args.len(), args.as_ptr()),
+        "__object_hash__" => {
+            // `object.__hash__` is the identity hash; routing through
+            // `Builtin::Hash` would re-enter `key_hash`, see the class's
+            // inherited `__object_hash__` slot and recurse forever.
+            match args.first() {
+                Some(receiver) => {
+                    ops::int_result((container::identity_hash(*receiver) >> 4) as i64)
+                }
+                None => NONE,
+            }
+        }
         "__object_dir__" => dir(args),
         "__object_sizeof__" => value::encode_int(0).unwrap_or(NONE),
         "__object_reduce_ex__" => NONE,

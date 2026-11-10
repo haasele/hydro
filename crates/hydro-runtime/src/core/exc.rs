@@ -476,7 +476,31 @@ pub(crate) fn exception_class(tag: u32) -> i64 {
         Some(&parent) => exception_class(parent),
         None => NONE,
     };
-    let class = value::class_new(tag_name(tag).to_string(), base, Vec::new());
+    let methods = vec![(
+        "__init__".to_string(),
+        value::native_function_new("builtins", "__exception_init__", usize::MAX),
+    )];
+    // `exception_class` is called lazily while a handler is evaluating an
+    // exception (for example `except struct.error:`), so a pending exception
+    // may be active. Native class creation stops early when `pending()` is
+    // set; park the exception for the allocation and restore it afterwards.
+    let saved = pending().then(pending_value);
+    if saved.is_some() {
+        clear();
+    }
+    let saved_roots = saved.map(|exception| crate::heap::root_values(&[exception]));
+    let class = value::class_new(tag_name(tag).to_string(), base, methods);
+    if let Some(exception) = saved {
+        if class != NONE && !pending() {
+            publish(exception);
+        }
+        if let Some(roots) = saved_roots {
+            crate::heap::release_roots(roots);
+        }
+        if class == NONE {
+            return NONE;
+        }
+    }
     // The cache is invisible to the conservative stack scan, so the class must
     // be an explicit root while it lives in the heap.
     crate::heap::add_thread_root(class);
@@ -2020,12 +2044,39 @@ fn match_exception_value(exception: i64, matcher: i64) -> Result<bool, ()> {
     let Some(data) = value::exception_data(exception) else {
         return Ok(false);
     };
-    let Some(tag) =
-        exception_tag_of_class(matcher).or_else(|| value::exception_tag_of_derived_class(matcher))
-    else {
-        return Ok(false);
-    };
-    Ok(tag_is_subclass(data.tag, tag))
+    if let Some(handler_tag) = exception_tag_of_class(matcher) {
+        // Built-in exception classes are matched by their tag hierarchy.
+        let tag = if known_tag(data.tag) {
+            data.tag
+        } else {
+            value::as_exc_instance(exception)
+                .and_then(|instance| exception_tag_of_class(instance.class))
+                .or_else(|| {
+                    value::instance_class_value(exception)
+                        .and_then(value::exception_tag_of_derived_class)
+                })
+                .unwrap_or(data.tag)
+        };
+        if !known_tag(tag) {
+            // Match [`matches_handler`]'s fallback for an anonymous native
+            // exception payload: it is an ordinary exception, so broad
+            // handlers (`except Exception:`, `except BaseException:`) still
+            // catch it.
+            return Ok(handler_tag == EXCEPTION || handler_tag == BASE_EXCEPTION);
+        }
+        return Ok(tag_is_subclass(tag, handler_tag));
+    }
+    // A native or user exception class that is not in the built-in tag table
+    // (`struct.error`, `re.error`, …) must match by class identity. Mapping it
+    // to its nearest built-in ancestor would make `except struct.error:` catch
+    // every ordinary exception.
+    if let Some(instance) = value::as_exc_instance(exception) {
+        return Ok(value::class_mro(instance.class).contains(&matcher));
+    }
+    if let Some(class) = value::instance_class_value(exception) {
+        return Ok(value::class_mro(class).contains(&matcher));
+    }
+    Ok(false)
 }
 
 /// Whether `candidate` is a class CPython accepts as an exception handler:
@@ -3106,7 +3157,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_classes_are_cached_empty_classes() {
+    fn exception_classes_are_cached_with_a_native_initializer() {
         init();
         let first = exception_class(VALUE_ERROR);
         let second = exception_class(VALUE_ERROR);
@@ -3118,7 +3169,10 @@ mod tests {
             exception_class(EXCEPTION),
             "the native class records its CPython base"
         );
-        assert!(state.methods.is_empty());
+        assert!(
+            state.methods.iter().any(|(name, _, _)| name == "__init__"),
+            "exception classes expose the native initializer"
+        );
         assert!(state.attrs.is_empty());
         assert_eq!(value::class_display_name(first), Some("ValueError"));
 

@@ -1865,7 +1865,14 @@ pub(crate) fn ordereddict_class() -> i64 {
     ));
     let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
     let method_roots = heap::root_values(&method_values);
-    let class = value::class_new_full("OrderedDict".to_string(), NONE, methods, Vec::new());
+    // CPython's `OrderedDict` is a real `dict` subclass; `isinstance(x, dict)`
+    // and libraries such as `plistlib` rely on that relationship.
+    let class = value::class_new_full(
+        "OrderedDict".to_string(),
+        value::dict_class(),
+        methods,
+        Vec::new(),
+    );
     let class_roots = heap::root_values(std::slice::from_ref(&class));
     globals::registry_set("collections.OrderedDict.class", class);
     heap::release_roots(class_roots);
@@ -1880,6 +1887,17 @@ fn ordereddict_data(obj: i64) -> Option<i64> {
         return None;
     }
     value::instance_attr(obj, ORDERED_DATA_ATTR)
+}
+
+/// Whether `value` is an `OrderedDict` (or subclass) instance.
+pub(crate) fn is_ordereddict_instance(value: i64) -> bool {
+    ordereddict_data(value).is_some()
+}
+
+/// The backing pairs of an `OrderedDict` instance, for the generic mapping
+/// protocol (`dict(ordered)`, `dict.update`, plistlib's writer).
+pub(crate) fn ordereddict_mapping_pairs(value: i64) -> Option<&'static [(i64, i64)]> {
+    ordereddict_data(value).and_then(value::as_dict)
 }
 
 /// Snapshot of an `OrderedDict`'s `(key, value)` pairs in insertion order.
