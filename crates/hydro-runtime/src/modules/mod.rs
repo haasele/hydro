@@ -1348,6 +1348,21 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         "sys._monitoring_restart_events",
         native_member("_monitoring_restart_events", 0, 0),
     ),
+    // `sys._current_frames()`: a `{thread_ident: frame}` mapping. The runtime
+    // only observes the calling thread's chain (see `exc::current_frames`), so
+    // the spec exists to give the name a declared arity and a dict result
+    // instead of a dynamic attribute read.
+    (
+        "sys._current_frames",
+        stdlib::FunctionSpec {
+            name: "_current_frames",
+            min_args: 0,
+            max_args: 0,
+            ret: hydro_ir::Type::Dict,
+            params: &[],
+            dynamic_keywords: false,
+        },
+    ),
     // `pickle.Pickler`'s instance methods. The class value lives in this
     // module; the methods take `self` plus their declared argument. The
     // constructor and `persistent_id` declare their parameter names so a
@@ -4469,6 +4484,12 @@ fn supplemental_value(module: &str, name: &str) -> Option<i64> {
         ("builtins", "eval") => Some(value::builtin_function_new(hydro_ir::Builtin::Eval)),
         ("builtins", "exec") => Some(value::builtin_function_new(hydro_ir::Builtin::Exec)),
         ("types", "CellType") => Some(types::cell_type_class()),
+        // `sys._current_frames` is declared in `SUPPLEMENTAL_FUNCTIONS` (it
+        // postdates the static table); reading the attribute must produce the
+        // same builtin function the call path resolves.
+        ("sys", "_current_frames") => {
+            Some(value::native_function_new("sys", "_current_frames", 0))
+        }
         // OS helpers used by the stdlib path modules but absent from the
         // static `os` table.
         ("os", "readlink") => Some(value::native_function_new("os", "readlink", 2)),
@@ -25615,6 +25636,8 @@ fn sys_call(function: &str, args: &[i64]) -> i64 {
         "setrecursionlimit" => sys_setrecursionlimit(args),
         "_getframemodulename" => sys::getframemodulename(args),
         "_getframe" => sys::getframe(args),
+        // `sys._current_frames()`: the frame chain this thread can observe.
+        "_current_frames" => exc::current_frames(),
         "getdefaultencoding" | "getfilesystemencoding" => value::str_from_bytes(b"utf-8"),
         "getfilesystemencodeerrors" => value::str_from_bytes(b"surrogateescape"),
         // Hydro's int↔str conversions are unbounded, which CPython spells as
@@ -26244,11 +26267,14 @@ fn sys_setrecursionlimit(args: &[i64]) -> i64 {
             ),
         );
     };
-    if limit == 0 {
+    // CPython rejects a limit at or below the depth of the frames that are
+    // already live (`depth >= new_limit`); reporting the real depth is the
+    // point of the message. `0` is always below any depth, including zero.
+    if limit == 0 || depth >= limit {
         return exc::raise_with_message(
             RECURSION_ERROR,
             &format!(
-                "cannot set the recursion limit to 0 at the recursion depth {depth}: \
+                "cannot set the recursion limit to {limit} at the recursion depth {depth}: \
                  the limit is too low"
             ),
         );
@@ -30367,18 +30393,22 @@ mod tests {
             .find_map(|(key, item)| (value::as_str(*key) == Some(name)).then_some(*item))
     }
 
-    /// Fiber body used by the frame-isolation test: it must see its own
-    /// activation as depth 0 and must not see the resumer's frames at depth 1.
+    /// Fiber body used by the frame-boundary test.
+    ///
+    /// While the generator runs, CPython keeps one frame stack per thread: the
+    /// resumer's frames sit *below* the generator's, so this probe sees its own
+    /// activation at depth 0, the resumer's `<module>` frame at depth 1, and a
+    /// truthful `ValueError` only past that end (depth 2).
     extern "C" fn fiber_frame_probe(_argv: *const i64) -> i64 {
-        let mut slots = [NONE];
+        let mut slots = [NONE; 4];
         let token = crate::abi::hydro_gc_frame_push(slots.as_mut_ptr(), slots.len());
         crate::abi::hydro_gc_frame_used(token, slots.len());
         crate::abi::hydro_frame_enter(b"probe".as_ptr(), 5);
         crate::abi::hydro_frame_bind(
             slots.as_mut_ptr(),
-            1,
-            b"slot".as_ptr(),
             4,
+            b"slot\0frame\0back\0past".as_ptr(),
+            20,
             0,
             0x3,
             b"__main__".as_ptr(),
@@ -30393,10 +30423,13 @@ mod tests {
             1,
             [int(0)].as_ptr(),
         );
+        assert!(!exc::pending(), "depth 0 must observe the probe activation");
         slots[0] = frame;
         let name = frame_attr(frame_attr(frame, "f_code"), "co_name");
-        slots[0] = name;
-        let _ = crate::abi::hydro_module_call(
+        slots[1] = name;
+
+        // The resumer's activation is spliced below the fiber's own frames.
+        let back = crate::abi::hydro_module_call(
             b"sys".as_ptr(),
             3,
             b"_getframe".as_ptr(),
@@ -30404,14 +30437,34 @@ mod tests {
             1,
             [int(1)].as_ptr(),
         );
-        let isolated = if exc::pending_tag() == VALUE_ERROR as i64 {
+        assert!(!exc::pending(), "depth 1 must cross the fiber boundary");
+        slots[2] = back;
+        let back_name = frame_attr(frame_attr(back, "f_code"), "co_name");
+        slots[3] = back_name;
+        // `f_back` and `sys._getframe(1)` must describe the same frame; the two
+        // strings are separate allocations, so compare their text.
+        assert_eq!(
+            value::as_str(back_name),
+            value::as_str(name_of_back(frame))
+        );
+
+        // Depth 2 is truly past the end of the thread's frame chain.
+        let _ = crate::abi::hydro_module_call(
+            b"sys".as_ptr(),
+            3,
+            b"_getframe".as_ptr(),
+            9,
+            1,
+            [int(2)].as_ptr(),
+        );
+        let past_end = if exc::pending_tag() == VALUE_ERROR as i64 {
             exc::clear();
             TRUE
         } else {
             exc::clear();
             FALSE
         };
-        let result = value::tuple_new(vec![name, isolated]);
+        let result = value::tuple_new(vec![name, back_name, past_end]);
         slots[0] = result;
         // Publish one generator value before the probe frame is torn down.
         let _ = crate::abi::hydro_yield(result);
@@ -30420,8 +30473,18 @@ mod tests {
         result
     }
 
+    /// Name of `frame.f_back`, used by [`fiber_frame_probe`] to prove that the
+    /// `f_back` chain and `sys._getframe(depth)` agree across the boundary.
+    fn name_of_back(frame: i64) -> i64 {
+        let back = frame_attr(frame, "f_back");
+        if back == NONE {
+            return NONE;
+        }
+        frame_attr(frame_attr(back, "f_code"), "co_name")
+    }
+
     #[test]
-    fn sys_getframe_keeps_fiber_frames_separate() {
+    fn sys_getframe_crosses_the_fiber_boundary() {
         exc::init();
         let mut slots = [NONE];
         let token = crate::abi::hydro_gc_frame_push(slots.as_mut_ptr(), slots.len());
@@ -30446,11 +30509,17 @@ mod tests {
         let mut result = NONE;
         assert_eq!(crate::abi::hydro_iter_next(iterator, &mut result), 1);
         let items = value::as_tuple(result).expect("probe result tuple");
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
         assert_eq!(value::as_str(items[0]), Some("probe"));
-        assert_eq!(items[1], TRUE);
+        assert_eq!(
+            value::as_str(items[1]),
+            Some("<module>"),
+            "the resumer's frame must be f_back of the generator's frame"
+        );
+        assert_eq!(items[2], TRUE);
 
-        // The resumer's frame stack is intact after the fiber finished.
+        // The resumer's frame stack is intact once the fiber suspends or
+        // finishes: its prefix was handed back, not copied.
         let outer = call("sys", "_getframe", &[int(0)]);
         assert!(!exc::pending());
         assert_eq!(
@@ -30681,6 +30750,195 @@ mod tests {
         call_value(frame, &[int(0)]);
         assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
         exc::clear();
+    }
+
+    #[test]
+    fn sys_current_frames_maps_the_running_chain() {
+        exc::init();
+        // A thread with no live activation contributes no entry, exactly like
+        // CPython's mapping of threads that never ran Python code.
+        let empty = call("sys", "_current_frames", &[]);
+        assert!(!exc::pending());
+        assert_eq!(value::as_dict(empty).map(|entries| entries.len()), Some(0));
+        // The attribute read yields the same callable the module-call path uses.
+        let current_frames = get("sys", "_current_frames");
+        assert_eq!(value::type_name(current_frames), "function");
+        let direct = call_value(current_frames, &[]);
+        assert!(!exc::pending());
+        assert_eq!(value::as_dict(direct).map(|entries| entries.len()), Some(0));
+
+        let mut slots = [NONE; 2];
+        let token = crate::abi::hydro_gc_frame_push(slots.as_mut_ptr(), slots.len());
+        crate::abi::hydro_gc_frame_used(token, slots.len());
+        crate::abi::hydro_frame_enter(b"probe".as_ptr(), 5);
+        crate::abi::hydro_frame_bind(
+            slots.as_mut_ptr(),
+            2,
+            b"a\0b".as_ptr(),
+            3,
+            0,
+            0x3,
+            b"__main__".as_ptr(),
+            8,
+            4,
+        );
+        slots[0] = int(1);
+        slots[1] = string("two");
+
+        let frames = call("sys", "_current_frames", &[]);
+        assert!(!exc::pending());
+        let entries = value::as_dict(frames).expect("mapping");
+        assert_eq!(entries.len(), 1, "only this thread is observable");
+        let (ident, frame) = entries[0];
+        assert_eq!(
+            value::as_integer(ident),
+            Some(crate::heap::current_thread_id())
+        );
+        // The mapped frame is the innermost running activation, with its live
+        // locals view, not a placeholder.
+        assert_eq!(
+            value::as_str(frame_attr(frame_attr(frame, "f_code"), "co_name")),
+            Some("probe")
+        );
+        assert_eq!(locals_entry(frame_attr(frame, "f_locals"), "a"), Some(int(1)));
+
+        crate::abi::hydro_frame_leave();
+        crate::abi::hydro_gc_frame_pop(token);
+        // Once the activation is gone the mapping is empty again.
+        let empty = call("sys", "_current_frames", &[]);
+        assert!(!exc::pending());
+        assert_eq!(value::as_dict(empty).map(|entries| entries.len()), Some(0));
+        exc::init();
+    }
+
+    #[test]
+    fn frame_trace_setter_and_clear_follow_cpython() {
+        exc::init();
+        let mut slots = [NONE; 1];
+        let token = crate::abi::hydro_gc_frame_push(slots.as_mut_ptr(), slots.len());
+        crate::abi::hydro_gc_frame_used(token, slots.len());
+        crate::abi::hydro_frame_enter(b"probe".as_ptr(), 5);
+        crate::abi::hydro_frame_bind(
+            slots.as_mut_ptr(),
+            1,
+            b"local".as_ptr(),
+            5,
+            0,
+            0x3,
+            b"__main__".as_ptr(),
+            8,
+            1,
+        );
+        let frame = call("sys", "_getframe", &[int(0)]);
+        assert!(!exc::pending());
+        slots[0] = frame;
+
+        // `f_trace` starts as `None` and is the one writable frame slot.
+        assert_eq!(frame_attr(frame, "f_trace"), NONE);
+        assert_eq!(
+            crate::methods::setattr(frame, b"f_trace".as_ptr(), 7, int(7)),
+            NONE
+        );
+        assert!(!exc::pending());
+        assert_eq!(frame_attr(frame, "f_trace"), int(7));
+
+        // The remaining slots report CPython's precise errors.
+        crate::methods::setattr(frame, b"f_code".as_ptr(), 6, NONE);
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "attribute 'f_code' of 'frame' objects is not writable"
+        );
+        exc::clear();
+        crate::methods::setattr(frame, b"f_lineno".as_ptr(), 8, int(3));
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        assert_eq!(message(), "f_lineno can only be set in a trace function");
+        exc::clear();
+        crate::methods::setattr(frame, b"nope".as_ptr(), 4, NONE);
+        assert_eq!(exc::pending_tag(), ATTRIBUTE_ERROR as i64);
+        exc::clear();
+
+        // A frame that is still on the running chain cannot be cleared.
+        crate::methods::call(frame, b"clear".as_ptr(), 5, 0, std::ptr::null());
+        assert_eq!(exc::pending_tag(), exc::RUNTIME_ERROR as i64);
+        assert_eq!(message(), "cannot clear an executing frame");
+        exc::clear();
+
+        // Keep the object alive past its activation, then clear it: the locals
+        // binding and the trace callback both disappear.
+        crate::heap::add_thread_root(frame);
+        crate::abi::hydro_frame_leave();
+        crate::abi::hydro_gc_frame_pop(token);
+        // `slots[0]` held the frame itself, so the snapshot taken at activation
+        // end keeps that value under the bound name.
+        assert_eq!(
+            locals_entry(frame_attr(frame, "f_locals"), "local"),
+            Some(frame)
+        );
+        crate::methods::call(frame, b"clear".as_ptr(), 5, 0, std::ptr::null());
+        assert!(!exc::pending());
+        assert_eq!(frame_attr(frame, "f_trace"), NONE);
+        assert_eq!(value::as_dict(frame_attr(frame, "f_locals")).map(|d| d.len()), Some(0));
+        exc::init();
+    }
+
+    #[test]
+    fn sys_setrecursionlimit_reports_live_frame_depth() {
+        exc::init();
+        let mut slots = [NONE; 1];
+        let token = crate::abi::hydro_gc_frame_push(slots.as_mut_ptr(), slots.len());
+        crate::abi::hydro_gc_frame_used(token, slots.len());
+        crate::abi::hydro_frame_enter(b"outer".as_ptr(), 5);
+        crate::abi::hydro_frame_bind(
+            slots.as_mut_ptr(),
+            1,
+            b"x".as_ptr(),
+            1,
+            0,
+            0x3,
+            b"__main__".as_ptr(),
+            8,
+            1,
+        );
+        let mut inner_slots = [NONE; 1];
+        let inner_token = crate::abi::hydro_gc_frame_push(inner_slots.as_mut_ptr(), 1);
+        crate::abi::hydro_gc_frame_used(inner_token, 1);
+        crate::abi::hydro_frame_enter(b"inner".as_ptr(), 5);
+        crate::abi::hydro_frame_bind(
+            inner_slots.as_mut_ptr(),
+            1,
+            b"y".as_ptr(),
+            1,
+            0,
+            0x3,
+            b"__main__".as_ptr(),
+            8,
+            2,
+        );
+
+        // Two live activations, no dynamic call charge: the frame chain is
+        // what `sys.setrecursionlimit` reports.
+        assert_eq!(exc::frame_depth(), 2);
+        assert_eq!(crate::fiber::recursion_depth(), 2);
+        let limit = as_int(call("sys", "getrecursionlimit", &[]));
+        call("sys", "setrecursionlimit", &[int(1)]);
+        assert_eq!(exc::pending_tag(), exc::RECURSION_ERROR as i64);
+        assert_eq!(
+            message(),
+            "cannot set the recursion limit to 1 at the recursion depth 2: the limit is too low"
+        );
+        exc::clear();
+        // A limit above the live depth is accepted and observable again.
+        assert_eq!(call("sys", "setrecursionlimit", &[int(limit)]), NONE);
+        assert!(!exc::pending());
+        assert_eq!(as_int(call("sys", "getrecursionlimit", &[])), limit);
+
+        crate::abi::hydro_frame_leave();
+        crate::abi::hydro_gc_frame_pop(inner_token);
+        crate::abi::hydro_frame_leave();
+        crate::abi::hydro_gc_frame_pop(token);
+        assert_eq!(exc::frame_depth(), 0);
+        exc::init();
     }
 
     #[test]

@@ -786,6 +786,7 @@ impl Activation {
             line: AtomicU32::new(self.line),
             flags: AtomicU32::new(self.flags),
             argcount: AtomicUsize::new(self.params),
+            trace: Mutex::new(NONE),
             parent,
             locals: FrameLocals {
                 base: AtomicUsize::new(self.base as usize),
@@ -814,6 +815,12 @@ pub(crate) struct FrameData {
     pub(crate) line: AtomicU32,
     pub(crate) flags: AtomicU32,
     pub(crate) argcount: AtomicUsize,
+    /// `frame.f_trace`: the per-frame trace callback, or `None`. CPython stores
+    /// it on the frame; observing it through `f_trace` is the only way a
+    /// compiled activation can be told apart from an untraced one. The payload
+    /// lives outside the collector's graph, so an assigned value is retained as
+    /// a process-wide root (see [`frame_setattr`]).
+    pub(crate) trace: Mutex<i64>,
     pub(crate) parent: Option<Arc<FrameData>>,
     pub(crate) locals: FrameLocals,
 }
@@ -901,6 +908,18 @@ pub(crate) fn take_thread_frames() -> Vec<Activation> {
 /// [`take_thread_frames`]).
 pub(crate) fn install_thread_frames(frames: Vec<Activation>) {
     STATE.with(|state| state.borrow_mut().frames = frames);
+}
+
+/// Number of activations on the running frame chain: CPython's recursion depth
+/// as observed by `sys.setrecursionlimit` and `len(sys._current_frames()[id])`
+/// walked through `f_back`.
+///
+/// This is the *frame* depth, not the dynamic-call counter in
+/// `fiber::recursion_depth`: generated code enters one activation per function
+/// (including statically resolved calls the depth guard never sees), so the
+/// chain is the honest measure of how many Python frames are live.
+pub(crate) fn frame_depth() -> usize {
+    with_frames(|frames| frames.len())
 }
 
 // Source location tracking
@@ -1150,10 +1169,119 @@ pub(crate) fn frame_attr(frame: i64, name: &str) -> Option<i64> {
         // CPython reports the last instruction index; the runtime keeps no
         // bytecode, so the conventional "no instruction" value is truthful.
         "f_lasti" => Some(value::encode_int(-1).expect("fits")),
-        "f_trace" => Some(value::NONE),
+        "f_trace" => Some(*data.trace.lock().unwrap_or_else(|p| p.into_inner())),
         "__class__" => Some(value::frame_class()),
         _ => None,
     }
+}
+
+/// Assignment to a frame attribute: `frame.f_trace = value` and the read-only
+/// slots CPython rejects with a precise error.
+///
+/// `None` means the name is not a frame attribute at all (the caller raises the
+/// ordinary `AttributeError`); every other result is the call's return value,
+/// which is `None` on success and a raised exception otherwise.
+pub(crate) fn frame_setattr(frame: i64, name: &str, new_value: i64) -> Option<i64> {
+    let state = value::as_frame(frame)?;
+    match name {
+        "f_trace" => {
+            // The activation record is native memory outside the collector's
+            // graph, so keep the assigned value reachable for as long as the
+            // record remembers it. A replaced callback stays rooted (the
+            // process-wide root list is only cleared on a fresh program run),
+            // which `f_trace` assignments make rare enough to be the same
+            // conservative retention the locals snapshot already uses.
+            crate::heap::add_global_root(new_value);
+            *state
+                .data
+                .trace
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = new_value;
+            Some(NONE)
+        }
+        // CPython allows this only while a trace function drives the frame; the
+        // runtime has no tracing hooks, so the precise error is the truthful
+        // answer instead of silently moving the reported line.
+        "f_lineno" => Some(raise_with_message(
+            VALUE_ERROR,
+            "f_lineno can only be set in a trace function",
+        )),
+        "f_back" | "f_code" | "f_globals" | "f_locals" | "f_lasti" | "f_builtins" => Some(
+            raise_with_message(
+                ATTRIBUTE_ERROR,
+                &format!("attribute '{name}' of 'frame' objects is not writable"),
+            ),
+        ),
+        _ => None,
+    }
+}
+
+/// `frame.clear()`: drop the frame's local bindings and trace callback.
+///
+/// CPython refuses while the frame is running or suspended, because its locals
+/// storage is still owned by the interpreter; the same two states are visible
+/// here as a live slot binding that is (or is not) on the running chain.
+/// `None` means `frame` is not a frame object.
+pub(crate) fn frame_clear(frame: i64) -> Option<i64> {
+    let state = value::as_frame(frame)?;
+    let data = &state.data;
+    if data.locals.base.load(Ordering::Relaxed) != 0 {
+        let executing = with_frames(|frames| {
+            frames.iter().any(|activation| {
+                activation
+                    .cached
+                    .as_ref()
+                    .is_some_and(|cached| Arc::ptr_eq(cached, data))
+            })
+        });
+        let message = if executing {
+            "cannot clear an executing frame"
+        } else {
+            // A suspended generator's activation still owns slots on its fiber
+            // stack; its locals are only snapshotted when it finishes.
+            "cannot clear a suspended frame"
+        };
+        return Some(raise_with_message(RUNTIME_ERROR, message));
+    }
+    // The empty dict is rooted for the same reason `frame_leave` roots its
+    // snapshot: the record lives outside the collector's graph.
+    let locals = value::dict_new(Vec::new());
+    crate::heap::add_global_root(locals);
+    *data
+        .locals
+        .snapshot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(locals);
+    data.locals.slots.store(0, Ordering::Relaxed);
+    *data
+        .trace
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = NONE;
+    Some(NONE)
+}
+
+/// `sys._current_frames()`: the innermost activation of each thread that can be
+/// observed, keyed by its thread identifier.
+///
+/// Hydro keeps frame chains in thread-local state (and in the running fiber, see
+/// [`with_frames`]), so another thread's chain cannot be walked without pausing
+/// it. The honest result is therefore this thread's top frame; a thread with no
+/// active activation contributes no entry, exactly like CPython skips a thread
+/// that has never run Python code.
+pub(crate) fn current_frames() -> i64 {
+    let Some(data) = frame_at(0) else {
+        return value::dict_new(Vec::new());
+    };
+    let dict = value::dict_new(Vec::new());
+    let dict_root = crate::heap::root_values(&[dict]);
+    let ident = value::encode_int(crate::heap::current_thread_id())
+        .expect("thread identifiers fit in a tagged integer");
+    let frame = value::frame_new(data);
+    let entry_root = crate::heap::root_values(&[ident, frame]);
+    crate::container::dict_set(dict, ident, frame);
+    crate::heap::release_roots(entry_root);
+    crate::heap::release_roots(dict_root);
+    dict
 }
 
 /// Attribute lookup on a code object.

@@ -644,16 +644,19 @@ impl Drop for CallDepthGuard {
     }
 }
 
-/// Depth of the Python call chain currently running on this thread, in frames
-/// below the innermost active call.
+/// Depth of the Python call chain currently running on this thread.
 ///
-/// `sys.setrecursionlimit` (modules/mod.rs) rejects a limit at or below this
-/// value, mirroring CPython's `"cannot set the recursion limit to N at the
-/// recursion depth D"` check; the runtime side of that message currently
-/// hard-codes depth `0`.
-#[allow(dead_code)] // used by modules/mod.rs once the limit check lands there
+/// CPython reports `py_recursion_limit - py_recursion_remaining`, i.e. the number
+/// of Python frames that are live; `sys.setrecursionlimit` (modules/mod.rs)
+/// rejects a limit at or below that value and puts it in the error message.
+/// The frame chain is the authoritative count here: generated code enters one
+/// activation per function, including statically resolved calls that never pass
+/// through [`enter_python_call`]. The depth guard's counter is folded in with
+/// `max` so a dynamic call observed without a matching frame (a native re-entry)
+/// is still accounted for.
 pub(crate) fn recursion_depth() -> usize {
-    CALL_DEPTH.with(Cell::get)
+    let calls = CALL_DEPTH.with(Cell::get);
+    calls.max(exc::frame_depth())
 }
 
 /// Checks that one more Python call fits in the configured recursion limit and
@@ -800,9 +803,10 @@ unsafe fn detach_caller_frames(ptr: *mut FiberState) {
             // observed or modified its emptied vector meanwhile.
             (*owner).saved_frames = caller;
         } else {
-            // Only a fiber resumer is spliced today; thread frames are left
-            // in the thread state and never reach this path.
-            debug_assert!(caller.is_empty(), "thread frames must not be spliced");
+            // The resumer ran on the thread's own stack: hand its activations
+            // back to the thread state (the reverse of the `resume_raw`
+            // splice), so the resumer's own `f_back` chain is intact again.
+            exc::install_thread_frames(caller);
         }
         (*ptr).frame_base = 0;
         (*ptr).frame_owner = std::ptr::null_mut();
@@ -932,10 +936,15 @@ pub(crate) unsafe fn resume_raw(ptr: *mut FiberState, value: i64) -> bool {
                 (*ptr).frame_owner = outer.ptr;
             }
             _ => {
-                // Resumed from the thread's own stack: the resumer's frames
-                // live in the thread state and stay there (a suspended fiber
-                // must not expose them).
-                (*ptr).frame_base = 0;
+                // Resumed from the thread's own stack: the resumer's
+                // activations move out of the thread state into this fiber for
+                // the duration of the resume, exactly like a fiber resumer's.
+                // They are handed back by [`detach_caller_frames`], so a
+                // suspended fiber never exposes frames that are not its own.
+                let mut inherited = exc::take_thread_frames();
+                (*ptr).frame_base = inherited.len();
+                inherited.append(&mut (*ptr).saved_frames);
+                (*ptr).saved_frames = inherited;
                 (*ptr).frame_owner = std::ptr::null_mut();
             }
         }
