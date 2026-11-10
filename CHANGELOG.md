@@ -28,6 +28,17 @@ initial state of the first runnable core.
   `type(cm).__exit__` and pass the manager explicitly; the native unittest
   cleanup path no longer double-binds the receiver and `test_repl`'s
   `tearDownClass` errors disappear.
+- Decorated methods whose wrapper has the shape `def wrapper(*args)` now
+  receive the receiver in that variadic slot instead of having it overwritten
+  when the collected `*args` list is installed. This fixes standard decorators
+  such as `test.support`'s `reap_threads` and `functools.wraps`-based method
+  wrappers, which previously saw an empty argument tuple and reported a
+  missing `self`.
+- PEP 584 dict union works for exact dicts and dict subclasses:
+  `dict | dict` returns a new plain dict with right-hand entries winning, and
+  `dict_merge` now accepts mapping pairs from subclasses/defaultdicts.
+  In-place `dict |=` still lowers as a rebind (the generic AugAssign path has
+  no in-place ABI yet); that remains open.
 - Latest official differential run (2026-11-10T17:20:05Z) reached **36/398
   `hydro_pass`** (296 `hydro_fail`, 56 `expected_fail`, 4 timeouts, 3 watchdog
   memkills, 3 `cpython_fail`). Seven tests newly passed
@@ -108,7 +119,7 @@ initial state of the first runnable core.
   CPython.
 - C3 class construction, `super()` defining-class tracking, regex flags
   (`re.U` implied for `str` patterns) and the workspace clippy/fmt gates are
-  green. Canonical workspace count: 3260 tests run, 1 skipped.
+  green. Canonical workspace count: 3261 tests run, 1 skipped.
 
 ### Compatibility — `__class__`
 

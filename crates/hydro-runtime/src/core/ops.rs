@@ -400,6 +400,12 @@ pub(crate) fn binop(op: u32, a: i64, b: i64) -> i64 {
             return type_union_error(a, b);
         }
     }
+    // PEP 584: `dict | dict` returns a new plain dict, with the right-hand
+    // entries winning. A non-dict operand falls through to the bitwise path,
+    // which reports the normal `unsupported operand type(s)` TypeError.
+    if op == OP_BIT_OR && value::mapping_pairs(a).is_some() && value::mapping_pairs(b).is_some() {
+        return crate::core::builtins::dict_merge(a, b);
+    }
     // Set operators over sets and live `dict` views (`dict_keys`/`dict_items`).
     if matches!(op, OP_BIT_AND | OP_BIT_OR | OP_BIT_XOR | OP_SUB)
         && container::is_set_like(a)
@@ -2066,6 +2072,16 @@ mod tests {
         assert_eq!(as_int(binop(OP_POW, int(0), int(0))), 1);
         assert_eq!(as_int(binop(OP_POW, int(-2), int(3))), -8);
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn dict_union_returns_plain_dict() {
+        exc::init();
+        let left = value::dict_new(vec![(int(1), int(2)), (int(3), int(4))]);
+        let right = value::dict_new(vec![(int(3), int(9)), (int(5), int(6))]);
+        let result = binop(OP_BIT_OR, left, right);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert_eq!(value::to_string(result), "{1: 2, 3: 9, 5: 6}");
     }
 
     #[test]

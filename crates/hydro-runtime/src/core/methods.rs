@@ -1700,15 +1700,24 @@ fn call_user_method_kw(
         MethodKind::Classmethod => Some(class),
         MethodKind::Staticmethod => None,
     };
+    // A decorator wrapper commonly has the shape `def wrapper(*args)`.  The
+    // first signature slot is then the `*args` slot itself; putting the
+    // receiver into `slots[0]` would be overwritten when the collected varargs
+    // list is installed below, so seed that list instead.
+    let mut receiver_vararg = None;
     if let Some(receiver) = receiver {
         if capture_count < slots.len() {
-            // Normal methods bind the instance; classmethods bind the class.
-            slots[capture_count] = Some(receiver);
+            if signature[capture_count].kind == ParamKind::VarArg {
+                receiver_vararg = Some(receiver);
+            } else {
+                // Normal methods bind the instance; classmethods bind the class.
+                slots[capture_count] = Some(receiver);
+            }
         }
     }
 
     let mut next_positional = 0usize;
-    let mut vararg_items: Vec<i64> = Vec::new();
+    let mut vararg_items: Vec<i64> = receiver_vararg.into_iter().collect();
     for (index, param) in signature.iter().enumerate().skip(receiver_count) {
         match param.kind {
             // Positional-only parameters bind exactly like positional ones;

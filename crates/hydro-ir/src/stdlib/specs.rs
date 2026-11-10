@@ -1685,7 +1685,7 @@ pub static THREADING: ModuleSpec = ModuleSpec {
         f("main_thread", 0, 0, Type::Any),
         f("_threadbase_init", 1, 4, Type::None),
         f("_threadbase_start", 1, 1, Type::None),
-        f("_threadbase_join", 1, 2, Type::None),
+        kw("_threadbase_join", 1, 2, Type::None, &["self", "timeout"]),
         f("_threadbase_is_alive", 1, 1, Type::Bool),
         f("_threadbase_run", 1, 1, Type::None),
         // `stack_size([size])`: with no argument, the stack size used for

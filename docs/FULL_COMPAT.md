@@ -56,7 +56,11 @@ checkout with the pinned oracle:
 | First-error families | **259** distinct rows | collapse by root cause; do not patch one error per test |
 | Stdlib imports | **288/297**; **288/288** comparable | behavioral tests for every module |
 | Ecosystem differential | **5/13** refreshed 2026-11-10; pydantic now reaches `annotationlib.__eq__` | 8 cases, then upstream suites |
-| Workspace | **3260 passed, 1 skipped**; clippy/fmt green | keep green through the compatibility work |
+| Workspace | **3261 passed, 1 skipped**; clippy/fmt green | keep green through the compatibility work |
+
+Post-baseline fixes since this run: variadic decorator receiver binding and
+PEP 584 `dict | dict`/subclass union, both covered by workspace tests and
+minimal scripts but not yet included in a fresh 398-test rerun.
 
 The four timeouts are `test_bisect.py`, `test_imaplib.py`, `test_queue.py` and
 `test_signal.py`. The three watchdog kills are `test_zipfile64.py`,
@@ -81,11 +85,12 @@ be claimed green.
 - `test_yield_from.py`: module-level `TypeError: 'str' object is not callable`
   while exercising `yield from ()`; isolate the shadowed callable and add a
   minimal regression.
-- `test_repl.py` improved from 17 to 15 failures after the cleanup and
-  descriptor fixes. Remaining first blockers: Popen `stdin`/`stdout`/`stderr`
-  stream attributes, `communicate()`, the Popen context-manager protocol, the
-  `wrapper() missing required argument 'self'` partial path, and
-  `asyncio/__main__.py`'s relative `from . import futures` under `-m`.
+- `test_repl.py` currently has 16 failing entries after the cleanup,
+  descriptor, variadic-decorator and dict-union fixes (more subtests now run
+  than the earlier 15-failure state). Remaining first blockers: Popen
+  `stdin`/`stdout`/`stderr` stream attributes, `communicate()`, the Popen
+  context-manager protocol, and `asyncio/__main__.py`'s relative
+  `from . import futures` under `-m`.
 
 ## Workstreams — everything still missing
 
@@ -167,11 +172,16 @@ Observed current families:
   `test_base64.py`), codec callbacks (`test_codeccallbacks.py`), Unicode
   identifiers/source encodings (`test_unicode_identifiers.py`,
   `test_utf8source.py`, `test_source_encoding.py`).
-- **Containers/iteration:** `dict.update` with no positional argument
+- **Containers/iteration:** `dict | dict` now works for exact dicts and
+  subclasses (right-hand entries win, plain-dict result); in-place
+  `dict |=` still rebinds through the generic AugAssign path and needs an
+  in-place ABI. Also open: `dict.update` with no positional argument
   (`test_dict.py`), list/tuple keyword constructors, unhashable set behavior
-  (`test_set.py`, `test_pprint.py`), dict views, iterator/unpacking errors
-  (`test_iter.py`), sequence index/protocol behavior (`test_index.py`,
-  `test_bigaddrspace.py`), ordered comparison type errors.
+  (`test_set.py`, `test_pprint.py`), dict-view set operations against
+  arbitrary iterables, recursive view reprs and copying
+  (`test_dictviews.py`), iterator/unpacking errors (`test_iter.py`), sequence
+  index/protocol behavior (`test_index.py`, `test_bigaddrspace.py`), and
+  ordered comparison type errors.
 - **Numbers:** BigInt exponent/convert paths (`test_pow.py`, `test_long.py`),
   float formatting/rounding (`test_float.py`, `test_int.py`), Decimal hashes
   and numeric tower (`test_numeric_tower.py`), Fraction construction

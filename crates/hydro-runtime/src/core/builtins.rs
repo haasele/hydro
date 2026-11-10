@@ -6998,7 +6998,7 @@ pub(crate) fn all(iterable: i64) -> i64 {
 /// filled through [`container::dict_insert_barrier`], so every inserted key
 /// and value gets its GC edge.
 pub(crate) fn dict_merge(left: i64, right: i64) -> i64 {
-    let Some(left_pairs) = value::as_dict(left) else {
+    let Some(left_pairs) = value::mapping_pairs(left) else {
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
@@ -7007,7 +7007,7 @@ pub(crate) fn dict_merge(left: i64, right: i64) -> i64 {
             ),
         );
     };
-    let Some(right_pairs) = value::as_dict(right) else {
+    let Some(right_pairs) = value::mapping_pairs(right) else {
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
