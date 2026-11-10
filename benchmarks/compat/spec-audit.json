@@ -1,6 +1,6 @@
 {
   "meta": {
-    "generated_at": "2026-11-10T01:04:45Z",
+    "generated_at": "2026-11-10T01:31:51Z",
     "python_target": "3.14.9",
     "python_executable": "/usr/bin/python3.14",
     "python_version": "3.14.9",
@@ -15,18 +15,18 @@
       "native": 108,
       "pure_python": 79,
       "with_missing_public": 59,
-      "total_missing_public": 1898,
+      "total_missing_public": 1868,
       "with_extra_public": 54,
       "total_extra_public": 618,
       "with_arity_mismatch": 31,
-      "total_arity_mismatch": 83
+      "total_arity_mismatch": 91
     }
   },
   "modules": [
     {
       "spec": "FUTURE",
       "name": "__future__",
-      "line": 4676,
+      "line": 4740,
       "functions": [],
       "constants": [
         "all_feature_names",
@@ -151,7 +151,7 @@
     {
       "spec": "_ABC",
       "name": "_abc",
-      "line": 8060,
+      "line": 8124,
       "functions": [
         "abstractmethod",
         "get_cache_token",
@@ -229,7 +229,7 @@
     {
       "spec": "_AST",
       "name": "_ast",
-      "line": 8308,
+      "line": 8372,
       "functions": [
         "literal_eval",
         "parse",
@@ -1110,7 +1110,7 @@
     {
       "spec": "_ASYNCIO",
       "name": "_asyncio",
-      "line": 8287,
+      "line": 8351,
       "functions": [
         "run",
         "sleep",
@@ -1299,7 +1299,7 @@
     {
       "spec": "_BISECT",
       "name": "_bisect",
-      "line": 3429,
+      "line": 3493,
       "functions": [
         "bisect_left",
         "bisect_right",
@@ -1450,7 +1450,7 @@
     {
       "spec": "_BLAKE2",
       "name": "_blake2",
-      "line": 7318,
+      "line": 7382,
       "functions": [
         "blake2b",
         "blake2s"
@@ -1571,7 +1571,7 @@
     {
       "spec": "_BZ2",
       "name": "_bz2",
-      "line": 7365,
+      "line": 7429,
       "functions": [
         "BZ2Compressor",
         "BZ2Decompressor",
@@ -1649,7 +1649,7 @@
     {
       "spec": "_CODECS",
       "name": "_codecs",
-      "line": 5479,
+      "line": 5543,
       "functions": [
         "encode",
         "decode",
@@ -2148,7 +2148,7 @@
     {
       "spec": "_CODECS_CN",
       "name": "_codecs_cn",
-      "line": 7930,
+      "line": 7994,
       "functions": [
         "getcodec"
       ],
@@ -2208,7 +2208,7 @@
     {
       "spec": "_CODECS_HK",
       "name": "_codecs_hk",
-      "line": 7954,
+      "line": 8018,
       "functions": [
         "getcodec"
       ],
@@ -2267,7 +2267,7 @@
     {
       "spec": "_CODECS_ISO2022",
       "name": "_codecs_iso2022",
-      "line": 7960,
+      "line": 8024,
       "functions": [
         "getcodec"
       ],
@@ -2323,7 +2323,7 @@
     {
       "spec": "_CODECS_JP",
       "name": "_codecs_jp",
-      "line": 7936,
+      "line": 8000,
       "functions": [
         "getcodec"
       ],
@@ -2390,7 +2390,7 @@
     {
       "spec": "_CODECS_KR",
       "name": "_codecs_kr",
-      "line": 7942,
+      "line": 8006,
       "functions": [
         "getcodec"
       ],
@@ -2449,7 +2449,7 @@
     {
       "spec": "_CODECS_TW",
       "name": "_codecs_tw",
-      "line": 7948,
+      "line": 8012,
       "functions": [
         "getcodec"
       ],
@@ -2507,7 +2507,7 @@
     {
       "spec": "_COLLECTIONS",
       "name": "_collections",
-      "line": 5467,
+      "line": 5531,
       "functions": [
         "defaultdict",
         "OrderedDict",
@@ -2579,7 +2579,7 @@
     {
       "spec": "_COLLECTIONS_ABC",
       "name": "_collections_abc",
-      "line": 5974,
+      "line": 6038,
       "functions": [
         "_abc_register",
         "_abc_buffer",
@@ -3238,7 +3238,7 @@
     {
       "spec": "_CONTEXTVARS",
       "name": "_contextvars",
-      "line": 6177,
+      "line": 6241,
       "functions": [
         "ContextVar",
         "copy_context",
@@ -3353,7 +3353,7 @@
     {
       "spec": "_CSV",
       "name": "_csv",
-      "line": 8252,
+      "line": 8316,
       "functions": [
         "reader",
         "writer",
@@ -3546,7 +3546,7 @@
     {
       "spec": "_CTYPES",
       "name": "_ctypes",
-      "line": 6313,
+      "line": 6377,
       "functions": [
         "sizeof",
         "alignment",
@@ -3995,7 +3995,7 @@
     {
       "spec": "CURSES",
       "name": "_curses",
-      "line": 7644,
+      "line": 7708,
       "functions": [
         "initscr",
         "endwin",
@@ -5752,7 +5752,7 @@
     {
       "spec": "_DATETIME",
       "name": "_datetime",
-      "line": 8067,
+      "line": 8131,
       "functions": [
         "_datetime_now",
         "_datetime_utcnow",
@@ -5934,7 +5934,7 @@
     {
       "spec": "DBM",
       "name": "_dbm",
-      "line": 7575,
+      "line": 7639,
       "functions": [
         "open",
         "_dbm_close",
@@ -6030,7 +6030,7 @@
     {
       "spec": "_DECIMAL",
       "name": "_decimal",
-      "line": 6596,
+      "line": 6660,
       "functions": [
         "_decimal_init",
         "_decimal_str",
@@ -6370,7 +6370,7 @@
     {
       "spec": "_FROZEN_IMPORTLIB",
       "name": "_frozen_importlib",
-      "line": 8138,
+      "line": 8202,
       "functions": [
         "import_module",
         "reload",
@@ -6557,7 +6557,7 @@
     {
       "spec": "_FROZEN_IMPORTLIB_EXTERNAL",
       "name": "_frozen_importlib_external",
-      "line": 8146,
+      "line": 8210,
       "functions": [
         "_spec_init",
         "_module_spec",
@@ -6892,7 +6892,7 @@
             "keyword_only": []
           },
           "spec_from_file_location": {
-            "signature": "(name, location=None, *, loader=None, submodule_search_locations=<object object at 0x7fcdc6780150>)",
+            "signature": "(name, location=None, *, loader=None, submodule_search_locations=<object object at 0x7f736b928150>)",
             "min_args": 1,
             "max_args": 2,
             "varargs": false,
@@ -7130,7 +7130,7 @@
     {
       "spec": "GDBM",
       "name": "_gdbm",
-      "line": 7542,
+      "line": 7606,
       "functions": [
         "open",
         "_gdbm_close",
@@ -7236,7 +7236,7 @@
     {
       "spec": "_HASHLIB",
       "name": "_hashlib",
-      "line": 7227,
+      "line": 7291,
       "functions": [
         "new",
         "hmac_new",
@@ -7590,7 +7590,7 @@
     {
       "spec": "_HEAPQ",
       "name": "_heapq",
-      "line": 3462,
+      "line": 3526,
       "functions": [
         "heappush",
         "heappop",
@@ -7753,7 +7753,7 @@
     {
       "spec": "_HMAC",
       "name": "_hmac",
-      "line": 7330,
+      "line": 7394,
       "functions": [
         "new",
         "compute_digest"
@@ -7972,7 +7972,7 @@
     {
       "spec": "HYDRO_SIDECAR",
       "name": "_hydro_sidecar",
-      "line": 6993,
+      "line": 7057,
       "functions": [
         "spawn",
         "call",
@@ -8003,7 +8003,7 @@
     {
       "spec": "_IMP",
       "name": "_imp",
-      "line": 5629,
+      "line": 5693,
       "functions": [
         "acquire_lock",
         "release_lock",
@@ -8224,7 +8224,7 @@
     {
       "spec": "_IO",
       "name": "_io",
-      "line": 2464,
+      "line": 2499,
       "functions": [
         "open",
         "StringIO",
@@ -8421,7 +8421,7 @@
     {
       "spec": "_JSON",
       "name": "_json",
-      "line": 8245,
+      "line": 8309,
       "functions": [
         "dumps",
         "loads",
@@ -8519,7 +8519,7 @@
     {
       "spec": "_LOCALE",
       "name": "_locale",
-      "line": 8074,
+      "line": 8138,
       "functions": [
         "setlocale",
         "getlocale",
@@ -8969,7 +8969,7 @@
     {
       "spec": "_LZMA",
       "name": "_lzma",
-      "line": 7381,
+      "line": 7445,
       "functions": [
         "LZMACompressor",
         "LZMADecompressor",
@@ -9148,7 +9148,7 @@
     {
       "spec": "_MD5",
       "name": "_md5",
-      "line": 7311,
+      "line": 7375,
       "functions": [
         "md5"
       ],
@@ -9220,7 +9220,7 @@
     {
       "spec": "MULTIBYTECODEC",
       "name": "_multibytecodec",
-      "line": 7969,
+      "line": 8033,
       "functions": [
         "__create_codec"
       ],
@@ -9295,7 +9295,7 @@
     {
       "spec": "_MULTIPROCESSING",
       "name": "_multiprocessing",
-      "line": 8294,
+      "line": 8358,
       "functions": [
         "Process",
         "Queue",
@@ -9376,7 +9376,7 @@
     {
       "spec": "_OPCODE",
       "name": "_opcode",
-      "line": 5665,
+      "line": 5729,
       "functions": [
         "stack_effect",
         "has_arg",
@@ -10391,7 +10391,7 @@
     {
       "spec": "_PICKLE",
       "name": "_pickle",
-      "line": 8259,
+      "line": 8323,
       "functions": [
         "dumps",
         "dump",
@@ -10753,7 +10753,7 @@
     {
       "spec": "_QUEUE",
       "name": "_queue",
-      "line": 8280,
+      "line": 8344,
       "functions": [
         "Queue",
         "SimpleQueue",
@@ -10830,7 +10830,7 @@
     {
       "spec": "_RANDOM",
       "name": "_random",
-      "line": 8266,
+      "line": 8330,
       "functions": [
         "seed",
         "random",
@@ -10912,7 +10912,7 @@
     {
       "spec": "_SHA1",
       "name": "_sha1",
-      "line": 7275,
+      "line": 7339,
       "functions": [
         "sha1"
       ],
@@ -10984,7 +10984,7 @@
     {
       "spec": "_SHA2",
       "name": "_sha2",
-      "line": 7282,
+      "line": 7346,
       "functions": [
         "sha224",
         "sha256",
@@ -11131,7 +11131,7 @@
     {
       "spec": "_SHA3",
       "name": "_sha3",
-      "line": 7297,
+      "line": 7361,
       "functions": [
         "sha3_224",
         "sha3_256",
@@ -11217,7 +11217,7 @@
     {
       "spec": "_SIGNAL",
       "name": "_signal",
-      "line": 1198,
+      "line": 1233,
       "functions": [
         "signal",
         "getsignal",
@@ -11626,7 +11626,7 @@
     {
       "spec": "_SOCKET",
       "name": "_socket",
-      "line": 2700,
+      "line": 2738,
       "functions": [
         "socket",
         "getdefaulttimeout",
@@ -11634,6 +11634,7 @@
         "create_connection",
         "create_server",
         "gethostname",
+        "sethostname",
         "socketpair",
         "getaddrinfo",
         "gethostbyname",
@@ -11698,7 +11699,7 @@
         "herror",
         "timeout"
       ],
-      "function_count": 18,
+      "function_count": 19,
       "constant_count": 49,
       "oracle": {
         "ok": true,
@@ -12890,7 +12891,7 @@
       "loader": "ExtensionFileLoader",
       "is_package": false,
       "public_name_count": 494,
-      "spec_name_count": 67,
+      "spec_name_count": 68,
       "missing_public": [
         "AF_ALG",
         "AF_APPLETALK",
@@ -13321,8 +13322,7 @@
         "if_nameindex",
         "if_nametoindex",
         "ntohl",
-        "ntohs",
-        "sethostname"
+        "ntohs"
       ],
       "extra_public": [
         "create_connection",
@@ -13337,7 +13337,7 @@
     {
       "spec": "_SQLITE3",
       "name": "_sqlite3",
-      "line": 7533,
+      "line": 7597,
       "functions": [
         "connect",
         "complete_statement",
@@ -14071,7 +14071,7 @@
     {
       "spec": "_SRE",
       "name": "_sre",
-      "line": 8096,
+      "line": 8160,
       "functions": [
         "search",
         "match",
@@ -14298,7 +14298,7 @@
     {
       "spec": "_SSL",
       "name": "_ssl",
-      "line": 8105,
+      "line": 8169,
       "functions": [
         "SSLContext",
         "create_default_context",
@@ -14335,10 +14335,29 @@
         "HAS_SNI",
         "HAS_TLSv1_3",
         "SSLError",
-        "OPENSSL_VERSION"
+        "OPENSSL_VERSION",
+        "OPENSSL_VERSION_INFO",
+        "OPENSSL_VERSION_NUMBER",
+        "HAS_ECDH",
+        "HAS_PHA",
+        "HAS_TLSv1_2",
+        "OP_CIPHER_SERVER_PREFERENCE",
+        "OP_SINGLE_DH_USE",
+        "OP_SINGLE_ECDH_USE",
+        "OP_NO_COMPRESSION",
+        "OP_NO_SSLv2",
+        "OP_NO_SSLv3",
+        "OP_NO_TLSv1",
+        "OP_NO_TLSv1_1",
+        "OP_NO_TLSv1_2",
+        "OP_NO_TLSv1_3",
+        "PROTOCOL_SSLv23",
+        "PROTOCOL_TLSv1",
+        "PROTOCOL_TLSv1_1",
+        "SSLCertVerificationError"
       ],
       "function_count": 9,
-      "constant_count": 25,
+      "constant_count": 44,
       "oracle": {
         "ok": true,
         "name": "_ssl",
@@ -14696,7 +14715,7 @@
       "loader": "ExtensionFileLoader",
       "is_package": false,
       "public_name_count": 117,
-      "spec_name_count": 34,
+      "spec_name_count": 53,
       "missing_public": [
         "ALERT_DESCRIPTION_ACCESS_DENIED",
         "ALERT_DESCRIPTION_BAD_CERTIFICATE",
@@ -14729,43 +14748,25 @@
         "ENCODING_DER",
         "ENCODING_PEM",
         "HAS_ALPN",
-        "HAS_ECDH",
         "HAS_NPN",
-        "HAS_PHA",
         "HAS_PSK",
         "HAS_SSLv2",
         "HAS_SSLv3",
         "HAS_TLS_UNIQUE",
         "HAS_TLSv1",
         "HAS_TLSv1_1",
-        "HAS_TLSv1_2",
         "HOSTFLAG_ALWAYS_CHECK_SUBJECT",
         "HOSTFLAG_MULTI_LABEL_WILDCARDS",
         "HOSTFLAG_NEVER_CHECK_SUBJECT",
         "HOSTFLAG_NO_PARTIAL_WILDCARDS",
         "HOSTFLAG_NO_WILDCARDS",
         "HOSTFLAG_SINGLE_LABEL_SUBDOMAINS",
-        "OPENSSL_VERSION_INFO",
-        "OPENSSL_VERSION_NUMBER",
-        "OP_CIPHER_SERVER_PREFERENCE",
         "OP_ENABLE_KTLS",
         "OP_ENABLE_MIDDLEBOX_COMPAT",
         "OP_IGNORE_UNEXPECTED_EOF",
         "OP_LEGACY_SERVER_CONNECT",
-        "OP_NO_COMPRESSION",
         "OP_NO_RENEGOTIATION",
-        "OP_NO_SSLv2",
-        "OP_NO_SSLv3",
         "OP_NO_TICKET",
-        "OP_NO_TLSv1",
-        "OP_NO_TLSv1_1",
-        "OP_NO_TLSv1_2",
-        "OP_NO_TLSv1_3",
-        "OP_SINGLE_DH_USE",
-        "OP_SINGLE_ECDH_USE",
-        "PROTOCOL_SSLv23",
-        "PROTOCOL_TLSv1",
-        "PROTOCOL_TLSv1_1",
         "PROTO_MAXIMUM_SUPPORTED",
         "PROTO_MINIMUM_SUPPORTED",
         "PROTO_SSLv3",
@@ -14776,7 +14777,6 @@
         "RAND_add",
         "RAND_bytes",
         "RAND_status",
-        "SSLCertVerificationError",
         "SSLSession",
         "SSL_ERROR_EOF",
         "SSL_ERROR_INVALID_ERROR_CODE",
@@ -14823,7 +14823,7 @@
     {
       "spec": "_STAT",
       "name": "_stat",
-      "line": 3600,
+      "line": 3664,
       "functions": [
         "S_IMODE",
         "S_IFMT",
@@ -15219,7 +15219,7 @@
     {
       "spec": "_STATISTICS",
       "name": "_statistics",
-      "line": 8273,
+      "line": 8337,
       "functions": [
         "mean",
         "fmean",
@@ -15277,7 +15277,7 @@
     {
       "spec": "_STRING",
       "name": "_string",
-      "line": 5697,
+      "line": 5761,
       "functions": [
         "formatter_parser",
         "formatter_field_name_split"
@@ -15343,7 +15343,7 @@
     {
       "spec": "_STRUCT",
       "name": "_struct",
-      "line": 6614,
+      "line": 6678,
       "functions": [
         "calcsize",
         "pack",
@@ -15459,7 +15459,7 @@
     {
       "spec": "_SUGGESTIONS",
       "name": "_suggestions",
-      "line": 8207,
+      "line": 8271,
       "functions": [
         "_generate_suggestions"
       ],
@@ -15503,7 +15503,7 @@
     {
       "spec": "_SYSCONFIG",
       "name": "_sysconfig",
-      "line": 8181,
+      "line": 8245,
       "functions": [
         "get_config_var",
         "_get_config_var",
@@ -15618,7 +15618,7 @@
     {
       "spec": "_TESTBUFFER",
       "name": "_testbuffer",
-      "line": 8647,
+      "line": 8711,
       "functions": [
         "getbuffer",
         "releasebuffer",
@@ -15817,7 +15817,7 @@
     {
       "spec": "_TESTINTERNALCAPI",
       "name": "_testinternalcapi",
-      "line": 8583,
+      "line": 8647,
       "functions": [
         "get_configs",
         "set_config",
@@ -17124,7 +17124,7 @@
     {
       "spec": "_TOKENIZE",
       "name": "_tokenize",
-      "line": 5863,
+      "line": 5927,
       "functions": [
         "TokenizerIter",
         "_tokenizeriter_next",
@@ -17181,7 +17181,7 @@
     {
       "spec": "_TYPES",
       "name": "_types",
-      "line": 8081,
+      "line": 8145,
       "functions": [
         "SimpleNamespace",
         "new_class",
@@ -17549,7 +17549,7 @@
     {
       "spec": "_TYPING",
       "name": "_typing",
-      "line": 8088,
+      "line": 8152,
       "functions": [
         "cast",
         "assert_never",
@@ -17934,7 +17934,7 @@
     {
       "spec": "_UUID",
       "name": "_uuid",
-      "line": 7345,
+      "line": 7409,
       "functions": [
         "generate_time_safe"
       ],
@@ -18006,7 +18006,7 @@
     {
       "spec": "_WARNINGS",
       "name": "_warnings",
-      "line": 5836,
+      "line": 5900,
       "functions": [
         "warn",
         "warn_explicit",
@@ -18117,7 +18117,7 @@
     {
       "spec": "_WEAKREF",
       "name": "_weakref",
-      "line": 5708,
+      "line": 5772,
       "functions": [
         "proxy",
         "getweakrefcount",
@@ -18257,7 +18257,7 @@
     {
       "spec": "_ZONEINFO",
       "name": "_zoneinfo",
-      "line": 8301,
+      "line": 8365,
       "functions": [
         "available_timezones",
         "reset_tzpath",
@@ -18335,7 +18335,7 @@
     {
       "spec": "_ZSTD",
       "name": "_zstd",
-      "line": 7984,
+      "line": 8048,
       "functions": [
         "get_frame_size",
         "get_frame_info",
@@ -18614,7 +18614,7 @@
     {
       "spec": "ABC",
       "name": "abc",
-      "line": 4627,
+      "line": 4691,
       "functions": [
         "abstractmethod",
         "get_cache_token",
@@ -18769,7 +18769,7 @@
     {
       "spec": "ANNOTATIONLIB",
       "name": "annotationlib",
-      "line": 4641,
+      "line": 4705,
       "functions": [
         "get_annotations",
         "call_annotate_function",
@@ -18883,7 +18883,7 @@
     {
       "spec": "ARGPARSE",
       "name": "argparse",
-      "line": 2470,
+      "line": 2505,
       "functions": [
         "ArgumentParser",
         "Namespace",
@@ -19032,7 +19032,7 @@
     {
       "spec": "ARRAY",
       "name": "array",
-      "line": 1495,
+      "line": 1530,
       "functions": [
         "array",
         "_array_reconstructor"
@@ -19096,7 +19096,7 @@
     {
       "spec": "AST",
       "name": "ast",
-      "line": 4857,
+      "line": 4921,
       "functions": [
         "literal_eval",
         "parse",
@@ -19633,7 +19633,7 @@
     {
       "spec": "ASYNCIO",
       "name": "asyncio",
-      "line": 2997,
+      "line": 3061,
       "functions": [
         "run",
         "sleep",
@@ -20036,7 +20036,7 @@
     {
       "spec": "ASYNCIO_COROUTINES",
       "name": "asyncio.coroutines",
-      "line": 3036,
+      "line": 3100,
       "functions": [],
       "constants": [
         "_is_coroutine"
@@ -20107,7 +20107,7 @@
     {
       "spec": "ASYNCIO_EVENTS",
       "name": "asyncio.events",
-      "line": 3050,
+      "line": 3114,
       "functions": [],
       "constants": [
         "_event_loop_policy"
@@ -20228,7 +20228,7 @@
     {
       "spec": "ASYNCIO_STAGGERED",
       "name": "asyncio.staggered",
-      "line": 3060,
+      "line": 3124,
       "functions": [
         "staggered_race"
       ],
@@ -20296,7 +20296,7 @@
     {
       "spec": "ATEXIT",
       "name": "atexit",
-      "line": 6105,
+      "line": 6169,
       "functions": [
         "register",
         "unregister",
@@ -20368,7 +20368,7 @@
     {
       "spec": "BASE64",
       "name": "base64",
-      "line": 3656,
+      "line": 3720,
       "functions": [
         "b64encode",
         "b64decode",
@@ -20554,7 +20554,7 @@
     {
       "spec": "BINASCII",
       "name": "binascii",
-      "line": 3607,
+      "line": 3671,
       "functions": [
         "hexlify",
         "b2a_hex",
@@ -20782,7 +20782,7 @@
     {
       "spec": "BISECT",
       "name": "bisect",
-      "line": 3422,
+      "line": 3486,
       "functions": [
         "bisect_left",
         "bisect_right",
@@ -20846,7 +20846,7 @@
     {
       "spec": "BUILTINS",
       "name": "builtins",
-      "line": 2103,
+      "line": 2138,
       "functions": [
         "print",
         "len",
@@ -22068,7 +22068,7 @@
     {
       "spec": "CMATH",
       "name": "cmath",
-      "line": 1510,
+      "line": 1545,
       "functions": [
         "acos",
         "acosh",
@@ -22400,7 +22400,7 @@
     {
       "spec": "CODE",
       "name": "code",
-      "line": 8428,
+      "line": 8492,
       "functions": [
         "InteractiveInterpreter",
         "InteractiveConsole",
@@ -22478,7 +22478,7 @@
     {
       "spec": "CODECS",
       "name": "codecs",
-      "line": 5517,
+      "line": 5581,
       "functions": [
         "lookup",
         "encode",
@@ -23485,7 +23485,7 @@
     {
       "spec": "COLLECTIONS",
       "name": "collections",
-      "line": 2536,
+      "line": 2571,
       "functions": [
         "defaultdict",
         "_count_elements",
@@ -23594,7 +23594,7 @@
     {
       "spec": "COLLECTIONS_ABC",
       "name": "collections.abc",
-      "line": 6023,
+      "line": 6087,
       "functions": [],
       "constants": [
         "abc",
@@ -24248,7 +24248,7 @@
     {
       "spec": "COLORSYS",
       "name": "colorsys",
-      "line": 3470,
+      "line": 3534,
       "functions": [
         "rgb_to_yiq",
         "yiq_to_rgb",
@@ -24331,7 +24331,7 @@
     {
       "spec": "CONTEXTLIB",
       "name": "contextlib",
-      "line": 5390,
+      "line": 5454,
       "functions": [
         "suppress",
         "nullcontext",
@@ -24484,7 +24484,7 @@
     {
       "spec": "CONTEXTVARS",
       "name": "contextvars",
-      "line": 6184,
+      "line": 6248,
       "functions": [
         "ContextVar",
         "copy_context",
@@ -24706,7 +24706,7 @@
     {
       "spec": "CTYPES",
       "name": "ctypes",
-      "line": 6307,
+      "line": 6371,
       "functions": [
         "sizeof",
         "alignment",
@@ -25043,7 +25043,7 @@
     {
       "spec": "DATACLASSES",
       "name": "dataclasses",
-      "line": 4239,
+      "line": 4303,
       "functions": [
         "field",
         "replace",
@@ -25208,7 +25208,7 @@
     {
       "spec": "DATETIME",
       "name": "datetime",
-      "line": 4303,
+      "line": 4367,
       "functions": [
         "_datetime_now",
         "_datetime_utcnow",
@@ -25340,7 +25340,7 @@
     {
       "spec": "DECIMAL",
       "name": "decimal",
-      "line": 6590,
+      "line": 6654,
       "functions": [
         "_decimal_init",
         "_decimal_str",
@@ -25533,7 +25533,7 @@
     {
       "spec": "ERRNO",
       "name": "errno",
-      "line": 3081,
+      "line": 3145,
       "functions": [],
       "constants": [
         "E2BIG",
@@ -25987,7 +25987,7 @@
     {
       "spec": "FAULTHANDLER",
       "name": "faulthandler",
-      "line": 8193,
+      "line": 8257,
       "functions": [
         "enable",
         "disable",
@@ -26117,7 +26117,7 @@
     {
       "spec": "FCNTL",
       "name": "fcntl",
-      "line": 1099,
+      "line": 1134,
       "functions": [
         "fcntl",
         "ioctl",
@@ -26424,7 +26424,7 @@
     {
       "spec": "FNMATCH",
       "name": "fnmatch",
-      "line": 3753,
+      "line": 3817,
       "functions": [
         "fnmatch",
         "fnmatchcase",
@@ -26508,7 +26508,7 @@
     {
       "spec": "FRACTIONS",
       "name": "fractions",
-      "line": 5069,
+      "line": 5133,
       "functions": [
         "Fraction"
       ],
@@ -26743,7 +26743,7 @@
     {
       "spec": "GC",
       "name": "gc",
-      "line": 6061,
+      "line": 6125,
       "functions": [
         "is_tracked",
         "collect",
@@ -27002,7 +27002,7 @@
     {
       "spec": "GETOPT",
       "name": "getopt",
-      "line": 3769,
+      "line": 3833,
       "functions": [
         "getopt",
         "gnu_getopt",
@@ -27082,7 +27082,7 @@
     {
       "spec": "GRP",
       "name": "grp",
-      "line": 1048,
+      "line": 1083,
       "functions": [
         "struct_group",
         "getgrnam",
@@ -27184,7 +27184,7 @@
     {
       "spec": "GZIP",
       "name": "gzip",
-      "line": 8385,
+      "line": 8449,
       "functions": [
         "open",
         "compress",
@@ -27310,7 +27310,7 @@
     {
       "spec": "HASHLIB",
       "name": "hashlib",
-      "line": 7164,
+      "line": 7228,
       "functions": [
         "new",
         "md5",
@@ -27454,7 +27454,7 @@
     {
       "spec": "HEAPQ",
       "name": "heapq",
-      "line": 3455,
+      "line": 3519,
       "functions": [
         "heappush",
         "heappop",
@@ -27564,7 +27564,7 @@
     {
       "spec": "HTML",
       "name": "html",
-      "line": 1667,
+      "line": 1702,
       "functions": [
         "escape",
         "unescape"
@@ -27632,7 +27632,7 @@
     {
       "spec": "HTML_ENTITIES",
       "name": "html.entities",
-      "line": 8332,
+      "line": 8396,
       "functions": [],
       "constants": [
         "html5",
@@ -27697,7 +27697,7 @@
     {
       "spec": "HTML_PARSER",
       "name": "html.parser",
-      "line": 8319,
+      "line": 8383,
       "functions": [
         "HTMLParser"
       ],
@@ -27794,7 +27794,7 @@
     {
       "spec": "HTTP",
       "name": "http",
-      "line": 6811,
+      "line": 6875,
       "functions": [
         "serve"
       ],
@@ -27860,7 +27860,7 @@
     {
       "spec": "HTTP_CLIENT",
       "name": "http.client",
-      "line": 6834,
+      "line": 6898,
       "functions": [
         "_create_https_context"
       ],
@@ -28234,7 +28234,7 @@
     {
       "spec": "HTTP_COOKIES",
       "name": "http.cookies",
-      "line": 8347,
+      "line": 8411,
       "functions": [
         "_quote",
         "_unquote",
@@ -28327,7 +28327,7 @@
     {
       "spec": "HTTP_SERVER",
       "name": "http.server",
-      "line": 6945,
+      "line": 7009,
       "functions": [],
       "constants": [
         "BaseHTTPRequestHandler",
@@ -28454,7 +28454,7 @@
     {
       "spec": "IMPORTLIB",
       "name": "importlib",
-      "line": 5081,
+      "line": 5145,
       "functions": [
         "import_module",
         "reload",
@@ -28539,7 +28539,7 @@
     {
       "spec": "IMPORTLIB_BOOTSTRAP_EXTERNAL",
       "name": "importlib._bootstrap_external",
-      "line": 8155,
+      "line": 8219,
       "functions": [
         "_spec_init",
         "_module_spec",
@@ -28874,7 +28874,7 @@
             "keyword_only": []
           },
           "spec_from_file_location": {
-            "signature": "(name, location=None, *, loader=None, submodule_search_locations=<object object at 0x7f5527980150>)",
+            "signature": "(name, location=None, *, loader=None, submodule_search_locations=<object object at 0x7f5374f28150>)",
             "min_args": 1,
             "max_args": 2,
             "varargs": false,
@@ -29000,7 +29000,7 @@
     {
       "spec": "IMPORTLIB_ABC",
       "name": "importlib.abc",
-      "line": 8365,
+      "line": 8429,
       "functions": [],
       "constants": [
         "Loader",
@@ -29092,7 +29092,7 @@
     {
       "spec": "IMPORTLIB_MACHINERY",
       "name": "importlib.machinery",
-      "line": 5176,
+      "line": 5240,
       "functions": [
         "_spec_init",
         "_module_spec",
@@ -29486,7 +29486,7 @@
     {
       "spec": "IMPORTLIB_METADATA",
       "name": "importlib.metadata",
-      "line": 5319,
+      "line": 5383,
       "functions": [
         "version",
         "metadata",
@@ -29692,7 +29692,7 @@
     {
       "spec": "IMPORTLIB_RESOURCES",
       "name": "importlib.resources",
-      "line": 5351,
+      "line": 5415,
       "functions": [
         "files",
         "_traversable_init",
@@ -29796,7 +29796,7 @@
     {
       "spec": "IMPORTLIB_UTIL",
       "name": "importlib.util",
-      "line": 5120,
+      "line": 5184,
       "functions": [
         "source_from_cache",
         "find_spec",
@@ -29961,7 +29961,7 @@
             "keyword_only": []
           },
           "spec_from_file_location": {
-            "signature": "(name, location=None, *, loader=None, submodule_search_locations=<object object at 0x7f65b6f80150>)",
+            "signature": "(name, location=None, *, loader=None, submodule_search_locations=<object object at 0x7fb094b80150>)",
             "min_args": 1,
             "max_args": 2,
             "varargs": false,
@@ -30016,7 +30016,7 @@
             "min": 1,
             "max": 2
           },
-          "signature": "(name, location=None, *, loader=None, submodule_search_locations=<object object at 0x7f65b6f80150>)"
+          "signature": "(name, location=None, *, loader=None, submodule_search_locations=<object object at 0x7fb094b80150>)"
         },
         {
           "name": "spec_from_loader",
@@ -30047,7 +30047,7 @@
     {
       "spec": "INSPECT",
       "name": "inspect",
-      "line": 7018,
+      "line": 7082,
       "functions": [
         "ismodule",
         "isclass",
@@ -30588,7 +30588,7 @@
     {
       "spec": "IO",
       "name": "io",
-      "line": 2436,
+      "line": 2471,
       "functions": [
         "open",
         "StringIO",
@@ -30907,7 +30907,7 @@
     {
       "spec": "ITERTOOLS",
       "name": "itertools",
-      "line": 4805,
+      "line": 4869,
       "functions": [
         "islice",
         "imap",
@@ -31290,7 +31290,7 @@
     {
       "spec": "KEYWORD",
       "name": "keyword",
-      "line": 3489,
+      "line": 3553,
       "functions": [
         "iskeyword",
         "issoftkeyword"
@@ -31355,7 +31355,7 @@
     {
       "spec": "LOCALE",
       "name": "locale",
-      "line": 6320,
+      "line": 6384,
       "functions": [
         "setlocale",
         "getlocale",
@@ -31727,7 +31727,7 @@
     {
       "spec": "MARSHAL",
       "name": "marshal",
-      "line": 5845,
+      "line": 5909,
       "functions": [
         "dump",
         "dumps",
@@ -32580,7 +32580,7 @@
     {
       "spec": "MEMCACHED",
       "name": "memcached",
-      "line": 6979,
+      "line": 7043,
       "functions": [
         "connect",
         "set"
@@ -32605,7 +32605,7 @@
     {
       "spec": "MIMETYPES",
       "name": "mimetypes",
-      "line": 3804,
+      "line": 3868,
       "functions": [
         "guess_type",
         "guess_all_extensions",
@@ -32727,7 +32727,7 @@
     {
       "spec": "MMAP",
       "name": "mmap",
-      "line": 6752,
+      "line": 6816,
       "functions": [
         "mmap",
         "_mmap_init",
@@ -32936,7 +32936,7 @@
     {
       "spec": "MULTIPROCESSING",
       "name": "multiprocessing",
-      "line": 1727,
+      "line": 1762,
       "functions": [
         "Process",
         "Queue",
@@ -33115,7 +33115,7 @@
     {
       "spec": "NTPATH",
       "name": "ntpath",
-      "line": 8131,
+      "line": 8195,
       "functions": [
         "join",
         "basename",
@@ -33645,7 +33645,7 @@
     {
       "spec": "OPCODE",
       "name": "opcode",
-      "line": 8541,
+      "line": 8605,
       "functions": [
         "stack_effect"
       ],
@@ -34245,7 +34245,12 @@
         "forkpty",
         "walk",
         "set_inheritable",
-        "get_inheritable"
+        "get_inheritable",
+        "getpgid",
+        "getxattr",
+        "setxattr",
+        "listxattr",
+        "removexattr"
       ],
       "constants": [
         "name",
@@ -34296,7 +34301,7 @@
         "supports_follow_symlinks",
         "supports_effective_ids"
       ],
-      "function_count": 84,
+      "function_count": 89,
       "constant_count": 47,
       "oracle": {
         "ok": true,
@@ -37315,7 +37320,7 @@
       "loader": "type",
       "is_package": false,
       "public_name_count": 404,
-      "spec_name_count": 131,
+      "spec_name_count": 136,
       "missing_public": [
         "CLD_CONTINUED",
         "CLD_DUMPED",
@@ -37497,18 +37502,15 @@
         "getgrouplist",
         "getgroups",
         "getlogin",
-        "getpgid",
         "getpriority",
         "getrandom",
         "getresgid",
         "getresuid",
         "getsid",
-        "getxattr",
         "grantpt",
         "initgroups",
         "killpg",
         "lchown",
-        "listxattr",
         "lockf",
         "memfd_create",
         "nice",
@@ -37530,7 +37532,6 @@
         "readv",
         "reload_environ",
         "removedirs",
-        "removexattr",
         "renames",
         "replace",
         "sched_get_priority_max",
@@ -37557,7 +37558,6 @@
         "setresuid",
         "setreuid",
         "setuid",
-        "setxattr",
         "spawnl",
         "spawnle",
         "spawnlp",
@@ -37753,6 +37753,54 @@
             "max": 4
           },
           "signature": "(top, topdown=True, onerror=None, followlinks=False)"
+        },
+        {
+          "name": "getxattr",
+          "spec": {
+            "min": 2,
+            "max": 3
+          },
+          "oracle": {
+            "min": 2,
+            "max": 2
+          },
+          "signature": "(path, attribute, *, follow_symlinks=True)"
+        },
+        {
+          "name": "setxattr",
+          "spec": {
+            "min": 3,
+            "max": 5
+          },
+          "oracle": {
+            "min": 3,
+            "max": 4
+          },
+          "signature": "(path, attribute, value, flags=0, *, follow_symlinks=True)"
+        },
+        {
+          "name": "listxattr",
+          "spec": {
+            "min": 0,
+            "max": 2
+          },
+          "oracle": {
+            "min": 0,
+            "max": 1
+          },
+          "signature": "(path=None, *, follow_symlinks=True)"
+        },
+        {
+          "name": "removexattr",
+          "spec": {
+            "min": 2,
+            "max": 3
+          },
+          "oracle": {
+            "min": 2,
+            "max": 2
+          },
+          "signature": "(path, attribute, *, follow_symlinks=True)"
         }
       ]
     },
@@ -38682,7 +38730,7 @@
     {
       "spec": "PICKLE",
       "name": "pickle",
-      "line": 1747,
+      "line": 1782,
       "functions": [
         "dumps",
         "dump",
@@ -39290,7 +39338,7 @@
     {
       "spec": "POSIX",
       "name": "posix",
-      "line": 8113,
+      "line": 8177,
       "functions": [
         "getpid",
         "getppid",
@@ -39375,7 +39423,12 @@
         "forkpty",
         "walk",
         "set_inheritable",
-        "get_inheritable"
+        "get_inheritable",
+        "getpgid",
+        "getxattr",
+        "setxattr",
+        "listxattr",
+        "removexattr"
       ],
       "constants": [
         "name",
@@ -39426,7 +39479,7 @@
         "supports_follow_symlinks",
         "supports_effective_ids"
       ],
-      "function_count": 84,
+      "function_count": 89,
       "constant_count": 47,
       "oracle": {
         "ok": true,
@@ -41665,7 +41718,7 @@
       "loader": "type",
       "is_package": false,
       "public_name_count": 346,
-      "spec_name_count": 131,
+      "spec_name_count": 136,
       "missing_public": [
         "CLD_CONTINUED",
         "CLD_DUMPED",
@@ -41831,18 +41884,15 @@
         "getgrouplist",
         "getgroups",
         "getlogin",
-        "getpgid",
         "getpriority",
         "getrandom",
         "getresgid",
         "getresuid",
         "getsid",
-        "getxattr",
         "grantpt",
         "initgroups",
         "killpg",
         "lchown",
-        "listxattr",
         "lockf",
         "memfd_create",
         "nice",
@@ -41861,7 +41911,6 @@
         "pwrite",
         "pwritev",
         "readv",
-        "removexattr",
         "replace",
         "sched_get_priority_max",
         "sched_get_priority_min",
@@ -41887,7 +41936,6 @@
         "setresuid",
         "setreuid",
         "setuid",
-        "setxattr",
         "splice",
         "statvfs",
         "sync",
@@ -42063,13 +42111,61 @@
             "max": 2
           },
           "signature": "(fd, buffer, /)"
+        },
+        {
+          "name": "getxattr",
+          "spec": {
+            "min": 2,
+            "max": 3
+          },
+          "oracle": {
+            "min": 2,
+            "max": 2
+          },
+          "signature": "(path, attribute, *, follow_symlinks=True)"
+        },
+        {
+          "name": "setxattr",
+          "spec": {
+            "min": 3,
+            "max": 5
+          },
+          "oracle": {
+            "min": 3,
+            "max": 4
+          },
+          "signature": "(path, attribute, value, flags=0, *, follow_symlinks=True)"
+        },
+        {
+          "name": "listxattr",
+          "spec": {
+            "min": 0,
+            "max": 2
+          },
+          "oracle": {
+            "min": 0,
+            "max": 1
+          },
+          "signature": "(path=None, *, follow_symlinks=True)"
+        },
+        {
+          "name": "removexattr",
+          "spec": {
+            "min": 2,
+            "max": 3
+          },
+          "oracle": {
+            "min": 2,
+            "max": 2
+          },
+          "signature": "(path, attribute, *, follow_symlinks=True)"
         }
       ]
     },
     {
       "spec": "POSIXPATH",
       "name": "posixpath",
-      "line": 8123,
+      "line": 8187,
       "functions": [
         "join",
         "basename",
@@ -42589,7 +42685,7 @@
     {
       "spec": "POSTGRES",
       "name": "postgres",
-      "line": 6965,
+      "line": 7029,
       "functions": [
         "connect",
         "insert",
@@ -42615,7 +42711,7 @@
     {
       "spec": "PWD",
       "name": "pwd",
-      "line": 1032,
+      "line": 1067,
       "functions": [
         "struct_passwd",
         "getpwnam",
@@ -42716,7 +42812,7 @@
     {
       "spec": "PYEXPAT",
       "name": "pyexpat",
-      "line": 7443,
+      "line": 7507,
       "functions": [
         "ParserCreate",
         "ErrorString",
@@ -42885,7 +42981,7 @@
     {
       "spec": "PYTEST",
       "name": "pytest",
-      "line": 3330,
+      "line": 3394,
       "functions": [
         "main",
         "raises",
@@ -42949,7 +43045,7 @@
     {
       "spec": "QUEUE",
       "name": "queue",
-      "line": 1706,
+      "line": 1741,
       "functions": [
         "Queue",
         "SimpleQueue",
@@ -43040,7 +43136,7 @@
     {
       "spec": "QUOPRI",
       "name": "quopri",
-      "line": 3721,
+      "line": 3785,
       "functions": [
         "encodestring",
         "decodestring",
@@ -43312,7 +43408,7 @@
     {
       "spec": "RE",
       "name": "re",
-      "line": 2859,
+      "line": 2923,
       "functions": [
         "search",
         "match",
@@ -43519,7 +43615,7 @@
     {
       "spec": "RE_COMPILER",
       "name": "re._compiler",
-      "line": 2968,
+      "line": 3032,
       "functions": [
         "compile",
         "isstring",
@@ -43824,7 +43920,7 @@
     {
       "spec": "RE_CONSTANTS_MODULE",
       "name": "re._constants",
-      "line": 2959,
+      "line": 3023,
       "functions": [],
       "constants": [
         "MAGIC",
@@ -44094,7 +44190,7 @@
     {
       "spec": "RE_PARSER",
       "name": "re._parser",
-      "line": 2982,
+      "line": 3046,
       "functions": [],
       "constants": [
         "MAGIC",
@@ -44408,7 +44504,7 @@
     {
       "spec": "READLINE",
       "name": "readline",
-      "line": 7608,
+      "line": 7672,
       "functions": [
         "parse_and_bind",
         "get_line_buffer",
@@ -44771,7 +44867,7 @@
     {
       "spec": "RESOURCE",
       "name": "resource",
-      "line": 1062,
+      "line": 1097,
       "functions": [
         "getrlimit",
         "setrlimit",
@@ -44953,7 +45049,7 @@
     {
       "spec": "RICH_STATUS",
       "name": "rich.status",
-      "line": 1680,
+      "line": 1715,
       "functions": [
         "Status",
         "_status_enter",
@@ -44982,7 +45078,7 @@
     {
       "spec": "RUNPY",
       "name": "runpy",
-      "line": 8216,
+      "line": 8280,
       "functions": [
         "run_module",
         "_get_module_details",
@@ -45089,7 +45185,7 @@
     {
       "spec": "SELECT",
       "name": "select",
-      "line": 2707,
+      "line": 2745,
       "functions": [
         "select",
         "poll",
@@ -45294,7 +45390,7 @@
     {
       "spec": "SELECTORS",
       "name": "selectors",
-      "line": 2778,
+      "line": 2816,
       "functions": [
         "DefaultSelector",
         "SelectSelector",
@@ -45393,7 +45489,7 @@
     {
       "spec": "SHUTIL",
       "name": "shutil",
-      "line": 4049,
+      "line": 4113,
       "functions": [
         "which",
         "get_terminal_size",
@@ -45594,7 +45690,7 @@
     {
       "spec": "SITE",
       "name": "site",
-      "line": 6120,
+      "line": 6184,
       "functions": [
         "main",
         "addsitedir"
@@ -45924,7 +46020,7 @@
     {
       "spec": "SOCKET",
       "name": "socket",
-      "line": 2689,
+      "line": 2727,
       "functions": [
         "socket",
         "getdefaulttimeout",
@@ -45932,6 +46028,7 @@
         "create_connection",
         "create_server",
         "gethostname",
+        "sethostname",
         "socketpair",
         "getaddrinfo",
         "gethostbyname",
@@ -45996,7 +46093,7 @@
         "herror",
         "timeout"
       ],
-      "function_count": 18,
+      "function_count": 19,
       "constant_count": 49,
       "oracle": {
         "ok": true,
@@ -47572,7 +47669,7 @@
       "loader": "SourceFileLoader",
       "is_package": false,
       "public_name_count": 515,
-      "spec_name_count": 67,
+      "spec_name_count": 68,
       "missing_public": [],
       "extra_public": [],
       "extra_private": [],
@@ -47581,7 +47678,7 @@
     {
       "spec": "SQLITE3",
       "name": "sqlite3",
-      "line": 7499,
+      "line": 7563,
       "functions": [
         "connect",
         "complete_statement",
@@ -48072,7 +48169,7 @@
     {
       "spec": "SSL",
       "name": "ssl",
-      "line": 2807,
+      "line": 2845,
       "functions": [
         "SSLContext",
         "create_default_context",
@@ -48109,10 +48206,29 @@
         "HAS_SNI",
         "HAS_TLSv1_3",
         "SSLError",
-        "OPENSSL_VERSION"
+        "OPENSSL_VERSION",
+        "OPENSSL_VERSION_INFO",
+        "OPENSSL_VERSION_NUMBER",
+        "HAS_ECDH",
+        "HAS_PHA",
+        "HAS_TLSv1_2",
+        "OP_CIPHER_SERVER_PREFERENCE",
+        "OP_SINGLE_DH_USE",
+        "OP_SINGLE_ECDH_USE",
+        "OP_NO_COMPRESSION",
+        "OP_NO_SSLv2",
+        "OP_NO_SSLv3",
+        "OP_NO_TLSv1",
+        "OP_NO_TLSv1_1",
+        "OP_NO_TLSv1_2",
+        "OP_NO_TLSv1_3",
+        "PROTOCOL_SSLv23",
+        "PROTOCOL_TLSv1",
+        "PROTOCOL_TLSv1_1",
+        "SSLCertVerificationError"
       ],
       "function_count": 9,
-      "constant_count": 25,
+      "constant_count": 44,
       "oracle": {
         "ok": true,
         "name": "ssl",
@@ -48436,7 +48552,7 @@
       "loader": "SourceFileLoader",
       "is_package": false,
       "public_name_count": 132,
-      "spec_name_count": 34,
+      "spec_name_count": 53,
       "missing_public": [],
       "extra_public": [],
       "extra_private": [],
@@ -48445,7 +48561,7 @@
     {
       "spec": "STAT",
       "name": "stat",
-      "line": 3593,
+      "line": 3657,
       "functions": [
         "S_IMODE",
         "S_IFMT",
@@ -49077,7 +49193,7 @@
     {
       "spec": "STRUCT",
       "name": "struct",
-      "line": 6620,
+      "line": 6684,
       "functions": [
         "calcsize",
         "pack",
@@ -49160,7 +49276,7 @@
     {
       "spec": "SUBPROCESS",
       "name": "subprocess",
-      "line": 3852,
+      "line": 3916,
       "functions": [
         "run",
         "check_output",
@@ -49314,7 +49430,7 @@
     {
       "spec": "SYS",
       "name": "sys",
-      "line": 1915,
+      "line": 1950,
       "functions": [
         "exit",
         "exc_info",
@@ -49965,7 +50081,7 @@
     {
       "spec": "SYSCONFIG",
       "name": "sysconfig",
-      "line": 6459,
+      "line": 6523,
       "functions": [
         "get_config_var",
         "_get_config_var",
@@ -50123,7 +50239,7 @@
     {
       "spec": "SYSLOG",
       "name": "syslog",
-      "line": 1143,
+      "line": 1178,
       "functions": [
         "openlog",
         "syslog",
@@ -50328,7 +50444,7 @@
     {
       "spec": "TMPFILE",
       "name": "tempfile",
-      "line": 3955,
+      "line": 4019,
       "functions": [
         "gettempdir",
         "gettempdirb",
@@ -50483,7 +50599,7 @@
     {
       "spec": "TERMIOS",
       "name": "termios",
-      "line": 1274,
+      "line": 1309,
       "functions": [
         "tcgetattr",
         "tcsetattr",
@@ -51337,7 +51453,7 @@
     {
       "spec": "TEXTWRAP",
       "name": "textwrap",
-      "line": 4087,
+      "line": 4151,
       "functions": [
         "dedent",
         "_textwrap_split",
@@ -51415,7 +51531,7 @@
     {
       "spec": "THREADING",
       "name": "threading",
-      "line": 1551,
+      "line": 1586,
       "functions": [
         "Thread",
         "Lock",
@@ -51960,7 +52076,7 @@
     {
       "spec": "TIMEIT",
       "name": "timeit",
-      "line": 4191,
+      "line": 4255,
       "functions": [
         "default_timer",
         "timeit",
@@ -52050,7 +52166,7 @@
     {
       "spec": "TOKEN",
       "name": "token",
-      "line": 5887,
+      "line": 5951,
       "functions": [
         "ISTERMINAL",
         "ISNONTERMINAL",
@@ -52404,7 +52520,7 @@
     {
       "spec": "TTY",
       "name": "tty",
-      "line": 8461,
+      "line": 8525,
       "functions": [
         "cfmakeraw",
         "cfmakecbreak",
@@ -52983,7 +53099,7 @@
     {
       "spec": "TYPES",
       "name": "types",
-      "line": 4716,
+      "line": 4780,
       "functions": [
         "SimpleNamespace",
         "new_class",
@@ -53166,7 +53282,7 @@
     {
       "spec": "TYPING",
       "name": "typing",
-      "line": 4383,
+      "line": 4447,
       "functions": [
         "cast",
         "assert_never",
@@ -53790,7 +53906,7 @@
     {
       "spec": "UNICODEDATA",
       "name": "unicodedata",
-      "line": 6627,
+      "line": 6691,
       "functions": [
         "category",
         "combining",
@@ -54009,7 +54125,7 @@
     {
       "spec": "UNITTEST",
       "name": "unittest",
-      "line": 3233,
+      "line": 3297,
       "functions": [
         "main",
         "expectedFailure",
@@ -54181,7 +54297,7 @@
     {
       "spec": "UNITTEST_RESULT",
       "name": "unittest.result",
-      "line": 3300,
+      "line": 3364,
       "functions": [
         "failfast"
       ],
@@ -54251,7 +54367,7 @@
     {
       "spec": "UNITTEST_UTIL",
       "name": "unittest.util",
-      "line": 3311,
+      "line": 3375,
       "functions": [
         "strclass",
         "safe_repr",
@@ -54334,7 +54450,7 @@
     {
       "spec": "UUID",
       "name": "uuid",
-      "line": 8483,
+      "line": 8547,
       "functions": [
         "uuid1",
         "uuid3",
@@ -54516,7 +54632,7 @@
     {
       "spec": "WARNINGS",
       "name": "warnings",
-      "line": 5817,
+      "line": 5881,
       "functions": [
         "warn",
         "warn_explicit",
@@ -54653,7 +54769,7 @@
     {
       "spec": "ZIPIMPORT",
       "name": "zipimport",
-      "line": 8168,
+      "line": 8232,
       "functions": [
         "zipimporter"
       ],
@@ -54795,7 +54911,7 @@
     {
       "spec": "ZLIB",
       "name": "zlib",
-      "line": 6674,
+      "line": 6738,
       "functions": [
         "compress",
         "decompress",
@@ -55012,7 +55128,7 @@
     {
       "spec": "ZONEINFO",
       "name": "zoneinfo",
-      "line": 6496,
+      "line": 6560,
       "functions": [
         "available_timezones",
         "reset_tzpath",
