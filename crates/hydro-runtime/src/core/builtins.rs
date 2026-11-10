@@ -4514,16 +4514,21 @@ fn call_user_new(class: i64, args: &[i64], keywords: &[(String, i64)]) -> Option
         return None;
     }
     // `__new__` is implicitly a static method: the class is the first
-    // argument even when the body does not decorate it.
-    let result = methods::call_user_method(
-        class,
-        class,
-        MethodKind::Normal,
-        new,
-        "__new__",
-        args,
-        keywords,
-    );
+    // argument even when the body does not decorate it. The allocator's body
+    // runs with its defining class as the `super()` start position.
+    let new_owner = value::class_lookup_owner(class, "__new__");
+    let result = {
+        let _defining_guard = new_owner.map(methods::DefiningClassGuard::enter);
+        methods::call_user_method(
+            class,
+            class,
+            MethodKind::Normal,
+            new,
+            "__new__",
+            args,
+            keywords,
+        )
+    };
     if exc::pending() {
         return Some(NONE);
     }
@@ -4531,6 +4536,8 @@ fn call_user_new(class: i64, args: &[i64], keywords: &[(String, i64)]) -> Option
         if let Some((kind, init)) = value::class_member(class, "__init__") {
             if !value::function_signature(init).is_empty() && value::function_full_entry(init) != 0
             {
+                let _defining_guard = value::class_lookup_owner(class, "__init__")
+                    .map(methods::DefiningClassGuard::enter);
                 let _ = methods::call_user_method(
                     result, class, kind, init, "__init__", args, keywords,
                 );
@@ -4809,14 +4816,18 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
         }
         return instance;
     };
-    // `object.__init__` ignores extra arguments when the scalar payload has
-    // already consumed them, matching CPython's behaviour for builtin
-    // subclasses (`class N(int): pass; N(3)`).
-    if value::function_native_name(init) == Some("__object_init__")
-        && (value::scalar_payload(instance).is_some()
-            || crate::core::methods::class_has_custom_new(class))
-    {
-        return instance;
+    // CPython's `object.__init__`: extra arguments are tolerated only when the
+    // class overrides `object.__new__` (the allocator consumed them), matching
+    // builtin subclasses (`class N(int): pass; N(3)`) and `__new__`-only
+    // classes; a bare class reports CPython's "takes no arguments".
+    if value::function_native_name(init) == Some("__object_init__") {
+        if argc == 0
+            || value::scalar_payload(instance).is_some()
+            || crate::core::methods::class_has_custom_new(class)
+        {
+            return instance;
+        }
+        return exc::raise_with_message(TYPE_ERROR, &format!("{name}() takes no arguments"));
     }
     if !value::function_signature(init).is_empty() && value::function_full_entry(init) != 0 {
         let call_args = if argc == 0 {
@@ -4825,6 +4836,10 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
             // SAFETY: checked above; caller contract.
             unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
         };
+        // Record the class whose body owns this initializer so a
+        // zero-argument `super()` inside it starts after that class.
+        let _defining_guard = value::class_lookup_owner(class, "__init__")
+            .map(methods::DefiningClassGuard::enter);
         let _ = methods::call_user_method(instance, class, kind, init, "__init__", &call_args, &[]);
         return if exc::pending() { NONE } else { instance };
     }

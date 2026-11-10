@@ -448,16 +448,73 @@ pub(crate) fn call(
     if is_integer_value(obj) {
         return int_method(obj, &method, &args, &[]);
     }
+    // Reified frames expose `clear()`; every other name is an ordinary
+    // attribute error. A non-frame receiver never reaches this branch.
+    if value::as_frame(obj).is_some() {
+        return match method.as_str() {
+            "clear" => exc::frame_clear(obj).unwrap_or_else(|| attribute_error(obj, &method)),
+            _ => attribute_error(obj, &method),
+        };
+    }
     attribute_error(obj, &method)
+}
+
+thread_local! {
+    /// Class whose body defines the method currently running on this thread.
+    ///
+    /// CPython's zero-argument `super()` reads the `__class__` cell the class
+    /// body closes over. Generated code passes that class explicitly when it is
+    /// a module-level binding; for every other class (one defined inside a
+    /// function, or a base's method reached through a subclass) the runtime
+    /// records the class that owns the resolved method here, so the search
+    /// still starts after the class whose body contains the call instead of
+    /// after the receiver's class. The value is restored on drop, so nested
+    /// calls see their own defining class.
+    static DEFINING_CLASS: Cell<i64> = const { Cell::new(NONE) };
+}
+
+/// Records the defining class of a running method for zero-argument `super()`.
+///
+/// Entering with [`NONE`] (a call with no class body behind it) leaves the
+/// enclosing value untouched.
+pub(crate) struct DefiningClassGuard {
+    previous: Option<i64>,
+}
+
+impl DefiningClassGuard {
+    /// Makes `class` the defining class until the guard is dropped.
+    pub(crate) fn enter(class: i64) -> Self {
+        let previous = if class == NONE {
+            None
+        } else {
+            Some(DEFINING_CLASS.with(|slot| slot.replace(class)))
+        };
+        Self { previous }
+    }
+}
+
+impl Drop for DefiningClassGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous {
+            DEFINING_CLASS.with(|slot| slot.set(previous));
+        }
+    }
+}
+
+/// The class body that contains the running method, or [`NONE`] when the
+/// current thread is not executing a method.
+fn defining_class() -> i64 {
+    DEFINING_CLASS.with(|slot| slot.get())
 }
 
 /// Implements the lowered `super().__init__(...)` form.
 ///
 /// Python resolves the initializer on the class after the one that defines the
-/// current method. Without runtime frame context the runtime can only start
-/// after the receiver's class, which is the same position for the common
-/// `__init__` case and, with the C3 linearization, now follows the full MRO
-/// (so diamond hierarchies reach the shared ancestor exactly once).
+/// current method. [`defining_class`] names that class for a method invoked
+/// through the runtime; without it the search starts after the receiver's
+/// class, which is the same position for the common `__init__` case and, with
+/// the C3 linearization, follows the full MRO so diamond hierarchies reach the
+/// shared ancestor exactly once.
 fn super_init(obj: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     // Native exception instances carry their `__init__` in the exception core,
     // not in the frozen class namespace, so `class_lookup_after` would stop at
@@ -472,7 +529,11 @@ fn super_init(obj: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     let Some(class) = value::instance_class_value(obj) else {
         return type_error("super(): __self__ is not a class instance".to_string());
     };
-    let Some(entry) = value::class_lookup_after(class, class, "__init__") else {
+    let start = match defining_class() {
+        defining if defining != NONE && value::class_mro(class).contains(&defining) => defining,
+        _ => class,
+    };
+    let Some((owner, entry)) = value::class_lookup_after_owner(class, start, "__init__") else {
         return NONE;
     };
     if let value::ClassEntry::Method(_, function) = &entry {
@@ -484,14 +545,19 @@ fn super_init(obj: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
             }
         }
     }
+    // The base initializer now runs with its own class as the `super()` start
+    // position, so a chain of `super().__init__()` calls walks the MRO once.
+    let _defining_guard = DefiningClassGuard::enter(owner);
     call_bound_entry(obj, class, entry, "__init__", args, keywords)
 }
 
 /// `self.$super_new([class])`: materialises a `super` proxy.
 ///
-/// Zero-argument `super()` cannot name its defining class without frame
-/// context, so the proxy starts after the receiver's class. An explicit class
-/// argument is validated against the receiver's linearization.
+/// Zero-argument `super()` starts after the class whose body contains the call:
+/// the generated code passes that class when it is a module-level binding, and
+/// otherwise the runtime recorded it when the method was entered (see
+/// [`defining_class`]). An explicit class argument is validated against the
+/// receiver's linearization.
 fn super_proxy(obj: i64, argc: usize, argv: *const i64) -> i64 {
     // `__self__` may be an instance (ordinary method) or a class object
     // (`classmethod` calling `super()`), matching CPython's second argument.
@@ -500,29 +566,32 @@ fn super_proxy(obj: i64, argc: usize, argv: *const i64) -> i64 {
         None if value::as_class(obj).is_some() => obj,
         None => return type_error("super(): no arguments".to_string()),
     };
-    let mut class = start;
-    if argc > 0 {
-        if argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>() {
-            return type_error("super() received arguments without an argument buffer".to_string());
+    if argc == 0 {
+        let defining = defining_class();
+        if defining != NONE && value::class_mro(start).contains(&defining) {
+            return value::super_new(defining, obj);
         }
-        // SAFETY: ABI contract: `argv` points at `argc` readable values.
-        let args = unsafe { std::slice::from_raw_parts(argv, argc) };
-        if args.len() != 1 {
-            return type_error("super() takes at most 1 argument here".to_string());
-        }
-        let explicit = args[0];
-        if value::as_class(explicit).is_none() {
-            return type_error(format!(
-                "super() argument 1 must be a type, not '{}'",
-                value::type_name(explicit)
-            ));
-        }
-        if !value::class_mro(start).contains(&explicit) {
-            return type_error(
-                "super(type, obj): obj must be an instance or subtype of type".to_string(),
-            );
-        }
-        class = explicit;
+        return value::super_new(start, obj);
+    }
+    if argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>() {
+        return type_error("super() received arguments without an argument buffer".to_string());
+    }
+    // SAFETY: ABI contract: `argv` points at `argc` readable values.
+    let args = unsafe { std::slice::from_raw_parts(argv, argc) };
+    if args.len() != 1 {
+        return type_error("super() takes at most 1 argument here".to_string());
+    }
+    let class = args[0];
+    if value::as_class(class).is_none() {
+        return type_error(format!(
+            "super() argument 1 must be a type, not '{}'",
+            value::type_name(class)
+        ));
+    }
+    if !value::class_mro(start).contains(&class) {
+        return type_error(
+            "super(type, obj): obj must be an instance or subtype of type".to_string(),
+        );
     }
     value::super_new(class, obj)
 }
@@ -539,7 +608,8 @@ fn super_method(proxy: i64, method: &str, args: &[i64]) -> i64 {
     } else {
         return attribute_error(proxy, method);
     };
-    let Some(entry) = value::class_lookup_after(owner, state.class, method) else {
+    let Some((entry_owner, entry)) = value::class_lookup_after_owner(owner, state.class, method)
+    else {
         if std::env::var_os("HYDRO_DEBUG_SUPER").is_some() {
             let mro: Vec<&str> = value::class_mro(owner)
                 .iter()
@@ -554,6 +624,9 @@ fn super_method(proxy: i64, method: &str, args: &[i64]) -> i64 {
         }
         return attribute_error(proxy, method);
     };
+    // The method that runs belongs to `entry_owner`; a `super()` inside its
+    // body must continue after that class, not after the receiver's.
+    let _defining_guard = DefiningClassGuard::enter(entry_owner);
     call_bound_entry(state.object, owner, entry, method, args, &[])
 }
 
@@ -650,6 +723,14 @@ fn call_bound_entry(
     };
     if !value::function_signature(function).is_empty() && value::function_full_entry(function) != 0
     {
+        // Record the class whose namespace owns this method so a
+        // zero-argument `super()` inside its body starts after it. The entry
+        // is trusted only when it really is this function's defining class;
+        // otherwise the caller's context (a `super()` chain, a base hook) is
+        // kept.
+        let defining = value::class_lookup_owner(owner, method)
+            .filter(|&candidate| value::class_own_function(candidate, method) == Some(function));
+        let _defining_guard = defining.map(DefiningClassGuard::enter);
         return call_user_method_kw(
             bound.unwrap_or(receiver),
             owner,
@@ -702,9 +783,14 @@ fn call_bound_entry(
     }
 }
 
+/// Whether the class overrides `object.__new__` (CPython's
+/// `tp_new != object_new`).
+///
+/// The answer decides whether `object.__init__` tolerates extra arguments: a
+/// class that supplies its own allocator has already consumed them, while a
+/// bare class rejects them.
 pub(crate) fn class_has_custom_new(class: i64) -> bool {
-    value::class_member(class, "__new__")
-        .is_some_and(|(_, function)| value::function_native_name(function) != Some("__object_new__"))
+    value::class_has_custom_new(class)
 }
 
 fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64 {
@@ -723,15 +809,24 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
         return attribute_error(obj, method);
     };
     let entry = value::class_lookup(class, method);
-    // `object.__init__` ignores extra arguments once a native scalar payload
-    // consumed them (`class N(int): pass`; `enum` calls a member's `__init__`
-    // after constructing it through `int.__new__`).
-    if method == "__init__"
-        && (value::scalar_payload(obj).is_some() || class_has_custom_new(class))
-    {
+    // CPython's `object.__init__`: extra arguments are tolerated only when the
+    // type overrides `object.__new__` — the allocator consumed them already
+    // (`class N(int): pass`; `enum` calls a member's `__init__` after
+    // constructing it through `int.__new__`) — while a plain class rejects
+    // them with the exact-one-argument error.
+    if method == "__init__" {
         if let Some(value::ClassEntry::Method(_, function)) = &entry {
             if value::function_native_name(*function) == Some("__object_init__") {
-                return NONE;
+                if argc == 0
+                    || value::scalar_payload(obj).is_some()
+                    || value::class_has_custom_new(class)
+                {
+                    return NONE;
+                }
+                return type_error(format!(
+                    "{}.__init__() takes exactly one argument (the instance to initialize)",
+                    value::class_display_name(class).unwrap_or("object")
+                ));
             }
         }
     }
@@ -1199,6 +1294,29 @@ fn metaclass_attribute(class: i64, attr: &str) -> Option<i64> {
     }
 }
 
+/// Reads the *data* descriptor the metaclass defines for `class`, if any.
+///
+/// CPython's `type.__getattribute__` consults the metatype before the class
+/// namespace and lets a data descriptor there win, so a metaclass property
+/// shadows a class-body value of the same name (`class M(type): @property …`).
+/// Non-data metatype entries only apply after the class namespace misses.
+fn metaclass_data_descriptor(class: i64, attr: &str) -> Option<i64> {
+    let metaclass = lookup_metaclass(class);
+    match value::class_lookup(metaclass, attr)? {
+        value::ClassEntry::Method(MethodKind::Property, function) => {
+            let args = [class];
+            Some(builtins::call(function, 1, args.as_ptr()))
+        }
+        value::ClassEntry::Attr(item) => {
+            if !is_data_descriptor(&value::ClassEntry::Attr(item)) {
+                return None;
+            }
+            descriptor_get(item, class, metaclass)
+        }
+        value::ClassEntry::Method(_, _) => None,
+    }
+}
+
 thread_local! {
     /// Class whose construction an explicit `type.__call__(...)` is running.
     ///
@@ -1356,6 +1474,24 @@ fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) 
         } else {
             class
         };
+        // `object.__new__` accepts extra arguments only for a class whose
+        // `__init__` consumes them; a bare class reports CPython's
+        // "takes no arguments" (and a custom allocator on the target rejects
+        // them itself).
+        if argc > 1 {
+            if value::class_has_custom_new(target) {
+                return type_error(
+                    "object.__new__() takes exactly one argument (the type to instantiate)"
+                        .to_string(),
+                );
+            }
+            if !value::class_has_custom_init(target) {
+                return type_error(format!(
+                    "{}() takes no arguments",
+                    value::class_display_name(target).unwrap_or("object")
+                ));
+            }
+        }
         return value::instance_new(target);
     }
     if argc > 0 && (argv.is_null() || argc > isize::MAX as usize / std::mem::size_of::<i64>()) {
@@ -1438,8 +1574,16 @@ fn class_member_method(class: i64, method: &str, argc: usize, argv: *const i64) 
             // SAFETY: checked above; caller contract.
             unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
         };
+        // `super()` in the classmethod body continues after the class that
+        // defines it, even when the method is reached through a subclass.
+        let defining = value::class_lookup_owner(class, method)
+            .filter(|&candidate| value::class_own_function(candidate, method) == Some(function));
+        let _defining_guard = defining.map(DefiningClassGuard::enter);
         return call_user_method(class, class, kind, function, method, &args, &[]);
     }
+    let defining = value::class_lookup_owner(class, method)
+        .filter(|&candidate| value::class_own_function(candidate, method) == Some(function));
+    let _defining_guard = defining.map(DefiningClassGuard::enter);
     let receiver = (kind == MethodKind::Classmethod).then_some(class);
     let mut call_args = Vec::with_capacity(argc + 1);
     call_args.extend(receiver);
@@ -3498,6 +3642,12 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         {
             return value::native_function_new("builtins", "__code_init__", 1);
         }
+        // CPython resolves a data descriptor on the metatype before the class
+        // namespace, so a metaclass property shadows a class-body value of the
+        // same name.
+        if let Some(result) = metaclass_data_descriptor(obj, attr) {
+            return result;
+        }
         match value::class_lookup(obj, attr) {
             Some(value::ClassEntry::Attr(item)) => {
                 // A descriptor stored as a class attribute receives
@@ -3776,6 +3926,14 @@ fn setattr_named(obj: i64, attr: &str, new_value: i64) -> i64 {
             return result;
         }
         return modules::extension::ext_object_setattr(obj, attr, new_value);
+    }
+    // Reified frames have exactly one writable slot (`f_trace`); the rest of
+    // their attribute surface reports CPython's typo or read-only error.
+    if value::as_frame(obj).is_some() {
+        if let Some(result) = exc::frame_setattr(obj, attr, new_value) {
+            return result;
+        }
+        return attribute_error(obj, attr);
     }
     // Module attributes are writable: a native module keeps its spec as the
     // default resolution and stores the assignment as an override, while a

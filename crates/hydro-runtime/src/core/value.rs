@@ -4126,6 +4126,18 @@ pub(crate) fn class_lookup_owner(class: i64, name: &str) -> Option<i64> {
 /// This is `super(start, instance).name` resolution: `None` when `start` is not
 /// part of `class`'s linearization or no ancestor defines the name.
 pub(crate) fn class_lookup_after(class: i64, start: i64, name: &str) -> Option<ClassEntry> {
+    class_lookup_after_owner(class, start, name).map(|(_, entry)| entry)
+}
+
+/// [`class_lookup_after`] plus the class whose namespace supplied the entry.
+///
+/// The owner is the class whose body contains the method, which is what a
+/// zero-argument `super()` inside that method must start after.
+pub(crate) fn class_lookup_after_owner(
+    class: i64,
+    start: i64,
+    name: &str,
+) -> Option<(i64, ClassEntry)> {
     let state = as_class(class)?;
     let position = if class == start {
         0
@@ -4134,7 +4146,7 @@ pub(crate) fn class_lookup_after(class: i64, start: i64, name: &str) -> Option<C
     };
     for &ancestor in &state.mro[position.min(state.mro.len())..] {
         if let Some(entry) = class_own_lookup(ancestor, name) {
-            return Some(entry);
+            return Some((ancestor, entry));
         }
     }
     // `object` is the implicit ancestor of every class, including one declared
@@ -4145,9 +4157,10 @@ pub(crate) fn class_lookup_after(class: i64, start: i64, name: &str) -> Option<C
     // linearization (or is the receiver): CPython's `super()` starts after the
     // named class, and `object` has nothing after it.
     if class != object_class() && !state.mro.contains(&object_class()) {
-        return class_own_lookup(object_class(), name);
+        return class_own_lookup(object_class(), name)
+            .map(|entry| (object_class(), entry));
     }
-    object_protocol_slot(name)
+    object_protocol_slot(name).map(|entry| (object_class(), entry))
 }
 
 /// Full C3 linearization of `class`, starting with the class itself.
@@ -4348,6 +4361,70 @@ pub(crate) fn class_member(class: i64, name: &str) -> Option<(MethodKind, i64)> 
 /// regardless of its binding kind.
 pub(crate) fn class_method(class: i64, name: &str) -> Option<i64> {
     class_member(class, name).map(|(_, function)| function)
+}
+
+/// The callable a class-namespace value stands for when it is a
+/// `classmethod`/`staticmethod` descriptor.
+///
+/// `object.__new__` and `object.__init__` are compared by identity against the
+/// entries a namespace declares, so a class that stores the slot as
+/// `__new__ = staticmethod(object.__new__)` must resolve to the same function.
+fn descriptor_target(item: i64) -> i64 {
+    match as_descriptor(item) {
+        Some(state)
+            if matches!(
+                state.kind,
+                DescriptorKind::Classmethod | DescriptorKind::Staticmethod
+            ) =>
+        {
+            state.target
+        }
+        _ => item,
+    }
+}
+
+/// Whether `class` resolves `__new__` to anything but `object.__new__`.
+///
+/// This is CPython's `tp_new != object_new` slot test: the slot is inherited,
+/// so a base class's `__new__` counts, and every native allocator that is *not*
+/// `object.__new__` (`dict.__new__`, `int.__new__`, ...) counts as custom. The
+/// answer decides whether `object.__init__` tolerates extra arguments.
+pub(crate) fn class_has_custom_new(class: i64) -> bool {
+    let Some(entry) = class_lookup(class, "__new__") else {
+        // No `__new__` anywhere in the MRO: a bare class body still allocates
+        // through the default path.
+        return false;
+    };
+    let function = match entry {
+        ClassEntry::Method(_, function) => function,
+        ClassEntry::Attr(item) => descriptor_target(item),
+    };
+    function_native_name(function) != Some("__object_new__")
+}
+
+/// Whether `class` resolves `__init__` to anything but `object.__init__`
+/// (CPython's `tp_init != object_init`).
+pub(crate) fn class_has_custom_init(class: i64) -> bool {
+    let Some(entry) = class_lookup(class, "__init__") else {
+        return false;
+    };
+    let function = match entry {
+        ClassEntry::Method(_, function) => function,
+        ClassEntry::Attr(item) => descriptor_target(item),
+    };
+    function_native_name(function) != Some("__object_init__")
+}
+
+/// The callable this class's *own* namespace defines for `name`, with
+/// `classmethod`/`staticmethod` wrappers removed.
+///
+/// Used to confirm that a name resolved along the MRO came from the class that
+/// owns it, so method dispatch can record the correct defining class.
+pub(crate) fn class_own_function(class: i64, name: &str) -> Option<i64> {
+    match class_own_lookup(class, name)? {
+        ClassEntry::Method(_, function) => Some(function),
+        ClassEntry::Attr(item) => Some(descriptor_target(item)),
+    }
 }
 
 /// Snapshot of `instance.__dict__` in insertion order. Method attributes are
@@ -6289,6 +6366,24 @@ fn create_class(
             ),
         );
     }
+    // CPython rejects a repeated base before linearizing (`class C(A, A)`).
+    // The check runs after `__mro_entries__` expansion, so an alias that
+    // expands to an already-present base reports the same error.
+    for (index, &base) in bases.iter().enumerate() {
+        if base == NONE || !bases[..index].contains(&base) {
+            continue;
+        }
+        return crate::exc::raise_with_message(
+            crate::exc::TYPE_ERROR,
+            &format!(
+                "duplicate base class {}",
+                match class_display_name(base) {
+                    Some(display) => display.to_string(),
+                    None => type_name_of(base),
+                }
+            ),
+        );
+    }
     let resolved = match resolve_metaclass(&bases, metaclass) {
         Ok(meta) => meta,
         Err(message) => return crate::exc::raise_with_message(crate::exc::TYPE_ERROR, &message),
@@ -6312,6 +6407,25 @@ fn create_class(
         Err(message) => return crate::exc::raise_with_message(crate::exc::TYPE_ERROR, &message),
     };
     let base = bases.first().copied().unwrap_or(NONE);
+    // `__classcell__` is the class body's implicit `__class__` cell. CPython
+    // consumes it in `type.__new__` (it never shows up in the class `__dict__`)
+    // and fills it once the class object exists, which is what lets a
+    // zero-argument `super()` name the class whose body contains it.
+    let class_cell = attrs
+        .iter()
+        .find(|(attr_name, _)| attr_name.as_str() == "__classcell__")
+        .map(|(_, cell)| *cell);
+    if let Some(cell) = class_cell {
+        if !is_cell(cell) {
+            return crate::exc::raise_with_message(
+                crate::exc::TYPE_ERROR,
+                &format!(
+                    "__classcell__ must be a nonlocal cell, not <class '{}'>",
+                    type_name_of(cell)
+                ),
+            );
+        }
+    }
     // A metaclass subclass may implement `__new__`/`__init__`; both receive
     // `(name, bases, namespace)`. The namespace mirrors the frozen class body.
     // The native `type.__new__` entry every metaclass inherits is the default
@@ -6326,11 +6440,18 @@ fn create_class(
     } else {
         None
     };
+    // The hook a subclass inherits: CPython runs
+    // `super(new_class, new_class).__init_subclass__(**kwds)`, so the search
+    // starts *after* the new class — a class's own `__init_subclass__` never
+    // runs for itself. `mro` already excludes `created`.
+    let init_subclass = mro.iter().find_map(|&ancestor| {
+        class_own_lookup(ancestor, "__init_subclass__").map(|entry| (ancestor, entry))
+    });
     // CPython's `type(name, bases, namespace, **kwds)` calls the metaclass
-    // with the keywords first. When the winner has no Python `__new__`, the
-    // native `type.__new__` receives them and forwards to `__init_subclass__`,
-    // which Hydro does not call; its default (`object`) refuses every keyword.
-    if !keywords.is_empty() && !has_new {
+    // with the keywords first; when the winner has no Python `__new__`, the
+    // keywords belong to `__init_subclass__`. Its default (`object`) refuses
+    // every keyword.
+    if !keywords.is_empty() && !has_new && init_subclass.is_none() {
         return crate::exc::raise_with_message(
             crate::exc::TYPE_ERROR,
             &format!("{name}.__init_subclass__() takes no keyword arguments"),
@@ -6390,26 +6511,58 @@ fn create_class(
     }
     let set_name_methods = methods.clone();
     let set_name_attrs = attrs.clone();
-    if created == NONE {
+    // Whether this call is the one allocating the class (Hydro's
+    // `type.__new__`). A class a metaclass `__new__` returned was built by its
+    // own `type.__new__`, which already ran `__set_name__` and
+    // `__init_subclass__`; running them here would call the user hooks twice.
+    let allocated_here = created == NONE;
+    if allocated_here {
+        // `__classcell__` is the class body's closure cell, not a class
+        // attribute: CPython drops it from the namespace it builds.
+        let mut class_attrs = attrs;
+        if class_cell.is_some() {
+            class_attrs.retain(|(attr_name, _)| attr_name.as_str() != "__classcell__");
+        }
         created = allocate_class(
-            name, base, bases, mro, resolved, methods, attrs, slots, has_dict,
+            name, base, bases, mro, resolved, methods, class_attrs, slots, has_dict,
         );
-    }
-    // CPython's `type.__new__` calls `__set_name__` on every descriptor in
-    // the class namespace before the metaclass `__init__` runs. This is the
-    // hook EnumType uses to turn `_proto_member` placeholders into members.
-    for (method_name, function, _) in &set_name_methods {
-        call_set_name(created, *function, method_name);
-        if crate::exc::pending() {
-            crate::heap::release_roots(namespace_root);
-            return NONE;
+        if let Some(cell) = class_cell {
+            cell_set(cell, created);
         }
     }
-    for (attr_name, value) in &set_name_attrs {
-        call_set_name(created, *value, attr_name);
-        if crate::exc::pending() {
-            crate::heap::release_roots(namespace_root);
-            return NONE;
+    // The new class is not reachable from any root yet, and the hooks below run
+    // user code that may allocate and collect.
+    let created_root = crate::heap::root_values(std::slice::from_ref(&created));
+    // CPython's `type.__new__` calls `__set_name__` on every descriptor in
+    // the class namespace before `__init_subclass__` and before the metaclass
+    // `__init__` runs. This is the hook EnumType uses to turn `_proto_member`
+    // placeholders into members.
+    if allocated_here {
+        for (method_name, function, _) in &set_name_methods {
+            call_set_name(created, *function, method_name);
+            if crate::exc::pending() {
+                crate::heap::release_roots(created_root);
+                crate::heap::release_roots(namespace_root);
+                return NONE;
+            }
+        }
+        for (attr_name, value) in &set_name_attrs {
+            call_set_name(created, *value, attr_name);
+            if crate::exc::pending() {
+                crate::heap::release_roots(created_root);
+                crate::heap::release_roots(namespace_root);
+                return NONE;
+            }
+        }
+        // `__init_subclass__` is called with the new class as `cls` and the
+        // class-header keywords, after `__set_name__`.
+        if let Some((owner, entry)) = init_subclass {
+            let _ = call_init_subclass(created, owner, entry, keywords);
+            if crate::exc::pending() {
+                crate::heap::release_roots(created_root);
+                crate::heap::release_roots(namespace_root);
+                return NONE;
+            }
         }
     }
     // `__init__` runs after creation and may mutate the new class namespace
@@ -6420,12 +6573,85 @@ fn create_class(
             resolved, "__init__", kind, function, created, arguments, keywords,
         );
         if crate::exc::pending() {
+            crate::heap::release_roots(created_root);
             crate::heap::release_roots(namespace_root);
             return NONE;
         }
     }
+    crate::heap::release_roots(created_root);
     crate::heap::release_roots(namespace_root);
     created
+}
+
+/// Calls the nearest ancestor's `__init_subclass__` for a freshly created
+/// class.
+///
+/// CPython evaluates `super(new_class, new_class).__init_subclass__(**kwds)`,
+/// so a plain function binds the *new* class as its first argument (the hook is
+/// an implicit classmethod), a `staticmethod` binds nothing, and the method
+/// receives the class-header keywords by name. `owner` is the ancestor that
+/// declares the hook: a `super()` inside its body continues after that class.
+fn call_init_subclass(
+    new_class: i64,
+    owner: i64,
+    entry: ClassEntry,
+    keywords: &[(String, i64)],
+) -> i64 {
+    let _defining_guard = crate::core::methods::DefiningClassGuard::enter(owner);
+    let (kind, function) = match entry {
+        ClassEntry::Method(kind, function) => (kind, function),
+        ClassEntry::Attr(item) => match as_descriptor(item) {
+            Some(state) if state.kind == DescriptorKind::Staticmethod => {
+                (MethodKind::Staticmethod, state.target)
+            }
+            Some(state) if state.kind == DescriptorKind::Classmethod => {
+                (MethodKind::Classmethod, state.target)
+            }
+            _ if as_function(item).is_some() => (MethodKind::Normal, item),
+            // A property or non-callable entry cannot be run as the hook; the
+            // class protocol keeps CPython's "no keywords" default.
+            _ => {
+                if keywords.is_empty() {
+                    return NONE;
+                }
+                return crate::exc::raise_with_message(
+                    crate::exc::TYPE_ERROR,
+                    &format!(
+                        "{}.__init_subclass__() takes no keyword arguments",
+                        class_display_name(new_class).unwrap_or("object")
+                    ),
+                );
+            }
+        },
+    };
+    if !function_signature(function).is_empty() && function_full_entry(function) != 0 {
+        return crate::core::methods::call_user_method(
+            new_class,
+            new_class,
+            kind,
+            function,
+            "__init_subclass__",
+            &[],
+            keywords,
+        );
+    }
+    // Native hooks (including `object.__init_subclass__`, which Hydro installs
+    // as a classmethod on its native `object` class) accept the class
+    // positionally and refuse the class-header keywords.
+    if !keywords.is_empty() {
+        return crate::exc::raise_with_message(
+            crate::exc::TYPE_ERROR,
+            &format!(
+                "{}.__init_subclass__() takes no keyword arguments",
+                class_display_name(new_class).unwrap_or("object")
+            ),
+        );
+    }
+    if kind == MethodKind::Staticmethod {
+        return NONE;
+    }
+    let arguments = [new_class];
+    crate::core::builtins::call(function, arguments.len(), arguments.as_ptr())
 }
 
 /// Restores a class plan's method binding kinds on a class a metaclass built.
@@ -6480,9 +6706,24 @@ fn restore_method_kinds(class: i64, methods: &[(String, i64, MethodKind)]) {
 
 /// Calls `value.__set_name__(owner, name)` when the value defines it.
 ///
-/// Missing attributes are ignored; any exception raised by the hook
-/// propagates to the caller (and aborts class creation).
+/// CPython uses `_PyObject_LookupSpecial`, so a value whose type does not
+/// provide the hook is skipped without calling anything. Any exception the hook
+/// raises propagates to the caller (and aborts class creation) — including an
+/// `AttributeError` raised *inside* the hook, which is not mistaken for a
+/// missing hook.
 fn call_set_name(owner: i64, value: i64, name: &str) {
+    // Probe the hook through the regular lookup first. Every value that owns
+    // one answers it; an ordinary class attribute (`1`, a string, a plain
+    // function) reports `AttributeError`, which only the probe swallows.
+    let has_hook = crate::core::methods::hasattr(value, b"__set_name__".as_ptr(), 12);
+    if crate::exc::pending() {
+        // A non-`AttributeError` failure during the lookup propagates and
+        // aborts class creation.
+        return;
+    }
+    if has_hook != TRUE {
+        return;
+    }
     let name_value = str_alloc(name.to_string());
     let root = crate::heap::root_values(&[owner, name_value]);
     let arguments = [owner, name_value];
@@ -6493,12 +6734,6 @@ fn call_set_name(owner: i64, value: i64, name: &str) {
         arguments.len(),
         arguments.as_ptr(),
     );
-    if crate::exc::pending() && crate::exc::pending_tag() == i64::from(crate::exc::ATTRIBUTE_ERROR)
-    {
-        // Ordinary class attributes do not define the hook; that is not a
-        // failure of class creation.
-        crate::exc::clear();
-    }
     crate::heap::release_roots(root);
 }
 
@@ -6970,6 +7205,22 @@ pub(crate) fn iter_callable_new(callable: i64, sentinel: i64) -> i64 {
 /// so every reader observes the current binding.
 pub(crate) fn cell_new(value: i64) -> i64 {
     alloc(KIND_CELL, ObjData::Cell(value))
+}
+
+/// Whether `v` is a closure cell (`KIND_CELL`).
+///
+/// Class creation validates a `__classcell__` namespace entry with this: CPython
+/// requires a cell there so the class body's implicit `__class__` closure can be
+/// filled with the new class.
+pub(crate) fn is_cell(v: i64) -> bool {
+    if !is_heap(v) {
+        return false;
+    }
+    // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
+    let Some(obj) = (unsafe { as_obj(v) }) else {
+        return false;
+    };
+    obj.kind == KIND_CELL
 }
 
 /// Reads the value held by `cell`. Non-cell values yield [`NONE`]; generated
@@ -8703,6 +8954,15 @@ fn object_native_class() -> i64 {
             "__init__".to_string(),
             native_function_new("builtins", "__object_init__", usize::MAX),
             MethodKind::Normal,
+        ),
+        (
+            // `object.__init_subclass__`: the default hook every class
+            // inherits. It is an implicit classmethod that accepts the new
+            // subclass and no keyword arguments, and returns `None`; a base
+            // class overrides it to observe (or reject) subclassing.
+            "__init_subclass__".to_string(),
+            native_function_new("builtins", "__object_init__", usize::MAX),
+            MethodKind::Classmethod,
         ),
         (
             "__str__".to_string(),
