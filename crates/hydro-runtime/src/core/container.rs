@@ -587,6 +587,26 @@ pub(crate) fn key_hash(v: i64) -> u64 {
     if let Some(token) = value::builtin_type_token(v) {
         return fnv_bytes(HASH_BUILTIN_TYPE, token.as_bytes());
     }
+    // A user instance participates through its class's `__hash__` slot.
+    // Dict/set lookup must use that value or equal keys with a shared hash
+    // never meet in the same bucket (and their `__eq__` is never consulted).
+    if let Some(instance) = value::as_instance(v) {
+        if value::class_lookup(instance.class, "__hash__").is_some() {
+            let result = crate::core::methods::call(
+                v,
+                b"__hash__".as_ptr(),
+                "__hash__".len(),
+                0,
+                std::ptr::null(),
+            );
+            if exc::pending() {
+                return 0;
+            }
+            if let Some(hash) = value::as_integer(result) {
+                return hash as u64;
+            }
+        }
+    }
     identity_hash(v)
 }
 

@@ -1775,6 +1775,18 @@ pub(crate) fn raise_msg_ptr(tag: u32, ptr: *const u8, len: usize) -> i64 {
 /// self-cycle. Raising anything that is not a `BaseException` raises
 /// CPython's `TypeError: exceptions must derive from BaseException`.
 pub(crate) fn raise_value(v: i64) -> i64 {
+    // `raise SomeExceptionClass` instantiates the class with no arguments,
+    // exactly like CPython; only the resulting instance is published.
+    if value::as_class(v).is_some() {
+        let instance = crate::core::builtins::call(v, 0, std::ptr::null());
+        if pending() {
+            return NONE;
+        }
+        if instance == v {
+            return raise_with_message(TYPE_ERROR, "exceptions must derive from BaseException");
+        }
+        return raise_value(instance);
+    }
     match value::exception_data(v) {
         Some(data) => {
             let context = handled().filter(|&h| h != v);
@@ -1905,6 +1917,16 @@ pub(crate) fn raise_from(tag: u32, msg: i64, cause: i64) -> i64 {
 /// `TypeError: exceptions must derive from BaseException`, like
 /// [`raise_value`].
 pub(crate) fn raise_value_from(v: i64, cause: i64) -> i64 {
+    if value::as_class(v).is_some() {
+        let instance = crate::core::builtins::call(v, 0, std::ptr::null());
+        if pending() {
+            return NONE;
+        }
+        if instance == v {
+            return raise_with_message(TYPE_ERROR, "exceptions must derive from BaseException");
+        }
+        return raise_value_from(instance, cause);
+    }
     match value::exception_data(v) {
         Some(data) => {
             let mut data = data.clone();
@@ -3195,11 +3217,10 @@ mod tests {
         assert_eq!(raise_value(not_an_exception), NONE);
         assert_eq!(pending_tag(), TYPE_ERROR as i64);
 
-        // `raise <exception class>` without instantiating it is the same
-        // error, not a silent instantiation.
+        // `raise <exception class>` instantiates the class with no arguments.
         init();
         assert_eq!(raise_value(exception_class(VALUE_ERROR)), NONE);
-        assert_eq!(pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(value::type_name(pending_value()), "ValueError");
         init();
     }
 

@@ -8414,6 +8414,9 @@ fn dict_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 return err;
             }
             let found = value::as_dict_data(obj).is_some_and(|dict| dict.find(args[0]).is_some());
+            if exc::pending() {
+                return NONE;
+            }
             value::bool_value(found)
         }
         "__len__" => {

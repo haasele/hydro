@@ -52,6 +52,14 @@ initial state of the first runnable core.
   `TypeError`, so `copy.copy` reports CPython's non-copyable error instead of
   `copy.Error`. View `repr` now marks the view active, so a view that contains
   itself through its dict prints `...` instead of overflowing the stack.
+- Dict and set key hashing dispatches to a user class's `__hash__` slot instead
+  of always using identity. Equal keys with the same hash now share a bucket
+  and their `__eq__` runs, so a raised equality exception propagates (fixes
+  `test_dictviews.test_compare_error`).
+- `raise SomeExceptionClass` and `raise module.SomeExceptionClass` now evaluate
+  and instantiate the real class instead of synthesizing `RuntimeError` in the
+  frontend. This preserves user exception identity, constructor validation and
+  `from ...` cause handling. The obsolete frontend fallback test was removed.
 - Latest official differential run (2026-11-10T17:20:05Z) reached **36/398
   `hydro_pass`** (296 `hydro_fail`, 56 `expected_fail`, 4 timeouts, 3 watchdog
   memkills, 3 `cpython_fail`). Seven tests newly passed
@@ -132,7 +140,7 @@ initial state of the first runnable core.
   CPython.
 - C3 class construction, `super()` defining-class tracking, regex flags
   (`re.U` implied for `str` patterns) and the workspace clippy/fmt gates are
-  green. Canonical workspace count: 3262 tests run, 1 skipped.
+  green. Canonical workspace count: 3261 tests run, 1 skipped.
 
 ### Compatibility — `__class__`
 

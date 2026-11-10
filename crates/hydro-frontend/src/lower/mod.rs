@@ -17103,10 +17103,19 @@ impl<'a> Lowerer<'a> {
             Some(exc_expr) => match &**exc_expr {
                 ast::Expr::Name(n) => match ExcKind::from_name(n.id.as_str()) {
                     Some(kind) => (Some(kind), None),
-                    None if self.is_user_exception_name(n.id.as_str()) => (
-                        Some(ExcKind::RuntimeError),
-                        Some(self.user_exception_message(n.id.as_str(), None, line, col)),
-                    ),
+                    None if self.is_user_exception_name(n.id.as_str()) => {
+                        // A user-defined exception class is a real runtime
+                        // value; evaluate it and let the runtime instantiate
+                        // the class, preserving the class identity instead of
+                        // synthesizing a RuntimeError.
+                        return Some(self.raise_value_stmt(
+                            exc_expr,
+                            s.cause.as_deref(),
+                            fs,
+                            line,
+                            col,
+                        ));
+                    }
                     // Any other name denotes an exception value (`raise e` in
                     // an `except` handler): raise the object it evaluates to.
                     None => {
@@ -17136,10 +17145,17 @@ impl<'a> Lowerer<'a> {
                     };
                     match ExcKind::from_name(&name) {
                         Some(kind) => (Some(kind), None),
-                        None => (
-                            Some(ExcKind::RuntimeError),
-                            Some(self.user_exception_message(&name, None, line, col)),
-                        ),
+                        None => {
+                            // Imported/user exception classes are real values;
+                            // let the runtime instantiate them.
+                            return Some(self.raise_value_stmt(
+                                exc_expr,
+                                s.cause.as_deref(),
+                                fs,
+                                line,
+                                col,
+                            ));
+                        }
                     }
                 }
                 ast::Expr::Call(call) => {

@@ -14113,21 +14113,6 @@ fn dotted_raise_lowers_to_the_runtime_error_fallback() {
 }
 
 #[test]
-fn bare_dotted_raise_uses_the_runtime_error_fallback() {
-    let source = "raise errors.StyleSyntaxError\n";
-    let (hir, _, diags) = lower_source(source, &parse(source));
-    assert!(diags.is_empty(), "{diags:?}");
-    let HStmtKind::Raise { exc, msg, .. } = &hir.functions[0].body[0].kind else {
-        panic!("expected a raise statement");
-    };
-    assert_eq!(*exc, Some(ExcKind::RuntimeError));
-    assert!(matches!(
-        &msg.as_ref().expect("message").kind,
-        HExprKind::Const(Const::Str(name)) if name == "errors.StyleSyntaxError"
-    ));
-}
-
-#[test]
 fn user_and_dotted_handlers_approximate_runtime_error() {
     // A user exception class declared in the unit and a dotted class name
     // keep the documented RuntimeError approximation (their `raise` forms use
