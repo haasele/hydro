@@ -3,11 +3,18 @@
 //!
 //! Discovery is filesystem based, layered over Hydro's native module table:
 //! a name in `hydro_ir::stdlib` is a built-in module, an installed package is
-//! found exactly where CPython would find it on `sys.path` (`HYDRO_SITE_PACKAGES`,
-//! the `VIRTUAL_ENV`/`CONDA_PREFIX` site directories, `PYTHONPATH`,
-//! `HYDRO_STDLIB` and the pure-Python modules vendored in Hydro's `stdlib/`),
-//! and a module compiled into the program resolves through the runtime
-//! registry.
+//! found exactly where CPython would find it on the live `sys.path` list
+//! (`HYDRO_SITE_PACKAGES`, the `VIRTUAL_ENV`/`CONDA_PREFIX` site directories,
+//! `PYTHONPATH`, `HYDRO_STDLIB` and the pure-Python modules vendored in Hydro's
+//! `stdlib/` seed that list), and a module compiled into the program resolves
+//! through the runtime registry.
+//!
+//! A dotted name is resolved the way `_find_and_load` does it: the parent
+//! package's live `__path__` (which `pkgutil.extend_path`-style code may have
+//! extended) is the finder path, and only the last dotted component is looked
+//! up there. A directory portion without `__init__.py` contributes a PEP 420
+//! namespace package, collected across every path entry exactly like
+//! `PathFinder._get_spec`.
 //!
 //! Hydro compiles Python ahead of time, so `module_from_spec` returns the
 //! already-initialized module when one exists and otherwise creates a real
@@ -408,14 +415,18 @@ pub(crate) fn resolve_module(name: &str) -> Option<FoundSpec> {
 
 /// [`resolve_module`] with an explicit finder path.
 ///
-/// `None` searches `sys.path`; `Some(dirs)` replaces only the filesystem
-/// finder's path, exactly as `importlib._bootstrap._find_spec(name, path)`
-/// forwards `path` to `PathFinder`. Built-in modules and modules compiled into
-/// the program are still found, because their finders ignore `path`.
-/// Finder entry point shared with `importlib.machinery.PathFinder`: resolves
-/// `name` against the explicit finder path (or `sys.path` when `None`),
-/// including native modules and modules compiled into the program.
+/// `None` searches the live `sys.path`, resolving a dotted name's parent
+/// package first so its `__path__` is the finder path — exactly what
+/// `importlib._bootstrap._find_and_load` does before calling `_find_spec`.
+/// `Some(dirs)` replaces the finder path, exactly like `PathFinder`: the last
+/// dotted component is looked up inside `dirs` (the parent package's
+/// `__path__`), never re-prefixed with the whole dotted name. Built-in modules
+/// and modules compiled into the program are still found through an explicit
+/// path, because their finders ignore it.
 pub(crate) fn resolve_module_with_path(name: &str, path: Option<&[String]>) -> Option<FoundSpec> {
+    if name.is_empty() || name.split('.').any(str::is_empty) {
+        return None;
+    }
     if name == "__main__" {
         // CPython always has a `__main__` module: the entry program. Materialise
         // its module value so the registry branch below describes it even when
@@ -430,61 +441,156 @@ pub(crate) fn resolve_module_with_path(name: &str, path: Option<&[String]>) -> O
             loader: LoaderKind::Builtin,
         });
     }
-    let default_path;
-    let search: &[String] = match path {
-        Some(path) => path,
-        None => {
-            default_path = super::search_path();
-            &default_path
-        }
+    let (parent, tail) = match name.rsplit_once('.') {
+        Some((parent, tail)) => (Some(parent), tail),
+        None => (None, name),
     };
-    // CPython searches a submodule inside its parent package's `__path__`, not
-    // only along `sys.path`. Resolving the parent first keeps submodules of
-    // packages found outside the search path (namespace packages, packages
-    // whose `__path__` was extended) importable.
-    if let Some((parent, leaf)) = name.rsplit_once('.') {
-        if let Some(found_parent) = resolve_module_with_path(parent, path) {
-            if let Some(dirs) = found_parent.search_locations.as_deref() {
-                if let Some(found) = filesystem_leaf_in(name, leaf, dirs) {
-                    return Some(found);
-                }
-            }
-        }
-    }
-    if let Some(found) = filesystem_module_in(name, search) {
-        return Some(found);
-    }
     // A module compiled into the program but not installed as a file (for
     // example a local module outside `sys.path`). Its path is taken from the
-    // `__file__` global when the module bound one.
+    // `__file__` global when the module bound one; a package's live `__path__`
+    // (possibly extended by `pkgutil.extend_path`) describes namespace packages.
+    // The registry is name-keyed and its modules have no finder path, so an
+    // explicit `path` does not hide them (`PathFinder` promises the same for
+    // frozen modules).
     if super::registry_lookup(name).is_some() {
-        let origin = globals::lookup(name, "__file__")
-            .and_then(value::as_str)
-            .map(machinery::absolute);
-        let package = origin
-            .as_deref()
-            .is_some_and(|path| is_package_init(Path::new(path)));
-        let search_locations = if package {
-            origin
-                .as_deref()
-                .and_then(|path| Path::new(path).parent())
-                .map(|dir| vec![dir.to_string_lossy().into_owned()])
+        return Some(registry_module_spec(name));
+    }
+    // An explicit finder path is already the parent package's `__path__` (or a
+    // replacement for `sys.path`): CPython's `FileFinder` searches the last
+    // dotted component there, so `pkg.mod` looks for `<dir>/mod.py`.
+    if let Some(dirs) = path {
+        return filesystem_leaf_in(name, tail, dirs);
+    }
+    // CPython imports the parent package before searching for a submodule and
+    // passes `parent.__path__` to `PathFinder`. The live attribute is
+    // authoritative: `__path__` may have been extended after import.
+    if let Some(parent) = parent {
+        let parent_dirs = module_path_dirs(parent);
+        if let Some(dirs) = &parent_dirs {
+            if let Some(found) = filesystem_leaf_in(name, tail, dirs) {
+                return Some(found);
+            }
+        }
+        let resolved_parent = if parent_dirs.is_none() {
+            resolve_module_with_path(parent, None)
         } else {
             None
         };
-        let loader = if origin.is_some() {
-            LoaderKind::Source
-        } else {
-            LoaderKind::None
+        // A parent with a real `__path__` that lacks the leaf has no such
+        // submodule. A parent with no path at all (`None`) is a plain module,
+        // which CPython reports as "not a package". An *empty* path marks a
+        // native package such as `unittest`: the central table has no
+        // directory for it, but a source tree on `sys.path` still holds
+        // `unittest/mock.py`, so the dotted-name walk below must run.
+        let fallback = match (&parent_dirs, &resolved_parent) {
+            (Some(dirs), _) => dirs.is_empty(),
+            (None, Some(found_parent)) => match found_parent.search_locations.as_deref() {
+                Some(dirs) => dirs.is_empty() && found_parent.loader == LoaderKind::Builtin,
+                None => false,
+            },
+            // The parent is unknown to every finder, but a PEP 420 layout can
+            // still hold the full dotted path.
+            (None, None) => true,
         };
-        return Some(FoundSpec {
-            name: name.to_string(),
-            origin,
-            search_locations,
-            loader,
-        });
+        if !fallback {
+            return None;
+        }
+    }
+    let search = live_search_path();
+    if let Some(found) = filesystem_module_in(name, &search) {
+        return Some(found);
     }
     None
+}
+
+/// The `FoundSpec` of a module compiled into the program, from its globals.
+fn registry_module_spec(name: &str) -> FoundSpec {
+    let origin = globals::lookup(name, "__file__")
+        .and_then(value::as_str)
+        .map(machinery::absolute);
+    let search_locations = module_path_dirs(name).or_else(|| {
+        origin.as_deref().and_then(|path| {
+            is_package_init(Path::new(path))
+                .then(|| Path::new(path).parent())
+                .flatten()
+                .map(|dir| vec![dir.to_string_lossy().into_owned()])
+        })
+    });
+    let loader = if origin.is_some() {
+        LoaderKind::Source
+    } else {
+        LoaderKind::None
+    };
+    FoundSpec {
+        name: name.to_string(),
+        origin,
+        search_locations,
+        loader,
+    }
+}
+
+/// `sys.path` as the live search roots.
+///
+/// CPython's `PathFinder` reads the mutable `sys.path` list on every import;
+/// Hydro derives the initial list from the environment but must observe later
+/// writes (`sys.path.append(...)`), so the module attribute wins once it
+/// exists. The environment-derived list is the fallback when the `sys` surface
+/// is unavailable.
+fn live_search_path() -> Vec<String> {
+    let path = super::module_get_by_name("sys", "path");
+    if exc::pending() {
+        exc::clear();
+        return super::search_path();
+    }
+    if let Some(items) = value::as_list(path) {
+        return items
+            .iter()
+            .filter_map(|item| value::as_str(*item).map(str::to_string))
+            .collect();
+    }
+    super::search_path()
+}
+
+/// A package's live `__path__` directories.
+///
+/// A compiled package keeps `__path__` in the runtime global store (so it
+/// survives a `sys.modules` pop); a namespace package materialised by
+/// `module_from_spec` carries it in its namespace dict. Native packages have
+/// no directory of their own and report none.
+fn module_path_dirs(name: &str) -> Option<Vec<String>> {
+    if let Some(module) = super::registry_lookup(name) {
+        if let Some(pairs) = value::as_namespace(module) {
+            if let Some((_, path)) = pairs.iter().find(|(key, _)| key.as_str() == "__path__") {
+                return path_dirs(*path);
+            }
+        }
+    }
+    path_dirs(globals::lookup(name, "__path__")?)
+}
+
+/// `__path__` as owned directory strings (a list or tuple of `str`).
+fn path_dirs(path: i64) -> Option<Vec<String>> {
+    let items = value::as_list(path).or_else(|| value::as_tuple(path))?;
+    Some(
+        items
+            .iter()
+            .filter_map(|item| value::as_str(*item).map(str::to_string))
+            .collect(),
+    )
+}
+
+/// The finder path CPython passes for `name`: its parent package's `__path__`.
+///
+/// A native package has an empty `__path__` (the central table names its
+/// submodules but no directory exists). Passing that empty list to a finder
+/// would hide the dotted source tree on `sys.path` (`unittest/mock.py`), so
+/// the live search roots are used instead, exactly as if the parent had no
+/// path entry of its own.
+pub(crate) fn parent_finder_path(name: &str) -> Option<Vec<String>> {
+    let (parent, _) = name.rsplit_once('.')?;
+    let dirs = module_path_dirs(parent)
+        .or_else(|| resolve_module_with_path(parent, None).and_then(|found| found.search_locations))?;
+    (!dirs.is_empty()).then_some(dirs)
 }
 
 /// The directory (or module file) of a package, used by
@@ -513,20 +619,30 @@ fn is_package_init(path: &Path) -> bool {
 /// Filesystem-only discovery for `importlib.machinery.FileFinder` and the
 /// `FileFinder` path hook: native modules and modules that exist only in the
 /// runtime registry are not found through a directory finder.
+///
+/// A `FileFinder` owns one directory and looks up the last dotted component
+/// there (`FileFinder.find_spec(fullname)` uses `fullname.rpartition('.')[2]`),
+/// so the whole dotted name is never used as a path.
 pub(crate) fn filesystem_spec(name: &str, dirs: &[String]) -> Option<FoundSpec> {
     if name.is_empty() || name.split('.').any(str::is_empty) {
         return None;
     }
-    filesystem_module_in(name, dirs)
+    let tail = name.rsplit_once('.').map_or(name, |(_, tail)| tail);
+    filesystem_leaf_in(name, tail, dirs)
 }
 
 /// Looks for the single component `leaf` of `name` inside `dirs` (a parent
 /// package's `__path__`), reusing the same file layout rules as
 /// [`filesystem_module_in`].
+///
+/// A bare directory portion is a PEP 420 namespace-package candidate: every
+/// portion is collected and returned once no later `dir` holds a regular
+/// package or module, exactly like `PathFinder._get_spec`.
 fn filesystem_leaf_in(name: &str, leaf: &str, dirs: &[String]) -> Option<FoundSpec> {
     if leaf.is_empty() {
         return None;
     }
+    let mut namespaces: Vec<String> = Vec::new();
     for dir in dirs {
         let base = Path::new(dir).join(leaf);
         let init = base.join("__init__.py");
@@ -555,8 +671,19 @@ fn filesystem_leaf_in(name: &str, leaf: &str, dirs: &[String]) -> Option<FoundSp
                 loader: LoaderKind::Extension,
             });
         }
+        if base.is_dir() {
+            namespaces.push(base.to_string_lossy().into_owned());
+        }
     }
-    None
+    if namespaces.is_empty() {
+        return None;
+    }
+    Some(FoundSpec {
+        name: name.to_string(),
+        origin: None,
+        search_locations: Some(namespaces),
+        loader: LoaderKind::None,
+    })
 }
 
 /// Looks for `name` in `search`, which is the documented `sys.path` order for
@@ -683,17 +810,16 @@ fn find_spec(args: &[i64]) -> i64 {
     if name.is_empty() || name.split('.').any(str::is_empty) {
         return NONE;
     }
-    // `sys.meta_path` is walked in order; Hydro's own finders are implemented
-    // by `spec_for_name`, so only program-defined finders are asked here.
-    if super::registry_lookup(&name).is_none() {
-        if let Some(spec) = super::importlib::meta_path_find_spec(&name) {
-            return spec;
-        }
+    // `sys.modules` wins: a loaded module's `__spec__` is authoritative.
+    match spec_from_sys_modules(&name) {
+        Ok(Some(spec)) => return spec,
+        Ok(None) => {}
+        Err(raised) => return raised,
     }
-    match spec_for_name(&name, None) {
-        Ok(spec) => spec,
-        Err(raised) => raised,
-    }
+    // CPython's `find_spec` imports the parent package first and hands its
+    // `__path__` to every finder on `sys.meta_path`.
+    let path = parent_finder_path(&name);
+    meta_path_find_spec(&name, path.as_deref()).unwrap_or(NONE)
 }
 
 /// `importlib.util._find_spec_from_path(name, path=None, target=None)`.
@@ -715,31 +841,195 @@ fn find_spec_from_path(args: &[i64]) -> i64 {
         return NONE;
     }
     // The util helper checks `sys.modules` itself and treats a missing or
-    // `None` `__spec__` as an error, unlike `find_spec` (which falls through
-    // to the finders). Any other loaded module returns its stored spec.
-    if let Some(module) = super::registry_lookup(&name) {
-        if module == NONE {
-            return NONE;
-        }
-        if let Some(pairs) = value::as_namespace(module) {
-            return match pairs.iter().find(|(key, _)| key.as_str() == "__spec__") {
-                Some((_, spec)) if *spec == NONE => {
-                    exc::raise_with_message(VALUE_ERROR, &format!("{name}.__spec__ is None"))
-                }
-                Some((_, spec)) => *spec,
-                None => {
-                    exc::raise_with_message(VALUE_ERROR, &format!("{name}.__spec__ is not set"))
-                }
-            };
-        }
-        if hydro_ir::stdlib::module(&name).is_some() {
-            return native_spec(&name);
-        }
+    // `None` `__spec__` as an error. Any other loaded module returns its
+    // stored spec; only an unloaded name reaches the finders.
+    match spec_from_sys_modules(&name) {
+        Ok(Some(spec)) => return spec,
+        Ok(None) => {}
+        Err(raised) => return raised,
     }
-    match resolve_module_with_path(&name, path.as_deref()) {
-        Some(found) => found_spec(&found),
+    meta_path_find_spec(&name, path.as_deref()).unwrap_or(NONE)
+}
+
+/// What a `sys.meta_path` walk produced.
+enum MetaMatch {
+    /// Hydro's own finder resolved the module.
+    Found(FoundSpec),
+    /// A program-defined finder returned this spec.
+    Finder(i64),
+}
+
+/// Walks `sys.meta_path` in order, returning the first match for `name`.
+///
+/// Hydro's finders are implemented natively but keep their place in the list:
+/// `BuiltinImporter` answers for native modules, `FrozenImporter` reports no
+/// frozen module (Hydro bundles none) and `PathFinder` searches `path` (or the
+/// live `sys.path` when `None`). Program-defined finders are called as
+/// `find_spec(name, path, None)` exactly where the list puts them, so a finder
+/// appended after the default trio cannot shadow a native module and a finder
+/// prepended before it can. When the list has no `PathFinder` — Hydro installs
+/// one lazily through `importlib.machinery._install` — the path search keeps
+/// CPython's default position, right after the builtin finders.
+fn meta_path_match(name: &str, path: Option<&[String]>) -> Option<MetaMatch> {
+    let meta_path = super::module_get_by_name("sys", "meta_path");
+    if exc::pending() {
+        exc::clear();
+        return None;
+    }
+    let finders = value::as_list(meta_path)?;
+    let builtin = machinery::builtin_importer_class();
+    let frozen = machinery::frozen_importer_class();
+    let path_finder = machinery::path_finder_class();
+    let has_path_finder = finders.iter().any(|finder| *finder == path_finder);
+    let mut path_roots = None;
+    let path_value = match path {
+        Some(dirs) => {
+            let list = value::list_new(Vec::new());
+            let roots = crate::heap::root_values(&[list]);
+            for dir in dirs {
+                let item = value::str_alloc(dir.clone());
+                let item_roots = crate::heap::root_values(&[item]);
+                crate::container::list_append(list, item);
+                crate::heap::release_roots(item_roots);
+            }
+            path_roots = Some(roots);
+            list
+        }
         None => NONE,
+    };
+    let name_value = value::str_alloc(name.to_string());
+    let roots = crate::heap::root_values(&[meta_path, name_value, path_value]);
+    if let Some(path_roots) = path_roots {
+        crate::heap::release_roots(path_roots);
     }
+    let mut searched_path = false;
+    let mut saw_hydro_finder = false;
+    let mut result = None;
+    for finder in finders {
+        if *finder == builtin {
+            saw_hydro_finder = true;
+            if hydro_ir::stdlib::module(name).is_some() {
+                result = Some(MetaMatch::Found(FoundSpec {
+                    name: name.to_string(),
+                    origin: None,
+                    search_locations: native_search_locations(name),
+                    loader: LoaderKind::Builtin,
+                }));
+                break;
+            }
+        } else if *finder == frozen {
+            // Hydro bundles no frozen module data, so the finder reports
+            // nothing; a name that also exists as source under `sys.path` is
+            // found by the path search.
+            saw_hydro_finder = true;
+        } else if *finder == path_finder {
+            saw_hydro_finder = true;
+            searched_path = true;
+            if let Some(found) = resolve_module_with_path(name, path) {
+                result = Some(MetaMatch::Found(found));
+                break;
+            }
+        } else {
+            // The implicit `PathFinder` keeps the position of CPython's
+            // default entry: after the builtin finders, before appended ones.
+            if !has_path_finder && saw_hydro_finder && !searched_path {
+                searched_path = true;
+                if let Some(found) = resolve_module_with_path(name, path) {
+                    result = Some(MetaMatch::Found(found));
+                    break;
+                }
+            }
+            let find_spec =
+                crate::core::methods::getattr(*finder, "find_spec".as_ptr(), "find_spec".len());
+            if exc::pending() {
+                exc::clear();
+                continue;
+            }
+            let spec = crate::builtins::call(find_spec, 3, [name_value, path_value, NONE].as_ptr());
+            if exc::pending() {
+                crate::heap::release_roots(roots);
+                return None;
+            }
+            if spec != NONE {
+                result = Some(MetaMatch::Finder(spec));
+                break;
+            }
+        }
+    }
+    if result.is_none() && !searched_path && saw_hydro_finder {
+        if let Some(found) = resolve_module_with_path(name, path) {
+            result = Some(MetaMatch::Found(found));
+        }
+    }
+    crate::heap::release_roots(roots);
+    result
+}
+
+/// The spec `sys.meta_path` reports for `name`.
+pub(crate) fn meta_path_find_spec(name: &str, path: Option<&[String]>) -> Option<i64> {
+    match meta_path_match(name, path)? {
+        MetaMatch::Found(found) => Some(spec_instance(&found)),
+        MetaMatch::Finder(spec) => Some(spec),
+    }
+}
+
+/// Imports `name` through `sys.meta_path`.
+///
+/// A module Hydro's own finders discovered is materialised (native modules,
+/// source/namespace modules on the search roots); a spec a program-defined
+/// finder returned is loaded through its loader, executing the loader's
+/// `exec_module` exactly like CPython's `_load`.
+pub(crate) fn meta_path_import(name: &str, path: Option<&[String]>) -> Option<i64> {
+    match meta_path_match(name, path)? {
+        MetaMatch::Found(found) => Some(materialize_found(&found)),
+        MetaMatch::Finder(spec) => Some(super::importlib::load_spec(name, spec)),
+    }
+}
+
+/// The authoritative `__spec__` of a module already in `sys.modules`.
+///
+/// `Ok(None)` means the name is not loaded, or the loaded module value is not
+/// authoritative (an extension module value with no published spec) and the
+/// finders should describe it. `Ok(Some(NONE))` means
+/// `sys.modules[name] is None` (CPython returns `None` from `find_spec`);
+/// a module namespace with a missing or `None` `__spec__` raises the same
+/// `ValueError` CPython's `importlib.util` helpers do.
+fn spec_from_sys_modules(name: &str) -> Result<Option<i64>, i64> {
+    let Some(module) = super::registry_lookup(name) else {
+        return Ok(None);
+    };
+    if module == NONE {
+        return Ok(Some(NONE));
+    }
+    if let Some(pairs) = value::as_namespace(module) {
+        return match pairs.iter().find(|(key, _)| key.as_str() == "__spec__") {
+            Some((_, spec)) if *spec == NONE => Err(exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("{name}.__spec__ is None"),
+            )),
+            Some((_, spec)) => Ok(Some(*spec)),
+            None => Err(exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("{name}.__spec__ is not set"),
+            )),
+        };
+    }
+    if hydro_ir::stdlib::module(name).is_some() {
+        return Ok(Some(native_spec(name)));
+    }
+    if let Some(spec) = globals::lookup(name, "__spec__") {
+        if spec == NONE {
+            return Err(exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("{name}.__spec__ is None"),
+            ));
+        }
+        return Ok(Some(spec));
+    }
+    // A module value that publishes neither a spec nor a central-table entry
+    // (an extension module value, or a synthetic value) is not authoritative:
+    // let the finders describe it, so `find_spec` still reports the real file.
+    Ok(None)
 }
 
 /// Decodes the `path` argument of `_find_spec_from_path`.
@@ -778,40 +1068,14 @@ fn path_arg(argument: i64) -> Result<Option<Vec<String>>, i64> {
     Ok(Some(path))
 }
 
-/// Resolves `name` honouring an already-loaded module's authoritative
-/// `__spec__`, then falls back to the finders over `path` (`None` = `sys.path`).
-///
-/// The `Err` side is the already-raised `ValueError` for a `None` `__spec__`.
-fn spec_for_name(name: &str, path: Option<&[String]>) -> Result<i64, i64> {
-    // `sys.modules` wins, exactly like CPython: a loaded module's `__spec__`
-    // is authoritative.
-    if let Some(module) = super::registry_lookup(name) {
-        if let Some(pairs) = value::as_namespace(module) {
-            if let Some((_, spec)) = pairs.iter().find(|(key, _)| key.as_str() == "__spec__") {
-                if *spec == NONE {
-                    return Err(exc::raise_with_message(
-                        VALUE_ERROR,
-                        &format!("{name}.__spec__ is set to None"),
-                    ));
-                }
-                return Ok(*spec);
-            }
-        }
-        if hydro_ir::stdlib::module(name).is_some() {
-            return Ok(native_spec(name));
-        }
-    }
-    Ok(match resolve_module_with_path(name, path) {
-        Some(found) => found_spec(&found),
-        None => NONE,
-    })
-}
-
 /// `spec_from_loader(name, loader, *, origin=None, is_package=None)`.
 ///
-/// Mirrors CPython: a loader with `get_filename()` supplies the origin, and a
-/// loader with `is_package()` supplies the package flag, unless the caller
-/// passed them explicitly. A loader that reports neither (a plain object, a
+/// Mirrors CPython's `_bootstrap.spec_from_loader`: `loader._ORIGIN` supplies
+/// the origin for built-in and frozen loaders, a file loader supplies it
+/// through `get_filename()` — which also makes the spec's `has_location` true
+/// and populates `submodule_search_locations` from the file's directory for a
+/// package — and `loader.is_package()` supplies the package flag unless the
+/// caller passed it. A loader that reports neither (a plain object, a
 /// `LazyLoader`) yields a module spec with `origin=None` and no
 /// `submodule_search_locations`, exactly like CPython.
 fn spec_from_loader(args: &[i64]) -> i64 {
@@ -820,44 +1084,89 @@ fn spec_from_loader(args: &[i64]) -> i64 {
         Err(raised) => return raised,
     };
     let loader = args.get(1).copied().unwrap_or(NONE);
-    let mut origin = args.get(2).copied().unwrap_or(NONE);
+    let origin_arg = args.get(2).copied().unwrap_or(NONE);
     let is_package_arg = args.get(3).copied().unwrap_or(NONE);
 
     let name_value = value::str_alloc(name.clone());
-    let roots = crate::heap::root_values(&[loader, origin, name_value]);
-    if origin == NONE {
-        if let Some(found) = loader_method(loader, "get_filename", &[name_value]) {
-            if exc::pending() {
-                exc::clear();
-            } else if found != NONE {
-                origin = found;
-            }
-        }
+    let roots = crate::heap::root_values(&[loader, origin_arg, name_value]);
+    let mut origin = origin_arg;
+    if value::as_str(origin).is_none_or(str::is_empty) {
+        origin = loader_constant(loader, "_ORIGIN");
     }
     let mut is_package = if is_package_arg == NONE {
         None
     } else {
         Some(value::truthy(is_package_arg))
     };
+    let origin_text = value::as_str(origin)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    let file_loader = loader != NONE && loader_member(loader, "get_filename") != NONE;
+    if origin_text.is_some() || !file_loader {
+        // `loader._ORIGIN` (or an explicit origin), or a loader without
+        // `get_filename()`: a plain `ModuleSpec`, no filesystem location.
+        let mut is_package = is_package;
+        if is_package.is_none() {
+            is_package = loader_package_flag(loader, name_value);
+        }
+        crate::heap::release_roots(roots);
+        let locations = (is_package == Some(true)).then(Vec::<String>::new);
+        return machinery::new_spec(&name, loader, origin_text, locations, false);
+    }
+    // A file loader names its own file. `get_filename()` raising `ImportError`
+    // leaves CPython's `<unknown>` placeholder in place.
+    let mut location = "<unknown>".to_string();
+    if let Some(found) = loader_method(loader, "get_filename", &[name_value]) {
+        if exc::pending() {
+            exc::clear();
+        } else if let Some(path) = value::as_str(found) {
+            location = machinery::absolute(path);
+        }
+    } else if exc::pending() {
+        exc::clear();
+    }
     if is_package.is_none() {
-        if let Some(found) = loader_method(loader, "is_package", &[name_value]) {
-            if exc::pending() {
-                exc::clear();
-            } else if found != NONE {
-                is_package = Some(value::truthy(found));
+        is_package = loader_package_flag(loader, name_value);
+    }
+    let mut locations = None;
+    if is_package == Some(true) {
+        let mut dirs = Vec::new();
+        if location != "<unknown>" {
+            if let Some(dir) = Path::new(&location).parent() {
+                let dir = dir.to_string_lossy().into_owned();
+                if !dir.is_empty() {
+                    dirs.push(dir);
+                }
             }
         }
+        locations = Some(dirs);
     }
     crate::heap::release_roots(roots);
+    machinery::new_spec(&name, loader, Some(location), locations, true)
+}
 
-    let origin_text = value::as_str(origin).map(str::to_string);
-    let locations = if is_package == Some(true) {
-        Some(Vec::new())
-    } else {
-        None
-    };
-    let has_location = origin_text.is_some();
-    machinery::new_spec(&name, loader, origin_text, locations, has_location)
+/// `getattr(loader, name)` for a loader's optional class attribute, consuming
+/// a missing attribute as `None`.
+fn loader_constant(loader: i64, name: &str) -> i64 {
+    let found = crate::core::methods::getattr(loader, name.as_ptr(), name.len());
+    if exc::pending() {
+        if exc::pending_tag() == i64::from(ATTRIBUTE_ERROR) {
+            exc::clear();
+        }
+        return NONE;
+    }
+    found
+}
+
+/// `loader.is_package(name)` as a flag, or `None` when the loader has no
+/// `is_package()` (or it raised, like CPython's ignored `ImportError`).
+fn loader_package_flag(loader: i64, name_value: i64) -> Option<bool> {
+    let found = loader_method(loader, "is_package", &[name_value])?;
+    if exc::pending() {
+        exc::clear();
+        return None;
+    }
+    (found != NONE).then(|| value::truthy(found))
 }
 
 /// `getattr(receiver, name)` as a callable, or `None` when the attribute is
@@ -969,7 +1278,26 @@ fn spec_from_file_location(args: &[i64]) -> i64 {
 
 /// `module_from_spec(spec)`.
 fn module_from_spec(args: &[i64]) -> i64 {
-    let spec = args[0];
+    module_from_spec_value(args[0])
+}
+
+/// `module_from_spec(spec)`: the module object described by `spec`.
+///
+/// CPython's contract is followed exactly: the loader's `create_module()` is
+/// asked first (a loader returning `None` requests the default module object),
+/// a loader that defines `exec_module()` without `create_module()` raises
+/// `ImportError`, and the documented metadata attributes are installed on the
+/// resulting module. A loader-created module gets only the attributes it does
+/// not already provide.
+///
+/// Hydro's module objects are native values, so the default module object is
+/// a real namespace carrying `__name__`, `__loader__`, `__package__`,
+/// `__spec__`, `__doc__` and, when the spec has them, `__file__`,
+/// `__cached__` and `__path__`. `__path__` is the spec's own
+/// `submodule_search_locations` list, so extending one is visible through the
+/// other. A spec without a loader but with search locations gets CPython's
+/// backward-compatibility `NamespaceLoader` (also published as `spec.loader`).
+pub(crate) fn module_from_spec_value(spec: i64) -> i64 {
     if !machinery::is_spec(spec) {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -988,49 +1316,200 @@ fn module_from_spec(args: &[i64]) -> i64 {
     // A compiled module already has a real module value; the loader's
     // `create_module()` would return exactly this object.
     if let Some(module) = super::registry_lookup(&name) {
-        return module;
-    }
-    // `module_from_spec` asks the loader for the module object first; a loader
-    // that returns one (a built-in importer, an extension loader) supplies it.
-    let loader_candidate = value::instance_attr(spec, "loader").unwrap_or(NONE);
-    if loader_candidate != NONE {
-        if let Some(created) = loader_method(loader_candidate, "create_module", &[spec]) {
-            if exc::pending() {
-                return created;
-            }
-            if created != NONE && value::as_module(created).is_some() {
-                return created;
-            }
+        if module != NONE {
+            return module;
         }
     }
-    let origin = machinery::spec_origin(spec);
-    let has_location = machinery::spec_has_location(spec);
-    let locations = machinery::spec_search_locations(spec);
+    let loader = value::instance_attr(spec, "loader").unwrap_or(NONE);
+    let roots = crate::heap::root_values(&[spec, loader]);
+    let create_module = if loader == NONE {
+        NONE
+    } else {
+        loader_member(loader, "create_module")
+    };
+    let mut created = NONE;
+    if create_module != NONE {
+        created = crate::builtins::call(create_module, 1, &spec as *const i64);
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return created;
+        }
+    } else if loader != NONE && loader_member(loader, "exec_module") != NONE {
+        crate::heap::release_roots(roots);
+        return exc::raise_with_message(
+            IMPORT_ERROR,
+            "loaders that define exec_module() must also define create_module()",
+        );
+    }
+    let created_roots = crate::heap::root_values(&[created]);
+    let metadata = module_metadata(spec, &name);
+    let metadata_roots = crate::heap::root_values(
+        &metadata
+            .iter()
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>(),
+    );
+    let module = if created != NONE {
+        initialize_module(created, metadata);
+        created
+    } else {
+        value::namespace_new(metadata)
+    };
+    crate::heap::release_roots(metadata_roots);
+    crate::heap::release_roots(created_roots);
+    crate::heap::release_roots(roots);
+    module
+}
+
+/// The metadata attributes `module_from_spec` installs, in CPython's order.
+fn module_metadata(spec: i64, name: &str) -> Vec<(String, i64)> {
+    let mut loader = value::instance_attr(spec, "loader").unwrap_or(NONE);
+    let search_locations = machinery::spec_search_locations_value(spec);
+    let mut namespace_loader = false;
+    if loader == NONE {
+        if let Some(path) = search_locations {
+            // CPython's backward-compatibility rule: a namespace spec reports
+            // a `NamespaceLoader` whose `_path` is the search-location list.
+            let created = value::instance_new(machinery::namespace_loader_class());
+            let roots = crate::heap::root_values(&[created, path]);
+            value::instance_setattr(created, "_path".to_string(), path);
+            machinery::set_spec_loader(spec, created);
+            crate::heap::release_roots(roots);
+            loader = created;
+            namespace_loader = true;
+        }
+    }
     let parent = value::instance_attr(spec, "parent")
         .and_then(value::as_str)
         .map(str::to_string)
         .unwrap_or_default();
-    let loader = value::instance_attr(spec, "loader").unwrap_or(NONE);
-
-    let mut pairs: Vec<(String, i64)> = Vec::with_capacity(8);
-    pairs.push(("__name__".to_string(), value::str_alloc(name.clone())));
-    pairs.push(("__loader__".to_string(), loader));
-    pairs.push(("__package__".to_string(), value::str_alloc(parent)));
-    pairs.push(("__spec__".to_string(), spec));
-    pairs.push(("__doc__".to_string(), NONE));
+    let has_location = machinery::spec_has_location(spec);
+    let mut metadata: Vec<(String, i64)> = Vec::with_capacity(9);
+    metadata.push(("__name__".to_string(), value::str_alloc(name.to_string())));
+    metadata.push(("__loader__".to_string(), loader));
+    metadata.push(("__package__".to_string(), value::str_alloc(parent)));
+    metadata.push(("__spec__".to_string(), spec));
+    metadata.push(("__doc__".to_string(), NONE));
     if has_location {
-        if let Some(origin) = origin.as_deref() {
-            pairs.push(("__file__".to_string(), value::str_alloc(origin.to_string())));
+        if let Some(origin) = machinery::spec_origin(spec) {
+            metadata.push(("__file__".to_string(), value::str_alloc(origin)));
         }
         if let Some(cached) = value::instance_attr(spec, "cached") {
-            pairs.push(("__cached__".to_string(), cached));
+            metadata.push(("__cached__".to_string(), cached));
+        }
+    } else if namespace_loader {
+        metadata.push(("__file__".to_string(), NONE));
+    }
+    if let Some(path) = search_locations {
+        metadata.push(("__path__".to_string(), path));
+    }
+    metadata
+}
+
+/// Installs `metadata` on a loader-created module, keeping any attribute the
+/// loader already provided (CPython's `_init_module_attrs(override=False)`).
+fn initialize_module(module: i64, metadata: Vec<(String, i64)>) {
+    if let Some(state) = value::as_module(module) {
+        let name = state.name().to_string();
+        // A native module synthesizes `__name__`, `__loader__`, `__package__`
+        // and `__spec__` from the central table; only the filesystem-facing
+        // attributes (`__path__` of a native package) come from the spec.
+        let native = hydro_ir::stdlib::module(&name).is_some();
+        for (attribute, item) in metadata {
+            if native
+                && matches!(
+                    attribute.as_str(),
+                    "__name__" | "__loader__" | "__package__" | "__spec__"
+                )
+            {
+                continue;
+            }
+            if globals::try_get(&name, &attribute).is_none() {
+                globals::set(&name, &attribute, item);
+            }
+        }
+        return;
+    }
+    if let Some(mut pairs) = value::namespace_pairs_mut(module) {
+        let mut added = Vec::new();
+        for (attribute, item) in metadata {
+            if !pairs.pairs.iter().any(|(key, _)| key == &attribute) {
+                pairs.pairs.push((attribute, item));
+                added.push(item);
+            }
+        }
+        drop(pairs);
+        // The namespace now references the values; publish the collector's
+        // write barrier exactly like every other namespace mutation.
+        for item in added {
+            crate::heap::write_barrier_edge(module, item);
+        }
+        return;
+    }
+    if value::instance_class_value(module).is_some() {
+        for (attribute, item) in metadata {
+            if value::instance_attr(module, &attribute).is_none() {
+                value::instance_setattr(module, attribute, item);
+            }
         }
     }
-    if let Some(locations) = locations {
-        let items = locations.into_iter().map(value::str_alloc).collect();
-        pairs.push(("__path__".to_string(), value::list_new(items)));
+}
+
+/// `getattr(loader, name)`, or `NONE` when the loader does not provide it.
+fn loader_member(loader: i64, name: &str) -> i64 {
+    let found = crate::core::methods::getattr(loader, name.as_ptr(), name.len());
+    if exc::pending() {
+        if exc::pending_tag() == i64::from(ATTRIBUTE_ERROR) {
+            exc::clear();
+        }
+        return NONE;
     }
-    value::namespace_new(pairs)
+    found
+}
+
+/// Materialises the module `found` describes and publishes it in
+/// `sys.modules`, returning the module object.
+///
+/// A unit compiled into the program keeps its namespace in the runtime global
+/// store, so a fresh module value exposes it exactly like the original one.
+/// Any other module (pure-Python source, namespace package) becomes a real
+/// module namespace carrying the discovered spec's metadata; executing a
+/// source body that was never compiled into the program is the caller's
+/// concern (`SourceFileLoader.exec_module` reports the missing runtime
+/// compiler instead of pretending the body ran).
+pub(crate) fn materialize_found(found: &FoundSpec) -> i64 {
+    let name = found.name.as_str();
+    if found.loader == LoaderKind::Extension {
+        if let Some(module) = crate::modules::extension::import_module(name) {
+            return module;
+        }
+        let origin = found.origin.as_deref().unwrap_or(name);
+        return exc::raise_with_message(
+            IMPORT_ERROR,
+            &format!("cannot load extension module '{name}' from '{origin}'"),
+        );
+    }
+    if globals::try_get(name, "__name__").is_some() {
+        return super::module_value_by_name(name);
+    }
+    let spec = spec_instance(found);
+    let module = module_from_spec_value(spec);
+    if exc::pending() {
+        return module;
+    }
+    super::publish_module(name, module);
+    module
+}
+
+/// Materialises the module `name` resolves to, or `None` when no finder knows
+/// it. A name already in `sys.modules` is returned as-is.
+pub(crate) fn materialize_module(name: &str) -> Option<i64> {
+    if let Some(module) = super::registry_lookup(name) {
+        if module != NONE {
+            return Some(module);
+        }
+    }
+    resolve_module(name).map(|found| materialize_found(&found))
 }
 
 /// `resolve_name(name, package)`.

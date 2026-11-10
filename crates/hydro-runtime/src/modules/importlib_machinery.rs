@@ -142,7 +142,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         SOURCE_SET_DATA => source_set_data(args),
         FILE_LOADER_GET_DATA => file_loader_get_data(args),
         EXTENSION_IS_PACKAGE => extension_is_package(args),
-        NAMESPACE_LOADER_EXEC_MODULE => exec_loaded_module(args[1]),
+        NAMESPACE_LOADER_EXEC_MODULE => namespace_exec_module(),
         NAMESPACE_LOADER_CREATE_MODULE
         | NAMESPACE_LOADER_GET_CODE
         | NAMESPACE_LOADER_GET_SOURCE
@@ -324,14 +324,27 @@ fn cached_class_multi(
     bases: Vec<i64>,
     methods: Vec<(String, i64, MethodKind)>,
 ) -> i64 {
+    cached_class_multi_attrs(key, name, bases, methods, Vec::new())
+}
+
+/// [`cached_class_multi`] with class-level attributes (CPython's `_ORIGIN`
+/// marker on the built-in and frozen importers).
+fn cached_class_multi_attrs(
+    key: &str,
+    name: &str,
+    bases: Vec<i64>,
+    methods: Vec<(String, i64, MethodKind)>,
+    attrs: Vec<(String, i64)>,
+) -> i64 {
     if let Some(class) = globals::registry_get(key) {
         return class;
     }
     let method_values: Vec<i64> = methods.iter().map(|(_, value, _)| *value).collect();
     let mut rooted = method_values.clone();
     rooted.extend_from_slice(&bases);
+    rooted.extend(attrs.iter().map(|(_, value)| *value));
     let roots = crate::heap::root_values(&rooted);
-    let class = value::class_new_multi(name.to_string(), bases, NONE, methods, Vec::new());
+    let class = value::class_new_multi(name.to_string(), bases, NONE, methods, attrs);
     let class_roots = crate::heap::root_values(&[class]);
     globals::registry_set(key, class);
     crate::heap::release_roots(class_roots);
@@ -771,7 +784,7 @@ pub(crate) fn extension_loader_class() -> i64 {
 
 /// `importlib.machinery.BuiltinImporter`: classmethods for native modules.
 pub(crate) fn builtin_importer_class() -> i64 {
-    cached_class_multi(
+    cached_class_multi_attrs(
         "importlib.machinery.BuiltinImporter",
         "BuiltinImporter",
         vec![meta_path_finder_class(), inspect_loader_class()],
@@ -797,13 +810,15 @@ pub(crate) fn builtin_importer_class() -> i64 {
                 MethodKind::Classmethod,
             ),
         ],
+        // `spec_from_loader` reads `_ORIGIN`, exactly like CPython.
+        vec![("_ORIGIN".to_string(), value::str_alloc("built-in".to_string()))],
     )
 }
 
 /// `importlib.machinery.FrozenImporter`: Hydro ships no frozen modules, so
 /// discovery returns `None` and `create_module` reports the exact reason.
 pub(crate) fn frozen_importer_class() -> i64 {
-    cached_class_multi(
+    cached_class_multi_attrs(
         "importlib.machinery.FrozenImporter",
         "FrozenImporter",
         vec![meta_path_finder_class(), inspect_loader_class()],
@@ -829,6 +844,7 @@ pub(crate) fn frozen_importer_class() -> i64 {
                 MethodKind::Classmethod,
             ),
         ],
+        vec![("_ORIGIN".to_string(), value::str_alloc("frozen".to_string()))],
     )
 }
 
@@ -1446,6 +1462,18 @@ pub(crate) fn spec_search_locations(spec: i64) -> Option<Vec<String>> {
     )
 }
 
+/// `spec.submodule_search_locations` as the live list value, or `None` when
+/// the spec is not a package.
+///
+/// `module_from_spec` binds this exact object as the module's `__path__`, so
+/// `module.__path__ is spec.submodule_search_locations` holds and extending
+/// one is visible through the other, exactly like CPython.
+pub(crate) fn spec_search_locations_value(spec: i64) -> Option<i64> {
+    let raw = value::instance_attr(spec, "submodule_search_locations")?;
+    value::as_list(raw)?;
+    Some(raw)
+}
+
 /// `spec.has_location` for a spec instance.
 pub(crate) fn spec_has_location(spec: i64) -> bool {
     value::instance_attr(spec, "has_location").is_some_and(value::truthy)
@@ -1613,6 +1641,12 @@ fn create_module(args: &[i64]) -> i64 {
 pub(crate) fn exec_module(args: &[i64]) -> i64 {
     let module = args[1];
     exec_loaded_module(module)
+}
+
+/// `NamespaceLoader.exec_module(module)`: a PEP 420 namespace package has no
+/// body, so the loader does nothing (CPython's implementation is `pass`).
+fn namespace_exec_module() -> i64 {
+    NONE
 }
 
 pub(crate) fn exec_loaded_module(module: i64) -> i64 {

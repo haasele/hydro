@@ -2,9 +2,21 @@
 //!
 //! Hydro resolves ordinary imports statically. `import_module` exists for code
 //! that selects a module name at runtime: the runtime registry (`sys.modules`)
-//! knows every native module from `hydro_ir::stdlib` and every loaded user
-//! module discovered in the globals store, and import returns that exact
-//! module value so identity matches `sys.modules[name]`.
+//! knows every native module from `hydro_ir::stdlib`, every compiled user
+//! module discovered in the globals store, and every module materialised here.
+//! Importing a registered name returns that exact module value so identity
+//! matches `sys.modules[name]`.
+//!
+//! A name that is not registered is resolved the way CPython's importer does:
+//! the parent package is imported first, then `sys.meta_path` is walked in
+//! order (`BuiltinImporter`, `FrozenImporter`, `PathFinder` and program-defined
+//! finders at their exact positions). Any pure-Python module or package found
+//! on the search roots — including nested packages and the CPython `__hello__`
+//! / `__phello__` source modules — is materialised: a real module object with
+//! the discovered spec's metadata is published in `sys.modules`. The body of a
+//! source module that was not compiled into the program is not executed, since
+//! that needs a runtime Python compiler; `SourceFileLoader.exec_module`
+//! reports the missing compiler instead of pretending the body ran.
 //!
 //! The dotted submodules live in their own native modules
 //! ([`importlib_util`](super::importlib_util),
@@ -15,11 +27,11 @@
 //!
 //! `reload` re-imports native modules (the built-in loader's documented
 //! no-op) and reports a precise `ImportError` for compiled Python modules,
-//! which have no runtime execution engine. Names outside the registry fail
-//! with `ModuleNotFoundError`. The only remaining placeholder is the generated
-//! Unicode width tables (`rich._unicode_data.unicodeX`): their synthesized
-//! `cell_table` reports a single default-width range for every codepoint
-//! instead of failing the import. The real per-width tables are not bundled.
+//! which have no runtime execution engine. The only remaining placeholder is
+//! the generated Unicode width tables (`rich._unicode_data.unicodeX`): their
+//! synthesized `cell_table` reports a single default-width range for every
+//! codepoint instead of failing the import. The real per-width tables are not
+//! bundled.
 
 use crate::exc::{self, IMPORT_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::value;
@@ -129,11 +141,19 @@ fn invalidate_caches() {
 /// `importlib.import_module(name, package=None)`.
 ///
 /// A relative name (`".sub"`, `"..sibling"`) is resolved against `package`
-/// first, exactly like CPython. The resolved dotted name is then looked up in
-/// the runtime module registry, which contains every compiled user module
-/// (including package submodules), every native module and every module value
-/// materialized by an extension import. Names outside the registry raise
-/// `ModuleNotFoundError` with the exact requested name.
+/// first, exactly like CPython. The absolute name is then imported with
+/// CPython's order: `sys.modules` first, the parent package next (so a
+/// compiled package's initializer runs and a source package on the search
+/// roots becomes a real module namespace carrying its `__path__`), then the
+/// compiled-body registry, then `sys.meta_path` in order and finally the
+/// extension loader.
+///
+/// A name nobody can satisfy raises `ModuleNotFoundError` with the exact
+/// requested name, so callers' fallback/probe logic still runs. A pure-Python
+/// module discovered on the search roots is *materialised* — a real module
+/// object with the found spec's metadata, published in `sys.modules` — but its
+/// body is not executed: Hydro has no runtime Python compiler for a module
+/// that was not compiled into the program (see `SourceFileLoader`).
 fn import_module(name_arg: i64, package_arg: i64) -> i64 {
     let Some(name) = value::as_str(name_arg) else {
         return exc::raise_with_message(
@@ -155,7 +175,14 @@ fn import_module(name_arg: i64, package_arg: i64) -> i64 {
         return crate::builtins::module_not_found(&name);
     }
     if let Some(module) = super::registry_lookup(&name) {
-        return module;
+        if module != NONE {
+            return module;
+        }
+        // CPython refuses to import over an explicit `None` entry.
+        return exc::raise_with_message(
+            IMPORT_ERROR,
+            &format!("import of {name} halted; None in sys.modules"),
+        );
     }
     // CPython always has `sys.modules["__main__"]`: the entry program. Hydro
     // compiles the entry module under that exact name, so expose its module
@@ -166,86 +193,86 @@ fn import_module(name_arg: i64, package_arg: i64) -> i64 {
     if name == UNICODE_TABLE_PREFIX || name.starts_with("rich._unicode_data.") {
         return unicode_table_placeholder();
     }
-    // A native module removed from `sys.modules` is imported as a fresh module
-    // value, exactly like CPython re-executing a module body: the new object is
-    // published, so callers observe a distinct module while `import` keeps
-    // working. Native attributes are resolved by name, so the fresh value
-    // exposes the same surface.
-    if hydro_ir::stdlib::module(&name).is_some() {
-        let module = value::module_value(name.clone());
-        super::publish_module(&name, module);
+    // The parent package comes first, exactly like `_find_and_load`: its
+    // initializer may publish `__path__` the child resolution depends on.
+    ensure_parent(&name);
+    if exc::pending() {
+        return NONE;
+    }
+    // A compiled unit whose body has not run yet: a C extension can import a
+    // unit before the startup loop reaches it.
+    crate::module_init::initialize(&name);
+    if exc::pending() {
+        return NONE;
+    }
+    if let Some(module) = super::registry_lookup(&name) {
+        if module != NONE {
+            return module;
+        }
+    }
+    // `sys.meta_path` in order: native finder, frozen finder, the path finder
+    // (implicit when `_install` has not run) and program-defined finders at
+    // their exact position.
+    let path = importlib_util::parent_finder_path(&name);
+    if let Some(module) = importlib_util::meta_path_import(&name, path.as_deref()) {
         return module;
     }
-    // A custom `sys.meta_path` finder (test doubles, `pkgutil`-style
-    // importers) is consulted before failing.
-    if let Some(module) = import_via_meta_path(&name) {
-        return module;
+    if exc::pending() {
+        return NONE;
     }
-    // A compiled extension module (a shared object on the search path) is
-    // loaded through the extension loader.
+    // A compiled extension module reachable only through the extension roots
+    // (`HYDRO_EXTENSION_PATH`, a site-packages `lib-dynload`, ...).
     if let Some(module) = crate::modules::extension::import_module(&name) {
         return module;
     }
-    // Unknown names never become a fake namespace: callers rely on the import
-    // failing so their fallback/probe logic runs.
     crate::builtins::module_not_found(&name)
 }
 
-/// Consults the non-builtin finders on `sys.meta_path`, in order, returning
-/// the first spec a program-defined finder reports.
+/// Materialises the parent package of `name`, CPython's first import step.
 ///
-/// Hydro's own finders (`BuiltinImporter`, `FrozenImporter`, `PathFinder`) are
-/// handled by the native resolution paths; every other entry is called through
-/// its `find_spec(fullname, None, None)`.
-pub(crate) fn meta_path_find_spec(name: &str) -> Option<i64> {
-    let meta_path = super::module_get_by_name("sys", "meta_path");
+/// A compiled package's initializer runs (publishing its `__path__`); a
+/// package found on the search roots becomes a real module namespace; a native
+/// package is published so `__package__`/`spec.parent` describe a module that
+/// really is in `sys.modules`. A missing parent is left to the child import:
+/// `import_module("pkg.missing")` keeps reporting the missing child.
+fn ensure_parent(name: &str) {
+    let Some((parent, _)) = name.rsplit_once('.') else {
+        return;
+    };
+    if super::registry_lookup(parent).is_some() {
+        return;
+    }
+    // Nested packages materialise outermost first.
+    ensure_parent(parent);
     if exc::pending() {
-        exc::clear();
-        return None;
+        return;
     }
-    let finders = value::as_list(meta_path)?;
-    let builtin = super::importlib_machinery::builtin_importer_class();
-    let frozen = super::importlib_machinery::frozen_importer_class();
-    let path_finder = super::importlib_machinery::path_finder_class();
-    let module_name = value::str_alloc(name.to_string());
-    let roots = crate::heap::root_values(&[meta_path, module_name]);
-    for finder in finders {
-        if *finder == builtin || *finder == frozen || *finder == path_finder {
-            continue;
-        }
-        let find_spec =
-            crate::core::methods::getattr(*finder, "find_spec".as_ptr(), "find_spec".len());
-        if exc::pending() {
-            exc::clear();
-            continue;
-        }
-        let spec = crate::builtins::call(find_spec, 3, [module_name, NONE, NONE].as_ptr());
-        if exc::pending() {
-            crate::heap::release_roots(roots);
-            return None;
-        }
-        if spec != NONE {
-            crate::heap::release_roots(roots);
-            return Some(spec);
-        }
+    crate::module_init::initialize(parent);
+    if exc::pending() {
+        return;
     }
-    crate::heap::release_roots(roots);
-    None
-}
-
-/// Imports `name` through the spec a program-defined meta-path finder reports.
-fn import_via_meta_path(name: &str) -> Option<i64> {
-    let spec = meta_path_find_spec(name)?;
-    Some(load_spec(name, spec))
+    if super::registry_lookup(parent).is_some() {
+        return;
+    }
+    if hydro_ir::stdlib::module(parent).is_some() {
+        super::publish_module(parent, value::module_value(parent.to_string()));
+        return;
+    }
+    // A package that only exists on the search roots becomes a real module
+    // namespace; a name nobody knows stays unknown for the child import.
+    let _ = importlib_util::materialize_module(parent);
 }
 
 /// Loads `spec` through its loader and publishes the result.
 ///
 /// `module_from_spec` asks the loader for the module object and falls back to
-/// a fresh module value; the loader's `exec_module` then runs, exactly the two
-/// steps CPython's `_load(spec)` performs.
-fn load_spec(name: &str, spec: i64) -> i64 {
-    let module = super::importlib_util::call("module_from_spec", &[spec]);
+/// a fresh module namespace; the loader's `exec_module` then runs, exactly the
+/// two steps CPython's `_load(spec)` performs. This is the program-defined
+/// finder path: Hydro's own finders materialise through
+/// [`importlib_util::materialize_found`] instead, so a source module that is
+/// not part of the program is never executed here.
+pub(crate) fn load_spec(name: &str, spec: i64) -> i64 {
+    let module = super::importlib_util::module_from_spec_value(spec);
     if exc::pending() {
         return module;
     }
