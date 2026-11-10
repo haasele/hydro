@@ -79,7 +79,10 @@ initial state of the first runnable core.
   platform modules. Added Hydro-native `turtle`, `symtable`/`_symtable` and
   `tracemalloc`/`_tracemalloc`, plus native `http.server`, and loaded pinned
   C extensions through derived `lib-dynload`/`HYDRO_EXTENSION_PATH` roots.
-- Official `Lib/test` differential baseline rose from 9/398 to **22/398**
+- Official `Lib/test` differential baseline rose from 22/398 to **32/398**
+  on 2026-11-10 after class/closure/import/format fixes (302 `hydro_fail`,
+  58 `expected_fail`, 3 timeouts, 2 watchdog memkills). The earlier 9/398 to
+  22/398 rise came from
   harness exit-code passes after `unittest.mock`/`result`, test-registration,
   contextlib/os.pipe/random/pickle-buffer, HTTP exception, recursion and
   hashlib keyword work.

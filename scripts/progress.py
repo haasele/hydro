@@ -69,7 +69,13 @@ def render(cpython: dict, stdlib: dict) -> str:
             row(f"    {name}", layer["ok"], layer["total"], 108 + index * 30)
         )
     svg_rows = [
-        row("CPython 3.14.9 Lib/test", suite["passed"], suite["total"], 42, True),
+        row(
+            "CPython 3.14.9 Lib/test",
+            suite["passed"],
+            suite.get("total", suite.get("selected", suite.get("completed", 0))),
+            42,
+            True,
+        ),
         row("Stdlib modules importable", counts["ok"], counts["total"], 72, True),
         *layer_rows,
     ]

@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-11-10 (latest):** CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN. Workspace: **3254 tests run, 1 skipped**; clippy `-D warnings` and `cargo fmt --check` green. Recent verified slices: C3 class construction and `super()` defining-class tracking; nested-function class method bodies; fiber/thread frame chains and `sys._current_frames`; `unittest` runner classification; on-demand stdlib/package materialization and dotted-import registration; `_io` underscore aliases; implicit `re.U` flags for `str` patterns. Open next: ABCMeta/ABC subclass-hook semantics, runtime `_getframe` depth behavior, and the official-test burn-down from the 22/398 baseline. The current test count and per-crate breakdown live in [`AGENTS.md`](../AGENTS.md#current-state).
+**As of 2026-11-10 (latest):** CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN. Workspace: **3254 tests run, 1 skipped**; clippy `-D warnings` and `cargo fmt --check` green. Recent verified slices: C3 class construction and `super()` defining-class tracking; nested-function class method bodies; fiber/thread frame chains and `sys._current_frames`; `unittest` runner classification; on-demand stdlib/package materialization and dotted-import registration; `_io` underscore aliases; implicit `re.U` flags for `str` patterns. Open next: ABCMeta/ABC subclass-hook semantics, runtime `_getframe` depth behavior, and the official-test burn-down from the 32/398 baseline. The current test count and per-crate breakdown live in [`AGENTS.md`](../AGENTS.md#current-state).
 
 **2026-10-26 four-scope checkpoint.** Delivered and tested: a runtime module
 registry (`sys.path`, `sys.modules`, module `__name__`, namespace packages,
@@ -417,8 +417,8 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `Lib/test/test_*.py` differential runs against the pinned CPython
       **3.14.9** oracle, JSON + `docs/CPYTHON_TESTS.md`, release gate
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
-      Manifest `tests/compat/cpython-3.14.9.json` records `minimum_passing=3`
-      for the 2026-11-08 full run's **22/398** harness passes
+      Manifest `tests/compat/cpython-3.14.9.json` records `minimum_passing=32`
+      for the 2026-11-10 full run's **32/398** harness passes
       (`test_colorsys.py`, `test_compiler_assemble.py`,
       `test_compiler_codegen.py`, `test_errno.py`, `test_file_eintr.py`,
       `test_int_literal.py`, `test_longexp.py`, `test_openpty.py`,
@@ -436,9 +436,10 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       package/site-packages loader and the native
       `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/`importlib`/
       `__future__` modules are importable and API-tested.
-      Official-suite baseline 2026-11-08: **22/398 harness passes** (314
-      `hydro_fail`, 62 `expected_fail` where CPython also fails; 0 timeouts). No test is marked
-      passing unless CPython 3.14.9 and Hydro both exit 0.
+      Official-suite baseline 2026-11-10: **32/398 harness passes** (302
+      `hydro_fail`, 58 `expected_fail` where CPython also fails, 3 timeouts,
+      2 watchdog memkills, 1 CPython failure). No test is marked passing
+      unless CPython 3.14.9 and Hydro both exit 0.
       The harness runs a defined subset of CPython 3.14 `Lib/test` against
       `tea` and emits a machine-readable report (per test: pass/skip/fail,
       plus the reason).
