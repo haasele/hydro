@@ -107,7 +107,7 @@ Other docs must link here instead of repeating the total.
   harness now sets `HYDRO_STDLIB` to the pinned CPython `Lib` tree; the earlier
   159 count used the toolchain's default subset. Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
-- **Official suite:** **32/398 harness passes** (CPython and Hydro both exit 0);
+- **Official suite:** **32/398 full-run harness passes** (CPython and Hydro both exit 0); a post-run subset recheck added `test__opcode.py`, so the offline manifest now pins **33 known passes**.
   several entries still execute 0 tests because imported harness modules fail,
   recorded in `docs/CPYTHON_TESTS.md`. The 2026-11-10 full run has 302
   `hydro_fail`, 58 `expected_fail`, 3 `timeout`, 2 watchdog `memkill`
@@ -122,7 +122,7 @@ Other docs must link here instead of repeating the total.
   shared import blockers (`platform.win32_is_iot`, `ctypes.windll`,
   `subprocess._args_from_interpreter_flags`) are fixed, and `test.support`
   now imports after platform-branch folding, dead-import bindings, lambda
-  keyword-only support and the missing harness APIs. The official suite was rerun on 2026-11-10 (32/398); per-test blockers now
+  keyword-only support and the missing harness APIs. The official suite was rerun on 2026-11-10 (32/398; `test__opcode.py` subsequently rechecked green, manifest 33); per-test blockers now
   include `unittest.mock`, `tempfile.mktemp`, `binascii.Error` and
   `unittest.result`. The
   ABI inventory reports **0 missing required symbols** across 68 pinned

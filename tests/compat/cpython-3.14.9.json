@@ -1,9 +1,10 @@
 {
   "python": "3.14.9",
-  "minimum_passing": 32,
+  "minimum_passing": 33,
   "required": [],
   "known_passing": [
     "test__locale.py",
+    "test__opcode.py",
     "test__osx_support.py",
     "test_codecmaps_cn.py",
     "test_codecmaps_hk.py",

@@ -23,6 +23,8 @@ Run complete: yes · 398/398 selected tests recorded · 835s
 | error | 0 |
 | **Total** | 398 |
 
+Subset recheck after the full run: `test__opcode.py` now passes (`hydro_pass`); the full-run totals above are unchanged and the offline manifest pins 33 known passing tests.
+
 Backlog: **307** tests need Hydro work (`hydro_fail`, `timeout`, `memkill`, `error`). `expected_fail` means the CPython oracle also fails in this environment; `cpython_fail` means the oracle failed while Hydro passed.
 
 ## Backlog by first error
