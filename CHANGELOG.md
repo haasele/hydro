@@ -60,6 +60,9 @@ initial state of the first runnable core.
   and instantiate the real class instead of synthesizing `RuntimeError` in the
   frontend. This preserves user exception identity, constructor validation and
   `from ...` cause handling. The obsolete frontend fallback test was removed.
+- `Popen` implements `__enter__`/`__exit__`; leaving the context waits for the
+  child and propagates wait errors. This removes the missing-context-manager
+  failures in `test_struct` (remaining failures there now use `communicate`).
 - Latest official differential run (2026-11-10T17:20:05Z) reached **36/398
   `hydro_pass`** (296 `hydro_fail`, 56 `expected_fail`, 4 timeouts, 3 watchdog
   memkills, 3 `cpython_fail`). Seven tests newly passed

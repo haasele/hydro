@@ -4055,6 +4055,8 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
         f("_popen_poll", 1, 1, Type::Int),
         f("_popen_terminate", 1, 1, Type::None),
         f("_popen_kill", 1, 1, Type::None),
+        f("_popen_enter", 1, 1, Type::Any),
+        f("_popen_exit", 1, 4, Type::Bool),
     ],
     constants: &[
         c("CalledProcessError", Type::Any),

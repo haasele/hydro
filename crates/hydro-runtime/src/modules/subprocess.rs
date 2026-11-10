@@ -988,11 +988,13 @@ fn raise_called_process_error(code: i64, command: Vec<String>) -> i64 {
 /// other native objects in this runtime; the methods are the dispatch names
 /// validated by the central spec table.
 fn popen_class() -> i64 {
-    const METHODS: [(&str, &str, usize); 4] = [
+    const METHODS: [(&str, &str, usize); 6] = [
         ("wait", "_popen_wait", 2),
         ("poll", "_popen_poll", 1),
         ("terminate", "_popen_terminate", 1),
         ("kill", "_popen_kill", 1),
+        ("__enter__", "_popen_enter", 1),
+        ("__exit__", "_popen_exit", 4),
     ];
     let mut functions = [NONE; METHODS.len()];
     for (slot, (_, native, arity)) in functions.iter_mut().zip(METHODS) {
@@ -1378,6 +1380,15 @@ fn popen_method(function: &str, args: &[i64]) -> i64 {
         "_popen_poll" => popen_poll(instance),
         "_popen_terminate" => popen_signal(instance, libc::SIGTERM),
         "_popen_kill" => popen_signal(instance, libc::SIGKILL),
+        "_popen_enter" => instance,
+        "_popen_exit" => {
+            let _ = popen_wait(instance, None);
+            if exc::pending() {
+                NONE
+            } else {
+                value::FALSE
+            }
+        }
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("subprocess has no native method '{function}'"),
@@ -1403,9 +1414,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             value::list_new(Vec::new())
         }
         "Popen" => popen_new(args),
-        "_popen_wait" | "_popen_poll" | "_popen_terminate" | "_popen_kill" => {
-            popen_method(function, args)
-        }
+        "_popen_wait" | "_popen_poll" | "_popen_terminate" | "_popen_kill" | "_popen_enter"
+        | "_popen_exit" => popen_method(function, args),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'subprocess' has no attribute '{function}'"),
