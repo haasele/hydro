@@ -2598,6 +2598,20 @@ fn typing_typevar_constant(name: &str) -> Option<i64> {
 
 /// Materialises the module constant `name`.
 pub(crate) fn constant(name: &str) -> i64 {
+    if name == "_generic_alias_eq" {
+        return entry_method(
+            "_generic_alias_eq",
+            &["self", "other"],
+            alias_eq_entry as *const () as usize,
+        );
+    }
+    if name == "_generic_alias_ne" {
+        return entry_method(
+            "_generic_alias_ne",
+            &["self", "other"],
+            alias_ne_entry as *const () as usize,
+        );
+    }
     if name == "TYPE_CHECKING" {
         return FALSE;
     }
@@ -2682,6 +2696,11 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "_get_defaults" => get_defaults(args.first().copied().unwrap_or(NONE)),
         "get_args" => alias_args(args.first().copied().unwrap_or(NONE)),
         "get_origin" => alias_origin(args.first().copied().unwrap_or(NONE)),
+        // The class-level method entry can also be reached through the native
+        // module dispatcher when a generic alias is compared during `Union`
+        // construction.
+        "_generic_alias_eq" => alias_eq_entry(args.as_ptr()),
+        "_generic_alias_ne" => alias_ne_entry(args.as_ptr()),
         // `@final` is a marker in this runtime: annotations are not enforced.
         "final" => args.first().copied().unwrap_or(NONE),
         "dataclass_transform" => {

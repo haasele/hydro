@@ -4562,6 +4562,10 @@ pub static TYPING: ModuleSpec = ModuleSpec {
         f("_is_param_expr", 1, 1, Type::Bool),
         kw_dynamic("_deduplicate", 1, 1, Type::Any, &[]),
         f("_generic_class_getitem", 2, 2, Type::Any),
+        // Native generic-alias comparison hooks reachable through the module
+        // dispatcher while `Union` deduplicates aliases.
+        f("_generic_alias_eq", 2, 2, Type::Any),
+        f("_generic_alias_ne", 2, 2, Type::Any),
         // PEP 695 lowering target: `type X = expr` becomes
         // `_type_alias_new(name, value, type_params, module)`.
         f("_type_alias_new", 4, 4, Type::Any),
