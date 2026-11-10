@@ -45,6 +45,18 @@ fn run_source(source: &str) {
 }
 
 #[test]
+fn exec_star_import_binds_public_names() {
+    run_source(
+        "\
+names = {}
+exec('from math import *', names)
+assert 'sqrt' in names
+assert abs(names['sqrt'](9) - 3.0) < 1e-12
+",
+    );
+}
+
+#[test]
 fn literals_operators_and_assignments() {
     run_source(
         "\

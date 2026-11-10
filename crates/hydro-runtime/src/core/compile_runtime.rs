@@ -1196,10 +1196,56 @@ impl Interp {
         self.roots.push(module);
         for alias in &node.names {
             if alias.name.as_str() == "*" {
-                return Err(raise_tag(
-                    ExcKind::NotImplementedError,
-                    "from-import '*' inside runtime-compiled source",
-                ));
+                // Importlib represents user modules as namespace pairs; native
+                // and registered modules expose a dict-backed `module_dict`.
+                let entries: Vec<(String, i64)> = if let Some(pairs) = value::as_namespace(module) {
+                    pairs.to_vec()
+                } else {
+                    let namespace = crate::modules::module_dict(module_name);
+                    self.roots.push(namespace);
+                    value::as_dict(namespace)
+                        .map(|pairs| {
+                            pairs
+                                .iter()
+                                .filter_map(|(name, value)| {
+                                    value::as_str(*name).map(|name| (name.to_string(), *value))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let all = entries
+                    .iter()
+                    .find(|(name, _)| name == "__all__")
+                    .map(|(_, value)| *value);
+                let names: Vec<String> = if let Some(items) = all.and_then(value::as_list) {
+                    items
+                        .iter()
+                        .filter_map(|item| value::as_str(*item).map(str::to_string))
+                        .collect()
+                } else {
+                    entries
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .filter(|name| !name.starts_with('_'))
+                        .collect()
+                };
+                let mut bindings = Vec::with_capacity(names.len());
+                for name in names {
+                    let member = entries
+                        .iter()
+                        .find(|(key, _)| *key == name)
+                        .map(|(_, value)| *value)
+                        .unwrap_or_else(|| methods::getattr(module, name.as_ptr(), name.len()));
+                    if exc::pending() {
+                        return Err(Flow::Raise);
+                    }
+                    bindings.push((name, member));
+                }
+                for (name, member) in bindings {
+                    self.bind(&name, member);
+                }
+                continue;
             }
             let member = methods::getattr(module, alias.name.as_ptr(), alias.name.len());
             if exc::pending() {
