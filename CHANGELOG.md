@@ -50,7 +50,8 @@ initial state of the first runnable core.
   `Set` (keys/items), `Collection`, `Sized`, `Iterable` and `Container`
   checks. Mapping views expose `__reduce__`/`__reduce_ex__` that raise
   `TypeError`, so `copy.copy` reports CPython's non-copyable error instead of
-  `copy.Error`.
+  `copy.Error`. View `repr` now marks the view active, so a view that contains
+  itself through its dict prints `...` instead of overflowing the stack.
 - Latest official differential run (2026-11-10T17:20:05Z) reached **36/398
   `hydro_pass`** (296 `hydro_fail`, 56 `expected_fail`, 4 timeouts, 3 watchdog
   memkills, 3 `cpython_fail`). Seven tests newly passed

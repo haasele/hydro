@@ -9638,7 +9638,15 @@ pub(crate) fn memoryview_repr(state: &MemoryViewState) -> String {
 }
 
 /// `repr(dict_keys/values/items)` over the view's current contents.
-pub(crate) fn dict_view_repr(state: &DictViewState) -> String {
+pub(crate) fn dict_view_repr(state: &DictViewState, view: i64) -> String {
+    // A view can contain itself through its dict (`d[42] = d.values()`);
+    // mark the view active before recursing so the self-reference prints
+    // `...` instead of exhausting the native stack.
+    let (repr_guard, fresh) = ReprGuard::enter(view);
+    if !fresh {
+        return "...".to_string();
+    }
+    let _repr_guard = repr_guard;
     let pairs: Vec<(i64, i64)> = as_dict(state.dict)
         .map(|pairs| pairs.to_vec())
         .unwrap_or_default();
@@ -9760,7 +9768,7 @@ pub(crate) fn to_string(v: i64) -> String {
                 // `str(bytearray)` is its `repr`, like CPython.
                 ObjDataRef::ByteArray(bytes) => bytearray_repr(bytes),
                 ObjDataRef::MemoryView(state) => memoryview_repr(state),
-                ObjDataRef::DictView(state) => dict_view_repr(state),
+                ObjDataRef::DictView(state) => dict_view_repr(state, v),
                 ObjDataRef::Super(state) => super_repr(state),
                 // `str(exception instance)` is its message, or the original
                 // extension object's `str()` when it came from a C extension.
@@ -10096,7 +10104,7 @@ fn repr_depth(v: i64) -> String {
         return memoryview_repr(state);
     }
     if let Some(state) = as_dict_view(v) {
-        return dict_view_repr(state);
+        return dict_view_repr(state, v);
     }
     if let Some(state) = as_super(v) {
         return super_repr(state);
