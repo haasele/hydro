@@ -7535,7 +7535,14 @@ pub(crate) fn hna_function_new(
 /// Allocates a builtin function value. Builtins validate their own arity, so
 /// `arity` is `usize::MAX` (variadic); callers never rely on it.
 pub(crate) fn builtin_function_new(builtin: hydro_ir::Builtin) -> i64 {
-    alloc(
+    // CPython's builtin type spellings and functions are singleton objects.
+    // Hydro reads `int` through the ABI on every reference, so canonicalise
+    // the value in the global registry to make `type(1) is int` hold.
+    let key = format!("builtin.function:{}", builtin.name());
+    if let Some(cached) = crate::core::globals::registry_get(&key) {
+        return cached;
+    }
+    let value = alloc(
         KIND_FUNCTION,
         ObjData::Function(FunctionObj {
             body: FunctionBody::Builtin(builtin),
@@ -7547,7 +7554,10 @@ pub(crate) fn builtin_function_new(builtin: hydro_ir::Builtin) -> i64 {
             metadata: FunctionMetadata::default(),
             params: Vec::new(),
         }),
-    )
+    );
+    crate::heap::add_global_root(value);
+    crate::core::globals::registry_set(&key, value);
+    value
 }
 
 /// Allocates an interpreter-backed function value.
@@ -9344,6 +9354,17 @@ pub(crate) fn partial_class() -> i64 {
 /// `type(value)`: the class object for instances, otherwise a cached native
 /// class named after the value's runtime type. `type` itself maps to a cached
 /// class object named `type`.
+/// `type(value)` under Hydro's model: scalar/container types use the same
+/// canonical builtin value as their source spelling, so `type(1) is int`.
+pub(crate) fn type_reference(v: i64) -> i64 {
+    if let Some(builtin) = hydro_ir::Builtin::from_name(&type_name_of(v)) {
+        if is_builtin_type(&builtin) && !matches!(builtin, hydro_ir::Builtin::Type) {
+            return builtin_function_new(builtin);
+        }
+    }
+    type_class(v)
+}
+
 pub(crate) fn type_class(v: i64) -> i64 {
     if let Some(instance) = as_instance(v) {
         return instance.class;

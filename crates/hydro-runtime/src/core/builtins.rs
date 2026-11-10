@@ -6611,7 +6611,7 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             _ => builtin_arity_error("bool", "at most 1", argc),
         },
         Builtin::Type => match args {
-            [value] => value::type_class(*value),
+            [value] => value::type_reference(*value),
             [name, bases, namespace] => type_three_arg(*name, *bases, *namespace),
             _ => builtin_arity_error("type", "1 or 3", argc),
         },

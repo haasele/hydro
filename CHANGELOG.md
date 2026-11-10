@@ -18,6 +18,10 @@ initial state of the first runnable core.
   prefix in the full-entry slot vector, so a method that closes over an
   enclosing local binds `self` at the correct slot instead of reporting
   `missing required argument 'self'`.
+- Builtin function values are canonical singletons in the global registry, so
+  `type(1) is int`, `type("") is str`, and container type spellings compare
+  identically to their source names. `type()` still returns native classes for
+  non-spelling values such as `None`.
 - Class-header keywords now reach the metaclass `__new__`/`__init__` and
   `__init_subclass__`, including `metaclass=` plus named arguments such as
   `name="test"`. Keywords are evaluated before the class body and carried
