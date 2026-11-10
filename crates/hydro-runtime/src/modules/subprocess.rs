@@ -285,6 +285,8 @@ enum StreamMode {
     Pipe,
     DevNull,
     Stdout,
+    /// An already-open integer file descriptor supplied by the caller.
+    Fd(i32),
 }
 
 fn stream_mode(argument: i64, name: &str) -> Result<StreamMode, i64> {
@@ -295,12 +297,26 @@ fn stream_mode(argument: i64, name: &str) -> Result<StreamMode, i64> {
         Some(PIPE) => Ok(StreamMode::Pipe),
         Some(STDOUT) => Ok(StreamMode::Stdout),
         Some(DEVNULL) => Ok(StreamMode::DevNull),
+        Some(fd) if (0..=i64::from(i32::MAX)).contains(&fd) => Ok(StreamMode::Fd(fd as i32)),
         _ => Err(value_error(&format!(
-            "subprocess: {name} must be None, subprocess.PIPE, subprocess.STDOUT or \
-             subprocess.DEVNULL, not '{}'",
+            "subprocess: {name} must be None, subprocess.PIPE, subprocess.STDOUT, \
+             subprocess.DEVNULL or a non-negative file descriptor, not '{}'",
             value::type_name(argument)
         ))),
     }
+}
+
+/// Duplicates a caller-owned descriptor for `Stdio`; the child setup closes
+/// its copy, while the Python-visible descriptor stays owned by the caller.
+fn fd_stdio(fd: i32) -> Result<Stdio, i64> {
+    // SAFETY: `dup` takes an integer descriptor and returns a fresh one.
+    let duplicated = unsafe { libc::dup(fd) };
+    if duplicated < 0 {
+        return Err(io_error(io::Error::last_os_error()));
+    }
+    // SAFETY: `duplicated` is a newly owned descriptor and is transferred to
+    // `Stdio` exactly once.
+    Ok(Stdio::from(unsafe { OwnedFd::from_raw_fd(duplicated) }))
 }
 
 fn output_mode(argument: i64, name: &str) -> Result<StreamMode, i64> {
@@ -373,11 +389,18 @@ fn build_command(
     args: &[String],
     cwd: &Option<String>,
     env: &Option<Vec<(String, String)>>,
+    executable: Option<&str>,
 ) -> Result<Command, i64> {
     let Some((program, rest)) = args.split_first() else {
         return Err(value_error("subprocess: args must not be empty"));
     };
-    let mut command = Command::new(program);
+    // `executable=` replaces the program handed to `exec`, while `args[0]`
+    // remains the child's `argv[0]` (CPython passes the sequence verbatim).
+    let mut command = Command::new(executable.unwrap_or(program));
+    #[cfg(unix)]
+    if executable.is_some() {
+        command.arg0(program);
+    }
     command.args(rest);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -397,7 +420,7 @@ fn build_command(
 /// All blocking work happens between `blocking_enter`/`blocking_leave`; the
 /// reader threads copy bytes only, they never touch Hydro objects.
 fn execute(plan: &Plan) -> Result<Captured, i64> {
-    let mut command = build_command(&plan.args, &plan.cwd, &plan.env)?;
+    let mut command = build_command(&plan.args, &plan.cwd, &plan.env, None)?;
 
     match plan.stdout {
         StreamMode::Inherit => {}
@@ -411,6 +434,9 @@ fn execute(plan: &Plan) -> Result<Captured, i64> {
             return Err(value_error(
                 "subprocess: stdout must not be subprocess.STDOUT",
             ));
+        }
+        StreamMode::Fd(fd) => {
+            command.stdout(fd_stdio(fd)?);
         }
     }
 
@@ -439,7 +465,13 @@ fn execute(plan: &Plan) -> Result<Captured, i64> {
             StreamMode::Inherit | StreamMode::Stdout => {
                 command.stderr(duplicate_stdout()?);
             }
+            StreamMode::Fd(fd) => {
+                command.stderr(fd_stdio(fd)?);
+            }
         },
+        StreamMode::Fd(fd) => {
+            command.stderr(fd_stdio(fd)?);
+        }
     }
 
     let stdin_mode = if plan.input.is_some() {
@@ -461,6 +493,9 @@ fn execute(plan: &Plan) -> Result<Captured, i64> {
             return Err(value_error(
                 "subprocess: stdin must not be subprocess.STDOUT",
             ));
+        }
+        StreamMode::Fd(fd) => {
+            command.stdin(fd_stdio(fd)?);
         }
     }
 
@@ -981,6 +1016,10 @@ fn popen_new(args: &[i64]) -> i64 {
         Ok(cwd) => cwd,
         Err(error) => return error,
     };
+    let executable = match path_option(argument(args, 14), "executable") {
+        Ok(executable) => executable,
+        Err(error) => return error,
+    };
     let stdout = match output_mode(argument(args, 2), "stdout") {
         Ok(mode) => mode,
         Err(error) => return error,
@@ -1039,7 +1078,7 @@ fn popen_new(args: &[i64]) -> i64 {
         v => value::truthy(v),
     };
 
-    let mut command = match build_command(&argv, &cwd, &env) {
+    let mut command = match build_command(&argv, &cwd, &env, executable.as_deref()) {
         Ok(command) => command,
         Err(error) => return error,
     };
@@ -1057,11 +1096,30 @@ fn popen_new(args: &[i64]) -> i64 {
         StreamMode::Stdout => {
             return value_error("subprocess: stdin must not be subprocess.STDOUT");
         }
+        StreamMode::Fd(fd) => match fd_stdio(fd) {
+            Ok(stdio) => {
+                command.stdin(stdio);
+            }
+            Err(error) => return error,
+        },
     }
-    if stdout == StreamMode::DevNull {
-        command.stdout(Stdio::null());
-    } else if stdout == StreamMode::Pipe {
-        command.stdout(Stdio::piped());
+    match stdout {
+        StreamMode::Inherit => {}
+        StreamMode::DevNull => {
+            command.stdout(Stdio::null());
+        }
+        StreamMode::Pipe => {
+            command.stdout(Stdio::piped());
+        }
+        StreamMode::Stdout => {
+            return value_error("subprocess: stdout must not be subprocess.STDOUT");
+        }
+        StreamMode::Fd(fd) => match fd_stdio(fd) {
+            Ok(stdio) => {
+                command.stdout(stdio);
+            }
+            Err(error) => return error,
+        },
     }
     match stderr {
         StreamMode::DevNull => {
@@ -1087,8 +1145,20 @@ fn popen_new(args: &[i64]) -> i64 {
                 command.stderr(Stdio::null());
             }
             StreamMode::Stdout => {}
+            StreamMode::Fd(fd) => match fd_stdio(fd) {
+                Ok(stdio) => {
+                    command.stderr(stdio);
+                }
+                Err(error) => return error,
+            },
         },
         StreamMode::Inherit => {}
+        StreamMode::Fd(fd) => match fd_stdio(fd) {
+            Ok(stdio) => {
+                command.stderr(stdio);
+            }
+            Err(error) => return error,
+        },
     }
 
     // `start_new_session=True` puts the child in a fresh session and process
@@ -1614,6 +1684,46 @@ mod tests {
             assert_eq!(value::as_integer(call("_popen_wait", &[process])), Some(4));
         }
         assert!(!exc::pending());
+    }
+
+    #[test]
+    fn popen_accepts_declared_keywords_and_executable_override() {
+        // The keyword binder used by dynamic calls and `functools.partial`
+        // must map `stdout` into slot 2; the native function then spawns with
+        // the inherited stdout instead of rejecting the keyword.
+        exc::init();
+        let args = [seq(&["/bin/true"])];
+        let stdout = value::str_alloc("stdout".to_string());
+        let pipe = int(PIPE);
+        let keywords = [stdout, pipe];
+        let process = crate::modules::call_native_kw(
+            "subprocess",
+            "Popen",
+            args.len(),
+            args.as_ptr(),
+            1,
+            keywords.as_ptr(),
+        );
+        assert!(
+            !exc::pending(),
+            "Popen(stdout=PIPE) failed: {}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(wait_bounded(process), Some(0));
+
+        // `executable=` replaces the program path; the original args[0] is
+        // not required to exist.
+        let mut slots = vec![NONE; 15];
+        slots[0] = seq(&["/nonexistent/hydro-stdin", "-c", "exit 0"]);
+        slots[14] = value::str_alloc("/bin/sh".to_string());
+        exc::init();
+        let process = call("Popen", &slots);
+        assert!(
+            !exc::pending(),
+            "Popen(executable=...) failed: {}",
+            value::to_string(exc::pending_value())
+        );
+        assert_eq!(wait_bounded(process), Some(0));
     }
 
     #[test]

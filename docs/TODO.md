@@ -7,7 +7,7 @@ ID legend: `P<Phase>-<Nr>`. Phases are milestones, not releases.
 A phase only counts as complete once its acceptance criteria (below) are green on
 a fresh checkout with `./scripts/verify.sh`.
 
-**As of 2026-11-10 (latest):** CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN. Workspace: **3258 tests run, 1 skipped**; clippy `-D warnings` and `cargo fmt --check` green. Recent verified slices: C3 class construction and `super()` defining-class tracking; nested-function class method bodies; fiber/thread frame chains and `sys._current_frames`; `unittest` runner classification; on-demand stdlib/package materialization and dotted-import registration; `_io` underscore aliases; implicit `re.U` flags for `str` patterns. Open next: ABCMeta/ABC subclass-hook semantics, builtin type/class identity (`type(1) is int`), real `opcode.opmap` tables, runtime `_getframe` depth behavior, and the official-test burn-down from the 32/398 baseline. The current test count and per-crate breakdown live in [`AGENTS.md`](../AGENTS.md#current-state).
+**As of 2026-11-10 (latest):** CPython **3.14.9** compatibility target, `scripts/verify.sh` ALL GREEN. Workspace: **3260 tests run, 1 skipped** (canonical count in [`AGENTS.md`](../AGENTS.md#test-counts-canonical--update-only-here)); clippy `-D warnings` and `cargo fmt --check` green. Recent verified slices: C3 class construction and `super()` defining-class tracking; nested-function class method bodies; fiber/thread frame chains and `sys._current_frames`; `unittest` runner classification; on-demand stdlib/package materialization and dotted-import registration; `_io` underscore aliases; implicit `re.U` flags for `str` patterns; native keyword routing for declared spec parameters and `Popen(executable=...)`. Open next: ABCMeta/ABC subclass-hook semantics, builtin type/class identity (`type(1) is int`), real `opcode.opmap` tables, runtime `_getframe` depth behavior, Popen pipe streams/`communicate`, the four regressed manifest pins, and the official-test burn-down from the 36/398 latest run. The complete gap inventory and strict 100 % gate live in [`docs/FULL_COMPAT.md`](FULL_COMPAT.md).
 
 **2026-10-26 four-scope checkpoint.** Delivered and tested: a runtime module
 registry (`sys.path`, `sys.modules`, module `__name__`, namespace packages,
@@ -417,14 +417,14 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `Lib/test/test_*.py` differential runs against the pinned CPython
       **3.14.9** oracle, JSON + `docs/CPYTHON_TESTS.md`, release gate
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
-      Manifest `tests/compat/cpython-3.14.9.json` records `minimum_passing=32`
-      for the 2026-11-10 full run's **32/398** harness passes
-      (`test_colorsys.py`, `test_compiler_assemble.py`,
-      `test_compiler_codegen.py`, `test_errno.py`, `test_file_eintr.py`,
-      `test_int_literal.py`, `test_longexp.py`, `test_openpty.py`,
-      `test_unary.py`); `required`
-      stays empty until a never-regress subset is pinned. It grows only from
-      real `hydro_pass` results.
+      Manifest `tests/compat/cpython-3.14.9.json` records
+      `minimum_passing=33` verified passes. The latest full run reached
+      **36/398**, but four older pins (`test_dictviews`, `test_plistlib`,
+      `test_poll`, `test_yield_from`) regressed, so the manifest gate is not
+      green until those are recovered. `required` stays empty until a
+      never-regress subset is pinned; the manifest grows only from real
+      `hydro_pass` results. The exhaustive gap inventory is
+      [`docs/FULL_COMPAT.md`](FULL_COMPAT.md).
       Stdlib import baseline 2026-10-30: **288/297 importable** (52
       builtin/frozen, 174 pure, 62 extension; 9 CPython-failing; 9 failed). Batch A of
       the P7 standard-library program (`_bisect`/`bisect`,
@@ -436,10 +436,13 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       package/site-packages loader and the native
       `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/`importlib`/
       `__future__` modules are importable and API-tested.
-      Official-suite baseline 2026-11-10: **32/398 harness passes** (302
-      `hydro_fail`, 58 `expected_fail` where CPython also fails, 3 timeouts,
-      2 watchdog memkills, 1 CPython failure). No test is marked passing
-      unless CPython 3.14.9 and Hydro both exit 0.
+      Official-suite baseline 2026-11-10T17:20:05Z: **36/398 harness passes**
+      (296 `hydro_fail`, 56 `expected_fail` where CPython also fails, 4
+      timeouts, 3 watchdog memkills, 3 CPython failures). No test is marked
+      passing unless CPython 3.14.9 and Hydro both exit 0. Four older pins
+      regressed (`test_dictviews`, `test_plistlib`, `test_poll`,
+      `test_yield_from`); the per-workstream inventory and recovery list are
+      [`docs/FULL_COMPAT.md`](FULL_COMPAT.md).
       The harness runs a defined subset of CPython 3.14 `Lib/test` against
       `tea` and emits a machine-readable report (per test: pass/skip/fail,
       plus the reason).
@@ -1049,24 +1052,22 @@ listed as unsupported with a reason.
       `_osx_support`, `_overlapped`, `_scproxy`, `_winapi`, `_wmi`,
       `msvcrt`, `nt`, `winreg`, `winsound`
 
-### Module ledger (272 originally missing)
+### Historical module ledger (2026-10-25 baseline — not current status)
 
-Derived from the 272-module baseline in `benchmarks/compat/latest.json`
-(the modules already importable at the baseline are not listed). 35 entries
-are checked; `[x]` means importable plus representative-API testing where the
-batch notes say so, not CPython test-subset parity (P7-05). The checked
-entries are the import/API slices delivered by Batches A/B/benchmark, the
-native `typing`/`abc`/`enum`/`types`/`itertools`/`ast`/`fractions`/
-`importlib`/`__future__` modules, and `html`/`contextlib`. `[!]`
-marks a module CPython ships only for a
+This checklist is preserved as the original 272-module planning snapshot. Its
+unchecked boxes do **not** mean a module is still missing: the import matrix
+later advanced to **288/297 importable**. The authoritative current status is
+the generated [`docs/COMPATIBILITY.md`](COMPATIBILITY.md) matrix; behavioral
+parity remains the `Lib/test` work in [`docs/FULL_COMPAT.md`](FULL_COMPAT.md)
+and [`docs/CPYTHON_TESTS.md`](CPYTHON_TESTS.md).
+
+At the baseline, 35 entries were checked; `[x]` meant importable plus
+representative-API testing where the batch notes said so, not CPython
+test-subset parity (P7-05). `[!]` marks a module CPython ships only for a
 platform Hydro does not target on this host (Windows/Apple), tracked as
 platform-unsupported rather than implemented.
 
-Current matrix: 288/297 importable, 9 failed (including 9 modules CPython
-3.14.9 itself fails). The ledger is the work list for the failed entries;
-checked entries count as delivered slices, not as complete parity.
-
-#### Builtin / frozen (46: 7 importable, 39 open)
+#### Builtin / frozen (2026-10-25 baseline: 46, 7 importable, 39 open)
 
 - [ ] `_abc`
 - [ ] `_ast`
@@ -1115,7 +1116,7 @@ checked entries count as delivered slices, not as complete parity.
 - [x] `stat`
 - [ ] `zipimport`
 
-#### Pure Python (156: 27 importable, 129 open)
+#### Pure Python (2026-10-25 baseline: 156, 27 importable, 129 open)
 
 - [x] `__future__`
 - [ ] `_aix_support`
@@ -1279,7 +1280,7 @@ checked entries count as delivered slices, not as complete parity.
 - [ ] `zipfile`
 - [ ] `zoneinfo`
 
-#### Extension (62: 4 importable, 58 open)
+#### Extension (2026-10-25 baseline: 62, 4 importable, 58 open)
 
 - [ ] `_asyncio`
 - [x] `_bisect`
@@ -1344,7 +1345,7 @@ checked entries count as delivered slices, not as complete parity.
 - [ ] `unicodedata`
 - [ ] `zlib`
 
-#### Unknown / platform-specific (8)
+#### Unknown / platform-specific (2026-10-25 baseline: 8)
 
 - [!] `_overlapped`
 - [!] `_scproxy`

@@ -1411,7 +1411,10 @@ where
     let Some((entered, exit)) = enter_context_core(cm) else {
         return NONE;
     };
-    let entry = cleanup_entry(exit, &[cm, NONE, NONE, NONE], &[]);
+    // `enter_context_core` reads `cm.__exit__`, so the receiver is already
+    // bound; passing `cm` again would supply five arguments to a native
+    // four-parameter exit (`_GeneratorContextManager.__exit__`).
+    let entry = cleanup_entry(exit, &[NONE, NONE, NONE], &[]);
     let roots = heap::root_values(&[entry]);
     add(entry);
     heap::release_roots(roots);

@@ -2253,6 +2253,23 @@ fn call_with_keywords(target: i64, args: Vec<i64>, keywords: &[(String, i64)]) -
                 pairs.as_ptr(),
             );
         }
+        if let FunctionBody::Native { module, name } = &func.body {
+            if crate::modules::native_accepts_keywords(module, name) {
+                let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
+                for (keyword, value) in keywords {
+                    pairs.push(value::str_alloc(keyword.clone()));
+                    pairs.push(*value);
+                }
+                return crate::modules::call_native_kw(
+                    module,
+                    name,
+                    args.len(),
+                    args.as_ptr(),
+                    keywords.len(),
+                    pairs.as_ptr(),
+                );
+            }
+        }
         if !value::function_signature(target).is_empty() && value::function_full_entry(target) != 0
         {
             let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);

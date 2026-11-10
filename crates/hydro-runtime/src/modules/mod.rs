@@ -4880,7 +4880,7 @@ pub(crate) fn call_native_kw(
 /// between the positional and keyword dispatch paths.
 pub(crate) fn native_accepts_keywords(module: &str, function: &str) -> bool {
     resolve_native(module, function)
-        .map(|(_, _, spec)| spec.dynamic_keywords)
+        .map(|(_, _, spec)| spec.dynamic_keywords || !spec.params.is_empty())
         .unwrap_or(false)
 }
 
@@ -5156,6 +5156,18 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
                 );
             }
             faulthandler_call(function, args)
+        }
+        // The declared `Popen`/`run`/`check_output` parameter names were
+        // already moved into their positional slots. A name that remains is
+        // not part of the signature.
+        "subprocess" => {
+            if let Some((name, _)) = keywords.first() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("subprocess.{function}() got an unexpected keyword argument '{name}'"),
+                );
+            }
+            subprocess::call(function, args)
         }
         _ => exc::raise_with_message(
             TYPE_ERROR,

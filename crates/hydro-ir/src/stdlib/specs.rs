@@ -4031,7 +4031,7 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
         kw(
             "Popen",
             1,
-            14,
+            15,
             Type::Any,
             &[
                 "args",
@@ -4048,9 +4048,10 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
                 "preexec_fn",
                 "bufsize",
                 "shell",
+                "executable",
             ],
         ),
-        f("_popen_wait", 1, 2, Type::Int),
+        kw("_popen_wait", 1, 2, Type::Int, &["self", "timeout"]),
         f("_popen_poll", 1, 1, Type::Int),
         f("_popen_terminate", 1, 1, Type::None),
         f("_popen_kill", 1, 1, Type::None),
@@ -11055,7 +11056,7 @@ mod tests {
         // `subprocess.Popen` declares the keyword-only options after the
         // leading six slots.
         let popen = function("subprocess", "Popen").expect("subprocess.Popen");
-        assert_eq!((popen.min_args, popen.max_args), (1, 14));
+        assert_eq!((popen.min_args, popen.max_args), (1, 15));
         assert_eq!(
             popen.params,
             &[
@@ -11073,6 +11074,7 @@ mod tests {
                 "preexec_fn",
                 "bufsize",
                 "shell",
+                "executable",
             ][..]
         );
         assert_eq!(

@@ -13,8 +13,9 @@ CLI/project/pytest/REPL/AOT packaging/PGO flavors. Sources of truth:
 `PLAN.md` (strategy), `docs/ARCHITECTURE.md` (contracts), `docs/TODO.md`
 (work list), `docs/C_API.md` (P4-04), `docs/NATIVE_BINDINGS.md` (binding
 tiers, HNA, roadmap), `docs/DIAGNOSTICS.md` (diagnostics),
-`docs/LAYOUT.md` (source tree) and `docs/COMPAT_STRATEGY.md` (long-running
-compatibility program).
+`docs/LAYOUT.md` (source tree), `docs/COMPAT_STRATEGY.md` (long-running
+compatibility program) and `docs/FULL_COMPAT.md` (exhaustive 100 % gap
+inventory and gate definition).
 
 ## Current State
 
@@ -39,8 +40,9 @@ in `scripts/verify.sh`/CI. LTS is policy only (P4-12).
 JIT and AOT: python-dateutil, six, typing-inspection, annotated-types and
 tzdata. Typing-extensions and pydantic-core pass under JIT but their AOT
 builds stop in `enum._proto_member.__set_name__` with
-`int('keep')`; pydantic's JIT import misses `typing._generic_alias_eq`.
-NumPy still stops on `_NoValue`; pandas AOT stops on
+`int('keep')`; pydantic's JIT import now passes the Union generic-alias check
+and stops at `annotationlib.Format.__eq__`. NumPy still stops on `_NoValue`;
+pandas AOT stops on
 `writer() got an unexpected keyword argument 'lineterminator'`. The ABI
 inventory reports **0 missing required symbols** across 68 extension modules. Recent
 unblockers: variadic `map`, `os` link/chown/utime/sync/affinity/lseek and seek
@@ -80,12 +82,12 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-11-10: **3259 tests run
-(3259 passed, 1 skipped)**; the per-crate breakdown below sums to 3259:
+`cargo nextest run --workspace` on 2026-11-10: **3260 tests run
+(3260 passed, 1 skipped)**; the per-crate breakdown below sums to 3260:
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 2104 |
+| runtime (unit + integration) | 2105 |
 | frontend | 910 |
 | codegen | 79 |
 | IR | 71 |
@@ -100,34 +102,38 @@ Tea (separate repository) `cargo test` is green: **154 E2E tests** plus all
 other suites, including HNA 7/7, bindgen 2/2, sidecar 6/6 and wheels 15/15.
 Other docs must link here instead of repeating the total.
 
-### Compatibility checkpoint (2026-10-30)
+### Compatibility checkpoint (2026-11-10)
 
 - **Import matrix:** **288/297 modules importable** (52 builtin/frozen, 174 pure,
   62 extension; 9 fail; 9 modules fail under CPython 3.14.9 itself). The
   harness now sets `HYDRO_STDLIB` to the pinned CPython `Lib` tree; the earlier
   159 count used the toolchain's default subset. Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
-- **Official suite:** **32/398 full-run harness passes** (CPython and Hydro both exit 0); a post-run subset recheck added `test__opcode.py`, so the offline manifest now pins **33 known passes**.
-  several entries still execute 0 tests because imported harness modules fail,
-  recorded in `docs/CPYTHON_TESTS.md`. The 2026-11-10 full run has 302
-  `hydro_fail`, 58 `expected_fail`, 3 `timeout`, 2 watchdog `memkill`
-  (`test_zipfile64`, `test_zlib` at the 580 MB threshold) and 1
-  `cpython_fail`.
+- **Official suite:** **36/398 full-run harness passes** (CPython and Hydro
+  both exit 0; 2026-11-10T17:20:05Z, 877 s); several entries still execute 0
+  tests because imported harness modules fail, recorded in
+  `docs/CPYTHON_TESTS.md`. The run has 296 `hydro_fail`, 56
+  `expected_fail`, 4 `timeout` (`test_bisect`, `test_imaplib`, `test_queue`,
+  `test_signal`), 3 watchdog `memkill` (`test_zipfile64`, `test_zlib`,
+  `test_zstd` at the 1500 MB threshold) and 3 `cpython_fail`
+  (`test_extcall`, `test_unpack`, `test_unpack_ex`). The offline manifest
+  still pins **33 verified passes**:
+  four older pins (`test_dictviews`, `test_plistlib`, `test_poll`,
+  `test_yield_from`) regressed and must be recovered; the full inventory is
+  [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md).
 - **Ecosystem:** **5/13 cases pass** under JIT and AOT (python-dateutil,
   six, typing-inspection, annotated-types, tzdata). Typing-extensions and
   pydantic-core pass JIT but AOT stops in `enum._proto_member.__set_name__`
-  (`int('keep')`); pydantic JIT misses `typing._generic_alias_eq`. NumPy 2.5
-  stops on the `_multiarray_umath` missing-`_NoValue` path; pandas AOT stops
-  on `writer(..., lineterminator=...)`. The official test runner's
-  shared import blockers (`platform.win32_is_iot`, `ctypes.windll`,
+  (`int('keep')`); pydantic JIT now passes the Union generic-alias check and
+  stops at `annotationlib.__eq__`. NumPy 2.5 stops on the
+  `_multiarray_umath` missing-`_NoValue` path; pandas AOT stops on
+  `writer(..., lineterminator=...)`. The official test runner's shared import
+  blockers (`platform.win32_is_iot`, `ctypes.windll`,
   `subprocess._args_from_interpreter_flags`) are fixed, and `test.support`
   now imports after platform-branch folding, dead-import bindings, lambda
-  keyword-only support and the missing harness APIs. The official suite was rerun on 2026-11-10 (32/398; `test__opcode.py` subsequently rechecked green, manifest 33); per-test blockers now
-  include `unittest.mock`, `tempfile.mktemp`, `binascii.Error` and
-  `unittest.result`. The
-  ABI inventory reports **0 missing required symbols** across 68 pinned
-  extension modules. Pinned ecosystem report:
-  `docs/ECOSYSTEM.md`.
+  keyword-only support and the missing harness APIs. The ABI inventory
+  reports **0 missing required symbols** across 68 pinned extension modules.
+  Pinned ecosystem report: `docs/ECOSYSTEM.md`.
 - **Native bindings:** HNA v1, `hydro-bindgen` and `_hydro_sidecar` protocol v1
   are implemented and tested (see the checkpoint above and
   `docs/NATIVE_BINDINGS.md` §3.7); Tier 2 is implemented for the v1 slice and
@@ -167,13 +173,15 @@ Other docs must link here instead of repeating the total.
 - Stdlib is a curated subset; `re` is Rust syntax, `socket` supports TCP/UDP/
   IPv6, TLS client, non-blocking I/O and selectors; argparse covers the
   documented CPython surface, pytest is the native runner, and pickle uses
-  HYD1. Full P7 parity is open.
+  HYD1. `subprocess.Popen` now accepts declared keywords and `executable=`, but
+  still lacks pipe `stdin`/`stdout`/`stderr` handles, `communicate()` and the
+  context-manager protocol. Full P7 parity is open.
 - C-API: full link-time symbol coverage for the pinned wheels and the
   CPython-compatible handle/tuple/list layout, but full `PyTypeObject`
   behavior, `tp_traverse`/`tp_clear`, NumPy/pandas semantic ABI, full
   GIL/thread integration, wheel ecosystem suites and some `ctypes` paths
-  remain open; pydantic import and model smoke pass, NumPy/pandas semantics do
-  not yet.
+  remain open; pydantic now advances to `annotationlib.Format.__eq__`;
+  NumPy/pandas semantics do not yet.
 - HNA v1 limits: `init` is lazy until first module load; hold tokens root on
   the calling thread and must be released there (the token table is
   process-wide); the manifest is optional when absent;
@@ -183,8 +191,9 @@ Other docs must link here instead of repeating the total.
   is no general `exec`/`eval` (bounded source subset, no runtime Python
   compiler), and boundary cost is not yet measured. The sidecar protocol is
   v1 (16 MiB frames, depth 64); no JVM/.NET/Node adapter exists. Ecosystem
-  blockers: NumPy dtype/module initialization and the pandas static-typing
-  false positive; pydantic now passes.
+  blockers: NumPy dtype/module initialization and pandas AOT/`lineterminator`;
+  pydantic reaches `annotationlib.Format.__eq__`; see
+  [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md).
 - Tea owns uv interoperability/injection and packaging; Hydro does not embed
   `uv` or a package manager.
 - Linux x86_64 is the verified target; aarch64 is untested; macOS/Windows and
@@ -192,21 +201,27 @@ Other docs must link here instead of repeating the total.
 
 ## Next Steps
 
-1. **NB-4 ecosystem:** close the NumPy ArrayMethod/DType check and add dynamic
+1. **100 % coverage execution:** follow [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md)
+   and the generated backlog. Immediate slices: Popen pipe streams/
+   `communicate`/context manager, `contextlib._contextmanager_exit` arity,
+   real `opcode` metadata (23 tests), `_testinternalcapi` (10), regex
+   backreferences (8), then class/type identity and the `test.support`
+   harness.
+2. **NB-4 ecosystem:** close the NumPy ArrayMethod/DType check and add dynamic
    `except`-expression handlers for pandas, then thread/GIL and `ctypes`
    paths (P4-04c/d, P4-05, P4-06, P4-10/P4-11).
-2. **NB-3/NB-2:** add the bindgen panic fixture, measure HNA boundary cost,
+3. **NB-3/NB-2:** add the bindgen panic fixture, measure HNA boundary cost,
    and register `hydro-bindgen --check` in CI.
-3. **NB-1/P7 stdlib:** continue Batches B/C/D/E/F and native modules, wire
+4. **NB-1/P7 stdlib:** continue Batches B/C/D/E/F and native modules, wire
    P7-05 per-module `Lib/test` subsets, then the dependency-ordered remaining
    batches.
-4. **P5:** generator resume is now faster than CPython; continue with
+5. **P5:** generator resume is now faster than CPython; continue with
    PGO/inlining and threshold tuning.
-5. **P3:** uv interpreter injection, reproducible builds (P3-05), packaging
+6. **P3:** uv interpreter injection, reproducible builds (P3-05), packaging
    (P3-08).
-6. **P6:** troubleshooting/migration docs (P6-09), progress/exit summary
+7. **P6:** troubleshooting/migration docs (P6-09), progress/exit summary
    (P6-10).
-7. **Cross-cutting:** long fuzz campaigns (Q-03/Q-04), `unsafe` security
+8. **Cross-cutting:** long fuzz campaigns (Q-03/Q-04), `unsafe` security
    review (Q-05), debugger (Q-01), cross-platform (Q-09).
 
 ## Commands
@@ -263,6 +278,6 @@ See `CHANGELOG.md` for details; this is only the resume pointer.
 - Function-local native imports now shadow module aliases, `math` covers the
   CPython 3.14 scalar/iterable surface, and `opcode`/`code`/`tty` resolve to
   their pure CPython modules; `ast` exposes its compile flags through `_ast`.
-- Workspace gate: **3259 tests run (3259 passed, 1 skipped)**; clippy and fmt
+- Workspace gate: **3260 tests run (3260 passed, 1 skipped)**; clippy and fmt
   are clean. The current report set is regenerated in
   `benchmarks/compat/latest.json` and `docs/COMPATIBILITY.md`.

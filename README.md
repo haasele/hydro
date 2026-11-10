@@ -38,13 +38,16 @@ by implementation layer. Exact case lists live in
 
 Current state of work (Cargo version 0.1.0, no public release yet): the runtime
 monorepo carries the unit/integration suites; CLI/E2E/AOT tests live in Tea.
-Compatibility target: **CPython 3.14.9**; the official `Lib/test` baseline is
-**32/398** (harness exit-code parity; some imported-harness files still run 0 tests, see `docs/CPYTHON_TESTS.md`), tracked in
+Compatibility target: **CPython 3.14.9**; the last full official `Lib/test`
+run is **36/398** harness exits (some imported-harness files still run 0
+tests); four previously pinned passes regressed and are listed in the gap
+inventory, tracked in
 [`docs/CPYTHON_TESTS.md`](docs/CPYTHON_TESTS.md). The generated stdlib import
 matrix is **288/297** ([`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).
 Hydro JIT (`tea infuse`) and AOT (`tea build`) share this runtime and IR.
 Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), work list in
-[`docs/TODO.md`](docs/TODO.md), source tree in
+[`docs/TODO.md`](docs/TODO.md), the exhaustive 100 % gap inventory in
+[`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md), source tree in
 [`docs/LAYOUT.md`](docs/LAYOUT.md).
 
 ## Performance
@@ -298,8 +301,10 @@ semantics and the complete stdlib remain open (288/297 modules import; see
 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). A general `sys.path`/
 `sys.modules` model, dynamic imports from unlinked packages, namespace/zip/
 frozen imports and `from x import *` are incomplete; packages, dotted/relative
-imports, `site-packages` and vendored `stdlib/` resolution work. Package
-management is a uv passthrough (no interpreter injection/packaging).
+imports, `site-packages` and vendored `stdlib/` resolution work. `subprocess`
+accepts declared keywords and `Popen(executable=...)`, but Popen pipe stream
+attributes, `communicate()` and its context-manager protocol are still missing.
+Package management is a uv passthrough (no interpreter injection/packaging).
 
 ## Architecture
 

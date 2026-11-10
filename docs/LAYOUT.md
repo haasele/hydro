@@ -40,6 +40,7 @@ repository root.
 │   ├── C_API.md               P4-04 decision, probes, milestones
 │   ├── COMPATIBILITY.md       generated stdlib import matrix
 │   ├── CPYTHON_TESTS.md       official-test gate policy + baseline
+│   ├── FULL_COMPAT.md         exhaustive 100 % coverage gap inventory
 │   ├── DIAGNOSTICS.md         diagnostic codes/spans/JSON, CLI flags, exit codes
 │   ├── TODO.md                single work list
 │   └── LAYOUT.md              this file

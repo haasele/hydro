@@ -10,6 +10,36 @@ initial state of the first runnable core.
 
 ### Compatibility — 2026-11-10 class/import/runtime slice
 
+- Native keyword routing now honors every declared `ModuleSpec` parameter name,
+  not only `dynamic_keywords`. Dynamic calls and `functools.partial` reach the
+  generic keyword binder for `subprocess.Popen`/`run`/`check_output`; unknown
+  names are still rejected by the module dispatcher. `Popen(executable=...)`
+  now replaces the program executed while preserving the original `argv[0]`,
+  so the `test_repl` harness can spawn the interpreter through a `<stdin>`
+  argv[0]. The regression covers `Popen(stdout=PIPE)` through the keyword
+  binder and an `executable=` override. Popen still lacks pipe stream
+  attributes, `communicate()` and the context-manager protocol. It accepts
+  integer file descriptors for `stdin`/`stdout`/`stderr` (duplicating the
+  caller's descriptor for the child), and `Popen.wait(timeout=...)` binds
+  through the declared keyword spec.
+- Class attribute reads now follow CPython binding rules: a normal or static
+  method returns the unbound function, while only a classmethod binds the
+  class. This fixes `_enter_context`/`enterClassContext`, which read
+  `type(cm).__exit__` and pass the manager explicitly; the native unittest
+  cleanup path no longer double-binds the receiver and `test_repl`'s
+  `tearDownClass` errors disappear.
+- Latest official differential run (2026-11-10T17:20:05Z) reached **36/398
+  `hydro_pass`** (296 `hydro_fail`, 56 `expected_fail`, 4 timeouts, 3 watchdog
+  memkills, 3 `cpython_fail`). Seven tests newly passed
+  (`test_descrtut`, `test_genexps`, `test_lltrace`, `test_metaclass`,
+  `test_monitoring`, `test_pep646_syntax`, `test_textwrap`), but four older
+  pins (`test_dictviews`, `test_plistlib`, `test_poll`, `test_yield_from`)
+  regressed; the manifest stays at 33 verified passes until they are
+  recovered.
+- Added [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md): the authoritative
+  hand-maintained inventory of every remaining workstream on the road to
+  100 % CPython 3.14.9 test-suite coverage, with the strict gate definition and
+  the measured baseline.
 - Function-local `from <module> import <name>` statements now bind a real
   local value, so they shadow a module-level `import <module>` alias of the
   same spelling. Nested imports are collected even when a top-level import
@@ -30,9 +60,9 @@ initial state of the first runnable core.
 - Ecosystem differential re-measured on 2026-11-10: **5/13 cases** pass under
   JIT and AOT. Python-dateutil, six, typing-inspection, annotated-types and
   tzdata pass; typing-extensions and pydantic-core pass JIT but AOT stops in
-  `enum._proto_member.__set_name__`, pydantic JIT misses
-  `typing._generic_alias_eq`, NumPy still hits `_NoValue`, and pandas AOT
-  hits the `lineterminator` keyword.
+  `enum._proto_member.__set_name__`, pydantic JIT now passes the Union generic
+  alias check and stops at `annotationlib.Format.__eq__`, NumPy still hits
+  `_NoValue`, and pandas AOT hits the `lineterminator` keyword.
 - Classes defined inside functions now lower their method bodies. Previously
   `def factory(): class A: def f(self): return 42` produced a class whose
   methods returned `None`; nested methods now bind `self`, close over enclosing
@@ -78,7 +108,7 @@ initial state of the first runnable core.
   CPython.
 - C3 class construction, `super()` defining-class tracking, regex flags
   (`re.U` implied for `str` patterns) and the workspace clippy/fmt gates are
-  green. Canonical workspace count: 3258 tests run, 1 skipped.
+  green. Canonical workspace count: 3260 tests run, 1 skipped.
 
 ### Compatibility — `__class__`
 

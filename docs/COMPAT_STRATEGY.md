@@ -12,6 +12,8 @@ the actionable list.
 4. Pinned ecosystem wheels (`docs/ECOSYSTEM.md`).
 5. The C-API/ABI inventory and native-extension link probes (`docs/C_API.md`).
 6. Performance/benchmark gates (`docs/PERFORMANCE.md`).
+7. The hand-maintained 100 % gap inventory (`docs/FULL_COMPAT.md`), which
+   groups the generated failures by root cause and defines the strict gate.
 
 A test passes only when the oracle passes and Hydro exits 0. Import success is
 not behavioral success. No result may be fabricated or marked passing because
@@ -132,6 +134,8 @@ target files, acceptance command, and a focused commit.
 - Promote WIP to `main` only with green gates; record exact commands.
 
 ## Near-term exit criteria
+
+See the completion checklist in [`docs/FULL_COMPAT.md`](FULL_COMPAT.md).
 
 - `wip/compat-wave` workspace tests green.
 - Official triage runner completes all 398 tests without client/SIGTERM loss.

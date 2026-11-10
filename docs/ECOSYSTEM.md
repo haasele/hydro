@@ -93,8 +93,8 @@ A case passes only when the oracle, Hydro JIT and (unless `--no-aot`) the AOT bi
 | `numpy:smoke` | ok | exit 1 | exit 1 | runtime_error | jit: NameError: name '_NoValue' is not defined |
 | `pandas:import` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0103]: error[HYD0103]: writer() got an unexpected keyword argument 'lineterminator' |
 | `pandas:smoke` | ok | exit 1 | - | aot_build_error | AOT build failed (exit 1) [HYD0103]: error[HYD0103]: writer() got an unexpected keyword argument 'lineterminator' |
-| `pydantic:import` | ok | exit 1 | exit 1 | runtime_error | jit: AttributeError: module 'typing' has no attribute '_generic_alias_eq' |
-| `pydantic:smoke` | ok | exit 1 | exit 1 | runtime_error | jit: AttributeError: module 'typing' has no attribute '_generic_alias_eq' |
+| `pydantic:import` | ok | exit 1 | exit 1 | runtime_error | jit: AttributeError: module 'annotationlib' has no attribute '__eq__' |
+| `pydantic:smoke` | ok | exit 1 | exit 1 | runtime_error | jit: AttributeError: module 'annotationlib' has no attribute '__eq__' |
 | `pydantic-core:import` | ok | ok | exit 1 | runtime_error | aot: ValueError: invalid literal for int() with base 10: 'keep' |
 | `python-dateutil:import` | ok | ok | ok | pass | - |
 | `six:import` | ok | ok | ok | pass | - |

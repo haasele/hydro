@@ -3708,8 +3708,19 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
                 }
                 return function;
             }
-            Some(value::ClassEntry::Method(_, _)) => {
+            // A normal function read from the class is unbound in CPython:
+            // `C.f` is the function object, and `C.__exit__` must accept the
+            // receiver explicitly (`_enter_context` stores it that way).
+            // Only a classmethod binds the class; a staticmethod stays a
+            // plain function.
+            Some(value::ClassEntry::Method(MethodKind::Classmethod, _)) => {
                 return value::bound_method_new(obj, attr.to_string());
+            }
+            Some(value::ClassEntry::Method(
+                MethodKind::Normal | MethodKind::Staticmethod,
+                function,
+            )) => {
+                return function;
             }
             None => {}
         }
