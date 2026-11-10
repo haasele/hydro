@@ -43,7 +43,9 @@ initial state of the first runnable core.
   `dict_keys & iterator`) and reflected dict-view operations (`[] & d.keys()`),
   while non-iterable operands still fall through to CPython's `unsupported
   operand type(s)` error. `dict_keys` and `dict_items` also compare by their
-  set elements regardless of view kind.
+  set elements regardless of view kind, and direct construction of the
+  `dict_keys`/`dict_items`/`dict_values` classes now raises CPython's
+  `cannot create '...' instances` TypeError.
 - Latest official differential run (2026-11-10T17:20:05Z) reached **36/398
   `hydro_pass`** (296 `hydro_fail`, 56 `expected_fail`, 4 timeouts, 3 watchdog
   memkills, 3 `cpython_fail`). Seven tests newly passed

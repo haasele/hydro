@@ -1864,6 +1864,16 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
         return modules::extension::ext_object_call(function, argc, argv);
     }
     if value::as_class(function).is_some() {
+        // Mapping views are not constructible from Python:
+        // `type({}.keys())()` raises TypeError in CPython.
+        if let Some(name) = value::class_display_name(function) {
+            if matches!(name, "dict_keys" | "dict_items" | "dict_values") {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("cannot create '{name}' instances"),
+                );
+            }
+        }
         // A Hydro class deriving from an extension type has no C-layout
         // instance of its own; construction defers to the extension base's
         // `tp_new`/vectorcall.
