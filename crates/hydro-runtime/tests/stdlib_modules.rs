@@ -577,7 +577,8 @@ rgb\\(([\\d\\s,]+)\\)$
         &[text(source), module_get("re", "VERBOSE")],
     );
     assert_no_error();
-    assert_int(getattr(pattern, "flags"), 64);
+    // CPython adds implicit re.UNICODE (32) for str patterns: X|U = 96.
+    assert_int(getattr(pattern, "flags"), 96);
 
     let hex = method(pattern, "search", &[text("#a1b2c3")]);
     assert_str(method(hex, "group", &[int(1)]), "a1b2c3");

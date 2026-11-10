@@ -2003,16 +2003,18 @@ fn scanner_scan(args: &[i64]) -> i64 {
                 Ok(regex) => regex,
                 Err(error) => return error,
             };
+            // The combined lexicon is one alternation, so the *first* phrase
+            // that matches at this position wins — including a zero-width
+            // match, which ends the scan (CPython's `if i == j: break`).
             if let Some(captures) = regex.captures(slice) {
                 if let Some(whole) = captures.get(0) {
-                    if whole.end() > 0 {
-                        matched = Some((order, whole.end(), whole.as_str().to_string()));
-                        break;
-                    }
+                    matched = Some((order, whole.end(), whole.as_str().to_string()));
+                    break;
                 }
             }
         }
         match matched {
+            Some((_, 0, _)) => break,
             Some((order, end, token)) => {
                 let Some(entry) = entries.get(order).copied() else {
                     break;
@@ -2039,9 +2041,9 @@ fn scanner_scan(args: &[i64]) -> i64 {
                 }
                 index += end;
             }
-            None => {
-                index += text[index..].chars().next().map_or(1, char::len_utf8);
-            }
+            // No phrase matches here: CPython stops and returns the rest of
+            // the subject, it does not skip the character.
+            None => break,
         }
     }
     let rest = value::str_alloc(text[index..].to_string());
@@ -2095,6 +2097,9 @@ pub(crate) fn match_attr(obj: i64, attr: &str) -> Option<i64> {
             value::str_alloc(state.text.clone())
         }),
         "re" => Some(value::pattern_new(state.pattern.clone(), 0)),
+        // `Match.expand(template)` is a method; `getattr` reaches it here
+        // because it is not part of the group/span name list.
+        "expand" => Some(value::bound_method_new(obj, "expand".to_string())),
         "pos" => Some(crate::ops::int_result(0)),
         "endpos" => Some(crate::ops::int_result(if bytes {
             state.text.len() as i64
@@ -2360,6 +2365,85 @@ fn group_index(state: &MatchState, name: &str) -> Option<usize> {
         .position(|entry| entry.as_deref() == Some(name))
 }
 
+/// `Match.expand(template)` / the substitution half of `sub`/`subn`: expands
+/// Python replacement escapes against this match.
+///
+/// `\1`..`\99` and `\g<number>` insert a group (empty when that group did not
+/// participate), `\g<name>` inserts a named group, and any other `\x` inserts
+/// `x` literally. `text` is the Latin-1 payload, so a bytes match expands into
+/// Latin-1 text that [`latin1_bytes`] turns back into bytes.
+fn expand_template(state: &MatchState, template: &str, bytes: bool) -> String {
+    let chars: Vec<char> = template.chars().collect();
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch != '\\' {
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let Some(&next) = chars.get(index) else {
+            break;
+        };
+        match next {
+            'g' if chars.get(index + 1) == Some(&'<') => {
+                let close = chars[index + 2..]
+                    .iter()
+                    .position(|&candidate| candidate == '>')
+                    .map(|offset| index + 2 + offset);
+                let Some(close) = close else {
+                    out.push('g');
+                    index += 1;
+                    continue;
+                };
+                let name: String = chars[index + 2..close].iter().collect();
+                push_expanded_group(state, &name, bytes, &mut out);
+                index = close + 1;
+            }
+            digit if digit.is_ascii_digit() => {
+                let mut digits = String::new();
+                let mut cursor = index;
+                while cursor < chars.len() && chars[cursor].is_ascii_digit() && digits.len() < 2 {
+                    digits.push(chars[cursor]);
+                    cursor += 1;
+                }
+                push_expanded_group(state, &digits, bytes, &mut out);
+                index = cursor;
+            }
+            other => {
+                out.push(other);
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Appends one group's text to an expansion; an unknown or unmatched group
+/// contributes nothing, exactly like CPython.
+fn push_expanded_group(state: &MatchState, name: &str, bytes: bool, out: &mut String) {
+    let group = match name.parse::<usize>() {
+        Ok(number) => Some(number),
+        Err(_) => group_index(state, name),
+    };
+    let Some(group) = group else {
+        return;
+    };
+    if let Some(Some((start, end))) = state.groups.get(group).copied() {
+        if bytes {
+            let start = start.min(state.text.len());
+            let end = end.min(state.text.len()).max(start);
+            out.push_str(&state.text[start..end]);
+        } else {
+            let start = byte_offset(&state.text, start);
+            let end = byte_offset(&state.text, end);
+            out.push_str(&state.text[start..end]);
+        }
+    }
+}
+
 /// Methods of a `Match` (`group`, `groups`, `groupdict`, `start`, `end`,
 /// `span`).
 pub(crate) fn match_method(obj: i64, name: &str, args: &[i64]) -> i64 {
@@ -2407,6 +2491,31 @@ pub(crate) fn match_method(obj: i64, name: &str, args: &[i64]) -> i64 {
             })
             .collect();
         return value::tuple_new(groups);
+    }
+    if name == "expand" {
+        if args.len() != 1 {
+            return type_error(&format!(
+                "Match.expand() takes exactly 1 argument ({} given)",
+                args.len()
+            ));
+        }
+        if bytes {
+            let Some(template) = value::as_bytes(args[0]) else {
+                return type_error(&format!(
+                    "expected bytes, got {}",
+                    value::type_name(args[0])
+                ));
+            };
+            let expanded = expand_template(state, &latin1_string(template), true);
+            return value::bytes_new(latin1_bytes(&expanded));
+        }
+        let Some(template) = value::as_str(args[0]) else {
+            return type_error(&format!(
+                "expected str, got {}",
+                value::type_name(args[0])
+            ));
+        };
+        return value::str_alloc(expand_template(state, template, false));
     }
     if args.len() > 1 {
         return type_error(&format!(
@@ -2465,12 +2574,61 @@ pub(crate) fn pattern_attr(obj: i64, attr: &str) -> Option<i64> {
         } else {
             value::str_alloc(state.source.clone())
         }),
-        "flags" => Some(crate::ops::int_result(state.flags & !BYTES_PATTERN)),
+        // `flags` reports the `RegexFlag` bits the pattern was compiled with.
+        // CPython always sets `UNICODE` on a `str` pattern (implicit since
+        // 3.6, so `re.compile(p, re.I).flags == re.I | re.U`), while a bytes
+        // pattern never carries it. The internal bytes-domain marker is masked
+        // out of both.
+        "flags" => Some(crate::ops::int_result(if is_bytes_pattern(state) {
+            state.flags & !BYTES_PATTERN
+        } else {
+            (state.flags & !BYTES_PATTERN) | UNICODE
+        })),
+        // `Pattern.groups`: the number of capturing groups.
+        // `Pattern.groupindex`: `{name: number}` for the named groups.
+        "groups" | "groupindex" => {
+            let flags = state.flags & !BYTES_PATTERN;
+            if is_bytes_pattern(state) {
+                match compile_bytes(&latin1_bytes(&state.source), flags) {
+                    Ok(regex) if attr == "groups" => {
+                        Some(crate::ops::int_result((regex.captures_len() - 1) as i64))
+                    }
+                    Ok(regex) => Some(group_index_dict(&regex_names_bytes(&regex))),
+                    Err(_) => None,
+                }
+            } else {
+                match compile_source(&state.source, flags) {
+                    Ok(regex) if attr == "groups" => {
+                        Some(crate::ops::int_result((regex.captures_len() - 1) as i64))
+                    }
+                    Ok(regex) => Some(group_index_dict(&regex_names(&regex))),
+                    Err(_) => None,
+                }
+            }
+        }
         // `Pattern.scanner(string)` is a method; `getattr` must hand back a
         // bound method value so `p.scanner(...)` reaches `pattern_method`.
         "scanner" => Some(value::bound_method_new(obj, "scanner".to_string())),
         _ => None,
     }
+}
+
+/// `{name: group number}` for the named groups of a compiled pattern.
+fn group_index_dict(names: &[Option<String>]) -> i64 {
+    let entries: Vec<(i64, i64)> = names
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(index, name)| {
+            name.as_ref().map(|name| {
+                (
+                    value::str_alloc(name.clone()),
+                    crate::ops::int_result(index as i64),
+                )
+            })
+        })
+        .collect();
+    value::dict_new(entries)
 }
 
 #[cfg(test)]
