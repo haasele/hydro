@@ -1010,10 +1010,17 @@ fn popen_class() -> i64 {
 
 fn popen_new(args: &[i64]) -> i64 {
     let args_argument = argument(args, 0);
-    let argv = match command_args(args_argument) {
+    let mut argv = match command_args(args_argument) {
         Ok(argv) => argv,
         Err(error) => return error,
     };
+    // `shell=True` runs the command through `/bin/sh -c`, matching CPython's
+    // POSIX argument vector. A list is joined in the same simple way the
+    // module-level `call` helper does.
+    if value::truthy(argument(args, 13)) {
+        let command = argv.join(" ");
+        argv = vec!["/bin/sh".to_string(), "-c".to_string(), command];
+    }
     let cwd = match path_option(argument(args, 1), "cwd") {
         Ok(cwd) => cwd,
         Err(error) => return error,
@@ -1187,12 +1194,12 @@ fn popen_new(args: &[i64]) -> i64 {
         Ok(child) => child,
         Err(error) => return io_error(error),
     };
-    // `Popen` has no read API in this slice, so the piped descriptors are
-    // drained to nowhere; otherwise a chatty child would block on a full pipe
-    // and never reach a state where `wait()` can return.
-    if let Some(reader) = child.stdout.take() {
-        discard(reader);
-    }
+    // Piped output stays attached to a file object so callers can read it and
+    // `select.poll.register(proc.stdout, ...)` can use its descriptor.
+    let stdout_file = child
+        .stdout
+        .take()
+        .map(|reader| value::file_new_pipe(reader, !text_mode));
     if let Some(reader) = child.stderr.take() {
         discard(reader);
     }
@@ -1235,9 +1242,10 @@ fn popen_new(args: &[i64]) -> i64 {
     value::instance_setattr(instance, "encoding".to_string(), encoding_value);
     value::instance_setattr(instance, "errors".to_string(), errors_argument);
     // CPython initializes `stdin`/`stdout`/`stderr` to `None` and only fills a
-    // stream attribute when it created a file object. Hydro has no file
-    // objects for child pipes, and the piped stdin is closed at spawn, so the
-    // attribute stays `None` just like inherited or `/dev/null` streams.
+    // stream attribute when it created a file object. Piped stdin is closed
+    // at spawn, so it stays `None`; piped stdout/stderr carry the live file.
+    value::instance_setattr(instance, "stdout".to_string(), stdout_file.unwrap_or(NONE));
+    value::instance_setattr(instance, "stderr".to_string(), NONE);
     value::instance_setattr(instance, "stdin".to_string(), NONE);
     value::instance_setattr(instance, ID_ATTR.to_string(), int_value(key as i64));
     instance

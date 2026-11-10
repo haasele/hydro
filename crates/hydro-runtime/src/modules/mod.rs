@@ -15808,6 +15808,8 @@ fn default_process_counter() -> &'static AtomicUsize {
 /// The subclass keeps normal user-class storage while `start`/`join`/
 /// `is_alive` delegate to a native Thread object stored on the instance.
 pub(crate) fn threading_thread_base() -> i64 {
+    let join = value::native_function_new("threading", "_threadbase_join", 2);
+    value::function_set_params(join, vec!["self".to_string(), "timeout".to_string()]);
     let methods = vec![
         (
             "__init__".to_string(),
@@ -15817,10 +15819,7 @@ pub(crate) fn threading_thread_base() -> i64 {
             "start".to_string(),
             value::native_function_new("threading", "_threadbase_start", 1),
         ),
-        (
-            "join".to_string(),
-            value::native_function_new("threading", "_threadbase_join", 2),
-        ),
+        ("join".to_string(), join),
         (
             "is_alive".to_string(),
             value::native_function_new("threading", "_threadbase_is_alive", 1),

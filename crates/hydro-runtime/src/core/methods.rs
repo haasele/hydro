@@ -2283,6 +2283,14 @@ pub(crate) fn call_kw(
     if is_integer_value(obj) {
         return int_method(obj, &method, &args, &keywords.items);
     }
+    // Native thread objects expose `join(timeout=...)`; bind the keyword to
+    // the same positional slot the positional ABI uses.
+    if value::as_thread(obj).is_some() && method == "join" {
+        if let Err(err) = keywords.bind("Thread", "join", &["timeout"], 0, &mut args) {
+            return err;
+        }
+        return thread_method(obj, "join", &args);
+    }
     // Native objects whose methods take no keyword parameters (and every
     // other receiver kind) reject the keywords explicitly.
     keywords.reject(value::type_name(obj), &method)
@@ -4358,6 +4366,7 @@ fn file_attr(obj: i64, attr: &str) -> i64 {
             | "flush"
             | "tell"
             | "seek"
+            | "fileno"
             | "__enter__"
             | "__exit__"
     ) {
@@ -9197,7 +9206,7 @@ fn thread_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             }
         }
         "join" => {
-            if let Some(err) = check_arity("Thread", method, args.len(), 0, 0) {
+            if let Some(err) = check_arity("Thread", method, args.len(), 0, 1) {
                 return err;
             }
             if !thread.started.load(Ordering::Acquire) {
@@ -9207,6 +9216,28 @@ fn thread_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 );
             }
             if thread.joined.load(Ordering::Acquire) {
+                return NONE;
+            }
+            // `join(timeout)` waits only for the deadline and leaves the
+            // thread joinable; the no-timeout form reaps it.
+            if let Some(timeout) = args.first().copied() {
+                let seconds = if let Some(integer) = value::as_integer(timeout) {
+                    integer as f64
+                } else if let Some(float) = value::as_float(timeout) {
+                    float
+                } else {
+                    return type_error("Thread.join() timeout must be a number".to_string());
+                };
+                if seconds < 0.0 {
+                    return exc::raise_with_message(VALUE_ERROR, "timeout value must be positive");
+                }
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
+                while !thread.finished.load(Ordering::Acquire)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 return NONE;
             }
             let id = thread.id.load(Ordering::Acquire);
@@ -9918,6 +9949,15 @@ fn file_method(obj: i64, method: &str, args: &[i64]) -> i64 {
             }
             match file.tell() {
                 Ok(position) => ops::int_result(i64::try_from(position).unwrap_or(value::MAX_INT)),
+                Err(error) => value::raise_file_error(error),
+            }
+        }
+        "fileno" => {
+            if let Some(err) = check_arity("file", method, args.len(), 0, 0) {
+                return err;
+            }
+            match file.fileno() {
+                Ok(fd) => value::encode_int(i64::from(fd)).unwrap_or(NONE),
                 Err(error) => value::raise_file_error(error),
             }
         }

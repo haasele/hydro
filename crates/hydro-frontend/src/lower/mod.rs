@@ -17375,7 +17375,7 @@ impl<'a> Lowerer<'a> {
         fs: &mut FuncState,
     ) -> Option<HandlerMatcher> {
         match type_expr {
-            ast::Expr::Name(n) => match self.static_handler_kind(n.id.as_str()) {
+            ast::Expr::Name(n) => match ExcKind::from_name(n.id.as_str()) {
                 Some(kind) => Some(HandlerMatcher::Kinds(vec![kind])),
                 None => Some(HandlerMatcher::Dynamic(
                     self.dynamic_handler_expr(type_expr, fs),
@@ -17396,7 +17396,7 @@ impl<'a> Lowerer<'a> {
                 let mut kinds = Vec::with_capacity(tuple.elts.len());
                 for elt in &tuple.elts {
                     match elt {
-                        ast::Expr::Name(n) => match self.static_handler_kind(n.id.as_str()) {
+                        ast::Expr::Name(n) => match ExcKind::from_name(n.id.as_str()) {
                             Some(kind) => kinds.push(kind),
                             None => {
                                 return Some(HandlerMatcher::Dynamic(
@@ -17437,17 +17437,6 @@ impl<'a> Lowerer<'a> {
         let expr = self.expr(type_expr, fs);
         self.name_fallback_depth -= 1;
         expr
-    }
-
-    /// Tag matched by a bare exception name in a handler, or `None` when the
-    /// name is a runtime value (an alias, a parameter, an imported class from
-    /// a non-user module, ...) that only `isinstance` can resolve.
-    fn static_handler_kind(&self, name: &str) -> Option<ExcKind> {
-        match ExcKind::from_name(name) {
-            Some(kind) => Some(kind),
-            None if self.is_user_exception_name(name) => Some(ExcKind::RuntimeError),
-            None => None,
-        }
     }
 
     /// Whether one `except` clause names `NameError` (alone or as one element
@@ -21729,11 +21718,19 @@ impl<'a> Lowerer<'a> {
             });
             if dynamic_fiber {
                 if !call.keywords.is_empty() {
-                    // The runtime creates a suspended fiber from positional
-                    // arguments only and binds the signature on first resume,
-                    // so a keyword call has no slot to reach; it stays
-                    // deferred and raises at runtime.
-                    return self.lower_deferred_call(call, fs, line, col);
+                    // The runtime binds keywords against the full signature
+                    // and creates the fiber from the complete slot vector.
+                    let (callee_line, callee_col) = self.span(name_expr.range);
+                    let callee = HExpr {
+                        kind: HExprKind::FunctionRef(id),
+                        ty: Ty::Concrete(Type::Function),
+                        line: callee_line,
+                        col: callee_col,
+                    };
+                    let Some(result) = self.call_kw_expr(callee, call, fs, line, col) else {
+                        return self.error_expr(call.range);
+                    };
+                    return result;
                 }
                 let Some(args) = self.plain_call_args(call, fs) else {
                     return self.error_expr(call.range);

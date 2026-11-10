@@ -14090,9 +14090,8 @@ fn dotted_raise_lowers_to_a_value_raise() {
 
 #[test]
 fn user_and_dotted_handlers_choose_the_expected_matcher() {
-    // A dotted class is evaluated at runtime so class identity survives; a
-    // bare user class keeps the documented RuntimeError approximation; a
-    // builtin keeps its exact tag.
+    // Dotted and bare user classes are evaluated at runtime so class identity
+    // survives; a builtin keeps its exact tag.
     let source = "\
 class ColorParseError(Exception):
     pass
@@ -14109,11 +14108,11 @@ except ValueError:
     assert!(diags.is_empty(), "{diags:?}");
     let handlers = try_handlers(&hir);
     let kinds: Vec<_> = handlers.iter().map(|handler| handler.exc).collect();
-    assert_eq!(
-        kinds,
-        vec![None, Some(ExcKind::RuntimeError), Some(ExcKind::ValueError)]
+    assert_eq!(kinds, vec![None, None, Some(ExcKind::ValueError)]);
+    assert!(
+        handlers[0].exc_expr.is_some() && handlers[1].exc_expr.is_some(),
+        "user and dotted classes are dynamic"
     );
-    assert!(handlers[0].exc_expr.is_some(), "dotted class is dynamic");
 }
 
 #[test]

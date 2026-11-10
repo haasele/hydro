@@ -1387,6 +1387,8 @@ enum FileBody {
     Read(Vec<char>),
     ReadBytes(Vec<u8>),
     Write(std::fs::File),
+    /// Live child-process pipe (`Popen.stdout`/`stderr`).
+    Pipe(std::io::BufReader<std::process::ChildStdout>),
 }
 
 /// Native `io` class a file object currently reports.
@@ -1479,6 +1481,23 @@ impl FileState {
         }
     }
 
+    fn new_pipe(reader: std::process::ChildStdout, binary: bool) -> FileState {
+        FileState {
+            inner: Arc::new(Mutex::new(FileInner {
+                body: Some(FileBody::Pipe(std::io::BufReader::new(reader))),
+                cursor: 0,
+            })),
+            path: "<pipe>".to_string(),
+            mode: 'r',
+            binary,
+            class: AtomicU8::new(if binary {
+                FileClass::BufferedReader.tag()
+            } else {
+                FileClass::TextIOWrapper.tag()
+            }),
+        }
+    }
+
     fn new_write(path: String, mode: char, file: std::fs::File, binary: bool) -> FileState {
         let class = if binary {
             FileClass::BufferedWriter
@@ -1538,6 +1557,39 @@ impl FileState {
         inner.body = None;
     }
 
+    /// Descriptor behind the stream, for `select.poll.register`.
+    pub(crate) fn fileno(&self) -> Result<i32, FileError> {
+        let inner = self.lock();
+        match &inner.body {
+            Some(FileBody::Pipe(reader)) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd as _;
+                    Ok(reader.get_ref().as_raw_fd())
+                }
+                #[cfg(not(unix))]
+                {
+                    Err(FileError::Os("fileno is unsupported".to_string()))
+                }
+            }
+            Some(FileBody::Write(file)) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd as _;
+                    Ok(file.as_raw_fd())
+                }
+                #[cfg(not(unix))]
+                {
+                    Err(FileError::Os("fileno is unsupported".to_string()))
+                }
+            }
+            Some(FileBody::Read(_)) | Some(FileBody::ReadBytes(_)) => {
+                Err(FileError::Os("Bad file descriptor".to_string()))
+            }
+            None => Err(FileError::Closed),
+        }
+    }
+
     pub(crate) fn tell(&self) -> Result<usize, FileError> {
         let inner = self.lock();
         if inner.body.is_none() {
@@ -1550,6 +1602,11 @@ impl FileState {
     /// negative).
     pub(crate) fn read(&self, limit: Option<i64>) -> Result<String, FileError> {
         let mut inner = self.lock();
+        let FileInner { body, .. } = &mut *inner;
+        if let Some(FileBody::Pipe(reader)) = body {
+            let bytes = pipe_read(reader, limit, false)?;
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
         let FileInner { body, cursor } = &mut *inner;
         let chars = read_chars(body)?;
         let start = *cursor;
@@ -1575,6 +1632,10 @@ impl FileState {
     /// them.
     pub(crate) fn read_bytes(&self, limit: Option<i64>) -> Result<Vec<u8>, FileError> {
         let mut inner = self.lock();
+        let FileInner { body, .. } = &mut *inner;
+        if let Some(FileBody::Pipe(reader)) = body {
+            return pipe_read(reader, limit, false);
+        }
         let FileInner { body, cursor } = &mut *inner;
         let bytes = read_bytes_body(body)?;
         let start = *cursor;
@@ -1598,6 +1659,14 @@ impl FileState {
     /// at the end, matching CPython's `readline(0)`.
     pub(crate) fn readline(&self, limit: Option<i64>) -> Result<Option<String>, FileError> {
         let mut inner = self.lock();
+        let FileInner { body, .. } = &mut *inner;
+        if let Some(FileBody::Pipe(reader)) = body {
+            let bytes = pipe_read(reader, limit, true)?;
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
+        }
         let FileInner { body, cursor } = &mut *inner;
         let chars = read_chars(body)?;
         let start = *cursor;
@@ -1638,6 +1707,11 @@ impl FileState {
     /// and the returned line keeps its trailing `\n`.
     pub(crate) fn readline_bytes(&self, limit: Option<i64>) -> Result<Option<Vec<u8>>, FileError> {
         let mut inner = self.lock();
+        let FileInner { body, .. } = &mut *inner;
+        if let Some(FileBody::Pipe(reader)) = body {
+            let bytes = pipe_read(reader, limit, true)?;
+            return Ok(if bytes.is_empty() { None } else { Some(bytes) });
+        }
         let FileInner { body, cursor } = &mut *inner;
         let bytes = read_bytes_body(body)?;
         let start = *cursor;
@@ -1734,7 +1808,9 @@ impl FileState {
         let mut inner = self.lock();
         let FileInner { body, .. } = &mut *inner;
         match body {
-            Some(FileBody::Read(_)) | Some(FileBody::ReadBytes(_)) => Ok(()),
+            Some(FileBody::Read(_)) | Some(FileBody::ReadBytes(_)) | Some(FileBody::Pipe(_)) => {
+                Ok(())
+            }
             Some(FileBody::Write(file)) => {
                 use std::io::Write as _;
                 file.flush()
@@ -1772,6 +1848,33 @@ impl FileState {
     }
 }
 
+/// Reads from a live pipe; `line` stops after the next newline.
+fn pipe_read(
+    reader: &mut std::io::BufReader<std::process::ChildStdout>,
+    limit: Option<i64>,
+    line: bool,
+) -> Result<Vec<u8>, FileError> {
+    use std::io::{BufRead as _, Read as _};
+    let mut data = Vec::new();
+    let result = if line {
+        reader.read_until(b'\n', &mut data)
+    } else {
+        match limit {
+            Some(n) if n >= 0 => reader.take(n as u64).read_to_end(&mut data),
+            _ => reader.read_to_end(&mut data),
+        }
+    };
+    result.map_err(|error| FileError::Os(error.to_string()))?;
+    if line {
+        if let Some(limit) = limit {
+            if limit >= 0 && data.len() > limit as usize {
+                data.truncate(limit as usize);
+            }
+        }
+    }
+    Ok(data)
+}
+
 fn read_chars(body: &mut Option<FileBody>) -> Result<&mut Vec<char>, FileError> {
     match body {
         Some(FileBody::Read(chars)) => Ok(chars),
@@ -1779,6 +1882,9 @@ fn read_chars(body: &mut Option<FileBody>) -> Result<&mut Vec<char>, FileError> 
             "cannot read binary file as text".to_string(),
         )),
         Some(FileBody::Write(_)) => Err(FileError::Os("file not open for reading".to_string())),
+        Some(FileBody::Pipe(_)) => Err(FileError::Value(
+            "cannot read binary pipe as text".to_string(),
+        )),
         None => Err(FileError::Closed),
     }
 }
@@ -1790,6 +1896,9 @@ fn read_bytes_body(body: &mut Option<FileBody>) -> Result<&mut Vec<u8>, FileErro
             "cannot read text file as bytes".to_string(),
         )),
         Some(FileBody::Write(_)) => Err(FileError::Os("file not open for reading".to_string())),
+        Some(FileBody::Pipe(_)) => Err(FileError::Value(
+            "cannot read text file as bytes".to_string(),
+        )),
         None => Err(FileError::Closed),
     }
 }
@@ -1800,6 +1909,7 @@ fn body_len(body: &Option<FileBody>) -> Result<usize, FileError> {
         Some(FileBody::Read(chars)) => Ok(chars.len()),
         Some(FileBody::ReadBytes(bytes)) => Ok(bytes.len()),
         Some(FileBody::Write(_)) => Err(FileError::Os("file not open for reading".to_string())),
+        Some(FileBody::Pipe(_)) => Err(FileError::Os("file is not seekable".to_string())),
         None => Err(FileError::Closed),
     }
 }
@@ -1807,7 +1917,7 @@ fn body_len(body: &Option<FileBody>) -> Result<usize, FileError> {
 fn write_file(body: &mut Option<FileBody>) -> Result<&mut std::fs::File, FileError> {
     match body {
         Some(FileBody::Write(file)) => Ok(file),
-        Some(FileBody::Read(_)) | Some(FileBody::ReadBytes(_)) => {
+        Some(FileBody::Read(_)) | Some(FileBody::ReadBytes(_)) | Some(FileBody::Pipe(_)) => {
             Err(FileError::Os("file not open for writing".to_string()))
         }
         None => Err(FileError::Closed),
@@ -8312,6 +8422,14 @@ pub(crate) fn file_new_read_bytes(path: String, content: Vec<u8>) -> i64 {
     alloc(
         KIND_FILE,
         ObjData::File(FileState::new_read_bytes(path, content)),
+    )
+}
+
+/// Allocates a read-only file object backed by a child process pipe.
+pub(crate) fn file_new_pipe(reader: std::process::ChildStdout, binary: bool) -> i64 {
+    alloc(
+        KIND_FILE,
+        ObjData::File(FileState::new_pipe(reader, binary)),
     )
 }
 

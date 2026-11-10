@@ -108,7 +108,13 @@ pub(crate) fn iter_new(obj: i64) -> i64 {
             if value::as_iter(result).is_some() || value::as_fiber(result).is_some() {
                 return result;
             }
-            if value::as_instance(result).is_some() {
+            // An instance returned by `__iter__` is already an iterator when
+            // it defines `__next__`; return it unchanged (CPython's
+            // `iter(obj) is obj` for self-returning iterators).
+            if let Some(inner) = value::as_instance(result) {
+                if value::class_lookup(inner.class, "__next__").is_some() {
+                    return result;
+                }
                 return value::iter_new(result);
             }
             return exc::raise_with_message(
@@ -118,9 +124,6 @@ pub(crate) fn iter_new(obj: i64) -> i64 {
                     value::type_name(result)
                 ),
             );
-        }
-        if value::class_lookup(instance.class, "__next__").is_some() {
-            return value::iter_new(obj);
         }
     }
     if let Some(values) = value::namedtuple_values(obj) {

@@ -419,9 +419,9 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       `--gate`, offline `--check-manifest`, monotonic manifest updates).
       Manifest `tests/compat/cpython-3.14.9.json` records
       `minimum_passing=33` verified passes. The latest full run reached
-      **38 known**, but two older pins (`test_poll`, `test_yield_from`) remain
-      regressed after `test_dictviews` and `test_plistlib` recovered, so the
-      manifest gate is not green until those are recovered. `required` stays empty until a
+      **39 known**, but `test_yield_from` remains regressed after `test_dictviews`,
+      `test_plistlib` and `test_poll` recovered, so the manifest gate is not
+      green until it is recovered. `required` stays empty until a
       never-regress subset is pinned; the manifest grows only from real
       `hydro_pass` results. The exhaustive gap inventory is
       [`docs/FULL_COMPAT.md`](FULL_COMPAT.md).
@@ -440,7 +440,7 @@ concurrent GC, fast startup). The decision for the C-API path is recorded in
       (296 `hydro_fail`, 56 `expected_fail` where CPython also fails, 4
       timeouts, 3 watchdog memkills, 3 CPython failures). No test is marked
       passing unless CPython 3.14.9 and Hydro both exit 0. Two older pins
-      remain regressed (`test_poll`, `test_yield_from`); the per-workstream inventory and recovery list are
+      remain regressed (`test_yield_from`); the per-workstream inventory and recovery list are
       [`docs/FULL_COMPAT.md`](FULL_COMPAT.md).
       The harness runs a defined subset of CPython 3.14 `Lib/test` against
       `tea` and emits a machine-readable report (per test: pass/skip/fail,

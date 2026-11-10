@@ -23,9 +23,14 @@ initial state of the first runnable core.
   `Exception`; dotted handler expressions are evaluated dynamically. Object
   identity hashing no longer re-enters itself, and exception-class creation
   parks an active pending exception so lazy class allocation cannot fail.
-- Workspace suite: **3262 passed, 1 skipped**. Official known total is **38**
-  (36 full-run + `test_dictviews` + `test_plistlib`); `test_poll` and
-  `test_yield_from` remain the two pinned regressions.
+- Workspace suite: **3262 passed, 1 skipped**. Official known total is **39**
+  (36 full-run + `test_dictviews` + `test_plistlib` + `test_poll`).
+  `test_poll` now passes through `Popen(shell=True)` plus live stdout pipe
+  files (`fileno`, `readline`) and `Thread.join(timeout=...)`; generator
+  keyword calls bind through the full-entry fiber trampoline. `yield from`
+  propagates custom-iterator `StopIteration(value)`, self-iterators keep their
+  identity, and `gen.throw(ExcClass)` instantiates the class. `test_yield_from`
+  remains the single pinned regression (late loop closure capture).
 
 ### Compatibility — 2026-11-10 class/import/runtime slice
 

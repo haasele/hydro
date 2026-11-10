@@ -118,8 +118,8 @@ Other docs must link here instead of repeating the total.
   `test_zstd` at the 1500 MB threshold) and 3 `cpython_fail`
   (`test_extcall`, `test_unpack`, `test_unpack_ex`). A post-run recheck
   recovered `test_dictviews.py` and `test_plistlib.py`, so the current known
-  total is **38**. The offline manifest still pins **33 verified passes**; two
-  older pins (`test_poll`, `test_yield_from`) remain regressed. The full
+  total is **39**. The offline manifest still pins **33 verified passes**;
+  `test_yield_from` remains the single older regressed pin. The full
   inventory is [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md).
 - **Ecosystem:** **5/13 cases pass** under JIT and AOT (python-dateutil,
   six, typing-inspection, annotated-types, tzdata). Typing-extensions and

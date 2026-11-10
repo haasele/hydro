@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, RECURSION_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR,
+    self, ATTRIBUTE_ERROR, RECURSION_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR, VALUE_ERROR,
 };
 use crate::gc::roots::{self, SavedRoots};
 use crate::value::{self, NONE};
@@ -1183,6 +1183,17 @@ pub(crate) fn throw_value(generator: i64, exception: i64) -> i64 {
     let Some(ptr) = value::fiber_raw(generator) else {
         return exc::raise_with_message(TYPE_ERROR, "throw() requires a generator object");
     };
+    // `gen.throw(MyError)` instantiates the class with no arguments, exactly
+    // like CPython's `gen_throw`; the instance path stays untouched.
+    let exception = if value::as_class(exception).is_some() {
+        let instance = crate::core::builtins::call(exception, 0, std::ptr::null());
+        if exc::pending() {
+            return NONE;
+        }
+        instance
+    } else {
+        exception
+    };
     if value::exception_data(exception).is_none() {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -1578,11 +1589,45 @@ fn advance_delegate(delegate: i64, is_generator: bool, sent: i64) -> DelegateSte
         );
         return DelegateStep::Failed;
     }
+    // A user iterator's `StopIteration(value)` carries the delegation result.
+    // `iter::iter_next` deliberately clears that exception for ordinary
+    // iteration, so drive an instance `__next__` here and keep its payload.
+    if let Some(instance) = value::as_instance(delegate) {
+        if let Some(value::ClassEntry::Method(_, function)) =
+            value::class_lookup(instance.class, "__next__")
+        {
+            let arguments = [delegate];
+            let item = crate::core::builtins::call(function, 1, arguments.as_ptr());
+            if exc::pending() {
+                if exc::pending_tag() == STOP_ITERATION as i64 {
+                    let exception = exc::pending_value();
+                    let value = value::exception_data(exception)
+                        .and_then(|data| data.arg_values.first().copied())
+                        .unwrap_or(NONE);
+                    let _ = exc::clear();
+                    return DelegateStep::Done(value);
+                }
+                return DelegateStep::Failed;
+            }
+            return DelegateStep::Item(item);
+        }
+    }
     let mut out = NONE;
     if crate::iter::iter_next(delegate, &mut out) == 1 {
         DelegateStep::Item(out)
     } else if exc::pending() {
-        DelegateStep::Failed
+        if exc::pending_tag() == STOP_ITERATION as i64 {
+            // A plain iterator signals its return value through
+            // `StopIteration(value)`, not through a fiber result.
+            let exception = exc::pending_value();
+            let value = value::exception_data(exception)
+                .and_then(|data| data.arg_values.first().copied())
+                .unwrap_or(NONE);
+            let _ = exc::clear();
+            DelegateStep::Done(value)
+        } else {
+            DelegateStep::Failed
+        }
     } else {
         DelegateStep::Done(NONE)
     }
@@ -1625,7 +1670,7 @@ pub(crate) fn yield_from_value(iterable: i64) -> i64 {
         .map(|fiber| fiber.running)
         .unwrap_or(false)
     {
-        return exc::raise_with_message(RUNTIME_ERROR, "generator already executing");
+        return exc::raise_with_message(VALUE_ERROR, "generator already executing");
     }
 
     let mut to_send = NONE;

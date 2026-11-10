@@ -37,6 +37,6 @@
     "test_xml_dom_xmlbuilder.py",
     "test_yield_from.py"
   ],
-  "notes": "Release gate; harness exit-code parity. Some entries run 0 tests when imported harness modules fail; see docs/CPYTHON_TESTS.md. The latest full run (2026-11-10T17:20:05Z) reached 36 hydro_pass, but test_dictviews and test_plistlib recovered after the run; two older pins (test_poll, test_yield_from) remain regressed; this verified set remains at 33 until they are recovered. See docs/FULL_COMPAT.md.",
+  "notes": "Release gate; harness exit-code parity. Some entries run 0 tests when imported harness modules fail; see docs/CPYTHON_TESTS.md. The latest full run (2026-11-10T17:20:05Z) reached 36 hydro_pass, but test_dictviews, test_plistlib and test_poll recovered after the run; test_yield_from remains regressed; this verified set remains at 33 until it is recovered. See docs/FULL_COMPAT.md.",
   "generated": "2026-11-10T03:33:32Z"
 }
