@@ -12,8 +12,9 @@ user-facing toolchain **Tea** is a separate repository (`../tea`) and owns
 CLI/project/pytest/REPL/AOT packaging/PGO flavors. Sources of truth:
 `PLAN.md` (strategy), `docs/ARCHITECTURE.md` (contracts), `docs/TODO.md`
 (work list), `docs/C_API.md` (P4-04), `docs/NATIVE_BINDINGS.md` (binding
-tiers, HNA, roadmap), `docs/DIAGNOSTICS.md` (diagnostics) and
-`docs/LAYOUT.md` (source tree).
+tiers, HNA, roadmap), `docs/DIAGNOSTICS.md` (diagnostics),
+`docs/LAYOUT.md` (source tree) and `docs/COMPAT_STRATEGY.md` (long-running
+compatibility program).
 
 ## Current State
 
