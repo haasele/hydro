@@ -79,8 +79,8 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-11-10: **3257 tests run
-(3257 passed, 1 skipped)**; the per-crate breakdown below sums to 3258
+`cargo nextest run --workspace` on 2026-11-10: **3258 tests run
+(3258 passed, 1 skipped)**; the per-crate breakdown below sums to 3259
 (the skipped test is not included in the listed binaries):
 
 | Crate | Tests |
@@ -90,7 +90,7 @@ was not regenerated after this slice.
 | codegen | 79 |
 | IR | 71 |
 | bindgen | 42 |
-| interpreter | 33 |
+| interpreter | 34 |
 | parser | 19 |
 | hna | 0 |
 | hna-fixture | 0 |

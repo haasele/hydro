@@ -53,7 +53,7 @@ initial state of the first runnable core.
   CPython.
 - C3 class construction, `super()` defining-class tracking, regex flags
   (`re.U` implied for `str` patterns) and the workspace clippy/fmt gates are
-  green. Canonical workspace count: 3257 tests run, 1 skipped.
+  green. Canonical workspace count: 3258 tests run, 1 skipped.
 
 ### Compatibility — `__class__`
 

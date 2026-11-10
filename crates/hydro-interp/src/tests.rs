@@ -103,6 +103,19 @@ assert t.m() is t
 }
 
 #[test]
+fn builtin_type_identity_is_canonical() {
+    run_source(
+        "\
+assert type(1) is int
+assert type('x') is str
+assert type([]) is list
+assert type({}) is dict
+assert type(None) is not int
+",
+    );
+}
+
+#[test]
 fn zero_argument_float_constructor() {
     run_source("assert float() == 0.0\n");
 }
