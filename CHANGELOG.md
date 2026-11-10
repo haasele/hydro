@@ -45,7 +45,7 @@ initial state of the first runnable core.
   resolve far enough for guarded support code to compile and run.
 - C3 class construction, `super()` defining-class tracking, regex flags
   (`re.U` implied for `str` patterns) and the workspace clippy/fmt gates are
-  green. Canonical workspace count: 3254 tests run, 1 skipped.
+  green. Canonical workspace count: 3255 tests run, 1 skipped.
 
 ### Compatibility — `__class__`
 
@@ -81,7 +81,8 @@ initial state of the first runnable core.
   C extensions through derived `lib-dynload`/`HYDRO_EXTENSION_PATH` roots.
 - Official `Lib/test` differential baseline rose from 22/398 to **32/398**
   on 2026-11-10 after class/closure/import/format fixes (302 `hydro_fail`,
-  58 `expected_fail`, 3 timeouts, 2 watchdog memkills). The earlier 9/398 to
+  58 `expected_fail`, 3 timeouts, 2 watchdog memkills). The 32 known-passing
+  entries were re-gated on the final binary: 32/32 pass in 48.7 s. The earlier 9/398 to
   22/398 rise came from
   harness exit-code passes after `unittest.mock`/`result`, test-registration,
   contextlib/os.pipe/random/pickle-buffer, HTTP exception, recursion and
