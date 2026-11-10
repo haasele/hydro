@@ -15475,6 +15475,23 @@ fn class_keywords_with_an_explicit_metaclass_are_forwarded() {
 }
 
 #[test]
+fn super_init_accepts_any_receiver_parameter_name() {
+    // CPython does not require the receiver to be called `self`.
+    let source = "\
+class A:
+    def __init__(this):
+        super().__init__()
+";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(
+        !diags
+            .iter()
+            .any(|diag| diag.message.contains("super().__init__")),
+        "{diags:?}"
+    );
+}
+
+#[test]
 fn module_level_binding_decorators_apply_at_runtime() {
     fn has_builtin(stmts: &[HStmt], builtin: Builtin) -> bool {
         stmts.iter().any(|stmt| match &stmt.kind {

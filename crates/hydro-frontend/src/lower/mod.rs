@@ -20829,11 +20829,19 @@ impl<'a> Lowerer<'a> {
                             // runtime helper that invokes the direct base
                             // initializer with this instance. Other `super()`
                             // forms remain unsupported.
-                            let Some(local) = fs.lookup("self") else {
+                            // CPython binds the first parameter regardless of
+                            // its name (`def __init__(this): super().__init__()`).
+                            let receiver = fs.lookup("self").or_else(|| {
+                                self.functions[fs.fid as usize]
+                                    .params
+                                    .first()
+                                    .map(|param| param.local)
+                            });
+                            let Some(local) = receiver else {
                                 self.error_at_code(
                                     call.range(),
                                     codes::NAME,
-                                    "super().__init__() requires a method receiver named 'self'",
+                                    "super().__init__() requires a method receiver parameter",
                                 );
                                 return HExpr {
                                     kind: HExprKind::Const(Const::None),
