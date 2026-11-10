@@ -112,6 +112,8 @@ pub(crate) mod sysconfig;
 pub(crate) mod syslog;
 pub(crate) mod tempfile;
 pub(crate) mod termios;
+pub(crate) mod testbuffer;
+pub(crate) mod testinternalcapi;
 pub(crate) mod textwrap;
 pub(crate) mod timeit;
 pub(crate) mod tokenize;
@@ -3586,6 +3588,33 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
     ("os.popen.__exit__", native_member("popen.__exit__", 4, 4)),
     ("os.popen.__iter__", native_member("popen.__iter__", 1, 1)),
     ("os.popen.__next__", native_member("popen.__next__", 1, 1)),
+    // `_testbuffer`'s class methods. The classes themselves are constants
+    // (`ndarray`/`Py_buffer`); their method values carry these dotted names,
+    // so the central table must know them even though they are not
+    // Python-visible module functions.
+    ("_testbuffer.ndarray.__init__", native_dynamic_member("ndarray.__init__", 1, 8,
+        &["self","obj","shape","strides","offset","format","flags","getbuf"])),
+    ("_testbuffer.ndarray.tolist", native_member_ret("ndarray.tolist", 1, 1, hydro_ir::Type::List)),
+    ("_testbuffer.ndarray.tobytes", native_member_ret("ndarray.tobytes", 1, 1, hydro_ir::Type::Bytes)),
+    ("_testbuffer.ndarray.push", native_dynamic_member("ndarray.push", 2, 7,
+        &["self","items","shape","strides","offset","format","flags"])),
+    ("_testbuffer.ndarray.pop", native_member_ret("ndarray.pop", 1, 1, hydro_ir::Type::None)),
+    ("_testbuffer.ndarray.add_suboffsets", native_member_ret("ndarray.add_suboffsets", 1, 1, hydro_ir::Type::None)),
+    ("_testbuffer.ndarray.memoryview_from_buffer", native_member("ndarray.memoryview_from_buffer", 1, 1)),
+    ("_testbuffer.ndarray.getbuffer", native_member("ndarray.getbuffer", 1, 2)),
+    ("_testbuffer.ndarray.releasebuffer", native_member_ret("ndarray.releasebuffer", 1, 2, hydro_ir::Type::None)),
+    ("_testbuffer.ndarray.__buffer__", native_member("ndarray.__buffer__", 1, 2)),
+    ("_testbuffer.ndarray.__release_buffer__", native_member_ret("ndarray.__release_buffer__", 1, 2, hydro_ir::Type::None)),
+    ("_testbuffer.ndarray.__getitem__", native_member("ndarray.__getitem__", 2, 2)),
+    ("_testbuffer.ndarray.__setitem__", native_member_ret("ndarray.__setitem__", 3, 3, hydro_ir::Type::None)),
+    ("_testbuffer.ndarray.__len__", native_member_ret("ndarray.__len__", 1, 1, hydro_ir::Type::Int)),
+    ("_testbuffer.ndarray.__repr__", native_member_ret("ndarray.__repr__", 1, 1, hydro_ir::Type::Str)),
+    ("_testbuffer.ndarray.__eq__", native_member("ndarray.__eq__", 2, 2)),
+    ("_testbuffer.ndarray.__hash__", native_member_ret("ndarray.__hash__", 1, 1, hydro_ir::Type::Int)),
+    ("_testbuffer.Py_buffer.release", native_member_ret("Py_buffer.release", 1, 1, hydro_ir::Type::None)),
+    ("_testbuffer.Py_buffer.buf", native_member("Py_buffer.buf", 1, 1)),
+    ("_testbuffer.Py_buffer.ptr", native_member("Py_buffer.ptr", 1, 1)),
+    ("_testbuffer.Py_buffer.__repr__", native_member_ret("Py_buffer.__repr__", 1, 1, hydro_ir::Type::Str)),
 ];
 
 /// Resolves a [`SUPPLEMENTAL_FUNCTIONS`] entry by module and member name.
@@ -4832,6 +4861,8 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
     }
     let module = alias_target(module).unwrap_or(module);
     match module {
+        "_testinternalcapi" => testinternalcapi::call_kw(function, args, &keywords),
+        "_testbuffer" => testbuffer::call_kw(function, args, &keywords),
         "math" => math_call_kw(function, args, keywords),
         // The `json` options are declared by the spec, so the generic binder
         // already moved the supplied names into their positional slots. A name
@@ -5587,6 +5618,8 @@ fn dispatch(module: &str, function: &str, args: &[i64]) -> i64 {
     }
     let module = alias_target(module).unwrap_or(module);
     match module {
+        "_testinternalcapi" => testinternalcapi::call(function, args),
+        "_testbuffer" => testbuffer::call(function, args),
         "builtins" => builtins_dispatch(function, args),
         "math" => math_call(function, args),
         "functools" | "_functools" => functools_call(function, args),
@@ -8397,6 +8430,12 @@ fn future_feature_class() -> i64 {
 
 fn constant_value(module: &str, name: &str) -> i64 {
     match (module, name) {
+        // `_testinternalcapi`'s numeric sizes/thresholds and `_testbuffer`'s
+        // `ND_*`/`PyBUF_*` flags. `_testbuffer.ndarray`/`Py_buffer` are real
+        // cached classes here, so `isinstance` sees a type and class calls
+        // route through the supplemental method specs.
+        ("_testinternalcapi", name) => testinternalcapi::constant(name),
+        ("_testbuffer", name) => testbuffer::constant(name),
         ("__future__", "_Feature") => future_feature_class(),
         ("__future__", name) => future::constant(name),
         // `csv`'s classes are real class values; resolve them here as well as
