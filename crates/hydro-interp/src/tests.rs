@@ -507,6 +507,45 @@ assert holder[\"p\"].total() == 2
 }
 
 #[test]
+fn class_defined_inside_a_function_keeps_its_method_bodies() {
+    // A class registered while its enclosing function body is lowered binds
+    // its methods through the runtime class namespace, not a static
+    // `ClassDef` statement; the method bodies must still be lowered.
+    run_source(
+        "\
+def factory():
+    class A:
+        def f(self):
+            return 42
+    return A
+
+A = factory()
+a = A()
+assert a.f() == 42
+assert A.f(a) == 42
+assert getattr(a, 'f')() == 42
+
+def local_use():
+    class B:
+        def value(self):
+            return 7
+    return B().value()
+
+assert local_use() == 7
+
+def scaled(factor):
+    class Mul:
+        def apply(self, value):
+            return value * factor
+    return Mul
+
+Mul = scaled(3)
+assert Mul().apply(5) == 15
+",
+    );
+}
+
+#[test]
 fn class_bases_resolve_mro_entries_special_forms() {
     run_source(
         "\

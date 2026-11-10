@@ -1022,6 +1022,14 @@ pub(crate) fn import_from_core(args: &[i64]) -> i64 {
     if !want_full {
         if let Some((top, _)) = name.split_once('.') {
             if let Some(module) = modules::registry_lookup(top) {
+                // `import a.b` binds `a` but still imports and registers the
+                // `a.b` submodule in `sys.modules`, exactly like CPython.
+                if modules::registry_lookup(&name).is_none() {
+                    modules::importlib::call("import_module", &[name_value]);
+                    if exc::pending() {
+                        return NONE;
+                    }
+                }
                 return module;
             }
         }
@@ -1029,8 +1037,14 @@ pub(crate) fn import_from_core(args: &[i64]) -> i64 {
     if let Some(module) = modules::registry_lookup(&name) {
         return module;
     }
-    // Defer to the import machinery for the exact `ModuleNotFoundError`.
-    modules::importlib::call("import_module", &[name_value])
+    // Defer to the import machinery for the exact `ModuleNotFoundError`, then
+    // prefer the registered module value: `importlib.import_module` may build a
+    // temporary namespace object that does not answer `getattr`.
+    let imported = modules::importlib::call("import_module", &[name_value]);
+    if exc::pending() {
+        return NONE;
+    }
+    modules::registry_lookup(&name).unwrap_or(imported)
 }
 
 #[cfg(test)]

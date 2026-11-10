@@ -16038,6 +16038,40 @@ def make():
 }
 
 #[test]
+fn nested_class_in_a_function_lowers_its_method_bodies() {
+    // A class registered while a function body is lowered binds its methods
+    // straight into the runtime class namespace, so it has no `ClassDef`
+    // statement for the module pass to walk. Registration must lower the
+    // bodies itself; otherwise every call returns None.
+    let source = "\
+def factory():
+    class A:
+        def f(self):
+            print('called')
+            return 42
+    return A
+A = factory()
+";
+    let hir = lower_ok(source);
+    let body = &function(&hir, "A.f").body;
+    let returns_42 = body.iter().any(|stmt| {
+        matches!(
+            &stmt.kind,
+            HStmtKind::Return(Some(value))
+                if matches!(&value.kind, HExprKind::Const(Const::Int(42)))
+        )
+    });
+    assert!(returns_42, "A.f must keep its `return 42`: {body:?}");
+    let calls_print = body.iter().any(|stmt| {
+        matches!(
+            &stmt.kind,
+            HStmtKind::Expr(value) if matches!(&value.kind, HExprKind::Call { .. })
+        )
+    });
+    assert!(calls_print, "A.f must keep its `print` call: {body:?}");
+}
+
+#[test]
 fn imported_module_test_functions_are_not_pytest_tests() {
     // A `test*` helper of an imported module is an ordinary function: pytest
     // only collects the entry file, so its parameters must not be resolved as
@@ -16065,6 +16099,29 @@ fn entry_module_test_functions_keep_pytest_fixture_binding() {
         diags.iter().any(|diag| diag
             .message
             .contains("pytest fixture 'left' is not defined")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn unittest_main_modules_do_not_expand_pytest_fixtures() {
+    // A module driven by `unittest.main()` treats free `test*` helpers as
+    // ordinary callables: `test_factory(abc_ABCMeta, get_cache_token)` in
+    // CPython's test_abc.py constructs test classes and is not a pytest test.
+    let source = "\
+import unittest
+
+def test_factory(abc_ABCMeta, get_cache_token):
+    return abc_ABCMeta
+
+if __name__ == '__main__':
+    unittest.main()
+";
+    let (_, _, diags) = lower_source(source, &parse(source));
+    assert!(
+        !diags
+            .iter()
+            .any(|diag| diag.message.contains("pytest fixture")),
         "{diags:?}"
     );
 }

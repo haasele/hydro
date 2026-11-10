@@ -2793,6 +2793,27 @@ pub struct Lowerer<'a> {
     pub diags: Vec<Diagnostic>,
 }
 
+/// Whether the module calls `unittest.main()`, including inside its
+/// `if __name__ == "__main__":` block.
+fn calls_unittest_main(body: &[ast::Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        ast::Stmt::Expr(stmt) => {
+            let ast::Expr::Call(call) = &*stmt.value else {
+                return false;
+            };
+            let ast::Expr::Attribute(attribute) = &*call.func else {
+                return false;
+            };
+            attribute.attr.as_str() == "main"
+                && matches!(&*attribute.value, ast::Expr::Name(name) if name.id.as_str() == "unittest")
+        }
+        ast::Stmt::If(stmt) => {
+            calls_unittest_main(&stmt.body) || calls_unittest_main(&stmt.orelse)
+        }
+        _ => false,
+    })
+}
+
 impl<'a> Lowerer<'a> {
     pub fn new(source: &'a str, filename: &'a str, infer: &'a mut Infer) -> Lowerer<'a> {
         Lowerer {
@@ -3866,18 +3887,7 @@ impl<'a> Lowerer<'a> {
                 }
                 ast::Stmt::ClassDef(c) => {
                     if let Some(plan) = self.class_defs.get(&start).cloned() {
-                        let bodies = class_method_bodies(&c.body);
-                        for method in plan.methods {
-                            // Synthesized methods already carry their body.
-                            let Some(method_start) = method.start else {
-                                continue;
-                            };
-                            let Some(method_body) = bodies.get(&method_start) else {
-                                continue;
-                            };
-                            let lowered = self.lower_function_body(method.function, method_body);
-                            self.functions[method.function as usize].body = lowered;
-                        }
+                        self.lower_class_method_bodies(&c.body, &plan);
                     }
                     // Nested classes are separate `ClassDef` statements inside
                     // this class body; lower their method bodies too.
@@ -3889,6 +3899,29 @@ impl<'a> Lowerer<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Lowers the method bodies of one registered class plan.
+    ///
+    /// A class body's `def` statements have no HIR statement of their own: the
+    /// class lowering binds each method value straight into the class namespace
+    /// or the frozen attribute table, so the bodies must be lowered out of
+    /// band. [`Self::lower_definition_bodies`] covers module-level classes and
+    /// classes nested in a class body; a class registered while an enclosing
+    /// function body is lowered has no such walk and calls this directly.
+    fn lower_class_method_bodies(&mut self, body: &[ast::Stmt], plan: &ClassPlan) {
+        let bodies = class_method_bodies(body);
+        for method in &plan.methods {
+            // Synthesized methods already carry their body.
+            let Some(method_start) = method.start else {
+                continue;
+            };
+            let Some(method_body) = bodies.get(&method_start) else {
+                continue;
+            };
+            let lowered = self.lower_function_body(method.function, method_body);
+            self.functions[method.function as usize].body = lowered;
         }
     }
 
@@ -3989,6 +4022,13 @@ impl<'a> Lowerer<'a> {
     /// teardown. Module-scoped fixtures go through `pytest._fixture_module`,
     /// which caches the resolved value for the child run.
     fn synthesize_pytest(&mut self, body: &[ast::Stmt], fs: &mut FuncState) {
+        // A module that ends in `unittest.main()` is driven by unittest, not
+        // pytest: free `test*` helpers such as `test_factory(a, b)` are
+        // ordinary callables, not fixture-taking tests. Pytest itself never
+        // collects a module's `unittest.main()` entrypoint this way.
+        if calls_unittest_main(body) {
+            return;
+        }
         let mut fixtures: HashMap<String, (FunctionId, &'static str)> = HashMap::new();
         for stmt in body {
             let ast::Stmt::FunctionDef(function) = stmt else {
@@ -13184,7 +13224,11 @@ impl<'a> Lowerer<'a> {
         let plan = self.register_class(s);
         self.method_capture_scope = saved_scope;
         // Lower the method bodies of this class and of any class nested in its
-        // body now; the module-level pass never reaches them.
+        // body now; the module-level pass never reaches them. The class body's
+        // own `def` statements have no HIR statement of their own, so they are
+        // lowered through the plan; the walk below only reaches the nested
+        // `class` statements (its definition table is empty by design).
+        self.lower_class_method_bodies(&s.body, &plan);
         self.lower_definition_bodies(&s.body, &HashMap::new());
         plan
     }

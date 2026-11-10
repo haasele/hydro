@@ -1184,11 +1184,9 @@ impl Interp {
         self.roots.push(fromlist);
         let name_value = value::str_alloc(module_name.to_string());
         self.roots.push(name_value);
-        // The loader only distinguishes absolute (0) from relative (non-zero)
-        // levels and rejects every relative import with `ImportError`, so the
-        // exact numeric level is irrelevant here; the AST's `Int` wrapper has
-        // no display conversion.
-        let level = if node.level.is_some() { 1 } else { 0 };
+        // `ImportFrom.level` is the numeric count of leading dots; zero is an
+        // absolute import and must not be mistaken for a relative one.
+        let level = node.level.as_ref().map(|level| level.to_u32()).unwrap_or(0) as i64;
         let level_value = ops::int_result(level);
         let args = [name_value, self.globals, self.locals, fromlist, level_value];
         let module = modules::builtins::import_from_core(&args);

@@ -2455,6 +2455,29 @@ const IO_FUNCTIONS: &[FunctionSpec] = &[
         Type::Any,
         &["decoder", "translate", "errors"],
     ),
+    // CPython's `_io` exposes the C implementation classes under underscore
+    // names; the runtime maps them to the same cached class objects as the
+    // public `io` spellings.
+    kw("_IOBase", 0, 0, Type::Any, &[]),
+    kw("_RawIOBase", 0, 0, Type::Any, &[]),
+    kw("_TextIOBase", 0, 0, Type::Any, &[]),
+    kw("_BufferedIOBase", 0, 0, Type::Any, &[]),
+    kw("_BytesIO", 0, 1, Type::Any, &["initial_value"]),
+    kw("_StringIO", 0, 2, Type::Any, &["initial_value", "newline"]),
+    kw(
+        "_TextIOWrapper",
+        1,
+        6,
+        Type::Any,
+        &[
+            "buffer",
+            "encoding",
+            "errors",
+            "newline",
+            "line_buffering",
+            "write_through",
+        ],
+    ),
     // `text_encoding(encoding, stacklevel=2)`: reports the encoding a call
     // would use, falling back to the locale when `encoding` is `None`.
     kw("text_encoding", 1, 2, Type::Str, &["encoding"]),

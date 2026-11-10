@@ -4175,6 +4175,25 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if module == "builtins" && name == "object" {
         return value::object_class();
     }
+    // CPython's `_io` exposes the C implementation classes under underscore
+    // names while `io` re-exports the public spellings. Both are the same
+    // class objects here, so the aliases must resolve to the cached classes.
+    if module == "_io" {
+        match name {
+            "_IOBase" => return io_base_class("IOBase"),
+            "_RawIOBase" => return io_base_class("RawIOBase"),
+            "_TextIOBase" => return io_base_class("TextIOBase"),
+            "_BufferedIOBase" => return io_base_class("BufferedIOBase"),
+            "_BytesIO" => return bytes_io_class(),
+            "_StringIO" => return string_io_class(),
+            "_TextIOWrapper" => return text_io_wrapper_class(),
+            "_IncrementalNewlineDecoder" => return incremental_newline_decoder_class(),
+            "_FileIO" => return io_file_class(value::FileClass::FileIO),
+            "_BufferedReader" => return io_file_class(value::FileClass::BufferedReader),
+            "_BufferedWriter" => return io_file_class(value::FileClass::BufferedWriter),
+            _ => {}
+        }
+    }
     // `io.StringIO`/`io.BytesIO` are declared as functions so calls lower as
     // module calls, but the runtime value is the cached class: identity,
     // `isinstance` and method binding all need a class, not a constructor
@@ -34159,6 +34178,24 @@ mod tests {
                 value::class_lookup(class_value, "__subclasshook__").is_some(),
                 "{name}.__subclasshook__"
             );
+        }
+        assert!(!exc::pending());
+    }
+
+    #[test]
+    fn io_private_aliases_share_the_cached_classes() {
+        let _heap_guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        for (private, public) in [
+            ("_IOBase", "IOBase"),
+            ("_RawIOBase", "RawIOBase"),
+            ("_TextIOBase", "TextIOBase"),
+            ("_BufferedIOBase", "BufferedIOBase"),
+            ("_BytesIO", "BytesIO"),
+            ("_StringIO", "StringIO"),
+        ] {
+            assert_eq!(get("_io", private), get("io", public), "{private}");
+            assert!(value::as_class(get("_io", private)).is_some(), "{private}");
         }
         assert!(!exc::pending());
     }
