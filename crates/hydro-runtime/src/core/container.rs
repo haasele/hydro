@@ -2225,13 +2225,11 @@ fn equals_depth(a: i64, b: i64, depth: usize) -> bool {
             .map(|seen| seen == bytes)
             .unwrap_or(false);
     }
-    // `dict_keys`/`dict_items` compare as sets; `dict_values` has no content
-    // equality (only the identity shortcut below).
+    // `dict_keys`/`dict_items` compare as sets, including against each other
+    // when their elements agree; `dict_values` has no content equality (only
+    // the identity shortcut below).
     if let (Some(x), Some(y)) = (value::as_dict_view(a), value::as_dict_view(b)) {
-        if x.kind != y.kind {
-            return false;
-        }
-        if x.kind == value::DictViewKind::Values {
+        if x.kind == value::DictViewKind::Values || y.kind == value::DictViewKind::Values {
             return false;
         }
         let (Some(xs), Some(ys)) = (dict_view_elements(x), dict_view_elements(y)) else {
