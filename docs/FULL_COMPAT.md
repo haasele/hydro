@@ -58,9 +58,11 @@ checkout with the pinned oracle:
 | Ecosystem differential | **5/13** refreshed 2026-11-10; pydantic now reaches `annotationlib.__eq__` | 8 cases, then upstream suites |
 | Workspace | **3262 passed, 1 skipped**; clippy/fmt green | keep green through the compatibility work |
 
-Post-baseline fixes since this run: variadic decorator receiver binding and
-PEP 584 `dict | dict`/subclass union, both covered by workspace tests and
-minimal scripts but not yet included in a fresh 398-test rerun.
+Post-baseline fixes since this run: variadic decorator receiver binding,
+PEP 584 `dict | dict`/subclass union, iterable set operands (including
+`dict_keys`/`dict_items` against tuples/iterators and reflected views), and
+cross-kind keys/items equality. These are covered by workspace tests and
+minimal scripts but were not included in this 398-test run.
 
 The four timeouts are `test_bisect.py`, `test_imaplib.py`, `test_queue.py` and
 `test_signal.py`. The three watchdog kills are `test_zipfile64.py`,
