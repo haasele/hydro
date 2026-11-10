@@ -4115,6 +4115,18 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if module == "sys" && name == "pycache_prefix" {
         return NONE;
     }
+    if (module == "ast" || module == "_ast")
+        && matches!(
+            name,
+            "PyCF_ONLY_AST"
+                | "PyCF_ALLOW_TOP_LEVEL_AWAIT"
+                | "PyCF_TYPE_COMMENTS"
+                | "PyCF_OPTIMIZED_AST"
+                | "PyCF_SOURCE_IS_UTF8"
+        )
+    {
+        return ast::constant(name);
+    }
     if module == "errno" {
         if let Some(value) = errno::constant_value(name) {
             return value;

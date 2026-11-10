@@ -120,7 +120,6 @@ pub static MODULES: &[&ModuleSpec] = &[
     &SYSLOG,
     &_SIGNAL,
     &TERMIOS,
-    &TTY,
     &ARRAY,
     &CMATH,
     &RE_CONSTANTS_MODULE,

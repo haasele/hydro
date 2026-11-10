@@ -8557,28 +8557,6 @@ pub static GZIP: ModuleSpec = ModuleSpec {
     ],
 };
 
-/// `tty`: terminal mode helpers built on `termios`.
-pub static TTY: ModuleSpec = ModuleSpec {
-    name: "tty",
-    functions: &[
-        kw("cfmakeraw", 1, 1, Type::None, &["mode"]),
-        kw("cfmakecbreak", 1, 1, Type::None, &["mode"]),
-        kw("setraw", 1, 2, Type::Any, &["fd", "when"]),
-        kw("setcbreak", 1, 2, Type::Any, &["fd", "when"]),
-    ],
-    constants: &[
-        // The `termios.tcgetattr()` list indices.
-        c("IFLAG", Type::Int),
-        c("OFLAG", Type::Int),
-        c("CFLAG", Type::Int),
-        c("LFLAG", Type::Int),
-        c("ISPEED", Type::Int),
-        c("OSPEED", Type::Int),
-        c("CC", Type::Int),
-        c("__all__", Type::List),
-    ],
-};
-
 /// `uuid`: RFC 9562 UUID generation and parsing.
 pub static UUID: ModuleSpec = ModuleSpec {
     name: "uuid",

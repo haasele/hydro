@@ -15,10 +15,11 @@ initial state of the first runnable core.
   same spelling. Nested imports are collected even when a top-level import
   already claimed the name; native module functions and constants are bound
   through their module attribute.
-- `opcode` and `code` now resolve to CPython's pure modules instead of empty
-  native shims. `dis` gets the real `CONVERT_VALUE`/`opmap` tables from
-  `_opcode_metadata`, and `code.InteractiveConsole` is a class object, so
-  importing `doctest`/`pdb` no longer fails at import time.
+- `opcode`, `code` and `tty` now resolve to CPython's pure modules instead of
+  empty native shims. `dis` gets the real `CONVERT_VALUE`/`opmap` tables from
+  `_opcode_metadata`, `code.InteractiveConsole` is a class object, and `pty`
+  imports the pure `tty` functions. `ast` also exposes its `PyCF_*` compile
+  flags through `_ast`, so `_ast_unparse` imports.
 - `math` gained `cbrt`, `cosh`, `sinh`, `tanh`, `erf`, `erfc`, `gamma`,
   `lgamma`, `fmod`, `remainder`, `fma`, `nextafter`, `ulp`, `frexp`,
   `factorial`, `comb`, `perm`, `lcm`, `fsum`, `dist` and `sumprod`; `log`
