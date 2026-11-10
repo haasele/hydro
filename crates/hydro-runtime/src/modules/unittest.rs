@@ -23,12 +23,15 @@ use hydro_ir::ParamKind;
 use crate::builtins;
 use crate::container;
 use crate::core::globals;
-use crate::exc::{self, ASSERTION_ERROR, ATTRIBUTE_ERROR, SKIPPED, TYPE_ERROR, VALUE_ERROR};
+use crate::exc::{
+    self, ASSERTION_ERROR, ATTRIBUTE_ERROR, BASE_EXCEPTION, EXCEPTION, KEYBOARD_INTERRUPT,
+    SKIPPED, TYPE_ERROR, VALUE_ERROR,
+};
 use crate::heap;
 use crate::iter;
 use crate::methods;
 use crate::ops;
-use crate::value::{self, FALSE, NONE, TRUE};
+use crate::value::{self, FALSE, NONE, NOT_IMPLEMENTED, TRUE};
 
 /// Hidden native method that identifies a `TestCase`-derived class.
 const CASE_MARKER: &str = "__unittest_case__";
@@ -49,6 +52,9 @@ const SUBTEST_KEY: &str = "unittest._SubTest.class";
 const FAILED_TEST_KEY: &str = "unittest.loader._FailedTest.class";
 const RAISES_KEY: &str = "unittest._AssertRaisesContext.class";
 const DEFAULT_LOADER_KEY: &str = "unittest.defaultTestLoader";
+const SHOULD_STOP_KEY: &str = "unittest.case._ShouldStop.class";
+const UNEXPECTED_SUCCESS_KEY: &str = "unittest.case._UnexpectedSuccess.class";
+const WRITELN_DECORATOR_KEY: &str = "unittest.runner._WritelnDecorator.class";
 
 /// Registered test classes, in creation order.
 static REGISTRY: LazyLock<Mutex<Vec<i64>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -516,8 +522,16 @@ pub(crate) fn test_case() -> i64 {
         ("subTest", "TestCase.subTest", 1),
         ("id", "TestCase.id", 1),
         ("shortDescription", "TestCase.shortDescription", 1),
+        ("__eq__", "TestCase.__eq__", 2),
+        ("__hash__", "TestCase.__hash__", 1),
         ("__str__", "TestCase.__str__", 1),
         ("__repr__", "TestCase.__repr__", 1),
+        ("_callSetUp", "TestCase._callSetUp", 1),
+        ("_callTestMethod", "TestCase._callTestMethod", 2),
+        ("_callTearDown", "TestCase._callTearDown", 1),
+        ("_callCleanup", "TestCase._callCleanup", 2),
+        ("_addDuration", "TestCase._addDuration", 3),
+        ("_getAssertEqualityFunc", "TestCase._getAssertEqualityFunc", 3),
         ("countTestCases", "TestCase.countTestCases", 1),
         ("defaultTestResult", "TestCase.defaultTestResult", 1),
         ("_formatMessage", "TestCase._formatMessage", 3),
@@ -599,6 +613,28 @@ pub(crate) fn test_case() -> i64 {
         value::native_function_new("unittest", "TestCase.assertTrue", 3),
     );
     crate::modules::unittest_assertions::install(class);
+    // CPython removed the deprecated `fail*`/`assertEquals` spellings in 3.12.
+    // `unittest.case` no longer defines them, so `getattr` must raise
+    // `AttributeError` (`testDeprecatedFailMethods`).
+    for name in [
+        "failIf",
+        "failUnless",
+        "failIfEqual",
+        "failUnlessEqual",
+        "failIfAlmostEqual",
+        "failUnlessAlmostEqual",
+        "failUnlessRaises",
+        "assertNotEquals",
+        "assertEquals",
+        "assertAlmostEquals",
+        "assertNotAlmostEquals",
+        "assert_",
+        "assertDictContainsSubset",
+        "assertRaisesRegexp",
+        "assertRegexpMatches",
+    ] {
+        value::class_delete_attr(class, name);
+    }
     // Native assertion methods bind keyword arguments only with real
     // parameter metadata plus a full-argv entry: `self.assertEqual(a, b,
     // msg=...)`, `assertAlmostEqual(..., places=..., delta=...)` and the rest
@@ -636,14 +672,38 @@ pub(crate) fn test_result_class() -> i64 {
 
 /// The cached `TextTestResult` class (a real `TestResult` subclass).
 pub(crate) fn text_test_result_class() -> i64 {
-    static METHODS: [(&str, &str, usize); 1] =
-        [("getDescription", "TextTestResult.getDescription", 2)];
-    cached_class(
+    static METHODS: [(&str, &str, usize); 13] = [
+        ("__init__", "TextTestResult.__init__", 4),
+        ("getDescription", "TextTestResult.getDescription", 2),
+        ("startTest", "TextTestResult.startTest", 2),
+        ("_write_status", "TextTestResult._write_status", 3),
+        ("addSubTest", "TextTestResult.addSubTest", 4),
+        ("addSuccess", "TextTestResult.addSuccess", 2),
+        ("addError", "TextTestResult.addError", 3),
+        ("addFailure", "TextTestResult.addFailure", 3),
+        ("addSkip", "TextTestResult.addSkip", 3),
+        ("addExpectedFailure", "TextTestResult.addExpectedFailure", 3),
+        ("addUnexpectedSuccess", "TextTestResult.addUnexpectedSuccess", 2),
+        ("printErrors", "TextTestResult.printErrors", 1),
+        ("printErrorList", "TextTestResult.printErrorList", 3),
+    ];
+    let class = cached_class(
         TEXT_RESULT_KEY,
         "TextTestResult",
         test_result_class(),
         &METHODS,
-    )
+    );
+    value::class_set_attr(
+        class,
+        "separator1".to_string(),
+        value::str_alloc("=".repeat(70)),
+    );
+    value::class_set_attr(
+        class,
+        "separator2".to_string(),
+        value::str_alloc("-".repeat(70)),
+    );
+    class
 }
 
 /// The cached `TextTestRunner` class.
@@ -653,7 +713,13 @@ pub(crate) fn text_test_runner_class() -> i64 {
         ("_makeResult", "TextTestRunner._makeResult", 1),
         ("run", "TextTestRunner.run", 2),
     ];
-    cached_class(TEXT_RUNNER_KEY, "TextTestRunner", NONE, &METHODS)
+    let class = cached_class(TEXT_RUNNER_KEY, "TextTestRunner", NONE, &METHODS);
+    value::class_set_attr(
+        class,
+        "resultclass".to_string(),
+        text_test_result_class(),
+    );
+    class
 }
 
 /// The cached `TestLoader` class.
@@ -776,6 +842,101 @@ fn raises_context_class() -> i64 {
     cached_class(RAISES_KEY, "_AssertRaisesContext", NONE, &METHODS)
 }
 
+/// `unittest.case._ShouldStop`: the internal control-flow exception a failing
+/// subtest raises to abandon the rest of the test body under `failfast`.
+pub(crate) fn should_stop_class() -> i64 {
+    cached_class(
+        SHOULD_STOP_KEY,
+        "_ShouldStop",
+        exc::exception_class(EXCEPTION),
+        &[],
+    )
+}
+
+/// Raises the internal `_ShouldStop` control-flow signal.
+fn raise_should_stop() -> i64 {
+    let instance = builtins::call(should_stop_class(), 0, std::ptr::null());
+    exc::raise_value(instance)
+}
+
+/// Whether `error` is the internal `_ShouldStop` signal.
+fn is_should_stop(error: i64) -> bool {
+    value::is_subclass_of(value::type_class(error), should_stop_class())
+}
+
+/// `unittest.case._UnexpectedSuccess`: the exception a legacy `TestResult`
+/// receives through `addFailure` when an expected failure unexpectedly passes.
+fn unexpected_success_class() -> i64 {
+    cached_class(
+        UNEXPECTED_SUCCESS_KEY,
+        "_UnexpectedSuccess",
+        exc::exception_class(EXCEPTION),
+        &[],
+    )
+}
+
+/// `unittest.runner._WritelnDecorator`: a stream wrapper with `writeln`.
+pub(crate) fn writeln_decorator_class() -> i64 {
+    static METHODS: [(&str, &str, usize); 4] = [
+        ("__init__", "_WritelnDecorator.__init__", 2),
+        ("__getattr__", "_WritelnDecorator.__getattr__", 2),
+        ("writeln", "_WritelnDecorator.writeln", 1),
+        ("write", "_WritelnDecorator.write", 2),
+    ];
+    cached_class(WRITELN_DECORATOR_KEY, "_WritelnDecorator", NONE, &METHODS)
+}
+
+fn writeln_decorator_method(method: &str, args: &[i64]) -> i64 {
+    match method {
+        "__init__" => {
+            let (Some(&instance), Some(&stream)) = (args.first(), args.get(1)) else {
+                return missing_arguments("_WritelnDecorator.__init__");
+            };
+            value::instance_setattr(instance, "stream".to_string(), stream);
+            NONE
+        }
+        "__getattr__" => {
+            let (Some(&instance), Some(&name)) = (args.first(), args.get(1)) else {
+                return missing_arguments("_WritelnDecorator.__getattr__");
+            };
+            let requested = value::as_str(name).unwrap_or("");
+            if requested == "stream" || requested == "__getstate__" {
+                return exc::raise_with_message(
+                    ATTRIBUTE_ERROR,
+                    &format!("'{requested}'"),
+                );
+            }
+            let stream = value::instance_attr(instance, "stream").unwrap_or(NONE);
+            methods::getattr(stream, requested.as_ptr(), requested.len())
+        }
+        "writeln" => {
+            let Some(&instance) = args.first() else {
+                return missing_arguments("_WritelnDecorator.writeln");
+            };
+            let stream = value::instance_attr(instance, "stream").unwrap_or(NONE);
+            if let Some(&argument) = args.get(1) {
+                if argument != NONE {
+                    stream_write(stream, &value::to_string(argument));
+                }
+            }
+            stream_write(stream, "\n");
+            NONE
+        }
+        "write" => {
+            let (Some(&instance), Some(&argument)) = (args.first(), args.get(1)) else {
+                return missing_arguments("_WritelnDecorator.write");
+            };
+            let stream = value::instance_attr(instance, "stream").unwrap_or(NONE);
+            let argument = value::str_alloc(value::to_string(argument));
+            let roots = heap::root_values(std::slice::from_ref(&argument));
+            methods::call(stream, b"write".as_ptr(), 5, 1, &argument as *const i64);
+            heap::release_roots(roots);
+            NONE
+        }
+        _ => missing_method("_WritelnDecorator", method),
+    }
+}
+
 /// Dispatches a native `unittest` function.
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
@@ -821,6 +982,13 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>
         | "TestCase.subTest"
         | "TestCase.assertRaises"
         | "TestCase.assertRaisesRegex" => {
+            if function == "TestCase.assertRaises" || function == "TestCase.assertRaisesRegex" {
+                return assert_raises_with_keywords(
+                    args,
+                    &keywords,
+                    function == "TestCase.assertRaisesRegex",
+                );
+            }
             let dictionary = keywords_dict(&keywords);
             let mut call_args = args.to_vec();
             call_args.push(dictionary);
@@ -880,7 +1048,7 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>
                 }
                 slots[index] = item;
             }
-            dispatch(function, &slots)
+            call(function, &slots)
         }
         "addModuleCleanup" => add_module_cleanup(args, &keywords),
         "enterModuleContext" | "doModuleCleanups" => {
@@ -890,17 +1058,50 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>
                     &format!("unittest.{function}() got an unexpected keyword argument '{name}'"),
                 );
             }
-            dispatch(function, args)
+            call(function, args)
         }
         // `unittest.main(module=...)` names the module whose tests run; the
         // argument is also accepted positionally through `call`.
         "main" => call_main(args, &keywords),
-        // Constructors and runners keep their declared positional slots; the
-        // remaining names are accepted and ignored exactly like CPython's
-        // compatibility keyword arguments.
-        "TestResult.__init__"
-        | "TextTestRunner.__init__"
-        | "TextTestRunner.run"
+        // Constructors bind their documented keyword arguments into the
+        // positional slots the native initializers read.
+        "TestResult.__init__" => {
+            let slots = bind_named_slots(args, &keywords, &["stream", "descriptions", "verbosity"], function);
+            dispatch(function, &slots)
+        }
+        "TextTestRunner.__init__" => {
+            let slots = bind_named_slots(
+                args,
+                &keywords,
+                &[
+                    "stream",
+                    "descriptions",
+                    "verbosity",
+                    "failfast",
+                    "buffer",
+                    "resultclass",
+                    "warnings",
+                    "tb_locals",
+                    "durations",
+                ],
+                function,
+            );
+            dispatch(function, &slots)
+        }
+        "TestCase.__init__" => {
+            let slots = bind_named_slots(args, &keywords, &["methodName"], function);
+            dispatch(function, &slots)
+        }
+        "TestLoader.discover" => {
+            let slots = bind_named_slots(
+                args,
+                &keywords,
+                &["start_dir", "pattern", "top_level_dir"],
+                function,
+            );
+            dispatch(function, &slots)
+        }
+        "TextTestRunner.run"
         | "TestProgram.__init__"
         | "TestLoader.__init__" => call(function, args),
         _ => {
@@ -926,7 +1127,7 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>
                 }
             }
             if remaining.is_empty() {
-                dispatch(function, args)
+                call(function, args)
             } else {
                 let name = remaining[0].0.clone();
                 exc::raise_with_message(
@@ -971,6 +1172,9 @@ fn dispatch(function: &str, args: &[i64]) -> i64 {
     }
     if let Some(method) = function.strip_prefix("_AssertRaisesContext.") {
         return raises_context_method(method, args);
+    }
+    if let Some(method) = function.strip_prefix("_WritelnDecorator.") {
+        return writeln_decorator_method(method, args);
     }
     exc::raise_with_message(
         ATTRIBUTE_ERROR,
@@ -1389,8 +1593,22 @@ fn test_case_method(method: &str, args: &[i64]) -> i64 {
         "subTest" => sub_test(args),
         "id" => test_case_id(args),
         "shortDescription" => short_description(args),
+        "__eq__" => test_case_eq(args),
+        "__hash__" => test_case_hash(args),
         "__str__" => test_case_str(args),
         "__repr__" => test_case_repr(args),
+        "_callSetUp" => call_method(args.first().copied().unwrap_or(NONE), "setUp", &[]),
+        "_callTearDown" => call_method(args.first().copied().unwrap_or(NONE), "tearDown", &[]),
+        "_callTestMethod" => test_case_call_test_method(args),
+        "_callCleanup" => {
+            let (Some(&function), Some(&call_args)) = (args.get(1), args.get(2)) else {
+                return missing_arguments("TestCase._callCleanup");
+            };
+            let positional = collect_items(call_args).unwrap_or_default();
+            builtins::call(function, positional.len(), positional.as_ptr())
+        }
+        "_addDuration" => test_case_add_duration(args),
+        "_getAssertEqualityFunc" => test_case_get_equality_func(args),
         "countTestCases" => encode_int(1),
         "defaultTestResult" => new_test_result(),
         "fail" => fail(args),
@@ -1486,7 +1704,6 @@ fn test_case_init(args: &[i64]) -> i64 {
     );
     let doc = method_function(class, &name)
         .map(value::function_doc)
-        .filter(|doc| *doc != NONE)
         .unwrap_or_else(|| value::str_alloc("No test".to_string()));
     value::instance_setattr(instance, "_testMethodDoc".to_string(), doc);
     NONE
@@ -1532,22 +1749,41 @@ fn test_case_run(args: &[i64]) -> i64 {
     let supplied = args.get(1).copied().unwrap_or(NONE);
     let owns_result = supplied == NONE;
     let result = if owns_result {
-        let result = new_test_result();
-        call_method(result, "startTestRun", &[]);
+        let result = call_method(instance, "defaultTestResult", &[]);
+        if exc::pending() {
+            return NONE;
+        }
+        if has_method(result, "startTestRun") {
+            call_method(result, "startTestRun", &[]);
+        } else {
+            warn_runtime("TestResult has no startTestRun method");
+        }
         result
     } else {
         supplied
     };
+    let roots = heap::root_values(&[result]);
     call_method(result, "startTest", &[instance]);
 
     let name = value::instance_attr(instance, "_testMethodName")
         .and_then(value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| "runTest".to_string());
+    // CPython resolves the test method with `getattr` after `startTest`, and a
+    // missing method propagates (only `stopTest`/`stopTestRun` run).
     let method = method_function(class, &name);
+    if method.is_none() {
+        let message = format!(
+            "'{}' object has no attribute '{name}'",
+            value::type_name(instance)
+        );
+        finish_run(result, instance, owns_result);
+        heap::release_roots(roots);
+        return exc::raise_with_message(ATTRIBUTE_ERROR, &message);
+    }
 
     // Class-level or method-level `@unittest.skip`.
-    let class_skip = class_attr_truthy(class, "__unittest_skip__");
+    let class_skip = class_flag_truthy(class, "__unittest_skip__");
     let method_skip = method.is_some_and(|function| attr_truthy(function, "__unittest_skip__"));
     if class_skip || method_skip {
         let why = class_attr_text(class, "__unittest_skip_why__")
@@ -1555,42 +1791,57 @@ fn test_case_run(args: &[i64]) -> i64 {
                 method.and_then(|function| function_attr_text(function, "__unittest_skip_why__"))
             })
             .unwrap_or_default();
-        call_method(result, "addSkip", &[instance, value::str_alloc(why)]);
-        call_method(result, "stopTest", &[instance]);
-        if owns_result {
-            call_method(result, "stopTestRun", &[]);
-        }
+        result_add_skip(result, instance, &why);
+        finish_run(result, instance, owns_result);
+        heap::release_roots(roots);
         return result;
     }
 
-    let expecting = class_attr_truthy(class, "__unittest_expecting_failure__")
+    let expecting = class_flag_truthy(class, "__unittest_expecting_failure__")
         || method.is_some_and(|function| attr_truthy(function, "__unittest_expecting_failure__"));
 
     // Expose the active result so `subTest` contexts and cleanups report into
     // it, and the expectation so a failing subtest registers the expected
     // failure of the whole test.
     value::instance_setattr(instance, "_unittest_result".to_string(), result);
-    value::instance_setattr(instance, "_unittest_expecting".to_string(), value::bool_value(expecting));
+    value::instance_setattr(
+        instance,
+        "_unittest_expecting".to_string(),
+        value::bool_value(expecting),
+    );
     value::instance_setattr(instance, "_unittest_expected_failure".to_string(), NONE);
 
+    let started = std::time::Instant::now();
     // CPython's `_Outcome`: `success` gates tearDown and final accounting;
     // `expectedFailure` is the exception an `@expectedFailure` body raised,
     // which still lets tearDown and cleanups run.
     let mut success = true;
     let mut expected_failure: Option<i64> = None;
+    let mut interrupted: Option<i64> = None;
 
     call_method(instance, "setUp", &[]);
     if exc::pending() {
-        success = false;
         let error = take_pending();
-        record_test_error(result, instance, error, false);
+        if is_keyboard_interrupt(error) {
+            interrupted = Some(error);
+        } else {
+            success = false;
+            record_test_error(result, instance, error, false);
+        }
     } else {
-        call_instance_method(instance, &name);
+        let returned = call_instance_method(instance, &name);
+        if !exc::pending() && returned != NONE {
+            warn_deprecated_return(instance, &name, returned);
+        }
         if exc::pending() {
             let error = take_pending();
             // `SkipTest` wins over the expected-failure flag: the test is
             // reported as skipped, not as an expected failure.
-            if value::exception_data(error).map(|data| data.tag) == Some(SKIPPED) {
+            if is_keyboard_interrupt(error) {
+                interrupted = Some(error);
+            } else if is_should_stop(error) {
+                // The failing subtest already reported its own outcome.
+            } else if value::exception_data(error).map(|data| data.tag) == Some(SKIPPED) {
                 success = false;
                 record_test_error(result, instance, error, false);
             } else if expecting {
@@ -1612,31 +1863,50 @@ fn test_case_run(args: &[i64]) -> i64 {
         }
         // `tearDown` runs when the body's outcome was a pass or an expected
         // failure (CPython keeps `success` true for the latter).
-        if success {
+        if success && interrupted.is_none() {
             call_method(instance, "tearDown", &[]);
             if exc::pending() {
-                success = false;
                 let error = take_pending();
-                record_test_error(result, instance, error, false);
+                if is_keyboard_interrupt(error) {
+                    interrupted = Some(error);
+                } else {
+                    success = false;
+                    record_test_error(result, instance, error, false);
+                }
             }
         }
     }
 
     // Cleanups always run, even after a failing `setUp`. Each failure is
     // reported as its own outcome and prevents a pass/expected-failure report.
-    if !do_cleanups(instance) {
+    if interrupted.is_none() && !do_cleanups(instance) {
         success = false;
+    }
+    if exc::pending() {
+        let error = take_pending();
+        if is_keyboard_interrupt(error) {
+            interrupted = Some(error);
+        } else {
+            success = false;
+            record_test_error(result, instance, error, false);
+        }
+    }
+
+    let _elapsed = started.elapsed().as_secs_f64();
+
+    if let Some(error) = interrupted {
+        value::instance_setattr(instance, "_unittest_result".to_string(), NONE);
+        value::instance_setattr(instance, "_unittest_expecting".to_string(), FALSE);
+        finish_run(result, instance, owns_result);
+        heap::release_roots(roots);
+        return exc::raise_value(error);
     }
 
     if success {
         if expecting {
             match expected_failure {
-                Some(error) => {
-                    call_method(result, "addExpectedFailure", &[instance, error_tuple(error)]);
-                }
-                None => {
-                    call_method(result, "addUnexpectedSuccess", &[instance]);
-                }
+                Some(error) => result_add_expected_failure(result, instance, error),
+                None => result_add_unexpected_success(result, instance),
             }
         } else {
             call_method(result, "addSuccess", &[instance]);
@@ -1645,11 +1915,66 @@ fn test_case_run(args: &[i64]) -> i64 {
 
     value::instance_setattr(instance, "_unittest_result".to_string(), NONE);
     value::instance_setattr(instance, "_unittest_expecting".to_string(), FALSE);
+    finish_run(result, instance, owns_result);
+    heap::release_roots(roots);
+    result
+}
+
+/// `result.stopTest(test)` plus `stopTestRun()` when this run owns the result.
+fn finish_run(result: i64, instance: i64, owns_result: bool) {
     call_method(result, "stopTest", &[instance]);
     if owns_result {
-        call_method(result, "stopTestRun", &[]);
+        if has_method(result, "stopTestRun") {
+            call_method(result, "stopTestRun", &[]);
+        } else {
+            warn_runtime("TestResult has no stopTestRun method");
+        }
     }
-    result
+}
+
+fn is_keyboard_interrupt(error: i64) -> bool {
+    value::exception_data(error).map(|data| data.tag) == Some(KEYBOARD_INTERRUPT)
+}
+
+fn warn_runtime(message: &str) {
+    crate::modules::warnings::warn_category(message, crate::exc::RUNTIME_WARNING);
+    if exc::pending() {
+        exc::clear();
+    }
+}
+
+/// `_addSkip`: prefer `result.addSkip`, otherwise warn and record a success
+/// (CPython's legacy-result compatibility path).
+fn result_add_skip(result: i64, test: i64, reason: &str) {
+    if has_method(result, "addSkip") {
+        call_method(result, "addSkip", &[test, value::str_alloc(reason.to_string())]);
+    } else {
+        warn_runtime("TestResult has no addSkip method, skips not reported");
+        call_method(result, "addSuccess", &[test]);
+    }
+}
+
+fn result_add_expected_failure(result: i64, test: i64, error: i64) {
+    if has_method(result, "addExpectedFailure") {
+        call_method(result, "addExpectedFailure", &[test, error_tuple(error)]);
+    } else {
+        warn_runtime(
+            "TestResult has no addExpectedFailure method, reporting as passes",
+        );
+        call_method(result, "addSuccess", &[test]);
+    }
+}
+
+fn result_add_unexpected_success(result: i64, test: i64) {
+    if has_method(result, "addUnexpectedSuccess") {
+        call_method(result, "addUnexpectedSuccess", &[test]);
+    } else {
+        warn_runtime(
+            "TestResult has no addUnexpectedSuccess method, reporting as failure",
+        );
+        let failure = builtins::call(unexpected_success_class(), 0, std::ptr::null());
+        call_method(result, "addFailure", &[test, error_tuple(failure)]);
+    }
 }
 
 /// Calls `instance.<name>()` through a bound attribute.
@@ -1742,7 +2067,18 @@ fn do_cleanups(instance: i64) -> bool {
     else {
         return true;
     };
-    let result = value::instance_attr(instance, "_unittest_result").unwrap_or(NONE);
+    let result = value::instance_attr(instance, "_unittest_result")
+        .filter(|result| *result != NONE)
+        .or_else(|| {
+            value::instance_attr(instance, "_outcome").and_then(|outcome| {
+                if outcome == NONE {
+                    None
+                } else {
+                    value::instance_attr(outcome, "result").filter(|result| *result != NONE)
+                }
+            })
+        })
+        .unwrap_or(NONE);
     let mut success = true;
     while let Some(items) = value::as_list(cleanups) {
         let Some(&entry) = items.last() else {
@@ -1755,6 +2091,11 @@ fn do_cleanups(instance: i64) -> bool {
         if exc::pending() {
             success = false;
             let error = take_pending();
+            if is_keyboard_interrupt(error) {
+                heap::release_roots(roots);
+                exc::raise_value(error);
+                return false;
+            }
             if result != NONE {
                 record_test_error(result, instance, error, false);
             }
@@ -1765,9 +2106,10 @@ fn do_cleanups(instance: i64) -> bool {
 }
 
 fn sub_test(args: &[i64]) -> i64 {
-    let (Some(&instance), Some(&message)) = (args.first(), args.get(1)) else {
+    let Some(&instance) = args.first() else {
         return missing_arguments("TestCase.subTest");
     };
+    let message = args.get(1).copied().unwrap_or(NONE);
     let params = match args.get(2) {
         Some(&dictionary) if value::as_dict(dictionary).is_some() => dictionary,
         _ => value::dict_new(Vec::new()),
@@ -1796,34 +2138,135 @@ fn test_case_id(args: &[i64]) -> i64 {
         .and_then(value::as_str)
         .map(str::to_string)
         .unwrap_or_default();
-    value::str_alloc(format!("{}.{name}", class_name(class)))
+    value::str_alloc(format!("{}.{name}", qualified_class_text(class)))
+}
+
+/// `TestCase.__eq__`: equal when both operands are the same exact class and
+/// name the same test method; otherwise `NotImplemented`.
+fn test_case_eq(args: &[i64]) -> i64 {
+    let (Some(&instance), Some(&other)) = (args.first(), args.get(1)) else {
+        return missing_arguments("TestCase.__eq__");
+    };
+    let Some(state) = value::as_instance(instance) else {
+        return NOT_IMPLEMENTED;
+    };
+    let Some(other_state) = value::as_instance(other) else {
+        return NOT_IMPLEMENTED;
+    };
+    if state.class != other_state.class {
+        return NOT_IMPLEMENTED;
+    }
+    let name = value::instance_attr(instance, "_testMethodName").unwrap_or(NONE);
+    let other_name = value::instance_attr(other, "_testMethodName").unwrap_or(NONE);
+    value::bool_value(container::equals(name, other_name))
+}
+
+/// `TestCase.__hash__`: `hash((type(self), self._testMethodName))`.
+fn test_case_hash(args: &[i64]) -> i64 {
+    let Some(&instance) = args.first() else {
+        return missing_arguments("TestCase.__hash__");
+    };
+    let class = value::type_class(instance);
+    let name = value::instance_attr(instance, "_testMethodName").unwrap_or(NONE);
+    let pair = value::tuple_new(vec![class, name]);
+    let roots = heap::root_values(std::slice::from_ref(&pair));
+    let hash = builtins::hash(pair);
+    heap::release_roots(roots);
+    hash
+}
+
+fn test_case_call_test_method(args: &[i64]) -> i64 {
+    let (Some(&instance), Some(&function)) = (args.first(), args.get(1)) else {
+        return missing_arguments("TestCase._callTestMethod");
+    };
+    let result = builtins::call(function, 0, std::ptr::null());
+    if exc::pending() {
+        return result;
+    }
+    if result != NONE {
+        let name = value::instance_attr(instance, "_testMethodName")
+            .and_then(value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default();
+        warn_deprecated_return(instance, &name, result);
+    }
+    result
+}
+
+/// CPython's deprecation warning for a test method returning a value.
+fn warn_deprecated_return(instance: i64, name: &str, returned: i64) {
+    let name = if name.is_empty() {
+        value::instance_attr(instance, "_testMethodName")
+            .and_then(value::as_str)
+            .unwrap_or("")
+            .to_string()
+    } else {
+        name.to_string()
+    };
+    let mut message = format!(
+        "It is deprecated to return a value that is not None from a test case ({name} returned {:?})",
+        value::type_name(returned)
+    );
+    if value::type_name(returned) == "coroutine" {
+        message.push_str(". Maybe you forgot to use IsolatedAsyncioTestCase as the base class?");
+    }
+    crate::modules::warnings::warn_category(&message, crate::exc::DEPRECATION_WARNING);
+    if exc::pending() {
+        exc::clear();
+    }
+}
+
+fn test_case_add_duration(args: &[i64]) -> i64 {
+    let (Some(&instance), Some(&result), Some(&elapsed)) =
+        (args.first(), args.get(1), args.get(2))
+    else {
+        return missing_arguments("TestCase._addDuration");
+    };
+    if result == NONE {
+        return NONE;
+    }
+    if !has_method(result, "addDuration") {
+        crate::modules::warnings::warn_category(
+            "TestResult has no addDuration method",
+            crate::exc::RUNTIME_WARNING,
+        );
+        if exc::pending() {
+            exc::clear();
+        }
+        return NONE;
+    }
+    let argv = [instance, elapsed];
+    methods::call(result, b"addDuration".as_ptr(), 10, 2, argv.as_ptr())
+}
+
+fn test_case_get_equality_func(args: &[i64]) -> i64 {
+    let (Some(&instance), Some(&first), Some(&second)) =
+        (args.first(), args.get(1), args.get(2))
+    else {
+        return missing_arguments("TestCase._getAssertEqualityFunc");
+    };
+    if value::type_class(first) == value::type_class(second) {
+        if let Some(entry) = type_equality_entry(instance, first) {
+            return entry;
+        }
+    }
+    let base = value::native_function_new("unittest", "TestCase._baseAssertEqual", 4);
+    base
 }
 
 fn short_description(args: &[i64]) -> i64 {
     let Some(&instance) = args.first() else {
         return missing_arguments("TestCase.shortDescription");
     };
-    let class = value::as_instance(instance)
-        .map(|state| state.class)
-        .unwrap_or(instance);
-    let name = value::instance_attr(instance, "_testMethodName")
-        .and_then(value::as_str)
-        .map(str::to_string)
-        .unwrap_or_default();
-    let Some(function) = method_function(class, &name) else {
+    let doc = value::instance_attr(instance, "_testMethodDoc").unwrap_or(NONE);
+    let Some(text) = value::as_str(doc) else {
         return NONE;
     };
-    let doc = value::function_doc(function);
-    match value::as_str(doc) {
-        Some(text) => {
-            let first = text.lines().next().unwrap_or("").trim();
-            if first.is_empty() {
-                NONE
-            } else {
-                value::str_alloc(first.to_string())
-            }
-        }
-        None => NONE,
+    let first = text.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        NONE
+    } else {
+        value::str_alloc(first.to_string())
     }
 }
 
@@ -1838,7 +2281,10 @@ fn test_case_str(args: &[i64]) -> i64 {
         .and_then(value::as_str)
         .map(str::to_string)
         .unwrap_or_default();
-    value::str_alloc(format!("{name} ({}.{name})", class_name(class)))
+    value::str_alloc(format!(
+        "{name} ({}.{name})",
+        qualified_class_text(class)
+    ))
 }
 
 fn test_case_repr(args: &[i64]) -> i64 {
@@ -1852,7 +2298,10 @@ fn test_case_repr(args: &[i64]) -> i64 {
         .and_then(value::as_str)
         .map(str::to_string)
         .unwrap_or_default();
-    value::str_alloc(format!("<{}.{name}>", class_name(class)))
+    value::str_alloc(format!(
+        "<{} testMethod={name}>",
+        qualified_class_text(class)
+    ))
 }
 
 // -------------------------------------------------------------------------
@@ -2002,6 +2451,27 @@ fn truncate_message(args: &[i64]) -> i64 {
     let message = reason_text(args.get(1).copied().unwrap_or(NONE));
     let diff = reason_text(args.get(2).copied().unwrap_or(NONE));
     value::str_alloc(truncate_message_text(instance, message, diff))
+}
+
+/// Calls the instance's `_truncateMessage`, honouring a test that replaces it
+/// (CPython's tests install their own to assert the diff path was/was not
+/// taken). Returns `None` when the call raised, leaving that exception pending.
+fn truncate_via_instance(instance: i64, message: String, diff: String) -> Option<String> {
+    let bound = methods::getattr(instance, b"_truncateMessage".as_ptr(), 16);
+    if exc::pending() {
+        exc::clear();
+        return Some(truncate_message_text(instance, message, diff));
+    }
+    let arguments = [value::str_alloc(message), value::str_alloc(diff)];
+    let roots = heap::root_values(&arguments);
+    let result = builtins::call(bound, 2, arguments.as_ptr());
+    let text = if exc::pending() {
+        None
+    } else {
+        value::as_str(result).map(str::to_string)
+    };
+    heap::release_roots(roots);
+    text
 }
 
 /// `self.addTypeEqualityFunc(typeobj, function)`.
@@ -2186,17 +2656,18 @@ fn assert_sequence_equal(args: &[i64], seq_type_name: Option<&str>) -> i64 {
         return missing_arguments("assertSequenceEqual");
     };
     let msg = args.get(3).copied().unwrap_or(NONE);
-    let seq_type = seq_type_name.map(str::to_string).or_else(|| {
-        args.get(4)
-            .copied()
-            .filter(|class| *class != NONE && value::as_class(*class).is_some())
-            .map(class_name)
-    });
+    let seq_type_value = args
+        .get(4)
+        .copied()
+        .filter(|class| *class != NONE && value::as_class(*class).is_some());
+    let seq_type = seq_type_name
+        .map(str::to_string)
+        .or_else(|| seq_type_value.map(class_name));
     let seq_type_name = seq_type.clone().unwrap_or_else(|| "sequence".to_string());
-    if let Some(name) = &seq_type {
-        let class = value::native_class(name);
+    if let Some(class) = seq_type_value {
+        let name = class_name(class);
         for (label, sequence) in [("First", seq1), ("Second", seq2)] {
-            if class != NONE && !value::truthy(builtins::isinstance(sequence, class)) {
+            if !value::truthy(builtins::isinstance(sequence, class)) {
                 return raise_assertion(format!(
                     "{label} sequence is not a {name}: {}",
                     value::repr(sequence)
@@ -2204,12 +2675,14 @@ fn assert_sequence_equal(args: &[i64], seq_type_name: Option<&str>) -> i64 {
             }
         }
     }
-    if container::equals(seq1, seq2) {
-        return NONE;
-    }
     let mut differing = String::new();
     let len1 = len_of(seq1);
     let len2 = len_of(seq2);
+    if let (Some(_), Some(_)) = (len1, len2) {
+        if container::equals(seq1, seq2) {
+            return NONE;
+        }
+    }
     match (len1, len2) {
         (None, _) => differing.push_str(&format!(
             "First {seq_type_name} has no length.    Non-sequence?"
@@ -2286,7 +2759,9 @@ fn assert_sequence_equal(args: &[i64], seq_type_name: Option<&str>) -> i64 {
             .unwrap_or_default(),
         _ => String::new(),
     };
-    let standard = truncate_message_text(instance, differing, diff);
+    let Some(standard) = truncate_via_instance(instance, differing, diff) else {
+        return NONE;
+    };
     raise_assertion(format_message_text(instance, msg, standard))
 }
 
@@ -2365,7 +2840,9 @@ fn assert_dict_equal(args: &[i64]) -> i64 {
             .unwrap_or_default(),
         _ => String::new(),
     };
-    let standard = truncate_message_text(instance, standard, diff);
+    let Some(standard) = truncate_via_instance(instance, standard, diff) else {
+        return NONE;
+    };
     raise_assertion(format_message_text(instance, msg, standard))
 }
 
@@ -2440,7 +2917,11 @@ fn assert_multi_line_equal(args: &[i64]) -> i64 {
                         text.push_str(line);
                     }
                 }
-                let standard = truncate_message_text(instance, standard, format!("\n{text}"));
+                let Some(standard) =
+                    truncate_via_instance(instance, standard, format!("\n{text}"))
+                else {
+                    return NONE;
+                };
                 return raise_assertion(format_message_text(instance, msg, standard));
             }
         }
@@ -2497,7 +2978,7 @@ fn assert_is(args: &[i64], expected: bool) -> i64 {
         if expected {
             format!("{} is not {}", value::repr(first), value::repr(second))
         } else {
-            format!("{} is {}", value::repr(first), value::repr(second))
+            format!("unexpectedly identical: {}", value::repr(first))
         },
     ))
 }
@@ -2516,7 +2997,7 @@ fn assert_is_none(args: &[i64], expected: bool) -> i64 {
         if expected {
             format!("{} is not None", value::repr(expression))
         } else {
-            format!("{} is None", value::repr(expression))
+            "unexpectedly None".to_string()
         },
     ))
 }
@@ -2536,9 +3017,17 @@ fn assert_in(args: &[i64], expected: bool) -> i64 {
         args,
         3,
         if expected {
-            format!("{} not in {}", value::repr(member), value::repr(collection))
+            format!(
+                "{} not found in {}",
+                value::repr(member),
+                value::repr(collection)
+            )
         } else {
-            format!("{} in {}", value::repr(member), value::repr(collection))
+            format!(
+                "{} unexpectedly found in {}",
+                value::repr(member),
+                value::repr(collection)
+            )
         },
     ))
 }
@@ -2554,22 +3043,41 @@ fn assert_is_instance(args: &[i64], expected: bool) -> i64 {
     if value::truthy(matches) == expected {
         return NONE;
     }
-    raise_assertion(assertion_message(
-        args,
-        3,
-        if expected {
+    let tuple = value::as_tuple(class);
+    if expected {
+        let standard = if tuple.is_some() {
             format!(
-                "{} is not an instance of {}",
+                "{} is not an instance of any of {}",
                 value::repr(expression),
                 value::repr(class)
             )
         } else {
             format!(
-                "{} is an instance of {}",
+                "{} is not an instance of {}",
                 value::repr(expression),
                 value::repr(class)
             )
-        },
+        };
+        return raise_assertion(assertion_message(args, 3, standard));
+    }
+    // `assertNotIsInstance` reports the one class of a tuple that matched.
+    let mut matched = class;
+    if let Some(items) = tuple {
+        for item in items {
+            let candidate = builtins::isinstance(expression, *item);
+            if !exc::pending() && value::truthy(candidate) {
+                matched = *item;
+                break;
+            }
+            if exc::pending() {
+                exc::clear();
+            }
+        }
+    }
+    raise_assertion(assertion_message(
+        args,
+        3,
+        format!("{} is an instance of {}", value::repr(expression), value::repr(matched)),
     ))
 }
 
@@ -2601,42 +3109,87 @@ fn assert_almost_equal(args: &[i64], expected: bool) -> i64 {
     let (Some(&first), Some(&second)) = (args.get(1), args.get(2)) else {
         return missing_arguments("assertAlmostEqual");
     };
-    let Some(first) = numeric_value(first) else {
-        return exc::raise_with_message(TYPE_ERROR, "first argument is not a number");
-    };
-    let Some(second) = numeric_value(second) else {
-        return exc::raise_with_message(TYPE_ERROR, "second argument is not a number");
-    };
-    let places = args
-        .get(3)
-        .copied()
-        .filter(|value| *value != NONE)
-        .and_then(value::as_integer)
-        .unwrap_or(7);
-    let delta = args
-        .get(5)
-        .copied()
-        .filter(|value| *value != NONE)
-        .and_then(numeric_value);
-    let difference = (first - second).abs();
-    let close = match delta {
-        Some(delta) => difference <= delta,
-        None => {
-            let threshold = 10f64.powi(-i32::try_from(places).unwrap_or(7));
-            difference < threshold || (first.is_nan() && second.is_nan())
+    if container::equals(first, second) {
+        return if expected {
+            NONE
+        } else {
+            raise_assertion(assertion_message(
+                args,
+                4,
+                format!("{} == {} within 7 places", value::repr(first), value::repr(second)),
+            ))
+        };
+    }
+    let places = args.get(3).copied().unwrap_or(NONE);
+    let msg = args.get(4).copied().unwrap_or(NONE);
+    let delta = args.get(5).copied().unwrap_or(NONE);
+    if delta != NONE && places != NONE {
+        return exc::raise_with_message(TYPE_ERROR, "specify delta or places not both");
+    }
+    let difference = ops::binop(ops::OP_SUB, first, second);
+    if exc::pending() {
+        return difference;
+    }
+    let difference = builtins::abs(difference);
+    if exc::pending() {
+        return difference;
+    }
+    if delta != NONE {
+        let within = ops::binop(ops::OP_LE, difference, delta);
+        if exc::pending() {
+            return within;
         }
+        let within = value::truthy(within);
+        if within == expected {
+            return NONE;
+        }
+        let relation = if expected { "!=" } else { "==" };
+        let standard = format!(
+            "{} {relation} {} within {} delta ({} difference)",
+            value::repr(first),
+            value::repr(second),
+            value::repr(delta),
+            value::repr(difference)
+        );
+        return raise_assertion(format_message_text(
+            args.first().copied().unwrap_or(NONE),
+            msg,
+            standard,
+        ));
+    }
+    let places = if places == NONE {
+        encode_int(7)
+    } else {
+        places
     };
+    let rounded = builtins::round_value(difference, places);
+    if exc::pending() {
+        return rounded;
+    }
+    let close = container::equals(rounded, encode_int(0));
     if close == expected {
         return NONE;
     }
-    raise_assertion(assertion_message(
-        args,
-        4,
-        if expected {
-            format!("{first} != {second} within {places} places")
-        } else {
-            format!("{first} == {second} within {places} places")
-        },
+    let standard = if expected {
+        format!(
+            "{} != {} within {} places ({} difference)",
+            value::repr(first),
+            value::repr(second),
+            value::repr(places),
+            value::repr(difference)
+        )
+    } else {
+        format!(
+            "{} == {} within {} places",
+            value::repr(first),
+            value::repr(second),
+            value::repr(places)
+        )
+    };
+    raise_assertion(format_message_text(
+        args.first().copied().unwrap_or(NONE),
+        msg,
+        standard,
     ))
 }
 
@@ -2644,26 +3197,30 @@ fn assert_regex(args: &[i64], expected: bool) -> i64 {
     let (Some(&text), Some(&pattern)) = (args.get(1), args.get(2)) else {
         return missing_arguments("assertRegex");
     };
-    let Some(text) = value::as_str(text) else {
-        return exc::raise_with_message(TYPE_ERROR, "expected string or bytes-like object");
-    };
-    let search_args = vec![pattern, value::str_alloc(text.to_string())];
+    let search_args = vec![pattern, text];
     let found = crate::modules::re::call("search", &search_args);
     if exc::pending() {
         return found;
     }
-    if value::truthy(found) == expected {
+    let matched = value::truthy(found);
+    if matched == expected {
         return NONE;
     }
-    raise_assertion(assertion_message(
-        args,
-        3,
+    let standard = if expected {
         format!(
-            "{} does not match {}",
-            value::repr(args[1]),
-            value::repr(pattern)
-        ),
-    ))
+            "Regex didn't match: {} not found in {}",
+            value::repr(pattern),
+            value::repr(text)
+        )
+    } else {
+        format!(
+            "Regex matched: {} matches {} in {}",
+            value::repr(text),
+            value::repr(pattern),
+            value::repr(text)
+        )
+    };
+    raise_assertion(assertion_message(args, 3, standard))
 }
 
 fn assert_count_equal(args: &[i64]) -> i64 {
@@ -2728,71 +3285,240 @@ fn assert_raises(args: &[i64], with_regex: bool) -> i64 {
             "assertRaises"
         });
     };
-    let (callable, regex) = if with_regex {
+    let regex = if with_regex {
         let Some(&regex) = args.get(2) else {
             return missing_arguments("assertRaisesRegex");
         };
-        let mutable = args.get(3).copied().unwrap_or(NONE);
-        (if mutable == NONE { NONE } else { mutable }, Some(regex))
+        Some(regex)
     } else {
-        (args.get(2).copied().unwrap_or(NONE), None)
+        None
     };
-    if callable != NONE {
-        let call_args = if with_regex { &args[4..] } else { &args[3..] };
-        let (positional, keywords) = split_call_kwargs(call_args);
-        if keywords.is_empty() {
-            builtins::call(callable, positional.len(), positional.as_ptr());
+    let callable_index = if with_regex { 3 } else { 2 };
+    if let Some(&callable) = args.get(callable_index) {
+        let call_args = &args[callable_index + 1..];
+        return assert_raises_callable(
+            instance,
+            expected,
+            regex,
+            callable,
+            call_args,
+            &[],
+            with_regex,
+        );
+    }
+    make_raises_context(instance, expected, regex, NONE, NONE, with_regex)
+}
+
+/// Keyword-aware entry for `assertRaises*`: the context form accepts `msg=`;
+/// the callable form forwards every keyword to the callable.
+fn assert_raises_with_keywords(args: &[i64], keywords: &[(String, i64)], with_regex: bool) -> i64 {
+    let (Some(&instance), Some(&expected)) = (args.first(), args.get(1)) else {
+        return missing_arguments(if with_regex {
+            "assertRaisesRegex"
         } else {
-            let words = keyword_words(&keywords);
-            builtins::call_kw(
-                callable,
-                positional.len(),
-                positional.as_ptr(),
-                keywords.len(),
-                words.as_ptr(),
+            "assertRaises"
+        });
+    };
+    let regex = if with_regex {
+        let Some(&regex) = args.get(2) else {
+            return missing_arguments("assertRaisesRegex");
+        };
+        Some(regex)
+    } else {
+        None
+    };
+    let callable_index = if with_regex { 3 } else { 2 };
+    if let Some(&callable) = args.get(callable_index) {
+        let call_args = &args[callable_index + 1..];
+        return assert_raises_callable(
+            instance,
+            expected,
+            regex,
+            callable,
+            call_args,
+            keywords,
+            with_regex,
+        );
+    }
+    let mut msg = NONE;
+    for (name, item) in keywords {
+        if name == "msg" {
+            msg = *item;
+        } else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("{name:?} is an invalid keyword argument for this function"),
             );
         }
-        if !exc::pending() {
-            return raise_assertion(missing_exception_message(expected));
-        }
-        let error = take_pending();
-        let matches = builtins::isinstance(error, expected);
-        if exc::pending() || !value::truthy(matches) {
-            // Re-raise the unexpected exception unchanged.
-            return exc::raise_value(error);
-        }
-        if let Some(regex) = regex {
-            if !regex_matches(regex, error) {
-                return raise_assertion(format!(
-                    "{} does not match {}",
-                    value::repr(regex),
-                    value::repr(error)
-                ));
-            }
-        }
+    }
+    make_raises_context(instance, expected, regex, msg, NONE, with_regex)
+}
+
+fn assert_raises_callable(
+    instance: i64,
+    expected: i64,
+    regex: Option<i64>,
+    callable: i64,
+    call_args: &[i64],
+    keywords: &[(String, i64)],
+    with_regex: bool,
+) -> i64 {
+    if !validate_exception_type(expected, with_regex) {
         return NONE;
     }
-    let class = raises_context_class();
-    let context = value::instance_new(class);
+    if let Some(regex) = regex {
+        if !validate_regex(regex) {
+            return NONE;
+        }
+    }
+    let name = callable_name(callable);
+    if keywords.is_empty() {
+        builtins::call(callable, call_args.len(), call_args.as_ptr());
+    } else {
+        let words = keyword_words(keywords);
+        builtins::call_kw(
+            callable,
+            call_args.len(),
+            call_args.as_ptr(),
+            keywords.len(),
+            words.as_ptr(),
+        );
+    }
+    if !exc::pending() {
+        return raise_assertion(missing_exception_message_for(expected, Some(&name)));
+    }
+    let error = take_pending();
+    let matches = builtins::isinstance(error, expected);
+    if exc::pending() || !value::truthy(matches) {
+        // Re-raise the unexpected exception unchanged.
+        return exc::raise_value(error);
+    }
+    if let Some(regex) = regex {
+        if !regex_matches(regex, error) {
+            return raise_assertion(format!(
+                "\"{}\" does not match \"{}\"",
+                regex_pattern_text(regex),
+                value::to_string(error)
+            ));
+        }
+    }
+    let _ = instance;
+    NONE
+}
+
+fn make_raises_context(
+    instance: i64,
+    expected: i64,
+    regex: Option<i64>,
+    msg: i64,
+    obj_name: i64,
+    with_regex: bool,
+) -> i64 {
+    if !validate_exception_type(expected, with_regex) {
+        return NONE;
+    }
+    if let Some(regex) = regex {
+        if !validate_regex(regex) {
+            return NONE;
+        }
+    }
+    let context = value::instance_new(raises_context_class());
     let roots = heap::root_values(&[context]);
     value::instance_setattr(context, "test_case".to_string(), instance);
     value::instance_setattr(context, "expected".to_string(), expected);
     value::instance_setattr(context, "expected_regex".to_string(), regex.unwrap_or(NONE));
+    value::instance_setattr(context, "msg".to_string(), msg);
+    value::instance_setattr(context, "obj_name".to_string(), obj_name);
     heap::release_roots(roots);
-    let _ = with_regex;
     context
 }
 
-/// Splits the synthetic trailing keyword dict appended by [`call_kw`] from the
-/// positional callable arguments.
-fn split_call_kwargs(args: &[i64]) -> (Vec<i64>, Vec<(String, i64)>) {
-    match args.last() {
-        Some(&dictionary) if value::as_dict(dictionary).is_some() => (
-            args[..args.len() - 1].to_vec(),
-            keywords_from_dict(dictionary),
-        ),
-        _ => (args.to_vec(), Vec::new()),
+/// CPython's `_is_subtype(expected, BaseException)`.
+fn validate_exception_type(expected: i64, with_regex: bool) -> bool {
+    let name = if with_regex {
+        "assertRaisesRegex"
+    } else {
+        "assertRaises"
+    };
+    let base = exc::exception_class(BASE_EXCEPTION);
+    let valid = if let Some(items) = value::as_tuple(expected) {
+        !items.is_empty()
+            && items.iter().all(|item| {
+                value::as_class(*item).is_some() && value::is_subclass_of(*item, base)
+            })
+    } else {
+        value::as_class(expected).is_some() && value::is_subclass_of(expected, base)
+    };
+    if valid {
+        return true;
     }
+    exc::raise_with_message(
+        TYPE_ERROR,
+        &format!("{name}() arg 1 must be an exception type or tuple of exception types"),
+    );
+    false
+}
+
+fn validate_regex(regex: i64) -> bool {
+    if value::as_str(regex).is_none() {
+        let search = methods::getattr(regex, b"search".as_ptr(), 6);
+        if !exc::pending() && search != NONE {
+            return true;
+        }
+        if exc::pending() {
+            exc::clear();
+        }
+    }
+    crate::modules::re::call("compile", std::slice::from_ref(&regex));
+    if exc::pending() {
+        return false;
+    }
+    true
+}
+
+/// `expected.__name__` or `str(expected)` for failure messages.
+fn expected_name(expected: i64) -> String {
+    if let Some(name) = value::class_display_name(expected) {
+        return name.to_string();
+    }
+    if let Some(items) = value::as_tuple(expected) {
+        if let Some(first) = items.first() {
+            return expected_name(*first);
+        }
+    }
+    value::to_string(expected)
+}
+
+fn callable_name(callable: i64) -> String {
+    let name = methods::getattr(callable, b"__name__".as_ptr(), 8);
+    if exc::pending() {
+        exc::clear();
+        return value::to_string(callable);
+    }
+    value::as_str(name).map(str::to_string).unwrap_or_else(|| value::to_string(callable))
+}
+
+fn missing_exception_message_for(expected: i64, obj_name: Option<&str>) -> String {
+    let name = expected_name(expected);
+    match obj_name {
+        Some(obj_name) => format!("{name} not raised by {obj_name}"),
+        None => format!("{name} not raised"),
+    }
+}
+
+/// The `pattern` of a compiled regex, or the literal text of a string.
+fn regex_pattern_text(regex: i64) -> String {
+    if let Some(text) = value::as_str(regex) {
+        return text.to_string();
+    }
+    let pattern = methods::getattr(regex, b"pattern".as_ptr(), 7);
+    if exc::pending() {
+        exc::clear();
+        return value::to_string(regex);
+    }
+    value::as_str(pattern)
+        .map(str::to_string)
+        .unwrap_or_else(|| value::to_string(regex))
 }
 
 fn assert_has_attr(args: &[i64], expected: bool) -> i64 {
@@ -2810,31 +3536,36 @@ fn assert_has_attr(args: &[i64], expected: bool) -> i64 {
     };
     let name = name.to_string();
     let result = methods::getattr(object, name.as_ptr(), name.len());
-    if !exc::pending() {
-        if !expected {
-            raise_assertion(assertion_message(
-                args,
-                3,
-                format!("{} has attribute {name:?}", value::repr(object)),
-            ))
-        } else {
-            NONE
-        }
-    } else {
+    let found = if exc::pending() {
         if exc::pending_tag() != i64::from(ATTRIBUTE_ERROR) {
             return result;
         }
         exc::clear();
-        if expected {
-            raise_assertion(assertion_message(
-                args,
-                3,
-                format!("{} has no attribute {name:?}", value::repr(object)),
-            ))
-        } else {
-            NONE
-        }
+        false
+    } else {
+        true
+    };
+    if found == expected {
+        return NONE;
     }
+    let owner = attribute_owner(object);
+    let standard = if expected {
+        format!("{owner} has no attribute {name:?}")
+    } else {
+        format!("{owner} has unexpected attribute {name:?}")
+    };
+    raise_assertion(assertion_message(args, 3, standard))
+}
+
+/// CPython's object description used by `assertHasAttr` failures.
+fn attribute_owner(object: i64) -> String {
+    if let Some(state) = value::as_module(object) {
+        return format!("module '{}'", state.name);
+    }
+    if value::as_class(object).is_some() {
+        return format!("type object '{}'", class_name(object));
+    }
+    format!("'{}' object", value::type_name(object))
 }
 
 fn raise_assertion(message: String) -> i64 {
@@ -2941,6 +3672,21 @@ fn test_result_method(method: &str, args: &[i64]) -> i64 {
 /// Native methods of `TextTestResult`.
 fn text_test_result_method(method: &str, args: &[i64]) -> i64 {
     match method {
+        "__init__" => {
+            let Some(&result) = args.first() else {
+                return missing_arguments("TextTestResult.__init__");
+            };
+            result_init(args);
+            let verbosity = args
+                .get(3)
+                .copied()
+                .and_then(value::as_integer)
+                .unwrap_or(1);
+            value::instance_setattr(result, "showAll".to_string(), value::bool_value(verbosity > 1));
+            value::instance_setattr(result, "dots".to_string(), value::bool_value(verbosity == 1));
+            value::instance_setattr(result, "_newline".to_string(), TRUE);
+            NONE
+        }
         "getDescription" => {
             let (Some(&result), Some(&test)) = (args.first(), args.get(1)) else {
                 return missing_arguments("TextTestResult.getDescription");
@@ -2956,7 +3702,294 @@ fn text_test_result_method(method: &str, args: &[i64]) -> i64 {
                 value::str_alloc(described)
             }
         }
+        "startTest" => {
+            let (Some(&result), Some(&test)) = (args.first(), args.get(1)) else {
+                return missing_arguments("TextTestResult.startTest");
+            };
+            test_result_method("startTest", args);
+            if result_attr_truthy(result, "showAll") {
+                let stream = value::instance_attr(result, "stream").unwrap_or(NONE);
+                let description = text_test_result_method("getDescription", args);
+                stream_write(stream, &value::to_string(description));
+                stream_write(stream, " ... ");
+                stream_flush(stream);
+                value::instance_setattr(result, "_newline".to_string(), FALSE);
+            }
+            NONE
+        }
+        "_write_status" => {
+            let (Some(&result), Some(&test), Some(&status)) =
+                (args.first(), args.get(1), args.get(2))
+            else {
+                return missing_arguments("TextTestResult._write_status");
+            };
+            write_status(result, test, &value::to_string(status));
+            NONE
+        }
+        "addSubTest" => {
+            let (Some(&result), Some(&_test), Some(&subtest), Some(&error)) =
+                (args.first(), args.get(1), args.get(2), args.get(3))
+            else {
+                return missing_arguments("TextTestResult.addSubTest");
+            };
+            if error != NONE {
+                let failure = error_is_failure(error, subtest);
+                if result_attr_truthy(result, "showAll") {
+                    write_status(
+                        result,
+                        subtest,
+                        if failure { "FAIL" } else { "ERROR" },
+                    );
+                } else if result_attr_truthy(result, "dots") {
+                    stream_write(
+                        value::instance_attr(result, "stream").unwrap_or(NONE),
+                        if failure { "F" } else { "E" },
+                    );
+                    stream_flush(value::instance_attr(result, "stream").unwrap_or(NONE));
+                }
+                result_add_subtest(args);
+            }
+            NONE
+        }
+        "addSuccess" => {
+            let (Some(&result), Some(&test)) = (args.first(), args.get(1)) else {
+                return missing_arguments("TextTestResult.addSuccess");
+            };
+            if result_attr_truthy(result, "showAll") {
+                write_status(result, test, "ok");
+            } else if result_attr_truthy(result, "dots") {
+                let stream = value::instance_attr(result, "stream").unwrap_or(NONE);
+                stream_write(stream, ".");
+                stream_flush(stream);
+            }
+            NONE
+        }
+        "addError" => {
+            let (Some(&result), Some(&test), Some(&error)) =
+                (args.first(), args.get(1), args.get(2))
+            else {
+                return missing_arguments("TextTestResult.addError");
+            };
+            maybe_failfast(result);
+            let text = value::str_alloc(error_text(error));
+            append_pair(result, "errors", test, text);
+            value::instance_setattr(result, "_mirrorOutput".to_string(), TRUE);
+            text_status(result, test, "ERROR");
+            NONE
+        }
+        "addFailure" => {
+            let (Some(&result), Some(&test), Some(&error)) =
+                (args.first(), args.get(1), args.get(2))
+            else {
+                return missing_arguments("TextTestResult.addFailure");
+            };
+            maybe_failfast(result);
+            let text = value::str_alloc(error_text(error));
+            append_pair(result, "failures", test, text);
+            value::instance_setattr(result, "_mirrorOutput".to_string(), TRUE);
+            text_status(result, test, "FAIL");
+            NONE
+        }
+        "addSkip" => {
+            let (Some(&result), Some(&test), Some(&reason)) =
+                (args.first(), args.get(1), args.get(2))
+            else {
+                return missing_arguments("TextTestResult.addSkip");
+            };
+            append_pair(result, "skipped", test, reason);
+            let text = format!("skipped {}", value::repr(reason));
+            text_status(result, test, &text);
+            NONE
+        }
+        "addExpectedFailure" => {
+            let (Some(&result), Some(&test), Some(&error)) =
+                (args.first(), args.get(1), args.get(2))
+            else {
+                return missing_arguments("TextTestResult.addExpectedFailure");
+            };
+            let text = value::str_alloc(error_text(error));
+            append_pair(result, "expectedFailures", test, text);
+            if result_attr_truthy(result, "showAll") {
+                let stream = value::instance_attr(result, "stream").unwrap_or(NONE);
+                stream_writeln(stream, "expected failure");
+            } else if result_attr_truthy(result, "dots") {
+                let stream = value::instance_attr(result, "stream").unwrap_or(NONE);
+                stream_write(stream, "x");
+                stream_flush(stream);
+            }
+            NONE
+        }
+        "addUnexpectedSuccess" => {
+            let (Some(&result), Some(&test)) = (args.first(), args.get(1)) else {
+                return missing_arguments("TextTestResult.addUnexpectedSuccess");
+            };
+            maybe_failfast(result);
+            append_value(result, "unexpectedSuccesses", test);
+            if result_attr_truthy(result, "showAll") {
+                let stream = value::instance_attr(result, "stream").unwrap_or(NONE);
+                stream_writeln(stream, "unexpected success");
+            } else if result_attr_truthy(result, "dots") {
+                let stream = value::instance_attr(result, "stream").unwrap_or(NONE);
+                stream_write(stream, "u");
+                stream_flush(stream);
+            }
+            NONE
+        }
+        "printErrors" => {
+            let Some(&result) = args.first() else {
+                return missing_arguments("TextTestResult.printErrors");
+            };
+            let stream = value::instance_attr(result, "stream").unwrap_or(NONE);
+            if result_attr_truthy(result, "dots") || result_attr_truthy(result, "showAll") {
+                stream_writeln(stream, "");
+            }
+            let errors = value::instance_attr(result, "errors").unwrap_or(NONE);
+            text_print_error_list(result, "ERROR", errors);
+            let failures = value::instance_attr(result, "failures").unwrap_or(NONE);
+            text_print_error_list(result, "FAIL", failures);
+            let unexpected = value::instance_attr(result, "unexpectedSuccesses").unwrap_or(NONE);
+            if let Some(items) = value::as_list(unexpected) {
+                if !items.is_empty() {
+                    let separator = object_attribute(result, "separator1")
+                        .map(value::to_string)
+                        .unwrap_or_default();
+                    stream_writeln(stream, &separator);
+                    for &test in items {
+                        let description = text_test_result_method("getDescription", &[result, test]);
+                        stream_writeln(
+                            stream,
+                            &format!("UNEXPECTED SUCCESS: {}", value::to_string(description)),
+                        );
+                    }
+                }
+            }
+            NONE
+        }
+        "printErrorList" => {
+            let (Some(&result), Some(&flavour), Some(&errors)) =
+                (args.first(), args.get(1), args.get(2))
+            else {
+                return missing_arguments("TextTestResult.printErrorList");
+            };
+            text_print_error_list(result, &value::to_string(flavour), errors);
+            NONE
+        }
         _ => missing_method("TextTestResult", method),
+    }
+}
+
+fn result_attr_truthy(result: i64, name: &str) -> bool {
+    object_attribute(result, name).is_some_and(value::truthy)
+}
+
+/// An instance attribute with the normal class-attribute fallback.
+fn object_attribute(instance: i64, name: &str) -> Option<i64> {
+    if let Some(value) = value::instance_attr(instance, name) {
+        return Some(value);
+    }
+    let class = value::type_class(instance);
+    match value::class_lookup(class, name) {
+        Some(value::ClassEntry::Attr(item)) => Some(item),
+        _ => None,
+    }
+}
+
+fn text_status(result: i64, test: i64, status: &str) {
+    if result_attr_truthy(result, "showAll") {
+        write_status(result, test, status);
+    } else if result_attr_truthy(result, "dots") {
+        let stream = value::instance_attr(result, "stream").unwrap_or(NONE);
+        let dot = match status {
+            "ERROR" => "E",
+            "FAIL" => "F",
+            _ if status.starts_with("skipped") => "s",
+            _ => ".",
+        };
+        stream_write(stream, dot);
+        stream_flush(stream);
+    } else {
+        let _ = test;
+    }
+}
+
+/// `TextTestResult._write_status`: finish the current line and print the
+/// description followed by `status`.
+fn write_status(result: i64, test: i64, status: &str) {
+    let stream = value::instance_attr(result, "stream").unwrap_or(NONE);
+    let newline = result_attr_truthy(result, "_newline");
+    let is_subtest = value::as_instance(test)
+        .map(|state| state.class == subtest_class())
+        .unwrap_or(false);
+    if is_subtest || newline {
+        if !newline {
+            stream_writeln(stream, "");
+        }
+        if is_subtest {
+            stream_write(stream, "  ");
+        }
+        let description = text_test_result_method("getDescription", &[result, test]);
+        stream_write(stream, &value::to_string(description));
+        stream_write(stream, " ... ");
+    }
+    stream_writeln(stream, status);
+    stream_flush(stream);
+    value::instance_setattr(result, "_newline".to_string(), TRUE);
+}
+
+fn text_print_error_list(result: i64, flavour: &str, errors: i64) {
+    let Some(items) = value::as_list(errors) else {
+        return;
+    };
+    let stream = value::instance_attr(result, "stream").unwrap_or(NONE);
+    let separator1 = object_attribute(result, "separator1")
+        .map(value::to_string)
+        .unwrap_or_default();
+    let separator2 = object_attribute(result, "separator2")
+        .map(value::to_string)
+        .unwrap_or_default();
+    for &item in items {
+        let Some(pair) = value::as_tuple(item) else {
+            continue;
+        };
+        let test = pair.first().copied().unwrap_or(NONE);
+        let message = pair.get(1).copied().unwrap_or(NONE);
+        let description = text_test_result_method("getDescription", &[result, test]);
+        stream_writeln(stream, &separator1);
+        stream_writeln(
+            stream,
+            &format!("{flavour}: {}", value::to_string(description)),
+        );
+        stream_writeln(stream, &separator2);
+        stream_writeln(stream, &value::to_string(message));
+        stream_flush(stream);
+    }
+}
+
+fn stream_write(stream: i64, text: &str) {
+    if stream == NONE {
+        return;
+    }
+    let argument = value::str_alloc(text.to_string());
+    let roots = heap::root_values(std::slice::from_ref(&argument));
+    methods::call(stream, b"write".as_ptr(), 5, 1, &argument as *const i64);
+    if exc::pending() {
+        exc::clear();
+    }
+    heap::release_roots(roots);
+}
+
+fn stream_writeln(stream: i64, text: &str) {
+    stream_write(stream, text);
+    stream_write(stream, "\n");
+}
+
+fn stream_flush(stream: i64) {
+    if stream == NONE {
+        return;
+    }
+    methods::call(stream, b"flush".as_ptr(), 5, 0, std::ptr::null());
+    if exc::pending() {
+        exc::clear();
     }
 }
 
@@ -3105,11 +4138,13 @@ fn runner_method(method: &str, args: &[i64]) -> i64 {
                 return missing_arguments("TextTestRunner.__init__");
             };
             let roots = heap::root_values(&[runner]);
-            value::instance_setattr(
-                runner,
-                "stream".to_string(),
-                args.get(1).copied().unwrap_or(NONE),
-            );
+            let stream = args.get(1).copied().unwrap_or(NONE);
+            let stream = if stream == NONE {
+                module_attr("sys", "stderr").unwrap_or(NONE)
+            } else {
+                stream
+            };
+            value::instance_setattr(runner, "stream".to_string(), stream);
             value::instance_setattr(
                 runner,
                 "descriptions".to_string(),
@@ -3137,8 +4172,18 @@ fn runner_method(method: &str, args: &[i64]) -> i64 {
             );
             value::instance_setattr(
                 runner,
+                "warnings".to_string(),
+                args.get(7).copied().unwrap_or(NONE),
+            );
+            value::instance_setattr(
+                runner,
                 "tb_locals".to_string(),
-                args.get(7).copied().unwrap_or(FALSE),
+                args.get(8).copied().unwrap_or(FALSE),
+            );
+            value::instance_setattr(
+                runner,
+                "durations".to_string(),
+                args.get(9).copied().unwrap_or(NONE),
             );
             heap::release_roots(roots);
             NONE
@@ -3150,18 +4195,23 @@ fn runner_method(method: &str, args: &[i64]) -> i64 {
             let resultclass = value::instance_attr(runner, "resultclass")
                 .filter(|value| value::as_class(*value).is_some());
             let class = resultclass.unwrap_or_else(text_test_result_class);
-            let mut call_args = Vec::new();
-            if let Some(stream) = value::instance_attr(runner, "stream") {
-                if stream != NONE {
-                    call_args.push(stream);
-                }
-            }
+            let stream = value::instance_attr(runner, "stream").unwrap_or(NONE);
+            let descriptions = value::instance_attr(runner, "descriptions").unwrap_or(TRUE);
+            let verbosity = value::instance_attr(runner, "verbosity")
+                .unwrap_or_else(|| encode_int(1));
+            let call_args = [stream, descriptions, verbosity];
             let result = builtins::call(class, call_args.len(), call_args.as_ptr());
+            if exc::pending() {
+                return NONE;
+            }
             if let Some(failfast) = value::instance_attr(runner, "failfast") {
                 value::instance_setattr(result, "failfast".to_string(), failfast);
             }
             if let Some(buffer) = value::instance_attr(runner, "buffer") {
                 value::instance_setattr(result, "buffer".to_string(), buffer);
+            }
+            if let Some(tb_locals) = value::instance_attr(runner, "tb_locals") {
+                value::instance_setattr(result, "tb_locals".to_string(), tb_locals);
             }
             result
         }
@@ -3178,29 +4228,80 @@ fn runner_run(args: &[i64]) -> i64 {
     if exc::pending() {
         return NONE;
     }
-    call_method(result, "startTestRun", &[]);
+    let roots = heap::root_values(&[result, runner]);
+    let started = std::time::Instant::now();
+    if has_method(result, "startTestRun") {
+        call_method(result, "startTestRun", &[]);
+    }
     if is_suite_like(test) {
         let _ = run_suite_root(test, result);
     } else {
         run_test_item(test, result);
     }
+    if has_method(result, "stopTestRun") {
+        call_method(result, "stopTestRun", &[]);
+    }
     if exc::pending() {
+        heap::release_roots(roots);
         return NONE;
     }
-    call_method(result, "stopTestRun", &[]);
-    if !value::truthy(call_method(result, "wasSuccessful", &[])) {
+    let elapsed = started.elapsed().as_secs_f64();
+    if has_method(result, "printErrors") {
         call_method(result, "printErrors", &[]);
-        print_failures(result);
     }
-    let verbosity = value::instance_attr(runner, "verbosity")
-        .and_then(value::as_integer)
-        .unwrap_or(1);
-    if verbosity > 0 {
-        println!(
-            "Ran {} test(s)",
-            result_integer(result, "testsRun").unwrap_or(0)
-        );
+    let stream = value::instance_attr(runner, "stream").unwrap_or(NONE);
+    let separator2 = object_attribute(result, "separator2")
+        .filter(|value| *value != NONE)
+        .map(value::to_string);
+    if let Some(separator) = &separator2 {
+        stream_writeln(stream, separator);
     }
+    let tests_run = result_integer(result, "testsRun").unwrap_or(0);
+    let plural = if tests_run == 1 { "" } else { "s" };
+    stream_writeln(
+        stream,
+        &format!("Ran {tests_run} test{plural} in {elapsed:.3}s"),
+    );
+    stream_writeln(stream, "");
+    let successful = has_method(result, "wasSuccessful")
+        && value::truthy(call_method(result, "wasSuccessful", &[]));
+    let failures = result_list_len(result, "failures");
+    let errors = result_list_len(result, "errors");
+    let skipped = result_list_len(result, "skipped");
+    let expected = result_list_len(result, "expectedFailures");
+    let unexpected = result_list_len(result, "unexpectedSuccesses");
+    let mut infos = Vec::new();
+    if successful {
+        if tests_run == 0 && skipped == 0 {
+            stream_write(stream, "NO TESTS RAN");
+        } else {
+            stream_write(stream, "OK");
+        }
+    } else {
+        stream_write(stream, "FAILED");
+        if failures > 0 {
+            infos.push(format!("failures={failures}"));
+        }
+        if errors > 0 {
+            infos.push(format!("errors={errors}"));
+        }
+    }
+    if skipped > 0 {
+        infos.push(format!("skipped={skipped}"));
+    }
+    if expected > 0 {
+        infos.push(format!("expected failures={expected}"));
+    }
+    if unexpected > 0 {
+        infos.push(format!("unexpected successes={unexpected}"));
+    }
+    if infos.is_empty() {
+        stream_writeln(stream, "");
+    } else {
+        stream_writeln(stream, &format!(" ({})", infos.join(", ")));
+    }
+    stream_flush(stream);
+    heap::release_roots(roots);
     result
 }
 
@@ -4029,11 +5130,14 @@ fn subtest_exit(args: &[i64]) -> i64 {
     };
     let test = value::instance_attr(instance, "test_case").unwrap_or(NONE);
     let result = value::instance_attr(test, "_unittest_result").unwrap_or(NONE);
+    // A legacy result (or debug mode) has no `addSubTest`: CPython yields the
+    // subtest body directly, so an exception must propagate unchanged.
+    if result == NONE || !has_method(result, "addSubTest") {
+        return FALSE;
+    }
     if exc_type == NONE {
         // A successful subtest is reported when the result supports subtests.
-        if result != NONE && has_method(result, "addSubTest") {
-            call_method(result, "addSubTest", &[test, instance, NONE]);
-        }
+        call_method(result, "addSubTest", &[test, instance, NONE]);
         return FALSE;
     }
     let error = match args.get(2).copied() {
@@ -4047,12 +5151,10 @@ fn subtest_exit(args: &[i64]) -> i64 {
     // suppressed, exactly like `_Outcome.testPartExecutor`.
     if value::exception_data(error).map(|data| data.tag) == Some(SKIPPED) {
         exc::clear();
-        if result != NONE && has_method(result, "addSkip") {
-            let why = value::exception_data(error)
-                .map(|data| data.msg.clone())
-                .unwrap_or_default();
-            call_method(result, "addSkip", &[instance, value::str_alloc(why)]);
-        }
+        let why = value::exception_data(error)
+            .map(|data| data.msg.clone())
+            .unwrap_or_default();
+        result_add_skip(result, instance, &why);
         return TRUE;
     }
     // Under `@expectedFailure`, the first failing subtest is the whole test's
@@ -4068,12 +5170,15 @@ fn subtest_exit(args: &[i64]) -> i64 {
                 error,
             );
         }
+        // CPython stops the test body once the expected failure is known.
+        raise_should_stop();
         return TRUE;
     }
     exc::clear();
-    if result != NONE && has_method(result, "addSubTest") {
-        let tuple = error_tuple(error);
-        call_method(result, "addSubTest", &[test, instance, tuple]);
+    let tuple = error_tuple(error);
+    call_method(result, "addSubTest", &[test, instance, tuple]);
+    if value::instance_attr(result, "failfast").is_some_and(value::truthy) {
+        raise_should_stop();
     }
     TRUE
 }
@@ -4106,8 +5211,17 @@ fn raises_context_exit(args: &[i64]) -> i64 {
         return missing_arguments("_AssertRaisesContext.__exit__");
     };
     let expected = value::instance_attr(instance, "expected").unwrap_or(NONE);
+    let test_case = value::instance_attr(instance, "test_case").unwrap_or(NONE);
+    let msg = value::instance_attr(instance, "msg").unwrap_or(NONE);
+    let obj_name = value::instance_attr(instance, "obj_name").unwrap_or(NONE);
     if exc_type == NONE {
-        raise_assertion(missing_exception_message(expected));
+        let name = if obj_name == NONE {
+            None
+        } else {
+            value::as_str(obj_name).map(str::to_string)
+        };
+        let standard = missing_exception_message_for(expected, name.as_deref());
+        raise_assertion(format_message_text(test_case, msg, standard));
         return FALSE;
     }
     let error = match args.get(2).copied() {
@@ -4120,11 +5234,12 @@ fn raises_context_exit(args: &[i64]) -> i64 {
     }
     if let Some(regex) = value::instance_attr(instance, "expected_regex") {
         if regex != NONE && !regex_matches(regex, error) {
-            raise_assertion(format!(
-                "{} does not match {}",
-                value::repr(regex),
-                value::repr(error)
-            ));
+            let standard = format!(
+                "\"{}\" does not match \"{}\"",
+                regex_pattern_text(regex),
+                value::to_string(error)
+            );
+            raise_assertion(format_message_text(test_case, msg, standard));
             return FALSE;
         }
     }
@@ -4143,22 +5258,29 @@ pub(crate) fn util_call(function: &str, args: &[i64]) -> i64 {
             let Some(&class) = args.first() else {
                 return missing_arguments("strclass");
             };
-            value::str_alloc(class_name(class))
+            value::str_alloc(class_text(class))
         }
         "safe_repr" => {
             let Some(&object) = args.first() else {
                 return missing_arguments("safe_repr");
             };
             let short = args.get(1).copied().is_some_and(value::truthy);
-            let text = value::repr(object);
-            if short && text.len() >= 80 {
-                value::str_alloc(format!("{} [truncated]...", &text[..80]))
+            let mut text = value::repr(object);
+            if exc::pending() {
+                exc::clear();
+                text = format!("<{} object>", value::type_name(object));
+            }
+            if short && text.chars().count() >= 80 {
+                let truncated: String = text.chars().take(80).collect();
+                value::str_alloc(format!("{truncated} [truncated]..."))
             } else {
                 value::str_alloc(text)
             }
         }
         "sorted_list_difference" => sorted_list_difference(args),
         "unorderable_list_difference" => unorderable_list_difference(args),
+        "_count_diff_all_purpose" => count_diff_all_purpose(args),
+        "_count_diff_hashable" => count_diff_all_purpose(args),
         "three_way_cmp" => three_way_cmp(args),
         "_common_shorten_repr" => common_shorten_repr(args),
         _ => {
@@ -4174,6 +5296,57 @@ pub(crate) fn util_call(function: &str, args: &[i64]) -> i64 {
             )
         }
     }
+}
+
+fn count_diff_all_purpose(args: &[i64]) -> i64 {
+    let (Some(&actual), Some(&expected)) = (args.first(), args.get(1)) else {
+        return missing_arguments("_count_diff_all_purpose");
+    };
+    let Some(actual) = collect_items(actual) else {
+        return NONE;
+    };
+    let Some(expected) = collect_items(expected) else {
+        return NONE;
+    };
+    let mut actual: Vec<Option<i64>> = actual.into_iter().map(Some).collect();
+    let mut expected: Vec<Option<i64>> = expected.into_iter().map(Some).collect();
+    let mut differences: Vec<i64> = Vec::new();
+    let mut index = 0usize;
+    while index < actual.len() {
+        let Some(item) = actual[index] else {
+            index += 1;
+            continue;
+        };
+        let mut actual_count = 0i64;
+        for later in index..actual.len() {
+            if actual[later].is_some_and(|candidate| container::equals(candidate, item)) {
+                actual_count += 1;
+                actual[later] = None;
+            }
+        }
+        let mut expected_count = 0i64;
+        for slot in expected.iter_mut() {
+            if slot.is_some_and(|candidate| container::equals(candidate, item)) {
+                expected_count += 1;
+                *slot = None;
+            }
+        }
+        if actual_count != expected_count {
+            differences.push(value::tuple_new(vec![
+                encode_int(actual_count),
+                encode_int(expected_count),
+                item,
+            ]));
+        }
+        index += 1;
+    }
+    for slot in expected {
+        let Some(item) = slot else {
+            continue;
+        };
+        differences.push(value::tuple_new(vec![encode_int(0), encode_int(1), item]));
+    }
+    value::list_new(differences)
 }
 
 fn three_way_cmp(args: &[i64]) -> i64 {
@@ -4267,9 +5440,21 @@ fn unorderable_list_difference(args: &[i64]) -> i64 {
 }
 
 fn common_shorten_repr(args: &[i64]) -> i64 {
+    const MAX_LENGTH: usize = 80;
+    const PLACEHOLDER_LEN: usize = 12;
+    const MIN_BEGIN_LEN: usize = 5;
+    const MIN_END_LEN: usize = 5;
+    const MIN_COMMON_LEN: usize = 5;
+    const MIN_DIFF_LEN: usize = MAX_LENGTH
+        - (MIN_BEGIN_LEN + PLACEHOLDER_LEN + MIN_COMMON_LEN + PLACEHOLDER_LEN + MIN_END_LEN);
+
     let reprs: Vec<String> = args.iter().map(|value| value::repr(*value)).collect();
-    let max_len = reprs.iter().map(String::len).max().unwrap_or(0);
-    if max_len <= 80 {
+    let max_len = reprs
+        .iter()
+        .map(|text| text.chars().count())
+        .max()
+        .unwrap_or(0);
+    if max_len <= MAX_LENGTH {
         return value::tuple_new(
             reprs
                 .into_iter()
@@ -4277,40 +5462,71 @@ fn common_shorten_repr(args: &[i64]) -> i64 {
                 .collect::<Vec<i64>>(),
         );
     }
-    // Keep the common prefix and shorten the differing tails, mirroring
-    // CPython's display budget closely enough for failure messages.
     let prefix = common_prefix(&reprs);
-    let items = reprs
-        .into_iter()
-        .map(|text| {
-            let rest = &text[prefix.len()..];
-            if rest.len() > 12 {
-                value::str_alloc(format!(
-                    "{}[{} chars]{}",
-                    &text[..prefix.len().min(5)],
-                    rest.len() - 5,
-                    &rest[rest.len().saturating_sub(5)..]
-                ))
-            } else {
-                value::str_alloc(text)
-            }
-        })
-        .collect::<Vec<i64>>();
+    let prefix_len = prefix.chars().count();
+    let common_len = MAX_LENGTH as i64
+        - (max_len.saturating_sub(prefix_len) + MIN_BEGIN_LEN + PLACEHOLDER_LEN) as i64;
+    let items = if common_len > MIN_COMMON_LEN as i64 {
+        let shortened = shorten_text(&prefix, MIN_BEGIN_LEN, common_len as usize);
+        reprs
+            .into_iter()
+            .map(|text| value::str_alloc(shortened.clone() + &chars_from(&text, prefix_len)))
+            .collect::<Vec<i64>>()
+    } else {
+        let shortened = shorten_text(&prefix, MIN_BEGIN_LEN, MIN_COMMON_LEN);
+        reprs
+            .into_iter()
+            .map(|text| {
+                let rest = chars_from(&text, prefix_len);
+                value::str_alloc(
+                    shortened.clone() + &shorten_text(&rest, MIN_DIFF_LEN, MIN_END_LEN),
+                )
+            })
+            .collect::<Vec<i64>>()
+    };
     value::tuple_new(items)
+}
+
+/// `_shorten`: replace the middle of `text` with `[N chars]` when it is
+/// longer than the placeholder budget.
+fn shorten_text(text: &str, prefix_len: usize, suffix_len: usize) -> String {
+    const PLACEHOLDER_LEN: usize = 12;
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let skip = len.saturating_sub(prefix_len + suffix_len);
+    if skip > PLACEHOLDER_LEN {
+        let mut out = String::new();
+        out.extend(chars.iter().take(prefix_len));
+        out.push_str(&format!("[{skip} chars]"));
+        out.extend(chars.iter().skip(len - suffix_len));
+        out
+    } else {
+        text.to_string()
+    }
+}
+
+/// The suffix of `text` after its first `count` characters.
+fn chars_from(text: &str, count: usize) -> String {
+    text.chars().skip(count).collect()
 }
 
 fn common_prefix(items: &[String]) -> String {
     let Some(first) = items.first() else {
         return String::new();
     };
-    let mut length = first.len();
+    let mut prefix: Vec<char> = first.chars().collect();
     for item in &items[1..] {
-        length = length.min(item.len());
-        while length > 0 && first.as_bytes()[..length] != item.as_bytes()[..length] {
+        let other: Vec<char> = item.chars().collect();
+        let mut length = prefix.len().min(other.len());
+        while length > 0 && prefix[..length] != other[..length] {
             length -= 1;
         }
+        prefix.truncate(length);
+        if prefix.is_empty() {
+            break;
+        }
     }
-    first[..length].to_string()
+    prefix.into_iter().collect()
 }
 
 // -------------------------------------------------------------------------
@@ -4344,6 +5560,13 @@ fn has_method(instance: i64, name: &str) -> bool {
     value::as_instance(instance)
         .map(|state| value::class_lookup(state.class, name).is_some())
         .unwrap_or(false)
+}
+
+fn class_flag_truthy(class: i64, name: &str) -> bool {
+    match value::class_own_lookup(class, name) {
+        Some(value::ClassEntry::Attr(item)) => value::truthy(item),
+        _ => class_attr_truthy(class, name),
+    }
 }
 
 fn class_attr_truthy(class: i64, name: &str) -> bool {
@@ -4558,16 +5781,33 @@ fn instance_class_value(item: i64) -> i64 {
 /// `unittest.util.strclass`: `module.qualname` (just the qualified name for
 /// classes without a recorded module).
 fn class_text(class: i64) -> String {
-    let name = class_name(class);
+    let name = qualified_class_text(class);
     match class_module(class) {
         Some(module) if module != "builtins" => format!("{module}.{name}"),
         _ => name,
     }
 }
 
-/// Resolves `module.name` for fixture hooks: compiled-module globals first,
-/// then the native module surface.
+/// `Cls.__qualname__`, falling back to the plain class name.
+fn qualified_class_text(class: i64) -> String {
+    value::class_qualname(class)
+        .map(str::to_string)
+        .or_else(|| value::class_display_name(class).map(str::to_string))
+        .unwrap_or_else(|| "TestCase".to_string())
+}
+
+/// Resolves `module.name` for fixture hooks: `sys.modules` first (the actual
+/// module object the suite sees), then compiled-module globals and the native
+/// module surface.
 fn module_attr(module: &str, name: &str) -> Option<i64> {
+    if let Some(found) = sys_module_value(module) {
+        let attr = methods::getattr(found, name.as_ptr(), name.len());
+        if exc::pending() {
+            exc::clear();
+        } else {
+            return Some(attr);
+        }
+    }
     if let Some(value) = globals::lookup(module, name) {
         return Some(value);
     }
@@ -4578,6 +5818,25 @@ fn module_attr(module: &str, name: &str) -> Option<i64> {
     } else {
         Some(value)
     }
+}
+
+/// `sys.modules.get(name)`, or `None` when the entry is missing/`None`.
+fn sys_module_value(name: &str) -> Option<i64> {
+    let modules = crate::modules::module_get_by_name("sys", "modules");
+    if exc::pending() {
+        exc::clear();
+        return None;
+    }
+    let pairs = value::as_dict(modules)?;
+    let wanted = value::str_alloc(name.to_string());
+    let roots = heap::root_values(std::slice::from_ref(&wanted));
+    let found = pairs
+        .iter()
+        .find(|(key, _)| container::equals(*key, wanted))
+        .map(|(_, item)| *item)
+        .filter(|item| *item != NONE);
+    heap::release_roots(roots);
+    found
 }
 
 /// Reports a class/module-level fixture failure under CPython's
@@ -4940,6 +6199,13 @@ fn error_text(error: i64) -> String {
     if error == NONE {
         return String::new();
     }
+    if let Some(items) = value::as_tuple(error) {
+        if let Some(exception) = items.get(1).copied() {
+            if exception != NONE {
+                return error_text(exception);
+            }
+        }
+    }
     if let Some(text) = exc::render_exception(error) {
         return text;
     }
@@ -4956,15 +6222,11 @@ fn record_test_error(result: i64, instance: i64, error: i64, expecting: bool) {
         let why = value::exception_data(error)
             .map(|data| data.msg.clone())
             .unwrap_or_default();
-        call_method(result, "addSkip", &[instance, value::str_alloc(why)]);
+        result_add_skip(result, instance, &why);
         return;
     }
     if expecting {
-        call_method(
-            result,
-            "addExpectedFailure",
-            &[instance, error_tuple(error)],
-        );
+        result_add_expected_failure(result, instance, error);
         return;
     }
     if error_is_failure(error_tuple(error), instance) {
@@ -5003,6 +6265,32 @@ fn collect_items(iterable: i64) -> Option<Vec<i64>> {
         items.push(item);
     }
     Some(items)
+}
+
+/// Binds named arguments into the positional slots a native initializer reads.
+/// `names` are the parameters after the receiver; an unknown name reports the
+/// same `TypeError` CPython's binder does.
+fn bind_named_slots(
+    args: &[i64],
+    keywords: &[(String, i64)],
+    names: &[&str],
+    function: &str,
+) -> Vec<i64> {
+    let mut slots = args.to_vec();
+    for (name, item) in keywords {
+        let Some(index) = names.iter().position(|candidate| *candidate == name) else {
+            exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("{function}() got an unexpected keyword argument '{name}'"),
+            );
+            return slots;
+        };
+        while slots.len() <= index + 1 {
+            slots.push(NONE);
+        }
+        slots[index + 1] = *item;
+    }
+    slots
 }
 
 fn keywords_dict(keywords: &[(String, i64)]) -> i64 {
@@ -5167,7 +6455,11 @@ mod tests {
         assert_eq!(registry_len(), 1);
 
         assert_eq!(call("main", &[]), NONE);
-        assert!(!exc::pending());
+        assert!(
+            !exc::pending(),
+            "runner left exception: {}",
+            value::to_string(exc::pending_value())
+        );
 
         let failing = value::class_new(
             "FailingCase".to_string(),
