@@ -14,7 +14,10 @@ initial state of the first runnable core.
   `def factory(): class A: def f(self): return 42` produced a class whose
   methods returned `None`; nested methods now bind `self`, close over enclosing
   locals and pass through `getattr`. Regression tests cover HIR bodies and
-  end-to-end execution.
+  end-to-end execution. Generated closure entries receive their captured
+  prefix in the full-entry slot vector, so a method that closes over an
+  enclosing local binds `self` at the correct slot instead of reporting
+  `missing required argument 'self'`.
 - `unittest.main()` modules are no longer treated as pytest collections: free
   `test*` factory helpers such as `test_factory(abc_ABCMeta, token)` keep their
   ordinary parameters instead of reporting missing pytest fixtures.

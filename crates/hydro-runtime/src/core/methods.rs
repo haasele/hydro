@@ -1679,17 +1679,31 @@ fn call_user_method_kw(
     let receiver_name = value::class_display_name(class)
         .unwrap_or("object")
         .to_string();
-    let receiver_count = usize::from(kind != MethodKind::Staticmethod);
+    // A generated closure signature starts with its captured values followed
+    // by the explicit parameters. The full-entry ABI receives both, so mirror
+    // that prefix here instead of assuming `self` is slot 0.
+    let capture_values: Vec<i64> = match value::as_function(function).map(|function| &function.body)
+    {
+        Some(value::FunctionBody::Wrapper { captures, .. }) if signature.len() > captures.len() => {
+            captures.clone()
+        }
+        _ => Vec::new(),
+    };
+    let capture_count = capture_values.len();
+    let receiver_count = capture_count + usize::from(kind != MethodKind::Staticmethod);
     let mut slots: Vec<Option<i64>> = vec![None; signature.len()];
+    for (index, capture) in capture_values.into_iter().enumerate() {
+        slots[index] = Some(capture);
+    }
     let receiver = match kind {
         MethodKind::Normal | MethodKind::Property => Some(instance),
         MethodKind::Classmethod => Some(class),
         MethodKind::Staticmethod => None,
     };
     if let Some(receiver) = receiver {
-        if !slots.is_empty() {
+        if capture_count < slots.len() {
             // Normal methods bind the instance; classmethods bind the class.
-            slots[0] = Some(receiver);
+            slots[capture_count] = Some(receiver);
         }
     }
 
@@ -3520,13 +3534,15 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         return match entry {
             // A non-data descriptor resolves `__get__(instance, owner)`.
             value::ClassEntry::Attr(item) => {
-                if let Some(result) = descriptor_get(item, obj, class) {
-                    return result;
-                }
                 if value::as_function(item).is_some() {
                     // A function assigned to the class binds the receiver,
-                    // exactly like a class-body method.
+                    // exactly like a class-body method. Closure-backed
+                    // functions must bind here too: `descriptor_get` only
+                    // knows explicit `__get__` descriptors.
                     return value::bound_method_new(obj, attr.to_string());
+                }
+                if let Some(result) = descriptor_get(item, obj, class) {
+                    return result;
                 }
                 item
             }
