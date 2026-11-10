@@ -964,6 +964,41 @@ pub static OS: ModuleSpec = ModuleSpec {
         f("walk", 1, 2, Type::List),
         f("set_inheritable", 2, 2, Type::None),
         f("get_inheritable", 1, 1, Type::Bool),
+        // `getpgid(pid)`: the process group of another process. CPython
+        // accepts `pid` by name.
+        kw("getpgid", 1, 1, Type::Int, &["pid"]),
+        // Extended attributes. `follow_symlinks` is keyword-only in CPython,
+        // but the binder keeps one positional slot per declared name;
+        // `setxattr`'s `flags` slot precedes it, exactly as CPython's
+        // generated clinic signature lays the arguments out.
+        kw(
+            "getxattr",
+            2,
+            3,
+            Type::Bytes,
+            &["path", "attribute", "follow_symlinks"],
+        ),
+        kw(
+            "setxattr",
+            3,
+            5,
+            Type::None,
+            &["path", "attribute", "value", "flags", "follow_symlinks"],
+        ),
+        kw(
+            "listxattr",
+            0,
+            2,
+            Type::List,
+            &["path", "follow_symlinks"],
+        ),
+        kw(
+            "removexattr",
+            2,
+            3,
+            Type::None,
+            &["path", "attribute", "follow_symlinks"],
+        ),
     ],
     constants: &[
         c("name", Type::Str),
@@ -2601,6 +2636,9 @@ const SOCKET_FUNCTIONS: &[FunctionSpec] = &[
     // `create_connection`.
     kw_dynamic("create_server", 1, 1, Type::Any, &[]),
     f("gethostname", 0, 0, Type::Str),
+    // `sethostname(name)`: sets the host name (str or bytes) and returns
+    // `None`. CPython exposes it from the `_socket` C module.
+    f("sethostname", 1, 1, Type::None),
     f("socketpair", 0, 3, Type::Any),
     f("getaddrinfo", 2, 6, Type::List),
     f("gethostbyname", 1, 1, Type::Str),
@@ -2853,6 +2891,32 @@ pub static SSL: ModuleSpec = ModuleSpec {
         c("HAS_TLSv1_3", Type::Bool),
         c("SSLError", Type::Any),
         c("OPENSSL_VERSION", Type::Str),
+        // The rustls-backed build reports the OpenSSL compatibility surface it
+        // implements: version numbers are zeroed, the feature flags describe
+        // the protocol/extension support, and the `OP_*` bits are the values
+        // `SSLContext.options` reads.
+        c("OPENSSL_VERSION_INFO", Type::Tuple),
+        c("OPENSSL_VERSION_NUMBER", Type::Int),
+        c("HAS_ECDH", Type::Bool),
+        c("HAS_PHA", Type::Bool),
+        c("HAS_TLSv1_2", Type::Bool),
+        c("OP_CIPHER_SERVER_PREFERENCE", Type::Int),
+        c("OP_SINGLE_DH_USE", Type::Int),
+        c("OP_SINGLE_ECDH_USE", Type::Int),
+        c("OP_NO_COMPRESSION", Type::Int),
+        c("OP_NO_SSLv2", Type::Int),
+        c("OP_NO_SSLv3", Type::Int),
+        c("OP_NO_TLSv1", Type::Int),
+        c("OP_NO_TLSv1_1", Type::Int),
+        c("OP_NO_TLSv1_2", Type::Int),
+        c("OP_NO_TLSv1_3", Type::Int),
+        // Deprecated protocol spellings the runtime maps onto `PROTOCOL_TLS`.
+        c("PROTOCOL_SSLv23", Type::Int),
+        c("PROTOCOL_TLSv1", Type::Int),
+        c("PROTOCOL_TLSv1_1", Type::Int),
+        // `SSLCertVerificationError` is a real exception-class value (also
+        // exported as `ssl.CertificateError`).
+        c("SSLCertVerificationError", Type::Any),
     ],
 };
 
