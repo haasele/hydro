@@ -4580,6 +4580,62 @@ fn call_user_new(class: i64, args: &[i64], keywords: &[(String, i64)]) -> Option
     Some(result)
 }
 
+/// Builtin container payload for a subclass call, or `None` when `class` is
+/// not a `list`/`tuple`/`set`/`frozenset` subclass.
+fn container_instance_new(class: i64, argc: usize, argv: *const i64) -> Option<i64> {
+    let state = value::as_class(class)?;
+    let base = state.mro.iter().find_map(|&ancestor| {
+        let name = value::class_display_name(ancestor)?;
+        match name {
+            "tuple" => Some(ContainerNew::Tuple),
+            "list" => Some(ContainerNew::List),
+            "set" => Some(ContainerNew::Set),
+            "frozenset" => Some(ContainerNew::Frozenset),
+            _ => None,
+        }
+    })?;
+    // Keep this slice to set subclasses; tuple subclasses such as namedtuple
+    // have their own construction paths and must not take the payload shortcut.
+    if !matches!(base, ContainerNew::Set) {
+        return None;
+    }
+    // The exact native class takes the normal builtin constructor path.
+    if value::class_display_name(class) == Some(base.name()) {
+        return None;
+    }
+    // A subclass with its own compiled `__new__` (namedtuple, dataclass-like
+    // wrappers) builds its own instance; only classes inheriting the native
+    // allocator take the payload shortcut.
+    if value::class_lookup_owner(class, "__new__")
+        .is_some_and(|owner| !value::is_cached_type_class(owner))
+    {
+        return None;
+    }
+    if argc > 1 {
+        return Some(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{}() takes at most 1 argument ({} given)",
+                base.name(),
+                argc
+            ),
+        ));
+    }
+    if argc > 0 && argv.is_null() {
+        return Some(exc::raise_with_message(
+            TYPE_ERROR,
+            "class instantiation received arguments without an argument buffer",
+        ));
+    }
+    let iterable = if argc == 0 {
+        value::tuple_new(Vec::new())
+    } else {
+        // SAFETY: argc == 1 and the buffer was checked above.
+        unsafe { *argv }
+    };
+    Some(container_new_value(base, class, iterable))
+}
+
 fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     if argc > 0 && argv.is_null() {
         return exc::raise_with_message(
@@ -4826,19 +4882,27 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     if let Some(result) = call_user_new(class, call_args, &[]) {
         return result;
     }
-    // A subclass of a native scalar allocates the wrapped scalar as its
-    // payload; the exact native class returns the plain builtin value.
-    let instance = match scalar_instance_new(class, argc, argv) {
-        Some(result) => {
-            if exc::pending() {
-                return NONE;
-            }
-            if value::as_instance(result).is_none() {
-                return result;
-            }
-            result
+    // A subclass of a native scalar/container allocates the wrapped builtin
+    // value as its payload; the exact native class returns the plain builtin
+    // value.
+    let instance = if let Some(result) = container_instance_new(class, argc, argv) {
+        if exc::pending() {
+            return NONE;
         }
-        None => value::instance_new(class),
+        result
+    } else {
+        match scalar_instance_new(class, argc, argv) {
+            Some(result) => {
+                if exc::pending() {
+                    return NONE;
+                }
+                if value::as_instance(result).is_none() {
+                    return result;
+                }
+                result
+            }
+            None => value::instance_new(class),
+        }
     };
     let Some((kind, init)) = value::class_member(class, "__init__") else {
         if argc > 0 {
@@ -4853,6 +4917,7 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     if value::function_native_name(init) == Some("__object_init__") {
         if argc == 0
             || value::scalar_payload(instance).is_some()
+            || value::container_payload(instance).is_some()
             || crate::core::methods::class_has_custom_new(class)
         {
             return instance;
