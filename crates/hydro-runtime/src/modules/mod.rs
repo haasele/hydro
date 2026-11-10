@@ -4109,6 +4109,12 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     // dictionaries `dis`/`test.support` inspect are filled by the pure
     // `opcode.py` in CPython. Empty equivalents keep those imports and
     // guarded probes working.
+    if module == "sys" && name == "dont_write_bytecode" {
+        return value::FALSE;
+    }
+    if module == "sys" && name == "pycache_prefix" {
+        return NONE;
+    }
     if module == "opcode" {
         match name {
             "_cache_format"
@@ -12550,6 +12556,18 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
             }
             Err(err) => err,
         },
+        "acosh" => match number(args[0]) {
+            Ok(x) => value::float_new(x.acosh()),
+            Err(err) => err,
+        },
+        "asinh" => match number(args[0]) {
+            Ok(x) => value::float_new(x.asinh()),
+            Err(err) => err,
+        },
+        "atanh" => match number(args[0]) {
+            Ok(x) => value::float_new(x.atanh()),
+            Err(err) => err,
+        },
         "asin" | "acos" => match number(args[0]) {
             Ok(x) => {
                 if !x.is_nan() && !(-1.0..=1.0).contains(&x) {
@@ -12585,6 +12603,10 @@ fn math_call(function: &str, args: &[i64]) -> i64 {
         },
         "degrees" => match number(args[0]) {
             Ok(x) => value::float_new(x.to_degrees()),
+            Err(err) => err,
+        },
+        "exp2" => match number(args[0]) {
+            Ok(x) => value::float_new(x.exp2()),
             Err(err) => err,
         },
         "exp" => match number(args[0]) {

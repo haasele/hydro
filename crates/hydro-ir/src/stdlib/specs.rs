@@ -13,6 +13,9 @@ pub static MATH: ModuleSpec = ModuleSpec {
         f("tan", 1, 1, Type::Float),
         f("asin", 1, 1, Type::Float),
         f("acos", 1, 1, Type::Float),
+        f("acosh", 1, 1, Type::Float),
+        f("asinh", 1, 1, Type::Float),
+        f("atanh", 1, 1, Type::Float),
         f("atan", 1, 1, Type::Float),
         // `atan2(y, x)`: the quadrant-aware arctangent of `y/x`, in radians.
         f("atan2", 2, 2, Type::Float),
@@ -20,6 +23,7 @@ pub static MATH: ModuleSpec = ModuleSpec {
         // (zero arguments yield `0.0`), computed without intermediate overflow.
         f("hypot", 0, usize::MAX, Type::Float),
         f("exp", 1, 1, Type::Float),
+        f("exp2", 1, 1, Type::Float),
         f("log", 1, 1, Type::Float),
         f("log10", 1, 1, Type::Float),
         f("log2", 1, 1, Type::Float),
@@ -2110,6 +2114,8 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("platlibdir", Type::Str),
         // `sys.int_info`: the `int` implementation parameters structseq.
         c("int_info", Type::Any),
+        c("dont_write_bytecode", Type::Bool),
+        c("pycache_prefix", Type::Any),
         // Last uncaught exception. Hydro is a batch compiler with no
         // interactive frame that survives an uncaught exception, so these
         // resolve to `None`. They exist (rather than raising

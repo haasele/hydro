@@ -18,6 +18,8 @@ initial state of the first runnable core.
   prefix in the full-entry slot vector, so a method that closes over an
   enclosing local binds `self` at the correct slot instead of reporting
   `missing required argument 'self'`.
+- Added `sys.dont_write_bytecode`, `sys.pycache_prefix`, and `math.exp2`,
+  `acosh`, `asinh`, `atanh` for support-code and math-suite probes.
 - Builtin function values are canonical singletons in the global registry, so
   `type(1) is int`, `type("") is str`, and container type spellings compare
   identically to their source names. `type()` still returns native classes for
