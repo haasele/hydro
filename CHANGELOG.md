@@ -38,6 +38,8 @@ initial state of the first runnable core.
   `_BytesIO`, ...) as the same cached classes as `io`; `import a.b` registers
   the dotted submodule; runtime-compiled absolute imports use their real AST
   level instead of being misclassified as relative.
+- `super().__init__()` accepts any receiver parameter name, matching CPython;
+  only the first method parameter is bound, not a literal `self`.
 - `sys.float_repr_style`, `sys.gettotalrefcount`/`getobjects` probes and the
   private `opcode` tables (`_inline_cache_entries`, `opmap`, `opname`) now
   resolve far enough for guarded support code to compile and run.
