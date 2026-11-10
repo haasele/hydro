@@ -18,6 +18,12 @@ initial state of the first runnable core.
   prefix in the full-entry slot vector, so a method that closes over an
   enclosing local binds `self` at the correct slot instead of reporting
   `missing required argument 'self'`.
+- Class-header keywords now reach the metaclass `__new__`/`__init__` and
+  `__init_subclass__`, including `metaclass=` plus named arguments such as
+  `name="test"`. Keywords are evaluated before the class body and carried
+  through the attribute ABI with a NUL-prefixed internal name that cannot
+  collide with Python identifiers; `**mapping` remains an explicit
+  diagnostic.
 - `unittest.main()` modules are no longer treated as pytest collections: free
   `test*` factory helpers such as `test_factory(abc_ABCMeta, token)` keep their
   ordinary parameters instead of reporting missing pytest fixtures.
@@ -34,7 +40,7 @@ initial state of the first runnable core.
   level instead of being misclassified as relative.
 - C3 class construction, `super()` defining-class tracking, regex flags
   (`re.U` implied for `str` patterns) and the workspace clippy/fmt gates are
-  green. Canonical workspace count: 3252 tests run, 1 skipped.
+  green. Canonical workspace count: 3253 tests run, 1 skipped.
 
 ### Compatibility — `__class__`
 

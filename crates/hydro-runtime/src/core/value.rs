@@ -6201,9 +6201,34 @@ pub(crate) fn class_new_multi(
     methods: Vec<(String, i64, MethodKind)>,
     attrs: Vec<(String, i64)>,
 ) -> i64 {
+    // Class-header keywords travel through the attribute buffer under a NUL
+    // prefix, which no Python identifier can contain. The frontend evaluates
+    // them before the body; splitting here keeps the C ABI unchanged.
+    let (attrs, keywords) = split_class_keywords(attrs);
+    let roots: Vec<i64> = keywords.iter().map(|(_, value)| *value).collect();
+    let root = crate::heap::root_values(&roots);
     // A class statement runs the metaclass `__prepare__` protocol before its
     // body; `type(name, bases, ns)` uses `class_new_multi_kw` instead.
-    class_new_multi_impl(name, bases, metaclass, methods, attrs, true, true, &[])
+    let created = class_new_multi_impl(
+        name, bases, metaclass, methods, attrs, true, true, &keywords,
+    );
+    crate::heap::release_roots(root);
+    created
+}
+
+const CLASS_KEYWORD_PREFIX: &str = "\0class_kw:";
+
+#[allow(clippy::type_complexity)]
+fn split_class_keywords(attrs: Vec<(String, i64)>) -> (Vec<(String, i64)>, Vec<(String, i64)>) {
+    let mut plain = Vec::with_capacity(attrs.len());
+    let mut keywords = Vec::new();
+    for (name, value) in attrs {
+        match name.strip_prefix(CLASS_KEYWORD_PREFIX) {
+            Some(keyword) => keywords.push((keyword.to_string(), value)),
+            None => plain.push((name, value)),
+        }
+    }
+    (plain, keywords)
 }
 
 /// [`class_new_multi`] with the class-header keywords CPython forwards to the

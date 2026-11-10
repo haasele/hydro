@@ -57,6 +57,30 @@ assert abs(names['sqrt'](9) - 3.0) < 1e-12
 }
 
 #[test]
+fn class_header_keywords_reach_init_subclass_and_metaclass() {
+    run_source(
+        "\
+saved = {}
+class Base:
+    def __init_subclass__(cls, **kw):
+        saved.update(kw)
+class Child(Base, name='test'):
+    pass
+assert saved == {'name': 'test'}
+
+seen = {}
+class Meta(type):
+    def __new__(mcls, *args, **kw):
+        seen.update(kw)
+        return super().__new__(mcls, *args)
+class WithMeta(metaclass=Meta, name='test'):
+    pass
+assert seen == {'name': 'test'}
+",
+    );
+}
+
+#[test]
 fn literals_operators_and_assignments() {
     run_source(
         "\
@@ -562,7 +586,8 @@ fn class_bases_resolve_mro_entries_special_forms() {
     run_source(
         "\
 class Base:
-    pass
+    def __init_subclass__(cls, **kw):
+        pass
 
 class SpecialForm:
     def __mro_entries__(self, bases):
@@ -595,7 +620,8 @@ assert len(Single.__orig_bases__) == 1
 assert Single.__orig_bases__[0] is form
 
 # Pydantic's spelling: a special-form base plus a class keyword. The keyword
-# is evaluated but not forwarded; the base still resolves.
+# is forwarded to the resolved base's `__init_subclass__`; the base still
+# resolves.
 class WithKeyword(form, total=False):
     pass
 

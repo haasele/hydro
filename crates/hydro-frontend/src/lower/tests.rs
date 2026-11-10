@@ -15415,6 +15415,7 @@ class C(base(), _root=flag()):
         attributes
             .iter()
             .map(|(name, _)| name.as_str())
+            .filter(|name| !name.starts_with("\0class_kw:"))
             .collect::<Vec<_>>(),
         ["__module__", "__qualname__", "value"]
     );
@@ -15459,15 +15460,12 @@ class C(object, total=flag()):
 }
 
 #[test]
-fn class_keywords_with_an_explicit_metaclass_are_rejected() {
+fn class_keywords_with_an_explicit_metaclass_are_forwarded() {
+    // Header keywords travel to the metaclass / `__init_subclass__` through
+    // the class attribute channel; no diagnostic may drop them.
     let source = "class C(metaclass=type, order=True):\n    pass\n";
     let (_, _, diags) = lower_source(source, &parse(source));
-    assert!(
-        diags
-            .iter()
-            .any(|diag| diag.message.contains("cannot be forwarded")),
-        "{diags:?}"
-    );
+    assert!(diags.is_empty(), "{diags:?}");
     let source = "class C(**options):\n    pass\n";
     let (_, _, diags) = lower_source(source, &parse(source));
     assert!(

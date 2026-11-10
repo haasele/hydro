@@ -8186,24 +8186,6 @@ impl<'a> Lowerer<'a> {
                 ),
             }
         }
-        if let (Some(_), Some(first)) = (metaclass, keywords.first()) {
-            // Hydro's metaclass hooks receive only `(name, bases, namespace)`,
-            // so extra keywords would be silently dropped if the class had a
-            // metaclass that consumes them. Report instead of losing them.
-            self.error_at_code(
-                s.keywords[*first].range,
-                codes::UNSUPPORTED,
-                format!(
-                    "class keyword '{}' cannot be forwarded together with metaclass=; \
-                     Hydro's metaclass hooks receive only (name, bases, namespace)",
-                    s.keywords[*first]
-                        .arg
-                        .as_ref()
-                        .map(|name| name.as_str())
-                        .unwrap_or("**")
-                ),
-            );
-        }
 
         // Every base expression is evaluated in source order and passed to the
         // runtime, which resolves the MRO (C3) and validates the operands.
@@ -13356,7 +13338,7 @@ impl<'a> Lowerer<'a> {
                 )
             })
             .collect();
-        let (attributes, prelude) = {
+        let (mut attributes, prelude) = {
             // CPython's class body starts with `__module__` and `__qualname__`
             // already in the namespace, before any annotation or member
             // assignment. The values are compile-time constants: the current
@@ -13569,6 +13551,7 @@ impl<'a> Lowerer<'a> {
             base_refs.push(temp_ref);
         }
         let mut metaclass = None;
+        let mut keyword_attrs: Vec<(String, HExpr)> = Vec::new();
         for (index, keyword) in s.keywords.iter().enumerate() {
             let is_metaclass = plan.metaclass == Some(index);
             if !is_metaclass && !plan.keywords.contains(&index) {
@@ -13600,8 +13583,15 @@ impl<'a> Lowerer<'a> {
             });
             if is_metaclass {
                 metaclass = Some(temp_ref);
+            } else {
+                // The NUL prefix cannot collide with a Python identifier; the
+                // runtime splits these entries back into metaclass /
+                // `__init_subclass__` keywords.
+                let name = keyword.arg.as_ref().map(|name| name.as_str()).unwrap_or("");
+                keyword_attrs.push((format!("\0class_kw:{name}"), temp_ref));
             }
         }
+        attributes.extend(keyword_attrs);
         // The body's parked attribute values run after the header operands
         // and before the class statement publishes them.
         statements.extend(prelude);
