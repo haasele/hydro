@@ -4111,12 +4111,27 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     // guarded probes working.
     if module == "opcode" {
         match name {
-            "_inline_cache_entries" | "opmap" | "_specializations" | "_specialized_opmap" => {
-                return value::dict_new(Vec::new())
-            }
+            "_cache_format"
+            | "_inline_cache_entries"
+            | "opmap"
+            | "_specializations"
+            | "_specialized_opmap"
+            | "_special_method_names" => return value::dict_new(Vec::new()),
             "opname" | "hascompare" | "hasarg" | "hasconst" | "hasname" | "hasjump" | "hasjrel"
-            | "hasjabs" | "hasfree" | "haslocal" | "hasexc" | "__all__" => {
+            | "hasjabs" | "hasfree" | "haslocal" | "hasexc" | "__all__" | "_nb_ops"
+            | "_common_constants" | "_intrinsic_1_descs" | "_intrinsic_2_descs" => {
                 return value::list_new(Vec::new())
+            }
+            "HAVE_ARGUMENT" => return encode_int(43),
+            "EXTENDED_ARG" => return encode_int(69),
+            "MIN_INSTRUMENTED_OPCODE" => return encode_int(234),
+            "cmp_op" => {
+                return value::tuple_new(
+                    ["<", "<=", "==", "!=", ">", ">="]
+                        .iter()
+                        .map(|name| value::str_alloc(name.to_string()))
+                        .collect(),
+                )
             }
             _ => {}
         }

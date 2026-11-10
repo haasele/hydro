@@ -426,6 +426,21 @@ const INT_METHODS: &[(&str, MethodSig)] = &[
     ("__index__", MethodSig::new(0, 0, &[], Type::Int)),
 ];
 
+/// Static signatures of the float instance methods used by the stdlib and
+/// CPython's own tests.
+const FLOAT_METHODS: &[(&str, MethodSig)] = &[
+    (
+        "__format__",
+        MethodSig::new(0, 1, &[ArgKind::Str], Type::Str),
+    ),
+    ("is_integer", MethodSig::new(0, 0, &[], Type::Bool)),
+    ("hex", MethodSig::new(0, 0, &[], Type::Str)),
+    ("as_integer_ratio", MethodSig::new(0, 0, &[], Type::Tuple)),
+    ("conjugate", MethodSig::new(0, 0, &[], Type::Float)),
+    ("__float__", MethodSig::new(0, 0, &[], Type::Float)),
+    ("__abs__", MethodSig::new(0, 0, &[], Type::Float)),
+];
+
 const STR_METHODS: &[(&str, MethodSig)] = &[
     ("upper", MethodSig::new(0, 0, &[], Type::Str)),
     ("lower", MethodSig::new(0, 0, &[], Type::Str)),
@@ -3286,6 +3301,7 @@ impl<'a> Checker<'a> {
             Ty::Concrete(receiver) => {
                 let table = match receiver {
                     Type::Int | Type::Bool => INT_METHODS,
+                    Type::Float => FLOAT_METHODS,
                     Type::Str => STR_METHODS,
                     Type::Bytes => BYTES_METHODS,
                     Type::List => LIST_METHODS,
@@ -3680,7 +3696,7 @@ impl<'a> Checker<'a> {
                 let allowed = if builtin == Builtin::Int {
                     0..=2
                 } else {
-                    1..=1
+                    0..=1
                 };
                 if !allowed.contains(&count) {
                     self.error_code(

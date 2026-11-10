@@ -7874,11 +7874,11 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
                 // spec (and conversion) is handled by `lower_format_call`
                 // before it reaches this point; a dynamic spec arrives here
                 // and is evaluated by the runtime `format` builtin. A
-                // source-level `format(value, spec)` takes exactly two.
-                if !(2..=3).contains(&values.len()) {
+                // source-level `format(value)` defaults the spec to `""`.
+                if !(1..=3).contains(&values.len()) {
                     let actual = values.len();
                     return Err(CodegenError::new(format!(
-                        "builtin format expects 2 or 3 arguments, got {actual}"
+                        "builtin format expects 1 to 3 arguments, got {actual}"
                     )));
                 }
                 self.lower_builtin_values(builtin, values)
@@ -8198,6 +8198,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             Builtin::Int | Builtin::Str if values.len() != 1 => {
                 self.lower_builtin_values(builtin, values)
             }
+            Builtin::Float if values.is_empty() => self.lower_builtin_values(builtin, values),
             Builtin::Len
             | Builtin::Str
             | Builtin::Repr

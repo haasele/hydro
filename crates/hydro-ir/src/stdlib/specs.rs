@@ -4803,11 +4803,11 @@ pub static FUTURE: ModuleSpec = ModuleSpec {
 pub static TYPES: ModuleSpec = ModuleSpec {
     name: "types",
     functions: &[
-        kw_dynamic("SimpleNamespace", 0, 1, Type::Any, &[]),
+        kw_dynamic("SimpleNamespace", 0, usize::MAX, Type::Any, &[]),
         // `new_class(name, bases=(), kwds=None, exec_body=None)`: the
         // functional class factory; every trailing argument is optional and
         // `kwds`/`exec_body` keep their keyword spellings.
-        kw_dynamic("new_class", 1, 4, Type::Any, &[]),
+        kw_dynamic("new_class", 0, 4, Type::Any, &[]),
         // `FunctionType(code, globals, name=None, argdefs=None, closure=None,
         // kwdefaults=None)` builds a callable from code metadata. Declared as
         // a function so calls lower as a module call; the runtime still
@@ -9558,7 +9558,7 @@ mod tests {
             ][..]
         );
         let namespace = function("types", "SimpleNamespace").unwrap();
-        assert_eq!((namespace.min_args, namespace.max_args), (0, 1));
+        assert_eq!((namespace.min_args, namespace.max_args), (0, usize::MAX));
         assert!(namespace.dynamic_keywords);
         let dynamic = function("types", "DynamicClassAttribute").unwrap();
         assert_eq!((dynamic.min_args, dynamic.max_args), (0, 4));

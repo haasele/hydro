@@ -6594,8 +6594,9 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             _ => builtin_arity_error("int", "at most 2", argc),
         },
         Builtin::Float => match args {
+            [] => value::float_new(0.0),
             [value] => to_float(*value),
-            _ => builtin_arity_error("float", "exactly 1", argc),
+            _ => builtin_arity_error("float", "at most 1", argc),
         },
         Builtin::Abs => match args {
             [value] => abs(*value),
