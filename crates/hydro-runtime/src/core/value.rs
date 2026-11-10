@@ -7966,6 +7966,22 @@ pub(crate) fn function_attribute(function: i64, name: &str) -> Option<i64> {
     if let Some(attribute) = builtin_type_spelling_attribute(function, name) {
         return Some(attribute);
     }
+    // CPython publishes `shutil.rmtree.avoids_symlink_attacks` as a function
+    // attribute. Hydro's native rmtree is path-walk based rather than fd-walk
+    // based, so report the conservative `False`.
+    if name == "avoids_symlink_attacks" {
+        if let Some(func) = as_function(function) {
+            if matches!(
+                &func.body,
+                FunctionBody::Native {
+                    module: "shutil",
+                    name: "rmtree"
+                }
+            ) {
+                return Some(FALSE);
+            }
+        }
+    }
     let dictionary = as_function(function)?.metadata.lock().dict;
     if dictionary == NONE {
         return None;
