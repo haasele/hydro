@@ -2408,6 +2408,58 @@ fn module_search_roots(importer_dir: &Path, module_root: &Path) -> Vec<PathBuf> 
     )
 }
 
+/// Roots searched to decide whether a module has a Python source
+/// implementation: `<root>/<dotted path>.py` or
+/// `<root>/<dotted path>/__init__.py`.
+///
+/// This is the standard-library tail of [`module_search_roots_from`] without
+/// the importing file's directory and package root (a native module spec has
+/// no source location of its own): `HYDRO_SITE_PACKAGES`, the site-packages
+/// directories of `VIRTUAL_ENV` and `CONDA_PREFIX`, `PYTHONPATH`, the vendored
+/// `stdlib/` tree ([`bundled_stdlib_root`]), `HYDRO_STDLIB` and finally the
+/// pinned CPython checkouts cached under `.hydro/cpython/Python-*/Lib`
+/// ([`pinned_cpython_lib_roots`]). Missing and non-directory entries are
+/// dropped and duplicates are searched only once (compared after
+/// canonicalization), so a symlinked tree is represented exactly like the
+/// module loader sees it.
+pub(crate) fn python_source_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(list) = std::env::var_os("HYDRO_SITE_PACKAGES") {
+        roots.extend(std::env::split_paths(&list));
+    }
+    for prefix in [
+        std::env::var_os("VIRTUAL_ENV").map(PathBuf::from),
+        std::env::var_os("CONDA_PREFIX").map(PathBuf::from),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        roots.extend(lower::prefix_site_packages(&prefix));
+    }
+    if let Some(list) = std::env::var_os("PYTHONPATH") {
+        roots.extend(std::env::split_paths(&list));
+    }
+    if let Some(root) = bundled_stdlib_root() {
+        roots.push(root.to_path_buf());
+    }
+    if let Some(list) = std::env::var_os("HYDRO_STDLIB") {
+        roots.extend(std::env::split_paths(&list));
+    }
+    // A pinned `.hydro/cpython/Python-*/Lib` checkout backs dynamic stdlib
+    // detection in tests and development builds when `HYDRO_STDLIB` is unset.
+    // It follows every explicit root so an environment override still wins.
+    roots.extend(pinned_cpython_lib_roots().iter().cloned());
+    let mut seen = HashSet::new();
+    roots.retain(|root| {
+        if root.as_os_str().is_empty() || !root.is_dir() {
+            return false;
+        }
+        let key = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        seen.insert(key)
+    });
+    roots
+}
+
 /// Directory of the pure-Python standard library modules vendored with Hydro
 /// (`stdlib/` in the repository).
 ///
@@ -2442,6 +2494,70 @@ fn bundled_stdlib_root() -> Option<&'static Path> {
             .and_then(|dir| fs::canonicalize(dir).ok())
     });
     ROOT.as_deref()
+}
+
+/// `Lib` directories of the pinned CPython source checkouts cached under
+/// `<base>/.hydro/cpython/Python-*/Lib`.
+///
+/// The triage/compat tooling downloads CPython once to `.hydro/cpython`; when
+/// `HYDRO_STDLIB` is unset (unit tests, a development build), the cache still
+/// tells the frontend which stdlib modules have a Python implementation.
+/// Bases are checked relative to the executable (its directory and four
+/// ancestors, which covers `target/debug/deps` test binaries and an installed
+/// `<prefix>/bin` layout) and to the repository root derived from
+/// `CARGO_MANIFEST_DIR`. Version directories are sorted and existing `Lib`
+/// directories kept once (compared after canonicalization), so the result is
+/// deterministic; the whole list is cached for the process.
+fn pinned_cpython_lib_roots() -> &'static [PathBuf] {
+    static ROOTS: std::sync::LazyLock<Vec<PathBuf>> = std::sync::LazyLock::new(|| {
+        let mut bases: Vec<PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            let mut ancestor = exe.parent();
+            for _ in 0..5 {
+                let Some(dir) = ancestor else {
+                    break;
+                };
+                bases.push(dir.to_path_buf());
+                ancestor = dir.parent();
+            }
+        }
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        bases.push(manifest.join("..").join(".."));
+        bases.push(manifest.join("..").join("..").join(".."));
+
+        let mut roots: Vec<PathBuf> = Vec::new();
+        let mut seen = HashSet::new();
+        for base in bases {
+            let cache = base.join(".hydro").join("cpython");
+            let Ok(entries) = fs::read_dir(&cache) else {
+                continue;
+            };
+            let mut versions: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|version| {
+                    version
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("Python-"))
+                })
+                .collect();
+            versions.sort();
+            for version in versions {
+                let lib = version.join("Lib");
+                if !lib.is_dir() {
+                    continue;
+                }
+                let lib = lexical_normalize(&lib);
+                let key = fs::canonicalize(&lib).unwrap_or_else(|_| lib.clone());
+                if seen.insert(key) {
+                    roots.push(lib);
+                }
+            }
+        }
+        roots
+    });
+    ROOTS.as_slice()
 }
 
 /// `lib-dynload` directories that hold the C extension modules of the CPython

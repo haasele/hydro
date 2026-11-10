@@ -1118,85 +1118,204 @@ static TYPES_CELLTYPE_MEMBER: FunctionSpec = FunctionSpec {
     dynamic_keywords: false,
 };
 
+/// Native modules whose CPython implementation is a builtin, a C extension or
+/// a frozen module (`socket` is the deliberate exception: Hydro's table covers
+/// the C-level surface and stays authoritative for it).
+///
+/// The `hydro_ir::stdlib` tables for these modules are authoritative: a name
+/// the table does not list is a typo, so an unknown member keeps the
+/// compile-time diagnostic. Everything else is a Python-source module whose
+/// table is only an approximation of a `Lib/*.py` file; an unknown member
+/// there resolves at runtime and raises the same `AttributeError` CPython
+/// raises.
+fn native_module(name: &str) -> bool {
+    matches!(
+        name,
+        // Builtins and core C accelerators.
+        "sys"
+            | "builtins"
+            | "math"
+            | "cmath"
+            | "time"
+            | "itertools"
+            | "_functools"
+            | "_operator"
+            | "_thread"
+            | "_signal"
+            | "_io"
+            | "_socket"
+            | "select"
+            | "errno"
+            | "_bisect"
+            | "_heapq"
+            | "_stat"
+            | "binascii"
+            | "_collections"
+            | "_codecs"
+            | "_imp"
+            | "_opcode"
+            | "_string"
+            | "_weakref"
+            | "_warnings"
+            | "marshal"
+            | "_tokenize"
+            | "gc"
+            | "atexit"
+            | "_contextvars"
+            | "_ctypes"
+            | "_decimal"
+            | "_struct"
+            | "struct"
+            | "unicodedata"
+            | "zlib"
+            | "mmap"
+            | "_abc"
+            | "_datetime"
+            | "_locale"
+            | "_types"
+            | "_typing"
+            | "_sre"
+            | "_ssl"
+            | "posix"
+            | "zipimport"
+            | "_sysconfig"
+            | "faulthandler"
+            | "_suggestions"
+            | "_json"
+            | "_csv"
+            | "_pickle"
+            | "_random"
+            | "_statistics"
+            | "_queue"
+            | "_asyncio"
+            | "_multiprocessing"
+            | "_zoneinfo"
+            | "_ast"
+            | "_testinternalcapi"
+            | "_testbuffer"
+            // POSIX and platform modules implemented by C extensions.
+            | "pwd"
+            | "grp"
+            | "resource"
+            | "fcntl"
+            | "syslog"
+            | "termios"
+            | "array"
+            | "readline"
+            | "_curses"
+            | "pyexpat"
+            // Hashing, compression and database accelerators.
+            | "_hashlib"
+            | "_sha1"
+            | "_sha2"
+            | "_sha3"
+            | "_md5"
+            | "_blake2"
+            | "_hmac"
+            | "_uuid"
+            | "_bz2"
+            | "_lzma"
+            | "_zstd"
+            | "_sqlite3"
+            | "_gdbm"
+            | "_dbm"
+            | "_codecs_cn"
+            | "_codecs_jp"
+            | "_codecs_kr"
+            | "_codecs_tw"
+            | "_codecs_hk"
+            | "_codecs_iso2022"
+            | "_multibytecodec"
+            // Frozen import machinery.
+            | "_frozen_importlib"
+            | "_frozen_importlib_external"
+            // Hydro's own native modules (no CPython `Lib` source exists).
+            | "socket"
+            | "os.path"
+            | "postgres"
+            | "memcached"
+            | "_hydro_sidecar"
+    )
+}
+
+/// Memoized filesystem decisions for [`python_source_module`].
+///
+/// The search roots and one boolean per module name are kept for the process,
+/// so an attribute read never stats the filesystem more than once per module.
+/// The environment snapshot that selected the roots is part of the cache: when
+/// a caller changes `HYDRO_STDLIB`, `PYTHONPATH` or the site-packages variables
+/// (tests do), the roots and decisions are recomputed instead of reporting a
+/// stale answer.
+#[derive(Default)]
+struct PythonSourceCache {
+    env: Vec<Option<std::ffi::OsString>>,
+    roots: Option<Vec<PathBuf>>,
+    modules: HashMap<String, bool>,
+}
+
+static PYTHON_SOURCE_CACHE: std::sync::LazyLock<std::sync::Mutex<PythonSourceCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(PythonSourceCache::default()));
+
+/// Environment variables [`crate::python_source_roots`] reads, in the order
+/// the cache must notice a change to them.
+fn python_source_env() -> Vec<Option<std::ffi::OsString>> {
+    [
+        "HYDRO_SITE_PACKAGES",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "PYTHONPATH",
+        "HYDRO_STDLIB",
+    ]
+    .into_iter()
+    .map(|key| std::env::var_os(key))
+    .collect()
+}
+
 /// Whether `name` is a module whose CPython implementation is Python source.
 ///
-/// The `hydro_ir::stdlib` tables for these modules are curated approximations
-/// of a `Lib/*.py` file, not authoritative native tables: a member the table
-/// does not list may still exist (or the table may simply lag CPython), so an
-/// unknown member resolves at runtime and raises the same `AttributeError`
-/// CPython raises. Native modules with authoritative tables (`math`,
-/// `socket`, `struct`, `_io`, ...) keep the compile-time diagnostic.
+/// A module is dynamic when `<root>/<dotted path>.py` or
+/// `<root>/<dotted path>/__init__.py` exists under any root returned by
+/// [`crate::python_source_roots`] (`HYDRO_SITE_PACKAGES`, venv/conda
+/// site-packages, `PYTHONPATH`, the vendored `stdlib/` tree, `HYDRO_STDLIB`
+/// and the pinned `.hydro/cpython/Python-*/Lib` cache). Native modules
+/// ([`native_module`]) keep the compile-time diagnostic, and the answer is
+/// cached per module for the process.
 fn python_source_module(name: &str) -> bool {
-    const MODULES: &[&str] = &[
-        "__future__",
-        "argparse",
-        "ast",
-        "asyncio",
-        "base64",
-        "bisect",
-        "code",
-        "codecs",
-        "collections",
-        "contextlib",
-        "contextvars",
-        "csv",
-        "dataclasses",
-        "datetime",
-        "decimal",
-        "fnmatch",
-        "fractions",
-        "functools",
-        "getopt",
-        "gzip",
-        "hashlib",
-        "heapq",
-        "html",
-        "http",
-        "importlib",
-        "inspect",
-        "itertools",
-        "json",
-        "keyword",
-        "locale",
-        "mimetypes",
-        "multiprocessing",
-        "opcode",
-        "operator",
-        "os",
-        "pathlib",
-        "pickle",
-        "platform",
-        "pytest",
-        "queue",
-        "quopri",
-        "random",
-        "re",
-        "runpy",
-        "selectors",
-        "shutil",
-        "sqlite3",
-        "stat",
-        "statistics",
-        "subprocess",
-        "sysconfig",
-        "tempfile",
-        "textwrap",
-        "threading",
-        "timeit",
-        "token",
-        "tty",
-        "types",
-        "typing",
-        "unittest",
-        "uuid",
-        "warnings",
-        "zoneinfo",
-    ];
-    MODULES.iter().any(|module| {
-        name == *module
-            || name
-                .strip_prefix(module)
-                .is_some_and(|rest| rest.starts_with('.'))
+    if native_module(name) || !crate::is_dotted_identifier(name) {
+        return false;
+    }
+    let env = python_source_env();
+    let mut cache = PYTHON_SOURCE_CACHE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if cache.env != env {
+        cache.env = env;
+        cache.roots = None;
+        cache.modules.clear();
+    }
+    if let Some(dynamic) = cache.modules.get(name) {
+        return *dynamic;
+    }
+    if cache.roots.is_none() {
+        cache.roots = Some(crate::python_source_roots());
+    }
+    let dynamic = {
+        let roots = cache.roots.as_deref().expect("search roots initialized");
+        module_source_exists(name, roots)
+    };
+    cache.modules.insert(name.to_string(), dynamic);
+    dynamic
+}
+
+/// Whether `<root>/<dotted path>.py` or `<root>/<dotted path>/__init__.py`
+/// exists under any search root.
+fn module_source_exists(name: &str, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| {
+        let mut path = root.clone();
+        for part in name.split('.') {
+            path.push(part);
+        }
+        path.with_extension("py").is_file() || path.join("__init__.py").is_file()
     })
 }
 
