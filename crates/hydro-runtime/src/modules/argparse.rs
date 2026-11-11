@@ -2390,6 +2390,9 @@ impl View {
 
 fn view(parser: i64) -> Option<View> {
     let state = parser_ref(parser)?;
+    let color = value::instance_attr(parser, "color")
+        .map(value::truthy)
+        .unwrap_or(state.color);
     Some(View {
         prog: state.prog.clone().unwrap_or_else(default_prog),
         usage: state.usage.clone(),
@@ -2400,7 +2403,7 @@ fn view(parser: i64) -> Option<View> {
         fromfile_prefix_chars: state.fromfile_prefix_chars.clone(),
         allow_abbrev: state.allow_abbrev,
         exit_on_error: state.exit_on_error,
-        color: state.color,
+        color,
         options: state.options.clone(),
         groups: state.groups.clone(),
         subparsers: state.subparsers.clone(),
