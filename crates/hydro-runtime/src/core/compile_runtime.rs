@@ -1303,12 +1303,28 @@ impl Interp {
         let bases = value::tuple_new(base_values);
         self.roots.push(bases);
 
+        // `metaclass=` is `__build_class__`'s parameter, not a class-header
+        // keyword: it selects the metaclass and is never forwarded to the
+        // metaclass hooks or `__init_subclass__`. A `**mapping` operand binds
+        // the same parameter, exactly like CPython's call convention.
         let mut keywords: Vec<(String, i64)> = Vec::with_capacity(node.keywords.len());
+        let mut metaclass = None;
         for keyword in &node.keywords {
             let item = self.eval(&keyword.value)?;
             self.roots.push(item);
             match &keyword.arg {
-                Some(argument) => keywords.push((argument.to_string(), item)),
+                Some(argument) => {
+                    if argument == "metaclass" {
+                        if metaclass.replace(item).is_some() {
+                            return Err(type_error(
+                                "__build_class__() got multiple values for keyword \
+                                 argument 'metaclass'",
+                            ));
+                        }
+                    } else {
+                        keywords.push((argument.to_string(), item));
+                    }
+                }
                 None => {
                     let Some(entries) = value::as_dict(item) else {
                         return Err(type_error("class keywords ** operand must be a mapping"));
@@ -1318,17 +1334,36 @@ impl Interp {
                         let Some(argument) = value::as_str(key) else {
                             return Err(type_error("keywords must be strings"));
                         };
-                        self.roots.push(item);
-                        keywords.push((argument.to_string(), item));
+                        if argument == "metaclass" {
+                            if metaclass.replace(item).is_some() {
+                                return Err(type_error(
+                                    "__build_class__() got multiple values for keyword \
+                                     argument 'metaclass'",
+                                ));
+                            }
+                        } else {
+                            self.roots.push(item);
+                            keywords.push((argument.to_string(), item));
+                        }
                     }
                 }
             }
         }
 
-        let mut class = if keywords.is_empty() {
+        // Without an explicit metaclass or extra keywords the class comes
+        // straight from the bases' metaclass; every other shape goes through
+        // the `__build_class__` construction step so the selected metaclass
+        // and `__init_subclass__` receive the header keywords.
+        let mut class = if metaclass.is_none() && keywords.is_empty() {
             runtime_builtins::type_new(value::NONE, name_value, bases, namespace)
         } else {
-            runtime_builtins::type_build_keywords(&[name_value, bases, namespace], &keywords)
+            runtime_builtins::type_build_class_keywords(
+                metaclass.unwrap_or(value::NONE),
+                name_value,
+                bases,
+                namespace,
+                &keywords,
+            )
         };
         if exc::pending() {
             return Err(Flow::Raise);

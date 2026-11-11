@@ -1201,11 +1201,35 @@ pub(crate) unsafe fn kind_pointer(object: *mut ShimObject) -> *mut ShimKind {
 
 /// Mutable access to a live handle's payload.
 ///
+/// Callers must have validated the handle with [`kind_mut_checked`] (or an
+/// equivalent [`kind_ref`] check) first: this accessor cannot tell a shim
+/// payload from the bytes an extension-owned instance keeps at the same
+/// offset.
+///
 /// # Safety
 /// `object` must be a non-NULL live shim handle; the caller holds the GIL.
 pub(crate) unsafe fn kind_mut(object: *mut ShimObject) -> &'static mut ShimKind {
     // SAFETY: delegated to the caller; the handle is heap-stable.
     unsafe { &mut *kind_pointer(object) }
+}
+
+/// Mutable access to a live handle's payload after validating the shim role.
+///
+/// Returns `None` for NULL, type objects and extension-owned instances, whose
+/// bytes at the shim payload offset are not a [`ShimKind`]. Callers still
+/// match the expected variant and report a type error for any other kind, so
+/// a wrong-but-valid handle can never be mutated as the wrong payload.
+///
+/// # Safety
+/// `object` must be a non-NULL live handle; the caller holds the GIL.
+pub(crate) unsafe fn kind_mut_checked(object: *mut ShimObject) -> Option<&'static mut ShimKind> {
+    if kind_ref(object).is_none() {
+        return None;
+    }
+    // SAFETY: `kind_ref` validated the shim role and the payload; the handle
+    // is heap-stable and the caller holds the GIL, so the second access sees
+    // the same payload.
+    Some(unsafe { kind_mut(object) })
 }
 
 /// Re-reads a list's `ob_size` and `ob_item` from its `Vec`.
@@ -1422,11 +1446,13 @@ fn drop_buffer_cache_entry(address: usize) {
 
 /// Returns a cached buffer for `object`, building it with `build` on first
 /// use. The vector is never mutated again, so the returned pointer is stable
-/// for the object's lifetime.
-fn cached_buffer(object: *mut ShimObject, build: impl FnOnce() -> Vec<u8>) -> *const u8 {
+/// for the object's lifetime. The pointer is derived from the cached vector's
+/// mutable storage so CPython's writable `PyUnicode_DATA` contract is not
+/// served through a shared reference.
+fn cached_buffer(object: *mut ShimObject, build: impl FnOnce() -> Vec<u8>) -> *mut u8 {
     let mut cache = buffer_cache();
     let entry = cache.entry(object as usize).or_insert_with(build);
-    entry.as_ptr()
+    entry.as_mut_ptr()
 }
 
 /// Recomputes a `PyUnicode_New` string's text from the storage an extension
@@ -3439,9 +3465,11 @@ fn list_slots_mut(object: *mut ShimObject) -> Result<&'static mut Vec<usize>, St
         return Err("TypeError: expected a list object, got NULL".to_string());
     }
     // SAFETY: shim objects are heap-stable; the caller holds a reference and
-    // the GIL contract forbids concurrent mutation.
-    match unsafe { kind_mut(object) } {
-        ShimKind::List(items) => Ok(items),
+    // the GIL contract forbids concurrent mutation. The checked accessor
+    // rejects type objects and extension-owned instances before the payload
+    // is interpreted as a `ShimKind`.
+    match unsafe { kind_mut_checked(object) } {
+        Some(ShimKind::List(items)) => Ok(items),
         _ => Err("TypeError: expected a list object".to_string()),
     }
 }
@@ -3459,9 +3487,11 @@ fn tuple_slots_mut(object: *mut ShimObject) -> Result<&'static mut [usize], Stri
         return Err("TypeError: expected a tuple object, got NULL".to_string());
     }
     // SAFETY: shim objects are heap-stable; the caller holds a reference and
-    // the GIL contract forbids concurrent mutation.
-    match unsafe { kind_mut(object) } {
-        ShimKind::Tuple(items) => {
+    // the GIL contract forbids concurrent mutation. The checked accessor
+    // rejects type objects and extension-owned instances before the payload
+    // is interpreted as a `ShimKind`.
+    match unsafe { kind_mut_checked(object) } {
+        Some(ShimKind::Tuple(items)) => {
             let length = items.len();
             // SAFETY: the inline array owns `ob_size` pointer slots in the
             // live allocation (zero before `PyTuple_SetItem` fills them).
@@ -3487,9 +3517,10 @@ fn dict_slots_mut(object: *mut ShimObject) -> Result<&'static mut Vec<(usize, us
     if object.is_null() {
         return Err("TypeError: expected a dict object, got NULL".to_string());
     }
-    // SAFETY: see `list_slots_mut`.
-    match unsafe { kind_mut(object) } {
-        ShimKind::Dict(pairs) => Ok(pairs),
+    // SAFETY: see `list_slots_mut`; the checked accessor validates the shim
+    // role and the payload variant.
+    match unsafe { kind_mut_checked(object) } {
+        Some(ShimKind::Dict(pairs)) => Ok(pairs),
         _ => Err("TypeError: expected a dict object".to_string()),
     }
 }
@@ -10625,10 +10656,11 @@ fn set_slots_mut(object: *mut ShimObject) -> Option<&'static mut Vec<usize>> {
     if object.is_null() {
         return None;
     }
-    // SAFETY: the handle is live and the GIL forbids concurrent mutation.
+    // SAFETY: the handle is live and the GIL forbids concurrent mutation; the
+    // checked accessor rejects non-shim roles before the payload is read.
     unsafe {
-        match kind_mut(object) {
-            ShimKind::Set(items) => Some(items),
+        match kind_mut_checked(object) {
+            Some(ShimKind::Set(items)) => Some(items),
             _ => None,
         }
     }

@@ -5053,6 +5053,25 @@ pub(crate) fn type_build_keywords(args: &[i64], keywords: &[(String, i64)]) -> i
     type_three_arg_kw(args[0], args[1], args[2], keywords)
 }
 
+/// `__build_class__` step of a class statement compiled at run time.
+///
+/// The header's `metaclass=` operand is `__build_class__`'s parameter, not a
+/// class keyword: the caller consumes it and passes it separately here. The
+/// remaining `keywords` go to the selected metaclass's `__new__`/`__init__`
+/// and then to `__init_subclass__`, which is what makes
+/// `class C(Base, flag=True)` receive `flag` by name. The three-argument
+/// `type(...)` path above keeps CPython's different semantics, where every
+/// keyword (including `metaclass`) is an ordinary class keyword.
+pub(crate) fn type_build_class_keywords(
+    metaclass: i64,
+    name: i64,
+    bases: i64,
+    namespace: i64,
+    keywords: &[(String, i64)],
+) -> i64 {
+    type_new_impl(metaclass, name, bases, namespace, true, keywords)
+}
+
 /// `type.__new__(metaclass, name, bases, namespace)`: the underlying class
 /// allocator with an explicit metaclass, the C-level operation metaclasses
 /// call from their `__new__`.
