@@ -44,6 +44,16 @@
 //! and `newlines`, implements `close()`/`__enter__`/`__exit__`, and deletes
 //! the file on close when `delete` and `delete_on_close` are both true (or on
 //! context-manager exit when only `delete` is true).
+//!
+//! Every constructor accepts its documented keyword names through both the
+//! compiler's static binding and [`call_kw`], the run-time binder used by an
+//! indirect call such as `TemporaryFile(*args, **kwargs)`. [`call_kw`] fills
+//! the positional slots in declaration order, padding an omitted leading slot
+//! with `None`, so the actual constructors keep a single positional layout.
+//! `_infer_return_type` and `_mkstemp_inner` use the canonical `str`/`bytes`
+//! builtin values for that layout: Hydro spells a builtin type name as a
+//! function value, and identity comparisons against the source spelling
+//! (`_infer_return_type(...) is str`) must see the same object.
 
 use std::fs;
 use std::io;
@@ -51,7 +61,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use hydro_ir::{MethodKind, ParamKind};
+use hydro_ir::{Builtin, MethodKind, ParamKind};
 
 use crate::core::{globals, iter, methods};
 use crate::exc::{
@@ -305,12 +315,20 @@ enum ReturnKind {
     Bytes,
 }
 
+/// The value the source spelling `bytes` denotes.
+///
+/// Hydro represents a builtin type name as a canonical function value
+/// (`builtin_function_new`), and `type(x)` answers with that same object for
+/// scalar values (`type_reference`). `_infer_return_type` must therefore
+/// return the canonical spelling, not a freshly built native class: the
+/// stdlib tests compare it with `is` against the `str`/`bytes` names, and
+/// `_mkstemp_inner` compares the caller's `output_type` the same way.
 fn bytes_type_value() -> i64 {
-    value::type_class(value::bytes_new(Vec::new()))
+    value::builtin_function_new(Builtin::Bytes)
 }
 
 fn str_type_value() -> i64 {
-    value::type_class(value::str_alloc(String::new()))
+    value::builtin_function_new(Builtin::Str)
 }
 
 fn return_kind_value(kind: ReturnKind) -> i64 {
@@ -3153,6 +3171,103 @@ pub(crate) fn constant(name: &str) -> i64 {
             &format!("module 'tempfile' has no attribute '{name}'"),
         ),
     }
+}
+
+/// Parameter names of a module-level `tempfile` entry point, in slot order.
+///
+/// Mirrors the central `TMPFILE` spec. `None` marks an entry with no keyword
+/// surface: the zero-argument helpers and the internal `_tempdir_*` hooks,
+/// which are reached through the class-method binder rather than a module
+/// call.
+fn parameter_names(function: &str) -> Option<&'static [&'static str]> {
+    Some(match function {
+        "_get_default_tempdir" => &["dirlist"],
+        "TemporaryFile" => &[
+            "mode",
+            "buffering",
+            "encoding",
+            "newline",
+            "suffix",
+            "prefix",
+            "dir",
+            "errors",
+        ],
+        "mktemp" | "mkdtemp" => &["suffix", "prefix", "dir"],
+        "mkstemp" => &["suffix", "prefix", "dir", "text"],
+        "TemporaryDirectory" => &["suffix", "prefix", "dir", "ignore_cleanup_errors", "delete"],
+        "NamedTemporaryFile" => &[
+            "mode",
+            "buffering",
+            "encoding",
+            "newline",
+            "suffix",
+            "prefix",
+            "dir",
+            "delete",
+            "errors",
+            "delete_on_close",
+        ],
+        _ => return None,
+    })
+}
+
+/// Binds `name=value` arguments into the positional slots [`call`] expects.
+///
+/// An indirect call (`f(*args, **kwargs)`, as in
+/// `tempfile.TemporaryFile(*args, **kwargs)`) reaches the module dispatcher
+/// with keyword names known only at run time, so [`call`]'s fixed slot layout
+/// needs the keywords bound by name first. A slot omitted before a named one
+/// is filled with `None`, exactly like the compiler's keyword lowering:
+/// `TemporaryFile(encoding='utf-16')` leaves `mode` and `buffering` at their
+/// defaults instead of shifting the encoding into `mode`. Duplicate and
+/// unknown names raise `TypeError` rather than being dropped.
+pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if keywords.is_empty() {
+        return call(function, args);
+    }
+    let Some(names) = parameter_names(function) else {
+        let (name, _) = &keywords[0];
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{function}() got an unexpected keyword argument '{name}'"),
+        );
+    };
+    let mut bound = args.to_vec();
+    let mut filled = vec![true; bound.len()];
+    for (name, argument) in keywords {
+        let Some(index) = names
+            .iter()
+            .position(|candidate| *candidate == name.as_str())
+        else {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("{function}() got an unexpected keyword argument '{name}'"),
+            );
+        };
+        if filled.get(index).copied().unwrap_or(false) {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!("{function}() got multiple values for argument '{name}'"),
+            );
+        }
+        while bound.len() <= index {
+            bound.push(NONE);
+            filled.push(false);
+        }
+        bound[index] = *argument;
+        filled[index] = true;
+    }
+    if bound.len() > names.len() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "{function}() takes at most {} arguments ({} given)",
+                names.len(),
+                bound.len()
+            ),
+        );
+    }
+    call(function, &bound)
 }
 
 /// Dispatches a native `tempfile` function or method.

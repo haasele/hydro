@@ -40,6 +40,19 @@
 //! code; `FUNCTION_FLAG_VARARGS | FUNCTION_FLAG_DYNAMIC_DEFAULTS` routes every
 //! call through that binder.
 //!
+//! # Generators defined by dynamic source
+//!
+//! A `def` (or `lambda`) whose own scope contains `yield`/`yield from` is
+//! created with `FUNCTION_FLAG_GENERATOR`. The shared binder already turns a
+//! call to such a value into a lazy fiber whose body entry is the same
+//! [`dyn_full_entry`] trampoline, so the defining namespace, closure
+//! environments and bound arguments travel in the fiber's argument vector.
+//! `yield` evaluates its operand and calls [`crate::fiber::yield_value`],
+//! which suspends the fiber stack with the evaluator frames intact; `yield
+//! from` delegates to [`crate::fiber::yield_from_value`]. Laziness, `send()`,
+//! `throw()`, `close()`, PEP 479 wrapping of an escaping `StopIteration` and
+//! `gi_*` introspection therefore all come from the ordinary fiber paths.
+//!
 //! # Rooting
 //!
 //! Every value the evaluator holds across a runtime call is registered on a
@@ -67,7 +80,7 @@ use rustpython_parser::{ast, parse, Mode};
 
 use crate::core::builtins as runtime_builtins;
 use crate::core::globals;
-use crate::{abi, container, exc, heap, iter, methods, modules, ops, value};
+use crate::{abi, container, exc, fiber, heap, iter, methods, modules, ops, value};
 
 /// Hidden signature-slot names. They cannot collide with a Python identifier,
 /// so user keyword arguments never bind them.
@@ -140,6 +153,139 @@ struct RegisteredDef {
     /// Number of leading slots the binder fills from signature defaults
     /// (identity, globals and the captured environments).
     hidden: usize,
+}
+
+/// True when a function body contains a `yield`/`yield from`, either as a
+/// statement or in any expression position (`x = yield 1`).
+///
+/// The scan descends into compound statements but not into nested functions,
+/// lambdas or classes: a `yield` there belongs to that nested scope, so it
+/// must not turn the enclosing definition into a generator.
+fn body_has_yield(stmts: &[ast::Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        ast::Stmt::Expr(s) => expr_has_yield(&s.value),
+        ast::Stmt::Assign(s) => expr_has_yield(&s.value) || s.targets.iter().any(expr_has_yield),
+        ast::Stmt::AugAssign(s) => expr_has_yield(&s.target) || expr_has_yield(&s.value),
+        ast::Stmt::AnnAssign(s) => s.value.as_deref().is_some_and(expr_has_yield),
+        ast::Stmt::TypeAlias(s) => expr_has_yield(&s.value),
+        ast::Stmt::Return(s) => s.value.as_deref().is_some_and(expr_has_yield),
+        ast::Stmt::Delete(s) => s.targets.iter().any(expr_has_yield),
+        ast::Stmt::Raise(s) => {
+            s.exc.as_deref().is_some_and(expr_has_yield)
+                || s.cause.as_deref().is_some_and(expr_has_yield)
+        }
+        ast::Stmt::Assert(s) => {
+            expr_has_yield(&s.test) || s.msg.as_deref().is_some_and(expr_has_yield)
+        }
+        ast::Stmt::If(s) => {
+            expr_has_yield(&s.test) || body_has_yield(&s.body) || body_has_yield(&s.orelse)
+        }
+        ast::Stmt::While(s) => {
+            expr_has_yield(&s.test) || body_has_yield(&s.body) || body_has_yield(&s.orelse)
+        }
+        ast::Stmt::For(s) => {
+            expr_has_yield(&s.iter)
+                || expr_has_yield(&s.target)
+                || body_has_yield(&s.body)
+                || body_has_yield(&s.orelse)
+        }
+        ast::Stmt::AsyncFor(s) => {
+            expr_has_yield(&s.iter)
+                || expr_has_yield(&s.target)
+                || body_has_yield(&s.body)
+                || body_has_yield(&s.orelse)
+        }
+        ast::Stmt::With(s) => {
+            s.items
+                .iter()
+                .any(|item| expr_has_yield(&item.context_expr))
+                || body_has_yield(&s.body)
+        }
+        ast::Stmt::AsyncWith(s) => {
+            s.items
+                .iter()
+                .any(|item| expr_has_yield(&item.context_expr))
+                || body_has_yield(&s.body)
+        }
+        ast::Stmt::Try(s) => try_parts_have_yield(&s.body, &s.handlers, &s.orelse, &s.finalbody),
+        ast::Stmt::TryStar(s) => {
+            try_parts_have_yield(&s.body, &s.handlers, &s.orelse, &s.finalbody)
+        }
+        ast::Stmt::Match(s) => {
+            expr_has_yield(&s.subject)
+                || s.cases.iter().any(|case| {
+                    case.guard.as_deref().is_some_and(expr_has_yield) || body_has_yield(&case.body)
+                })
+        }
+        _ => false,
+    })
+}
+
+fn try_parts_have_yield(
+    body: &[ast::Stmt],
+    handlers: &[ast::ExceptHandler],
+    orelse: &[ast::Stmt],
+    finalbody: &[ast::Stmt],
+) -> bool {
+    body_has_yield(body)
+        || handlers.iter().any(|handler| {
+            let ast::ExceptHandler::ExceptHandler(h) = handler;
+            body_has_yield(&h.body)
+        })
+        || body_has_yield(orelse)
+        || body_has_yield(finalbody)
+}
+
+/// True when `expr` contains a `yield` (or `yield from`) outside a nested
+/// scope. Lambdas, comprehensions and generator expressions are nested scopes
+/// and are not inspected.
+fn expr_has_yield(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Yield(_) | ast::Expr::YieldFrom(_) => true,
+        ast::Expr::BoolOp(b) => b.values.iter().any(expr_has_yield),
+        ast::Expr::NamedExpr(n) => expr_has_yield(&n.value),
+        ast::Expr::BinOp(b) => expr_has_yield(&b.left) || expr_has_yield(&b.right),
+        ast::Expr::UnaryOp(u) => expr_has_yield(&u.operand),
+        ast::Expr::IfExp(i) => {
+            expr_has_yield(&i.test) || expr_has_yield(&i.body) || expr_has_yield(&i.orelse)
+        }
+        ast::Expr::Dict(d) => {
+            d.keys.iter().flatten().any(expr_has_yield) || d.values.iter().any(expr_has_yield)
+        }
+        ast::Expr::Set(s) => s.elts.iter().any(expr_has_yield),
+        ast::Expr::Compare(c) => {
+            expr_has_yield(&c.left) || c.comparators.iter().any(expr_has_yield)
+        }
+        ast::Expr::Call(c) => {
+            expr_has_yield(&c.func)
+                || c.args.iter().any(expr_has_yield)
+                || c.keywords
+                    .iter()
+                    .any(|keyword| expr_has_yield(&keyword.value))
+        }
+        ast::Expr::FormattedValue(f) => {
+            expr_has_yield(&f.value) || f.format_spec.as_deref().is_some_and(expr_has_yield)
+        }
+        ast::Expr::JoinedStr(s) => s.values.iter().any(expr_has_yield),
+        ast::Expr::Await(a) => expr_has_yield(&a.value),
+        ast::Expr::Attribute(a) => expr_has_yield(&a.value),
+        ast::Expr::Subscript(s) => expr_has_yield(&s.value) || expr_has_yield(&s.slice),
+        ast::Expr::Starred(s) => expr_has_yield(&s.value),
+        ast::Expr::List(l) => l.elts.iter().any(expr_has_yield),
+        ast::Expr::Tuple(t) => t.elts.iter().any(expr_has_yield),
+        ast::Expr::Slice(s) => [s.lower.as_deref(), s.upper.as_deref(), s.step.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(expr_has_yield),
+        // Nested scopes and leaf nodes.
+        ast::Expr::Lambda(_)
+        | ast::Expr::ListComp(_)
+        | ast::Expr::SetComp(_)
+        | ast::Expr::DictComp(_)
+        | ast::Expr::GeneratorExp(_)
+        | ast::Expr::Constant(_)
+        | ast::Expr::Name(_) => false,
+    }
 }
 
 static DEFS: LazyLock<Mutex<Vec<Arc<RegisteredDef>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -1389,6 +1535,15 @@ impl Interp {
     ) -> EvalResult {
         let envs = self.environment();
         let hidden = 2 + envs.len();
+        // A `def`/`lambda` whose own scope contains a `yield` is a generator
+        // function: calling it must produce a suspended fiber instead of
+        // running the body. The runtime binder already does that for a wrapper
+        // carrying `FUNCTION_FLAG_GENERATOR`, so the flag is the only hook the
+        // evaluator needs here.
+        let generator = match &def {
+            DynDef::Function { body, .. } => body_has_yield(body),
+            DynDef::Lambda { body, .. } => expr_has_yield(body),
+        };
 
         let mut plans: Vec<(String, ParamKind, Option<ast::Expr>)> = Vec::new();
         for argument in &args.posonlyargs {
@@ -1461,12 +1616,11 @@ impl Interp {
         }
 
         let arity = args.posonlyargs.len() + args.args.len();
-        let function = value::function_new_with_flags(
-            0,
-            arity,
-            name,
-            value::FUNCTION_FLAG_VARARGS | value::FUNCTION_FLAG_DYNAMIC_DEFAULTS,
-        );
+        let mut flags = value::FUNCTION_FLAG_VARARGS | value::FUNCTION_FLAG_DYNAMIC_DEFAULTS;
+        if generator {
+            flags |= value::FUNCTION_FLAG_GENERATOR;
+        }
+        let function = value::function_new_with_flags(0, arity, name, flags);
         self.roots.push(function);
         value::function_set_full_entry(function, dyn_full_entry as *const () as usize);
         value::function_set_signature(function, signature);
@@ -1644,8 +1798,38 @@ impl Interp {
                 "a generator expression",
             )),
             ast::Expr::Await(_) => Err(raise_tag(ExcKind::NotImplementedError, "await")),
-            ast::Expr::Yield(_) => Err(raise_tag(ExcKind::NotImplementedError, "yield")),
-            ast::Expr::YieldFrom(_) => Err(raise_tag(ExcKind::NotImplementedError, "yield from")),
+            ast::Expr::Yield(node) => {
+                // `yield`/`yield value` lowers to the fiber suspension point
+                // used by generated code. The produced value is rooted while
+                // the fiber is suspended (the evaluation frame's shadow stack
+                // follows the fiber switch), and the resume value - `None` for
+                // `next()`, the `send()` argument, or the exception injected
+                // by `throw()`/`close()` - continues the expression.
+                let yielded = match &node.value {
+                    Some(expression) => self.eval(expression)?,
+                    None => value::NONE,
+                };
+                self.roots.push(yielded);
+                let sent = fiber::yield_value(yielded);
+                if exc::pending() {
+                    return Err(Flow::Raise);
+                }
+                self.roots.push(sent);
+                Ok(sent)
+            }
+            ast::Expr::YieldFrom(node) => {
+                // Delegation (`send`/`throw`/`close` forwarding and the
+                // delegate's return value) is implemented once, for both
+                // generated and interpreted generators, by the fiber runtime.
+                let delegate = self.eval(&node.value)?;
+                self.roots.push(delegate);
+                let result = fiber::yield_from_value(delegate);
+                if exc::pending() {
+                    return Err(Flow::Raise);
+                }
+                self.roots.push(result);
+                Ok(result)
+            }
             ast::Expr::Slice(_) => Err(raise_syntax("a slice is only valid inside a subscript")),
         }
     }

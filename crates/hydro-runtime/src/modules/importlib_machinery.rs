@@ -1647,8 +1647,9 @@ fn create_module(args: &[i64]) -> i64 {
 }
 
 /// Shared `exec_module` implementation: a module whose body is part of the
-/// compiled program has already run, so nothing remains to execute. Any other
-/// module cannot be executed at runtime.
+/// compiled program has already run, so nothing remains to execute. A source
+/// module discovered at runtime is executed through the runtime compiler
+/// (`compile`/`exec`) into its live globals, exactly like CPython's loader.
 pub(crate) fn exec_module(args: &[i64]) -> i64 {
     let module = args[1];
     exec_loaded_module(module)
@@ -1671,25 +1672,105 @@ pub(crate) fn exec_loaded_module(module: i64) -> i64 {
             ),
         );
     };
-    if super::registry_lookup(&name).is_some() {
-        // The compiled initializer already ran; executing again would be a
-        // silent no-op, which is exactly what CPython's built-in loaders do.
+    // A module compiled into the program mirrors `__name__` into the runtime
+    // global store from its initializer; that body already ran. A module
+    // materialised at runtime has no such entry and still needs execution.
+    if globals::try_get(&name, "__name__").is_some() {
         return NONE;
     }
-    let origin = value::instance_attr(module, "__file__")
-        .and_then(value::as_str)
-        .map(str::to_string);
-    let detail = match origin {
-        Some(path) => format!("cannot execute module '{name}' from '{path}'"),
-        None => format!("cannot execute module '{name}'"),
+    let origin = module_attribute(module, "__file__");
+    if exc::pending() {
+        return NONE;
+    }
+    let origin = origin.and_then(value::as_str).map(str::to_string);
+    let Some(origin) = origin else {
+        return exc::raise_with_message(
+            IMPORT_ERROR,
+            &format!("cannot execute module '{name}': no source file is known"),
+        );
     };
-    exc::raise_with_message(
-        IMPORT_ERROR,
-        &format!(
-            "{detail}: Hydro has no runtime Python compiler; Python modules are \
-             compiled into the program ahead of time"
-        ),
-    )
+    if !origin.ends_with(".py") {
+        return exc::raise_with_message(
+            IMPORT_ERROR,
+            &format!(
+                "{origin} has no Python source: Hydro executes bytecode ahead of time and \
+                 has no runtime bytecode compiler"
+            ),
+        );
+    }
+    exec_source_module(module, &name, &origin)
+}
+
+/// Reads the module attribute `name`, translating `AttributeError` to `None`.
+///
+/// Any other pending exception is left in place; the caller checks
+/// [`exc::pending`] before continuing.
+fn module_attribute(module: i64, name: &str) -> Option<i64> {
+    let found = crate::core::methods::getattr(module, name.as_ptr(), name.len());
+    if exc::pending() {
+        if exc::pending_tag() == i64::from(ATTRIBUTE_ERROR) {
+            exc::clear();
+        }
+        return None;
+    }
+    Some(found)
+}
+
+/// Executes the Python source file `path` as the body of module `name`.
+///
+/// The source is compiled by the runtime `compile()` implementation and run
+/// through `exec()` with the module's live globals view as its namespace, so
+/// every binding the body makes is observable through attribute reads,
+/// `globals()` and `module.__dict__`. The module's metadata dunders are seeded
+/// first, matching what the loader installed on the module object. A source
+/// error or a raised exception stays pending and is returned to the caller as
+/// the import failure.
+fn exec_source_module(module: i64, name: &str, path: &str) -> i64 {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return exc::raise_with_message(
+                IMPORT_ERROR,
+                &format!("cannot execute module '{name}' from '{path}': {error}"),
+            )
+        }
+    };
+    let source = value::bytes_new(bytes);
+    let filename = value::str_alloc(path.to_string());
+    let mode = value::str_alloc("exec".to_string());
+    let namespace = globals::view(name);
+    let roots = crate::heap::root_values(&[source, filename, mode, namespace]);
+    for attribute in [
+        "__name__",
+        "__file__",
+        "__package__",
+        "__spec__",
+        "__loader__",
+        "__cached__",
+        "__path__",
+        "__doc__",
+    ] {
+        let item = module_attribute(module, attribute);
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
+        if let Some(item) = item {
+            globals::set_in_view(name, attribute, item);
+        }
+    }
+    let builtins = super::module_value_by_name("builtins");
+    globals::set_in_view(name, "__builtins__", builtins);
+    let code = crate::core::compile_runtime::builtin_compile(&[source, filename, mode]);
+    if exc::pending() {
+        crate::heap::release_roots(roots);
+        return NONE;
+    }
+    let code_roots = crate::heap::root_values(&[code]);
+    let result = crate::core::compile_runtime::builtin_exec(&[code, namespace]);
+    crate::heap::release_roots(code_roots);
+    crate::heap::release_roots(roots);
+    result
 }
 
 /// Name of a module value or of a module-like namespace created by

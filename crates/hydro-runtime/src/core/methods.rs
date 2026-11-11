@@ -3181,6 +3181,12 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         }
         return attribute_error(obj, attr);
     }
+    // Builtin scalar receivers expose their type-level method surface as
+    // bound methods: `''.join`, `b''.join`, `(1).bit_length`, ...
+    let receiver_type = value::type_name_of(obj);
+    if builtin_type_method_names(&receiver_type).is_some_and(|methods| methods.contains(&attr)) {
+        return value::bound_method_new(obj, attr.to_string());
+    }
     if let Some(module) = value::as_module(obj) {
         return crate::modules::module_attr(module, attr);
     }

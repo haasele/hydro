@@ -862,6 +862,19 @@ fn compile_anchored_bytes(
     compile_bytes_text(&wrapped, flags)
 }
 
+/// CPython 3.14's `re.escape` special-character set.
+fn python_escape(text: &str) -> String {
+    const SPECIAL: &str = "()[]{}?*+-|^$\\.&~# \t\n\r\x0b\x0c";
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if SPECIAL.contains(ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Converts a UTF-8 byte offset to a Python character offset.
 fn char_offset(text: &str, byte: usize) -> usize {
     text[..byte.min(text.len())].chars().count()
@@ -1680,9 +1693,9 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         }
         "escape" => {
             if let Some(text) = value::as_str(args[0]) {
-                value::str_alloc(regex::escape(text))
+                value::str_alloc(python_escape(text))
             } else if let Some(bytes) = value::as_bytes(args[0]) {
-                let escaped = regex::escape(&latin1_string(bytes));
+                let escaped = python_escape(&latin1_string(bytes));
                 value::bytes_new(latin1_bytes(&escaped))
             } else {
                 type_error(&format!(

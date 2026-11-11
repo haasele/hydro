@@ -18,9 +18,10 @@
 //!
 //! Hydro compiles Python ahead of time, so `module_from_spec` returns the
 //! already-initialized module when one exists and otherwise creates a real
-//! module-like namespace carrying the documented metadata attributes. It never
-//! pretends the source executed: `loader.exec_module` on such a module raises
-//! a precise `ImportError` instead.
+//! module-like namespace carrying the documented metadata attributes. A
+//! discovered source module's body is then executed through the runtime
+//! `compile`/`exec` evaluator (`SourceFileLoader.exec_module`), so its
+//! bindings are real; a module compiled into the program is never re-run.
 
 use std::path::{Path, PathBuf};
 
@@ -1666,10 +1667,9 @@ fn loader_member(loader: i64, name: &str) -> i64 {
 /// A unit compiled into the program keeps its namespace in the runtime global
 /// store, so a fresh module value exposes it exactly like the original one.
 /// Any other module (pure-Python source, namespace package) becomes a real
-/// module namespace carrying the discovered spec's metadata; executing a
-/// source body that was never compiled into the program is the caller's
-/// concern (`SourceFileLoader.exec_module` reports the missing runtime
-/// compiler instead of pretending the body ran).
+/// module namespace carrying the discovered spec's metadata; a discovered
+/// source module's body is then executed through the runtime compiler so its
+/// bindings are real, while a namespace package has no body to run.
 pub(crate) fn materialize_found(found: &FoundSpec) -> i64 {
     let name = found.name.as_str();
     if found.loader == LoaderKind::Extension {
@@ -1691,6 +1691,16 @@ pub(crate) fn materialize_found(found: &FoundSpec) -> i64 {
         return module;
     }
     super::publish_module(name, module);
+    // A source module discovered on the search roots has not run: execute its
+    // body now through the runtime compiler. Namespace packages have no body
+    // and compiled modules already ran (the loader reports the latter as a
+    // no-op), so only the discovered source loader reaches this path.
+    if found.loader == LoaderKind::Source {
+        machinery::exec_loaded_module(module);
+        if exc::pending() {
+            return module;
+        }
+    }
     module
 }
 

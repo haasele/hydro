@@ -13,10 +13,11 @@
 //! finders at their exact positions). Any pure-Python module or package found
 //! on the search roots — including nested packages and the CPython `__hello__`
 //! / `__phello__` source modules — is materialised: a real module object with
-//! the discovered spec's metadata is published in `sys.modules`. The body of a
-//! source module that was not compiled into the program is not executed, since
-//! that needs a runtime Python compiler; `SourceFileLoader.exec_module`
-//! reports the missing compiler instead of pretending the body ran.
+//! the discovered spec's metadata is published in `sys.modules` and, for a
+//! source module, its body is executed through the runtime `compile`/`exec`
+//! evaluator so its bindings are real. A source module compiled into the
+//! program keeps its ahead-of-time body; its loader reports the already-run
+//! module instead of executing it twice.
 //!
 //! The dotted submodules live in their own native modules
 //! ([`importlib_util`](super::importlib_util),

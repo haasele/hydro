@@ -162,8 +162,9 @@ pub(crate) struct ArgParserState {
     /// messages do not add "did you mean" hints yet, so the flag is stored for
     /// introspection and repr.
     pub(crate) suggest_on_error: bool,
-    /// CPython 3.14's `color=` constructor keyword. Help output has no ANSI
-    /// styling in Hydro, so the flag is stored for introspection only.
+    /// CPython 3.14's `color=` constructor keyword. When true (and
+    /// `_colorize.can_colorize()` allows it) usage and help output carry the
+    /// same ANSI styling as CPython's formatter.
     pub(crate) color: bool,
     pub(crate) options: Vec<ArgSpec>,
     pub(crate) groups: Vec<GroupState>,
@@ -2215,6 +2216,7 @@ struct View {
     fromfile_prefix_chars: Option<String>,
     allow_abbrev: bool,
     exit_on_error: bool,
+    color: bool,
     options: Vec<ArgSpec>,
     groups: Vec<GroupState>,
     subparsers: Option<SubparsersState>,
@@ -2270,12 +2272,188 @@ fn view(parser: i64) -> Option<View> {
         fromfile_prefix_chars: state.fromfile_prefix_chars.clone(),
         allow_abbrev: state.allow_abbrev,
         exit_on_error: state.exit_on_error,
+        color: state.color,
         options: state.options.clone(),
         groups: state.groups.clone(),
         subparsers: state.subparsers.clone(),
         defaults: state.defaults.clone(),
         test_mode: state.test_mode,
     })
+}
+
+/// CPython 3.14's default `_colorize.Argparse` ANSI palette.
+///
+/// Every field holds an ANSI SGR prefix. A palette with empty strings is the
+/// plain-text formatter, so every rendering path can use `paint`
+/// unconditionally and produce byte-identical plain output.
+#[derive(Clone)]
+struct Palette {
+    usage: String,
+    prog: String,
+    prog_extra: String,
+    heading: String,
+    summary_long_option: String,
+    summary_short_option: String,
+    summary_label: String,
+    summary_action: String,
+    long_option: String,
+    short_option: String,
+    label: String,
+    action: String,
+    reset: String,
+}
+
+/// `_colorize.ANSIColors` spellings used by the default argparse theme.
+const ANSI_BOLD_BLUE: &str = "\x1b[1;34m";
+const ANSI_BOLD_MAGENTA: &str = "\x1b[1;35m";
+const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
+const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
+const ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
+const ANSI_CYAN: &str = "\x1b[36m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_MAGENTA: &str = "\x1b[35m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_RESET: &str = "\x1b[0m";
+
+impl Palette {
+    fn plain() -> Palette {
+        Palette {
+            usage: String::new(),
+            prog: String::new(),
+            prog_extra: String::new(),
+            heading: String::new(),
+            summary_long_option: String::new(),
+            summary_short_option: String::new(),
+            summary_label: String::new(),
+            summary_action: String::new(),
+            long_option: String::new(),
+            short_option: String::new(),
+            label: String::new(),
+            action: String::new(),
+            reset: String::new(),
+        }
+    }
+
+    fn colored() -> Palette {
+        Palette {
+            usage: ANSI_BOLD_BLUE.to_string(),
+            prog: ANSI_BOLD_MAGENTA.to_string(),
+            prog_extra: ANSI_MAGENTA.to_string(),
+            heading: ANSI_BOLD_BLUE.to_string(),
+            summary_long_option: ANSI_CYAN.to_string(),
+            summary_short_option: ANSI_GREEN.to_string(),
+            summary_label: ANSI_YELLOW.to_string(),
+            summary_action: ANSI_GREEN.to_string(),
+            long_option: ANSI_BOLD_CYAN.to_string(),
+            short_option: ANSI_BOLD_GREEN.to_string(),
+            label: ANSI_BOLD_YELLOW.to_string(),
+            action: ANSI_BOLD_GREEN.to_string(),
+            reset: ANSI_RESET.to_string(),
+        }
+    }
+
+    fn paint(&self, color: &str, text: &str) -> String {
+        if color.is_empty() {
+            text.to_string()
+        } else {
+            format!("{color}{text}{}", self.reset)
+        }
+    }
+}
+
+/// Imports `_colorize`, the stdlib module owning CPython's color policy.
+fn colorize_module() -> Option<i64> {
+    let name = text_value("_colorize");
+    let module = crate::modules::importlib::call("import_module", std::slice::from_ref(&name));
+    if exc::pending() {
+        exc::clear();
+        return None;
+    }
+    (module != NONE).then_some(module)
+}
+
+/// Reads an attribute without letting a missing member leak an exception.
+fn colorize_attr(object: i64, name: &str) -> Option<i64> {
+    let item = try_action_attr(object, name)?;
+    (item != NONE).then_some(item)
+}
+
+/// Calls `_colorize.can_colorize()`; `None` when the hook is unavailable.
+fn colorize_can_colorize(module: i64) -> Option<bool> {
+    let function = colorize_attr(module, "can_colorize")?;
+    let roots = crate::heap::root_values(&[function]);
+    let result = crate::core::builtins::call(function, 0, std::ptr::null());
+    let enabled = if exc::pending() {
+        exc::clear();
+        None
+    } else {
+        Some(value::truthy(result))
+    };
+    crate::heap::release_roots(roots);
+    enabled
+}
+
+/// Reads the active `_colorize.Theme.argparse` section.
+fn palette_from_colorize(module: i64) -> Option<Palette> {
+    let theme = colorize_attr(module, "_theme")?;
+    let roots = crate::heap::root_values(&[theme]);
+    let section = colorize_attr(theme, "argparse");
+    let palette = section.and_then(|section| {
+        let roots = crate::heap::root_values(&[section]);
+        let palette = palette_from_section(section);
+        crate::heap::release_roots(roots);
+        palette
+    });
+    crate::heap::release_roots(roots);
+    palette
+}
+
+/// Reads every `Argparse` theme field, falling back to the defaults when the
+/// section is not the expected mapping/dataclass shape.
+fn palette_from_section(section: i64) -> Option<Palette> {
+    fn field(section: i64, name: &str) -> Option<String> {
+        colorize_attr(section, name)
+            .and_then(value::as_str)
+            .map(str::to_string)
+    }
+    Some(Palette {
+        usage: field(section, "usage")?,
+        prog: field(section, "prog")?,
+        prog_extra: field(section, "prog_extra")?,
+        heading: field(section, "heading")?,
+        summary_long_option: field(section, "summary_long_option")?,
+        summary_short_option: field(section, "summary_short_option")?,
+        summary_label: field(section, "summary_label")?,
+        summary_action: field(section, "summary_action")?,
+        long_option: field(section, "long_option")?,
+        short_option: field(section, "short_option")?,
+        label: field(section, "label")?,
+        action: field(section, "action")?,
+        reset: field(section, "reset")?,
+    })
+}
+
+/// CPython's `HelpFormatter._set_color`: `color=` plus the stdlib policy.
+///
+/// `can_colorize()` accounts for `PYTHON_COLORS`, `NO_COLOR`, `FORCE_COLOR`,
+/// `TERM=dumb` and `isatty`; consulting the Python hook (rather than reading
+/// those variables here) also honours `test.support.force_color` and other
+/// callers that monkeypatch the policy.
+fn active_palette(color: bool) -> Palette {
+    if !color {
+        return Palette::plain();
+    }
+    let Some(module) = colorize_module() else {
+        return Palette::plain();
+    };
+    let roots = crate::heap::root_values(&[module]);
+    let palette = if colorize_can_colorize(module) == Some(true) {
+        palette_from_colorize(module).unwrap_or_else(Palette::colored)
+    } else {
+        Palette::plain()
+    };
+    crate::heap::release_roots(roots);
+    palette
 }
 
 /// Reports a parse error: prints the usage block and raises
@@ -3573,26 +3751,69 @@ fn value_usage(spec: &ArgSpec, metavar: &str) -> String {
     }
 }
 
-fn optional_usage(view: &View, spec: &ArgSpec) -> String {
-    let metavar = metavar_for(view, spec);
-    let mut body = if spec.action.takes_no_value() {
-        spec.flags.first().cloned().unwrap_or_default()
-    } else {
-        let suffix = value_usage(spec, &metavar);
-        match spec.flags.first() {
-            Some(flag) if suffix.is_empty() => flag.clone(),
-            Some(flag) => format!("{flag} {suffix}"),
-            None => suffix,
-        }
-    };
-    if spec.action == ActionKind::BooleanOptional {
-        let mut alternatives = Vec::new();
-        for flag in spec.flags.iter().chain(spec.negative_flags.iter()) {
-            alternatives.push(flag.clone());
-        }
-        body = alternatives.join(" | ");
+/// CPython's `_format_args` result for one positional argument.
+fn positional_usage_text(view: &View, spec: &ArgSpec) -> String {
+    let metavar = positional_metavar(view, spec);
+    match spec.nargs {
+        Nargs::Single => metavar,
+        Nargs::Optional => format!("[{metavar}]"),
+        Nargs::ZeroOrMore => format!("[{metavar} ...]"),
+        Nargs::OneOrMore => format!("{metavar} [{metavar} ...]"),
+        Nargs::Exact(count) => vec![metavar; count].join(" "),
     }
-    if spec.required {
+}
+
+/// ANSI style for an option spelling: CPython treats any string longer than
+/// two characters as a long option.
+fn option_style<'a>(palette: &'a Palette, flag: &str) -> &'a str {
+    if flag.chars().count() > 2 {
+        &palette.summary_long_option
+    } else {
+        &palette.summary_short_option
+    }
+}
+
+/// One `_get_actions_usage_parts` entry, without the outer brackets that group
+/// contexts add. `in_group` suppresses an optional's own brackets and strips a
+/// positional's `[...]`; `group_required` mirrors a required mutex group.
+fn summary_usage_part(
+    view: &View,
+    spec: &ArgSpec,
+    palette: &Palette,
+    in_group: bool,
+    group_required: bool,
+) -> String {
+    if spec.positional {
+        let mut text = positional_usage_text(view, spec);
+        if in_group && text.starts_with('[') && text.ends_with(']') {
+            text = text[1..text.len() - 1].to_string();
+        }
+        return palette.paint(&palette.summary_action, &text);
+    }
+    let first = spec.flags.first().cloned().unwrap_or_default();
+    let style = option_style(palette, &first);
+    let body = if spec.action.takes_no_value() {
+        if spec.action == ActionKind::BooleanOptional {
+            let text = spec
+                .flags
+                .iter()
+                .chain(spec.negative_flags.iter())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            palette.paint(style, &text)
+        } else {
+            palette.paint(style, &first)
+        }
+    } else {
+        let metavar = metavar_for(view, spec);
+        let suffix = value_usage(spec, &metavar);
+        format!(
+            "{style}{first} {}{suffix}{}",
+            palette.summary_label, palette.reset
+        )
+    };
+    if spec.required || group_required || in_group {
         body
     } else {
         format!("[{body}]")
@@ -3600,9 +3821,20 @@ fn optional_usage(view: &View, spec: &ArgSpec) -> String {
 }
 
 fn format_usage_text(view: &View) -> String {
+    format_usage_text_with(view, &active_palette(view.color))
+}
+
+fn format_usage_text_with(view: &View, palette: &Palette) -> String {
     if let Some(usage) = &view.usage {
-        let usage = usage.replace("%(prog)s", &view.prog);
-        return format!("usage: {usage}\n");
+        let colored_prog = format!(
+            "{}{}{}{}",
+            palette.prog, view.prog, palette.reset, palette.prog_extra
+        );
+        let usage = usage.replace("%(prog)s", &colored_prog);
+        return format!(
+            "{}usage: {}{}{}{}\n",
+            palette.usage, palette.reset, palette.prog_extra, usage, palette.reset
+        );
     }
     let mut parts: Vec<String> = Vec::new();
     // Optionals first, in declaration order, with mutex groups collapsed.
@@ -3621,26 +3853,13 @@ fn format_usage_text(view: &View) -> String {
                 let mut alternatives = Vec::new();
                 for member in &group.members {
                     let member_spec = &view.options[*member];
-                    let metavar = metavar_for(view, member_spec);
-                    let mut body = if member_spec.action.takes_no_value() {
-                        member_spec.flags.first().cloned().unwrap_or_default()
-                    } else {
-                        let suffix = value_usage(member_spec, &metavar);
-                        format!(
-                            "{} {suffix}",
-                            member_spec.flags.first().cloned().unwrap_or_default()
-                        )
-                    };
-                    if member_spec.action == ActionKind::BooleanOptional {
-                        body = member_spec
-                            .flags
-                            .iter()
-                            .chain(member_spec.negative_flags.iter())
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(" | ");
-                    }
-                    alternatives.push(body);
+                    alternatives.push(summary_usage_part(
+                        view,
+                        member_spec,
+                        palette,
+                        true,
+                        group.required,
+                    ));
                 }
                 let body = alternatives.join(" | ");
                 parts.push(if group.required {
@@ -3651,23 +3870,27 @@ fn format_usage_text(view: &View) -> String {
                 continue;
             }
         }
-        parts.push(optional_usage(view, spec));
+        parts.push(summary_usage_part(view, spec, palette, false, false));
     }
     for spec in view.options.iter().filter(|spec| spec.positional) {
-        let metavar = positional_metavar(view, spec);
-        let text = match spec.nargs {
-            Nargs::Single => metavar,
-            Nargs::Optional => format!("[{metavar}]"),
-            Nargs::ZeroOrMore => format!("[{metavar} ...]"),
-            Nargs::OneOrMore => format!("{metavar} [{metavar} ...]"),
-            Nargs::Exact(count) => vec![metavar; count].join(" "),
-        };
-        parts.push(text);
+        // A positional already rendered as part of a mutex group is not
+        // repeated later in the usage line.
+        if view
+            .groups
+            .get(spec.group)
+            .is_some_and(|group| group.mutex && rendered_groups.contains(&spec.group))
+        {
+            continue;
+        }
+        parts.push(summary_usage_part(view, spec, palette, false, false));
     }
     if let Some(subparsers) = &view.subparsers {
-        parts.push(subparser_metavar(subparsers));
+        parts.push(palette.paint(&palette.summary_action, &subparser_metavar(subparsers)));
     }
-    let mut text = format!("usage: {}", view.prog);
+    let mut text = format!(
+        "{}usage: {}{}{}{}",
+        palette.usage, palette.reset, palette.prog, view.prog, palette.reset
+    );
     for part in parts {
         text.push(' ');
         text.push_str(&part);
@@ -3706,17 +3929,59 @@ fn help_invocation(view: &View, spec: &ArgSpec) -> String {
     }
     let metavar = metavar_for(view, spec);
     let suffix = value_usage(spec, &metavar);
-    spec.flags
+    let options = spec.flags.join(", ");
+    if suffix.is_empty() {
+        options
+    } else {
+        format!("{options} {suffix}")
+    }
+}
+
+/// ANSI style for an option spelling in the help listing: CPython uses the
+/// bold variants there and the summary variants in usage lines.
+fn help_option_style<'a>(palette: &'a Palette, flag: &str) -> &'a str {
+    if flag.chars().count() > 2 {
+        &palette.long_option
+    } else {
+        &palette.short_option
+    }
+}
+
+fn help_invocation_colored(view: &View, spec: &ArgSpec, palette: &Palette) -> String {
+    if spec.positional {
+        return palette.paint(&palette.action, &positional_metavar(view, spec));
+    }
+    let paint_flag = |flag: &String| palette.paint(help_option_style(palette, flag), flag);
+    if spec.action == ActionKind::BooleanOptional {
+        return spec
+            .flags
+            .iter()
+            .chain(spec.negative_flags.iter())
+            .map(paint_flag)
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+    if spec.action.takes_no_value() {
+        return spec
+            .flags
+            .iter()
+            .map(paint_flag)
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+    let metavar = metavar_for(view, spec);
+    let suffix = value_usage(spec, &metavar);
+    let options = spec
+        .flags
         .iter()
-        .map(|flag| {
-            if suffix.is_empty() {
-                flag.clone()
-            } else {
-                format!("{flag} {suffix}")
-            }
-        })
+        .map(paint_flag)
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    if suffix.is_empty() {
+        options
+    } else {
+        format!("{options} {}{suffix}{}", palette.label, palette.reset)
+    }
 }
 
 fn help_text_for(view: &View, spec: &ArgSpec) -> String {
@@ -3748,11 +4013,24 @@ fn effective_default(view: &View, spec: &ArgSpec) -> Option<i64> {
 
 struct HelpEntry {
     invoked: String,
+    invoked_colored: String,
     help: String,
     indent: usize,
 }
 
+impl HelpEntry {
+    fn new(view: &View, spec: &ArgSpec, palette: &Palette, indent: usize) -> HelpEntry {
+        HelpEntry {
+            invoked: help_invocation(view, spec),
+            invoked_colored: help_invocation_colored(view, spec, palette),
+            help: help_text_for(view, spec),
+            indent,
+        }
+    }
+}
+
 fn format_help_text(view: &View) -> String {
+    let palette = active_palette(view.color);
     let mut sections: Vec<(String, Vec<HelpEntry>)> = Vec::new();
 
     // Positional arguments (including the subparsers action).
@@ -3761,15 +4039,12 @@ fn format_help_text(view: &View) -> String {
         if spec.help == SUPPRESS {
             continue;
         }
-        positional_entries.push(HelpEntry {
-            invoked: help_invocation(view, spec),
-            help: help_text_for(view, spec),
-            indent: 2,
-        });
+        positional_entries.push(HelpEntry::new(view, spec, &palette, 2));
     }
     if let Some(subparsers) = &view.subparsers {
         positional_entries.push(HelpEntry {
             invoked: subparser_metavar(subparsers),
+            invoked_colored: palette.paint(&palette.action, &subparser_metavar(subparsers)),
             help: String::new(),
             indent: 2,
         });
@@ -3780,6 +4055,7 @@ fn format_help_text(view: &View) -> String {
             }
             positional_entries.push(HelpEntry {
                 invoked: name.clone(),
+                invoked_colored: palette.paint(&palette.action, name),
                 help: help.clone(),
                 indent: 4,
             });
@@ -3799,11 +4075,7 @@ fn format_help_text(view: &View) -> String {
         if spec.help == SUPPRESS {
             continue;
         }
-        default_entries.push(HelpEntry {
-            invoked: help_invocation(view, spec),
-            help: help_text_for(view, spec),
-            indent: 2,
-        });
+        default_entries.push(HelpEntry::new(view, spec, &palette, 2));
     }
     if !default_entries.is_empty() {
         sections.push(("options".to_string(), default_entries));
@@ -3820,11 +4092,7 @@ fn format_help_text(view: &View) -> String {
             if spec.help == SUPPRESS {
                 continue;
             }
-            entries.push(HelpEntry {
-                invoked: help_invocation(view, spec),
-                help: help_text_for(view, spec),
-                indent: 2,
-            });
+            entries.push(HelpEntry::new(view, spec, &palette, 2));
         }
         if !entries.is_empty() {
             let title = group.title.clone().unwrap_or_else(|| "options".to_string());
@@ -3840,7 +4108,7 @@ fn format_help_text(view: &View) -> String {
         .unwrap_or(0);
     let help_position = (max_invocation + 2).min(24);
 
-    let mut text = format_usage_text(view);
+    let mut text = format_usage_text_with(view, &palette);
     if let Some(description) = &view.description {
         text.push('\n');
         if view.raw_text() || view.raw_description() {
@@ -3852,21 +4120,25 @@ fn format_help_text(view: &View) -> String {
     }
     for (title, entries) in sections {
         text.push('\n');
+        text.push_str(&palette.heading);
         text.push_str(&title);
-        text.push_str(":\n");
+        text.push(':');
+        text.push_str(&palette.reset);
+        text.push('\n');
         for entry in entries {
             let header = format!("{}{}", " ".repeat(entry.indent), entry.invoked);
+            let colored_header = format!("{}{}", " ".repeat(entry.indent), entry.invoked_colored);
             if entry.help.is_empty() {
-                text.push_str(&header);
+                text.push_str(&colored_header);
                 text.push('\n');
                 continue;
             }
             if header.chars().count() + 2 <= help_position {
-                text.push_str(&header);
+                text.push_str(&colored_header);
                 let padding = help_position.saturating_sub(header.chars().count());
                 text.push_str(&" ".repeat(padding.max(2)));
             } else {
-                text.push_str(&header);
+                text.push_str(&colored_header);
                 text.push('\n');
                 text.push_str(&" ".repeat(help_position));
             }
