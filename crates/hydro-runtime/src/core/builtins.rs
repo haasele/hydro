@@ -4612,9 +4612,13 @@ fn container_instance_new(class: i64, argc: usize, argv: *const i64) -> Option<i
             _ => None,
         }
     })?;
-    // Keep this slice to set subclasses; tuple subclasses such as namedtuple
-    // have their own construction paths and must not take the payload shortcut.
-    if !matches!(base, ContainerNew::Set | ContainerNew::Frozenset) {
+    // List subclasses without their own `__new__` share the native storage;
+    // tuple subclasses (namedtuple and friends) keep their generated
+    // construction path.
+    if !matches!(
+        base,
+        ContainerNew::List | ContainerNew::Set | ContainerNew::Frozenset
+    ) {
         return None;
     }
     // The exact native class takes the normal builtin constructor path.
