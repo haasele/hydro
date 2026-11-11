@@ -17717,7 +17717,7 @@ fn pickle_load(args: &[i64]) -> i64 {
 /// buffers.
 fn pickle_call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "dumps" => {
+        "dumps" | "_dumps" => {
             if let Err(raised) = pickle_check_protocol(args.get(1).copied().unwrap_or(NONE)) {
                 return raised;
             }
@@ -17726,7 +17726,7 @@ fn pickle_call(function: &str, args: &[i64]) -> i64 {
                 Err(error) => pickle_error(error, false),
             }
         }
-        "dump" => {
+        "dump" | "_dump" => {
             if let Err(raised) = pickle_check_protocol(args.get(2).copied().unwrap_or(NONE)) {
                 return raised;
             }
@@ -17760,7 +17760,7 @@ fn pickle_call(function: &str, args: &[i64]) -> i64 {
         // UTF-8 `bytes` form decode; a CPython binary stream raises
         // `UnpicklingError` with the format mismatch instead of a silent
         // success or a bare `TypeError`.
-        "loads" => {
+        "loads" | "_loads" => {
             let data: Vec<u8> = if let Some(text) = value::as_str(args[0]) {
                 text.as_bytes().to_vec()
             } else if let Some(bytes) = value::as_bytes(args[0]) {
@@ -17778,7 +17778,7 @@ fn pickle_call(function: &str, args: &[i64]) -> i64 {
             };
             pickle_decode_bytes(&data)
         }
-        "load" => pickle_load(args),
+        "load" | "_load" => pickle_load(args),
         "decode_long" => pickle_decode_long(args),
         "Pickler" => pickle_pickler_new(args),
         "_Pickler" => pickle_pickler_new_for(pickle_pickler_base_class(), args),

@@ -1813,6 +1813,10 @@ pub static PICKLE: ModuleSpec = ModuleSpec {
             &["obj", "file", "protocol", "fix_imports", "buffer_callback"],
         ),
         f("loads", 1, 1, Type::Any),
+        f("_loads", 1, 1, Type::Any),
+        f("_dumps", 1, 2, Type::Str),
+        f("_load", 1, 5, Type::Any),
+        f("_dump", 2, 5, Type::None),
         // `load(file, *, fix_imports=True, encoding="ASCII",
         // errors="strict", buffers=None)`: reads the HYD1 payload back from a
         // file object. The keyword-only options are accepted for signature
