@@ -8,6 +8,21 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-11-11 dynamic execution and official-cluster follow-up
+
+- Discovered `.py` modules now execute into their module namespace at runtime;
+  `TestResult` native methods are rooted during cache construction, so
+  `unittest.main()` no longer receives a `None` result.
+- `tempfile` keyword calls (`TemporaryFile(*args, **kwargs)`, `mkstemp`, etc.)
+  bind through a dedicated keyword dispatcher; canonical `str`/`bytes` type
+  values fix `_infer_return_type` assertions.
+- Runtime-compiled `yield`/`yield from` use the existing fiber generator path;
+  colorized argparse usage/help/errors honor `_colorize`.
+- Builtin scalar attributes expose bound methods (`''.join`), `re.escape`
+  follows CPython's special-character set, and `_loads`/`_dumps`/`_load`/
+  `_dump` aliases are registered.
+- Workspace suite: **3291 passed, 1 skipped**; clippy/fmt/verify green.
+
 ### Compatibility — 2026-11-11 unittest/module/contextlib stabilisation
 
 - Native `unittest` class methods are rooted while cached classes are built,
