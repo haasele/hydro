@@ -1046,11 +1046,141 @@ fn cached_module_class(name: &str) -> i64 {
     if let Some(class) = globals::registry_get(&key) {
         return class;
     }
-    let class = value::class_new(name.to_string(), NONE, Vec::new());
+    if !is_help_formatter_name(name) {
+        let class = value::class_new(name.to_string(), NONE, Vec::new());
+        let roots = crate::heap::root_values(std::slice::from_ref(&class));
+        globals::registry_set(&key, class);
+        crate::heap::release_roots(roots);
+        return class;
+    }
+    // A formatter is a real class: CPython constructs it with `prog` and reads
+    // the layout parameters from the resulting instance. `HelpFormatter` owns
+    // the constructor; the specialized formatters derive from it.
+    if name == "HelpFormatter" {
+        let init = help_formatter_init();
+        let roots = crate::heap::root_values(std::slice::from_ref(&init));
+        let class = value::class_new_full(
+            name.to_string(),
+            NONE,
+            vec![("__init__".to_string(), init, MethodKind::Normal)],
+            Vec::new(),
+        );
+        let class_roots = crate::heap::root_values(std::slice::from_ref(&class));
+        globals::registry_set(&key, class);
+        crate::heap::release_roots(class_roots);
+        crate::heap::release_roots(roots);
+        return class;
+    }
+    let base = cached_module_class("HelpFormatter");
+    let class = value::class_new_full(name.to_string(), base, Vec::new(), Vec::new());
     let roots = crate::heap::root_values(std::slice::from_ref(&class));
     globals::registry_set(&key, class);
     crate::heap::release_roots(roots);
     class
+}
+
+/// The public `argparse` help formatters.
+fn is_help_formatter_name(name: &str) -> bool {
+    matches!(
+        name,
+        "HelpFormatter"
+            | "RawTextHelpFormatter"
+            | "RawDescriptionHelpFormatter"
+            | "ArgumentDefaultsHelpFormatter"
+            | "MetavarTypeHelpFormatter"
+    )
+}
+
+/// Default formatter width. CPython uses `shutil.get_terminal_size().columns
+/// - 2`; the runtime keeps the historical 80-column layout so plain output is
+///   byte-identical.
+const DEFAULT_FORMATTER_WIDTH: i64 = 80;
+
+/// `HelpFormatter.__init__(prog, indent_increment=2, max_help_position=24,
+/// width=None, color=True)`.
+///
+/// The instance records the layout parameters the way CPython does, so a
+/// Python subclass (or a `formatter_class` callable returning a formatter)
+/// controls the layout of `format_help`.
+fn help_formatter_init() -> i64 {
+    let function = value::native_function_new("argparse", "HelpFormatter.__init__", usize::MAX);
+    value::function_set_signature(
+        function,
+        vec![
+            self_param(),
+            ParamMeta {
+                name: "prog".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            ParamMeta {
+                name: "indent_increment".to_string(),
+                kind: ParamKind::Positional,
+                default: Some(tagged_int(2)),
+            },
+            ParamMeta {
+                name: "max_help_position".to_string(),
+                kind: ParamKind::Positional,
+                default: Some(tagged_int(24)),
+            },
+            ParamMeta {
+                name: "width".to_string(),
+                kind: ParamKind::Positional,
+                default: Some(NONE),
+            },
+            ParamMeta {
+                name: "color".to_string(),
+                kind: ParamKind::Positional,
+                default: Some(value::TRUE),
+            },
+        ],
+    );
+    value::function_set_full_entry(function, help_formatter_init_entry as *const () as usize);
+    function
+}
+
+extern "C" fn help_formatter_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: signature slots are `(self, prog, indent_increment,
+    // max_help_position, width, color)`.
+    let instance = unsafe { *argv };
+    let indent = unsafe { *argv.add(2) };
+    let max_help = unsafe { *argv.add(3) };
+    let width = unsafe { *argv.add(4) };
+    let Some(indent_increment) = value::as_integer(indent) else {
+        return type_error("HelpFormatter() indent_increment must be an integer");
+    };
+    let Some(max_help_position) = value::as_integer(max_help) else {
+        return type_error("HelpFormatter() max_help_position must be an integer");
+    };
+    let width = if width == NONE {
+        DEFAULT_FORMATTER_WIDTH
+    } else {
+        let Some(width) = value::as_integer(width) else {
+            return type_error("HelpFormatter() width must be an integer or None");
+        };
+        width
+    };
+    let indent_increment = indent_increment.max(0);
+    // CPython clamps `max_help_position` against the width and indent.
+    let max_help_position = max_help_position.min(
+        width
+            .saturating_sub(20)
+            .max(indent_increment.saturating_mul(2)),
+    );
+    let roots = crate::heap::root_values(std::slice::from_ref(&instance));
+    value::instance_setattr(
+        instance,
+        "_indent_increment".to_string(),
+        tagged_int(indent_increment),
+    );
+    value::instance_setattr(
+        instance,
+        "_max_help_position".to_string(),
+        tagged_int(max_help_position),
+    );
+    value::instance_setattr(instance, "_width".to_string(), tagged_int(width));
+    crate::heap::release_roots(roots);
+    NONE
 }
 
 // -------------------------------------------------------------------------
@@ -2206,12 +2336,13 @@ fn get_default(parser: i64, args: &[i64]) -> i64 {
 // -------------------------------------------------------------------------
 
 /// Snapshot of the parser definition used by the scanner and formatter.
+#[derive(Clone)]
 struct View {
     prog: String,
     usage: Option<String>,
     description: Option<String>,
     epilog: Option<String>,
-    formatter_name: Option<String>,
+    formatter_class: i64,
     prefix_chars: String,
     fromfile_prefix_chars: Option<String>,
     allow_abbrev: bool,
@@ -2225,29 +2356,26 @@ struct View {
 }
 
 impl View {
+    /// Whether the active formatter derives from `name`.
+    fn formatter_is(&self, name: &str) -> bool {
+        value::is_subclass_of(self.formatter_class, cached_module_class(name))
+    }
+
     fn allocator_formatter(&self) -> bool {
-        matches!(
-            self.formatter_name.as_deref(),
-            Some("ArgumentDefaultsHelpFormatter")
-        )
+        self.formatter_is("ArgumentDefaultsHelpFormatter")
     }
 
     fn metavar_formatter(&self) -> bool {
-        matches!(
-            self.formatter_name.as_deref(),
-            Some("MetavarTypeHelpFormatter")
-        )
+        self.formatter_is("MetavarTypeHelpFormatter")
     }
 
     fn raw_description(&self) -> bool {
-        matches!(
-            self.formatter_name.as_deref(),
-            Some("RawTextHelpFormatter") | Some("RawDescriptionHelpFormatter")
-        )
+        self.formatter_is("RawTextHelpFormatter")
+            || self.formatter_is("RawDescriptionHelpFormatter")
     }
 
     fn raw_text(&self) -> bool {
-        matches!(self.formatter_name.as_deref(), Some("RawTextHelpFormatter"))
+        self.formatter_is("RawTextHelpFormatter")
     }
 
     /// The display group holding `spec`'s help entry.
@@ -2267,7 +2395,7 @@ fn view(parser: i64) -> Option<View> {
         usage: state.usage.clone(),
         description: state.description.clone(),
         epilog: state.epilog.clone(),
-        formatter_name: value::class_display_name(state.formatter_class).map(str::to_string),
+        formatter_class: state.formatter_class,
         prefix_chars: state.prefix_chars.clone(),
         fromfile_prefix_chars: state.fromfile_prefix_chars.clone(),
         allow_abbrev: state.allow_abbrev,
@@ -4029,8 +4157,85 @@ impl HelpEntry {
     }
 }
 
+/// Layout parameters CPython's `HelpFormatter` reads from its instance.
+#[derive(Clone, Copy)]
+struct FormatterLayout {
+    indent_increment: usize,
+    max_help_position: usize,
+    width: usize,
+}
+
+impl Default for FormatterLayout {
+    fn default() -> Self {
+        Self {
+            indent_increment: 2,
+            max_help_position: 24,
+            width: DEFAULT_FORMATTER_WIDTH as usize,
+        }
+    }
+}
+
+/// Instantiates `formatter_class(prog)` and copies its layout parameters.
+///
+/// `view.formatter_class` is replaced with the instance's class, so behaviour
+/// (`RawTextHelpFormatter`, `ArgumentDefaultsHelpFormatter`, ...) follows
+/// subclasses and callables that return a formatter, exactly as CPython reads
+/// the overridden methods from the constructed formatter.
+fn resolve_formatter_layout(view: &mut View) -> FormatterLayout {
+    let mut layout = FormatterLayout::default();
+    if view.formatter_class == NONE {
+        return layout;
+    }
+    let prog = text_value(&view.prog);
+    let roots = crate::heap::root_values(std::slice::from_ref(&prog));
+    let instance = crate::core::builtins::call(view.formatter_class, 1, [prog].as_ptr());
+    let instance_roots = crate::heap::root_values(std::slice::from_ref(&instance));
+    crate::heap::release_roots(roots);
+    if exc::pending() {
+        crate::heap::release_roots(instance_roots);
+        return layout;
+    }
+    if let Some(state) = value::as_instance(instance) {
+        view.formatter_class = state.class;
+    }
+    layout.indent_increment =
+        formatter_layout_attr(instance, "_indent_increment", layout.indent_increment);
+    if !exc::pending() {
+        layout.max_help_position =
+            formatter_layout_attr(instance, "_max_help_position", layout.max_help_position);
+    }
+    if !exc::pending() {
+        layout.width = formatter_layout_attr(instance, "_width", layout.width);
+    }
+    crate::heap::release_roots(instance_roots);
+    layout
+}
+
+/// Reads a non-negative integer layout attribute, falling back to `default`
+/// when the formatter does not define it.
+fn formatter_layout_attr(instance: i64, name: &str, default: usize) -> usize {
+    let attribute = crate::core::methods::getattr(instance, name.as_ptr(), name.len());
+    if exc::pending() {
+        if exc::pending_tag() == i64::from(ATTRIBUTE_ERROR) {
+            exc::clear();
+        }
+        return default;
+    }
+    match value::as_integer(attribute) {
+        Some(number) => number.max(0) as usize,
+        None => default,
+    }
+}
+
 fn format_help_text(view: &View) -> String {
+    let mut resolved = view.clone();
+    let layout = resolve_formatter_layout(&mut resolved);
+    if exc::pending() {
+        return String::new();
+    }
+    let view = &resolved;
     let palette = active_palette(view.color);
+    let indent = layout.indent_increment;
     let mut sections: Vec<(String, Vec<HelpEntry>)> = Vec::new();
 
     // Positional arguments (including the subparsers action).
@@ -4039,14 +4244,14 @@ fn format_help_text(view: &View) -> String {
         if spec.help == SUPPRESS {
             continue;
         }
-        positional_entries.push(HelpEntry::new(view, spec, &palette, 2));
+        positional_entries.push(HelpEntry::new(view, spec, &palette, indent));
     }
     if let Some(subparsers) = &view.subparsers {
         positional_entries.push(HelpEntry {
             invoked: subparser_metavar(subparsers),
             invoked_colored: palette.paint(&palette.action, &subparser_metavar(subparsers)),
             help: String::new(),
-            indent: 2,
+            indent,
         });
         for (name, _, help) in &subparsers.parsers {
             // CPython lists only choices that declare a help text.
@@ -4057,7 +4262,7 @@ fn format_help_text(view: &View) -> String {
                 invoked: name.clone(),
                 invoked_colored: palette.paint(&palette.action, name),
                 help: help.clone(),
-                indent: 4,
+                indent: indent.saturating_mul(2),
             });
         }
     }
@@ -4075,7 +4280,7 @@ fn format_help_text(view: &View) -> String {
         if spec.help == SUPPRESS {
             continue;
         }
-        default_entries.push(HelpEntry::new(view, spec, &palette, 2));
+        default_entries.push(HelpEntry::new(view, spec, &palette, indent));
     }
     if !default_entries.is_empty() {
         sections.push(("options".to_string(), default_entries));
@@ -4092,7 +4297,7 @@ fn format_help_text(view: &View) -> String {
             if spec.help == SUPPRESS {
                 continue;
             }
-            entries.push(HelpEntry::new(view, spec, &palette, 2));
+            entries.push(HelpEntry::new(view, spec, &palette, indent));
         }
         if !entries.is_empty() {
             let title = group.title.clone().unwrap_or_else(|| "options".to_string());
@@ -4106,7 +4311,7 @@ fn format_help_text(view: &View) -> String {
         .map(|entry| entry.indent + entry.invoked.chars().count())
         .max()
         .unwrap_or(0);
-    let help_position = (max_invocation + 2).min(24);
+    let help_position = (max_invocation + 2).min(layout.max_help_position);
 
     let mut text = format_usage_text_with(view, &palette);
     if let Some(description) = &view.description {
@@ -4114,7 +4319,7 @@ fn format_help_text(view: &View) -> String {
         if view.raw_text() || view.raw_description() {
             text.push_str(description);
         } else {
-            text.push_str(&wrap_text(description, 80, 0));
+            text.push_str(&wrap_text(description, layout.width.max(11), 0));
         }
         text.push('\n');
     }
@@ -4142,8 +4347,14 @@ fn format_help_text(view: &View) -> String {
                 text.push('\n');
                 text.push_str(&" ".repeat(help_position));
             }
-            let width = 80usize.saturating_sub(help_position).max(11);
-            let wrapped = wrap_text(&entry.help, width, 0);
+            let width = layout.width.saturating_sub(help_position).max(11);
+            let wrapped = if view.raw_text() {
+                // `RawTextHelpFormatter._split_lines` returns the lines as
+                // written instead of re-filling them.
+                entry.help.lines().collect::<Vec<_>>().join("\n")
+            } else {
+                wrap_text(&entry.help, width, 0)
+            };
             for (line_index, line) in wrapped.split('\n').enumerate() {
                 if line_index > 0 {
                     text.push('\n');
@@ -4159,7 +4370,7 @@ fn format_help_text(view: &View) -> String {
         if view.raw_text() || view.raw_description() {
             text.push_str(epilog);
         } else {
-            text.push_str(&wrap_text(epilog, 80, 0));
+            text.push_str(&wrap_text(epilog, layout.width.max(11), 0));
         }
         text.push('\n');
     }

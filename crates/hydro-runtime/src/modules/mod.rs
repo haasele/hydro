@@ -130,8 +130,9 @@ pub(crate) mod zstd_native;
 
 use crate::container;
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, IMPORT_ERROR, INDEX_ERROR, NOT_IMPLEMENTED_ERROR, OS_ERROR,
-    OVERFLOW_ERROR, RECURSION_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR, VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, IMPORT_ERROR, INDEX_ERROR, LOOKUP_ERROR, NOT_IMPLEMENTED_ERROR,
+    OS_ERROR, OVERFLOW_ERROR, RECURSION_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR,
+    VALUE_ERROR,
 };
 use crate::heap;
 use crate::iter;
@@ -10515,7 +10516,14 @@ fn contextmanager_enter(manager: i64) -> i64 {
 /// throw()")`. A different escaping exception propagates unchanged. The
 /// error paths close the generator so its `finally` blocks run.
 fn contextmanager_exit(manager: i64, exc_type: i64, exception: i64, traceback: i64) -> i64 {
-    let _ = (exc_type, traceback);
+    let _ = traceback;
+    // `__exit__(ExcType, None, None)` still has to throw an instance of the
+    // type into the generator (CPython test_contextlib calls this directly).
+    let exception = if exception == NONE && exc_type != NONE {
+        exc_type
+    } else {
+        exception
+    };
     let generator = match contextmanager_generator(manager) {
         Ok(generator) => generator,
         Err(err) => return err,
@@ -29375,6 +29383,10 @@ pub(crate) fn io_open(args: &[i64]) -> i64 {
         Err(message) => return exc::raise_with_message(VALUE_ERROR, &message),
     };
 
+    // Text mode defaults to UTF-8; an explicit name is resolved before the
+    // file is opened so an unknown codec leaves no file behind.
+    let mut file_encoding = value::FileEncoding::Utf8;
+
     if mode.binary {
         // CPython rejects every text-only argument in binary mode instead of
         // ignoring it, so a caller cannot assume an encoding was applied.
@@ -29408,25 +29420,26 @@ pub(crate) fn io_open(args: &[i64]) -> i64 {
                 );
             }
         }
+        // Slot 3 is `encoding`; the name is resolved before the file is
+        // opened, so an unknown codec raises `LookupError` without creating
+        // or truncating the path.
         if let Some(arg) = args.get(3).copied() {
             if arg != NONE {
-                match value::as_str(arg) {
-                    Some(encoding) => {
-                        let normalized = encoding.to_ascii_lowercase();
-                        if normalized != "utf-8" && normalized != "utf8" {
-                            return exc::raise_with_message(
-                                VALUE_ERROR,
-                                &format!("unsupported encoding: '{encoding}'"),
-                            );
-                        }
-                    }
+                let Some(name) = value::as_str(arg) else {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!(
+                            "open() argument 'encoding' must be str or None, not {}",
+                            value::type_name(arg)
+                        ),
+                    );
+                };
+                match value::FileEncoding::from_name(name) {
+                    Some(encoding) => file_encoding = encoding,
                     None => {
                         return exc::raise_with_message(
-                            TYPE_ERROR,
-                            &format!(
-                                "open() argument 'encoding' must be str or None, not {}",
-                                value::type_name(arg)
-                            ),
+                            LOOKUP_ERROR,
+                            &format!("unknown encoding: {name}"),
                         )
                     }
                 }
@@ -29452,13 +29465,7 @@ pub(crate) fn io_open(args: &[i64]) -> i64 {
     match (mode.base, mode.binary, mode.plus) {
         ('r', binary, false) => match std::fs::read(&path) {
             Ok(content) if binary => value::file_new_read_bytes(path, content),
-            Ok(content) => match String::from_utf8(content) {
-                Ok(text) => value::file_new_read(path, text),
-                Err(error) => exc::raise_with_message(
-                    VALUE_ERROR,
-                    &format!("invalid UTF-8 in input: '{path}': {error}"),
-                ),
-            },
+            Ok(content) => value::file_new_read_encoded(path, content, file_encoding),
             Err(error) => os_failure(&path, &error),
         },
         (base, binary, plus) => {
@@ -29503,8 +29510,10 @@ pub(crate) fn io_open(args: &[i64]) -> i64 {
                 }
             };
             match opened {
-                Ok(file) if plus => value::file_new_read_write(path, base, file, binary),
-                Ok(file) => value::file_new_write(path, base, file, binary),
+                Ok(file) if plus => {
+                    value::file_new_read_write_encoded(path, base, file, binary, file_encoding)
+                }
+                Ok(file) => value::file_new_write_encoded(path, base, file, binary, file_encoding),
                 Err(error) => os_failure(&path, &error),
             }
         }

@@ -1354,13 +1354,22 @@ pub(crate) enum FileError {
     /// I/O failure, including mode mismatches such as reading a
     /// write-only file (`OSError`).
     Os(String),
+    /// The stream bytes are not valid in the file's encoding
+    /// (`UnicodeDecodeError`).
+    UnicodeDecode(String),
+    /// The text being written is not representable in the file's encoding
+    /// (`UnicodeEncodeError`).
+    UnicodeEncode(String),
 }
 
 impl FileError {
     pub(crate) fn message(&self) -> &str {
         match self {
             FileError::Closed => "I/O operation on closed file",
-            FileError::Value(message) | FileError::Os(message) => message,
+            FileError::Value(message)
+            | FileError::Os(message)
+            | FileError::UnicodeDecode(message)
+            | FileError::UnicodeEncode(message) => message,
         }
     }
 }
@@ -1373,6 +1382,396 @@ pub(crate) fn raise_file_error(err: FileError) -> i64 {
             crate::exc::raise_with_message(crate::exc::VALUE_ERROR, err.message())
         }
         FileError::Os(_) => crate::exc::raise_with_message(crate::exc::OS_ERROR, err.message()),
+        FileError::UnicodeDecode(_) => {
+            crate::exc::raise_with_message(crate::exc::UNICODE_DECODE_ERROR, err.message())
+        }
+        FileError::UnicodeEncode(_) => {
+            crate::exc::raise_with_message(crate::exc::UNICODE_ENCODE_ERROR, err.message())
+        }
+    }
+}
+
+/// Text codec used by a native file object.
+///
+/// The file layer implements the encodings `io.open` needs for round-tripping
+/// text; unknown names are rejected by the caller with `LookupError`.
+/// `Utf16`/`Utf32` are the byte-order-mark forms: decoding inspects the
+/// stream's first bytes to choose an endianness (native when no BOM is
+/// present), and writing emits the BOM once, at the start of an empty stream.
+/// The `_le`/`_be` variants are the explicit BOM-less codecs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileEncoding {
+    Utf8,
+    Utf8Sig,
+    Utf16,
+    Utf16Le,
+    Utf16Be,
+    Utf32,
+    Utf32Le,
+    Utf32Be,
+    Latin1,
+    Ascii,
+}
+
+/// CPython's encoding-name normalization: ASCII alphanumerics are lowercased,
+/// `.` is kept, and every other run of characters becomes a single `_`
+/// (non-ASCII characters contribute nothing).
+fn normalize_file_encoding(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut punct = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() || character == '.' {
+            if punct && !out.is_empty() {
+                out.push('_');
+            }
+            if character.is_ascii() {
+                out.push(character.to_ascii_lowercase());
+            }
+            punct = false;
+        } else {
+            punct = true;
+        }
+    }
+    out
+}
+
+fn native_utf16() -> FileEncoding {
+    if cfg!(target_endian = "little") {
+        FileEncoding::Utf16Le
+    } else {
+        FileEncoding::Utf16Be
+    }
+}
+
+fn native_utf32() -> FileEncoding {
+    if cfg!(target_endian = "little") {
+        FileEncoding::Utf32Le
+    } else {
+        FileEncoding::Utf32Be
+    }
+}
+
+impl FileEncoding {
+    /// Resolves an encoding name, including the CPython aliases, to a codec
+    /// this file layer implements. `None` means the name is unknown and the
+    /// caller raises `LookupError`.
+    pub(crate) fn from_name(name: &str) -> Option<FileEncoding> {
+        if name.contains('\0') {
+            return None;
+        }
+        let normalized = normalize_file_encoding(name);
+        Some(match normalized.as_str() {
+            "utf_8" | "utf8" | "u8" | "cp65001" => FileEncoding::Utf8,
+            "utf_8_sig" | "utf8_sig" => FileEncoding::Utf8Sig,
+            "ascii" | "us_ascii" | "us" | "646" | "ansi_x3.4.1968" => FileEncoding::Ascii,
+            "latin_1" | "latin1" | "latin" | "iso8859_1" | "iso_8859_1" | "iso_latin_1" | "l1"
+            | "cp819" | "8859" | "819" | "iso8859" | "cp28591" => FileEncoding::Latin1,
+            "utf_16" | "utf16" | "u16" | "unicodelittleunmarked" => FileEncoding::Utf16,
+            "utf_16_le" | "utf16_le" | "utf_16le" | "utf16le" | "unicodelittle" => {
+                FileEncoding::Utf16Le
+            }
+            "utf_16_be" | "utf16_be" | "utf_16be" | "utf16be" | "unicodebig"
+            | "unicodebigunmarked" => FileEncoding::Utf16Be,
+            "utf_32" | "utf32" | "u32" => FileEncoding::Utf32,
+            "utf_32_le" | "utf32_le" | "utf_32le" | "utf32le" => FileEncoding::Utf32Le,
+            "utf_32_be" | "utf32_be" | "utf_32be" | "utf32be" => FileEncoding::Utf32Be,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            FileEncoding::Utf8 => "utf-8",
+            FileEncoding::Utf8Sig => "utf-8-sig",
+            FileEncoding::Utf16 => "utf-16",
+            FileEncoding::Utf16Le => "utf-16-le",
+            FileEncoding::Utf16Be => "utf-16-be",
+            FileEncoding::Utf32 => "utf-32",
+            FileEncoding::Utf32Le => "utf-32-le",
+            FileEncoding::Utf32Be => "utf-32-be",
+            FileEncoding::Latin1 => "latin-1",
+            FileEncoding::Ascii => "ascii",
+        }
+    }
+
+    fn native(self) -> FileEncoding {
+        match self {
+            FileEncoding::Utf16 => native_utf16(),
+            FileEncoding::Utf32 => native_utf32(),
+            other => other,
+        }
+    }
+
+    /// Whether writing this codec at the start of an empty stream emits a
+    /// byte-order mark. Only the BOM forms do; the explicit `_le`/`_be`
+    /// codecs leave the stream untouched.
+    fn writes_bom(self) -> bool {
+        matches!(
+            self,
+            FileEncoding::Utf16 | FileEncoding::Utf32 | FileEncoding::Utf8Sig
+        )
+    }
+
+    /// Resolves a BOM form against the first bytes of the stream, returning
+    /// the concrete codec and the number of BOM bytes to skip.
+    fn detect(self, head: &[u8]) -> (FileEncoding, usize) {
+        match self {
+            FileEncoding::Utf16 => {
+                if head.starts_with(&[0xFF, 0xFE]) {
+                    (FileEncoding::Utf16Le, 2)
+                } else if head.starts_with(&[0xFE, 0xFF]) {
+                    (FileEncoding::Utf16Be, 2)
+                } else {
+                    (native_utf16(), 0)
+                }
+            }
+            FileEncoding::Utf32 => {
+                if head.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+                    (FileEncoding::Utf32Le, 4)
+                } else if head.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
+                    (FileEncoding::Utf32Be, 4)
+                } else {
+                    (native_utf32(), 0)
+                }
+            }
+            FileEncoding::Utf8Sig => {
+                if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                    (FileEncoding::Utf8, 3)
+                } else {
+                    (FileEncoding::Utf8, 0)
+                }
+            }
+            other => (other, 0),
+        }
+    }
+
+    /// BOM bytes this codec writes for a concrete resolved encoding.
+    fn bom_bytes(self, resolved: FileEncoding) -> Vec<u8> {
+        match self {
+            FileEncoding::Utf16 => match resolved {
+                FileEncoding::Utf16Be => vec![0xFE, 0xFF],
+                _ => vec![0xFF, 0xFE],
+            },
+            FileEncoding::Utf32 => match resolved {
+                FileEncoding::Utf32Be => vec![0x00, 0x00, 0xFE, 0xFF],
+                _ => vec![0xFF, 0xFE, 0x00, 0x00],
+            },
+            FileEncoding::Utf8Sig => vec![0xEF, 0xBB, 0xBF],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Byte length of `text` in this codec, excluding any BOM.
+    fn byte_len(self, text: &str) -> usize {
+        match self.native() {
+            FileEncoding::Utf8 | FileEncoding::Utf8Sig => text.len(),
+            FileEncoding::Ascii | FileEncoding::Latin1 => text.chars().count(),
+            FileEncoding::Utf16Le | FileEncoding::Utf16Be => str_codes(text)
+                .map(|code| if code <= 0xFFFF { 2 } else { 4 })
+                .sum(),
+            FileEncoding::Utf32Le | FileEncoding::Utf32Be => str_codes(text).count() * 4,
+            FileEncoding::Utf16 | FileEncoding::Utf32 => unreachable!("resolved above"),
+        }
+    }
+}
+
+/// Builds the `UnicodeDecodeError` message for a malformed byte sequence.
+fn decode_failure(
+    encoding: FileEncoding,
+    position: usize,
+    byte: Option<u8>,
+    reason: &str,
+) -> FileError {
+    let detail = match byte {
+        Some(byte) => format!("byte 0x{byte:02x} in position {position}: {reason}"),
+        None => format!("bytes in position {position}: {reason}"),
+    };
+    FileError::UnicodeDecode(format!("'{}' codec can't decode {detail}", encoding.name()))
+}
+
+/// Builds the `UnicodeEncodeError` message for an unrepresentable code point.
+fn encode_failure(encoding: FileEncoding, code: u32, position: usize) -> FileError {
+    FileError::UnicodeEncode(format!(
+        "'{}' codec can't encode character '\\u{{{code:x}}}' in position {position}: \
+         character is not representable in the codec",
+        encoding.name()
+    ))
+}
+
+/// Encodes `text` with a concrete codec (the BOM is written separately).
+fn encode_file_text(text: &str, encoding: FileEncoding) -> Result<Vec<u8>, FileError> {
+    let encoding = encoding.native();
+    let mut out = Vec::with_capacity(encoding.byte_len(text));
+    match encoding {
+        FileEncoding::Utf8 | FileEncoding::Utf8Sig => {
+            for (position, code) in str_codes(text).enumerate() {
+                let Some(character) = char::from_u32(code) else {
+                    return Err(encode_failure(encoding, code, position));
+                };
+                let mut buffer = [0u8; 4];
+                out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            }
+        }
+        FileEncoding::Ascii | FileEncoding::Latin1 => {
+            let limit = if encoding == FileEncoding::Ascii {
+                0x7F
+            } else {
+                0xFF
+            };
+            for (position, code) in str_codes(text).enumerate() {
+                if code > limit {
+                    return Err(encode_failure(encoding, code, position));
+                }
+                out.push(code as u8);
+            }
+        }
+        FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
+            let little = encoding == FileEncoding::Utf16Le;
+            for (position, code) in str_codes(text).enumerate() {
+                if code > 0x10FFFF || (0xD800..=0xDFFF).contains(&code) {
+                    return Err(encode_failure(encoding, code, position));
+                }
+                if code < 0x10000 {
+                    let unit = code as u16;
+                    let bytes = if little {
+                        unit.to_le_bytes()
+                    } else {
+                        unit.to_be_bytes()
+                    };
+                    out.extend_from_slice(&bytes);
+                } else {
+                    let value = code - 0x10000;
+                    let high = 0xD800 + (value >> 10) as u16;
+                    let low = 0xDC00 + (value & 0x3FF) as u16;
+                    for unit in [high, low] {
+                        let bytes = if little {
+                            unit.to_le_bytes()
+                        } else {
+                            unit.to_be_bytes()
+                        };
+                        out.extend_from_slice(&bytes);
+                    }
+                }
+            }
+        }
+        FileEncoding::Utf32Le | FileEncoding::Utf32Be => {
+            let little = encoding == FileEncoding::Utf32Le;
+            for (position, code) in str_codes(text).enumerate() {
+                if code > 0x10FFFF || (0xD800..=0xDFFF).contains(&code) {
+                    return Err(encode_failure(encoding, code, position));
+                }
+                let bytes = if little {
+                    code.to_le_bytes()
+                } else {
+                    code.to_be_bytes()
+                };
+                out.extend_from_slice(&bytes);
+            }
+        }
+        FileEncoding::Utf16 | FileEncoding::Utf32 => unreachable!("resolved above"),
+    }
+    Ok(out)
+}
+
+/// Decodes `bytes` with a concrete codec. Any BOM has already been stripped
+/// by the caller.
+fn decode_file_text(bytes: &[u8], encoding: FileEncoding) -> Result<String, FileError> {
+    match encoding.native() {
+        FileEncoding::Utf8 | FileEncoding::Utf8Sig => match std::str::from_utf8(bytes) {
+            Ok(text) => Ok(text.to_string()),
+            Err(error) => {
+                let position = error.valid_up_to();
+                Err(decode_failure(
+                    encoding,
+                    position,
+                    bytes.get(position).copied(),
+                    "invalid data",
+                ))
+            }
+        },
+        FileEncoding::Ascii | FileEncoding::Latin1 => {
+            if encoding == FileEncoding::Ascii {
+                if let Some((position, byte)) = bytes
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .find(|(_, byte)| *byte > 0x7F)
+                {
+                    return Err(decode_failure(
+                        encoding,
+                        position,
+                        Some(byte),
+                        "ordinal not in range(128)",
+                    ));
+                }
+            }
+            Ok(bytes.iter().map(|byte| *byte as char).collect())
+        }
+        FileEncoding::Utf16Le | FileEncoding::Utf16Be => {
+            if !bytes.len().is_multiple_of(2) {
+                return Err(decode_failure(
+                    encoding,
+                    bytes.len(),
+                    None,
+                    "truncated data",
+                ));
+            }
+            let little = encoding == FileEncoding::Utf16Le;
+            let units = bytes.as_chunks::<2>().0.iter().map(|pair| {
+                if little {
+                    u16::from_le_bytes(*pair)
+                } else {
+                    u16::from_be_bytes(*pair)
+                }
+            });
+            let mut text = String::with_capacity(bytes.len() / 2);
+            for (index, decoded) in char::decode_utf16(units).enumerate() {
+                match decoded {
+                    Ok(character) => text.push(character),
+                    Err(_) => {
+                        return Err(decode_failure(
+                            encoding,
+                            index * 2,
+                            bytes.get(index * 2).copied(),
+                            "illegal UTF-16 surrogate",
+                        ))
+                    }
+                }
+            }
+            Ok(text)
+        }
+        FileEncoding::Utf32Le | FileEncoding::Utf32Be => {
+            if !bytes.len().is_multiple_of(4) {
+                return Err(decode_failure(
+                    encoding,
+                    bytes.len(),
+                    None,
+                    "truncated data",
+                ));
+            }
+            let little = encoding == FileEncoding::Utf32Le;
+            let mut text = String::with_capacity(bytes.len() / 4);
+            for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+                let code = if little {
+                    u32::from_le_bytes(*chunk)
+                } else {
+                    u32::from_be_bytes(*chunk)
+                };
+                match char::from_u32(code) {
+                    Some(character) => text.push(character),
+                    None => {
+                        return Err(decode_failure(
+                            encoding,
+                            index * 4,
+                            bytes.get(index * 4).copied(),
+                            "code point not in range(0x110000)",
+                        ))
+                    }
+                }
+            }
+            Ok(text)
+        }
+        FileEncoding::Utf16 | FileEncoding::Utf32 => unreachable!("resolved above"),
     }
 }
 
@@ -1440,6 +1839,14 @@ struct FileInner {
     /// for a binary read or read-write file, and the number of
     /// characters/bytes written for write-only mode.
     cursor: usize,
+    /// Concrete codec for text files. A BOM form (`Utf16`/`Utf32`) is
+    /// resolved against the stream's first bytes at construction, so later
+    /// reads and writes keep the endianness even after seeking past the BOM.
+    resolved: FileEncoding,
+    /// Bytes of the byte-order mark at the start of the stream, or 0 when the
+    /// stream carries none. Used to translate character seeks into byte
+    /// offsets without counting the BOM as a character.
+    bom: usize,
 }
 
 /// Shared state of a file object.
@@ -1455,6 +1862,10 @@ pub(crate) struct FileState {
     /// One of `r`, `w`, `a`, `x`; used by `repr`.
     mode: char,
     binary: bool,
+    /// Codec requested by `io.open`; the BOM forms keep their identity here
+    /// so the first write can emit the mark while [`FileInner::resolved`]
+    /// carries the concrete endianness.
+    encoding: FileEncoding,
     /// Current native `io` class, set at construction and adjusted by the
     /// `io.FileIO` constructor. Buffered wrappers create a separate view with
     /// their own class rather than rewriting this one.
@@ -1463,14 +1874,21 @@ pub(crate) struct FileState {
 
 impl FileState {
     fn new_read(path: String, content: String) -> FileState {
+        FileState::new_read_with_encoding(path, content, FileEncoding::Utf8)
+    }
+
+    fn new_read_with_encoding(path: String, content: String, encoding: FileEncoding) -> FileState {
         FileState {
             inner: Arc::new(Mutex::new(FileInner {
                 body: Some(FileBody::Read(content.chars().collect())),
                 cursor: 0,
+                resolved: encoding,
+                bom: 0,
             })),
             path,
             mode: 'r',
             binary: false,
+            encoding,
             class: AtomicU8::new(FileClass::TextIOWrapper.tag()),
         }
     }
@@ -1480,10 +1898,13 @@ impl FileState {
             inner: Arc::new(Mutex::new(FileInner {
                 body: Some(FileBody::ReadBytes(content)),
                 cursor: 0,
+                resolved: FileEncoding::Utf8,
+                bom: 0,
             })),
             path,
             mode: 'r',
             binary: true,
+            encoding: FileEncoding::Utf8,
             class: AtomicU8::new(FileClass::BufferedReader.tag()),
         }
     }
@@ -1493,10 +1914,13 @@ impl FileState {
             inner: Arc::new(Mutex::new(FileInner {
                 body: Some(FileBody::Pipe(std::io::BufReader::new(reader))),
                 cursor: 0,
+                resolved: FileEncoding::Utf8,
+                bom: 0,
             })),
             path: "<pipe>".to_string(),
             mode: 'r',
             binary,
+            encoding: FileEncoding::Utf8,
             class: AtomicU8::new(if binary {
                 FileClass::BufferedReader.tag()
             } else {
@@ -1505,7 +1929,13 @@ impl FileState {
         }
     }
 
-    fn new_write(path: String, mode: char, file: std::fs::File, binary: bool) -> FileState {
+    fn new_write(
+        path: String,
+        mode: char,
+        file: std::fs::File,
+        binary: bool,
+        encoding: FileEncoding,
+    ) -> FileState {
         let class = if binary {
             FileClass::BufferedWriter
         } else {
@@ -1515,10 +1945,13 @@ impl FileState {
             inner: Arc::new(Mutex::new(FileInner {
                 body: Some(FileBody::Write(file)),
                 cursor: 0,
+                resolved: encoding.native(),
+                bom: 0,
             })),
             path,
             mode,
             binary,
+            encoding,
             class: AtomicU8::new(class.tag()),
         }
     }
@@ -1526,15 +1959,37 @@ impl FileState {
     /// Opens a file body that can be read and written through one handle.
     ///
     /// Append mode starts at end-of-file, matching CPython's initial `tell()`;
-    /// for text files the cursor is the character count, so the whole (valid
-    /// UTF-8) content is scanned once at construction.
+    /// for text files the cursor is the character count, so the stream is
+    /// decoded once at construction. The BOM form is resolved here from the
+    /// stream's first bytes; doing it once keeps reads and writes aligned with
+    /// the existing byte order even when a seek has already passed the mark.
     fn new_read_write(
         path: String,
         mode: char,
         mut file: std::fs::File,
         binary: bool,
+        encoding: FileEncoding,
     ) -> FileState {
         use std::io::{Read as _, Seek as _};
+        let (resolved, bom) = if binary {
+            (FileEncoding::Utf8, 0)
+        } else {
+            let mut head = [0u8; 4];
+            let mut filled = 0;
+            if file.seek(std::io::SeekFrom::Start(0)).is_ok() {
+                while filled < head.len() {
+                    match file.read(&mut head[filled..]) {
+                        Ok(0) => break,
+                        Ok(read) => filled += read,
+                        Err(_) => break,
+                    }
+                }
+            }
+            encoding.detect(&head[..filled])
+        };
+        // The probe above moved the handle; read/write modes start at the
+        // beginning (append repositions to end below).
+        let _ = file.seek(std::io::SeekFrom::Start(0));
         let mut cursor = 0;
         if mode == 'a' {
             if let Ok(end) = file.seek(std::io::SeekFrom::End(0)) {
@@ -1544,7 +1999,10 @@ impl FileState {
                     if file.seek(std::io::SeekFrom::Start(0)).is_ok()
                         && file.read_to_end(&mut bytes).is_ok()
                     {
-                        cursor = String::from_utf8_lossy(&bytes).chars().count();
+                        if let Ok(text) = decode_file_text(&bytes[bom.min(bytes.len())..], resolved)
+                        {
+                            cursor = text.chars().count();
+                        }
                     }
                     let _ = file.seek(std::io::SeekFrom::End(0));
                 }
@@ -1559,10 +2017,13 @@ impl FileState {
             inner: Arc::new(Mutex::new(FileInner {
                 body: Some(FileBody::ReadWrite(file)),
                 cursor,
+                resolved,
+                bom,
             })),
             path,
             mode,
             binary,
+            encoding,
             class: AtomicU8::new(class.tag()),
         }
     }
@@ -1653,7 +2114,12 @@ impl FileState {
     /// negative).
     pub(crate) fn read(&self, limit: Option<i64>) -> Result<String, FileError> {
         let mut inner = self.lock();
-        let FileInner { body, cursor } = &mut *inner;
+        let FileInner {
+            body,
+            cursor,
+            resolved,
+            bom,
+        } = &mut *inner;
         if let Some(FileBody::Pipe(reader)) = body {
             let bytes = pipe_read(reader, limit, false)?;
             return Ok(String::from_utf8_lossy(&bytes).into_owned());
@@ -1664,11 +2130,10 @@ impl FileState {
                     "cannot read binary file as text".to_string(),
                 ));
             }
-            use std::io::Seek as _;
+            use std::io::{Read as _, Seek as _};
             let start = file
                 .stream_position()
                 .map_err(|error| FileError::Os(error.to_string()))?;
-            let text = read_file_text(&mut *file)?;
             let max = limit.and_then(|n| {
                 if n < 0 {
                     None
@@ -1676,13 +2141,32 @@ impl FileState {
                     Some(usize::try_from(n).unwrap_or(usize::MAX))
                 }
             });
-            let consumed = max.map_or(text.len(), |max| utf8_prefix_len(&text, max));
-            if consumed < text.len() {
+            if max == Some(0) {
+                return Ok(String::new());
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            // At the stream's first byte the BOM belongs to the encoding, not
+            // to the text; the cursor counts characters only.
+            let skip = if start == 0 {
+                (*bom).min(bytes.len())
+            } else {
+                0
+            };
+            let text = decode_file_text(&bytes[skip..], *resolved)?;
+            let total = text.chars().count();
+            if total == 0 {
+                return Ok(String::new());
+            }
+            let end = max.map_or(total, |max| max.min(total));
+            let taken: String = text.chars().take(end).collect();
+            let consumed = skip + (*resolved).byte_len(&taken);
+            if consumed < bytes.len() {
                 file.seek(std::io::SeekFrom::Start(start + consumed as u64))
                     .map_err(|error| FileError::Os(error.to_string()))?;
             }
-            let taken = text[..consumed].to_string();
-            *cursor = cursor.saturating_add(taken.chars().count());
+            *cursor = cursor.saturating_add(end);
             return Ok(taken);
         }
         let chars = read_chars(body)?;
@@ -1709,7 +2193,7 @@ impl FileState {
     /// them.
     pub(crate) fn read_bytes(&self, limit: Option<i64>) -> Result<Vec<u8>, FileError> {
         let mut inner = self.lock();
-        let FileInner { body, cursor } = &mut *inner;
+        let FileInner { body, cursor, .. } = &mut *inner;
         if let Some(FileBody::Pipe(reader)) = body {
             return pipe_read(reader, limit, false);
         }
@@ -1759,7 +2243,12 @@ impl FileState {
     /// at the end, matching CPython's `readline(0)`.
     pub(crate) fn readline(&self, limit: Option<i64>) -> Result<Option<String>, FileError> {
         let mut inner = self.lock();
-        let FileInner { body, cursor } = &mut *inner;
+        let FileInner {
+            body,
+            cursor,
+            resolved,
+            bom,
+        } = &mut *inner;
         if let Some(FileBody::Pipe(reader)) = body {
             let bytes = pipe_read(reader, limit, true)?;
             if bytes.is_empty() {
@@ -1773,15 +2262,10 @@ impl FileState {
                     "cannot read binary file as text".to_string(),
                 ));
             }
-            use std::io::Seek as _;
+            use std::io::{Read as _, Seek as _};
             let start = file
                 .stream_position()
                 .map_err(|error| FileError::Os(error.to_string()))?;
-            let text = read_file_text(&mut *file)?;
-            if text.is_empty() {
-                return Ok(None);
-            }
-            let chars: Vec<char> = text.chars().collect();
             let max = limit.and_then(|n| {
                 if n < 0 {
                     None
@@ -1789,20 +2273,36 @@ impl FileState {
                     Some(usize::try_from(n).unwrap_or(usize::MAX))
                 }
             });
-            let mut end = chars.len();
-            if let Some(index) = chars.iter().position(|ch| *ch == '\n') {
-                end = index + 1;
+            if max == Some(0) {
+                return Ok(Some(String::new()));
             }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            let skip = if start == 0 {
+                (*bom).min(bytes.len())
+            } else {
+                0
+            };
+            let text = decode_file_text(&bytes[skip..], *resolved)?;
+            let total = text.chars().count();
+            if total == 0 {
+                return Ok(None);
+            }
+            let mut end = text
+                .find('\n')
+                .map_or(total, |index| text[..=index].chars().count());
             if let Some(max) = max {
                 end = end.min(max);
             }
-            let consumed = utf8_prefix_len(&text, end);
-            if consumed < text.len() {
+            let taken: String = text.chars().take(end).collect();
+            let consumed = skip + (*resolved).byte_len(&taken);
+            if consumed < bytes.len() {
                 file.seek(std::io::SeekFrom::Start(start + consumed as u64))
                     .map_err(|error| FileError::Os(error.to_string()))?;
             }
             *cursor = cursor.saturating_add(end);
-            return Ok(Some(text[..consumed].to_string()));
+            return Ok(Some(taken));
         }
         let chars = read_chars(body)?;
         let start = *cursor;
@@ -1843,7 +2343,7 @@ impl FileState {
     /// and the returned line keeps its trailing `\n`.
     pub(crate) fn readline_bytes(&self, limit: Option<i64>) -> Result<Option<Vec<u8>>, FileError> {
         let mut inner = self.lock();
-        let FileInner { body, cursor } = &mut *inner;
+        let FileInner { body, cursor, .. } = &mut *inner;
         if let Some(FileBody::Pipe(reader)) = body {
             let bytes = pipe_read(reader, limit, true)?;
             return Ok(if bytes.is_empty() { None } else { Some(bytes) });
@@ -1943,8 +2443,14 @@ impl FileState {
     pub(crate) fn write(&self, text: &str) -> Result<usize, FileError> {
         let binary = self.binary;
         let append = self.mode == 'a';
+        let encoding = self.encoding;
         let mut inner = self.lock();
-        let FileInner { body, cursor } = &mut *inner;
+        let FileInner {
+            body,
+            cursor,
+            resolved,
+            bom,
+        } = &mut *inner;
         use std::io::Write as _;
         let read_write = matches!(body, Some(FileBody::ReadWrite(_)));
         let file = write_file(body)?;
@@ -1966,20 +2472,48 @@ impl FileState {
         } else {
             true
         };
-        file.write_all(text.as_bytes())
+        // The BOM is written once, when this codec needs one and the stream is
+        // empty at its first byte. An append to a non-empty stream therefore
+        // keeps the existing byte order and adds no second mark.
+        let include_bom = encoding.writes_bom() && !text.is_empty() && {
+            use std::io::Seek as _;
+            let position = file
+                .stream_position()
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            let len = file
+                .metadata()
+                .map_err(|error| FileError::Os(error.to_string()))?
+                .len();
+            position == 0 && len == 0
+        };
+        let bom_bytes = if include_bom {
+            encoding.bom_bytes(*resolved)
+        } else {
+            Vec::new()
+        };
+        let payload = encode_file_text(text, *resolved)?;
+        file.write_all(&bom_bytes)
             .map_err(|error| FileError::Os(error.to_string()))?;
+        file.write_all(&payload)
+            .map_err(|error| FileError::Os(error.to_string()))?;
+        if !bom_bytes.is_empty() && *bom == 0 {
+            *bom = bom_bytes.len();
+        }
         let count = text.chars().count();
         if read_write && append && !at_eof {
             // An append-mode write always lands at end-of-file, so the
             // character cursor has to jump to the new end rather than advance
             // from the seeked position.
-            use std::io::Seek as _;
+            use std::io::{Read as _, Seek as _};
             let position = file
                 .stream_position()
                 .map_err(|error| FileError::Os(error.to_string()))?;
             file.seek(std::io::SeekFrom::Start(0))
                 .map_err(|error| FileError::Os(error.to_string()))?;
-            let content = read_file_text(&mut *file)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            let content = decode_file_text(&bytes[(*bom).min(bytes.len())..], *resolved)?;
             *cursor = content.chars().count();
             file.seek(std::io::SeekFrom::Start(position))
                 .map_err(|error| FileError::Os(error.to_string()))?;
@@ -1994,7 +2528,7 @@ impl FileState {
     pub(crate) fn write_bytes(&self, data: &[u8]) -> Result<usize, FileError> {
         let binary = self.binary;
         let mut inner = self.lock();
-        let FileInner { body, cursor } = &mut *inner;
+        let FileInner { body, cursor, .. } = &mut *inner;
         use std::io::Write as _;
         let read_write = matches!(body, Some(FileBody::ReadWrite(_)));
         let file = write_file(body)?;
@@ -2041,8 +2575,13 @@ impl FileState {
     /// a negative target raises `OSError`, like CPython's text layer.
     pub(crate) fn seek(&self, offset: i64, whence: i64) -> Result<(), FileError> {
         let mut inner = self.lock();
-        let FileInner { body, cursor } = &mut *inner;
-        let len = body_len(body, self.binary)?;
+        let FileInner {
+            body,
+            cursor,
+            resolved,
+            bom,
+        } = &mut *inner;
+        let len = body_len(body, self.binary, *resolved, *bom)?;
         let base = match whence {
             0 => 0,
             1 => i64::try_from(*cursor).unwrap_or(i64::MAX),
@@ -2066,17 +2605,21 @@ impl FileState {
                 u64::try_from(target).unwrap_or(u64::MAX)
             } else {
                 // The cursor counts characters; translate the target into a
-                // byte offset in the UTF-8 stream. Positions past the end sit
-                // at end-of-file, like CPython's text seeks.
+                // byte offset in the file's encoding. The BOM is not a
+                // character, so a seek to zero lands on the first text byte
+                // and a later read decodes the concrete endianness without
+                // re-reading the mark. Positions past the end sit at
+                // end-of-file, like CPython's text seeks.
                 file.seek(std::io::SeekFrom::Start(0))
                     .map_err(|error| FileError::Os(error.to_string()))?;
                 let mut bytes = Vec::new();
                 file.read_to_end(&mut bytes)
                     .map_err(|error| FileError::Os(error.to_string()))?;
-                let content = String::from_utf8(bytes)
-                    .map_err(|error| FileError::Value(format!("invalid UTF-8 in file: {error}")))?;
+                let skip = (*bom).min(bytes.len());
+                let content = decode_file_text(&bytes[skip..], *resolved)?;
                 let clamped = target.min(content.chars().count());
-                u64::try_from(utf8_prefix_len(&content, clamped)).unwrap_or(u64::MAX)
+                let prefix: String = content.chars().take(clamped).collect();
+                u64::try_from(skip + (*resolved).byte_len(&prefix)).unwrap_or(u64::MAX)
             };
             file.seek(std::io::SeekFrom::Start(byte_target))
                 .map_err(|error| FileError::Os(error.to_string()))?;
@@ -2147,25 +2690,13 @@ fn read_bytes_body(body: &mut Option<FileBody>) -> Result<&mut Vec<u8>, FileErro
     }
 }
 
-/// Reads the rest of a text file from the current OS position and decodes it.
-fn read_file_text(file: &mut std::fs::File) -> Result<String, FileError> {
-    use std::io::Read as _;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| FileError::Os(error.to_string()))?;
-    String::from_utf8(bytes)
-        .map_err(|error| FileError::Value(format!("invalid UTF-8 in file: {error}")))
-}
-
-/// Byte length of the first `chars` characters of `text`.
-fn utf8_prefix_len(text: &str, chars: usize) -> usize {
-    text.char_indices()
-        .nth(chars)
-        .map_or(text.len(), |(index, _)| index)
-}
-
 /// Length of a file body in its cursor unit (characters or bytes).
-fn body_len(body: &mut Option<FileBody>, binary: bool) -> Result<usize, FileError> {
+fn body_len(
+    body: &mut Option<FileBody>,
+    binary: bool,
+    resolved: FileEncoding,
+    bom: usize,
+) -> Result<usize, FileError> {
     match body {
         Some(FileBody::Read(chars)) => Ok(chars.len()),
         Some(FileBody::ReadBytes(bytes)) => Ok(bytes.len()),
@@ -2177,13 +2708,17 @@ fn body_len(body: &mut Option<FileBody>, binary: bool) -> Result<usize, FileErro
                     .map(|metadata| usize::try_from(metadata.len()).unwrap_or(usize::MAX))
                     .map_err(|error| FileError::Os(error.to_string()));
             }
-            use std::io::Seek as _;
+            use std::io::{Read as _, Seek as _};
             let position = file
                 .stream_position()
                 .map_err(|error| FileError::Os(error.to_string()))?;
             file.seek(std::io::SeekFrom::Start(0))
                 .map_err(|error| FileError::Os(error.to_string()))?;
-            let content = read_file_text(&mut *file)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            let skip = bom.min(bytes.len());
+            let content = decode_file_text(&bytes[skip..], resolved)?;
             file.seek(std::io::SeekFrom::Start(position))
                 .map_err(|error| FileError::Os(error.to_string()))?;
             Ok(content.chars().count())
@@ -9011,6 +9546,22 @@ pub(crate) fn file_new_read(path: String, content: String) -> i64 {
     alloc(KIND_FILE, ObjData::File(FileState::new_read(path, content)))
 }
 
+/// Allocates a text read-mode file object from raw bytes, decoding them with
+/// `encoding` (including a leading BOM of the BOM forms). A malformed stream
+/// raises `UnicodeDecodeError` and yields `None`.
+pub(crate) fn file_new_read_encoded(path: String, content: Vec<u8>, encoding: FileEncoding) -> i64 {
+    let head = &content[..content.len().min(4)];
+    let (resolved, bom) = encoding.detect(head);
+    let text = match decode_file_text(&content[bom.min(content.len())..], resolved) {
+        Ok(text) => text,
+        Err(error) => return raise_file_error(error),
+    };
+    alloc(
+        KIND_FILE,
+        ObjData::File(FileState::new_read_with_encoding(path, text, encoding)),
+    )
+}
+
 /// Allocates a binary read-mode file object holding the raw file content.
 pub(crate) fn file_new_read_bytes(path: String, content: Vec<u8>) -> i64 {
     alloc(
@@ -9029,9 +9580,20 @@ pub(crate) fn file_new_pipe(reader: std::process::ChildStdout, binary: bool) -> 
 
 /// Allocates a write/append-mode file object around an open OS handle.
 pub(crate) fn file_new_write(path: String, mode: char, file: std::fs::File, binary: bool) -> i64 {
+    file_new_write_encoded(path, mode, file, binary, FileEncoding::Utf8)
+}
+
+/// [`file_new_write`] with an explicit text encoding.
+pub(crate) fn file_new_write_encoded(
+    path: String,
+    mode: char,
+    file: std::fs::File,
+    binary: bool,
+    encoding: FileEncoding,
+) -> i64 {
     alloc(
         KIND_FILE,
-        ObjData::File(FileState::new_write(path, mode, file, binary)),
+        ObjData::File(FileState::new_write(path, mode, file, binary, encoding)),
     )
 }
 
@@ -9042,9 +9604,22 @@ pub(crate) fn file_new_read_write(
     file: std::fs::File,
     binary: bool,
 ) -> i64 {
+    file_new_read_write_encoded(path, mode, file, binary, FileEncoding::Utf8)
+}
+
+/// [`file_new_read_write`] with an explicit text encoding.
+pub(crate) fn file_new_read_write_encoded(
+    path: String,
+    mode: char,
+    file: std::fs::File,
+    binary: bool,
+    encoding: FileEncoding,
+) -> i64 {
     alloc(
         KIND_FILE,
-        ObjData::File(FileState::new_read_write(path, mode, file, binary)),
+        ObjData::File(FileState::new_read_write(
+            path, mode, file, binary, encoding,
+        )),
     )
 }
 
@@ -9058,6 +9633,7 @@ pub(crate) fn file_wrap(source: i64, class: FileClass) -> Option<i64> {
         path: file.path.clone(),
         mode: file.mode,
         binary: file.binary,
+        encoding: file.encoding,
         class: AtomicU8::new(class.tag()),
     };
     Some(alloc(KIND_FILE, ObjData::File(wrapped)))

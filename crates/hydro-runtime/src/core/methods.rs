@@ -1707,18 +1707,25 @@ fn call_user_method_kw(
     let receiver_name = value::class_display_name(class)
         .unwrap_or("object")
         .to_string();
-    // A generated closure signature starts with its captured values followed
-    // by the explicit parameters. The full-entry ABI receives both, so mirror
-    // that prefix here instead of assuming `self` is slot 0.
+    // A signature starts with its hidden prefix followed by the explicit
+    // parameters: a generated closure stores its captured values there, and a
+    // runtime-compiled function stores its tagged body id, globals and
+    // captured environments. Every hidden name is NUL-prefixed, so no caller
+    // can bind one. The full-entry ABI receives the prefix before the
+    // explicit parameters, so the receiver belongs after it instead of at
+    // slot 0 (writing it into the body-id slot would corrupt the identity a
+    // runtime-compiled method dispatches on).
+    let hidden = signature
+        .iter()
+        .take_while(|param| param.name.starts_with('\u{0}'))
+        .count();
     let capture_values: Vec<i64> = match value::as_function(function).map(|function| &function.body)
     {
-        Some(value::FunctionBody::Wrapper { captures, .. }) if signature.len() > captures.len() => {
+        Some(value::FunctionBody::Wrapper { captures, .. }) if hidden >= captures.len() => {
             captures.clone()
         }
         _ => Vec::new(),
     };
-    let capture_count = capture_values.len();
-    let receiver_count = capture_count + usize::from(kind != MethodKind::Staticmethod);
     let mut slots: Vec<Option<i64>> = vec![None; signature.len()];
     for (index, capture) in capture_values.into_iter().enumerate() {
         slots[index] = Some(capture);
@@ -1729,20 +1736,21 @@ fn call_user_method_kw(
         MethodKind::Staticmethod => None,
     };
     // A decorator wrapper commonly has the shape `def wrapper(*args)`.  The
-    // first signature slot is then the `*args` slot itself; putting the
-    // receiver into `slots[0]` would be overwritten when the collected varargs
-    // list is installed below, so seed that list instead.
+    // first explicit slot is then the `*args` slot itself; putting the
+    // receiver into it would be overwritten when the collected varargs list is
+    // installed below, so seed that list instead.
     let mut receiver_vararg = None;
     if let Some(receiver) = receiver {
-        if capture_count < slots.len() {
-            if signature[capture_count].kind == ParamKind::VarArg {
+        if hidden < slots.len() {
+            if signature[hidden].kind == ParamKind::VarArg {
                 receiver_vararg = Some(receiver);
             } else {
                 // Normal methods bind the instance; classmethods bind the class.
-                slots[capture_count] = Some(receiver);
+                slots[hidden] = Some(receiver);
             }
         }
     }
+    let receiver_count = hidden + usize::from(kind != MethodKind::Staticmethod);
 
     let mut next_positional = 0usize;
     let mut vararg_items: Vec<i64> = receiver_vararg.into_iter().collect();
@@ -1817,7 +1825,12 @@ fn call_user_method_kw(
         slots[index] = Some(value::dict_new(pairs));
     }
 
-    for (index, param) in signature.iter().enumerate().skip(receiver_count) {
+    // Fill every unbound slot from its default. This includes the hidden
+    // prefix: a runtime-compiled function carries its tagged body id, globals
+    // and captured environments as keyword-only defaults, and its full entry
+    // reads them before the explicit parameters. Missing explicit arguments
+    // still report CPython's positional-arity error.
+    for (index, param) in signature.iter().enumerate() {
         if slots[index].is_some() {
             continue;
         }
@@ -1842,6 +1855,31 @@ fn call_user_method_kw(
         if func.flags & (value::FUNCTION_FLAG_GENERATOR | value::FUNCTION_FLAG_ASYNC) != 0 {
             if signature.iter().all(|param| param.kind.is_positional()) {
                 return builtins::call(function, full.len(), full.as_ptr());
+            }
+            // A keyword-bearing signature (captures or the runtime-compiled
+            // hidden prefix) cannot be re-bound by the generated prologue, so
+            // create the suspended fiber from the fully bound vector, exactly
+            // like the shared binder's keyword path.
+            if entry != 0 {
+                let roots = crate::heap::root_values(&full);
+                let name = func.name.clone();
+                let created = if func.flags & value::FUNCTION_FLAG_ASYNC != 0 {
+                    if func.flags & value::FUNCTION_FLAG_GENERATOR != 0 {
+                        value::fiber_async_generator_new(entry, name, full)
+                    } else {
+                        value::fiber_coroutine_new(entry, name, full)
+                    }
+                } else {
+                    value::fiber_generator_new(entry, name, full)
+                };
+                crate::heap::release_roots(roots);
+                return match created {
+                    Some(fiber) => fiber,
+                    None => exc::raise_with_message(
+                        RUNTIME_ERROR,
+                        "cannot allocate a generator/coroutine stack",
+                    ),
+                };
             }
             return type_error(format!(
                 "{receiver_name}.{method}() cannot bind keywords for a generator"

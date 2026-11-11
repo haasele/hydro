@@ -741,14 +741,13 @@ fn keyword_slots_apply_defaults_and_validate_encoding() {
     assert_eq!(hydro_exc_pending(), 0);
     close(file);
 
-    call(
+    let file = call(
         "io",
         "open",
         &[temp.value(), text("r"), hydro_none(), text("latin-1")],
     );
-    assert_eq!(error_tag(), 0);
-    assert_error_text(error_message(), "unsupported encoding: 'latin-1'");
-    clear_error();
+    assert_eq!(hydro_exc_pending(), 0);
+    close(file);
 }
 
 #[test]
