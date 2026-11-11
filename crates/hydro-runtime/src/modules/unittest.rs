@@ -145,11 +145,21 @@ fn cached_class(
     if let Some(class) = globals::registry_get(key) {
         return class;
     }
-    let functions: Vec<i64> = methods
-        .iter()
-        .map(|(_, native, arity)| value::native_function_new("unittest", native, *arity))
-        .collect();
-    let function_roots = heap::root_values(&functions);
+    // Each function value is reachable only from this Rust vector until
+    // `class_new` copies it into the class. `native_function_new` allocates,
+    // so a collection triggered by a later iteration would free every earlier
+    // function; their slots are then reused by the following functions, and
+    // the class binds a name to a different method (observed: `TestResult`
+    // gained `__init__ = addExpectedFailure` after a run that created the
+    // cached class late, which made `TestResult()` raise and `unittest.main()`
+    // see a `None` result). Root every value as it is produced.
+    let function_roots = heap::root_values(&[]);
+    let mut functions: Vec<i64> = Vec::with_capacity(methods.len());
+    for (_, native, arity) in methods {
+        let function = value::native_function_new("unittest", native, *arity);
+        heap::push_scoped_root(function);
+        functions.push(function);
+    }
     let pairs: Vec<(String, i64)> = methods
         .iter()
         .zip(&functions)

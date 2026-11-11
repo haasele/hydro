@@ -9390,10 +9390,15 @@ fn abstract_manager_subclasshook(args: &[i64], asynchronous: bool) -> i64 {
     } else {
         ["__enter__", "__exit__"]
     };
-    if required
-        .iter()
-        .all(|&method| value::class_lookup(candidate, method).is_some())
-    {
+    // CPython's `_check_methods` requires the attribute to exist *and* not be
+    // `None`; `class C(AbstractContextManager): __enter__ = None` is not a
+    // structural subclass.
+    let defines = |method: &str| match value::class_lookup(candidate, method) {
+        Some(value::ClassEntry::Attr(item)) => item != NONE,
+        Some(_) => true,
+        None => false,
+    };
+    if required.iter().all(|&method| defines(method)) {
         TRUE
     } else {
         value::NOT_IMPLEMENTED
@@ -9432,6 +9437,10 @@ fn suppress_new(args: &[i64]) -> i64 {
     let exceptions = value::tuple_new(args.to_vec());
     let exception_roots = heap::root_values(&[exceptions]);
     value::instance_setattr(instance, "_exceptions".to_string(), exceptions);
+    // CPython's `suppress` class docstring is inherited by instances; the
+    // native class has none, so publish the concrete `None` slot the class
+    // attribute reports instead of leaving `__doc__` absent.
+    value::instance_setattr(instance, "__doc__".to_string(), NONE);
     heap::release_roots(exception_roots);
     heap::release_roots(roots);
     instance
@@ -9775,6 +9784,7 @@ fn contextlib_call(function: &str, args: &[i64]) -> i64 {
                 value::native_function_new("contextlib", "_contextmanager_call", usize::MAX);
             let wrapper_roots = heap::root_values(&[wrapper]);
             let result = value::partial_new(wrapper, vec![function]);
+            contextlib_copy_function_metadata(function, result);
             heap::release_roots(wrapper_roots);
             heap::release_roots(roots);
             result
@@ -9890,6 +9900,9 @@ fn closing_new(thing: i64) -> i64 {
     let instance = value::instance_new(class);
     let roots = heap::root_values(&[instance, thing]);
     value::instance_setattr(instance, "thing".to_string(), thing);
+    // The class's `__doc__` is `None`; instances report it like CPython's
+    // inherited class docstring rather than raising `AttributeError`.
+    value::instance_setattr(instance, "__doc__".to_string(), NONE);
     heap::release_roots(roots);
     instance
 }
@@ -10240,6 +10253,39 @@ fn exitstack_exit(stack: i64, exc_type: i64, exception: i64, traceback: i64) -> 
     result
 }
 
+/// `functools.wraps` for the native `contextmanager` helper.
+///
+/// CPython decorates the helper with `@wraps(func)`, so the callable returned
+/// by `contextmanager(func)` carries the decorated function's name, qualified
+/// name, documentation, module, annotations and function dictionary. Hydro
+/// represents that helper as a partial-shaped native value, which otherwise
+/// exposes none of them; copy the metadata it can carry.
+fn contextlib_copy_function_metadata(source: i64, target: i64) {
+    let name = value::function_name(source);
+    if !name.is_empty() {
+        let _ = value::function_setattr(target, "__name__", value::str_alloc(name));
+    }
+    let qualname = value::function_qualname(source);
+    if !qualname.is_empty() {
+        let _ = value::function_setattr(target, "__qualname__", value::str_alloc(qualname));
+    }
+    let doc = value::function_doc(source);
+    if doc != NONE {
+        let _ = value::function_setattr(target, "__doc__", doc);
+    }
+    if let Some(module) = value::function_module(source) {
+        let _ = value::function_setattr(target, "__module__", module);
+    }
+    if let Some(annotations) = value::function_annotations(source) {
+        let _ = value::function_setattr(target, "__annotations__", annotations);
+    }
+    for name in value::function_attribute_names(source) {
+        if let Some(attribute) = value::function_attribute(source, &name) {
+            let _ = value::function_setattr(target, &name, attribute);
+        }
+    }
+}
+
 /// Calls the decorated generator function and wraps the resulting generator.
 ///
 /// The call may raise (a normal function used as a context manager can fail
@@ -10252,8 +10298,12 @@ fn contextmanager_wrap(function: i64, args: &[i64], keywords: &[(String, i64)]) 
     rooted.extend_from_slice(args);
     rooted.extend(keywords.iter().map(|(_, value)| *value));
     let roots = heap::root_values(&rooted);
+    // Route through the keyword binder even without keywords: a generated
+    // generator function stores its parameter metadata on the value, and the
+    // binder validates the arguments at call time (CPython raises `TypeError`
+    // for a bad `woohoo()` call, not at the first `next()`).
     let generator = if keywords.is_empty() {
-        crate::core::builtins::call(function, args.len(), args.as_ptr())
+        crate::core::builtins::call_kw(function, args.len(), args.as_ptr(), 0, std::ptr::null())
     } else {
         let mut pairs: Vec<i64> = Vec::with_capacity(keywords.len() * 2);
         for (name, value) in keywords {
@@ -10276,9 +10326,56 @@ fn contextmanager_wrap(function: i64, args: &[i64], keywords: &[(String, i64)]) 
     let class = context_manager_class();
     let manager = value::instance_new(class);
     value::instance_setattr(manager, "gen".to_string(), generator);
+    // `_GeneratorContextManagerBase.__init__` keeps the call operands for
+    // `_recreate_cm` and gives the instance the decorated function's
+    // docstring (falling back to the helper class's own doc).
+    value::instance_setattr(manager, "func".to_string(), function);
+    let args_tuple = value::tuple_new(args.to_vec());
+    let args_roots = heap::root_values(&[args_tuple]);
+    value::instance_setattr(manager, "args".to_string(), args_tuple);
+    heap::release_roots(args_roots);
+    let keyword_pairs: Vec<(i64, i64)> = keywords
+        .iter()
+        .map(|(name, value)| (value::str_alloc(name.clone()), *value))
+        .collect();
+    let keyword_dict = value::dict_new(keyword_pairs);
+    let keyword_roots = heap::root_values(&[keyword_dict]);
+    value::instance_setattr(manager, "kwds".to_string(), keyword_dict);
+    heap::release_roots(keyword_roots);
+    let mut doc = value::function_doc(function);
+    if doc == NONE {
+        doc = match value::class_own_lookup(class, "__doc__") {
+            Some(value::ClassEntry::Attr(doc)) => doc,
+            _ => NONE,
+        };
+    }
+    value::instance_setattr(manager, "__doc__".to_string(), doc);
     heap::release_roots(generator_roots);
     heap::release_roots(roots);
     manager
+}
+
+/// Recreates a manager used as a decorator (`ContextDecorator.__call__`).
+///
+/// `_GeneratorContextManager` is one-shot: both `_recreate_cm` and the
+/// decorator path build a fresh manager from the stored `func`/`args`/`kwds`,
+/// which is what makes a decorated function reusable (and recursive).
+fn contextmanager_recreate(manager: i64) -> Option<i64> {
+    let function = value::instance_attr(manager, "func")?;
+    let args = value::instance_attr(manager, "args").and_then(value::as_tuple)?;
+    let kwds = value::instance_attr(manager, "kwds").and_then(value::as_dict)?;
+    let args: Vec<i64> = args.to_vec();
+    let mut keywords: Vec<(String, i64)> = Vec::with_capacity(kwds.len());
+    for (name, value) in kwds {
+        keywords.push((value::as_str(*name)?.to_string(), *value));
+    }
+    let mut roots_source = args.clone();
+    roots_source.push(function);
+    roots_source.extend(keywords.iter().map(|(_, value)| *value));
+    let roots = heap::root_values(&roots_source);
+    let created = contextmanager_wrap(function, &args, &keywords);
+    heap::release_roots(roots);
+    Some(created)
 }
 
 /// Runs a `_GeneratorContextManager` used as a decorator: enter the context,
@@ -10289,6 +10386,17 @@ pub(crate) fn contextmanager_run(
     argc: usize,
     argv: *const i64,
 ) -> i64 {
+    // A manager used as a decorator is a one-shot template: every call enters
+    // a fresh manager built from the stored operands, like CPython's
+    // `ContextDecorator.__call__`/`_recreate_cm`.
+    let manager = if value::instance_attr(manager, "func").is_some() {
+        match contextmanager_recreate(manager) {
+            Some(fresh) if !exc::pending() => fresh,
+            _ => return NONE,
+        }
+    } else {
+        manager
+    };
     let _ = contextmanager_enter(manager);
     if exc::pending() {
         return NONE;
@@ -10364,6 +10472,12 @@ fn contextmanager_enter(manager: i64) -> i64 {
         Ok(generator) => generator,
         Err(err) => return err,
     };
+    // CPython's `__enter__` drops `args`, `kwds` and `func` (they are only
+    // needed for recreation, which is impossible after entering); this also
+    // releases the argument objects the caller handed to the decorator.
+    value::instance_remove_attr(manager, "args");
+    value::instance_remove_attr(manager, "kwds");
+    value::instance_remove_attr(manager, "func");
     if crate::fiber::is_done(generator) {
         if crate::fiber::has_error(generator) {
             return crate::fiber::raise_error(generator);
@@ -10451,6 +10565,22 @@ fn contextmanager_exit(manager: i64, exc_type: i64, exception: i64, traceback: i
             let _ = exc::clear();
             return TRUE;
         }
+        // PEP 479: a StopIteration thrown into a generator that lets it
+        // escape is wrapped in `RuntimeError(...)` with `__cause__` pointing
+        // at the thrown value. CPython reports the original StopIteration as
+        // unsuppressed instead of leaking the wrapper.
+        let thrown_stop = value::exception_data(exception)
+            .is_some_and(|data| exc::tag_is_subclass(data.tag, STOP_ITERATION));
+        if thrown_stop && exc::pending_tag() == RUNTIME_ERROR as i64 {
+            let cause = value::exception_data(pending).and_then(|data| data.cause);
+            let caused_by_thrown = cause.is_some_and(|cause| {
+                cause == exception || same_exception_payload(cause, exception)
+            });
+            if caused_by_thrown {
+                let _ = exc::clear();
+                return FALSE;
+            }
+        }
         // A different exception escapes the generator; keep it pending.
         return NONE;
     }
@@ -10494,6 +10624,22 @@ fn same_exception(a: i64, b: i64) -> bool {
         && left.tag == right.tag
         && left.msg == right.msg
         && left.args == right.args
+}
+
+/// Payload equality including `StopIteration`.
+///
+/// `same_exception` excludes `StopIteration` because a generator that handles
+/// it and returns reports a *new* `StopIteration`; the PEP 479 cause check
+/// needs the opposite, comparing the wrapper's cause with the thrown value
+/// even after the runtime copied the payload.
+fn same_exception_payload(a: i64, b: i64) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(left), Some(right)) = (value::exception_data(a), value::exception_data(b)) else {
+        return false;
+    };
+    left.tag == right.tag && left.msg == right.msg && left.args == right.args
 }
 
 /// `dataclasses` functions. The frontend reads `field(...)` from the class-body

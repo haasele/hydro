@@ -2040,7 +2040,7 @@ thread_local! {
     /// local-heap mode before `hydro_runtime_init` registered the main thread).
     static GC_SELF: RefCell<Option<Arc<ThreadGc>>> = const { RefCell::new(None) };
     /// Additional root ranges of the outermost fiber resume on this thread:
-    /// the native caller stack and the resumed fiber's `caller_ctx`. A
+    /// the live native caller frames and the resumed fiber's `caller_ctx`. A
     /// `(0, 0)` entry is unused.
     static AUX_STACK: Cell<[(usize, usize); 2]> = const { Cell::new([(0, 0); 2]) };
 }
@@ -3283,6 +3283,16 @@ fn mark_roots(
         }
         for &(low, high) in &thread.suspended {
             if high > low {
+                // A range containing this thread's live stack pointer is the
+                // stack it is running on: the part below `sp` is returned
+                // frames whose stale slots must not retain objects. The self
+                // snapshot carries no saved `sp`; its live one is `self_sp`.
+                let bottom = if thread.sp == 0 { self_sp } else { thread.sp };
+                let low = if low < bottom && bottom < high {
+                    bottom
+                } else {
+                    low
+                };
                 scan_stack_excluding(low, high, addresses, &exclusions);
             }
         }
@@ -3897,7 +3907,7 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
             scan_stack_excluding(sp, stack_high, addresses, &exclusions);
             mark_captured_registers(addresses);
             scan_aux_stack(addresses, &exclusions);
-            scan_suspended_stacks(addresses, &exclusions);
+            scan_suspended_stacks(sp, addresses, &exclusions);
         }
     }
     // `getweakrefs` pins the references it is about to return; keep them and
@@ -4497,7 +4507,12 @@ unsafe fn trace(addr: usize) {
     }
 }
 
-/// Conservatively scans the native caller range of a running fiber, if any.
+/// Conservatively scans the live native caller range of a running fiber, if
+/// any.
+///
+/// The range starts at the resume frame, not at the bottom of the native
+/// stack mapping, so returned frames below it cannot retain a tagged value
+/// through a stale slot.
 ///
 /// `exclude` holds the merged byte extents of the precise shadow frames and
 /// ranges of the collection, so their slots are marked exactly instead of
@@ -4513,7 +4528,12 @@ fn scan_aux_stack(addresses: &AddressSet, exclude: &[(usize, usize)]) {
 /// Conservatively scans every lifetime-registered fiber root range of this
 /// thread (private stack and both register contexts, including the running
 /// fiber's own stack).
-fn scan_suspended_stacks(addresses: &AddressSet, exclude: &[(usize, usize)]) {
+///
+/// A range that contains the collector's own stack pointer is the stack it
+/// runs on; `sp..high` is already scanned by the caller, and the bytes below
+/// `sp` are returned frames whose stale slots must not retain objects. The
+/// scan therefore starts at `sp` for that range.
+fn scan_suspended_stacks(sp: usize, addresses: &AddressSet, exclude: &[(usize, usize)]) {
     let owner = current_gc_token();
     let ranges: Vec<(usize, usize)> = lock_suspended_stacks()
         .iter()
@@ -4522,6 +4542,7 @@ fn scan_suspended_stacks(addresses: &AddressSet, exclude: &[(usize, usize)]) {
         .collect();
     for (low, high) in ranges {
         if high > low {
+            let low = if low < sp && sp < high { sp } else { low };
             scan_stack_excluding(low, high, addresses, exclude);
         }
     }
@@ -4644,16 +4665,17 @@ fn with_current_gc(f: impl FnOnce(&ThreadGc)) {
     });
 }
 
-/// Publishes the two extra root ranges of the outermost fiber resume.
+/// Returns the auxiliary root ranges currently published by the calling
+/// thread; both entries are `(0, 0)` while no fiber runs there.
 ///
-/// While the fiber runs, the resumer's native stack frames (`low..high`) and
-/// the resumed fiber's `caller_ctx` (which the context switch fills with the
-/// resumer's callee-saved registers) are live but are not on the current
-/// stack. Both are scanned conservatively. Nested resumes do not publish
-/// anything: their caller is a fiber whose lifetime stack and context ranges
-/// are already registered.
-pub(crate) fn aux_stack_published() -> bool {
-    AUX_STACK.with(|slot| slot.get()[0].0 != 0)
+/// While a fiber runs, the resumer's live native frames and the resumed
+/// fiber's `caller_ctx` (which the context switch fills with the resumer's
+/// callee-saved registers) are live but are not on the stack the collector
+/// scans. The fiber module publishes them around the switch with
+/// [`set_aux_stack`]; a nested resume keeps the outermost range because its
+/// caller is another fiber whose stack is registered for its lifetime.
+pub(crate) fn aux_stack() -> [(usize, usize); 2] {
+    AUX_STACK.with(Cell::get)
 }
 
 /// Cached native stack bounds of this thread, independent of an active fiber
@@ -4662,6 +4684,14 @@ pub(crate) fn native_stack_bounds_cached() -> Option<(usize, usize)> {
     native_stack_bounds()
 }
 
+/// Publishes the auxiliary root ranges of a fiber resume (see [`aux_stack`]).
+///
+/// `low` must be the start of the live resumer frames, never the bottom of
+/// the native stack mapping: the bytes below the resume frame are returned
+/// frames whose stale slots must not retain objects. Passing `(0, 0)` clears
+/// the ranges again once the resumer runs. In shared mode the ranges are
+/// mirrored into the thread registration so a parked fiber can be scanned by
+/// another thread's collector.
 pub(crate) fn set_aux_stack(low: usize, high: usize, ctx_low: usize, ctx_high: usize) {
     let ranges = [(low, high), (ctx_low, ctx_high)];
     AUX_STACK.with(|slot| slot.set(ranges));

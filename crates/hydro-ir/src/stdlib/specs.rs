@@ -2993,7 +2993,9 @@ pub static RE: ModuleSpec = ModuleSpec {
         // bytes. The static table has no overload channel, so the return is
         // dynamic (the runtime returns `bytes` for bytes patterns).
         f("sub", 3, 6, Type::Any),
+        f("subn", 3, 6, Type::Tuple),
         f("split", 2, 5, Type::List),
+        f("purge", 0, 0, Type::None),
         f("escape", 1, 1, Type::Any),
         // `compile(pattern, flags=0)`; the runtime forwards the flags to the
         // regex builder. `_compile` is the cache-aware internal spelling.

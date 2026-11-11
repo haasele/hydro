@@ -110,24 +110,74 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
 /// Mirrors `ABCMeta.__subclasscheck__` for the parts the runtime models: a
 /// class is a virtual subclass when it (or a real ancestor) was registered
 /// with `ancestor` or with a real subclass of `ancestor` (CPython checks the
-/// registries of every subclass as well). Both arguments must be classes —
-/// Hydro class values or extension class handles; native type spellings are
-/// handled by [`is_virtual_instance`].
+/// registries of every subclass as well). After the registry misses, an ABC's
+/// `__subclasshook__` decides structurally, exactly like CPython's
+/// `_abc_subclasscheck`. Both arguments must be classes — Hydro class values
+/// or extension class handles; native type spellings are handled by
+/// [`is_virtual_instance`].
 pub(crate) fn is_virtual_subclass(subclass: i64, ancestor: i64) -> bool {
-    if VIRTUAL_EDGES.load(Ordering::Relaxed) == 0 {
-        return false;
-    }
     let subclass_is_class =
         value::as_class(subclass).is_some() || extension_class_target(subclass).is_some();
     if !subclass_is_class || value::as_class(ancestor).is_none() {
         return false;
     }
-    let Some(edges) = virtual_edges() else {
+    if VIRTUAL_EDGES.load(Ordering::Relaxed) != 0 {
+        if let Some(edges) = virtual_edges() {
+            if edges.as_chunks::<2>().0.iter().any(|&[abc, target]| {
+                registered_under(abc, ancestor) && edge_matches_subclass(subclass, target)
+            }) {
+                return true;
+            }
+        }
+    }
+    structural_subclass(subclass, ancestor)
+}
+
+/// `ABCMeta.__subclasscheck__`'s final step: an ABC's classmethod
+/// `__subclasshook__(subclass)` decides when the registry has no edge.
+///
+/// CPython invokes the hook only for classes created through `ABCMeta`.
+/// `True` means structurally compatible and `NotImplemented`/falsey means no
+/// answer; a hook that raises leaves its exception pending for the caller.
+/// A guard prevents a hook that re-enters `issubclass` for the same ancestors
+/// from recursing without bound.
+fn structural_subclass(subclass: i64, ancestor: i64) -> bool {
+    if !is_abc_class(ancestor) || exc::pending() {
+        return false;
+    }
+    static DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if DEPTH.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    let Some(entry) = value::class_lookup(ancestor, "__subclasshook__") else {
         return false;
     };
-    edges.as_chunks::<2>().0.iter().any(|&[abc, target]| {
-        registered_under(abc, ancestor) && edge_matches_subclass(subclass, target)
-    })
+    let (kind, function) = match entry {
+        value::ClassEntry::Method(kind, function) => (kind, function),
+        // A function stored as a class attribute is a descriptor too; it
+        // binds the class exactly like a normal method.
+        value::ClassEntry::Attr(item) if value::as_function(item).is_some() => {
+            (MethodKind::Normal, item)
+        }
+        value::ClassEntry::Attr(_) => return false,
+    };
+    // CPython reads the hook through the descriptor protocol: a classmethod
+    // or plain function binds the ABC as its first argument, a staticmethod
+    // does not.
+    let args: [i64; 2] = [ancestor, subclass];
+    let argc = if kind == MethodKind::Staticmethod {
+        1
+    } else {
+        2
+    };
+    let argv = if argc == 1 { &args[1] } else { &args[0] };
+    DEPTH.store(1, Ordering::Relaxed);
+    let result = builtins::call(function, argc, argv as *const i64);
+    DEPTH.store(0, Ordering::Relaxed);
+    if exc::pending() || result == value::NOT_IMPLEMENTED {
+        return false;
+    }
+    value::truthy(result)
 }
 
 /// Whether `value` is an instance of `ancestor` through a registered edge.
@@ -139,15 +189,15 @@ pub(crate) fn is_virtual_subclass(subclass: i64, ancestor: i64) -> bool {
 /// Extension handles are tested with `PyObject_IsInstance`, so a registered C
 /// base class covers the extension's own subclasses.
 pub(crate) fn is_virtual_instance(value: i64, ancestor: i64) -> bool {
-    if VIRTUAL_EDGES.load(Ordering::Relaxed) == 0 {
-        return false;
-    }
     if value::as_class(ancestor).is_none() || value::as_class(value).is_some() {
         return false;
     }
     let class = value::type_class(value);
     if value::as_class(class).is_some() && is_virtual_subclass(class, ancestor) {
         return true;
+    }
+    if VIRTUAL_EDGES.load(Ordering::Relaxed) == 0 {
+        return false;
     }
     let Some(edges) = virtual_edges() else {
         return false;

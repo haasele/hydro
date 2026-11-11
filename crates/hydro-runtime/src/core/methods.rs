@@ -708,7 +708,7 @@ fn call_bound_entry(
                 }
                 return builtins::call(result, args.len(), args.as_ptr());
             }
-            if value::as_function(value).is_some() {
+            if value::as_function(value).is_some() && is_descriptor_function(value) {
                 (MethodKind::Normal, value)
             } else {
                 return builtins::call(value, args.len(), args.as_ptr());
@@ -862,6 +862,26 @@ fn instance_method(obj: i64, method: &str, argc: usize, argv: *const i64) -> i64
         unsafe { std::slice::from_raw_parts(argv, argc) }.to_vec()
     };
     call_bound_entry(obj, class, entry, method, &args, &[])
+}
+
+/// Whether a function value stored as a plain class attribute behaves as a
+/// descriptor (binds the receiver).
+///
+/// CPython's function objects implement `__get__`; C-level callables
+/// (`builtin_function_or_method`, extension functions, HNA functions) do not,
+/// so `class C: f = os.unlink` keeps `C().f(name)` unbound. Partial objects,
+/// bound methods and the `operator` callables are likewise not descriptors.
+fn is_descriptor_function(item: i64) -> bool {
+    match value::as_function(item) {
+        Some(function) => matches!(
+            function.body,
+            value::FunctionBody::Wrapper { .. }
+                | value::FunctionBody::Host { .. }
+                | value::FunctionBody::ContextFunction { .. }
+                | value::FunctionBody::Exec { .. }
+        ),
+        None => false,
+    }
 }
 
 /// Whether a class-namespace entry is a data descriptor.
@@ -3507,13 +3527,31 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         let Some(pairs) = value::as_namespace(obj) else {
             return attribute_error(obj, attr);
         };
+        // A compiled module's namespace carries the export pairs, while the
+        // module's live globals store holds every binding its body made
+        // (including names the export list omits). When the namespace names a
+        // module, answer from that store first so `dir()`, `globals()`,
+        // ordinary reads and `__dict__` observe the same bindings.
+        let module = pairs
+            .iter()
+            .find(|(name, _)| name.as_str() == "__name__")
+            .and_then(|(_, value)| value::as_str(*value))
+            .map(str::to_string);
         if attr == "__dict__" {
+            if let Some(module) = module.as_deref() {
+                return crate::core::globals::view(module);
+            }
             return value::dict_new(
                 pairs
                     .iter()
                     .map(|(name, value)| (value::str_alloc(name.clone()), *value))
                     .collect(),
             );
+        }
+        if let Some(module) = module.as_deref() {
+            if let Some(bound) = crate::core::globals::lookup(module, attr) {
+                return bound;
+            }
         }
         if let Some((_, value)) = pairs.iter().find(|(name, _)| name.as_str() == attr) {
             return *value;
@@ -3561,7 +3599,7 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
     }
     if let Some(class) = value::instance_class_value(obj) {
         if attr == "__dict__" {
-            if !value::class_has_dict(class) {
+            if !class_has_instance_dict(class) {
                 return attribute_error(obj, attr);
             }
             return match value::instance_dict(obj) {
@@ -3597,11 +3635,9 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         return match entry {
             // A non-data descriptor resolves `__get__(instance, owner)`.
             value::ClassEntry::Attr(item) => {
-                if value::as_function(item).is_some() {
-                    // A function assigned to the class binds the receiver,
-                    // exactly like a class-body method. Closure-backed
-                    // functions must bind here too: `descriptor_get` only
-                    // knows explicit `__get__` descriptors.
+                if is_descriptor_function(item) {
+                    // A Python function assigned to the class binds the
+                    // receiver, exactly like a class-body method.
                     return value::bound_method_new(obj, attr.to_string());
                 }
                 if let Some(result) = descriptor_get(item, obj, class) {
@@ -4166,7 +4202,7 @@ fn setattr_named(obj: i64, attr: &str, new_value: i64) -> i64 {
                 value::ClassEntry::Method(_, _) => {}
             }
         }
-        if !value::class_allows_attr(class, attr) {
+        if !class_allows_instance_attr(class, attr) {
             let name = value::instance_class_name(obj).unwrap_or("object");
             return exc::raise_with_message(
                 ATTRIBUTE_ERROR,
@@ -4193,6 +4229,57 @@ fn setattr_named(obj: i64, attr: &str, new_value: i64) -> i64 {
         return type_error(format!("cannot set attributes of class '{}'", class.name));
     }
     attribute_error(obj, attr)
+}
+
+/// Whether `class` or a non-`object` ancestor gives instances an attribute
+/// table (`__dict__`).
+///
+/// Hydro builds the cached native `object` class without a `__slots__`
+/// declaration, so its `has_dict` bit is set even though CPython's `object`
+/// has no instance dictionary. Ignoring that ancestor keeps a slots-only
+/// subclass of `object` (every class, via the implicit base) dictionary-free.
+fn class_has_instance_dict(class: i64) -> bool {
+    value::class_mro(class).iter().any(|&ancestor| {
+        !value::is_object_class(ancestor)
+            && value::as_class(ancestor)
+                .map(|state| state.has_dict)
+                .unwrap_or(true)
+    })
+}
+
+/// Whether a class instance accepts `name` as an attribute.
+///
+/// Mirrors [`value::class_allows_attr`], but ignores the cached native
+/// `object` ancestor for the same reason as [`class_has_instance_dict`]: its
+/// `has_dict` bit is not a CPython instance dictionary.
+fn class_allows_instance_attr(class: i64, name: &str) -> bool {
+    if value::as_class(class).is_none() {
+        return true;
+    }
+    for &ancestor in value::class_mro(class).iter() {
+        let Some(current) = value::as_class(ancestor) else {
+            continue;
+        };
+        if value::is_object_class(ancestor) {
+            continue;
+        }
+        if current.has_dict {
+            return true;
+        }
+        if current.slots.iter().any(|slot| slot == name) {
+            return true;
+        }
+        if current.attrs.iter().any(|(existing, _)| existing == name)
+            || current
+                .methods
+                .iter()
+                .any(|(existing, _, _)| existing == name)
+            || current.overlay.get(name).is_some()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// `TypeError` for a `__class__` assignment CPython reserves for mutable heap

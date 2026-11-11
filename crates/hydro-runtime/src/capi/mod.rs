@@ -1223,9 +1223,7 @@ pub(crate) unsafe fn kind_mut(object: *mut ShimObject) -> &'static mut ShimKind 
 /// # Safety
 /// `object` must be a non-NULL live handle; the caller holds the GIL.
 pub(crate) unsafe fn kind_mut_checked(object: *mut ShimObject) -> Option<&'static mut ShimKind> {
-    if kind_ref(object).is_none() {
-        return None;
-    }
+    kind_ref(object)?;
     // SAFETY: `kind_ref` validated the shim role and the payload; the handle
     // is heap-stable and the caller holds the GIL, so the second access sees
     // the same payload.

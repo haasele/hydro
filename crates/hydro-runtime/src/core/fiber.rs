@@ -24,7 +24,9 @@
 //!
 //! The *native* caller frames of a resume (the only suspended side that is
 //! not on a fiber stack) are published through
-//! [`crate::heap::set_aux_stack`] while the fiber runs.
+//! [`crate::heap::set_aux_stack`] for the duration of the outermost resume.
+//! The published range starts at the resume frame: everything below it is a
+//! returned frame, and its stale tagged slots must not keep objects alive.
 //!
 //! Precise shadow-stack roots follow the switch: [`resume_raw`] detaches the
 //! resumer's root set into [`FiberState::caller_roots`] and installs the
@@ -505,7 +507,10 @@ impl FiberState {
             frame_owner: std::ptr::null_mut(),
         });
         // The three ranges stay valid until `Drop`; registering them once
-        // keeps the per-resume path free of global-registry work.
+        // keeps the per-resume path free of registry work. The native caller
+        // stack is published per resume instead: between resumes the resumer
+        // runs on that stack, so the collector's normal scan already covers
+        // it and the dead frames below its stack pointer must not be roots.
         let [(ctx_lo, ctx_hi), (caller_lo, caller_hi)] = context_root_ranges(&state);
         state.ctx_root_lo = ctx_lo;
         state.ctx_root_hi = ctx_hi;
@@ -514,14 +519,6 @@ impl FiberState {
         crate::heap::register_suspended_stack(stack_lo, stack_hi);
         crate::heap::register_suspended_stack(ctx_lo, ctx_hi);
         crate::heap::register_suspended_stack(caller_lo, caller_hi);
-        // The outermost caller's native stack is a lifetime root of every
-        // fiber on this thread. Publishing the whole stack once keeps the
-        // resume path free of an aux-range TLS check.
-        if !crate::heap::aux_stack_published() {
-            if let Some((low, high)) = crate::heap::native_stack_bounds_cached() {
-                crate::heap::set_aux_stack(low, high, 0, 0);
-            }
-        }
         Some(state)
     }
 
@@ -1036,8 +1033,9 @@ pub(crate) unsafe fn resume_raw(ptr: *mut FiberState, value: i64) -> bool {
         let Some(_call) = enter_python_call() else {
             return refuse_resume(ptr);
         };
-        // The native caller stack and the fiber's own stack/context ranges
-        // are lifetime roots published at fiber creation.
+        // The fiber's stack and register contexts are lifetime roots
+        // registered at creation; the resumer's native frames are published
+        // around each outermost switch (below).
         (*ptr).started = true;
         (*ptr).sent = value;
         (*ptr).running = true;
@@ -1085,6 +1083,27 @@ pub(crate) unsafe fn resume_raw(ptr: *mut FiberState, value: i64) -> bool {
                 (*ptr).frame_owner = std::ptr::null_mut();
             }
         }
+        let nested = CURRENT
+            .with(Cell::get)
+            .is_some_and(|outer| outer.ptr != ptr);
+        // While a fiber runs, the resumer's native frames are live but are
+        // not on the stack the collector scans (its stack pointer is on the
+        // fiber stack). Publish the live part of that stack - from this
+        // resume frame up - for the duration of the switch. The bytes below
+        // are returned frames whose stale tagged slots must not retain
+        // objects. A nested resume keeps the outermost range: its caller is
+        // another fiber whose stack is registered separately.
+        let previous_aux = crate::heap::aux_stack();
+        let live_bounds = if nested {
+            None
+        } else {
+            crate::heap::native_stack_bounds_cached()
+        };
+        if let Some((low, high)) = live_bounds {
+            let sp = stack_pointer();
+            let live_low = if sp > low && sp < high { sp } else { low };
+            crate::heap::set_aux_stack(live_low, high, 0, 0);
+        }
         let outer = CURRENT.with(|cell| cell.replace(Some(CurrentFiber { ptr, value })));
         // CPython swaps `tstate->exc_info` to the fiber's own exception state
         // for the duration of a resume (`gi_exc_state`/`cr_exc_state`), and
@@ -1094,6 +1113,17 @@ pub(crate) unsafe fn resume_raw(ptr: *mut FiberState, value: i64) -> bool {
         // to the fiber's `ctx` (the trampoline entry on first resume, the
         // suspension point afterwards).
         switch_to_fiber(ptr);
+        if !nested {
+            // Back on the resumer's stack: the normal stack scan covers it
+            // again, so drop the auxiliary range before running any code that
+            // could allocate (and therefore collect) here.
+            crate::heap::set_aux_stack(
+                previous_aux[0].0,
+                previous_aux[0].1,
+                previous_aux[1].0,
+                previous_aux[1].1,
+            );
+        }
         CURRENT.with(|cell| cell.set(outer));
         // The fiber suspended or finished: park its handler stack again and
         // make the caller's current.

@@ -180,8 +180,10 @@ fn object_is_the_universal_cached_base() {
 fn setattr_vars_delattr_and_dir() {
     let _guard = test_guard();
     hydro_runtime_init();
-    let object = module_get("builtins", "object");
-    let instance = hydro_instance_new(object);
+    // `object()` itself has no instance dictionary; use the native
+    // `types.SimpleNamespace`, which CPython exposes as a dict-backed object.
+    let class = module_get("types", "SimpleNamespace");
+    let instance = hydro_instance_new(class);
 
     let set_args = [instance, text("x"), int(5)];
     let _ = module("builtins", "setattr", &set_args);
