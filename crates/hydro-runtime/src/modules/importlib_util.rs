@@ -28,8 +28,8 @@ use hydro_ir::MethodKind;
 
 use crate::core::globals;
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, IMPORT_ERROR, SYNTAX_ERROR, TYPE_ERROR, UNICODE_DECODE_ERROR,
-    VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, IMPORT_ERROR, MODULE_NOT_FOUND_ERROR, SYNTAX_ERROR, TYPE_ERROR,
+    UNICODE_DECODE_ERROR, VALUE_ERROR,
 };
 use crate::value::{self, NONE};
 
@@ -284,6 +284,12 @@ fn source_hash(args: &[i64]) -> i64 {
     };
     let hash = siphash13(u64::from(PYC_MAGIC_NUMBER_TOKEN), 0, source);
     value::bytes_new(hash.to_le_bytes().to_vec())
+}
+
+/// CPython's `_Py_KeyedHash` (SipHash-1-3) with an arbitrary 64-bit key,
+/// little-endian: the digest `_imp.source_hash` returns.
+pub(crate) fn keyed_source_hash(key: u64, source: &[u8]) -> [u8; 8] {
+    siphash13(key, 0, source).to_le_bytes()
 }
 
 /// CPython's `_Py_KeyedHash` (SipHash-1-3), used by `_imp.source_hash`.
@@ -559,13 +565,87 @@ fn live_search_path() -> Vec<String> {
 /// no directory of their own and report none.
 fn module_path_dirs(name: &str) -> Option<Vec<String>> {
     if let Some(module) = super::registry_lookup(name) {
-        if let Some(pairs) = value::as_namespace(module) {
-            if let Some((_, path)) = pairs.iter().find(|(key, _)| key.as_str() == "__path__") {
-                return path_dirs(*path);
+        if module != NONE {
+            if let Some(dirs) = module_path_dirs_value(module) {
+                return Some(dirs);
             }
         }
     }
     path_dirs(globals::lookup(name, "__path__")?)
+}
+
+/// `getattr(module, name)` for a module-like value: a module value, a
+/// namespace created by `module_from_spec`, or a `types.ModuleType` instance.
+///
+/// `None` means the attribute is absent; an attribute whose value is `None`
+/// is reported as `Some(NONE)`. A failure other than `AttributeError` stays
+/// pending for the caller.
+fn module_attribute(module: i64, name: &str) -> Option<i64> {
+    if module == NONE {
+        return None;
+    }
+    if let Some(pairs) = value::as_namespace(module) {
+        return pairs
+            .iter()
+            .find(|(key, _)| key.as_str() == name)
+            .map(|(_, item)| *item);
+    }
+    if let Some(item) = value::instance_attr(module, name) {
+        return Some(item);
+    }
+    let state = value::as_module(module)?;
+    let item = super::module_attr(state, name);
+    if exc::pending() {
+        if exc::pending_tag() == i64::from(ATTRIBUTE_ERROR) {
+            exc::clear();
+        }
+        return None;
+    }
+    Some(item)
+}
+
+/// `module.__path__` of a module-like value, or `None` when the value is not
+/// a package.
+///
+/// A native package is one whose submodules the central table declares; it has
+/// no directory of its own, so its path is the empty marker (`NONE`) while the
+/// attribute still counts as present.
+pub(crate) fn module_path_value(module: i64) -> Option<i64> {
+    if let Some(path) = module_attribute(module, "__path__") {
+        return Some(path);
+    }
+    let state = value::as_module(module)?;
+    native_search_locations(state.name()).map(|_| NONE)
+}
+
+/// `module.__path__` as owned directory strings; `None` when the value is not
+/// a package. A package whose path is empty or not a list of strings reports
+/// an empty directory list.
+pub(crate) fn module_path_dirs_value(module: i64) -> Option<Vec<String>> {
+    match module_path_value(module)? {
+        NONE => Some(Vec::new()),
+        path => Some(path_dirs(path).unwrap_or_default()),
+    }
+}
+
+/// Whether a module-like value is a package (`module.__path__` is present).
+pub(crate) fn module_is_package(module: i64) -> bool {
+    module_path_value(module).is_some()
+}
+
+/// Raises CPython's `ModuleNotFoundError` with an arbitrary message and the
+/// missing module's name attached as the `name` keyword.
+pub(crate) fn raise_module_not_found(message: &str, name: &str) -> i64 {
+    let missing = value::str_alloc(name.to_string());
+    let roots = crate::heap::root_values(&[missing]);
+    let exception = exc::exception_value_with_keywords(
+        MODULE_NOT_FOUND_ERROR,
+        message,
+        vec![message.to_string()],
+        vec![("name".to_string(), missing)],
+    );
+    crate::heap::release_roots(roots);
+    exc::raise_value(exception)
 }
 
 /// `__path__` as owned directory strings (a list or tuple of `str`).
@@ -795,6 +875,13 @@ fn str_arg(args: &[i64], index: usize, function: &str, name: &str) -> Result<Str
 }
 
 /// `find_spec(name, package=None)`.
+///
+/// CPython resolves a relative name, returns the stored `__spec__` for a name
+/// already in `sys.modules`, and otherwise imports the parent package — the
+/// parent's initializer may publish the `__path__` the finders need — before
+/// walking `sys.meta_path` with that path. A parent that cannot be imported
+/// raises the parent's `ModuleNotFoundError`; a parent that is not a package
+/// raises `ModuleNotFoundError` naming the requested module.
 fn find_spec(args: &[i64]) -> i64 {
     let name = match str_arg(args, 0, "find_spec", "name") {
         Ok(name) => name,
@@ -817,10 +904,48 @@ fn find_spec(args: &[i64]) -> i64 {
         Ok(None) => {}
         Err(raised) => return raised,
     }
-    // CPython's `find_spec` imports the parent package first and hands its
-    // `__path__` to every finder on `sys.meta_path`.
-    let path = parent_finder_path(&name);
+    let mut path = None;
+    if let Some((parent, _)) = name.rsplit_once('.') {
+        // `__import__(parent, fromlist=['__path__'])`: importing the parent is
+        // an observable step (`test_find_submodule` checks `sys.modules`).
+        let imported = import_parent(parent);
+        if exc::pending() {
+            return NONE;
+        }
+        if imported == NONE {
+            return crate::builtins::module_not_found(&name);
+        }
+        let Some(dirs) = module_path_dirs_value(imported) else {
+            return raise_module_not_found(
+                &format!(
+                    "__path__ attribute not found on '{parent}' while trying to find '{name}'"
+                ),
+                &name,
+            );
+        };
+        // A native package reports an empty path (no directory exists); the
+        // live search roots keep a dotted source tree reachable.
+        path = (!dirs.is_empty()).then_some(dirs);
+    }
     meta_path_find_spec(&name, path.as_deref()).unwrap_or(NONE)
+}
+
+/// Imports `name` as `find_spec`'s parent step, returning its module value.
+///
+/// The result is the same object `sys.modules[name]` holds; a raised import
+/// error stays pending for the caller.
+fn import_parent(name: &str) -> i64 {
+    let name_value = value::str_alloc(name.to_string());
+    let roots = crate::heap::root_values(&[name_value]);
+    let module = super::importlib::import_module(name_value, NONE);
+    crate::heap::release_roots(roots);
+    module
+}
+
+/// Whether `value` is a `types.ModuleType` (or subclass) instance.
+fn is_module_type_instance(module: i64) -> bool {
+    value::instance_class_value(module)
+        .is_some_and(|class| value::is_subclass_of(class, super::types::module_type_class()))
 }
 
 /// `importlib.util._find_spec_from_path(name, path=None, target=None)`.
@@ -1002,23 +1127,11 @@ fn spec_from_sys_modules(name: &str) -> Result<Option<i64>, i64> {
     if module == NONE {
         return Ok(Some(NONE));
     }
-    if let Some(pairs) = value::as_namespace(module) {
-        return match pairs.iter().find(|(key, _)| key.as_str() == "__spec__") {
-            Some((_, spec)) if *spec == NONE => Err(exc::raise_with_message(
-                VALUE_ERROR,
-                &format!("{name}.__spec__ is None"),
-            )),
-            Some((_, spec)) => Ok(Some(*spec)),
-            None => Err(exc::raise_with_message(
-                VALUE_ERROR,
-                &format!("{name}.__spec__ is not set"),
-            )),
-        };
-    }
-    if hydro_ir::stdlib::module(name).is_some() {
-        return Ok(Some(native_spec(name)));
-    }
-    if let Some(spec) = globals::lookup(name, "__spec__") {
+    // A module-like value answers through its live `__spec__` attribute:
+    // native module values synthesize their spec, and a `types.ModuleType`
+    // instance or a namespace published by a program-defined finder stores
+    // the spec CPython would read.
+    if let Some(spec) = module_attribute(module, "__spec__") {
         if spec == NONE {
             return Err(exc::raise_with_message(
                 VALUE_ERROR,
@@ -1027,9 +1140,30 @@ fn spec_from_sys_modules(name: &str) -> Result<Option<i64>, i64> {
         }
         return Ok(Some(spec));
     }
-    // A module value that publishes neither a spec nor a central-table entry
-    // (an extension module value, or a synthetic value) is not authoritative:
-    // let the finders describe it, so `find_spec` still reports the real file.
+    if exc::pending() {
+        // Another failure from the attribute surface is the outcome.
+        return Err(NONE);
+    }
+    // A value with no `__spec__` at all: CPython's util helpers raise for
+    // module objects and namespaces. An extension module value owns its own
+    // attribute table and is not authoritative, so the finders still describe
+    // the file.
+    if let Some(state) = value::as_module(module) {
+        return if state.path().is_some() {
+            Ok(None)
+        } else {
+            Err(exc::raise_with_message(
+                VALUE_ERROR,
+                &format!("{name}.__spec__ is not set"),
+            ))
+        };
+    }
+    if value::as_namespace(module).is_some() || is_module_type_instance(module) {
+        return Err(exc::raise_with_message(
+            VALUE_ERROR,
+            &format!("{name}.__spec__ is not set"),
+        ));
+    }
     Ok(None)
 }
 
@@ -1091,8 +1225,14 @@ fn spec_from_loader(args: &[i64]) -> i64 {
     let name_value = value::str_alloc(name.clone());
     let roots = crate::heap::root_values(&[loader, origin_arg, name_value]);
     let mut origin = origin_arg;
-    if value::as_str(origin).is_none_or(str::is_empty) {
+    // CPython consults `loader._ORIGIN` only for an *omitted* origin; an
+    // explicit empty string is kept.
+    if origin_arg == NONE {
         origin = loader_constant(loader, "_ORIGIN");
+    }
+    if exc::pending() {
+        crate::heap::release_roots(roots);
+        return NONE;
     }
     let mut is_package = if is_package_arg == NONE {
         None
@@ -1103,6 +1243,10 @@ fn spec_from_loader(args: &[i64]) -> i64 {
         .filter(|text| !text.is_empty())
         .map(str::to_string);
     let file_loader = loader != NONE && loader_member(loader, "get_filename") != NONE;
+    if exc::pending() {
+        crate::heap::release_roots(roots);
+        return NONE;
+    }
     if origin_text.is_some() || !file_loader {
         // `loader._ORIGIN` (or an explicit origin), or a loader without
         // `get_filename()`: a plain `ModuleSpec`, no filesystem location.
@@ -1110,24 +1254,41 @@ fn spec_from_loader(args: &[i64]) -> i64 {
         if is_package.is_none() {
             is_package = loader_package_flag(loader, name_value);
         }
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
         crate::heap::release_roots(roots);
         let locations = (is_package == Some(true)).then(Vec::<String>::new);
         return machinery::new_spec(&name, loader, origin_text, locations, false);
     }
     // A file loader names its own file. `get_filename()` raising `ImportError`
-    // leaves CPython's `<unknown>` placeholder in place.
+    // leaves CPython's `<unknown>` placeholder in place; every other failure
+    // propagates.
     let mut location = "<unknown>".to_string();
     if let Some(found) = loader_method(loader, "get_filename", &[name_value]) {
         if exc::pending() {
+            if exc::pending_tag() != i64::from(IMPORT_ERROR) {
+                crate::heap::release_roots(roots);
+                return NONE;
+            }
             exc::clear();
         } else if let Some(path) = value::as_str(found) {
-            location = machinery::absolute(path);
+            location = path.to_string();
         }
     } else if exc::pending() {
+        if exc::pending_tag() != i64::from(IMPORT_ERROR) {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
         exc::clear();
     }
     if is_package.is_none() {
         is_package = loader_package_flag(loader, name_value);
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
     }
     let mut locations = None;
     if is_package == Some(true) {
@@ -1160,14 +1321,18 @@ fn loader_constant(loader: i64, name: &str) -> i64 {
 }
 
 /// `loader.is_package(name)` as a flag, or `None` when the loader has no
-/// `is_package()` (or it raised, like CPython's ignored `ImportError`).
+/// `is_package()` (or it raised `ImportError`, which CPython treats as an
+/// undefined answer). Any other failure stays pending for the caller.
 fn loader_package_flag(loader: i64, name_value: i64) -> Option<bool> {
     let found = loader_method(loader, "is_package", &[name_value])?;
     if exc::pending() {
-        exc::clear();
+        if exc::pending_tag() == i64::from(IMPORT_ERROR) {
+            exc::clear();
+            return None;
+        }
         return None;
     }
-    (found != NONE).then(|| value::truthy(found))
+    Some(found != NONE && value::truthy(found))
 }
 
 /// `getattr(receiver, name)` as a callable, or `None` when the attribute is
@@ -1202,12 +1367,38 @@ fn spec_from_file_location(args: &[i64]) -> i64 {
     let loader_arg = args.get(2).copied().unwrap_or(NONE);
     let search_arg = args.get(3).copied().unwrap_or(NONE);
 
+    let name_value = value::str_alloc(name.clone());
+    let roots = crate::heap::root_values(&[location_arg, loader_arg, search_arg, name_value]);
+
+    // `location=None`: ask a file loader for its own filename, keeping
+    // CPython's `<unknown>` placeholder when the loader has none.
     let location = if location_arg == NONE {
-        "<unknown>".to_string()
+        let mut location = "<unknown>".to_string();
+        if loader_arg != NONE {
+            if let Some(found) = loader_method(loader_arg, "get_filename", &[name_value]) {
+                if exc::pending() {
+                    if exc::pending_tag() != i64::from(IMPORT_ERROR) {
+                        crate::heap::release_roots(roots);
+                        return NONE;
+                    }
+                    exc::clear();
+                } else if let Some(path) = value::as_str(found) {
+                    location = path.to_string();
+                }
+            } else if exc::pending() {
+                if exc::pending_tag() != i64::from(IMPORT_ERROR) {
+                    crate::heap::release_roots(roots);
+                    return NONE;
+                }
+                exc::clear();
+            }
+        }
+        location
     } else {
         match value::as_path_like(location_arg) {
             Some(text) => machinery::absolute(text),
             None => {
+                crate::heap::release_roots(roots);
                 return exc::raise_with_message(
                     TYPE_ERROR,
                     &format!(
@@ -1215,7 +1406,7 @@ fn spec_from_file_location(args: &[i64]) -> i64 {
                          os.PathLike, not '{}'",
                         value::type_name(location_arg)
                     ),
-                )
+                );
             }
         }
     };
@@ -1226,10 +1417,13 @@ fn spec_from_file_location(args: &[i64]) -> i64 {
         loader_arg
     } else if location.ends_with(".py") {
         machinery::source_loader(&name, &location)
+    } else if location.ends_with(".pyc") {
+        machinery::sourceless_loader(&name, &location)
     } else if is_extension_path(Path::new(&location)) {
         machinery::extension_loader(&name, &location)
     } else {
         // CPython declines locations whose suffix no loader recognizes.
+        crate::heap::release_roots(roots);
         return NONE;
     };
     machinery::set_spec_loader(spec, loader);
@@ -1246,6 +1440,7 @@ fn spec_from_file_location(args: &[i64]) -> i64 {
         } else if let Some(text) = value::as_str(search_arg) {
             locations = Some(vec![text.to_string()]);
         } else {
+            crate::heap::release_roots(roots);
             return exc::raise_with_message(
                 TYPE_ERROR,
                 &format!(
@@ -1255,16 +1450,16 @@ fn spec_from_file_location(args: &[i64]) -> i64 {
                 ),
             );
         }
-    } else if is_package_init(Path::new(&location)) {
-        let dir = Path::new(&location)
-            .parent()
-            .map(|dir| dir.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        locations = Some(if dir.is_empty() {
-            Vec::new()
-        } else {
-            vec![dir]
-        });
+    } else {
+        // Omitted: CPython checks the loader's own `is_package()` answer.
+        let is_package = loader_package_flag(loader, name_value);
+        if exc::pending() {
+            crate::heap::release_roots(roots);
+            return NONE;
+        }
+        if is_package == Some(true) {
+            locations = Some(Vec::new());
+        }
     }
     if let Some(mut dirs) = locations {
         if dirs.is_empty() && location != "<unknown>" {
@@ -1274,6 +1469,7 @@ fn spec_from_file_location(args: &[i64]) -> i64 {
         }
         machinery::set_package_locations(spec, dirs);
     }
+    crate::heap::release_roots(roots);
     spec
 }
 
@@ -1531,14 +1727,16 @@ fn resolve_relative(name: &str, package_arg: i64) -> Result<String, i64> {
     let Some(package) = package else {
         return Err(exc::raise_with_message(
             IMPORT_ERROR,
-            &format!("no package specified for {name:?} (required for relative module names)"),
+            &format!("no package specified for '{name}' (required for relative module names)"),
         ));
     };
     let dots = name.bytes().take_while(|byte| *byte == b'.').count();
     let rest = &name[dots..];
     let mut parts: Vec<&str> = package.split('.').filter(|part| !part.is_empty()).collect();
     let up = dots - 1;
-    if up > parts.len() {
+    // `_resolve_name` removes `level - 1` components from the package; the
+    // base package itself must survive.
+    if up >= parts.len() {
         return Err(exc::raise_with_message(
             IMPORT_ERROR,
             "attempted relative import beyond top-level package",

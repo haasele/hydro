@@ -23,7 +23,7 @@ profiling flavors) and `tea brew`/`tea build` (AOT).
 | Phase 3 — Toolchain (`new`/`init`/`test`/`fmt`/`lint`/`clean`, build cache, uv passthrough) | moved to the separate **Tea** repository |
 | Phase 4 — Python compatibility, C API/ABI | **decision B; native C-API layer imports real wheels** (0 missing link-time symbols for pinned NumPy/pandas/pydantic extensions, no `libpython`; python-dateutil, six, typing-inspection, annotated-types and tzdata green; pydantic/NumPy/pandas still blocked); full ABI semantics/stdlib/ecosystem remain open (P4-04c…P4-11), see [`docs/C_API.md`](docs/C_API.md) |
 | Phase 5 — Performance | baseline + local regression gate + CPython/Hydro/PyPy/Go engine comparison |
-| Phase 6 — Diagnostics/Developer Experience | largely done; CLI/diagnostic references, `--verbose`/`--quiet`, ICE and span tests; troubleshooting/migration open |
+| Phase 6 — Diagnostics/Developer Experience | largely done; CLI/diagnostic references, `--verbose`/`--quiet`, ICE and span tests, and the troubleshooting/migration guide in [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md) |
 
 ## Progress
 
@@ -116,6 +116,34 @@ comparison.
   layout expects `../tea`.
 - Python 3 is used only by the benchmark harnesses and compatibility scripts
   under `benchmarks/` and `scripts/`.
+
+## Troubleshooting and migration
+
+`tea check` reports frontend diagnostics without executing the program;
+`tea infuse` runs the Hydro JIT; `tea build` produces an AOT binary. `tea run`
+is CPython via uv and never exercises the Hydro engine.
+
+```bash
+tea check main.py
+tea infuse main.py
+tea build main.py -o main-bin && ./main-bin
+```
+
+The full troubleshooting guide, environment variables (`HYDRO_STDLIB`,
+`HYDRO_SITE_PACKAGES`, `HYDRO_EXTENSION_PATH`), import-failure checks, AOT/JIT
+classification, `HYDRO_GC_PRECISE=1` strict mode, official-suite triage
+commands and the difference-report checklist are in
+[`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md#troubleshooting).
+
+Hydro's compatibility target is **CPython 3.14.9** (3.13 is security-only and
+3.15 is newer than the supported oracle). The supported subset is the
+[Language and Stdlib Scope](#language-and-stdlib-scope) section below; native C
+extensions are limited to supported wheel tags and the shim surface in
+[`docs/C_API.md`](docs/C_API.md), and `pickle` is Hydro's own HYD1 format. The
+compatibility/support policy lives in
+[`docs/COMPAT_STRATEGY.md`](docs/COMPAT_STRATEGY.md) and the strict gate in
+[`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md); per-module status is in
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 
 ## Quickstart
 
@@ -244,9 +272,10 @@ See the Tea repository for the complete command reference, flavor storage
 - Native modules (see below) and **user modules**: `import foo` /
   `from foo import f` resolve a sibling file, a package (`foo/__init__.py`),
   dotted and relative submodules, `HYDRO_SITE_PACKAGES`, venv/conda
-  site-packages, `PYTHONPATH`, `HYDRO_STDLIB` (a CPython `Lib` tree) and
-  finally the pure-Python modules vendored in the repository's `stdlib/`
-  directory, so explicit roots always win over the vendored tree. Each unit
+  site-packages, `PYTHONPATH`, the pure-Python modules vendored in the
+  repository's `stdlib/` directory and `HYDRO_STDLIB` (a CPython `Lib` tree)
+  last, so explicit roots win over the vendored tree and the vendored
+  compatibility modules win over the generic CPython tree. Each unit
   loads once per canonical path, imported module bodies run once as
   initializers, and import cycles are diagnosed. `from x import *` and a
   general `sys.modules`/`sys.path` model are missing.

@@ -991,10 +991,15 @@ mod tests {
 
     #[test]
     fn normal_compilation_keeps_its_semantics() {
-        // The session API does not change standalone checks: an unknown name
-        // is still a compile error, and no global read is synthesized.
-        let diags = crate::check_source("value = 1\nprint(valu)\n", "test.py")
-            .expect_err("unknown name must fail");
+        // The session API does not change standalone checks: an unresolved
+        // module read is a runtime lookup, while a module-level name hidden
+        // from a function is still a compile error.
+        let diags = crate::check_source(
+            "try:\n    raise ValueError\nexcept ValueError as item:\n    pass\n\
+             def read():\n    return item\n",
+            "test.py",
+        )
+        .expect_err("a hidden module local must fail");
         assert!(diags.iter().any(|diag| diag.code == codes::NAME));
     }
 

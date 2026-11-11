@@ -900,7 +900,19 @@ struct State {
     /// Exceptions whose handlers are active (and in-flight exceptions while a
     /// `finally` body runs), innermost last. Implicit chaining reads the top;
     /// the heap mirror keeps these values alive.
+    ///
+    /// This is the running fiber's own handler stack. While a fiber runs the
+    /// caller's stack sits in [`Self::saved_handled`], because CPython swaps
+    /// `tstate->exc_info` to the generator's `gi_exc_state` for the duration
+    /// of a resume (and to the coroutine's `cr_exc_state` for a coroutine).
     handled: Vec<i64>,
+    /// Caller handler stacks parked by nested fiber resumes, outermost first.
+    ///
+    /// CPython links the resumed fiber's exception state to the caller's via
+    /// `previous_item`, so `sys.exc_info()` and implicit chaining fall back to
+    /// the caller's exception when the fiber handles none itself. The parked
+    /// stacks provide that fallback and keep their exceptions reachable.
+    saved_handled: Vec<Vec<i64>>,
 }
 
 thread_local! {
@@ -1460,27 +1472,25 @@ pub(crate) fn init() {
 /// context. `None` marks a `finally` body entered without an in-flight
 /// exception, so outer handlers are not shadowed by a stale value.
 pub(crate) fn handler_push(value: i64) -> i64 {
-    let handled = STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        state.handled.push(value);
-        state.handled.clone()
-    });
-    crate::heap::set_handled_mirror(&handled);
+    STATE.with(|s| s.borrow_mut().handled.push(value));
+    refresh_handled_mirror();
     NONE
 }
 
 /// Pops the innermost handler context (`hydro_exc_handler_pop`).
 pub(crate) fn handler_pop() -> i64 {
-    let handled = STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        state.handled.pop();
-        state.handled.clone()
+    STATE.with(|s| {
+        s.borrow_mut().handled.pop();
     });
-    crate::heap::set_handled_mirror(&handled);
+    refresh_handled_mirror();
     NONE
 }
 
 /// Number of active handler contexts (`hydro_exc_handler_depth`).
+///
+/// Only the running fiber's own stack counts: generated code captures this
+/// depth to balance its pushes, and CPython's per-frame state node likewise
+/// starts empty instead of including the caller's handled exceptions.
 pub(crate) fn handler_depth() -> i64 {
     STATE.with(|s| s.borrow().handled.len() as i64)
 }
@@ -1489,20 +1499,44 @@ pub(crate) fn handler_depth() -> i64 {
 /// (`hydro_exc_handler_truncate`). A depth at or beyond the current length is a
 /// no-op, so a path that already unwound cannot pop a caller's context.
 pub(crate) fn handler_truncate(depth: i64) -> i64 {
-    let handled = STATE.with(|s| {
+    STATE.with(|s| {
         let mut state = s.borrow_mut();
         if depth >= 0 {
             state.handled.truncate(depth as usize);
         }
-        state.handled.clone()
     });
-    crate::heap::set_handled_mirror(&handled);
+    refresh_handled_mirror();
     NONE
 }
 
-/// Exception whose handler is active, if any. `None` entries above it are
-/// `finally` markers and are skipped.
-fn handled() -> Option<i64> {
+/// Installs `own` as the running fiber's handler stack and parks the caller's
+/// stack (`fiber::resume_raw` calls this around the context switch).
+pub(crate) fn enter_fiber_handlers(own: Vec<i64>) {
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let caller = std::mem::replace(&mut state.handled, own);
+        state.saved_handled.push(caller);
+    });
+    refresh_handled_mirror();
+}
+
+/// Restores the caller's handler stack and returns the fiber's own stack
+/// (the resume side of [`enter_fiber_handlers`]).
+pub(crate) fn leave_fiber_handlers() -> Vec<i64> {
+    let own = STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let caller = state.saved_handled.pop().unwrap_or_default();
+        std::mem::replace(&mut state.handled, caller)
+    });
+    refresh_handled_mirror();
+    own
+}
+
+/// Topmost exception handled by the running fiber itself, ignoring the
+/// caller's parked stack. `gen.throw`/`close` chain an injected exception to
+/// this state only (CPython's `_PyErr_ChainStackItem` inspects the current
+/// `gi_exc_state` node, not its `previous_item` chain).
+pub(crate) fn handled_own() -> Option<i64> {
     STATE.with(|s| {
         s.borrow()
             .handled
@@ -1513,9 +1547,48 @@ fn handled() -> Option<i64> {
     })
 }
 
-/// Tagged values of the active handler stack, for the collector's root scan.
+/// Exception whose handler is active, if any. `None` entries above it are
+/// `finally` markers and are skipped. The running fiber's own stack wins;
+/// when it handles nothing, the parked caller stacks supply the exception
+/// CPython reaches through `previous_item`.
+fn handled() -> Option<i64> {
+    STATE.with(|s| {
+        let state = s.borrow();
+        state
+            .handled
+            .iter()
+            .rev()
+            .copied()
+            .find(|&value| value != NONE)
+            .or_else(|| {
+                state
+                    .saved_handled
+                    .iter()
+                    .rev()
+                    .find_map(|stack| stack.iter().rev().copied().find(|&value| value != NONE))
+            })
+    })
+}
+
+/// Tagged values of the active handler stacks (the running fiber's and every
+/// parked caller's), for the collector's root scan.
 pub(crate) fn handled_values() -> Vec<i64> {
-    STATE.with(|s| s.borrow().handled.clone())
+    STATE.with(|s| {
+        let state = s.borrow();
+        let mut values = state.handled.clone();
+        for stack in &state.saved_handled {
+            values.extend_from_slice(stack);
+        }
+        values
+    })
+}
+
+/// Mirror the live handler values into the thread registration for the
+/// collector. Looks only at the thread-local state; callers must not hold a
+/// borrow.
+fn refresh_handled_mirror() {
+    let values = handled_values();
+    crate::heap::set_handled_mirror(&values);
 }
 
 /// `sys.exc_info()`: the `(type, value, traceback)` triple of the exception
@@ -1663,6 +1736,134 @@ fn raise_with_message_cause(
     publish(exception)
 }
 
+/// The `StopIteration.value` member for `data`: the first positional
+/// argument, or `None` when the exception was built without one.
+///
+/// CPython stores the member at construction (`StopIteration_init`); runtime
+/// raises only render their argument as text, so the text is materialised
+/// back into a string in that case.
+fn stop_iteration_value(data: &ExcData) -> i64 {
+    data.arg_values
+        .first()
+        .copied()
+        .or_else(|| {
+            data.args
+                .first()
+                .map(|text| value::str_from_bytes(text.as_bytes()))
+        })
+        .unwrap_or(NONE)
+}
+
+/// Raised when a generator body finishes: `StopIteration` carrying the
+/// generator's return value, exactly like CPython's `_PyGen_SetStopIterationValue`.
+///
+/// `result == None` raises the bare form (`args == ()`, `value is None`).
+pub(crate) fn raise_stop_iteration(result: i64) -> i64 {
+    if result == NONE {
+        return raise_with_message(STOP_ITERATION, "");
+    }
+    let (file, line, frame) = current_location();
+    // `result` only lives on the Rust stack while the payload allocates.
+    let start = crate::heap::root_values(&[result]);
+    let text = value::to_string(result);
+    let repr = value::repr(result);
+    let data = ExcData {
+        tag: STOP_ITERATION,
+        name: tag_name(STOP_ITERATION),
+        msg: text.clone(),
+        file,
+        line,
+        frame,
+        cause: None,
+        // `_PyGen_SetStopIterationValue` installs the exception with
+        // `PyErr_SetRaisedException`, so a valued StopIteration never picks up
+        // the caller's handled exception as context (the bare form, built by
+        // `PyErr_SetNone`, does).
+        context: None,
+        suppress_context: false,
+        exit_code: None,
+        args: vec![text],
+        arg_values: vec![result],
+        arg_reprs: vec![repr],
+        keywords: Vec::new(),
+        object: None,
+    };
+    let exception = value::exception_new(data);
+    crate::heap::release_roots(start);
+    publish(exception)
+}
+
+/// Publishes an existing exception without implicit `__context__` chaining.
+///
+/// CPython propagates a captured or injected exception with `_PyErr_Restore`/
+/// `_PyErr_SetRaisedException`, which keeps the exception's context exactly as
+/// it was raised. [`raise_value`] is the source-level `raise` and adds the
+/// handled exception as context; this is the propagation path.
+pub(crate) fn raise_value_unchained(v: i64) -> i64 {
+    match value::exception_data(v) {
+        Some(_) => publish(v),
+        None if value::is_ext_exception(v) => raise_extension(v, RUNTIME_ERROR, ""),
+        None => raise_with_message(TYPE_ERROR, "exceptions must derive from BaseException"),
+    }
+}
+
+/// Raises `v` as an injected exception (`gen.throw`/cancellation), chaining it
+/// only to `context`: the running fiber's own handled exception.
+///
+/// A pre-existing context is kept, and the value itself is published when no
+/// chaining is needed, so `gen.throw(exc)` propagating unchanged preserves
+/// object identity. CPython mutates the exception in place; the immutable
+/// payload forces a copy only when a context is actually attached.
+pub(crate) fn raise_injected(v: i64, context: Option<i64>) -> i64 {
+    match value::exception_data(v) {
+        Some(data) => {
+            let context = context.filter(|&handled| handled != v);
+            match context {
+                Some(context) if data.context.is_none() => {
+                    let mut data = data.clone();
+                    data.context = Some(context);
+                    publish(value::exception_with_data(v, data))
+                }
+                _ => publish(v),
+            }
+        }
+        None if value::is_ext_exception(v) => raise_extension(v, RUNTIME_ERROR, ""),
+        None => raise_with_message(TYPE_ERROR, "exceptions must derive from BaseException"),
+    }
+}
+
+/// PEP 479: a `StopIteration` (or, for async generators,
+/// `StopAsyncIteration`) escaping a generator body becomes a `RuntimeError`.
+///
+/// CPython's `stopiteration_error` sets both `__cause__` and `__context__` to
+/// the escaping exception and suppresses the implicit context rendering.
+pub(crate) fn raise_generator_stop(error: i64, message: &str) -> i64 {
+    let (file, line, frame) = current_location();
+    // `error` stays referenced by the pending slot, but the payload copy must
+    // survive a collection during allocation.
+    let start = crate::heap::root_values(&[error]);
+    let data = ExcData {
+        tag: RUNTIME_ERROR,
+        name: tag_name(RUNTIME_ERROR),
+        msg: message.to_string(),
+        file,
+        line,
+        frame,
+        cause: Some(error),
+        context: Some(error),
+        suppress_context: true,
+        exit_code: None,
+        args: vec![message.to_string()],
+        arg_values: Vec::new(),
+        arg_reprs: vec![value::quote_str(message)],
+        keywords: Vec::new(),
+        object: None,
+    };
+    let exception = value::exception_new(data);
+    crate::heap::release_roots(start);
+    publish(exception)
+}
+
 /// Raises `SystemExit` with the tagged Python value `code`, as `sys.exit()`
 /// and `raise SystemExit(...)` do.
 ///
@@ -1741,6 +1942,44 @@ fn cause_of(cause: i64) -> Option<i64> {
     }
 }
 
+/// Exclusive access to an exception payload (native or user-defined subclass).
+///
+/// CPython mutates an exception in place when a `raise` records `__context__`
+/// or `__cause__`, and tests compare the re-raised object by identity, so the
+/// payload is updated rather than copied. `None` for values that are not
+/// exception instances.
+fn exception_data_mut(exception: i64) -> Option<&'static mut ExcData> {
+    if !value::is_heap(exception) || (exception & !value::TAG_MASK) == 0 {
+        return None;
+    }
+    // SAFETY: the tag bits identify a heap object rooted by the caller; the
+    // payload type is selected by `kind` and checked below.
+    let obj = unsafe { &mut *((exception & !value::TAG_MASK) as *mut value::HydroObj) };
+    match obj.kind {
+        value::KIND_EXCEPTION => match obj.data_mut() {
+            value::ObjDataMut::Exception(data) => Some(data),
+            _ => None,
+        },
+        value::KIND_EXC_INSTANCE => match obj.data_mut() {
+            value::ObjDataMut::ExcInstance(state) => Some(&mut state.data),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Records `context` on an existing exception in place. Returns whether the
+/// payload could be updated (`false` for non-exception values).
+fn set_exception_context(exception: i64, context: i64) -> bool {
+    match exception_data_mut(exception) {
+        Some(data) => {
+            data.context = Some(context);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Renders the positional payload of a `raise X(v)` form.
 ///
 /// Returns `(message, args, reprs, values)`: `None` selects the tag's default
@@ -1794,10 +2033,11 @@ pub(crate) fn raise_msg_ptr(tag: u32, ptr: *const u8, len: usize) -> i64 {
 ///
 /// The object is stored as-is, so type, message and source location of the
 /// original raise are preserved. If another exception's handler is active and
-/// the object has no implicit context yet, a copy carrying that context is
-/// published instead; re-raising the handled object itself never creates a
-/// self-cycle. Raising anything that is not a `BaseException` raises
-/// CPython's `TypeError: exceptions must derive from BaseException`.
+/// the object has no implicit context yet, `__context__` is attached to the
+/// object in place (CPython's `PyException_SetContext`); re-raising the
+/// handled object itself never creates a self-cycle. Raising anything that is
+/// not a `BaseException` raises CPython's
+/// `TypeError: exceptions must derive from BaseException`.
 pub(crate) fn raise_value(v: i64) -> i64 {
     // `raise SomeExceptionClass` instantiates the class with no arguments,
     // exactly like CPython; only the resulting instance is published.
@@ -1811,25 +2051,32 @@ pub(crate) fn raise_value(v: i64) -> i64 {
         }
         return raise_value(instance);
     }
-    match value::exception_data(v) {
-        Some(data) => {
-            let context = handled().filter(|&h| h != v);
-            match context {
-                Some(context) if data.context.is_none() => {
-                    let mut data = data.clone();
+    // An extension exception object re-raised from source. Hydro has no class
+    // object for it, so it becomes the handler-compatible `RuntimeError`
+    // wrapper that keeps the original instance.
+    if value::exception_data(v).is_none() {
+        return if value::is_ext_exception(v) {
+            raise_extension(v, RUNTIME_ERROR, "")
+        } else {
+            raise_with_message(TYPE_ERROR, "exceptions must derive from BaseException")
+        };
+    }
+    // CPython's `PyException_SetContext` mutates the re-raised object, so
+    // `raise` through an outer handler preserves its identity.
+    let needs_context = value::exception_data(v).is_some_and(|data| data.context.is_none());
+    if needs_context {
+        if let Some(context) = handled().filter(|&h| h != v) {
+            if !set_exception_context(v, context) {
+                // No exclusive payload (should not happen for a checked
+                // exception); fall back to a copy that keeps the class.
+                if let Some(mut data) = value::exception_clone(v) {
                     data.context = Some(context);
-                    // Keep a user-defined exception's Python class identity.
-                    publish(value::exception_with_data(v, data))
+                    return publish(value::exception_with_data(v, data));
                 }
-                _ => publish(v),
             }
         }
-        // An extension exception object re-raised from source. Hydro has no
-        // class object for it, so it becomes the handler-compatible
-        // `RuntimeError` wrapper that keeps the original instance.
-        None if value::is_ext_exception(v) => raise_extension(v, RUNTIME_ERROR, ""),
-        None => raise_with_message(TYPE_ERROR, "exceptions must derive from BaseException"),
     }
+    publish(v)
 }
 
 /// Python-visible class name of an exception payload.
@@ -2855,6 +3102,12 @@ pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
         "__context__" => data.context.unwrap_or(NONE),
         "__suppress_context__" => value::bool_value(data.suppress_context),
         "__traceback__" => NONE,
+        // `StopIteration.value`: the generator return value. CPython stores it
+        // as a mutable member initialised from the first positional argument;
+        // a subclass instance that assigned the name keeps its attribute.
+        "value" if data.tag == STOP_ITERATION => {
+            value::instance_attr(object, "value").unwrap_or_else(|| stop_iteration_value(data))
+        }
         "__str__" | "__repr__" | "__setstate__" | "__reduce__" | "__reduce_ex__"
         | "with_traceback" | "__init__" | "add_note" => {
             value::bound_method_new(object, name.to_string())
@@ -2885,6 +3138,75 @@ pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
             keyword_value(data, name).unwrap_or(NONE)
         }
     })
+}
+
+/// Assigns a writable exception attribute. Returns `None` when `name` is not
+/// part of the surface, so the caller can fall through to its own dispatch.
+///
+/// The writable names mirror CPython's member/getset descriptors:
+/// `StopIteration.value` (the first `args` entry), `__context__`, `__cause__`
+/// (which implies `__suppress_context__`, like `PyException_SetCause`) and
+/// `__suppress_context__`.
+pub(crate) fn exception_setattr(object: i64, name: &str, new_value: i64) -> Option<i64> {
+    let tag = value::exception_data(object)?.tag;
+    let exception_instance =
+        |v: i64| value::exception_data(v).is_some() || value::is_ext_exception(v);
+    match name {
+        "value" if tag == STOP_ITERATION => {
+            let data = exception_data_mut(object)?;
+            // The member starts as `args[0]`; assignment replaces it while
+            // the rendered message (`str(e)`) stays what the constructor
+            // stored, exactly like CPython's member slot.
+            let text = value::to_string(new_value);
+            let repr = value::repr(new_value);
+            if !data.arg_values.is_empty() {
+                data.arg_values[0] = new_value;
+            } else {
+                data.arg_values = vec![new_value];
+            }
+            if !data.args.is_empty() {
+                data.args[0] = text;
+            } else {
+                data.args = vec![text];
+            }
+            if !data.arg_reprs.is_empty() {
+                data.arg_reprs[0] = repr;
+            } else {
+                data.arg_reprs = vec![repr];
+            }
+            Some(NONE)
+        }
+        "__context__" => {
+            if new_value != NONE && !exception_instance(new_value) {
+                return Some(raise_with_message(
+                    TYPE_ERROR,
+                    "exception context must be None or derive from BaseException",
+                ));
+            }
+            let data = exception_data_mut(object)?;
+            data.context = (new_value != NONE).then_some(new_value);
+            Some(NONE)
+        }
+        "__cause__" => {
+            if new_value != NONE && !exception_instance(new_value) {
+                return Some(raise_with_message(
+                    TYPE_ERROR,
+                    "exception cause must be None or derive from BaseException",
+                ));
+            }
+            let data = exception_data_mut(object)?;
+            data.cause = (new_value != NONE).then_some(new_value);
+            // `PyException_SetCause` always suppresses the rendered context.
+            data.suppress_context = true;
+            Some(NONE)
+        }
+        "__suppress_context__" => {
+            let data = exception_data_mut(object)?;
+            data.suppress_context = value::truthy(new_value);
+            Some(NONE)
+        }
+        _ => None,
+    }
 }
 
 /// Whether the receiver's Python class defines `name` itself. Used to keep a

@@ -1554,7 +1554,7 @@ pub static ARRAY: ModuleSpec = ModuleSpec {
         // `array.__reduce_ex__`'s unpickling entry point.
         f("_array_reconstructor", 4, 4, Type::Any),
     ],
-    constants: &[c("typecodes", Type::Str)],
+    constants: &[c("ArrayType", Type::Any), c("typecodes", Type::Str)],
 };
 
 /// `cmath`: complex-number versions of the `math` functions. Unary functions
@@ -2001,6 +2001,7 @@ pub static SYS: ModuleSpec = ModuleSpec {
         // `sys._getframe()` rejects keywords in CPython (it is C-level), so
         // this stays positional-only.
         f("_getframe", 0, 1, Type::Any),
+        f("intern", 1, 1, Type::Str),
         f("getdefaultencoding", 0, 0, Type::Str),
         // `sys.audit(event, *args)`: raises if a hook vetoes the event; the
         // trailing arguments are event-specific.
@@ -2552,31 +2553,7 @@ pub static _IO: ModuleSpec = ModuleSpec {
 pub static ARGPARSE: ModuleSpec = ModuleSpec {
     name: "argparse",
     functions: &[
-        kw(
-            "ArgumentParser",
-            0,
-            14,
-            Type::Any,
-            &[
-                "prog",
-                "usage",
-                "description",
-                "epilog",
-                "parents",
-                "formatter_class",
-                "prefix_chars",
-                "fromfile_prefix_chars",
-                "argument_default",
-                "conflict_handler",
-                "add_help",
-                "allow_abbrev",
-                "exit_on_error",
-                "color",
-            ],
-        ),
-        // `Namespace` is a class in CPython; exposing it as a native
-        // constructor keeps `Namespace(**kwargs)` and `from argparse import
-        // Namespace` working without a second object kind.
+        f("ArgumentParser", 0, 15, Type::Any),
         kw_dynamic("Namespace", 0, 0, Type::Any, &[]),
         kw(
             "FileType",
@@ -2591,6 +2568,11 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
         f("_", 1, 1, Type::Str),
     ],
     constants: &[
+        // `ArgumentParser` and `Namespace` are real classes so that
+        // `class Parser(argparse.ArgumentParser)` and `vars(ns)` work like
+        // CPython; the runtime builds/caches the class values.
+        c("ArgumentParser", Type::Any),
+        c("Namespace", Type::Any),
         c("SUPPRESS", Type::Any),
         // `argparse.ArgumentTypeError`: the exception `type=` callables raise.
         c("ArgumentTypeError", Type::Any),
@@ -2988,13 +2970,23 @@ pub static RE: ModuleSpec = ModuleSpec {
         // same kind as the input string, so a bytes pattern/subject returns
         // bytes. The static table has no overload channel, so the return is
         // dynamic (the runtime returns `bytes` for bytes patterns).
-        f("sub", 3, 5, Type::Any),
-        f("split", 2, 3, Type::List),
+        f("sub", 3, 6, Type::Any),
+        f("split", 2, 5, Type::List),
         f("escape", 1, 1, Type::Str),
         // `compile(pattern, flags=0)`; the runtime forwards the flags to the
         // regex builder. `_compile` is the cache-aware internal spelling.
-        f("compile", 1, 2, Type::Any),
+        // The six-argument form is the private `_sre.compile(pattern, flags,
+        // code, groups, groupindex, indexgroup)` slot, reached through the
+        // `_sre` alias; the runtime validates it separately.
+        f("compile", 1, 6, Type::Any),
         f("_compile", 2, 2, Type::Any),
+        // The private `_sre` helpers exercised by `test_re.test_case_helpers`
+        // and `test_sre_template_invalid_group_index`.
+        f("ascii_tolower", 1, 1, Type::Int),
+        f("unicode_tolower", 1, 1, Type::Int),
+        f("ascii_iscased", 1, 1, Type::Bool),
+        f("unicode_iscased", 1, 1, Type::Bool),
+        f("template", 1, 2, Type::Any),
         // `finditer(pattern, string, flags=0)`: every non-overlapping match
         // as a `Match` object in a list. `flags` may be passed by keyword,
         // which rich does (`flags=re.MULTILINE`).
@@ -3009,6 +3001,11 @@ pub static RE: ModuleSpec = ModuleSpec {
     // The `RegexFlag` members, with CPython's numeric values. They are plain
     // tagged ints: the runtime reads the bits it understands.
     constants: &[
+        // The `_sre` C-module surface (it aliases this module's table).
+        c("MAGIC", Type::Int),
+        c("MAXREPEAT", Type::Int),
+        c("MAXGROUPS", Type::Int),
+        c("CODESIZE", Type::Int),
         c("NOFLAG", Type::Int),
         c("TEMPLATE", Type::Int),
         c("T", Type::Int),
@@ -4034,7 +4031,7 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
         kw(
             "Popen",
             1,
-            15,
+            16,
             Type::Any,
             &[
                 "args",
@@ -4052,6 +4049,7 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
                 "bufsize",
                 "shell",
                 "executable",
+                "universal_newlines",
             ],
         ),
         kw("_popen_wait", 1, 2, Type::Int, &["self", "timeout"]),
@@ -4063,6 +4061,8 @@ pub static SUBPROCESS: ModuleSpec = ModuleSpec {
     ],
     constants: &[
         c("CalledProcessError", Type::Any),
+        c("TimeoutExpired", Type::Any),
+        c("SubprocessError", Type::Any),
         c("PIPE", Type::Int),
         c("STDOUT", Type::Int),
         c("DEVNULL", Type::Int),
@@ -5302,7 +5302,20 @@ pub static IMPORTLIB_UTIL: ModuleSpec = ModuleSpec {
 pub static IMPORTLIB_MACHINERY: ModuleSpec = ModuleSpec {
     name: "importlib.machinery",
     functions: &[
-        f("_spec_init", 3, 6, Type::None),
+        kw(
+            "_spec_init",
+            3,
+            6,
+            Type::None,
+            &[
+                "self",
+                "name",
+                "loader",
+                "origin",
+                "loader_state",
+                "is_package",
+            ],
+        ),
         // `_module_spec(name, origin, is_package)`: the `ModuleSpec` binding
         // every compiled unit publishes as `__spec__`.
         f("_module_spec", 3, 3, Type::Any),
@@ -5663,6 +5676,7 @@ pub static CODECS: ModuleSpec = ModuleSpec {
         f("replace_errors", 1, 1, Type::Any),
         f("xmlcharrefreplace_errors", 1, 1, Type::Any),
         f("backslashreplace_errors", 1, 1, Type::Any),
+        f("surrogatepass_errors", 1, 1, Type::Any),
         f("namereplace_errors", 1, 1, Type::Any),
         // `escape_decode(data, errors='strict')`: the `unicode_escape` /
         // `raw_unicode_escape` decoder shared with `_codecs`.
@@ -5775,8 +5789,6 @@ pub static _IMP: ModuleSpec = ModuleSpec {
         f("is_frozen", 1, 1, Type::Bool),
         f("is_frozen_package", 1, 1, Type::Bool),
         f("init_frozen", 1, 1, Type::Any),
-        f("pyc_magic_number_token", 0, 0, Type::Int),
-        f("check_hash_based_pycs", 2, 2, Type::Bool),
         f("_frozen_module_names", 0, 0, Type::List),
         f("extension_suffixes", 0, 0, Type::List),
         f("create_builtin", 1, 1, Type::Any),
@@ -5790,7 +5802,10 @@ pub static _IMP: ModuleSpec = ModuleSpec {
         f("_override_frozen_modules_for_tests", 1, 1, Type::Int),
         f("_override_multi_interp_extensions_check", 1, 1, Type::Int),
     ],
-    constants: &[],
+    constants: &[
+        c("pyc_magic_number_token", Type::Int),
+        c("check_hash_based_pycs", Type::Str),
+    ],
 };
 
 /// `_opcode`: truthful introspection for a bytecode-less runtime.
@@ -8669,7 +8684,27 @@ pub static _TESTINTERNALCAPI: ModuleSpec = ModuleSpec {
         f("exec_interpreter", 2, 3, Type::Any),
         f("run_in_subinterp_with_config", 1, 2, Type::Any),
         f("pystate_getmodule", 1, 1, Type::Any),
-        f("pystate_addmodule_run", 1, 1, Type::Any),
+        f("_PyTime_FromSeconds", 1, 1, Type::Int),
+        f("_PyTime_FromSecondsObject", 2, 2, Type::Int),
+        f("_PyTime_AsTimeval", 2, 2, Type::Tuple),
+        f("_PyTime_AsTimeval_clamp", 2, 2, Type::Tuple),
+        f("_PyTime_AsTimespec", 1, 1, Type::Tuple),
+        f("_PyTime_AsTimespec_clamp", 1, 1, Type::Tuple),
+        f("_PyTime_AsMilliseconds", 2, 2, Type::Int),
+        f("_PyTime_AsMicroseconds", 2, 2, Type::Int),
+        f("_PyTime_ObjectToTime_t", 2, 2, Type::Int),
+        f("_PyTime_ObjectToTimespec", 2, 2, Type::Tuple),
+        f("_PyTime_ObjectToTimeval", 2, 2, Type::Tuple),
+        f(
+            "_PyUnicode_TransformDecimalAndSpaceToASCII",
+            1,
+            1,
+            Type::Str,
+        ),
+        f("EncodeLocaleEx", 1, 3, Type::Bytes),
+        f("DecodeLocaleEx", 1, 3, Type::Str),
+        f("get_co_framesize", 1, 1, Type::Int),
+        f("get_co_localskinds", 1, 1, Type::Dict),
     ],
     constants: &[
         c("SIZEOF_PYGC_HEAD", Type::Int),
@@ -9828,7 +9863,7 @@ mod tests {
         }
         // `compile(pattern, flags=0)` takes the optional flag argument.
         let compile = function("re", "compile").expect("re.compile");
-        assert_eq!((compile.min_args, compile.max_args), (1, 2));
+        assert_eq!((compile.min_args, compile.max_args), (1, 6));
         // `re.search(pat, text, re.I)`: the flags argument is positional on
         // every matching entry point (`findall` has included it since 3.11).
         for (name, ret) in [
@@ -11062,7 +11097,7 @@ mod tests {
         // `subprocess.Popen` declares the keyword-only options after the
         // leading six slots.
         let popen = function("subprocess", "Popen").expect("subprocess.Popen");
-        assert_eq!((popen.min_args, popen.max_args), (1, 15));
+        assert_eq!((popen.min_args, popen.max_args), (1, 16));
         assert_eq!(
             popen.params,
             &[
@@ -11081,6 +11116,7 @@ mod tests {
                 "bufsize",
                 "shell",
                 "executable",
+                "universal_newlines",
             ][..]
         );
         assert_eq!(

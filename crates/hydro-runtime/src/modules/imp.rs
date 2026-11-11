@@ -57,15 +57,23 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         // The import lock is process-wide and is never held while user code
         // runs, so this thread's answer is always `False`.
         "lock_held" => FALSE,
-        "init_frozen" => {
-            exc::raise_with_message(IMPORT_ERROR, "frozen modules are not available in Hydro")
-        }
+        // Hydro bundles no frozen modules. CPython's `init_frozen` and
+        // `find_frozen` return `None` when the name is not frozen, while the
+        // object/predicate queries raise `ImportError` for an unknown name.
+        "init_frozen" => NONE,
         "is_builtin" => match module_name(function, args[0]) {
             Some(name) => value::bool_value(stdlib::module(name).is_some()),
             None => NONE,
         },
-        "is_frozen" | "is_frozen_package" => match module_name(function, args[0]) {
+        "is_frozen" => match module_name(function, args[0]) {
             Some(_) => FALSE,
+            None => NONE,
+        },
+        "is_frozen_package" => match module_name(function, args[0]) {
+            Some(name) => exc::raise_with_message(
+                IMPORT_ERROR,
+                &format!("No such frozen object named '{name}'"),
+            ),
             None => NONE,
         },
         "extension_suffixes" => extension_suffixes(),
@@ -77,12 +85,17 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             IMPORT_ERROR,
             "cannot exec a built-in module: Hydro has no module execution ABI",
         ),
-        "find_frozen" => {
-            exc::raise_with_message(IMPORT_ERROR, "frozen modules are not available in Hydro")
-        }
-        "get_frozen_object" => {
-            exc::raise_with_message(IMPORT_ERROR, "frozen modules are not available in Hydro")
-        }
+        "find_frozen" => match module_name(function, args[0]) {
+            Some(_) => NONE,
+            None => NONE,
+        },
+        "get_frozen_object" => match module_name(function, args[0]) {
+            Some(name) => exc::raise_with_message(
+                IMPORT_ERROR,
+                &format!("No such frozen object named '{name}'"),
+            ),
+            None => NONE,
+        },
         "create_dynamic" => exc::raise_with_message(
             IMPORT_ERROR,
             "cannot create a dynamic module: Hydro has no dynamic loader spec ABI",
@@ -97,15 +110,48 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         ),
         "_override_frozen_modules_for_tests" => override_state(&FROZEN_OVERRIDE, args),
         "_override_multi_interp_extensions_check" => override_state(&MULTI_INTERP_OVERRIDE, args),
-        "source_hash" => exc::raise_with_message(
-            NOT_IMPLEMENTED_ERROR,
-            "_imp.source_hash() is not supported: Hydro has no code object",
-        ),
+        "source_hash" => source_hash(args),
         _ => exc::raise_with_message(
             exc::ATTRIBUTE_ERROR,
             &format!("module '_imp' has no attribute '{function}'"),
         ),
     }
+}
+
+/// `_imp.source_hash(key, source_bytes)`: CPython's keyed SipHash-1-3 of the
+/// source, as the eight bytes hash-based `.pyc` files store.
+///
+/// The key is a C `long` (signed 64-bit here); CPython reports an
+/// `OverflowError` for a Python int outside that range.
+fn source_hash(args: &[i64]) -> i64 {
+    let key_arg = args.first().copied().unwrap_or(NONE);
+    let Some(key) = value::as_integer(key_arg) else {
+        if value::as_bigint(key_arg).is_some() {
+            return exc::raise_with_message(
+                crate::exc::OVERFLOW_ERROR,
+                "Python int too large to convert to C long",
+            );
+        }
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(key_arg)
+            ),
+        );
+    };
+    let source_arg = args.get(1).copied().unwrap_or(NONE);
+    let Some(source) = value::as_bytes(source_arg) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "a bytes-like object is required, not '{}'",
+                value::type_name(source_arg)
+            ),
+        );
+    };
+    let digest = crate::modules::importlib_util::keyed_source_hash(key as u64, source);
+    value::bytes_new(digest.to_vec())
 }
 
 /// Type-checks a module-name argument.

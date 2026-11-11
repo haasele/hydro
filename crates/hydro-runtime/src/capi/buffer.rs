@@ -32,7 +32,8 @@ use std::sync::LazyLock;
 
 use super::types::{type_name, type_of};
 use super::{
-    bytes_c_data, bytes_data, dec_ref, inc_ref, kind_mut, set_error, GilGuard, ShimKind, ShimObject,
+    bytes_c_data, bytes_data, dec_ref, inc_ref, kind_mut, kind_ref, set_error, GilGuard, ShimKind,
+    ShimObject,
 };
 
 /// Mirrors `Py_buffer` from CPython 3.14 on x86_64 (`pybuffer.h`).
@@ -140,6 +141,33 @@ fn zero_view(view: *mut Py_buffer) {
     unsafe { ptr::write_bytes(view as *mut u8, 0, std::mem::size_of::<Py_buffer>()) };
 }
 
+/// Borrows a bytearray's NUL-terminated storage through the mutable payload
+/// accessor.
+///
+/// This is the only path that hands out a writable pointer for `bytearray`.
+/// The role/kind check runs before `kind_mut`, so a type object or an
+/// extension-owned instance is never interpreted as a `ShimKind`. The pointer
+/// stays valid while the buffer view holds its reference; this host never
+/// resizes a bytearray in place, and C writes must happen under the emulated
+/// GIL and before `PyBuffer_Release` commits them.
+///
+/// # Safety
+/// `object` must be a live shim handle and the caller must hold the GIL.
+unsafe fn bytearray_storage_mut(object: *mut ShimObject) -> Option<(*mut u8, usize)> {
+    if !matches!(kind_ref(object), Some(ShimKind::ByteArray { .. })) {
+        return None;
+    }
+    // SAFETY: the role and kind were validated under the GIL, shim objects
+    // are heap-stable, and the emulated GIL excludes concurrent Rust access
+    // while the raw pointer is in use.
+    match unsafe { kind_mut(object) } {
+        ShimKind::ByteArray { c_data, .. } => {
+            Some((c_data.as_mut_ptr(), c_data.len().saturating_sub(1)))
+        }
+        _ => None,
+    }
+}
+
 /// `bytes` exporter: one-dimensional, contiguous and read-only.
 ///
 /// `PyBuffer_FillInfo` implements the field layout, including the CPython
@@ -166,6 +194,10 @@ pub(crate) extern "C" fn bytes_getbuffer(
     // `c_data` is `data` plus a trailing NUL, so even an empty bytes object
     // exposes a real pointer (CPython guarantees `buf` is dereferenceable for
     // zero-length views as well).
+    // `bytes` storage is immutable; the pointer is only cast to `*mut`
+    // because `Py_buffer.buf` has that ABI type. `PyBuffer_FillInfo` receives
+    // `readonly = 1` and rejects a `PyBUF_WRITABLE` request, so no write path
+    // through this pointer exists.
     let pointer = match bytes_c_data(object) {
         Ok(data) => data.as_ptr(),
         Err(error) => {
@@ -191,18 +223,12 @@ pub(crate) extern "C" fn bytearray_getbuffer(
         set_error("TypeError: expected a bytearray object, got NULL");
         return -1;
     }
-    // SAFETY: `kind_ref` validates the handle; taking the payload mutably is
-    // sound under the emulated GIL, which the buffer protocol entry points
-    // hold.
-    let (length, pointer) = match unsafe { kind_mut(object) } {
-        ShimKind::ByteArray { c_data, .. } => {
-            let length = c_data.len().saturating_sub(1);
-            (length, c_data.as_mut_ptr())
-        }
-        _ => {
-            set_error("TypeError: expected a bytearray object");
-            return -1;
-        }
+    // The helper validates the shim role/kind and derives the writable pointer
+    // from the mutable payload accessor; the view holds a reference, so the
+    // storage stays live until `PyBuffer_Release`.
+    let Some((pointer, length)) = (unsafe { bytearray_storage_mut(object) }) else {
+        set_error("TypeError: expected a bytearray object");
+        return -1;
     };
     let length = match isize::try_from(length) {
         Ok(length) => length,
@@ -240,8 +266,14 @@ pub(crate) extern "C" fn bytearray_releasebuffer(object: *mut ShimObject, view: 
         return;
     }
     let length = length as usize;
-    // SAFETY: `kind_ref` validates the handle; the object is kept alive by the
-    // reference the view holds, and the emulated GIL is held by
+    // Reject non-shim roles before the mutable payload borrow: the object is
+    // kept alive by the reference the view holds, and `PyBuffer_Release` holds
+    // the emulated GIL.
+    if !matches!(kind_ref(object), Some(ShimKind::ByteArray { .. })) {
+        return;
+    }
+    // SAFETY: the role/kind check above passed, the object is kept alive by
+    // the reference the view holds, and the emulated GIL is held by
     // `PyBuffer_Release`.
     let kind = unsafe { kind_mut(object) };
     let ShimKind::ByteArray { data, c_data } = kind else {

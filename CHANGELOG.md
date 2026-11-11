@@ -8,6 +8,45 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-11-11 stdlib, generator and harness expansion
+
+- **Frontend:** module/class-body name reads and callees now defer to runtime
+  `NameError` (dead `sys.version_info` branches compile like CPython), async
+  generator expressions support `await`/`async for` inside sync scopes, and
+  loop targets captured by a pre-loop closure become shared cells. The frontend
+  suite is **913 passed, 1 skipped**.
+- **Runtime:** `next()` accepts user objects with `__next__`; `StopIteration`
+  carries a readable/writable `value`; PEP 479 conversion, generator resume
+  context chains, `yield from` return/throw/close forwarding, and
+  `raise_value` identity are implemented.
+- **unittest:** `TextTestResult`/`TextTestRunner` member registration, duration
+  accounting, tearDown-after-failure, subtest inventory/reporting, skip wrapper
+  semantics, and module-qualified ids. `test_poll`, `test_plistlib` and
+  `test_dictviews` remain green.
+- **argparse:** `ArgumentParser` and `Namespace` are real subclassable classes
+  with instance `__dict__`, CPython 3.14 constructor slots, method tables, and
+  test-mode compatibility; `Namespace` has `str`/`repr`/comparison/contains.
+- **`_sre`/`re`:** `MAGIC`/`MAXREPEAT`/`MAXGROUPS`/`CODESIZE`, case helpers,
+  template validation, and six-argument `compile` parity.
+- **codecs:** `lookup` normalization/search semantics, `CodecInfo` instances,
+  incremental getters, `surrogatepass`/`backslashreplace`/`xmlcharrefreplace`
+  handlers, and strict UTF-16/32 surrogate handling.
+- **importlib:** parent-package import, `sys.modules` `None` halting, relative
+  imports, live `__path__` submodule discovery, `spec_from_loader`/file-location
+  handling, `_imp.source_hash` and truthful frozen-module queries.
+- **binary/process/files:** `struct` overflow bounds, `Struct` methods/properties,
+  `unpack_iterator`, `?` truthiness; `subprocess` pipe handles, `communicate()`,
+  timeouts, signals and context management; `io.open` `+` modes with read/write
+  file bodies; `tempfile` path/error/cleanup/spooled semantics; `sys.intern`;
+  `bytes.hex(sep, bytes_per_sep)`.
+- **C-API/HNA:** `_PyTuple_FromArray`, `_PyErr_ExceptionMatches`, code accessors,
+  pytime/locale helpers, HNA descriptor-size ordering, ABI count/pointer guards,
+  and shim-role validation in list/dict/buffer mutation paths.
+- **Docs:** troubleshooting/migration guide in `docs/DIAGNOSTICS.md`, linked from
+  `README.md`.
+- Workspace suite: **3284 passed, 1 skipped**; clippy `-D warnings`, `fmt`, and
+  `scripts/verify.sh` green.
+
 ### Compatibility — 2026-11-11 stdlib semantics slice
 
 - `locale.normalize` now mirrors CPython's encoding alias/modifier pipeline

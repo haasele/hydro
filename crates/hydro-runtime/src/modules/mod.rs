@@ -2688,6 +2688,34 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         native_member("TestCase.__repr__", 1, 1),
     ),
     (
+        "unittest.TestCase.__eq__",
+        native_member("TestCase.__eq__", 2, 2),
+    ),
+    (
+        "unittest.TestCase.__hash__",
+        native_member("TestCase.__hash__", 1, 1),
+    ),
+    (
+        "unittest.TestCase._callSetUp",
+        native_member("TestCase._callSetUp", 1, 1),
+    ),
+    (
+        "unittest.TestCase._callTestMethod",
+        native_member("TestCase._callTestMethod", 2, 2),
+    ),
+    (
+        "unittest.TestCase._callTearDown",
+        native_member("TestCase._callTearDown", 1, 1),
+    ),
+    (
+        "unittest.TestCase._callCleanup",
+        native_member("TestCase._callCleanup", 2, 2),
+    ),
+    (
+        "unittest.TestCase._addDuration",
+        native_member("TestCase._addDuration", 3, 3),
+    ),
+    (
         "unittest.TestCase.countTestCases",
         native_member("TestCase.countTestCases", 1, 1),
     ),
@@ -3189,8 +3217,61 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
         native_member("TestResult._exc_info_to_string", 3, 3),
     ),
     (
+        "unittest.TextTestResult.__init__",
+        native_dynamic_member(
+            "TextTestResult.__init__",
+            4,
+            4,
+            &["self", "stream", "descriptions", "verbosity"],
+        ),
+    ),
+    (
         "unittest.TextTestResult.getDescription",
         native_member("TextTestResult.getDescription", 2, 2),
+    ),
+    (
+        "unittest.TextTestResult.startTest",
+        native_member("TextTestResult.startTest", 2, 2),
+    ),
+    (
+        "unittest.TextTestResult._write_status",
+        native_member("TextTestResult._write_status", 3, 3),
+    ),
+    (
+        "unittest.TextTestResult.addSubTest",
+        native_member("TextTestResult.addSubTest", 4, 4),
+    ),
+    (
+        "unittest.TextTestResult.addSuccess",
+        native_member("TextTestResult.addSuccess", 2, 2),
+    ),
+    (
+        "unittest.TextTestResult.addError",
+        native_member("TextTestResult.addError", 3, 3),
+    ),
+    (
+        "unittest.TextTestResult.addFailure",
+        native_member("TextTestResult.addFailure", 3, 3),
+    ),
+    (
+        "unittest.TextTestResult.addSkip",
+        native_member("TextTestResult.addSkip", 3, 3),
+    ),
+    (
+        "unittest.TextTestResult.addExpectedFailure",
+        native_member("TextTestResult.addExpectedFailure", 3, 3),
+    ),
+    (
+        "unittest.TextTestResult.addUnexpectedSuccess",
+        native_member("TextTestResult.addUnexpectedSuccess", 2, 2),
+    ),
+    (
+        "unittest.TextTestResult.printErrors",
+        native_member("TextTestResult.printErrors", 1, 1),
+    ),
+    (
+        "unittest.TextTestResult.printErrorList",
+        native_member("TextTestResult.printErrorList", 3, 3),
     ),
     (
         "unittest.TextTestRunner.__init__",
@@ -3368,6 +3449,27 @@ static SUPPLEMENTAL_FUNCTIONS: &[(&str, stdlib::FunctionSpec)] = &[
     (
         "unittest._SubTest.__str__",
         native_member("_SubTest.__str__", 1, 1),
+    ),
+    ("unittest._SubTest.id", native_member("_SubTest.id", 1, 1)),
+    (
+        "unittest._SubTest.shortDescription",
+        native_member("_SubTest.shortDescription", 1, 1),
+    ),
+    (
+        "unittest._WritelnDecorator.__init__",
+        native_member("_WritelnDecorator.__init__", 2, 2),
+    ),
+    (
+        "unittest._WritelnDecorator.__getattr__",
+        native_member("_WritelnDecorator.__getattr__", 2, 2),
+    ),
+    (
+        "unittest._WritelnDecorator.writeln",
+        native_member("_WritelnDecorator.writeln", 1, 2),
+    ),
+    (
+        "unittest._WritelnDecorator.write",
+        native_member("_WritelnDecorator.write", 2, 2),
     ),
     (
         "unittest._AssertRaisesContext.__init__",
@@ -4132,6 +4234,9 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
             return value;
         }
         return errno::lookup(name);
+    }
+    if module == "argparse" && matches!(name, "ArgumentParser" | "Namespace") {
+        return argparse::constant(name);
     }
     if module == "unittest" {
         match name {
@@ -8908,6 +9013,8 @@ fn constant_value(module: &str, name: &str) -> i64 {
         ("subprocess", "STDOUT") => encode_int(subprocess::STDOUT),
         ("subprocess", "DEVNULL") => encode_int(subprocess::DEVNULL),
         ("subprocess", "CalledProcessError") => subprocess::called_process_error_class(),
+        ("subprocess", "TimeoutExpired") => subprocess::timeout_expired_class(),
+        ("subprocess", "SubprocessError") => exc::exception_class(exc::EXCEPTION),
         ("keyword", "kwlist") => keyword::kwlist(),
         ("keyword", "softkwlist") => keyword::softkwlist(),
         ("stat" | "_stat", name) => stat::constant(name),
@@ -26134,6 +26241,7 @@ fn sys_call(function: &str, args: &[i64]) -> i64 {
         "setrecursionlimit" => sys_setrecursionlimit(args),
         "_getframemodulename" => sys::getframemodulename(args),
         "_getframe" => sys::getframe(args),
+        "intern" => sys::intern(args),
         // `sys._current_frames()`: the frame chain this thread can observe.
         "_current_frames" => exc::current_frames(),
         "getdefaultencoding" | "getfilesystemencoding" => value::str_from_bytes(b"utf-8"),
@@ -29202,11 +29310,9 @@ pub(crate) fn io_open(args: &[i64]) -> i64 {
             },
             Err(error) => os_failure(&path, &error),
         },
-        (base, binary, _) => {
-            // Update modes open a real read/write descriptor. The runtime's
-            // file body stores a writable OS stream (reads on the same handle
-            // after an update open are a documented limitation of that body,
-            // not of the mode parser).
+        (base, binary, plus) => {
+            // Update modes open one real read/write descriptor; plain write
+            // modes keep the write-only body.
             let opened = match (base, mode.plus) {
                 ('r', true) => std::fs::OpenOptions::new()
                     .read(true)
@@ -29246,6 +29352,7 @@ pub(crate) fn io_open(args: &[i64]) -> i64 {
                 }
             };
             match opened {
+                Ok(file) if plus => value::file_new_read_write(path, base, file, binary),
                 Ok(file) => value::file_new_write(path, base, file, binary),
                 Err(error) => os_failure(&path, &error),
             }
@@ -29272,7 +29379,7 @@ struct OpenMode {
 ///
 /// Exactly one base letter and at most one of `b`/`t` are allowed (so `bt` is
 /// invalid); `b` and `t` may appear in any position relative to the base.
-/// Read/write (`+`) mode is still unsupported and rejected.
+/// A single `+` selects read/write mode.
 fn parse_mode(mode: &str) -> Result<OpenMode, String> {
     let mut base = None;
     let mut binary = None;
@@ -33394,15 +33501,8 @@ mod tests {
         let argv = value::list_new(vec![string("--help")]);
         let parsed = argparse::method(parser, "parse_args", &[argv]);
         assert!(!exc::pending());
-        let entries = value::as_namespace(parsed).expect("namespace");
-        let mut help = None;
-        for (name, entry) in entries {
-            if name.as_str() == "_help" {
-                help = Some(*entry);
-                break;
-            }
-        }
-        assert_eq!(help, Some(TRUE));
+        assert!(value::as_instance(parsed).is_some(), "Namespace instance");
+        assert_eq!(value::instance_attr(parsed, "_help"), Some(TRUE));
     }
 
     #[test]
@@ -35828,7 +35928,9 @@ mod tests {
         exc::init();
         let info = call("codecs", "lookup", &[string("ascii")]);
         assert!(!exc::pending());
-        assert_eq!(value::as_tuple(info).expect("CodecInfo tuple").len(), 4);
+        assert!(value::as_instance(info).is_some(), "CodecInfo instance");
+        assert!(value::instance_attr(info, "encode").is_some());
+        assert!(value::instance_attr(info, "decode").is_some());
 
         assert_eq!(
             value::as_bytes(get("codecs", "BOM_UTF8")).unwrap(),
@@ -39587,9 +39689,13 @@ mod tests {
             Some("utf-8")
         );
 
-        // The built-in registry still answers with a four-tuple entry.
+        // The built-in registry answers with a CodecInfo instance.
         let looked_up = call("codecs", "lookup", &[string("utf-8")]);
-        assert_eq!(value::as_tuple(looked_up).map(|items| items.len()), Some(4));
+        assert!(value::as_instance(looked_up).is_some());
+        assert_eq!(
+            value::instance_attr(looked_up, "name").and_then(value::as_str),
+            Some("utf-8")
+        );
     }
 
     #[test]

@@ -245,15 +245,15 @@ fn argument_parser_accepts_color_false() {
     // (prog, usage, description, epilog, parents, formatter_class,
     // prefix_chars, fromfile_prefix_chars, argument_default,
     // conflict_handler, add_help, allow_abbrev, exit_on_error, color).
-    let mut slots = [NONE; 14];
-    slots[13] = hydro_false();
+    let mut slots = [NONE; 15];
+    slots[14] = hydro_false();
     let parser = call("argparse", "ArgumentParser", &slots);
     assert_no_error();
     assert_eq!(getattr(parser, "color"), hydro_false());
     assert_eq!(getattr(parser, "add_help"), hydro_true());
 
-    let mut slots = [NONE; 14];
-    slots[13] = hydro_true();
+    let mut slots = [NONE; 15];
+    slots[14] = hydro_true();
     let parser = call("argparse", "ArgumentParser", &slots);
     assert_no_error();
     assert_eq!(getattr(parser, "color"), hydro_true());

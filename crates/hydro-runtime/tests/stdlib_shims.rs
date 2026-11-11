@@ -130,7 +130,8 @@ fn imp_loader_queries_are_truthful() {
     assert_true(module("_imp", "is_builtin", &[text("math")]));
     assert_false(module("_imp", "is_builtin", &[text("not_a_module")]));
     assert_false(module("_imp", "is_frozen", &[text("math")]));
-    assert_false(module("_imp", "is_frozen_package", &[text("math")]));
+    let _ = module("_imp", "is_frozen_package", &[text("math")]);
+    assert_error_tag(IMPORT_ERROR);
 
     let suffixes = module("_imp", "extension_suffixes", &[]);
     assert_no_error();
@@ -154,8 +155,7 @@ fn imp_unsupported_operations_raise_tagged_errors() {
     assert_error_tag(IMPORT_ERROR);
     let _ = module("_imp", "exec_builtin", &[hydro_none()]);
     assert_error_tag(IMPORT_ERROR);
-    let _ = module("_imp", "find_frozen", &[text("x")]);
-    assert_error_tag(IMPORT_ERROR);
+    assert_none(module("_imp", "find_frozen", &[text("x")]));
     let _ = module("_imp", "get_frozen_object", &[text("x")]);
     assert_error_tag(IMPORT_ERROR);
     let _ = module("_imp", "create_dynamic", &[hydro_none()]);
@@ -165,8 +165,10 @@ fn imp_unsupported_operations_raise_tagged_errors() {
 
     let _ = module("_imp", "_fix_co_filename", &[hydro_none(), text("f.py")]);
     assert_error_tag(NOT_IMPLEMENTED_ERROR);
-    let _ = module("_imp", "source_hash", &[text("k"), bytes(b"x")]);
-    assert_error_tag(NOT_IMPLEMENTED_ERROR);
+    let hashed = module("_imp", "source_hash", &[int(1), bytes(b"x")]);
+    assert_no_error();
+    assert_eq!(hydro_exc_pending(), 0);
+    let _ = hashed;
 }
 
 // -------------------------------------------------------------------------
@@ -356,7 +358,10 @@ fn codecs_error_handling_and_lookup_errors() {
     ] {
         let info = module("_codecs", "lookup", &[text(alias)]);
         assert_no_error();
-        assert_int(hydro_len(info), 4);
+        assert_ne!(info, hydro_none());
+        let encode = hydro_getattr(info, b"encode".as_ptr(), b"encode".len());
+        assert_no_error();
+        assert_ne!(encode, hydro_none());
     }
     // `cp1252` resolves through the iconv charset table, so only a name no
     // table knows is unknown.

@@ -1376,17 +1376,24 @@ pub(crate) fn raise_file_error(err: FileError) -> i64 {
     }
 }
 
-/// Native payload of a file object: either the fully read content (read mode)
-/// or the OS handle (write/append mode).
+/// Native payload of a file object: either the fully read content (read-only
+/// mode), an OS handle open for writing, or an OS handle open for reading and
+/// writing (`+` modes).
 ///
-/// Text files hold the content as `char`s and count the cursor in characters;
-/// binary files hold raw bytes and count in bytes. A file holds no Hydro values;
+/// Text files hold read-only content as `char`s and count the cursor in
+/// characters; binary files hold raw bytes and count in bytes. Read-write
+/// files keep the cursor in the same unit as their read-only counterpart and
+/// perform both directions on one OS handle. A file holds no Hydro values;
 /// the `std::fs::File` is closed when the object is dropped, and `close()`
 /// drops it explicitly (idempotent).
 enum FileBody {
     Read(Vec<char>),
     ReadBytes(Vec<u8>),
     Write(std::fs::File),
+    /// Handle open for both reading and writing (`r+`, `w+`, `a+`, `x+`).
+    /// The cursor is kept in sync with the handle: characters for text files,
+    /// bytes for binary files.
+    ReadWrite(std::fs::File),
     /// Live child-process pipe (`Popen.stdout`/`stderr`).
     Pipe(std::io::BufReader<std::process::ChildStdout>),
 }
@@ -1429,9 +1436,9 @@ impl FileClass {
 
 struct FileInner {
     body: Option<FileBody>,
-    /// Cursor position: characters for a text read file, bytes for a binary
-    /// read file, and the number of characters/bytes written for write/append
-    /// mode.
+    /// Cursor position: characters for a text read or read-write file, bytes
+    /// for a binary read or read-write file, and the number of
+    /// characters/bytes written for write-only mode.
     cursor: usize,
 }
 
@@ -1516,6 +1523,50 @@ impl FileState {
         }
     }
 
+    /// Opens a file body that can be read and written through one handle.
+    ///
+    /// Append mode starts at end-of-file, matching CPython's initial `tell()`;
+    /// for text files the cursor is the character count, so the whole (valid
+    /// UTF-8) content is scanned once at construction.
+    fn new_read_write(
+        path: String,
+        mode: char,
+        mut file: std::fs::File,
+        binary: bool,
+    ) -> FileState {
+        use std::io::{Read as _, Seek as _};
+        let mut cursor = 0;
+        if mode == 'a' {
+            if let Ok(end) = file.seek(std::io::SeekFrom::End(0)) {
+                cursor = usize::try_from(end).unwrap_or(usize::MAX);
+                if !binary {
+                    let mut bytes = Vec::new();
+                    if file.seek(std::io::SeekFrom::Start(0)).is_ok()
+                        && file.read_to_end(&mut bytes).is_ok()
+                    {
+                        cursor = String::from_utf8_lossy(&bytes).chars().count();
+                    }
+                    let _ = file.seek(std::io::SeekFrom::End(0));
+                }
+            }
+        }
+        let class = if binary {
+            FileClass::BufferedWriter
+        } else {
+            FileClass::TextIOWrapper
+        };
+        FileState {
+            inner: Arc::new(Mutex::new(FileInner {
+                body: Some(FileBody::ReadWrite(file)),
+                cursor,
+            })),
+            path,
+            mode,
+            binary,
+            class: AtomicU8::new(class.tag()),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, FileInner> {
         self.inner
             .lock()
@@ -1572,7 +1623,7 @@ impl FileState {
                     Err(FileError::Os("fileno is unsupported".to_string()))
                 }
             }
-            Some(FileBody::Write(file)) => {
+            Some(FileBody::Write(file)) | Some(FileBody::ReadWrite(file)) => {
                 #[cfg(unix)]
                 {
                     use std::os::unix::io::AsRawFd as _;
@@ -1602,12 +1653,38 @@ impl FileState {
     /// negative).
     pub(crate) fn read(&self, limit: Option<i64>) -> Result<String, FileError> {
         let mut inner = self.lock();
-        let FileInner { body, .. } = &mut *inner;
+        let FileInner { body, cursor } = &mut *inner;
         if let Some(FileBody::Pipe(reader)) = body {
             let bytes = pipe_read(reader, limit, false)?;
             return Ok(String::from_utf8_lossy(&bytes).into_owned());
         }
-        let FileInner { body, cursor } = &mut *inner;
+        if let Some(FileBody::ReadWrite(file)) = body {
+            if self.binary {
+                return Err(FileError::Value(
+                    "cannot read binary file as text".to_string(),
+                ));
+            }
+            use std::io::Seek as _;
+            let start = file
+                .stream_position()
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            let text = read_file_text(&mut *file)?;
+            let max = limit.and_then(|n| {
+                if n < 0 {
+                    None
+                } else {
+                    Some(usize::try_from(n).unwrap_or(usize::MAX))
+                }
+            });
+            let consumed = max.map_or(text.len(), |max| utf8_prefix_len(&text, max));
+            if consumed < text.len() {
+                file.seek(std::io::SeekFrom::Start(start + consumed as u64))
+                    .map_err(|error| FileError::Os(error.to_string()))?;
+            }
+            let taken = text[..consumed].to_string();
+            *cursor = cursor.saturating_add(taken.chars().count());
+            return Ok(taken);
+        }
         let chars = read_chars(body)?;
         let start = *cursor;
         if start >= chars.len() {
@@ -1632,11 +1709,34 @@ impl FileState {
     /// them.
     pub(crate) fn read_bytes(&self, limit: Option<i64>) -> Result<Vec<u8>, FileError> {
         let mut inner = self.lock();
-        let FileInner { body, .. } = &mut *inner;
+        let FileInner { body, cursor } = &mut *inner;
         if let Some(FileBody::Pipe(reader)) = body {
             return pipe_read(reader, limit, false);
         }
-        let FileInner { body, cursor } = &mut *inner;
+        if let Some(FileBody::ReadWrite(file)) = body {
+            if !self.binary {
+                return Err(FileError::Value(
+                    "cannot read text file as bytes".to_string(),
+                ));
+            }
+            use std::io::Read as _;
+            let mut data = Vec::new();
+            match limit {
+                Some(n) if n >= 0 => {
+                    let take = u64::try_from(n).unwrap_or(u64::MAX);
+                    (&mut *file)
+                        .take(take)
+                        .read_to_end(&mut data)
+                        .map_err(|error| FileError::Os(error.to_string()))?;
+                }
+                _ => {
+                    file.read_to_end(&mut data)
+                        .map_err(|error| FileError::Os(error.to_string()))?;
+                }
+            }
+            *cursor = cursor.saturating_add(data.len());
+            return Ok(data);
+        }
         let bytes = read_bytes_body(body)?;
         let start = *cursor;
         if start >= bytes.len() {
@@ -1659,7 +1759,7 @@ impl FileState {
     /// at the end, matching CPython's `readline(0)`.
     pub(crate) fn readline(&self, limit: Option<i64>) -> Result<Option<String>, FileError> {
         let mut inner = self.lock();
-        let FileInner { body, .. } = &mut *inner;
+        let FileInner { body, cursor } = &mut *inner;
         if let Some(FileBody::Pipe(reader)) = body {
             let bytes = pipe_read(reader, limit, true)?;
             if bytes.is_empty() {
@@ -1667,7 +1767,43 @@ impl FileState {
             }
             return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
         }
-        let FileInner { body, cursor } = &mut *inner;
+        if let Some(FileBody::ReadWrite(file)) = body {
+            if self.binary {
+                return Err(FileError::Value(
+                    "cannot read binary file as text".to_string(),
+                ));
+            }
+            use std::io::Seek as _;
+            let start = file
+                .stream_position()
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            let text = read_file_text(&mut *file)?;
+            if text.is_empty() {
+                return Ok(None);
+            }
+            let chars: Vec<char> = text.chars().collect();
+            let max = limit.and_then(|n| {
+                if n < 0 {
+                    None
+                } else {
+                    Some(usize::try_from(n).unwrap_or(usize::MAX))
+                }
+            });
+            let mut end = chars.len();
+            if let Some(index) = chars.iter().position(|ch| *ch == '\n') {
+                end = index + 1;
+            }
+            if let Some(max) = max {
+                end = end.min(max);
+            }
+            let consumed = utf8_prefix_len(&text, end);
+            if consumed < text.len() {
+                file.seek(std::io::SeekFrom::Start(start + consumed as u64))
+                    .map_err(|error| FileError::Os(error.to_string()))?;
+            }
+            *cursor = cursor.saturating_add(end);
+            return Ok(Some(text[..consumed].to_string()));
+        }
         let chars = read_chars(body)?;
         let start = *cursor;
         if start >= chars.len() {
@@ -1707,12 +1843,50 @@ impl FileState {
     /// and the returned line keeps its trailing `\n`.
     pub(crate) fn readline_bytes(&self, limit: Option<i64>) -> Result<Option<Vec<u8>>, FileError> {
         let mut inner = self.lock();
-        let FileInner { body, .. } = &mut *inner;
+        let FileInner { body, cursor } = &mut *inner;
         if let Some(FileBody::Pipe(reader)) = body {
             let bytes = pipe_read(reader, limit, true)?;
             return Ok(if bytes.is_empty() { None } else { Some(bytes) });
         }
-        let FileInner { body, cursor } = &mut *inner;
+        if let Some(FileBody::ReadWrite(file)) = body {
+            if !self.binary {
+                return Err(FileError::Value(
+                    "cannot read text file as bytes".to_string(),
+                ));
+            }
+            use std::io::{Read as _, Seek as _};
+            let start = file
+                .stream_position()
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            let mut data = Vec::new();
+            file.read_to_end(&mut data)
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            if data.is_empty() {
+                return Ok(None);
+            }
+            let read_len = data.len();
+            let max = limit.and_then(|n| {
+                if n < 0 {
+                    None
+                } else {
+                    Some(usize::try_from(n).unwrap_or(usize::MAX))
+                }
+            });
+            let mut end = data
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(read_len, |index| index + 1);
+            if let Some(max) = max {
+                end = end.min(max);
+            }
+            if end < read_len {
+                file.seek(std::io::SeekFrom::Start(start + end as u64))
+                    .map_err(|error| FileError::Os(error.to_string()))?;
+            }
+            data.truncate(end);
+            *cursor = cursor.saturating_add(end);
+            return Ok(Some(data));
+        }
         let bytes = read_bytes_body(body)?;
         let start = *cursor;
         if start >= bytes.len() {
@@ -1768,19 +1942,50 @@ impl FileState {
     /// only: writing a `str` into a binary file raises `ValueError`.
     pub(crate) fn write(&self, text: &str) -> Result<usize, FileError> {
         let binary = self.binary;
+        let append = self.mode == 'a';
         let mut inner = self.lock();
         let FileInner { body, cursor } = &mut *inner;
         use std::io::Write as _;
+        let read_write = matches!(body, Some(FileBody::ReadWrite(_)));
         let file = write_file(body)?;
         if binary {
             return Err(FileError::Value(
                 "cannot write text to binary file".to_string(),
             ));
         }
+        let at_eof = if read_write && append {
+            use std::io::Seek as _;
+            let position = file
+                .stream_position()
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            let len = file
+                .metadata()
+                .map_err(|error| FileError::Os(error.to_string()))?
+                .len();
+            position >= len
+        } else {
+            true
+        };
         file.write_all(text.as_bytes())
             .map_err(|error| FileError::Os(error.to_string()))?;
         let count = text.chars().count();
-        *cursor = cursor.saturating_add(count);
+        if read_write && append && !at_eof {
+            // An append-mode write always lands at end-of-file, so the
+            // character cursor has to jump to the new end rather than advance
+            // from the seeked position.
+            use std::io::Seek as _;
+            let position = file
+                .stream_position()
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            file.seek(std::io::SeekFrom::Start(0))
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            let content = read_file_text(&mut *file)?;
+            *cursor = content.chars().count();
+            file.seek(std::io::SeekFrom::Start(position))
+                .map_err(|error| FileError::Os(error.to_string()))?;
+        } else {
+            *cursor = cursor.saturating_add(count);
+        }
         Ok(count)
     }
 
@@ -1791,6 +1996,7 @@ impl FileState {
         let mut inner = self.lock();
         let FileInner { body, cursor } = &mut *inner;
         use std::io::Write as _;
+        let read_write = matches!(body, Some(FileBody::ReadWrite(_)));
         let file = write_file(body)?;
         if !binary {
             return Err(FileError::Value(
@@ -1800,7 +2006,17 @@ impl FileState {
         file.write_all(data)
             .map_err(|error| FileError::Os(error.to_string()))?;
         let count = data.len();
-        *cursor = cursor.saturating_add(count);
+        if read_write {
+            // Follow the OS position: append mode writes at end-of-file even
+            // after a seek.
+            use std::io::Seek as _;
+            let position = file
+                .stream_position()
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            *cursor = usize::try_from(position).unwrap_or(usize::MAX);
+        } else {
+            *cursor = cursor.saturating_add(count);
+        }
         Ok(count)
     }
 
@@ -1811,7 +2027,7 @@ impl FileState {
             Some(FileBody::Read(_)) | Some(FileBody::ReadBytes(_)) | Some(FileBody::Pipe(_)) => {
                 Ok(())
             }
-            Some(FileBody::Write(file)) => {
+            Some(FileBody::Write(file)) | Some(FileBody::ReadWrite(file)) => {
                 use std::io::Write as _;
                 file.flush()
                     .map_err(|error| FileError::Os(error.to_string()))
@@ -1826,7 +2042,7 @@ impl FileState {
     pub(crate) fn seek(&self, offset: i64, whence: i64) -> Result<(), FileError> {
         let mut inner = self.lock();
         let FileInner { body, cursor } = &mut *inner;
-        let len = body_len(body)?;
+        let len = body_len(body, self.binary)?;
         let base = match whence {
             0 => 0,
             1 => i64::try_from(*cursor).unwrap_or(i64::MAX),
@@ -1843,7 +2059,29 @@ impl FileState {
         if target < 0 {
             return Err(FileError::Os("invalid argument".to_string()));
         }
-        *cursor = usize::try_from(target).unwrap_or(usize::MAX);
+        let target = usize::try_from(target).unwrap_or(usize::MAX);
+        if let Some(FileBody::ReadWrite(file)) = body {
+            use std::io::{Read as _, Seek as _};
+            let byte_target = if self.binary {
+                u64::try_from(target).unwrap_or(u64::MAX)
+            } else {
+                // The cursor counts characters; translate the target into a
+                // byte offset in the UTF-8 stream. Positions past the end sit
+                // at end-of-file, like CPython's text seeks.
+                file.seek(std::io::SeekFrom::Start(0))
+                    .map_err(|error| FileError::Os(error.to_string()))?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)
+                    .map_err(|error| FileError::Os(error.to_string()))?;
+                let content = String::from_utf8(bytes)
+                    .map_err(|error| FileError::Value(format!("invalid UTF-8 in file: {error}")))?;
+                let clamped = target.min(content.chars().count());
+                u64::try_from(utf8_prefix_len(&content, clamped)).unwrap_or(u64::MAX)
+            };
+            file.seek(std::io::SeekFrom::Start(byte_target))
+                .map_err(|error| FileError::Os(error.to_string()))?;
+        }
+        *cursor = target;
         Ok(())
     }
 }
@@ -1882,6 +2120,9 @@ fn read_chars(body: &mut Option<FileBody>) -> Result<&mut Vec<char>, FileError> 
             "cannot read binary file as text".to_string(),
         )),
         Some(FileBody::Write(_)) => Err(FileError::Os("file not open for reading".to_string())),
+        Some(FileBody::ReadWrite(_)) => Err(FileError::Os(
+            "file not open for reading as text".to_string(),
+        )),
         Some(FileBody::Pipe(_)) => Err(FileError::Value(
             "cannot read binary pipe as text".to_string(),
         )),
@@ -1896,6 +2137,9 @@ fn read_bytes_body(body: &mut Option<FileBody>) -> Result<&mut Vec<u8>, FileErro
             "cannot read text file as bytes".to_string(),
         )),
         Some(FileBody::Write(_)) => Err(FileError::Os("file not open for reading".to_string())),
+        Some(FileBody::ReadWrite(_)) => Err(FileError::Os(
+            "file not open for reading as bytes".to_string(),
+        )),
         Some(FileBody::Pipe(_)) => Err(FileError::Value(
             "cannot read text file as bytes".to_string(),
         )),
@@ -1903,12 +2147,47 @@ fn read_bytes_body(body: &mut Option<FileBody>) -> Result<&mut Vec<u8>, FileErro
     }
 }
 
-/// Length of a read body in its cursor unit (characters or bytes).
-fn body_len(body: &Option<FileBody>) -> Result<usize, FileError> {
+/// Reads the rest of a text file from the current OS position and decodes it.
+fn read_file_text(file: &mut std::fs::File) -> Result<String, FileError> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| FileError::Os(error.to_string()))?;
+    String::from_utf8(bytes)
+        .map_err(|error| FileError::Value(format!("invalid UTF-8 in file: {error}")))
+}
+
+/// Byte length of the first `chars` characters of `text`.
+fn utf8_prefix_len(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(index, _)| index)
+}
+
+/// Length of a file body in its cursor unit (characters or bytes).
+fn body_len(body: &mut Option<FileBody>, binary: bool) -> Result<usize, FileError> {
     match body {
         Some(FileBody::Read(chars)) => Ok(chars.len()),
         Some(FileBody::ReadBytes(bytes)) => Ok(bytes.len()),
         Some(FileBody::Write(_)) => Err(FileError::Os("file not open for reading".to_string())),
+        Some(FileBody::ReadWrite(file)) => {
+            if binary {
+                return file
+                    .metadata()
+                    .map(|metadata| usize::try_from(metadata.len()).unwrap_or(usize::MAX))
+                    .map_err(|error| FileError::Os(error.to_string()));
+            }
+            use std::io::Seek as _;
+            let position = file
+                .stream_position()
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            file.seek(std::io::SeekFrom::Start(0))
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            let content = read_file_text(&mut *file)?;
+            file.seek(std::io::SeekFrom::Start(position))
+                .map_err(|error| FileError::Os(error.to_string()))?;
+            Ok(content.chars().count())
+        }
         Some(FileBody::Pipe(_)) => Err(FileError::Os("file is not seekable".to_string())),
         None => Err(FileError::Closed),
     }
@@ -1916,7 +2195,7 @@ fn body_len(body: &Option<FileBody>) -> Result<usize, FileError> {
 
 fn write_file(body: &mut Option<FileBody>) -> Result<&mut std::fs::File, FileError> {
     match body {
-        Some(FileBody::Write(file)) => Ok(file),
+        Some(FileBody::Write(file)) | Some(FileBody::ReadWrite(file)) => Ok(file),
         Some(FileBody::Read(_)) | Some(FileBody::ReadBytes(_)) | Some(FileBody::Pipe(_)) => {
             Err(FileError::Os("file not open for writing".to_string()))
         }
@@ -8438,6 +8717,19 @@ pub(crate) fn file_new_write(path: String, mode: char, file: std::fs::File, bina
     alloc(
         KIND_FILE,
         ObjData::File(FileState::new_write(path, mode, file, binary)),
+    )
+}
+
+/// Allocates a read/write (`+` mode) file object around an open OS handle.
+pub(crate) fn file_new_read_write(
+    path: String,
+    mode: char,
+    file: std::fs::File,
+    binary: bool,
+) -> i64 {
+    alloc(
+        KIND_FILE,
+        ObjData::File(FileState::new_read_write(path, mode, file, binary)),
     )
 }
 

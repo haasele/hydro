@@ -500,10 +500,35 @@ pub extern "C" fn hydro_bind_class_kwargs(
     let Some(class) = required_name(class_ptr, class_len) else {
         return exc::raise_with_message(exc::TYPE_ERROR, "class name must be a non-empty string");
     };
-    if name_count > 0 && (names_ptr.is_null() || slots.is_null()) {
+    // The `names` buffer holds `2 * name_count` words; reject a count whose
+    // word range would make the pointer arithmetic overflow before reading.
+    if name_count > isize::MAX as usize / (2 * std::mem::size_of::<i64>()) {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "class constructor parameter buffer is too large",
+        );
+    }
+    // `slots` is required whenever a bindable name exists or a `**kwargs`
+    // slot is addressed; a NULL array would otherwise be dereferenced below.
+    if (name_count > 0 || kwarg_index >= 0) && slots.is_null() {
         return exc::raise_with_message(
             exc::TYPE_ERROR,
             "class constructor received parameters without a binding buffer",
+        );
+    }
+    if name_count > 0 && names_ptr.is_null() {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "class constructor received parameters without a binding buffer",
+        );
+    }
+    // A negative index means the signature has no `**kwargs` slot; a
+    // non-negative one is an element offset, so it must fit pointer
+    // arithmetic for the `i64` slot array.
+    if kwarg_index >= 0 && kwarg_index as usize > isize::MAX as usize / std::mem::size_of::<i64>() {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            "class constructor keyword slot index is out of range",
         );
     }
     let Some(dict) = value::as_dict_data(mapping) else {
@@ -540,6 +565,12 @@ pub extern "C" fn hydro_bind_class_kwargs(
             let len = unsafe { *names_ptr.add(index * 2 + 1) } as usize;
             if len == 0 {
                 continue;
+            }
+            if ptr.is_null() || len > isize::MAX as usize {
+                return exc::raise_with_message(
+                    exc::TYPE_ERROR,
+                    "class constructor parameter name is invalid",
+                );
             }
             let candidate = unsafe { std::slice::from_raw_parts(ptr, len) };
             if candidate == name.as_bytes() {
@@ -638,7 +669,10 @@ pub extern "C" fn hydro_closure_new(
     if wrapper.is_null() {
         return exc::raise_with_message(exc::RUNTIME_ERROR, "function wrapper is NULL");
     }
-    if capture_count > 0 && (captures_ptr.is_null() || capture_count > isize::MAX as usize) {
+    if capture_count > 0
+        && (captures_ptr.is_null()
+            || capture_count > isize::MAX as usize / std::mem::size_of::<i64>())
+    {
         return exc::raise_with_message(exc::RUNTIME_ERROR, "closure capture buffer is invalid");
     }
     let captures = if capture_count == 0 {
@@ -686,6 +720,12 @@ pub extern "C" fn hydro_function_meta(
     defaults: *const i64,
     default_flags: *const i64,
 ) -> i64 {
+    if value::as_function(function).is_none() {
+        return exc::raise_with_message(
+            exc::TYPE_ERROR,
+            &format!("function expected, got '{}'", value::type_name(function)),
+        );
+    }
     if count > 0
         && (names.is_null() || kinds.is_null() || defaults.is_null() || default_flags.is_null())
     {
@@ -694,7 +734,10 @@ pub extern "C" fn hydro_function_meta(
             "function metadata received parameters without a metadata buffer",
         );
     }
-    if count > isize::MAX as usize / std::mem::size_of::<i64>() {
+    // `names` holds `2 * count` words and the other arrays one word per
+    // parameter; reject a count whose word range would overflow pointer
+    // arithmetic before reading.
+    if count > isize::MAX as usize / (2 * std::mem::size_of::<i64>()) {
         return exc::raise_with_message(exc::TYPE_ERROR, "function metadata is too large");
     }
     let mut signature = Vec::with_capacity(count);
@@ -1007,7 +1050,11 @@ pub extern "C" fn hydro_map_many(argc: u64, argv: *const i64) -> i64 {
             "map() expects a function and at least one iterable",
         );
     }
-    // SAFETY: the codegen contract makes `argc` tagged values readable.
+    if argc > isize::MAX as u64 / std::mem::size_of::<i64>() as u64 {
+        return exc::raise_with_message(exc::RUNTIME_ERROR, "map() argument buffer is too large");
+    }
+    // SAFETY: the codegen contract makes `argc` tagged values readable; the
+    // count bound above keeps the slice within `isize::MAX` bytes.
     let arguments = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
     builtins::map_many(arguments[0], &arguments[1..])
 }

@@ -2075,6 +2075,20 @@ pub(crate) fn call_kw(
     if let Some(s) = value::as_str(obj) {
         return str_method_kw(obj, s.to_string(), &method, &mut args, &keywords);
     }
+    // `hex` binds its optional `sep`/`bytes_per_sep` keywords; every other
+    // bytes/bytearray method takes no keyword parameters. Class instances
+    // (including scalar subclasses, which may override `hex`) keep instance
+    // dispatch below.
+    if method == "hex" && value::as_instance(obj).is_none() {
+        if let Some(bytes) = value::as_bytearray(obj) {
+            let data = bytes.clone();
+            return hex_keyword_call("bytearray", &data, &args, &keywords.items);
+        }
+        if let Some(bytes) = value::as_bytes(obj) {
+            let data = bytes.to_vec();
+            return hex_keyword_call("bytes", &data, &args, &keywords.items);
+        }
+    }
     if value::as_path(obj).is_some() {
         return path_method_kw(obj, &method, &mut args, &keywords);
     }
@@ -3474,6 +3488,14 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         let Some(pairs) = value::as_namespace(obj) else {
             return attribute_error(obj, attr);
         };
+        if attr == "__dict__" {
+            return value::dict_new(
+                pairs
+                    .iter()
+                    .map(|(name, value)| (value::str_alloc(name.clone()), *value))
+                    .collect(),
+            );
+        }
         if let Some((_, value)) = pairs.iter().find(|(name, _)| name.as_str() == attr) {
             return *value;
         }
@@ -3961,6 +3983,12 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
 
 /// The default `obj.name = value` assignment (see [`setattr`]).
 fn setattr_named(obj: i64, attr: &str, new_value: i64) -> i64 {
+    // Exception members (`StopIteration.value`, `__context__`, `__cause__`,
+    // `__suppress_context__`) are writable C-level slots, not instance-dict
+    // entries; they are resolved before the generic instance path.
+    if let Some(result) = exc::exception_setattr(obj, attr, new_value) {
+        return result;
+    }
     // Extension functions keep writable metadata in the shim slot; opaque
     // handles use a metadata overlay for the four dunder slots and delegate
     // every other assignment to the extension's `tp_setattro`.
@@ -6595,6 +6623,47 @@ fn str_method(obj: i64, s: String, method: &str, args: &[i64]) -> i64 {
             Ok(text) => value::str_alloc(text),
             Err(error) => exc::raise_with_message(error.tag, &error.message),
         },
+        "format_map" => {
+            if args.len() != 1 {
+                return type_error(format!(
+                    "format_map() takes exactly one argument ({} given)",
+                    args.len()
+                ));
+            }
+            let mapping = args[0];
+            let pairs = if value::as_match(mapping).is_some() {
+                let dictionary = crate::modules::re::match_method(mapping, "groupdict", &[]);
+                if exc::pending() {
+                    return NONE;
+                }
+                value::mapping_pairs(dictionary)
+                    .map(|pairs| pairs.to_vec())
+                    .unwrap_or_default()
+            } else {
+                value::mapping_pairs(mapping)
+                    .map(|pairs| pairs.to_vec())
+                    .unwrap_or_default()
+            };
+            let mut positional = Vec::new();
+            let mut named = Vec::new();
+            for (key, item) in pairs {
+                if let Some(name) = value::as_str(key) {
+                    named.push((name.to_string(), item));
+                } else if let Some(index) = value::as_integer(key) {
+                    if index >= 0 {
+                        let index = usize::try_from(index).unwrap_or(usize::MAX);
+                        if positional.len() <= index {
+                            positional.resize(index + 1, NONE);
+                        }
+                        positional[index] = item;
+                    }
+                }
+            }
+            match crate::format::call_format_kw(&s, &positional, &named) {
+                Ok(text) => value::str_alloc(text),
+                Err(error) => exc::raise_with_message(error.tag, &error.message),
+            }
+        }
         "isdigit" | "isalpha" | "isalnum" | "isspace" => {
             if let Some(err) = check_arity("str", method, args.len(), 0, 0) {
                 return err;
@@ -6816,14 +6885,200 @@ fn count_sub(haystack: &[u8], needle: &[u8]) -> usize {
     count
 }
 
-fn hex_bytes(data: &[u8]) -> String {
+/// `bytes.hex(sep=..., bytes_per_sep=...)`: lowercase ASCII hex digits,
+/// optionally grouped by `separator`.
+///
+/// A positive `bytes_per_sep` counts groups of that many bytes from the right;
+/// a negative value counts from the left. `0`, or a magnitude at least the
+/// data length, inserts no separator. This is CPython's `_Py_strhex_with_sep`
+/// layout, including the shorter remainder group at the far end.
+fn hex_bytes(data: &[u8], separator: Option<u8>, bytes_per_sep: i32) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(data.len() * 2);
-    for &byte in data {
+    let group = bytes_per_sep.unsigned_abs() as usize;
+    // No separator requested, or a group wider than the data: plain digits.
+    let Some(separator) = separator.filter(|_| group != 0 && group < data.len()) else {
+        let mut out = String::with_capacity(data.len().saturating_mul(2));
+        for &byte in data {
+            out.push(DIGITS[(byte >> 4) as usize] as char);
+            out.push(DIGITS[(byte & 0x0f) as usize] as char);
+        }
+        return out;
+    };
+    let separators = (data.len() - 1) / group;
+    let left_anchored = bytes_per_sep < 0;
+    let mut out = String::with_capacity(data.len().saturating_mul(2).saturating_add(separators));
+    for (index, &byte) in data.iter().enumerate() {
+        if index > 0
+            && if left_anchored {
+                // Negative counts anchor the boundaries at the left end.
+                index.is_multiple_of(group)
+            } else {
+                // Positive counts anchor the boundaries at the right end.
+                (data.len() - index).is_multiple_of(group)
+            }
+        {
+            out.push(separator as char);
+        }
         out.push(DIGITS[(byte >> 4) as usize] as char);
         out.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Converts the `bytes_per_sep` argument to a C `int` like Argument Clinic:
+/// non-integers raise `TypeError`, values outside `i32` raise CPython's
+/// `OverflowError`.
+fn hex_bytes_per_sep(argument: i64) -> Result<i32, i64> {
+    if let Some(number) = value::as_integer(argument) {
+        return i32::try_from(number).map_err(|_| {
+            exc::raise_with_message(OVERFLOW_ERROR, "Python int too large to convert to C int")
+        });
+    }
+    if value::as_bigint(argument).is_some() {
+        return Err(exc::raise_with_message(
+            OVERFLOW_ERROR,
+            "Python int too large to convert to C int",
+        ));
+    }
+    Err(type_error(format!(
+        "'{}' object cannot be interpreted as an integer",
+        value::type_name(argument)
+    )))
+}
+
+/// Validates one explicit `hex` separator, returning its ASCII byte.
+///
+/// CPython checks `len(sep)` first through the argument's length protocol,
+/// then requires a `str` or `bytes` (a `bytearray`/`memoryview` of one element
+/// has the right length but the wrong type), and only then the ASCII range.
+/// A `str` counts code points, so a lone surrogate is one non-ASCII character.
+fn hex_separator(argument: i64) -> Result<u8, i64> {
+    let length = builtins::len(argument);
+    if exc::pending() {
+        return Err(length);
+    }
+    let length = value::as_integer(length).unwrap_or(0);
+    if length != 1 {
+        return Err(exc::raise_with_message(
+            VALUE_ERROR,
+            "sep must be length 1.",
+        ));
+    }
+    if let Some(text) = value::as_str(argument) {
+        let character = text.chars().next().expect("one code point");
+        if !character.is_ascii() {
+            return Err(exc::raise_with_message(VALUE_ERROR, "sep must be ASCII."));
+        }
+        return Ok(character as u8);
+    }
+    // `as_bytes` also borrows a `bytearray` payload, which CPython rejects.
+    if value::as_bytearray(argument).is_none() {
+        if let Some(bytes) = value::as_bytes(argument) {
+            if bytes[0] >= 0x80 {
+                return Err(exc::raise_with_message(VALUE_ERROR, "sep must be ASCII."));
+            }
+            return Ok(bytes[0]);
+        }
+    }
+    Err(type_error("sep must be str or bytes.".to_string()))
+}
+
+/// Shared `bytes.hex`/`bytearray.hex` implementation.
+///
+/// `sep` and `bytes_per_sep` are `None` when the argument was omitted
+/// (CPython's `NULL` default); an explicitly supplied value is validated even
+/// when the data is empty. `bytes_per_sep` is converted first, matching the
+/// order in which Argument Clinic parses the two arguments.
+fn hex_method(data: &[u8], sep: Option<i64>, bytes_per_sep: Option<i64>) -> i64 {
+    let bytes_per_sep = match bytes_per_sep {
+        Some(argument) => match hex_bytes_per_sep(argument) {
+            Ok(number) => number,
+            Err(raised) => return raised,
+        },
+        None => 1,
+    };
+    let separator = match sep {
+        Some(argument) => match hex_separator(argument) {
+            Ok(separator) => Some(separator),
+            Err(raised) => return raised,
+        },
+        None => None,
+    };
+    value::str_alloc(hex_bytes(data, separator, bytes_per_sep))
+}
+
+/// Binds `hex`'s two optional positional-or-keyword arguments.
+///
+/// CPython's parser first rejects more than two supplied arguments (counting
+/// keywords), then reports duplicate bindings by name and position, then
+/// unknown names. The messages mirror that parser.
+fn bind_hex_arguments(
+    receiver: &str,
+    positional: &[i64],
+    keywords: &[(String, i64)],
+) -> Result<(Option<i64>, Option<i64>), i64> {
+    if positional.len() > 2 || positional.len() + keywords.len() > 2 {
+        return Err(type_error(format!(
+            "hex() takes at most 2 arguments ({} given)",
+            positional.len() + keywords.len()
+        )));
+    }
+    let mut sep = positional.first().copied();
+    let mut bytes_per_sep = positional.get(1).copied();
+    let mut sep_from_keyword = false;
+    let mut bytes_per_sep_from_keyword = false;
+    for (name, argument) in keywords {
+        match name.as_str() {
+            "sep" => {
+                if sep_from_keyword {
+                    return Err(type_error(format!(
+                        "{receiver}.hex() got multiple values for keyword argument 'sep'"
+                    )));
+                }
+                if sep.is_some() {
+                    return Err(type_error(
+                        "argument for hex() given by name ('sep') and position (1)".to_string(),
+                    ));
+                }
+                sep = Some(*argument);
+                sep_from_keyword = true;
+            }
+            "bytes_per_sep" => {
+                if bytes_per_sep_from_keyword {
+                    return Err(type_error(format!(
+                        "{receiver}.hex() got multiple values for keyword argument 'bytes_per_sep'"
+                    )));
+                }
+                if bytes_per_sep.is_some() {
+                    return Err(type_error(
+                        "argument for hex() given by name ('bytes_per_sep') and position (2)"
+                            .to_string(),
+                    ));
+                }
+                bytes_per_sep = Some(*argument);
+                bytes_per_sep_from_keyword = true;
+            }
+            _ => {
+                return Err(type_error(format!(
+                    "hex() got an unexpected keyword argument '{name}'"
+                )))
+            }
+        }
+    }
+    Ok((sep, bytes_per_sep))
+}
+
+/// `obj.hex(...)` when the call supplies keywords.
+fn hex_keyword_call(
+    receiver: &str,
+    data: &[u8],
+    positional: &[i64],
+    keywords: &[(String, i64)],
+) -> i64 {
+    match bind_hex_arguments(receiver, positional, keywords) {
+        Ok((sep, bytes_per_sep)) => hex_method(data, sep, bytes_per_sep),
+        Err(raised) => raised,
+    }
 }
 
 /// `bytes.replace`: returns `None` when the result size cannot be
@@ -7074,10 +7329,10 @@ fn bytes_method(obj: i64, data: Vec<u8>, method: &str, args: &[i64]) -> i64 {
             result
         }
         "hex" => {
-            if let Some(err) = check_arity("bytes", method, args.len(), 0, 0) {
+            if let Some(err) = check_arity("bytes", method, args.len(), 0, 2) {
                 return err;
             }
-            value::str_alloc(hex_bytes(&data))
+            hex_method(&data, args.first().copied(), args.get(1).copied())
         }
         "expandtabs" => {
             if let Some(err) = check_arity("bytes", method, args.len(), 0, 1) {
@@ -11111,6 +11366,133 @@ mod tests {
         assert_eq!(
             value::as_bytes(invoke(data, "expandtabs", &[int(-1)])),
             Some(&b"abcd\ne\rf"[..])
+        );
+    }
+
+    /// `bytes.hex`/`bytearray.hex` follow CPython's separator rules: positive
+    /// group sizes count from the right, negative ones from the left, and both
+    /// arguments are validated even for empty data.
+    #[test]
+    fn bytes_hex_separators_match_cpython() {
+        reset();
+        let data = value::bytes_new(b"abcdef".to_vec());
+        assert_eq!(text(invoke(data, "hex", &[])), "616263646566");
+        assert_eq!(
+            text(invoke(data, "hex", &[string("-")])),
+            "61-62-63-64-65-66"
+        );
+        assert_eq!(
+            text(invoke(data, "hex", &[string("-"), int(2)])),
+            "6162-6364-6566"
+        );
+        assert_eq!(
+            text(invoke(data, "hex", &[string("-"), int(-2)])),
+            "6162-6364-6566"
+        );
+        // A remainder group sits at the far end the sign selects.
+        let odd = value::bytes_new(b"abcde".to_vec());
+        assert_eq!(
+            text(invoke(odd, "hex", &[string("-"), int(2)])),
+            "61-6263-6465"
+        );
+        assert_eq!(
+            text(invoke(odd, "hex", &[string("-"), int(-2)])),
+            "6162-6364-65"
+        );
+        // Group sizes of zero or at least the data length insert nothing.
+        assert_eq!(
+            text(invoke(data, "hex", &[string("-"), int(0)])),
+            "616263646566"
+        );
+        assert_eq!(
+            text(invoke(data, "hex", &[string("-"), int(6)])),
+            "616263646566"
+        );
+        assert_eq!(
+            text(invoke(data, "hex", &[string("-"), int(-99)])),
+            "616263646566"
+        );
+        // Empty bytes produce an empty string, but the arguments still validate.
+        let empty = value::bytes_new(Vec::new());
+        assert_eq!(text(invoke(empty, "hex", &[string("-"), int(2)])), "");
+        invoke(empty, "hex", &[string("::")]);
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(message(), "sep must be length 1.");
+        crate::exc::clear();
+
+        // Keywords bind both optional positional-or-keyword parameters.
+        let pairs = [string("sep"), string("-"), string("bytes_per_sep"), int(2)];
+        let keyword_result = call_kw(
+            data,
+            b"hex".as_ptr(),
+            3,
+            0,
+            std::ptr::null(),
+            2,
+            pairs.as_ptr(),
+        );
+        assert_eq!(text(keyword_result), "6162-6364-6566");
+        let sep_only = [string("sep"), string("-")];
+        assert_eq!(
+            text(call_kw(
+                data,
+                b"hex".as_ptr(),
+                3,
+                0,
+                std::ptr::null(),
+                1,
+                sep_only.as_ptr(),
+            )),
+            "61-62-63-64-65-66"
+        );
+
+        // `sep` must be a one-character ASCII str or a one-byte ASCII bytes.
+        invoke(data, "hex", &[value::bytes_new(b"--".to_vec())]);
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(message(), "sep must be length 1.");
+        crate::exc::clear();
+        invoke(data, "hex", &[string("é")]);
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(message(), "sep must be ASCII.");
+        crate::exc::clear();
+        invoke(data, "hex", &[value::bytes_new(b"\xff".to_vec())]);
+        assert_eq!(error_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(message(), "sep must be ASCII.");
+        crate::exc::clear();
+        invoke(data, "hex", &[value::bytearray_new(b"-".to_vec())]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "sep must be str or bytes.");
+        crate::exc::clear();
+        // Explicit `None` is not the omitted default: CPython reports the
+        // missing length protocol, not a "str or bytes" type error.
+        invoke(data, "hex", &[NONE]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "object of type 'NoneType' has no len()");
+        crate::exc::clear();
+
+        // `bytes_per_sep` is a C int: floats and out-of-range integers report
+        // the conversion errors.
+        invoke(data, "hex", &[string("-"), value::float_new(2.0)]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(
+            message(),
+            "'float' object cannot be interpreted as an integer"
+        );
+        crate::exc::clear();
+        invoke(data, "hex", &[string("-"), int(1 << 40)]);
+        assert_eq!(error_tag(), crate::exc::OVERFLOW_ERROR as i64);
+        assert_eq!(message(), "Python int too large to convert to C int");
+        crate::exc::clear();
+        invoke(data, "hex", &[string("-"), int(1), int(2)]);
+        assert_eq!(error_tag(), crate::exc::TYPE_ERROR as i64);
+        assert_eq!(message(), "hex() takes at most 2 arguments (3 given)");
+        crate::exc::clear();
+
+        // bytearray.hex shares the formatting and returns a str.
+        let mutable = value::bytearray_new(b"abcde".to_vec());
+        assert_eq!(
+            text(invoke(mutable, "hex", &[string("-"), int(2)])),
+            "61-6263-6465"
         );
     }
 

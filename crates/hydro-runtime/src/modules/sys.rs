@@ -12,6 +12,13 @@
 //!
 //! `sys.thread_info` is computed from the C library this binary links
 //! against; see [`thread_info`].
+//!
+//! `sys.intern(string)` keeps a per-run canonical object per distinct text, so
+//! repeated interning of equal `str` values returns one object. The table
+//! lives in the runtime globals store (a reserved pseudo-module), which roots
+//! its entries and clears them with the rest of a program run's state.
+
+use std::sync::{LazyLock, Mutex};
 
 use crate::core::exc;
 use crate::core::globals;
@@ -54,6 +61,69 @@ pub(crate) fn getframemodulename(args: &[i64]) -> i64 {
         Some(module) => value::str_alloc(module),
         None => value::NONE,
     }
+}
+
+/// Reserved pseudo-module that owns the intern table.
+///
+/// The leading NUL keeps its entries out of [`globals::module_names`], so no
+/// Python module can see or collide with them. Storing the table in the
+/// globals store roots every interned object and drops the table with the rest
+/// of a program run's state.
+const INTERN_MODULE: &str = "\0hydro.intern";
+
+/// Serialises the lookup-or-create sequence. The globals store has no atomic
+/// get-or-insert, and two threads interning the same text must observe one
+/// canonical object, so the whole sequence takes this lock.
+static INTERN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// `sys.intern(string)`: the canonical object for `string`'s text.
+///
+/// CPython interns the argument in place and returns it; equal `str` values
+/// interned later resolve to that same object. A `str` subclass instance is
+/// rejected like CPython's `PyUnicode_CheckExact` check
+/// (`can't intern <type>`), while any other type reports the Argument Clinic
+/// message naming the actual type.
+pub(crate) fn intern(args: &[i64]) -> i64 {
+    if args.len() != 1 {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "sys.intern() takes exactly one argument ({} given)",
+                args.len()
+            ),
+        );
+    }
+    let argument = args[0];
+    let Some(text) = value::as_str(argument) else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "intern() argument must be str, not {}",
+                value::type_name_of(argument)
+            ),
+        );
+    };
+    if value::as_instance(argument).is_some() {
+        // `as_str` unwraps scalar subclass payloads; CPython's exact-type
+        // check rejects the subclass before interning the payload.
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("can't intern {}", value::type_name_of(argument)),
+        );
+    }
+    // Copy before allocating: the borrow points into another heap object.
+    let text = text.to_string();
+    let _guard = INTERN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(interned) = globals::try_get(INTERN_MODULE, &text) {
+        return interned;
+    }
+    // A string interned for the first time is its own canonical object, as in
+    // CPython's `PyUnicode_InternInPlace`: `sys.intern(s) is s` holds for a
+    // fresh value. The globals store roots the argument for later lookups.
+    globals::set(INTERN_MODULE, &text, argument);
+    argument
 }
 
 /// `sys.thread_info`: the native thread implementation, its lock strategy and
@@ -229,5 +299,51 @@ mod tests {
         // repeated reads share identity.
         assert_eq!(thread_info(), info);
         assert!(!exc::pending());
+    }
+
+    /// `sys.intern` returns one canonical object per distinct text and rejects
+    /// non-strings with CPython's `TypeError`.
+    #[test]
+    fn intern_returns_one_object_per_text() {
+        exc::init();
+        // A fresh string is its own canonical object, like CPython's in-place
+        // interning; a later equal value resolves to it.
+        let original = value::str_from_bytes(b"hydro intern");
+        let first = intern(&[original]);
+        assert_eq!(first, original);
+        let second = intern(&[value::str_from_bytes(b"hydro intern")]);
+        assert_eq!(first, second, "equal text must intern to one object");
+        assert_eq!(value::as_str(first), Some("hydro intern"));
+
+        let other = intern(&[value::str_from_bytes(b"hydro inter")]);
+        assert_ne!(first, other);
+
+        let empty = intern(&[value::str_from_bytes(b"")]);
+        assert_eq!(empty, intern(&[value::str_from_bytes(b"")]));
+        assert!(!exc::pending());
+
+        // Arity and type errors carry CPython's messages.
+        assert_eq!(intern(&[]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "sys.intern() takes exactly one argument (0 given)"
+        );
+        exc::clear();
+        let number = value::encode_int(1).expect("small int");
+        assert_eq!(intern(&[number]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "intern() argument must be str, not int"
+        );
+        exc::clear();
+        assert_eq!(intern(&[first, second]), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            value::to_string(exc::pending_value()),
+            "sys.intern() takes exactly one argument (2 given)"
+        );
+        exc::clear();
     }
 }

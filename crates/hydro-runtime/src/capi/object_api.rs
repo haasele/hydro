@@ -1379,6 +1379,103 @@ pub unsafe extern "C" fn PyCode_NewEmpty(
     code_object as *mut CodeObject
 }
 
+/// True when `object` is one of this host's code objects.
+///
+/// The check mirrors [`PyFrame_New`]'s: the private type must be linked
+/// before its address identifies an instance.
+fn is_code_object(code: *mut CodeObject) -> bool {
+    if code.is_null() {
+        return false;
+    }
+    ensure_private_types();
+    type_of(code as *mut ShimObject) == ptr::addr_of_mut!(CODE_TYPE)
+}
+
+/// `get_localsplus_names`: a new tuple of the slots whose kind has `kind`.
+///
+/// This is CPython's [`get_localsplus_names`](Objects/codeobject.c): the
+/// locals-plus table is walked in order and every name whose `kind` byte has
+/// the requested bit is retained into the new tuple.
+unsafe fn localsplus_names(code: *mut CodeObject, kind: u8) -> *mut ShimObject {
+    let names = (*code).co_localsplusnames;
+    let kinds = (*code).co_localspluskinds;
+    let kinds: &'static [u8] = match kind_ref(kinds) {
+        Some(ShimKind::Bytes { data, .. }) => data,
+        _ => {
+            set_error("SystemError: code object has malformed locals-plus kinds");
+            return ptr::null_mut();
+        }
+    };
+    let items = match tuple_slots(names) {
+        Ok(items) => items,
+        Err(_) => {
+            set_error("SystemError: code object has malformed locals-plus names");
+            return ptr::null_mut();
+        }
+    };
+    if items.len() != kinds.len() {
+        set_error("SystemError: code object's locals-plus names and kinds differ in length");
+        return ptr::null_mut();
+    }
+    let mut selected: Vec<usize> = Vec::new();
+    if selected.try_reserve(items.len()).is_err() {
+        set_error("MemoryError: cannot allocate tuple");
+        return ptr::null_mut();
+    }
+    for (index, &item) in items.iter().enumerate() {
+        if kinds[index] & kind != 0 {
+            inc_ref(item as *mut ShimObject);
+            selected.push(item);
+        }
+    }
+    new_tuple(selected)
+}
+
+/// `PyCode_GetCode`: a new reference to the code object's bytecode.
+///
+/// The bytes object handed to the constructor is the one this host keeps, so
+/// no deoptimisation copy is needed: the shim never specialises instructions.
+#[no_mangle]
+pub unsafe extern "C" fn PyCode_GetCode(code: *mut CodeObject) -> *mut ShimObject {
+    if !is_code_object(code) {
+        set_error("SystemError: PyCode_GetCode: argument is not a code object");
+        return ptr::null_mut();
+    }
+    let bytecode = (*code).co_code;
+    inc_ref(bytecode);
+    bytecode
+}
+
+/// `PyCode_GetVarnames`: a new tuple of the code object's local names.
+#[no_mangle]
+pub unsafe extern "C" fn PyCode_GetVarnames(code: *mut CodeObject) -> *mut ShimObject {
+    if !is_code_object(code) {
+        set_error("SystemError: PyCode_GetVarnames: argument is not a code object");
+        return ptr::null_mut();
+    }
+    localsplus_names(code, CO_FAST_LOCAL)
+}
+
+/// `PyCode_GetCellvars`: a new tuple of the code object's cell names.
+#[no_mangle]
+pub unsafe extern "C" fn PyCode_GetCellvars(code: *mut CodeObject) -> *mut ShimObject {
+    if !is_code_object(code) {
+        set_error("SystemError: PyCode_GetCellvars: argument is not a code object");
+        return ptr::null_mut();
+    }
+    localsplus_names(code, CO_FAST_CELL)
+}
+
+/// `PyCode_GetFreevars`: a new tuple of the code object's free variables.
+#[no_mangle]
+pub unsafe extern "C" fn PyCode_GetFreevars(code: *mut CodeObject) -> *mut ShimObject {
+    if !is_code_object(code) {
+        set_error("SystemError: PyCode_GetFreevars: argument is not a code object");
+        return ptr::null_mut();
+    }
+    localsplus_names(code, CO_FAST_FREE)
+}
+
 // ---------------------------------------------------------------------------
 // Frames and tracebacks
 // ---------------------------------------------------------------------------

@@ -129,14 +129,33 @@ pub(crate) fn register_class(class: i64) {
     if !state.name.starts_with("Test") {
         return;
     }
-    if !state
-        .methods
+    // `unittest.TestCase` subclasses are driven by the unittest runner, which
+    // owns their fixtures, skips and result protocol; collecting them here
+    // would run each method raw with neither.
+    if value::class_mro(class)
         .iter()
-        .any(|(name, _, _)| name.starts_with("test"))
+        .any(|&base| value::class_lookup(base, "__unittest_case__").is_some())
     {
         return;
     }
-    classes().push(class);
+    // A test method may be inherited from a `Test*` base class, exactly like
+    // pytest's collector; only the MRO-independent name matters.
+    if !value::class_mro(class).iter().any(|&base| {
+        value::as_class(base).is_some_and(|state| {
+            state
+                .methods
+                .iter()
+                .any(|(name, _, _)| name.starts_with("test"))
+        })
+    }) {
+        return;
+    }
+    let mut registered = classes();
+    if registered.contains(&class) {
+        return;
+    }
+    registered.push(class);
+    drop(registered);
     heap::add_thread_root(class);
 }
 

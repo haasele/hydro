@@ -7486,6 +7486,52 @@ pub extern "C" fn PyTuple_SetItem(
     0
 }
 
+/// `_PyTuple_FromArray`: a tuple built from `count` borrowed items.
+///
+/// CPython's internal tuple constructor: every item is retained with a new
+/// reference and the tuple owns those references. A negative count or a NULL
+/// array reports the `SystemError` the caller would otherwise observe as a
+/// crash.
+#[no_mangle]
+pub unsafe extern "C" fn _PyTuple_FromArray(
+    items: *const *mut ShimObject,
+    count: isize,
+) -> *mut ShimObject {
+    if count == 0 {
+        return empty_tuple();
+    }
+    let count = match non_negative_size(count, "tuple") {
+        Ok(count) => count,
+        Err(error) => {
+            set_error(error);
+            return ptr::null_mut();
+        }
+    };
+    if items.is_null() {
+        bad_internal_call();
+        return ptr::null_mut();
+    }
+    let mut slots = Vec::new();
+    if slots.try_reserve_exact(count).is_err() {
+        set_error("MemoryError: cannot allocate tuple");
+        return ptr::null_mut();
+    }
+    // SAFETY: the helper's contract is that `items` points at `count`
+    // readable `PyObject *` slots.
+    for &item in unsafe { std::slice::from_raw_parts(items, count) } {
+        if item.is_null() {
+            for slot in slots {
+                dec_ref(slot as *mut ShimObject);
+            }
+            bad_internal_call();
+            return ptr::null_mut();
+        }
+        inc_ref(item);
+        slots.push(item as usize);
+    }
+    new_tuple(slots)
+}
+
 /// `PyDict_New`.
 #[no_mangle]
 pub extern "C" fn PyDict_New() -> *mut ShimObject {
@@ -13545,6 +13591,21 @@ pub extern "C" fn PyErr_ExceptionMatches(exception: *mut ShimObject) -> c_int {
     PyErr_GivenExceptionMatches(pending, exception)
 }
 
+/// `_PyErr_ExceptionMatches`: the thread-state-taking spelling of
+/// [`PyErr_ExceptionMatches`].
+///
+/// CPython resolves the argument through `_PyErr_Occurred(tstate)`; this host
+/// keeps one pending exception per thread behind a single interpreter state,
+/// so the token every live thread holds designates the same state and is not
+/// dereferenced.
+#[no_mangle]
+pub extern "C" fn _PyErr_ExceptionMatches(
+    _state: *mut PyThreadState,
+    exception: *mut ShimObject,
+) -> c_int {
+    PyErr_ExceptionMatches(exception)
+}
+
 /// `PyErr_CheckSignals`: this host installs no signal handlers, so there is
 /// never a pending signal to deliver.
 #[no_mangle]
@@ -15852,6 +15913,7 @@ pub(crate) fn anchor() {
         PyTuple_Size as *const (),
         PyTuple_GetItem as *const (),
         PyTuple_SetItem as *const (),
+        _PyTuple_FromArray as *const (),
         PyDict_New as *const (),
         PyDict_SetItem as *const (),
         PyDict_SetItemString as *const (),
@@ -16129,6 +16191,7 @@ pub(crate) fn anchor() {
         PyDict_Values as *const (),
         PyErr_CheckSignals as *const (),
         PyErr_ExceptionMatches as *const (),
+        _PyErr_ExceptionMatches as *const (),
         PyErr_Fetch as *const (),
         PyErr_NormalizeException as *const (),
         PyErr_Print as *const (),
@@ -16250,6 +16313,10 @@ pub(crate) fn anchor() {
         object_api::PyTraceBack_Here as *const (),
         object_api::PyFrame_New as *const (),
         object_api::PyCode_NewEmpty as *const (),
+        object_api::PyCode_GetCode as *const (),
+        object_api::PyCode_GetVarnames as *const (),
+        object_api::PyCode_GetCellvars as *const (),
+        object_api::PyCode_GetFreevars as *const (),
         object_api::PyUnstable_Code_NewWithPosOnlyArgs as *const (),
         object_api::PyUnstable_Object_EnableDeferredRefcount as *const (),
         object_api::_Py_FatalErrorFunc as *const (),

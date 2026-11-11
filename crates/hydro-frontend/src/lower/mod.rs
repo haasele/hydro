@@ -8020,8 +8020,8 @@ impl<'a> Lowerer<'a> {
 
         // Cell analysis: a local becomes a cell when a nested function
         // captures it and this function (or a descendant's `nonlocal`)
-        // mutates it. Loop targets bind a fresh iteration value and only count
-        // as mutations when they are also assigned in the loop body.
+        // mutates it. Loop targets bind a fresh iteration value, so they count
+        // as mutations only for a closure that reads them (see below).
         let mut nonlocal_decls = Vec::new();
         collect_scope_nonlocals(decl.body, &mut nonlocal_decls);
         let nonlocal_names: HashSet<String> =
@@ -8062,6 +8062,25 @@ impl<'a> Lowerer<'a> {
             bound.insert(name.clone());
             mutated.insert(name.clone());
             needed.insert(name);
+        }
+        // A `for` target is rebound by the loop header, not by an assignment
+        // statement, so `collect_scope_mutations` reports only the loop body.
+        // That is right for a closure created after the loop: capturing the
+        // final value matches capturing a cell that already holds it. A closure
+        // created before the loop is different: it captures the binding as it
+        // exists at creation time (usually unbound), and the loop's rebinding
+        // must be visible to it. Promote a target a nested closure reads to a
+        // cell, so `lower_for_parts` binds through the hidden `$forN` slot and
+        // stores each item with `CellAssign`. `loop_cell_inits` is untouched:
+        // it still allocates fresh cells only for closures created inside the
+        // iteration, while a closure outside the loop shares the entry cell the
+        // loop keeps updating.
+        let mut loop_targets = HashSet::new();
+        collect_loop_target_names(decl.body, &mut loop_targets);
+        for name in loop_targets {
+            if needed.contains(&name) {
+                mutated.insert(name);
+            }
         }
         let owned = bound
             .iter()
@@ -15705,16 +15724,6 @@ impl<'a> Lowerer<'a> {
         saved: &mut Vec<(String, Option<LocalId>)>,
         iterable: HExpr,
     ) -> HCompClause {
-        if generator.is_async && !fs.is_async {
-            // CPython rejects an asynchronous comprehension outside an
-            // asynchronous function; the enclosing frame would have no way to
-            // await the iterator.
-            self.error_at_code(
-                generator.target.range(),
-                codes::CONTROL,
-                "asynchronous comprehension outside of an asynchronous function",
-            );
-        }
         let target = self.lower_comp_target(&generator.target, fs, saved);
         let mut conditions = Vec::with_capacity(generator.ifs.len());
         for condition in &generator.ifs {
@@ -15748,19 +15757,14 @@ impl<'a> Lowerer<'a> {
             return self.error_expr(c.range);
         };
         let async_for_clause = c.generators.iter().any(|generator| generator.is_async);
-        if async_for_clause && !fs.is_async {
-            self.error_at_code(
-                c.range,
-                codes::CONTROL,
-                "asynchronous comprehension outside of an asynchronous function",
-            );
-        }
-        // `await` inside the frame turns the generator expression into an
-        // async generator. The enclosing function must be async for that, so
-        // the frame only permits `await` when it is; whether it actually
-        // contains one is decided after lowering (`await_frames`).
-        let frame_is_async = async_for_clause || fs.is_async;
-
+        // A generator-expression frame is always async-capable: since Python
+        // 3.7 an `await` (or an asynchronous comprehension) in the element
+        // turns the expression into an async generator even when the enclosing
+        // scope is synchronous, and `async for` clauses are legal there too.
+        // Whether the frame is actually an async generator is decided after
+        // lowering (`await_frames`); an expression with neither stays a plain
+        // generator.
+        //
         // `(target := value)` inside this frame binds in the scope enclosing
         // the generator expression, never in the frame itself (CPython skips
         // comprehension scopes). The enclosing function/module/lambda made the
@@ -15877,7 +15881,9 @@ impl<'a> Lowerer<'a> {
             globals,
             loop_depth: 0,
             in_lambda: fs.in_lambda,
-            is_async: frame_is_async,
+            // See above: the frame may become an async generator, so `await`
+            // and asynchronous comprehensions inside it are always legal.
+            is_async: true,
             is_generator: true,
             genexp_frame: true,
             class_ns: None,
@@ -18675,46 +18681,37 @@ impl<'a> Lowerer<'a> {
                         col,
                     }
                 } else {
-                    // A name that resolves to nothing in a *function* body is
-                    // a runtime `LOAD_GLOBAL`: CPython raises `NameError` only
-                    // when the read executes, and the name may be installed at
+                    // A name that resolves to nothing is a runtime lookup:
+                    // `LOAD_NAME` in a module or class body, `LOAD_GLOBAL` in
+                    // a function body. CPython raises `NameError` only when
+                    // the read executes, and the name may be installed at
                     // runtime (`globals()[...]`, a decorator, `exec`, a
-                    // module-level `global` write from another function).
-                    // Module bodies keep the compile-time diagnostic: there
-                    // the whole module namespace is statically known.
+                    // module-level `global` write from another function) or
+                    // live in a dead version/platform branch that never runs.
+                    // Every body therefore defers to the runtime global table.
                     //
                     // A module local that a function cannot see is still a
                     // scope error worth reporting statically.
-                    if !fs.is_module {
-                        if self.module_local_names.contains(name) {
-                            self.error_at_code(
-                                e.range(),
-                                codes::NAME,
-                                format!(
-                                    "name '{name}' is not visible inside a function; pass it as a parameter"
-                                ),
-                            );
-                            self.error_expr(e.range())
-                        } else {
-                            self.used_globals.insert(name.to_string());
-                            HExpr {
-                                kind: HExprKind::GlobalGet {
-                                    module: self.dunder_name.clone(),
-                                    name: name.to_string(),
-                                },
-                                ty: Ty::Concrete(Type::Any),
-                                line,
-                                col,
-                            }
-                        }
-                    } else {
-                        self.error_name(
+                    if !fs.is_module && self.module_local_names.contains(name) {
+                        self.error_at_code(
                             e.range(),
-                            name,
-                            fs,
-                            format!("name '{name}' is not defined"),
+                            codes::NAME,
+                            format!(
+                                "name '{name}' is not visible inside a function; pass it as a parameter"
+                            ),
                         );
                         self.error_expr(e.range())
+                    } else {
+                        self.used_globals.insert(name.to_string());
+                        HExpr {
+                            kind: HExprKind::GlobalGet {
+                                module: self.dunder_name.clone(),
+                                name: name.to_string(),
+                            },
+                            ty: Ty::Concrete(Type::Any),
+                            line,
+                            col,
+                        }
                     }
                 }
             }
@@ -22101,47 +22098,35 @@ impl<'a> Lowerer<'a> {
             };
         }
 
-        if !fs.is_module {
-            if self.module_local_names.contains(name) {
-                // A module local a function cannot see stays a compile-time
-                // scope error worth reporting statically.
-                self.error_at_code(
-                    call.range,
-                    codes::NAME,
-                    format!(
-                        "name '{name}' is not visible inside a function; pass it as a parameter"
-                    ),
-                );
-                return self.error_expr(call.range);
-            }
-            // A callee that resolves to nothing in a *function* body is a
-            // runtime `LOAD_GLOBAL`: CPython raises `NameError` only when the
-            // call executes, and the name may be installed at runtime
-            // (`globals()[...]`, a decorator, `exec`, or a module-level
-            // `global` write from another function). Read it from the module's
-            // global table and call the value through the runtime protocol.
-            self.used_globals.insert(name.to_string());
-            let (callee_line, callee_col) = self.span(name_expr.range);
-            let callee = HExpr {
-                kind: HExprKind::GlobalGet {
-                    module: self.dunder_name.clone(),
-                    name: name.to_string(),
-                },
-                ty: Ty::Concrete(Type::Any),
-                line: callee_line,
-                col: callee_col,
-            };
-            return self.lower_dynamic_callee_call(callee, call, fs, line, col);
+        // A callee that resolves to nothing in a function body is a runtime
+        // `LOAD_GLOBAL`; in a module or class body it is a runtime
+        // `LOAD_NAME`. CPython raises `NameError` only when the call executes,
+        // and the name may be installed at runtime (`globals()[...]`, a
+        // decorator, `exec`, or a module-level `global` write from another
+        // function) or sit in a dead compatibility branch that never runs, so
+        // every body defers to the module's global table. A module local a
+        // function cannot see is still a compile-time scope error worth
+        // reporting statically.
+        if !fs.is_module && self.module_local_names.contains(name) {
+            self.error_at_code(
+                call.range,
+                codes::NAME,
+                format!("name '{name}' is not visible inside a function; pass it as a parameter"),
+            );
+            return self.error_expr(call.range);
         }
-        // A module body's whole namespace is statically known, so a typo there
-        // keeps its compile-time diagnostic.
-        self.error_name(
-            name_expr.range,
-            name,
-            fs,
-            format!("name '{name}' is not defined"),
-        );
-        self.error_expr(call.range)
+        self.used_globals.insert(name.to_string());
+        let (callee_line, callee_col) = self.span(name_expr.range);
+        let callee = HExpr {
+            kind: HExprKind::GlobalGet {
+                module: self.dunder_name.clone(),
+                name: name.to_string(),
+            },
+            ty: Ty::Concrete(Type::Any),
+            line: callee_line,
+            col: callee_col,
+        };
+        self.lower_dynamic_callee_call(callee, call, fs, line, col)
     }
 
     /// Lower a call that needs runtime argument flattening.
@@ -25822,8 +25807,10 @@ fn collect_scope_nonlocals(stmts: &[ast::Stmt], out: &mut Vec<(String, TextRange
 }
 
 /// Names assigned in one function scope without descending into nested
-/// functions or classes. `for` targets are skipped: they bind a fresh value
-/// per iteration, so a read-only closure capture keeps by-value semantics.
+/// functions or classes. `for` targets are skipped here: the loop header
+/// rebinds them without an assignment statement, and the cell plan decides
+/// separately whether a target a closure reads must become a cell (see
+/// [`collect_loop_target_names`]).
 fn collect_scope_mutations(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
     let mut targets = Vec::new();
     for stmt in stmts {
@@ -25922,16 +25909,71 @@ fn collect_scope_mutations(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
     }
 }
 
+/// Names bound by a `for`/`async for` target in this scope.
+///
+/// [`collect_scope_mutations`] skips loop targets: the loop header rebinds
+/// them without an assignment statement, so a closure created after the loop
+/// sees the final value either way. A closure created before the loop only
+/// sees later rebindings when the target is a cell, so the cell plan consults
+/// this set (gated on the target being read by a nested closure) and lets the
+/// loop store through the cell. Compound statements are searched; nested
+/// function and class bodies belong to their own scope and are not entered.
+fn collect_loop_target_names(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
+    let mut targets = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            ast::Stmt::For(s) => {
+                targets.clear();
+                collect_target_names(&s.target, &mut targets);
+                out.extend(targets.iter().cloned());
+                collect_loop_target_names(&s.body, out);
+                collect_loop_target_names(&s.orelse, out);
+            }
+            ast::Stmt::AsyncFor(s) => {
+                targets.clear();
+                collect_target_names(&s.target, &mut targets);
+                out.extend(targets.iter().cloned());
+                collect_loop_target_names(&s.body, out);
+                collect_loop_target_names(&s.orelse, out);
+            }
+            ast::Stmt::If(s) => {
+                collect_loop_target_names(&s.body, out);
+                collect_loop_target_names(&s.orelse, out);
+            }
+            ast::Stmt::While(s) => {
+                collect_loop_target_names(&s.body, out);
+                collect_loop_target_names(&s.orelse, out);
+            }
+            ast::Stmt::Try(s) => {
+                collect_loop_target_names(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_loop_target_names(&handler.body, out);
+                }
+                collect_loop_target_names(&s.orelse, out);
+                collect_loop_target_names(&s.finalbody, out);
+            }
+            ast::Stmt::With(s) => collect_loop_target_names(&s.body, out),
+            ast::Stmt::AsyncWith(s) => collect_loop_target_names(&s.body, out),
+            ast::Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_loop_target_names(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Names bound by a `def`/`async def`/`class` statement in this scope.
 ///
-/// These are the bindings [`collect_scope_mutations`] deliberately skips: the
-/// statement writes its name once, when it executes, so a loop target that is
-/// only read by a closure keeps by-value capture. A nested closure reading the
-/// name of such a definition (its own for recursion, a sibling's defined
-/// later for mutual recursion) still needs the shared cell, because the read
-/// happens after the creation site. Compound statements are searched; the
-/// bodies of nested definitions belong to their own scope and are not
-/// entered.
+/// These are bindings [`collect_scope_mutations`] deliberately skips: the
+/// statement writes its name once, when it executes, so a closure created
+/// after it still observes it by value. A nested closure reading the name of
+/// such a definition (its own for recursion, a sibling's defined later for
+/// mutual recursion) still needs the shared cell, because the read happens
+/// after the creation site. Compound statements are searched; the bodies of
+/// nested definitions belong to their own scope and are not entered.
 fn collect_def_binding_names(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
     for stmt in stmts {
         match stmt {

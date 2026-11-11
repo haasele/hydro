@@ -70,7 +70,12 @@ fn registry() -> MutexGuard<'static, Vec<i64>> {
 
 /// Records a test class created by the frontend.
 pub(crate) fn register(class: i64) {
-    registry().push(class);
+    let mut classes = registry();
+    if classes.contains(&class) {
+        return;
+    }
+    classes.push(class);
+    drop(classes);
     heap::add_thread_root(class);
 }
 
@@ -828,6 +833,11 @@ pub(crate) fn test_list_class() -> i64 {
 }
 
 /// The cached `_SubTest` context manager class.
+///
+/// CPython's `_SubTest` is a real `TestCase` subclass; `isinstance(subtest,
+/// unittest.TestCase)` is part of the documented result protocol (the skip
+/// tests assert it). The class is removed from the discovery registry: it is a
+/// framework-internal class, not a test the module defines.
 fn subtest_class() -> i64 {
     static METHODS: [(&str, &str, usize); 6] = [
         ("__init__", "_SubTest.__init__", 3),
@@ -837,7 +847,8 @@ fn subtest_class() -> i64 {
         ("id", "_SubTest.id", 1),
         ("shortDescription", "_SubTest.shortDescription", 1),
     ];
-    let class = cached_class(SUBTEST_KEY, "_SubTest", NONE, &METHODS);
+    let class = cached_class(SUBTEST_KEY, "_SubTest", test_case(), &METHODS);
+    registry().retain(|registered| *registered != class);
     value::class_set_attr(class, "failureException".to_string(), NONE);
     class
 }
@@ -996,6 +1007,29 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>
                     function == "TestCase.assertRaisesRegex",
                 );
             }
+            if function == "TestCase.subTest" {
+                // `subTest(self, msg=..., **params)`: `msg` is the message,
+                // every other name is a subtest parameter. Passing all of them
+                // through as `**params` would lose the message entirely.
+                let mut call_args = args.to_vec();
+                let mut remaining = keywords;
+                if let Some(index) = remaining.iter().position(|(name, _)| name == "msg") {
+                    if call_args.len() > 1 {
+                        return exc::raise_with_message(
+                            TYPE_ERROR,
+                            "unittest.TestCase.subTest() got multiple values for argument 'msg'",
+                        );
+                    }
+                    let (_, message) = remaining.remove(index);
+                    call_args.push(message);
+                }
+                while call_args.len() < 2 {
+                    call_args.push(subtest_message_sentinel());
+                }
+                let dictionary = keywords_dict(&remaining);
+                call_args.push(dictionary);
+                return dispatch(function, &call_args);
+            }
             let dictionary = keywords_dict(&keywords);
             let mut call_args = args.to_vec();
             call_args.push(dictionary);
@@ -1033,27 +1067,43 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: Vec<(String, i64)>
         }
         // The skip/expected-failure decorators accept their documented names
         // (`reason=`, `condition=`), including when the spec entry leaves the
-        // names dynamic.
+        // names dynamic. Binding is strict: a duplicate positional/keyword
+        // value and a missing `condition` report the same `TypeError` as
+        // CPython's binder instead of silently shifting the slots.
         "skip" | "skipIf" | "skipUnless" => {
+            let names: &[&str] = if function == "skip" {
+                &["reason"]
+            } else {
+                &["condition", "reason"]
+            };
             let mut slots = args.to_vec();
             for (name, item) in keywords {
-                let index = match (function, name.as_str()) {
-                    ("skip", "reason") => 0,
-                    (_, "condition") => 0,
-                    (_, "reason") => 1,
-                    _ => {
-                        return exc::raise_with_message(
-                            TYPE_ERROR,
-                            &format!(
-                                "unittest.{function}() got an unexpected keyword argument '{name}'"
-                            ),
-                        )
-                    }
+                let Some(index) = names.iter().position(|candidate| *candidate == name) else {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!(
+                            "unittest.{function}() got an unexpected keyword argument '{name}'"
+                        ),
+                    );
                 };
-                while slots.len() <= index {
+                if index < slots.len() {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("unittest.{function}() got multiple values for argument '{name}'"),
+                    );
+                }
+                while slots.len() < index {
                     slots.push(NONE);
                 }
-                slots[index] = item;
+                slots.push(item);
+            }
+            if function != "skip" && slots.first().is_none_or(|condition| *condition == NONE) {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "unittest.{function}() missing 1 required positional argument: 'condition'"
+                    ),
+                );
             }
             call(function, &slots)
         }
@@ -1249,14 +1299,41 @@ fn skip_apply(args: &[i64]) -> i64 {
         None if reason == NONE => String::new(),
         None => value::to_string(reason),
     };
+    // A function/class item is still being decorated. Anything else is the
+    // receiver of a wrapper produced by `apply_skip` and called through an
+    // outer decorator: CPython's `skip_wrapper` raises `SkipTest` there, so
+    // the skip cannot be erased by a decorator that does not copy attributes.
+    if value::as_function(item).is_none() && value::as_class(item).is_none() {
+        return exc::raise_with_message(SKIPPED, &text);
+    }
     apply_skip(item, &text)
 }
 
 fn apply_skip(item: i64, reason: &str) -> i64 {
     set_item_flag(item, "__unittest_skip__", TRUE);
-    let reason = value::str_alloc(reason.to_string());
-    set_item_flag(item, "__unittest_skip_why__", reason);
-    item
+    let reason_value = value::str_alloc(reason.to_string());
+    set_item_flag(item, "__unittest_skip_why__", reason_value);
+    if value::as_class(item).is_some() {
+        return item;
+    }
+    // CPython replaces a decorated function with a wrapper that raises
+    // `SkipTest` when called and carries the skip attributes. The runtime has
+    // no function factory, so the wrapper is the internal
+    // `_skip_apply(True, reason, receiver)` call: at run time `skip_apply`
+    // sees a receiver (not a function/class) and raises the same exception.
+    let apply = value::native_function_new("unittest", "_skip_apply", 3);
+    let wrapper = value::partial_new(apply, vec![TRUE, reason_value]);
+    set_item_flag(wrapper, "__unittest_skip__", TRUE);
+    set_item_flag(wrapper, "__unittest_skip_why__", reason_value);
+    let name = value::function_name(item);
+    if !name.is_empty() {
+        value::function_setattr(wrapper, "__name__", value::str_alloc(name));
+    }
+    let doc = value::function_doc(item);
+    if doc != NONE {
+        value::function_setattr(wrapper, "__doc__", doc);
+    }
+    wrapper
 }
 
 /// Stores an attribute on a class or function test item.
@@ -1825,6 +1902,7 @@ fn test_case_run(args: &[i64]) -> i64 {
         value::bool_value(expecting),
     );
     value::instance_setattr(instance, "_unittest_expected_failure".to_string(), NONE);
+    value::instance_setattr(instance, "_subtest".to_string(), NONE);
 
     let started = std::time::Instant::now();
     // CPython's `_Outcome`: `success` gates tearDown and final accounting;
@@ -1876,9 +1954,10 @@ fn test_case_run(args: &[i64]) -> i64 {
                 value::instance_setattr(instance, "_unittest_expected_failure".to_string(), NONE);
             }
         }
-        // `tearDown` runs when the body's outcome was a pass or an expected
-        // failure (CPython keeps `success` true for the latter).
-        if success && interrupted.is_none() {
+        // CPython runs `tearDown` after every body outcome except a
+        // `KeyboardInterrupt`: on a failure the extra `testPartExecutor`
+        // simply records the second outcome. Only a failing `setUp` skips it.
+        if interrupted.is_none() {
             call_method(instance, "tearDown", &[]);
             if exc::pending() {
                 let error = take_pending();
@@ -1907,7 +1986,7 @@ fn test_case_run(args: &[i64]) -> i64 {
         }
     }
 
-    let _elapsed = started.elapsed().as_secs_f64();
+    let elapsed = started.elapsed().as_secs_f64();
 
     if let Some(error) = interrupted {
         value::instance_setattr(instance, "_unittest_result".to_string(), NONE);
@@ -1916,6 +1995,14 @@ fn test_case_run(args: &[i64]) -> i64 {
         heap::release_roots(roots);
         return exc::raise_value(error);
     }
+
+    // CPython records the elapsed time after the cleanups, on every path that
+    // reached this point (an early `@skip` returns before the timer starts).
+    call_method(
+        instance,
+        "_addDuration",
+        &[result, value::float_new(elapsed)],
+    );
 
     if success {
         if expecting {
@@ -2120,24 +2207,74 @@ fn do_cleanups(instance: i64) -> bool {
     success
 }
 
+/// The unique value CPython uses for an omitted `subTest(msg=...)`.
+///
+/// `None` cannot serve as the sentinel: `subTest(None)` is an explicit message
+/// and must render as `[None]`.
+fn subtest_message_sentinel() -> i64 {
+    const KEY: &str = "unittest._subtest_msg_sentinel";
+    if let Some(sentinel) = globals::registry_get(KEY) {
+        return sentinel;
+    }
+    let sentinel = value::native_function_new("unittest", "_subtest_msg_sentinel", 0);
+    let roots = heap::root_values(std::slice::from_ref(&sentinel));
+    globals::registry_set(KEY, sentinel);
+    heap::add_thread_root(sentinel);
+    heap::release_roots(roots);
+    sentinel
+}
+
+/// CPython's `_OrderedChainMap.new_child(params)` for a nested subtest.
+///
+/// The child mapping goes first, then the parent's keys that the child does
+/// not override; insertion order is preserved so `_subDescription` renders
+/// `(baz=2, bar=3, foo=1)` exactly like CPython.
+fn chained_subtest_params(parent: i64, params: i64) -> i64 {
+    let parent_pairs = value::as_dict(parent).unwrap_or(&[]);
+    let child_pairs = value::as_dict(params).unwrap_or(&[]);
+    let mut merged: Vec<(i64, i64)> = child_pairs.to_vec();
+    for &(key, item) in parent_pairs {
+        let overridden = merged
+            .iter()
+            .any(|(existing, _)| container::equals(*existing, key));
+        if !overridden {
+            merged.push((key, item));
+        }
+    }
+    value::dict_new(merged)
+}
+
 fn sub_test(args: &[i64]) -> i64 {
     let Some(&instance) = args.first() else {
         return missing_arguments("TestCase.subTest");
     };
-    let message = args.get(1).copied().unwrap_or(NONE);
+    let message = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(subtest_message_sentinel);
     let params = match args.get(2) {
         Some(&dictionary) if value::as_dict(dictionary).is_some() => dictionary,
         _ => value::dict_new(Vec::new()),
     };
+    let parent = value::instance_attr(instance, "_subtest").unwrap_or(NONE);
+    let params = if parent != NONE {
+        let parent_params = value::instance_attr(parent, "params").unwrap_or(NONE);
+        chained_subtest_params(parent_params, params)
+    } else {
+        params
+    };
     let class = subtest_class();
     let context = value::instance_new(class);
-    let roots = heap::root_values(&[context]);
+    let roots = heap::root_values(&[context, params, parent]);
     value::instance_setattr(context, "test_case".to_string(), instance);
     value::instance_setattr(context, "_message".to_string(), message);
     value::instance_setattr(context, "_params".to_string(), params);
+    value::instance_setattr(context, "params".to_string(), params);
+    value::instance_setattr(context, "_parent".to_string(), parent);
     let failure = self_attribute(instance, "failureException")
         .unwrap_or_else(|| exc::exception_class(ASSERTION_ERROR));
     value::instance_setattr(context, "failureException".to_string(), failure);
+    value::instance_setattr(instance, "_subtest".to_string(), context);
     heap::release_roots(roots);
     context
 }
@@ -2153,7 +2290,7 @@ fn test_case_id(args: &[i64]) -> i64 {
         .and_then(value::as_str)
         .map(str::to_string)
         .unwrap_or_default();
-    value::str_alloc(format!("{}.{name}", qualified_class_text(class)))
+    value::str_alloc(format!("{}.{name}", class_text(class)))
 }
 
 /// `TestCase.__eq__`: equal when both operands are the same exact class and
@@ -2250,7 +2387,8 @@ fn test_case_add_duration(args: &[i64]) -> i64 {
         return NONE;
     }
     let argv = [instance, elapsed];
-    methods::call(result, b"addDuration".as_ptr(), 10, 2, argv.as_ptr())
+    let name = b"addDuration";
+    methods::call(result, name.as_ptr(), name.len(), 2, argv.as_ptr())
 }
 
 fn test_case_get_equality_func(args: &[i64]) -> i64 {
@@ -2294,7 +2432,7 @@ fn test_case_str(args: &[i64]) -> i64 {
         .and_then(value::as_str)
         .map(str::to_string)
         .unwrap_or_default();
-    value::str_alloc(format!("{name} ({}.{name})", qualified_class_text(class)))
+    value::str_alloc(format!("{name} ({}.{name})", class_text(class)))
 }
 
 fn test_case_repr(args: &[i64]) -> i64 {
@@ -2308,10 +2446,7 @@ fn test_case_repr(args: &[i64]) -> i64 {
         .and_then(value::as_str)
         .map(str::to_string)
         .unwrap_or_default();
-    value::str_alloc(format!(
-        "<{} testMethod={name}>",
-        qualified_class_text(class)
-    ))
+    value::str_alloc(format!("<{} testMethod={name}>", class_text(class)))
 }
 
 // -------------------------------------------------------------------------
@@ -3695,6 +3830,10 @@ fn text_test_result_method(method: &str, args: &[i64]) -> i64 {
                 value::bool_value(verbosity == 1),
             );
             value::instance_setattr(result, "_newline".to_string(), TRUE);
+            // `TextTestResult(stream, descriptions, verbosity, *,
+            // durations=None)`; the native constructor has no keyword slot,
+            // so the runner sets it after construction.
+            value::instance_setattr(result, "durations".to_string(), NONE);
             NONE
         }
         "getDescription" => {
@@ -4220,6 +4359,11 @@ fn runner_method(method: &str, args: &[i64]) -> i64 {
             if let Some(tb_locals) = value::instance_attr(runner, "tb_locals") {
                 value::instance_setattr(result, "tb_locals".to_string(), tb_locals);
             }
+            if value::as_instance(result).is_some() {
+                if let Some(durations) = value::instance_attr(runner, "durations") {
+                    value::instance_setattr(result, "durations".to_string(), durations);
+                }
+            }
             result
         }
         "run" => runner_run(args),
@@ -4255,6 +4399,9 @@ fn runner_run(args: &[i64]) -> i64 {
     let elapsed = started.elapsed().as_secs_f64();
     if has_method(result, "printErrors") {
         call_method(result, "printErrors", &[]);
+    }
+    if value::instance_attr(runner, "durations").is_some_and(|durations| durations != NONE) {
+        print_durations(runner, result);
     }
     let stream = value::instance_attr(runner, "stream").unwrap_or(NONE);
     let separator2 = object_attribute(result, "separator2")
@@ -4310,6 +4457,64 @@ fn runner_run(args: &[i64]) -> i64 {
     stream_flush(stream);
     heap::release_roots(roots);
     result
+}
+
+/// `TextTestRunner._printDurations`: print the slowest tests, honouring the
+/// runner's verbosity and duration limit.
+fn print_durations(runner: i64, result: i64) {
+    let Some(items) = value::instance_attr(result, "collectedDurations").and_then(value::as_list)
+    else {
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    let mut entries: Vec<(f64, i64)> = Vec::with_capacity(items.len());
+    for &item in items {
+        let Some(pair) = value::as_tuple(item) else {
+            continue;
+        };
+        let Some(label) = pair.first().copied() else {
+            continue;
+        };
+        let elapsed = pair.get(1).copied().and_then(numeric_value).unwrap_or(0.0);
+        entries.push((elapsed, label));
+    }
+    if entries.is_empty() {
+        return;
+    }
+    entries.sort_by(|left, right| right.0.total_cmp(&left.0));
+    let limit = value::instance_attr(runner, "durations")
+        .and_then(value::as_integer)
+        .unwrap_or(-1);
+    if limit > 0 {
+        entries.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    }
+    let stream = value::instance_attr(runner, "stream").unwrap_or(NONE);
+    stream_writeln(stream, "Slowest test durations");
+    if let Some(separator) = object_attribute(result, "separator2") {
+        stream_writeln(stream, &value::to_string(separator));
+    }
+    let verbosity = value::instance_attr(runner, "verbosity")
+        .and_then(value::as_integer)
+        .unwrap_or(1);
+    let mut hidden = false;
+    for (elapsed, label) in entries {
+        if verbosity < 2 && elapsed < 0.001 {
+            hidden = true;
+            continue;
+        }
+        let timing = format!("{elapsed:.3}s");
+        stream_writeln(stream, &format!("{timing:<10} {}", value::to_string(label)));
+    }
+    if hidden {
+        stream_writeln(
+            stream,
+            "\n(durations < 0.001s were hidden; use -v to show these durations)",
+        );
+    } else {
+        stream_writeln(stream, "");
+    }
 }
 
 /// Runs a test case, suite or any callable test item against `result`.
@@ -5062,10 +5267,12 @@ fn make_test_list(tests: Vec<i64>) -> i64 {
 fn subtest_description(instance: i64) -> String {
     let mut parts = Vec::new();
     let message = value::instance_attr(instance, "_message").unwrap_or(NONE);
-    if message != NONE {
+    if message != subtest_message_sentinel() {
         parts.push(format!("[{}]", value::to_string(message)));
     }
-    if let Some(params) = value::instance_attr(instance, "_params").and_then(value::as_dict) {
+    let params = value::instance_attr(instance, "params")
+        .or_else(|| value::instance_attr(instance, "_params"));
+    if let Some(params) = params.and_then(value::as_dict) {
         if !params.is_empty() {
             let rendered = params
                 .iter()
@@ -5092,7 +5299,10 @@ fn subtest_method(method: &str, args: &[i64]) -> i64 {
             };
             value::instance_setattr(instance, "test_case".to_string(), test);
             value::instance_setattr(instance, "_message".to_string(), message);
-            value::instance_setattr(instance, "_params".to_string(), value::dict_new(Vec::new()));
+            let params = value::dict_new(Vec::new());
+            value::instance_setattr(instance, "_params".to_string(), params);
+            value::instance_setattr(instance, "params".to_string(), params);
+            value::instance_setattr(instance, "_parent".to_string(), NONE);
             NONE
         }
         "__enter__" => args.first().copied().unwrap_or(NONE),
@@ -5131,6 +5341,17 @@ fn subtest_method(method: &str, args: &[i64]) -> i64 {
     }
 }
 
+/// Restores the enclosing subtest (CPython's `finally: self._subtest = parent`
+/// in the `subTest` generator).
+fn restore_subtest(instance: i64) {
+    let test = value::instance_attr(instance, "test_case").unwrap_or(NONE);
+    if test == NONE {
+        return;
+    }
+    let parent = value::instance_attr(instance, "_parent").unwrap_or(NONE);
+    value::instance_setattr(test, "_subtest".to_string(), parent);
+}
+
 fn subtest_exit(args: &[i64]) -> i64 {
     let (Some(&instance), Some(&exc_type)) = (args.first(), args.get(1)) else {
         return missing_arguments("_SubTest.__exit__");
@@ -5140,11 +5361,13 @@ fn subtest_exit(args: &[i64]) -> i64 {
     // A legacy result (or debug mode) has no `addSubTest`: CPython yields the
     // subtest body directly, so an exception must propagate unchanged.
     if result == NONE || !has_method(result, "addSubTest") {
+        restore_subtest(instance);
         return FALSE;
     }
     if exc_type == NONE {
         // A successful subtest is reported when the result supports subtests.
         call_method(result, "addSubTest", &[test, instance, NONE]);
+        restore_subtest(instance);
         return FALSE;
     }
     let error = match args.get(2).copied() {
@@ -5152,16 +5375,28 @@ fn subtest_exit(args: &[i64]) -> i64 {
         _ => exc::pending_value(),
     };
     if error == NONE {
+        restore_subtest(instance);
+        return FALSE;
+    }
+    let tag = value::exception_data(error).map(|data| data.tag);
+    // `KeyboardInterrupt` always escapes, and the internal control-flow signal
+    // is for the outer `TestCase.run` to consume.
+    if tag == Some(KEYBOARD_INTERRUPT) || is_should_stop(error) {
+        restore_subtest(instance);
         return FALSE;
     }
     // `SkipTest` inside a subtest is reported as a skip of that subtest and
     // suppressed, exactly like `_Outcome.testPartExecutor`.
-    if value::exception_data(error).map(|data| data.tag) == Some(SKIPPED) {
+    if tag == Some(SKIPPED) {
         exc::clear();
         let why = value::exception_data(error)
             .map(|data| data.msg.clone())
             .unwrap_or_default();
         result_add_skip(result, instance, &why);
+        restore_subtest(instance);
+        if value::instance_attr(result, "failfast").is_some_and(value::truthy) {
+            raise_should_stop();
+        }
         return TRUE;
     }
     // Under `@expectedFailure`, the first failing subtest is the whole test's
@@ -5174,13 +5409,16 @@ fn subtest_exit(args: &[i64]) -> i64 {
             value::instance_setattr(test, "_unittest_expected_failure".to_string(), error);
         }
         // CPython stops the test body once the expected failure is known.
+        restore_subtest(instance);
         raise_should_stop();
         return TRUE;
     }
     exc::clear();
     let tuple = error_tuple(error);
     call_method(result, "addSubTest", &[test, instance, tuple]);
-    if value::instance_attr(result, "failfast").is_some_and(value::truthy) {
+    let failfast = value::instance_attr(result, "failfast").is_some_and(value::truthy);
+    restore_subtest(instance);
+    if failfast {
         raise_should_stop();
     }
     TRUE
@@ -6328,6 +6566,9 @@ fn encode_int(value_to_encode: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        crate::heap::heap_reset_test_guard()
+    }
 
     fn int(n: i64) -> i64 {
         value::encode_int(n).expect("tagged int")
@@ -6339,6 +6580,7 @@ mod tests {
 
     #[test]
     fn test_case_has_the_expected_native_methods() {
+        let _guard = serial();
         let case = test_case();
         assert_eq!(value::as_class(case).expect("class value").name, "TestCase");
         for name in [
@@ -6358,6 +6600,7 @@ mod tests {
 
     #[test]
     fn skip_if_false_is_the_identity_decorator() {
+        let _guard = serial();
         exc::init();
         let identity = skip_if(&[FALSE, value::str_alloc("why".to_string())], false);
         // The identity callable returns the decorated item unchanged.
@@ -6368,6 +6611,7 @@ mod tests {
 
     #[test]
     fn assertion_helpers_pass_and_fail() {
+        let _guard = serial();
         exc::init();
         assert_eq!(test_case_method("assertTrue", &[NONE, TRUE]), NONE);
         assert!(!exc::pending());
@@ -6409,6 +6653,7 @@ mod tests {
 
     #[test]
     fn registry_and_runner() {
+        let _guard = serial();
         reset();
         exc::init();
         assert_eq!(registry_len(), 0);
@@ -6454,6 +6699,7 @@ mod tests {
 
     #[test]
     fn result_accounting_for_expected_failure_and_skip() {
+        let _guard = serial();
         reset();
         exc::init();
         let case = test_case();
@@ -6504,6 +6750,7 @@ mod tests {
 
     #[test]
     fn main_module_argument_selects_the_entry_unit() {
+        let _guard = serial();
         exc::init();
         // No argument and an explicit `None` both mean the entry unit.
         assert_eq!(main_module(&[], &[]).as_deref(), Some(MAIN_MODULE));
@@ -6527,6 +6774,7 @@ mod tests {
 
     #[test]
     fn main_scan_merges_module_namespace_and_registry() {
+        let _guard = serial();
         reset();
         exc::init();
         let case = test_case();
@@ -6595,6 +6843,7 @@ mod tests {
 
     #[test]
     fn load_tests_hook_ignores_missing_and_none_entries() {
+        let _guard = serial();
         exc::init();
         let module = "unittest.load_tests_probe";
         assert_eq!(load_tests_hook(module), None);
@@ -6610,6 +6859,7 @@ mod tests {
 
     #[test]
     fn load_tests_returning_none_cannot_pass_silently() {
+        let _guard = serial();
         exc::init();
         let module = "unittest.load_tests_none";
         // `_case_marker` accepts the hook's three arguments and returns None,
@@ -6624,6 +6874,7 @@ mod tests {
 
     #[test]
     fn load_tests_result_replaces_the_standard_tests() {
+        let _guard = serial();
         reset();
         exc::init();
         let module = "unittest.load_tests_replace";
@@ -6655,6 +6906,7 @@ mod tests {
 
     #[test]
     fn standard_run_reports_failures_without_a_hook() {
+        let _guard = serial();
         reset();
         exc::init();
         let module = "unittest.standard_probe";

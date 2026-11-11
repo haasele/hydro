@@ -35,6 +35,7 @@ use crate::exc::{self, ASSERTION_ERROR, TYPE_ERROR};
 use crate::heap;
 use crate::methods;
 use crate::value::{self, FALSE, NONE, TRUE};
+use hydro_ir::ParamKind;
 
 /// `longMessage` lookup spelling shared by every failure path.
 const LONG_MESSAGE: &[u8] = b"longMessage";
@@ -93,6 +94,32 @@ pub(crate) fn install(class: i64) {
         let function = value::native_function_new("unittest", native_name, arity);
         value::class_set_attr(class, python_name.to_string(), function);
     }
+    // `_assertNotWarns` is CPython's private helper behind `assertNotWarns`.
+    // It is not in the static spec table (CPython exposes only the private
+    // name), so the class attribute carries its own full signature and entry:
+    // the shared method binder binds `msg=` and calls the trampoline directly,
+    // exactly like the signed public assertions.
+    let function = value::native_function_new("unittest", "TestCase.assertWarns", 2);
+    value::class_set_attr(class, "_assertNotWarns".to_string(), function);
+    let signature = vec![
+        value::ParamMeta {
+            name: "self".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "expected_warning".to_string(),
+            kind: ParamKind::Positional,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "msg".to_string(),
+            kind: ParamKind::Positional,
+            default: Some(NONE),
+        },
+    ];
+    value::function_set_signature(function, signature);
+    value::function_set_full_entry(function, assert_not_warns_entry as *const () as usize);
 }
 
 fn dispatch(function: &str, args: &[i64], keywords: &[(String, i64)]) -> Option<i64> {
@@ -699,7 +726,36 @@ fn new_warns_context(test_case: i64, expected: i64, regex: Option<i64>, msg: Opt
     value::instance_setattr(context, "expected_regex".to_string(), regex.unwrap_or(NONE));
     value::instance_setattr(context, "msg".to_string(), msg.unwrap_or(NONE));
     value::instance_setattr(context, "obj_name".to_string(), NONE);
+    value::instance_setattr(context, "not_warns".to_string(), FALSE);
     heap::release_roots(roots);
+    context
+}
+
+/// Full-argv entry for `_assertNotWarns(self, expected_warning, msg=None)`.
+extern "C" fn assert_not_warns_entry(arguments: *const i64) -> i64 {
+    // SAFETY: the binder supplies one slot per declared parameter (three).
+    let slots = unsafe { std::slice::from_raw_parts(arguments, 3) };
+    assert_not_warns(slots)
+}
+
+/// `TestCase._assertNotWarns(expected_warning, msg=None)`: the context form of
+/// CPython's private helper. `warns_exit_impl` inverts the check when the
+/// context's `not_warns` flag is set.
+fn assert_not_warns(args: &[i64]) -> i64 {
+    let test_case = args.first().copied().unwrap_or(NONE);
+    let expected = args.get(1).copied().unwrap_or(NONE);
+    let msg = args.get(2).copied().filter(|value| *value != NONE);
+    if !valid_warning_argument(expected) {
+        exc::raise_with_message(
+            TYPE_ERROR,
+            "assertWarns() arg 1 must be a warning type or tuple of warning types",
+        );
+        return NONE;
+    }
+    let context = new_warns_context(test_case, expected, None, msg);
+    if context != NONE {
+        value::instance_setattr(context, "not_warns".to_string(), TRUE);
+    }
     context
 }
 
@@ -868,6 +924,28 @@ fn warns_exit_impl(args: &[i64]) -> i64 {
     }
     if exc_type != NONE {
         return FALSE;
+    }
+    if value::instance_attr(instance, "not_warns").is_some_and(value::truthy) {
+        let expected = value::instance_attr(instance, "expected").unwrap_or(NONE);
+        let test_case = value::instance_attr(instance, "test_case").unwrap_or(NONE);
+        let msg = value::instance_attr(instance, "msg").filter(|message| *message != NONE);
+        let roots = heap::root_values(&[instance, expected, recorded]);
+        for &item in value::as_list(recorded).unwrap_or(&[]) {
+            let message = value::instance_attr(item, "message").unwrap_or(NONE);
+            let matches = builtins::isinstance(message, expected);
+            if exc::pending() {
+                heap::release_roots(roots);
+                return matches;
+            }
+            if value::truthy(matches) {
+                let standard = format!("{} triggered", expected_name(expected));
+                fail_with(test_case, msg, standard);
+                heap::release_roots(roots);
+                return FALSE;
+            }
+        }
+        heap::release_roots(roots);
+        return NONE;
     }
     let expected = value::instance_attr(instance, "expected").unwrap_or(NONE);
     let regex = value::instance_attr(instance, "expected_regex").unwrap_or(NONE);

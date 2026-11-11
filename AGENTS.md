@@ -82,13 +82,13 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-11-11: **3274 tests run
-(3274 passed, 1 skipped)**; the per-crate breakdown below sums to 3274:
+`cargo nextest run --workspace` on 2026-11-11: **3284 tests run
+(3284 passed, 1 skipped)**; the per-crate breakdown below sums to 3284:
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 2119 |
-| frontend | 910 |
+| runtime (unit + integration) | 2126 |
+| frontend | 913 |
 | codegen | 79 |
 | IR | 71 |
 | bindgen | 42 |
@@ -273,11 +273,18 @@ python3 scripts/check_benchmarks.py
 
 See `CHANGELOG.md` for details; this is only the resume pointer.
 
+- **2026-11-11 compatibility slice:** workspace **3284 passed, 1 skipped**
+  (runtime 2126, frontend 913); clippy/fmt/`verify.sh` green. Target triage
+  confirms `test_plistlib` and `test_poll` still pass; `test_yield_from`
+  still fails in unittest discovery, and `test_argparse`, `test_codecs`,
+  `test_datetime`, `test_pickle`, `test_re`, `test_struct`, `test_tempfile`,
+  `test_contextlib`, `test_asyncgen` remain open despite the new runtime
+  surfaces.
 - Stdlib import matrix is **288/288 CPython-comparable modules**; the nine
   remaining failures also fail under CPython 3.14.9 on this host.
 - Function-local native imports now shadow module aliases, `math` covers the
   CPython 3.14 scalar/iterable surface, and `opcode`/`code`/`tty` resolve to
   their pure CPython modules; `ast` exposes its compile flags through `_ast`.
-- Workspace gate: **3262 tests run (3262 passed, 1 skipped)**; clippy and fmt
+- Workspace gate: **3284 tests run (3284 passed, 1 skipped)**; clippy and fmt
   are clean. The current report set is regenerated in
   `benchmarks/compat/latest.json` and `docs/COMPATIBILITY.md`.

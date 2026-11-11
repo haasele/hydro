@@ -2657,6 +2657,17 @@ pub unsafe extern "C" fn PyModule_AddType(
 /// Returns 0 on success and -1 with an exception when `list` is not a list.
 #[no_mangle]
 pub unsafe extern "C" fn PyList_Clear(list: *mut ShimObject) -> c_int {
+    // Validate the shim role and kind before the mutable payload borrow: a
+    // type object or extension-owned instance has no `ShimKind` at the shim
+    // payload offset.
+    if !matches!(kind_ref(list), Some(ShimKind::List(_))) {
+        set_error(if list.is_null() {
+            "TypeError: expected a list object, got NULL"
+        } else {
+            "TypeError: expected a list object"
+        });
+        return -1;
+    }
     let items = match list_slots_mut(list) {
         Ok(items) => std::mem::take(items),
         Err(error) => {
@@ -2676,6 +2687,16 @@ pub unsafe extern "C" fn PyList_Clear(list: *mut ShimObject) -> c_int {
 /// `PyList_Reverse`: reverse the list in place.
 #[no_mangle]
 pub unsafe extern "C" fn PyList_Reverse(list: *mut ShimObject) -> c_int {
+    // Validate the shim role and kind before the mutable payload borrow; see
+    // `PyList_Clear`.
+    if !matches!(kind_ref(list), Some(ShimKind::List(_))) {
+        set_error(if list.is_null() {
+            "TypeError: expected a list object, got NULL"
+        } else {
+            "TypeError: expected a list object"
+        });
+        return -1;
+    }
     match list_slots_mut(list) {
         Ok(items) => {
             items.reverse();
@@ -2731,6 +2752,17 @@ pub unsafe extern "C" fn PyDict_PopString(
     }
     if key.is_null() {
         super::bad_internal_call();
+        return -1;
+    }
+    // Validate the shim role and kind before the mutable payload borrow: a
+    // type object or extension-owned instance has no `ShimKind` at the shim
+    // payload offset.
+    if !matches!(kind_ref(dict), Some(ShimKind::Dict(_))) {
+        set_error(if dict.is_null() {
+            "TypeError: expected a dict object, got NULL"
+        } else {
+            "TypeError: expected a dict object"
+        });
         return -1;
     }
     let name = read_c_string(key);

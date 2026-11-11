@@ -287,6 +287,33 @@ fn parse_params(
     Ok(names)
 }
 
+/// Reads a descriptor's leading `struct_size` word without forming a typed
+/// reference to the full struct.
+///
+/// An artifact built against an older HNA layout may have a shorter
+/// `HydroNativeModule`, so only the leading size word is guaranteed readable
+/// until [`check_descriptor_size`] passes.
+fn descriptor_struct_size(descriptor: *const HydroNativeModule) -> u32 {
+    // SAFETY: the HNA descriptor contract fixes `struct_size` as the first
+    // `u32` word. `read_unaligned` tolerates a misaligned static; reading the
+    // single prefix word is the only field access an undersized descriptor
+    // permits.
+    unsafe { std::ptr::read_unaligned(descriptor.cast::<u32>()) }
+}
+
+/// Rejects descriptors shorter than this runtime's struct before any field
+/// beyond `struct_size` is read.
+fn check_descriptor_size(descriptor: *const HydroNativeModule, label: &str) -> Result<(), String> {
+    let runtime_size = std::mem::size_of::<HydroNativeModule>() as u32;
+    let struct_size = descriptor_struct_size(descriptor);
+    if struct_size < runtime_size {
+        return Err(format!(
+            "hna module '{label}': descriptor struct_size {struct_size}, runtime expects at least {runtime_size}"
+        ));
+    }
+    Ok(())
+}
+
 /// Validates a descriptor and copies everything the runtime needs.
 ///
 /// `expected` is the exact dotted import name when the caller knows it. The
@@ -300,14 +327,10 @@ fn validate_descriptor(
     expected: Option<&str>,
     descriptor: &HydroNativeModule,
 ) -> Result<ValidatedModule, String> {
-    let runtime_size = std::mem::size_of::<HydroNativeModule>() as u32;
-    if descriptor.struct_size < runtime_size {
-        return Err(format!(
-            "hna module '{}': descriptor struct_size {}, runtime expects at least {runtime_size}",
-            expected.unwrap_or("<artifact>"),
-            descriptor.struct_size
-        ));
-    }
+    check_descriptor_size(
+        descriptor as *const HydroNativeModule,
+        expected.unwrap_or("<artifact>"),
+    )?;
     // Diagnostic module name: the requested import name when the caller knows
     // it, otherwise the descriptor's own `module_name` (borrowed safely; a
     // NULL, empty or non-UTF-8 pointer falls back to a neutral label so the
@@ -813,8 +836,15 @@ fn load_new(expected: Option<&str>, canonical: &Path) -> Result<Arc<ModuleEntry>
     let manifest =
         crate::native_manifest::find_for_artifact(canonical).map_err(LoadFailure::Diagnostic)?;
     let (handle, descriptor_ptr, build) = open_artifact(canonical)?;
-    // SAFETY: `open_artifact` rejected NULL and the descriptor contract
-    // promises static read-only storage valid for the process lifetime.
+    // The size word is checked before any typed access: an artifact built
+    // against an older HNA layout may have a descriptor shorter than this
+    // runtime's struct, so reading `module_name` first would be out of bounds.
+    check_descriptor_size(descriptor_ptr, expected.unwrap_or("<artifact>"))
+        .map_err(LoadFailure::Diagnostic)?;
+    // SAFETY: the size check proved the descriptor is at least as large as
+    // `HydroNativeModule`, and the descriptor contract promises static
+    // read-only storage valid for the process lifetime. `open_artifact`
+    // rejected NULL.
     let descriptor = unsafe { &*descriptor_ptr };
     // A descriptor that names a different module is a wrong-name import of a
     // valid artifact, not a broken artifact: report it without caching so the

@@ -559,9 +559,9 @@ fn runtime_error(message: &str) -> i64 {
     exc::raise_with_message(RUNTIME_ERROR, message)
 }
 
-/// Renders a code point the way CPython's `UnicodeEncodeError` message does.
-fn escaped_character(character: char) -> String {
-    let code = character as u32;
+/// Renders a Python code point the way CPython's `UnicodeEncodeError` message
+/// does.
+fn escaped_character(code: u32) -> String {
     if code <= 0xff {
         format!("\\x{code:02x}")
     } else if code <= 0xffff {
@@ -586,6 +586,17 @@ fn call_error_handler(errors: &str, error: i64) -> Result<(Replacement, i64), i6
     let name = value::str_alloc(errors.to_string());
     let handler = crate::modules::codecs::call("lookup_error", &[name]);
     if exc::pending() {
+        return Err(NONE);
+    }
+    // CPython's built-in `surrogatepass` handler only understands the
+    // standard UTF encodings (it inspects the exception's encoding); every
+    // codec in this module is a non-UTF multibyte codec, so the handler
+    // re-raises the original exception unchanged. A handler registered under
+    // the same name still runs (register_error may override a builtin).
+    if errors == "surrogatepass"
+        && value::function_native_name(handler) == Some("surrogatepass_errors")
+    {
+        exc::raise_value(error);
         return Err(NONE);
     }
     let result = core_builtins::call(handler, 1, [error].as_ptr());
@@ -625,7 +636,10 @@ fn decode_exception(kind: Kind, data: &[u8], start: usize, end: usize, reason: &
     };
     let args = vec![
         name.to_string(),
-        format!("b\"{}\"", String::from_utf8_lossy(data)),
+        // The undecodable object, one lone surrogate per byte, so the
+        // `surrogateescape`/`surrogatepass` handlers can recover the rejected
+        // bytes exactly (the same representation `codecs.rs` uses).
+        value::str_from_codes(data.iter().map(|byte| 0xDC00 + u32::from(*byte))),
         start.to_string(),
         end.to_string(),
         reason.to_string(),
@@ -636,10 +650,12 @@ fn decode_exception(kind: Kind, data: &[u8], start: usize, end: usize, reason: &
 /// Builds the `UnicodeEncodeError` value CPython hands to an encode handler.
 fn encode_exception(kind: Kind, text: &str, start: usize, end: usize, reason: &str) -> i64 {
     let name = kind.name();
-    let character = text.chars().nth(start).unwrap_or('\u{0}');
+    // `start` is a character index; `str_codes` sees lone surrogates rather
+    // than the string payload's private-use mirrors.
+    let code = value::str_codes(text).nth(start).unwrap_or(0);
     let message = format!(
         "'{name}' codec can't encode character '{}' in position {start}: {reason}",
-        escaped_character(character)
+        escaped_character(code)
     );
     let args = vec![
         name.to_string(),

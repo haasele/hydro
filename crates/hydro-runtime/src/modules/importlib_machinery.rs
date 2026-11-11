@@ -1315,6 +1315,11 @@ pub(crate) fn extension_loader(name: &str, path: &str) -> i64 {
     loader_instance(extension_loader_class(), name, path)
 }
 
+/// `SourcelessFileLoader(name, path)` instance.
+pub(crate) fn sourceless_loader(name: &str, path: &str) -> i64 {
+    loader_instance(sourceless_loader_class(), name, path)
+}
+
 fn loader_instance(class: i64, name: &str, path: &str) -> i64 {
     let instance = value::instance_new(class);
     value::instance_setattr(

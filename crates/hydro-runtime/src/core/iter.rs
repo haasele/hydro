@@ -234,17 +234,89 @@ fn is_callable(v: i64) -> bool {
             .unwrap_or(false)
 }
 
+/// One step of a non-native instance's `__next__`.
+enum InstanceStep {
+    /// The method produced a value.
+    Item(i64),
+    /// The method raised `StopIteration`, which is left pending so callers can
+    /// propagate the original exception or clear it for a default.
+    Exhausted,
+    /// The method raised another exception, which is pending.
+    Failed,
+}
+
+/// Steps a non-native instance whose class provides `__next__`.
+///
+/// Returns `None` when `obj` is not an instance or its class supplies no
+/// callable `__next__`; callers then report the ordinary "not an iterator"
+/// error. The method is invoked with the receiver bound, exactly like a
+/// method call.
+fn instance_next(obj: i64) -> Option<InstanceStep> {
+    let class = value::as_instance(obj)?.class;
+    let function = match value::class_lookup(class, "__next__")? {
+        value::ClassEntry::Method(hydro_ir::MethodKind::Normal, function) => function,
+        // A runtime class assignment (`C.__next__ = fn`) lands in the class
+        // overlay; CPython binds it like a class-body function.
+        value::ClassEntry::Attr(function) if value::as_function(function).is_some() => function,
+        _ => return None,
+    };
+    // Native methods carry parameter metadata and a uniform full-argv
+    // trampoline, so bind them through the shared method binder like the
+    // `__iter__` path below. User functions take the receiver as their only
+    // positional argument.
+    let item = if !value::function_signature(function).is_empty()
+        && value::function_full_entry(function) != 0
+    {
+        crate::core::methods::call_user_method(
+            obj,
+            class,
+            hydro_ir::MethodKind::Normal,
+            function,
+            "__next__",
+            &[],
+            &[],
+        )
+    } else {
+        let arguments = [obj];
+        crate::core::builtins::call(function, 1, arguments.as_ptr())
+    };
+    if exc::pending() {
+        return Some(if exc::pending_tag() == exc::STOP_ITERATION as i64 {
+            InstanceStep::Exhausted
+        } else {
+            InstanceStep::Failed
+        });
+    }
+    Some(InstanceStep::Item(item))
+}
+
 /// `next(obj[, default])`: advances an iterator or generator by one step.
 ///
 /// Returns the element. At the end, raises `StopIteration` when no default was
 /// given and returns the default otherwise. An exception raised inside a
 /// generator propagates unchanged: it leaves a pending exception, which takes
 /// precedence over the exhausted/default path.
+///
+/// A non-native instance is accepted when its class provides `__next__`
+/// (CPython reads the type's iterator-next slot, so `next()` does not require
+/// one of Hydro's native iterator wrappers).
 pub(crate) fn next_value(obj: i64, default: i64, has_default: bool) -> i64 {
     let generator = value::as_fiber(obj)
         .map(|fiber| fiber.kind == crate::fiber::FiberKind::Generator)
         .unwrap_or(false);
     if !generator && value::as_iter(obj).is_none() {
+        if let Some(step) = instance_next(obj) {
+            return match step {
+                InstanceStep::Item(item) => item,
+                // CPython's `next(obj, default)` swallows only StopIteration;
+                // without a default the original exception propagates.
+                InstanceStep::Exhausted if has_default => {
+                    exc::clear();
+                    default
+                }
+                InstanceStep::Exhausted | InstanceStep::Failed => value::NONE,
+            };
+        }
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!("'{}' object is not an iterator", value::type_name(obj)),
@@ -266,14 +338,24 @@ pub(crate) fn next_value(obj: i64, default: i64, has_default: bool) -> i64 {
     }
     if has_default {
         default
+    } else if generator {
+        // CPython's `gen_iternext` raises `StopIteration` carrying the
+        // generator's return value (`_PyGen_SetStopIterationValue`), so
+        // `next(g)` exposes it as `StopIteration.value`.
+        let result = value::as_fiber(obj)
+            .map(|fiber| fiber.result)
+            .unwrap_or(value::NONE);
+        exc::raise_stop_iteration(result)
     } else {
         exc::raise_with_message(exc::STOP_ITERATION, "")
     }
 }
 
 /// `hydro_iter_next`: writes the next element to `out` and returns `1`, or
-/// returns `0` at the end (no pending exception). An invalid iterator or a
-/// `NULL` out-pointer raises `TypeError` and returns `0`.
+/// returns `0` at the end (no pending exception). A non-native instance whose
+/// class defines `__next__` is stepped through that method, like `next()`.
+/// An invalid iterator or a `NULL` out-pointer raises `TypeError` and
+/// returns `0`.
 pub(crate) fn iter_next(iter: i64, out: *mut i64) -> i64 {
     if out.is_null() {
         exc::raise_with_message(TYPE_ERROR, "iteration output pointer is NULL");
@@ -284,6 +366,26 @@ pub(crate) fn iter_next(iter: i64, out: *mut i64) -> i64 {
         .unwrap_or(false)
     {
         return generator_next(iter, out);
+    }
+    // `iter()` returns a self-iterating user object unchanged, so the native
+    // ABI can receive a plain instance whose class defines `__next__`.
+    if value::as_iter(iter).is_none() {
+        if let Some(step) = instance_next(iter) {
+            return match step {
+                InstanceStep::Item(item) => {
+                    // SAFETY: `out` is non-null (checked above).
+                    unsafe { *out = item };
+                    1
+                }
+                // The ABI reports exhaustion as `0` with no pending
+                // exception; `__next__`'s StopIteration is the signal.
+                InstanceStep::Exhausted => {
+                    exc::clear();
+                    0
+                }
+                InstanceStep::Failed => 0,
+            };
+        }
     }
     let (target, from_callable, exhausted) = match value::as_iter(iter) {
         Some(state) => (state.target, state.from_callable, state.exhausted),
@@ -389,28 +491,28 @@ pub(crate) fn iter_next(iter: i64, out: *mut i64) -> i64 {
     } else if value::as_csv_reader(target).is_some() {
         // The snapshot is native; a fresh list/dict is built per yielded row.
         crate::csv::reader_item(target)
-    } else if let Some(instance) = value::as_instance(target) {
-        let Some(value::ClassEntry::Method(hydro_ir::MethodKind::Normal, function)) =
-            value::class_lookup(instance.class, "__next__")
-        else {
+    } else if value::as_instance(target).is_some() {
+        // A wrapper around a user iterator delegates to its `__next__`, with
+        // the same exhaustion/exception rules as the direct instance path.
+        let Some(step) = instance_next(target) else {
             exc::raise_with_message(
                 TYPE_ERROR,
                 &format!("'{}' object is not iterable", value::type_name(target)),
             );
             return 0;
         };
-        let arguments = [target];
-        let item = crate::core::builtins::call(function, 1, arguments.as_ptr());
-        if exc::pending() {
-            if exc::pending_tag() == exc::STOP_ITERATION as i64 {
-                exc::clear();
-                return 0;
+        return match step {
+            InstanceStep::Item(item) => {
+                // SAFETY: the caller supplied a writable `i64` slot.
+                unsafe { *out = item };
+                1
             }
-            return 0;
-        }
-        // SAFETY: the caller supplied a writable `i64` slot.
-        unsafe { *out = item };
-        return 1;
+            InstanceStep::Exhausted => {
+                exc::clear();
+                0
+            }
+            InstanceStep::Failed => 0,
+        };
     } else {
         exc::raise_with_message(
             TYPE_ERROR,
@@ -836,5 +938,124 @@ mod tests {
         let instance = value::instance_new(class);
         assert_eq!(iter_callable(instance, value::NONE), value::NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+    }
+
+    static USER_NEXT_STEPS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    static USER_NEXT_RECEIVER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    static USER_NEXT_BOUND: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Normal one-parameter `__next__`: yields `0`, `1`, then StopIteration,
+    /// recording that the receiver arrived in slot 0.
+    extern "C" fn user_next_entry(argv: *const i64) -> i64 {
+        // SAFETY: a `MethodKind::Normal` method receives the receiver first.
+        let receiver = unsafe { *argv };
+        if receiver == USER_NEXT_RECEIVER.load(std::sync::atomic::Ordering::SeqCst) {
+            USER_NEXT_BOUND.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let step = USER_NEXT_STEPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if step < 2 {
+            int(step)
+        } else {
+            exc::raise_with_message(crate::exc::STOP_ITERATION, "")
+        }
+    }
+
+    /// `__iter__` returning the receiver, like every self-iterating class.
+    extern "C" fn user_iter_entry(argv: *const i64) -> i64 {
+        // SAFETY: slot 0 is the bound receiver.
+        unsafe { *argv }
+    }
+
+    extern "C" fn failing_user_next(_argv: *const i64) -> i64 {
+        exc::raise_with_message(crate::exc::VALUE_ERROR, "boom")
+    }
+
+    fn user_method(entry: extern "C" fn(*const i64) -> i64, name: &str) -> i64 {
+        value::function_new(entry as *const () as usize, 1, name.to_string())
+    }
+
+    #[test]
+    fn next_advances_user_instances_through_next() {
+        use std::sync::atomic::Ordering;
+        exc::init();
+        USER_NEXT_STEPS.store(0, Ordering::SeqCst);
+        USER_NEXT_BOUND.store(false, Ordering::SeqCst);
+        let class = value::class_new(
+            "PyIterator".to_string(),
+            value::NONE,
+            vec![
+                (
+                    "__iter__".to_string(),
+                    user_method(user_iter_entry, "__iter__"),
+                ),
+                (
+                    "__next__".to_string(),
+                    user_method(user_next_entry, "__next__"),
+                ),
+            ],
+        );
+        let instance = value::instance_new(class);
+        USER_NEXT_RECEIVER.store(instance, Ordering::SeqCst);
+
+        // `iter()` preserves the self-iterating instance unchanged.
+        assert_eq!(iter_of(instance), instance);
+        assert_eq!(iter_new(instance), instance);
+
+        // Successive `next()` calls bind the instance as `self`.
+        assert_eq!(next_value(instance, value::NONE, false), int(0));
+        assert_eq!(next_value(iter_of(instance), value::NONE, false), int(1));
+        assert!(USER_NEXT_BOUND.load(Ordering::SeqCst));
+
+        // Exhaustion with a default returns it and clears StopIteration.
+        assert_eq!(next_value(instance, int(-1), true), int(-1));
+        assert!(!exc::pending());
+
+        // Without a default the method's StopIteration propagates.
+        assert_eq!(next_value(instance, value::NONE, false), value::NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::STOP_ITERATION as i64);
+        exc::clear();
+
+        // The native ABI steps the same instance and reports 0 at exhaustion.
+        USER_NEXT_STEPS.store(0, Ordering::SeqCst);
+        let mut out = int(-1);
+        assert_eq!(iter_next(instance, &mut out), 1);
+        assert_eq!(out, int(0));
+        assert_eq!(iter_next(instance, &mut out), 1);
+        assert_eq!(out, int(1));
+        assert_eq!(iter_next(instance, &mut out), 0);
+        assert!(!exc::pending());
+
+        // `iter()` still rejects a `__next__`-only object: only `__iter__`
+        // makes a class iterable.
+        let next_only = value::instance_new(value::class_new(
+            "NextOnly".to_string(),
+            value::NONE,
+            vec![(
+                "__next__".to_string(),
+                user_method(user_next_entry, "__next__"),
+            )],
+        ));
+        assert_eq!(iter_new(next_only), value::NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::clear();
+    }
+
+    #[test]
+    fn next_propagates_user_instance_exceptions() {
+        exc::init();
+        let class = value::class_new(
+            "FailingIterator".to_string(),
+            value::NONE,
+            vec![(
+                "__next__".to_string(),
+                user_method(failing_user_next, "__next__"),
+            )],
+        );
+        let instance = value::instance_new(class);
+        // A default only swallows StopIteration, never other exceptions.
+        assert_eq!(next_value(instance, int(-1), true), value::NONE);
+        assert_eq!(exc::pending_tag(), crate::exc::VALUE_ERROR as i64);
+        assert_eq!(value::to_string(exc::pending_value()), "boom");
     }
 }

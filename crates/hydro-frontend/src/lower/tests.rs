@@ -1409,7 +1409,8 @@ fn user_star_import_exports_public_names_only() {
         HExprKind::GlobalGet { module, name } if module == "helper" && name == "VALUE"
     ));
 
-    // `_private` was not bound by the star import.
+    // `_private` was not bound by the star import: the read is an ordinary
+    // runtime global lookup, never a static binding of the imported name.
     let source = "from helper import *\ny = _private\n";
     let mut infer = Infer::new();
     let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
@@ -1424,14 +1425,18 @@ fn user_star_import_exports_public_names_only() {
             module_getattr: false,
         },
     )]));
-    let _ = lowerer.lower_module(&parse(source));
+    let hir = lowerer.lower_module(&parse(source));
     let diags = std::mem::take(&mut lowerer.diags);
     drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
     assert!(
-        diags
-            .iter()
-            .any(|diag| diag.code == codes::NAME && diag.message.contains("'_private'")),
-        "{diags:?}"
+        matches!(
+            &assigned(&hir, "y").kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "_private"
+        ),
+        "a private star-import name must not be statically bound: {:?}",
+        assigned(&hir, "y").kind
     );
 }
 
@@ -1464,7 +1469,8 @@ fn user_star_import_honors_a_literal_all() {
             if matches!(&callee.kind, HExprKind::FunctionRef(1))
     ));
 
-    // A name defined by the module but absent from `__all__` is not bound.
+    // A name defined by the module but absent from `__all__` is not bound by
+    // the star import: the call is a runtime lookup of the module namespace.
     let source = "from helper import *\nx = drop()\n";
     let mut infer = Infer::new();
     let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
@@ -1482,14 +1488,24 @@ fn user_star_import_honors_a_literal_all() {
             module_getattr: false,
         },
     )]));
-    let _ = lowerer.lower_module(&parse(source));
+    let hir = lowerer.lower_module(&parse(source));
     let diags = std::mem::take(&mut lowerer.diags);
     drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
+    let HExprKind::IndirectCall { callee, .. } = &assigned(&hir, "x").kind else {
+        panic!(
+            "expected a runtime call for `drop`, got {:?}",
+            assigned(&hir, "x").kind
+        );
+    };
     assert!(
-        diags
-            .iter()
-            .any(|diag| diag.code == codes::NAME && diag.message.contains("'drop'")),
-        "{diags:?}"
+        matches!(
+            &callee.kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "drop"
+        ),
+        "`drop` is not statically bound by `__all__`: {:?}",
+        callee.kind
     );
 }
 
@@ -1584,7 +1600,8 @@ fn pep562_getattr_module_attribute_read_uses_the_module_value() {
 #[test]
 fn pep562_star_import_still_binds_only_static_names() {
     // A star import copies the static namespace/`__all__`; names that only
-    // `__getattr__` can provide are not invented as local bindings.
+    // `__getattr__` can provide are not invented as static bindings. The
+    // read is an ordinary runtime global lookup of the importing module.
     let source = "from dynamic import *\nvalue = BaseModel\n";
     let mut infer = Infer::new();
     let mut lowerer = Lowerer::new(source, "test.py", &mut infer);
@@ -1592,14 +1609,18 @@ fn pep562_star_import_still_binds_only_static_names() {
         "dynamic".to_string(),
         getattr_user_module("dynamic", &[]),
     )]));
-    let _ = lowerer.lower_module(&parse(source));
+    let hir = lowerer.lower_module(&parse(source));
     let diags = std::mem::take(&mut lowerer.diags);
     drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
     assert!(
-        diags
-            .iter()
-            .any(|diag| diag.code == codes::NAME && diag.message.contains("'BaseModel'")),
-        "{diags:?}"
+        matches!(
+            &assigned(&hir, "value").kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "BaseModel"
+        ),
+        "`BaseModel` is not statically bound by the star import: {:?}",
+        assigned(&hir, "value").kind
     );
 }
 
@@ -1802,9 +1823,10 @@ fn propagated_dynamic_globals_do_not_shadow_explicit_definitions() {
 }
 
 #[test]
-fn star_import_of_an_ordinary_module_keeps_unknown_name_errors() {
-    // Without extension stars or dynamic globals neither fallback applies:
-    // a name the source never exports is still a compile error.
+fn star_import_of_an_ordinary_module_defers_unknown_reads() {
+    // Without extension stars or dynamic globals an exported name still links
+    // statically; a name the source never exports is an ordinary runtime
+    // global lookup, not a compile error.
     let source = "from helper import *\nx = add(1, 2)\ny = missing\n";
     let mut infer = Infer::new();
     let mut lowerer = Lowerer::new(source, "main.py", &mut infer);
@@ -1812,14 +1834,26 @@ fn star_import_of_an_ordinary_module_keeps_unknown_name_errors() {
         "helper".to_string(),
         user_module("helper", &[("add", UserExport::Function(1))]),
     )]));
-    let _hir = lowerer.lower_module(&parse(source));
+    let hir = lowerer.lower_module(&parse(source));
     let diags = std::mem::take(&mut lowerer.diags);
     drop(lowerer);
+    assert!(diags.is_empty(), "{diags:?}");
     assert!(
-        diags
-            .iter()
-            .any(|diag| diag.code == codes::NAME && diag.message.contains("'missing'")),
-        "{diags:?}"
+        matches!(
+            &assigned(&hir, "x").kind,
+            HExprKind::CallKw { callee, .. } | HExprKind::IndirectCall { callee, .. }
+                if matches!(&callee.kind, HExprKind::FunctionRef(1))
+        ),
+        "`add` stays statically linked: {:?}",
+        assigned(&hir, "x").kind
+    );
+    assert!(
+        matches!(
+            &assigned(&hir, "y").kind,
+            HExprKind::GlobalGet { module, name } if module == "__main__" && name == "missing"
+        ),
+        "`missing` must defer to the runtime global table: {:?}",
+        assigned(&hir, "y").kind
     );
 }
 
@@ -2012,22 +2046,47 @@ fn imports_emit_no_statements() {
 }
 
 #[test]
-fn undefined_name_suggests_a_local() {
-    let source = "value = 1\nprint(valu)\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::NAME);
-    assert_eq!(diags[0].message, "name 'valu' is not defined");
-    assert_eq!(diags[0].help.as_deref(), Some("did you mean `value`?"));
+fn undefined_name_in_a_class_body_is_a_runtime_lookup() {
+    // A class body resolves an unknown bare name when the body executes, not
+    // when the module is compiled.
+    let source = "class C:\n    value = valu\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::ClassDef { attributes, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected a class, got {:?}", hir.functions[0].body[0]);
+    };
+    let value = attributes
+        .iter()
+        .find(|(name, _)| name == "value")
+        .map(|(_, value)| value)
+        .expect("value attribute");
+    assert!(
+        matches!(
+            &value.kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "valu"
+        ),
+        "the class-body read must defer to the runtime global table: {:?}",
+        value.kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("deferred class-body read");
 }
 
 #[test]
-fn undefined_name_without_a_close_match_has_no_help() {
-    let source = "value = 1\nprint(zzzzzz)\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::NAME);
-    assert_eq!(diags[0].help, None);
+fn undefined_name_in_a_function_body_is_a_runtime_lookup() {
+    let source = "def read():\n    return valu\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let body = function_body(&hir, "read");
+    let HStmtKind::Return(Some(value)) = &body[0].kind else {
+        panic!("expected a return, got {:?}", body[0]);
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::GlobalGet { name, .. } if name == "valu"),
+        "the function read must defer to the runtime global table: {:?}",
+        value.kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("deferred function read");
 }
 
 #[test]
@@ -8251,17 +8310,44 @@ class D:
 }
 
 #[test]
-fn unresolved_class_decorator_name_is_diagnosed() {
-    // Class decorators are now applied at runtime, so an unknown name is an
-    // ordinary unresolved-name diagnostic instead of a blanket rejection.
+fn unresolved_class_decorator_name_is_deferred() {
+    // Class decorators are applied at runtime, so an unknown name is an
+    // ordinary deferred global read that raises `NameError` when the class
+    // statement executes, exactly like CPython's `LOAD_NAME`.
     let source = "@dec\nclass C:\n    pass\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    // CPython evaluates the decorator expression before the class body runs.
+    let HStmtKind::Assign { value, .. } = &hir.functions[0].body[0].kind else {
+        panic!(
+            "expected the decorator temp assignment, got {:?}",
+            hir.functions[0].body[0]
+        );
+    };
     assert!(
-        diags[0].message.contains("not defined"),
-        "{:?}",
-        diags[0].message
+        matches!(&value.kind, HExprKind::GlobalGet { name, .. } if name == "dec"),
+        "the decorator must be looked up at runtime: {:?}",
+        value.kind
     );
+    // The class statement still runs and the decorator is applied to it.
+    assert!(
+        hir.functions[0]
+            .body
+            .iter()
+            .any(|stmt| { matches!(&stmt.kind, HStmtKind::ClassDef { name, .. } if name == "C") }),
+        "the class itself must still be created: {body:?}",
+        body = hir.functions[0].body
+    );
+    assert!(
+        hir.functions[0].body.iter().any(|stmt| matches!(
+            &stmt.kind,
+            HStmtKind::Assign { value, .. }
+                if matches!(&value.kind, HExprKind::IndirectCall { .. })
+        )),
+        "the decorator must be applied to the class value: {body:?}",
+        body = hir.functions[0].body
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("deferred decorator lookup");
 }
 
 #[test]
@@ -8314,9 +8400,24 @@ fn duplicate_underscore_unpack_targets_share_a_local() {
 #[test]
 fn class_methods_are_not_globally_callable() {
     let source = "class A:\n    def f(self):\n        return 1\nx = f\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].message, "name 'f' is not defined");
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    // A method never becomes a module-level function binding; the bare read
+    // is an ordinary runtime global lookup that raises `NameError` when the
+    // module body executes.
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(
+            &assigned(&hir, "x").kind,
+            HExprKind::GlobalGet { module, name } if module == "__main__" && name == "f"
+        ),
+        "the method read must defer to the runtime global table: {:?}",
+        assigned(&hir, "x").kind
+    );
+    assert!(
+        !hir.functions.iter().any(|function| function.name == "f"),
+        "a class method must not be registered as a module function"
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("deferred method read");
 }
 
 #[test]
@@ -9073,6 +9174,67 @@ fn generator_expression_with_await_is_an_async_generator() {
 }
 
 #[test]
+fn async_generator_expression_is_allowed_in_a_sync_function() {
+    // Since Python 3.7 an asynchronous generator expression is legal in any
+    // scope; only its synthetic frame is async, the enclosing function stays
+    // a plain function.
+    let source = "def f(it):\n    return (x async for x in it)\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    assert!(!f.is_async, "the enclosing function stays synchronous");
+    let HStmtKind::Return(Some(value)) = &f.body[0].kind else {
+        panic!("expected the returned generator expression");
+    };
+    let HExprKind::Call {
+        callee: Callee::Function(id),
+        ..
+    } = &value.kind
+    else {
+        panic!("expected the generator function call, got {:?}", value.kind);
+    };
+    let helper = &hir.functions[*id as usize];
+    assert_eq!(helper.name, "<genexpr>");
+    assert!(
+        helper.is_async,
+        "an `async for` frame is an async generator"
+    );
+    assert!(helper.is_generator);
+    crate::sema::check(&hir, &mut infer, "test.py").expect("async generator expression");
+}
+
+#[test]
+fn await_inside_a_generator_expression_is_allowed_in_a_sync_function() {
+    // `(await f(x) for x in xs)` inside a plain function is an async
+    // generator expression, exactly like CPython 3.7+.
+    let source = "import asyncio\ndef f(xs):\n    return (await asyncio.sleep(0) for x in xs)\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let f = function(&hir, "f");
+    assert!(!f.is_async, "the enclosing function stays synchronous");
+    let HStmtKind::Return(Some(value)) = &f.body[0].kind else {
+        panic!("expected the returned generator expression");
+    };
+    let HExprKind::Call {
+        callee: Callee::Function(id),
+        ..
+    } = &value.kind
+    else {
+        panic!("expected the generator function call, got {:?}", value.kind);
+    };
+    let helper = &hir.functions[*id as usize];
+    assert_eq!(helper.name, "<genexpr>");
+    assert!(helper.is_async, "a frame that awaits is an async generator");
+    assert!(helper.is_generator);
+    assert!(nested_stmt_any(&helper.body, &|kind| matches!(
+        kind,
+        HStmtKind::Yield { value: Some(value) }
+            if matches!(value.kind, HExprKind::Await { .. })
+    )));
+    crate::sema::check(&hir, &mut infer, "test.py").expect("async generator expression");
+}
+
+#[test]
 fn await_inside_a_list_comprehension_stays_in_the_enclosing_coroutine() {
     let source =
         "import asyncio\nasync def f(xs):\n    return [await asyncio.sleep(0) for x in xs]\n";
@@ -9212,20 +9374,118 @@ fn nested_function_in_a_loop_captures_the_current_iteration_value() {
         .position(|local| local.name == "get")
         .expect("nested function local get") as LocalId;
 
-    let HStmtKind::ForRange { body, .. } = &outer.body[1].kind else {
-        panic!("expected the range loop, got {:?}", outer.body[1].kind);
+    let HStmtKind::ForRange { body, .. } = &outer.body[2].kind else {
+        panic!("expected the range loop, got {:?}", outer.body[2].kind);
     };
+    // The loop target is a cell because the nested function reads it: the
+    // header binds a hidden `$forN` slot and stores each item through the
+    // cell. A fresh cell at the top of the iteration gives each closure the
+    // cell of the iteration that created it.
+    assert!(
+        matches!(&body[0].kind, HStmtKind::CellInit { target, value } if *target == i_local && value.is_none()),
+        "expected a fresh cell for i, got {:?}",
+        body[0].kind
+    );
+    assert!(
+        matches!(&body[1].kind, HStmtKind::CellAssign { target, .. } if *target == i_local),
+        "expected the loop to store through the cell, got {:?}",
+        body[1].kind
+    );
     let HStmtKind::Closure {
         target,
         function: fid,
         captures,
-    } = &body[0].kind
+    } = &body[2].kind
     else {
-        panic!("expected a closure inside the loop, got {:?}", body[0].kind);
+        panic!("expected a closure inside the loop, got {:?}", body[2].kind);
     };
     assert_eq!(*target, get_local);
     assert_eq!(captures, &vec![i_local]);
     assert_eq!(hir.functions[*fid as usize].capture_count, 1);
+    // The body reads the shared cell, not the value from creation time.
+    let HStmtKind::Return(Some(value)) = &hir.functions[*fid as usize].body[0].kind else {
+        panic!("expected the closure return");
+    };
+    assert!(
+        matches!(value.kind, HExprKind::CellGet(_)),
+        "{:?}",
+        value.kind
+    );
+}
+
+#[test]
+fn nested_function_defined_before_a_loop_sees_each_iteration_value() {
+    // The definition precedes the loop, so the closure captures the binding,
+    // not the value: the target must be a cell the loop keeps storing into.
+    let source = "\
+def outer(n):
+    def current():
+        return i
+    for i in range(n):
+        pass
+    return current
+";
+    let (hir, _, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let outer = function(&hir, "outer");
+    let i_local = outer
+        .locals
+        .iter()
+        .position(|local| local.name == "i")
+        .expect("loop variable i") as LocalId;
+    let current_local = outer
+        .locals
+        .iter()
+        .position(|local| local.name == "current")
+        .expect("nested function local current") as LocalId;
+
+    // The entry cell exists before the definition, so the closure captures
+    // the cell (not its current, unbound value).
+    assert!(
+        matches!(&outer.body[0].kind, HStmtKind::CellInit { target, value } if *target == i_local && value.is_none()),
+        "expected the entry cell for i, got {:?}",
+        outer.body[0].kind
+    );
+    let HStmtKind::Closure {
+        target,
+        function: fid,
+        captures,
+    } = &outer.body[1].kind
+    else {
+        panic!(
+            "expected the pre-loop closure, got {:?}",
+            outer.body[1].kind
+        );
+    };
+    assert_eq!(*target, current_local);
+    assert_eq!(captures, &vec![i_local]);
+
+    let HStmtKind::ForRange { body, .. } = &outer.body[2].kind else {
+        panic!("expected the range loop, got {:?}", outer.body[2].kind);
+    };
+    // The closure was created outside the loop, so the iteration must not
+    // allocate a fresh cell: every store updates the shared entry cell.
+    assert!(
+        !body
+            .iter()
+            .any(|stmt| matches!(stmt.kind, HStmtKind::CellInit { .. })),
+        "a pre-loop closure shares the entry cell: {body:?}"
+    );
+    assert!(
+        matches!(&body[0].kind, HStmtKind::CellAssign { target, .. } if *target == i_local),
+        "expected the loop to store each item through the cell, got {:?}",
+        body[0].kind
+    );
+
+    let HStmtKind::Return(Some(value)) = &hir.functions[*fid as usize].body[0].kind else {
+        panic!("expected the closure return");
+    };
+    assert!(
+        matches!(value.kind, HExprKind::CellGet(_)),
+        "the closure reads the shared cell: {:?}",
+        value.kind
+    );
 }
 
 #[test]
@@ -9740,24 +10000,35 @@ def outer(n):
     let i_local = local("i");
     let step_local = local("step");
 
-    // The loop body re-creates the recursion cell, so a closure from one
+    // Both the recursion binding and the loop target are shared cells; the
+    // loop body creates fresh ones per iteration, so a closure from one
     // iteration never shares its binding with the next iteration.
-    let HStmtKind::ForRange { body, .. } = &outer.body[2].kind else {
-        panic!("expected the range loop, got {:?}", outer.body[2].kind);
+    let HStmtKind::ForRange { body, .. } = &outer.body[3].kind else {
+        panic!("expected the range loop, got {:?}", outer.body[3].kind);
     };
     assert!(
-        matches!(&body[0].kind, HStmtKind::CellInit { target, value } if *target == step_local && value.is_none()),
-        "expected a fresh cell at the top of the iteration, got {:?}",
+        matches!(&body[0].kind, HStmtKind::CellInit { target, value } if *target == i_local && value.is_none()),
+        "expected a fresh cell for i at the top of the iteration, got {:?}",
         body[0].kind
     );
-    let HStmtKind::If { then_body, .. } = &body[1].kind else {
-        panic!("expected the definition block, got {:?}", body[1].kind);
+    assert!(
+        matches!(&body[1].kind, HStmtKind::CellInit { target, value } if *target == step_local && value.is_none()),
+        "expected a fresh cell for step at the top of the iteration, got {:?}",
+        body[1].kind
+    );
+    assert!(
+        matches!(&body[2].kind, HStmtKind::CellAssign { target, .. } if *target == i_local),
+        "expected the loop to store through i's cell, got {:?}",
+        body[2].kind
+    );
+    let HStmtKind::If { then_body, .. } = &body[3].kind else {
+        panic!("expected the definition block, got {:?}", body[3].kind);
     };
     let HStmtKind::Closure { captures, .. } = &then_body[0].kind else {
         panic!("expected the step closure, got {:?}", then_body[0].kind);
     };
-    // `i` stays a by-value capture of the current iteration; `step` is the
-    // per-iteration cell the recursive call reads.
+    // `i` and `step` are both cell captures of the current iteration; the
+    // recursive call reads the per-iteration `step` cell.
     assert_eq!(captures, &vec![i_local, step_local]);
 
     let step = function(&hir, "outer.step");
@@ -16933,15 +17204,59 @@ fn dynamic_global_alias_from_vars_allows_unknown_reads() {
 }
 
 #[test]
-fn undefined_name_in_a_module_body_still_errors() {
-    // A function body defers an unresolved name to `LOAD_GLOBAL` (the
-    // `NameError` happens when the read executes), but the module body's
-    // namespace is statically known, so a typo there keeps its diagnostic.
+fn undefined_name_in_a_module_body_is_a_runtime_lookup() {
+    // CPython resolves a module-body name through `LOAD_NAME` when the
+    // statement executes, so a missing binding is a runtime `NameError`, not
+    // a compile error.
     let source = "value = 1\ndef read():\n    return value\nx = valeu\n";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(
+            &assigned(&hir, "x").kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "valeu"
+        ),
+        "the module read must defer to the runtime global table: {:?}",
+        assigned(&hir, "x").kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("deferred module read");
+}
+
+#[test]
+fn undefined_name_in_a_dead_module_branch_compiles() {
+    // A literal `if False:` branch is never lowered; a runtime version guard
+    // still lowers its branch, where the Python 2 `long` base is a deferred
+    // global read instead of a compile-time binding check.
+    let source = "if False:\n    class X(long):\n        pass\nprint('ok')\n";
     let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::NAME);
-    assert_eq!(diags[0].message, "name 'valeu' is not defined");
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let source = "\
+import sys
+if sys.version_info < (3,):
+    x = long
+else:
+    x = 1
+print('ok')
+";
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::If { then_body, .. } = &hir.functions[0].body[0].kind else {
+        panic!(
+            "expected the runtime version guard, got {:?}",
+            hir.functions[0].body[0]
+        );
+    };
+    let HStmtKind::Assign { value, .. } = &then_body[0].kind else {
+        panic!("expected the deferred read, got {:?}", then_body[0]);
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::GlobalGet { name, .. } if name == "long"),
+        "the dead branch's name must be a runtime lookup: {:?}",
+        value.kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("dead compatibility branch");
 }
 
 #[test]
@@ -17001,10 +17316,11 @@ class Screen:
 }
 
 #[test]
-fn a_local_globals_binding_does_not_make_module_reads_dynamic() {
+fn a_local_globals_binding_does_not_change_module_read_semantics() {
     // `globals` is an ordinary function local here, not the builtin, so the
-    // write targets that local mapping: the module namespace is untouched and
-    // an undefined module-level read is still a compile-time error.
+    // write targets that local mapping and never sets up the dynamic
+    // module-namespace fallback. An unresolved module-level read is an
+    // ordinary runtime global lookup either way.
     let source = "\
 def install(name):
     globals = {}
@@ -17013,10 +17329,14 @@ def install(name):
 
 value = missing
 ";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::NAME);
-    assert_eq!(diags[0].message, "name 'missing' is not defined");
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(&assigned(&hir, "value").kind, HExprKind::GlobalGet { name, .. } if name == "missing"),
+        "the module read must defer to the runtime global table: {:?}",
+        assigned(&hir, "value").kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("deferred module read");
 }
 
 #[test]
@@ -17084,9 +17404,9 @@ def read():
 }
 
 #[test]
-fn ordinary_class_decorator_keeps_undefined_name_diagnostics() {
-    // Only the member-injecting `global_enum` shape turns reads dynamic; a
-    // generic decorator must not hide typos.
+fn ordinary_class_decorator_keeps_module_reads_runtime() {
+    // Only the member-injecting `global_enum` shape publishes extra names; a
+    // generic decorator leaves the module read as an ordinary runtime lookup.
     let source = "\
 def mark(cls):
     return cls
@@ -17097,10 +17417,14 @@ class C:
 
 x = missing
 ";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::NAME);
-    assert_eq!(diags[0].message, "name 'missing' is not defined");
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(&assigned(&hir, "x").kind, HExprKind::GlobalGet { name, .. } if name == "missing"),
+        "the module read must defer to the runtime global table: {:?}",
+        assigned(&hir, "x").kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("deferred module read");
 }
 
 #[test]
@@ -17130,12 +17454,22 @@ fn try_name_error_fallback_compiles_an_absent_name_probe() {
 }
 
 #[test]
-fn try_handler_without_name_error_keeps_undefined_name_diagnostics() {
+fn try_handler_without_name_error_still_defers_the_name() {
     let source = "try:\n    WindowsError\nexcept ValueError:\n    pass\n";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::NAME);
-    assert_eq!(diags[0].message, "name 'WindowsError' is not defined");
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Try { body, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected a try, got {:?}", hir.functions[0].body[0]);
+    };
+    let HStmtKind::Expr(value) = &body[0].kind else {
+        panic!("expected the name probe, got {:?}", body[0]);
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::GlobalGet { name, .. } if name == "WindowsError"),
+        "the absent name must be a runtime global read: {:?}",
+        value.kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("deferred name inside a try");
 }
 
 #[test]
@@ -17819,13 +18153,21 @@ fn generic_type_alias_sets_up_type_parameters_and_binds_the_alias() {
         hir.functions[0].locals[*local as usize].name
     );
 
-    // The parameter name is scoped to the alias.
-    let (_, _, diags) = lower_source(
-        "type Vector[T] = list[T]\nleaked = T\n",
-        &parse("type Vector[T] = list[T]\nleaked = T\n"),
+    // The parameter name is scoped to the alias: outside it the name is an
+    // ordinary deferred module read, never the hidden parameter local.
+    let source = "type Vector[T] = list[T]\nleaked = T\n";
+    let (leaked_hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(
+            &assigned(&leaked_hir, "leaked").kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "T"
+        ),
+        "the leaked parameter must be a runtime global read: {:?}",
+        assigned(&leaked_hir, "leaked").kind
     );
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::NAME);
+    crate::sema::check(&leaked_hir, &mut infer, "test.py").expect("deferred leaked parameter");
 }
 
 #[test]
@@ -18039,11 +18381,21 @@ fn generic_class_publishes_type_params_and_scopes_them() {
         .expect("value attribute");
     assert_eq!(hidden_local_name(&hir, attribute), Some(hidden));
 
-    // The parameter is scoped to the class statement.
+    // The parameter is scoped to the class statement: outside it the name is
+    // an ordinary deferred module read.
     let leaked = "class Box[T]:\n    value = T\nleaked = T\n";
-    let (_, _, diags) = lower_source(leaked, &parse(leaked));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::NAME);
+    let (leaked_hir, mut infer, diags) = lower_source(leaked, &parse(leaked));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(
+            &assigned(&leaked_hir, "leaked").kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "T"
+        ),
+        "the leaked parameter must be a runtime global read: {:?}",
+        assigned(&leaked_hir, "leaked").kind
+    );
+    crate::sema::check(&leaked_hir, &mut infer, "test.py").expect("deferred leaked parameter");
 
     // It is not a module local either.
     assert!(
@@ -18297,11 +18649,21 @@ fn generic_function_publishes_type_params_and_scopes_annotations() {
     assert_eq!(items.len(), 1);
     assert_eq!(hidden_local_name(&hir, &items[0]), Some(hidden));
 
-    // The parameter is scoped to the definition statement, like a class's.
+    // The parameter is scoped to the definition statement, like a class's:
+    // outside it the name is an ordinary deferred module read.
     let leaked = "def f[T](x: T) -> T:\n    return x\nleaked = T\n";
-    let (_, _, diags) = lower_source(leaked, &parse(leaked));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, codes::NAME);
+    let (leaked_hir, mut infer, diags) = lower_source(leaked, &parse(leaked));
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        matches!(
+            &assigned(&leaked_hir, "leaked").kind,
+            HExprKind::GlobalGet { module, name }
+                if module == "__main__" && name == "T"
+        ),
+        "the leaked parameter must be a runtime global read: {:?}",
+        assigned(&leaked_hir, "leaked").kind
+    );
+    crate::sema::check(&leaked_hir, &mut infer, "test.py").expect("deferred leaked parameter");
 
     // ... and it is never a module local.
     assert!(!hir.functions[0]
@@ -19535,11 +19897,11 @@ fd = os.open('path', 0, dir_fd=1)
 }
 
 #[test]
-fn name_error_fallback_stays_inside_the_guarded_try_body() {
+fn name_error_fallback_covers_the_whole_module_body() {
     // A probe such as `try: WindowsError` lowers to a runtime global read so
-    // the `except NameError` handler can catch it. An undefined name outside
-    // the guarded body stays a compile-time diagnostic: the fallback must not
-    // hide typos.
+    // the `except NameError` handler can catch it. Every module read defers
+    // the same way, whether or not a handler guards it, because CPython
+    // resolves module names when the statement executes.
     let source = "\
 try:
     probe = missing_probe
@@ -19547,12 +19909,31 @@ except NameError:
     probe = 0
 typo = other_missing
 ";
-    let (_, _, diags) = lower_source(source, &parse(source));
-    assert_eq!(diags.len(), 1, "{diags:?}");
+    let (hir, mut infer, diags) = lower_source(source, &parse(source));
+    assert!(diags.is_empty(), "{diags:?}");
+    let HStmtKind::Try { body, .. } = &hir.functions[0].body[0].kind else {
+        panic!("expected a try, got {:?}", hir.functions[0].body[0]);
+    };
+    let HStmtKind::Assign { value, .. } = &body[0].kind else {
+        panic!("expected the guarded probe, got {:?}", body[0]);
+    };
     assert!(
-        diags[0].message.contains("other_missing"),
-        "only the name outside the guarded body is a compile error: {diags:?}"
+        matches!(&value.kind, HExprKind::GlobalGet { name, .. } if name == "missing_probe"),
+        "the guarded probe must be a runtime global read: {:?}",
+        value.kind
     );
+    let HStmtKind::Assign { value, .. } = &hir.functions[0].body[1].kind else {
+        panic!(
+            "expected the unguarded typo, got {:?}",
+            hir.functions[0].body[1]
+        );
+    };
+    assert!(
+        matches!(&value.kind, HExprKind::GlobalGet { name, .. } if name == "other_missing"),
+        "the unguarded read must defer to the runtime global table: {:?}",
+        value.kind
+    );
+    crate::sema::check(&hir, &mut infer, "test.py").expect("deferred module reads");
 }
 
 #[test]

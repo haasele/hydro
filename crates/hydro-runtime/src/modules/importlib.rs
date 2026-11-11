@@ -154,7 +154,7 @@ fn invalidate_caches() {
 /// object with the found spec's metadata, published in `sys.modules` — but its
 /// body is not executed: Hydro has no runtime Python compiler for a module
 /// that was not compiled into the program (see `SourceFileLoader`).
-fn import_module(name_arg: i64, package_arg: i64) -> i64 {
+pub(crate) fn import_module(name_arg: i64, package_arg: i64) -> i64 {
     let Some(name) = value::as_str(name_arg) else {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -179,9 +179,9 @@ fn import_module(name_arg: i64, package_arg: i64) -> i64 {
             return module;
         }
         // CPython refuses to import over an explicit `None` entry.
-        return exc::raise_with_message(
-            IMPORT_ERROR,
+        return importlib_util::raise_module_not_found(
             &format!("import of {name} halted; None in sys.modules"),
+            &name,
         );
     }
     // CPython always has `sys.modules["__main__"]`: the entry program. Hydro
@@ -215,6 +215,9 @@ fn import_module(name_arg: i64, package_arg: i64) -> i64 {
     // their exact position.
     let path = importlib_util::parent_finder_path(&name);
     if let Some(module) = importlib_util::meta_path_import(&name, path.as_deref()) {
+        if module != NONE {
+            bind_child(&name, module);
+        }
         return module;
     }
     if exc::pending() {
@@ -223,44 +226,93 @@ fn import_module(name_arg: i64, package_arg: i64) -> i64 {
     // A compiled extension module reachable only through the extension roots
     // (`HYDRO_EXTENSION_PATH`, a site-packages `lib-dynload`, ...).
     if let Some(module) = crate::modules::extension::import_module(&name) {
+        if module != NONE {
+            bind_child(&name, module);
+        }
         return module;
     }
     crate::builtins::module_not_found(&name)
 }
 
+/// Publishes a freshly imported child module as `<parent>.<child>`, CPython's
+/// final `_find_and_load_unlocked` step.
+///
+/// A module value owns the assignment directly; a namespace created by
+/// `module_from_spec` (a pure-Python package discovered on the search roots)
+/// stores the pair in its namespace mapping. A read-only parent is reported as
+/// CPython's `ImportWarning` instead of failing the import.
+fn bind_child(name: &str, module: i64) {
+    let Some((parent, child)) = name.rsplit_once('.') else {
+        return;
+    };
+    if child.is_empty() {
+        return;
+    }
+    let Some(parent_module) = super::registry_lookup(parent) else {
+        return;
+    };
+    if parent_module == NONE {
+        return;
+    }
+    if let Some(mut pairs) = value::namespace_pairs_mut(parent_module) {
+        let replaced = pairs
+            .pairs
+            .iter_mut()
+            .find(|(key, _)| key.as_str() == child);
+        match replaced {
+            Some((_, slot)) => *slot = module,
+            None => pairs.pairs.push((child.to_string(), module)),
+        }
+        drop(pairs);
+        crate::heap::write_barrier_edge(parent_module, module);
+        return;
+    }
+    crate::core::methods::setattr(parent_module, child.as_ptr(), child.len(), module);
+    if exc::pending() && exc::pending_tag() == i64::from(exc::ATTRIBUTE_ERROR) {
+        exc::clear();
+        super::warnings::warn_category(
+            &format!("Cannot set an attribute on '{parent}' for child module '{child}'"),
+            exc::IMPORT_WARNING,
+        );
+    }
+}
+
 /// Materialises the parent package of `name`, CPython's first import step.
 ///
-/// A compiled package's initializer runs (publishing its `__path__`); a
-/// package found on the search roots becomes a real module namespace; a native
-/// package is published so `__package__`/`spec.parent` describe a module that
-/// really is in `sys.modules`. A missing parent is left to the child import:
-/// `import_module("pkg.missing")` keeps reporting the missing child.
+/// The parent is imported in full (its own ancestors first) exactly like
+/// `_find_and_load_unlocked`'s `import_(parent)`: a compiled package's
+/// initializer runs, a package found on the search roots becomes a real module
+/// namespace, and a native package is published. Afterwards the parent must
+/// expose `__path__`; a missing parent propagates its own `ModuleNotFoundError`
+/// while a loaded non-package reports CPython's "is not a package" error.
 fn ensure_parent(name: &str) {
     let Some((parent, _)) = name.rsplit_once('.') else {
         return;
     };
-    if super::registry_lookup(parent).is_some() {
+    if parent.is_empty() {
         return;
     }
-    // Nested packages materialise outermost first.
-    ensure_parent(parent);
-    if exc::pending() {
-        return;
+    if super::registry_lookup(parent).is_none() {
+        let parent_value = value::str_alloc(parent.to_string());
+        let roots = crate::heap::root_values(&[parent_value]);
+        let imported = import_module(parent_value, NONE);
+        crate::heap::release_roots(roots);
+        if exc::pending() {
+            return;
+        }
+        if imported == NONE {
+            return;
+        }
     }
-    crate::module_init::initialize(parent);
-    if exc::pending() {
+    let Some(module) = super::registry_lookup(parent) else {
         return;
+    };
+    if module == NONE || !importlib_util::module_is_package(module) {
+        importlib_util::raise_module_not_found(
+            &format!("No module named '{name}'; '{parent}' is not a package"),
+            name,
+        );
     }
-    if super::registry_lookup(parent).is_some() {
-        return;
-    }
-    if hydro_ir::stdlib::module(parent).is_some() {
-        super::publish_module(parent, value::module_value(parent.to_string()));
-        return;
-    }
-    // A package that only exists on the search roots becomes a real module
-    // namespace; a name nobody knows stays unknown for the child import.
-    let _ = importlib_util::materialize_module(parent);
 }
 
 /// Loads `spec` through its loader and publishes the result.
@@ -301,23 +353,30 @@ fn resolve_relative(name: &str, package_arg: i64) -> Result<String, i64> {
     if !name.starts_with('.') {
         return Ok(name.to_string());
     }
-    let Some(package) = value::as_str(package_arg) else {
-        return Err(exc::raise_with_message(
-            TYPE_ERROR,
-            "package argument required for relative module names",
-        ));
+    let package = match value::as_str(package_arg) {
+        Some(package) if !package.is_empty() => package,
+        None if package_arg != NONE => {
+            return Err(exc::raise_with_message(
+                TYPE_ERROR,
+                "__package__ not set to a string",
+            ));
+        }
+        _ => {
+            return Err(exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "the 'package' argument is required to perform a relative import for '{name}'"
+                ),
+            ));
+        }
     };
-    if package.is_empty() {
-        return Err(exc::raise_with_message(
-            TYPE_ERROR,
-            "package argument required for relative module names",
-        ));
-    }
     let dots = name.bytes().take_while(|byte| *byte == b'.').count();
     let rest = &name[dots..];
     let mut parts: Vec<&str> = package.split('.').filter(|part| !part.is_empty()).collect();
     let up = dots - 1;
-    if up > parts.len() {
+    // `_resolve_name` removes `level - 1` components from the package; the
+    // base package itself must survive.
+    if up >= parts.len() {
         return Err(exc::raise_with_message(
             IMPORT_ERROR,
             "attempted relative import beyond top-level package",
@@ -660,7 +719,7 @@ mod tests {
         assert_eq!(exc::pending_tag(), i64::from(MODULE_NOT_FOUND_ERROR));
         assert_eq!(
             value::to_string(exc::pending_value()),
-            "No module named 'pkg.missing'"
+            "No module named 'pkg.missing'; 'pkg' is not a package"
         );
 
         // A relative name without a package is a `TypeError`, like CPython.

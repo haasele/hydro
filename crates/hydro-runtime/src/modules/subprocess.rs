@@ -1,26 +1,44 @@
-//! `subprocess`: process spawning and simple pipe capture.
+//! `subprocess`: process spawning and pipe capture.
 //!
-//! The module covers the benchmark-facing subset: [`run`], [`check_output`],
-//! `call` and a native `Popen` object with `wait`/`poll`/`terminate`/`kill`.
-//! `call` returns the child's exit status and accepts `shell=True`, which
-//! routes the command through `/bin/sh -c` like CPython on POSIX. There is no
-//! `communicate()` and no file-object redirection; the stream selectors accept
-//! `None`, `PIPE`, `DEVNULL` and (for `stderr`) `STDOUT`.
-//! `Popen(..., start_new_session=True)` really calls `setsid(2)` in the child.
+//! The module covers [`run`], [`check_output`], `call`/`check_call` and a
+//! native `Popen` object implementing CPython's stream-handle,
+//! `communicate()` and context-manager protocol. `call` returns the child's
+//! exit status and accepts `shell=True`, which routes the command through
+//! `/bin/sh -c` like CPython on POSIX.
 //!
 //! `Popen` accepts CPython's `stdin`/`stdout`/`stderr`, `text`, `encoding`,
-//! `errors`, `close_fds`, `start_new_session`, `cwd`, `env` and `preexec_fn`
-//! parameters. The stream slots map to `Stdio::inherit`, `Stdio::null` and
-//! `Stdio::piped`; a piped stdin is closed right after the spawn (the object
-//! exposes no write handle), so the child sees EOF. `encoding`/`errors` and
-//! `text` are recorded as `encoding`, `errors` and `text_mode`. `preexec_fn`
-//! cannot run a Python callable between `fork` and `exec`, so a supplied hook
-//! raises `NotImplementedError` instead of being silently ignored.
+//! `errors`, `close_fds`, `start_new_session`, `cwd`, `env`, `shell`,
+//! `executable` and `preexec_fn` parameters. Each stream selector accepts
+//! `None`, `PIPE`, `DEVNULL`, `STDOUT` (for `stderr`) or a file descriptor /
+//! object exposing `fileno()`. `stdin=PIPE` exposes a writable `p.stdin`,
+//! `stdout=PIPE` a readable `p.stdout` and `stderr=PIPE` a readable
+//! `p.stderr`; the objects are backed by the runtime's file values, so
+//! `read`/`readline`/`write`/`flush`/`close`/`fileno` and `select` all work
+//! on them. `stderr=STDOUT` shares the `stdout` pipe, so `p.stderr` stays
+//! `None` and `p.stdout` sees the interleaved output.
 //!
-//! `stdin`/`stdout`/`stderr` are `std::process::Stdio` choices. For
-//! `stderr=STDOUT` the child's stderr descriptor is pointed at the same pipe
-//! (or at the parent's stdout when nothing is captured), so interleaving is
-//! preserved like CPython instead of concatenating two buffers afterwards.
+//! `encoding`/`errors` are validated and recorded; `text_mode` follows
+//! CPython's `encoding or errors or text` truthiness. Pipe file objects are
+//! binary or text according to `text_mode` (UTF-8). `universal_newlines` is
+//! exposed as a read-only property aliasing `text_mode`.
+//! `preexec_fn` cannot run a Python callable between `fork` and `exec`, so a
+//! supplied hook raises `NotImplementedError` instead of being ignored.
+//!
+//! `communicate(input=None, timeout=None)` feeds `p.stdin`, drains both
+//! output pipes concurrently, waits for the child and closes the handles,
+//! returning `(stdout, stderr)`; unredirected streams answer `None` and text
+//! mode applies universal-newline translation. A timeout raises the module's
+//! `TimeoutExpired` class and keeps the buffered state so a later
+//! `communicate()` call resumes and returns the complete output. `p.stdout`
+//! (and `p.stderr`) may be read directly instead; data already read is not
+//! replayed.
+//!
+//! `with Popen(...) as p:` returns the instance from `__enter__`; `__exit__`
+//! closes the pipe handles and waits for the child.
+//!
+//! `wait`/`poll`/`send_signal`/`terminate`/`kill` are thread-safe: the child
+//! entry is claimed by one waiter while concurrent callers poll the recorded
+//! `returncode`, so every caller observes the same exit status.
 //!
 //! Spawned `Popen` processes live in a process-global
 //! `Mutex<HashMap<u64, Child>>`; the instance carries the key in a private
@@ -29,7 +47,7 @@
 //!
 //! Blocking waits park the thread with [`heap::blocking_enter`] so a
 //! concurrent collection does not wait for a thread sleeping in the kernel;
-//! no Hydro object is allocated while parked.
+//! the helper threads copy raw bytes and never touch Hydro objects.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -37,20 +55,34 @@ use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::core::{globals, methods};
 use crate::exc::{
     self, ATTRIBUTE_ERROR, EXCEPTION, NOT_IMPLEMENTED_ERROR, OS_ERROR, OVERFLOW_ERROR,
     RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR,
 };
 use crate::heap;
 use crate::value::{self, NONE};
+use hydro_ir::MethodKind;
 
 /// Private instance attribute holding the key into [`CHILDREN`].
 const ID_ATTR: &str = "$id";
+
+/// Private instance attribute set once `communicate()` starts, so a later
+/// call with new input reports CPython's `ValueError` instead of re-feeding
+/// the closed pipe.
+const COMMUNICATION_STARTED_ATTR: &str = "$communication_started";
+
+/// Cached `Popen` class.
+const POPEN_CLASS_KEY: &str = "subprocess.Popen.class";
+
+/// Cached `TimeoutExpired` exception class.
+const TIMEOUT_EXPIRED_KEY: &str = "subprocess.TimeoutExpired.class";
 
 /// `subprocess.PIPE`.
 pub(crate) const PIPE: i64 = -1;
@@ -70,6 +102,29 @@ fn children() -> MutexGuard<'static, HashMap<u64, Child>> {
     // No user code runs while the map is locked, so poisoning (only possible
     // through a panic in this module) can be ignored.
     CHILDREN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One in-flight `communicate()` call.
+///
+/// The reader threads append raw bytes into the shared buffers; a timed-out
+/// call leaves the structure here so a later `communicate()` resumes reading
+/// instead of restarting (and replaying) the exchange.
+struct Communication {
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stdout_reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
+    stdin_writer: Option<JoinHandle<()>>,
+}
+
+/// In-flight communications keyed by the owning instance's `$id`.
+static COMMUNICATIONS: LazyLock<Mutex<HashMap<u64, Communication>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn communications() -> MutexGuard<'static, HashMap<u64, Communication>> {
+    COMMUNICATIONS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -293,15 +348,47 @@ fn stream_mode(argument: i64, name: &str) -> Result<StreamMode, i64> {
     if argument == NONE {
         return Ok(StreamMode::Inherit);
     }
-    match value::as_integer(argument) {
-        Some(PIPE) => Ok(StreamMode::Pipe),
-        Some(STDOUT) => Ok(StreamMode::Stdout),
-        Some(DEVNULL) => Ok(StreamMode::DevNull),
-        Some(fd) if (0..=i64::from(i32::MAX)).contains(&fd) => Ok(StreamMode::Fd(fd as i32)),
-        _ => Err(value_error(&format!(
+    if let Some(number) = value::as_integer(argument) {
+        return match number {
+            PIPE => Ok(StreamMode::Pipe),
+            STDOUT => Ok(StreamMode::Stdout),
+            DEVNULL => Ok(StreamMode::DevNull),
+            fd if (0..=i64::from(i32::MAX)).contains(&fd) => Ok(StreamMode::Fd(fd as i32)),
+            _ => Err(value_error(&format!(
+                "subprocess: {name} must be None, subprocess.PIPE, subprocess.STDOUT, \
+                 subprocess.DEVNULL or a non-negative file descriptor, not '{}'",
+                value::type_name(argument)
+            ))),
+        };
+    }
+    // CPython accepts any object exposing `fileno()`; the descriptor is
+    // duplicated for the child, so the Python-visible object keeps ownership.
+    if value::as_bigint(argument).is_some() {
+        return Err(value_error(&format!(
+            "subprocess: {name} is out of range for a file descriptor"
+        )));
+    }
+    let method = methods::getattr(argument, b"fileno".as_ptr(), b"fileno".len());
+    if exc::pending() {
+        exc::clear();
+        return Err(value_error(&format!(
             "subprocess: {name} must be None, subprocess.PIPE, subprocess.STDOUT, \
-             subprocess.DEVNULL or a non-negative file descriptor, not '{}'",
+             subprocess.DEVNULL or a file descriptor, not '{}'",
             value::type_name(argument)
+        )));
+    }
+    let result = crate::builtins::call(method, 0, std::ptr::null());
+    if exc::pending() {
+        return Err(NONE);
+    }
+    match value::as_integer(result) {
+        Some(fd) if (0..=i64::from(i32::MAX)).contains(&fd) => Ok(StreamMode::Fd(fd as i32)),
+        Some(_) => Err(value_error(&format!(
+            "subprocess: {name}.fileno() is out of range for a file descriptor"
+        ))),
+        None => Err(type_error(&format!(
+            "subprocess: {name}.fileno() must return an integer, not '{}'",
+            value::type_name(result)
         ))),
     }
 }
@@ -356,6 +443,32 @@ fn duplicate_stdout() -> Result<Stdio, i64> {
     }
     // SAFETY: `dup` returned a new descriptor owned by this call.
     Ok(Stdio::from(unsafe { OwnedFd::from_raw_fd(duplicated) }))
+}
+
+/// Wraps the parent's read end of a child pipe in a runtime file object.
+fn pipe_reader_value(fd: OwnedFd, binary: bool) -> i64 {
+    value::file_new_pipe(ChildStdout::from(fd), binary)
+}
+
+/// Wraps the parent's write end of a child pipe in a writable file object.
+fn pipe_writer_value(pipe: ChildStdin, binary: bool) -> i64 {
+    let file = File::from(OwnedFd::from(pipe));
+    value::file_new_write("<stdin>".to_string(), 'w', file, binary)
+}
+
+/// The runtime file value stored in `popen.<name>`, if any.
+fn stream_handle(instance: i64, name: &str) -> Option<i64> {
+    value::instance_attr(instance, name).filter(|&handle| handle != NONE)
+}
+
+/// Closes `popen.<name>` when it is an open runtime file object. Closing an
+/// already-closed file is a no-op, matching CPython.
+fn close_stream_handle(instance: i64, name: &str) {
+    if let Some(handle) = stream_handle(instance, name) {
+        if let Some(file) = value::as_file(handle) {
+            file.close();
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -587,23 +700,6 @@ fn spawn_writer<W: Write + Send + 'static>(
             let _ = pipe.write_all(&data);
         })
         .ok()
-}
-
-/// Reads a `Popen` pipe until EOF and drops the bytes on a detached thread.
-fn discard<R: Read + Send + 'static>(mut reader: R) {
-    let _ = std::thread::Builder::new()
-        .stack_size(16 * 1024)
-        .spawn(move || {
-            let mut sink = [0u8; 4096];
-            loop {
-                match reader.read(&mut sink) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
-                }
-            }
-        });
 }
 
 /// Waits for `child`, polling so a timeout can interrupt the wait.
@@ -984,36 +1080,147 @@ fn raise_called_process_error(code: i64, command: Vec<String>) -> i64 {
 // Popen
 // -------------------------------------------------------------------------
 
-/// Builds the native `Popen` class. A fresh class per instance matches the
-/// other native objects in this runtime; the methods are the dispatch names
-/// validated by the central spec table.
-fn popen_class() -> i64 {
-    const METHODS: [(&str, &str, usize); 6] = [
-        ("wait", "_popen_wait", 2),
-        ("poll", "_popen_poll", 1),
-        ("terminate", "_popen_terminate", 1),
-        ("kill", "_popen_kill", 1),
-        ("__enter__", "_popen_enter", 1),
-        ("__exit__", "_popen_exit", 4),
-    ];
-    let mut functions = [NONE; METHODS.len()];
-    for (slot, (_, native, arity)) in functions.iter_mut().zip(METHODS) {
-        *slot = value::native_function_new("subprocess", native, arity);
+/// A positional parameter slot for a native class method.
+fn method_param(name: &str, default: Option<i64>) -> value::ParamMeta {
+    value::ParamMeta {
+        name: name.to_string(),
+        kind: hydro_ir::ParamKind::Positional,
+        default,
     }
-    let methods = METHODS
-        .iter()
-        .zip(functions)
-        .map(|((python_name, _, _), function)| ((*python_name).to_string(), function))
-        .collect();
-    value::class_new("Popen".to_string(), NONE, methods)
+}
+
+/// Builds a native class method that binds arguments through the shared
+/// method binder (`function_signature` + `function_full_entry`).
+///
+/// Methods with parameter metadata are reached through
+/// `core::methods::call_bound_entry`, which fills the receiver slot and
+/// applies defaults before calling `entry`; the central module spec (and its
+/// `min_args..=max_args` validation) is not consulted. This is the same
+/// mechanism `asyncio.Timeout` uses.
+fn bounded_method(
+    native: &'static str,
+    entry: extern "C" fn(*const i64) -> i64,
+    signature: Vec<value::ParamMeta>,
+) -> i64 {
+    let function = value::native_function_new("subprocess", native, usize::MAX);
+    value::function_set_signature(function, signature);
+    value::function_set_full_entry(function, entry as *const () as usize);
+    function
+}
+
+/// `Popen.communicate(input=None, timeout=None)`.
+extern "C" fn communicate_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `[self, input, timeout]`.
+    let (instance, input, timeout) = unsafe { (*argv, *argv.add(1), *argv.add(2)) };
+    popen_communicate(instance, input, timeout)
+}
+
+/// `Popen.wait(timeout=None)`.
+extern "C" fn wait_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `[self, timeout]`.
+    let (instance, timeout_argument) = unsafe { (*argv, *argv.add(1)) };
+    let timeout = match duration_option(timeout_argument, "timeout") {
+        Ok(timeout) => timeout,
+        Err(error) => return error,
+    };
+    popen_wait(instance, timeout)
+}
+
+/// `Popen.send_signal(sig)`.
+extern "C" fn send_signal_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes `[self, sig]`.
+    let (instance, signal) = unsafe { (*argv, *argv.add(1)) };
+    popen_send_signal(instance, signal)
+}
+
+/// Builds (once) the native `Popen` class.
+///
+/// The class is cached: `type(p)` compares by identity across instances, like
+/// CPython's class object. The spec-validated `_popen_*` entries keep their
+/// module-dispatched implementations; `communicate` and `send_signal` carry
+/// their own parameter metadata and are bound by the generic method binder.
+fn popen_class() -> i64 {
+    if let Some(class) = globals::registry_get(POPEN_CLASS_KEY) {
+        return class;
+    }
+    let methods: Vec<(String, i64, MethodKind)> = vec![
+        (
+            "wait".to_string(),
+            bounded_method(
+                "_popen_wait",
+                wait_entry,
+                vec![
+                    method_param("self", None),
+                    method_param("timeout", Some(NONE)),
+                ],
+            ),
+            MethodKind::Normal,
+        ),
+        (
+            "poll".to_string(),
+            value::native_function_new("subprocess", "_popen_poll", 1),
+            MethodKind::Normal,
+        ),
+        (
+            "terminate".to_string(),
+            value::native_function_new("subprocess", "_popen_terminate", 1),
+            MethodKind::Normal,
+        ),
+        (
+            "kill".to_string(),
+            value::native_function_new("subprocess", "_popen_kill", 1),
+            MethodKind::Normal,
+        ),
+        (
+            "__enter__".to_string(),
+            value::native_function_new("subprocess", "_popen_enter", 1),
+            MethodKind::Normal,
+        ),
+        (
+            "__exit__".to_string(),
+            value::native_function_new("subprocess", "_popen_exit", 4),
+            MethodKind::Normal,
+        ),
+        (
+            "communicate".to_string(),
+            bounded_method(
+                "_popen_communicate",
+                communicate_entry,
+                vec![
+                    method_param("self", None),
+                    method_param("input", Some(NONE)),
+                    method_param("timeout", Some(NONE)),
+                ],
+            ),
+            MethodKind::Normal,
+        ),
+        (
+            "send_signal".to_string(),
+            bounded_method(
+                "_popen_send_signal",
+                send_signal_entry,
+                vec![method_param("self", None), method_param("sig", None)],
+            ),
+            MethodKind::Normal,
+        ),
+    ];
+    let values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let roots = heap::root_values(&values);
+    let class = value::class_new_full("Popen".to_string(), NONE, methods, Vec::new());
+    let class_roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(POPEN_CLASS_KEY, class);
+    heap::release_roots(class_roots);
+    heap::release_roots(roots);
+    class
 }
 
 fn popen_new(args: &[i64]) -> i64 {
     let args_argument = argument(args, 0);
-    let mut argv = match command_args(args_argument) {
+    let original_argv = match command_args(args_argument) {
         Ok(argv) => argv,
         Err(error) => return error,
     };
+    let mut argv = original_argv.clone();
     // `shell=True` runs the command through `/bin/sh -c`, matching CPython's
     // POSIX argument vector. A list is joined in the same simple way the
     // module-level `call` helper does.
@@ -1048,16 +1255,43 @@ fn popen_new(args: &[i64]) -> i64 {
         Err(error) => return error,
     };
     // Slots 9 and 10 are `encoding` and `errors`. CPython stores them
-    // verbatim and derives `text_mode` from their truthiness; the values are
-    // only consumed when a text wrapper is created, and this object exposes
-    // no pipe handles, so they are recorded rather than decoded here.
+    // verbatim (after validating the type through the io machinery) and
+    // derives `text_mode` from their truthiness.
     let encoding_argument = argument(args, 9);
     let errors_argument = argument(args, 10);
+    if encoding_argument != NONE && value::as_str(encoding_argument).is_none() {
+        return type_error(&format!(
+            "subprocess: encoding must be str or None, not '{}'",
+            value::type_name(encoding_argument)
+        ));
+    }
+    if errors_argument != NONE && value::as_str(errors_argument).is_none() {
+        return type_error(&format!(
+            "subprocess: errors must be str or None, not '{}'",
+            value::type_name(errors_argument)
+        ));
+    }
     // `text` is slot 4; CPython's `text_mode` is the truthiness of `encoding`,
-    // `errors` or `text` (`encoding=""` does not enable it).
+    // `errors`, `text` or `universal_newlines` (`encoding=""` does not enable
+    // it). `universal_newlines` is CPython's backwards-compatible alias; when
+    // the central spec declares it, it arrives in slot 15 (after
+    // `executable`), and a value that contradicts `text` is rejected exactly
+    // like `SubprocessError('Cannot disambiguate ...')`.
+    let universal_newlines = argument(args, 15);
+    if universal_newlines != NONE
+        && argument(args, 4) != NONE
+        && value::truthy(universal_newlines) != value::truthy(argument(args, 4))
+    {
+        return exc::raise_with_message(
+            exc::EXCEPTION,
+            "Cannot disambiguate when both text and universal_newlines are supplied \
+             but differ. Pass one or the other.",
+        );
+    }
     let text_mode = value::truthy(encoding_argument)
         || value::truthy(errors_argument)
-        || value::truthy(argument(args, 4));
+        || value::truthy(argument(args, 4))
+        || value::truthy(universal_newlines);
     // Slot 11 is `preexec_fn`. CPython calls it between `fork` and `exec`,
     // where no Python-level code (and therefore no Hydro object) may run:
     // rejecting the hook is the only honest option.
@@ -1093,7 +1327,7 @@ fn popen_new(args: &[i64]) -> i64 {
     };
     // Bottom of the CPython `Popen(..., stdin=...)` matrix: inherit the
     // parent's descriptor, open `/dev/null`, or create a pipe whose parent
-    // side is closed right after the spawn.
+    // side becomes `popen.stdin`.
     match stdin {
         StreamMode::Inherit => {}
         StreamMode::DevNull => {
@@ -1112,62 +1346,78 @@ fn popen_new(args: &[i64]) -> i64 {
             Err(error) => return error,
         },
     }
-    match stdout {
-        StreamMode::Inherit => {}
-        StreamMode::DevNull => {
-            command.stdout(Stdio::null());
-        }
-        StreamMode::Pipe => {
-            command.stdout(Stdio::piped());
-        }
-        StreamMode::Stdout => {
-            return value_error("subprocess: stdout must not be subprocess.STDOUT");
-        }
-        StreamMode::Fd(fd) => match fd_stdio(fd) {
-            Ok(stdio) => {
-                command.stdout(stdio);
+    // `stderr=STDOUT` with `stdout=PIPE` shares one pipe between the two
+    // child descriptors; CPython leaves `popen.stderr` as `None` in that
+    // configuration and `popen.stdout` reports the interleaved bytes.
+    let mut merged_stdout_parent: Option<OwnedFd> = None;
+    if stdout == StreamMode::Pipe && stderr == StreamMode::Stdout {
+        let (reader, writer) = match os_pipe() {
+            Ok(pair) => pair,
+            Err(error) => return io_error(error),
+        };
+        let second = match writer.try_clone() {
+            Ok(clone) => clone,
+            Err(error) => return io_error(error),
+        };
+        command.stdout(Stdio::from(writer));
+        command.stderr(Stdio::from(second));
+        merged_stdout_parent = Some(OwnedFd::from(reader));
+    } else {
+        match stdout {
+            StreamMode::Inherit => {}
+            StreamMode::DevNull => {
+                command.stdout(Stdio::null());
             }
-            Err(error) => return error,
-        },
-    }
-    match stderr {
-        StreamMode::DevNull => {
-            command.stderr(Stdio::null());
-        }
-        StreamMode::Pipe => {
-            command.stderr(Stdio::piped());
-        }
-        StreamMode::Stdout => match stdout {
-            StreamMode::Inherit => match duplicate_stdout() {
+            StreamMode::Pipe => {
+                command.stdout(Stdio::piped());
+            }
+            StreamMode::Stdout => {
+                return value_error("subprocess: stdout must not be subprocess.STDOUT");
+            }
+            StreamMode::Fd(fd) => match fd_stdio(fd) {
                 Ok(stdio) => {
-                    command.stderr(stdio);
+                    command.stdout(stdio);
                 }
                 Err(error) => return error,
             },
+        }
+        match stderr {
             StreamMode::DevNull => {
                 command.stderr(Stdio::null());
             }
-            // `Popen` exposes no read handle, so a merged pipe would be a
-            // discarded pipe either way; use the null device instead of
-            // filling an unread pipe buffer.
             StreamMode::Pipe => {
-                command.stderr(Stdio::null());
+                command.stderr(Stdio::piped());
             }
-            StreamMode::Stdout => {}
+            StreamMode::Stdout => match stdout {
+                StreamMode::Inherit => match duplicate_stdout() {
+                    Ok(stdio) => {
+                        command.stderr(stdio);
+                    }
+                    Err(error) => return error,
+                },
+                StreamMode::DevNull => {
+                    command.stderr(Stdio::null());
+                }
+                // Handled by the shared-pipe branch above.
+                StreamMode::Pipe => {
+                    command.stderr(Stdio::null());
+                }
+                StreamMode::Stdout => {}
+                StreamMode::Fd(fd) => match fd_stdio(fd) {
+                    Ok(stdio) => {
+                        command.stderr(stdio);
+                    }
+                    Err(error) => return error,
+                },
+            },
+            StreamMode::Inherit => {}
             StreamMode::Fd(fd) => match fd_stdio(fd) {
                 Ok(stdio) => {
                     command.stderr(stdio);
                 }
                 Err(error) => return error,
             },
-        },
-        StreamMode::Inherit => {}
-        StreamMode::Fd(fd) => match fd_stdio(fd) {
-            Ok(stdio) => {
-                command.stderr(stdio);
-            }
-            Err(error) => return error,
-        },
+        }
     }
 
     // `start_new_session=True` puts the child in a fresh session and process
@@ -1194,28 +1444,39 @@ fn popen_new(args: &[i64]) -> i64 {
         Ok(child) => child,
         Err(error) => return io_error(error),
     };
-    // Piped output stays attached to a file object so callers can read it and
-    // `select.poll.register(proc.stdout, ...)` can use its descriptor.
-    let stdout_file = child
-        .stdout
-        .take()
-        .map(|reader| value::file_new_pipe(reader, !text_mode));
-    if let Some(reader) = child.stderr.take() {
-        discard(reader);
-    }
-    // The object exposes no writable stdin handle, so closing the parent's
-    // pipe end immediately gives the child EOF instead of leaving it blocked
-    // forever on a pipe nobody writes to.
-    drop(child.stdin.take());
+    // Each piped stream stays attached to a runtime file object so callers can
+    // read/write it and `select.poll.register(proc.stdout, ...)` can use its
+    // descriptor. Text mode switches the objects to text (`str`) I/O; the
+    // bytes are UTF-8.
+    let stdin_handle = match child.stdin.take() {
+        Some(pipe) => pipe_writer_value(pipe, !text_mode),
+        None => NONE,
+    };
+    let stdout_handle = match merged_stdout_parent.take() {
+        Some(reader) => pipe_reader_value(reader, !text_mode),
+        None => match child.stdout.take() {
+            Some(reader) => pipe_reader_value(OwnedFd::from(reader), !text_mode),
+            None => NONE,
+        },
+    };
+    let stderr_handle = match child.stderr.take() {
+        Some(reader) => pipe_reader_value(OwnedFd::from(reader), !text_mode),
+        None => NONE,
+    };
     let pid = i64::from(child.id());
     let key = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     children().insert(key, child);
 
+    // The handles are held only in Rust locals until they become instance
+    // attributes; keep them (and then the instance) visible to the collector
+    // while the attribute assignments allocate.
+    let handle_roots = heap::root_values(&[stdin_handle, stdout_handle, stderr_handle]);
     let instance = value::instance_new(popen_class());
+    let instance_roots = heap::root_values(std::slice::from_ref(&instance));
     value::instance_setattr(
         instance,
         "args".to_string(),
-        args_value(args_argument, &argv),
+        args_value(args_argument, &original_argv),
     );
     value::instance_setattr(instance, "returncode".to_string(), NONE);
     value::instance_setattr(instance, "pid".to_string(), int_value(pid));
@@ -1232,6 +1493,13 @@ fn popen_new(args: &[i64]) -> i64 {
         "text_mode".to_string(),
         value::bool_value(text_mode),
     );
+    // `universal_newlines` is CPython's read-only alias property for
+    // `text_mode`; instances expose the same value as a plain attribute.
+    value::instance_setattr(
+        instance,
+        "universal_newlines".to_string(),
+        value::bool_value(text_mode),
+    );
     let encoding_value = if encoding_argument != NONE {
         encoding_argument
     } else if text_mode {
@@ -1241,13 +1509,14 @@ fn popen_new(args: &[i64]) -> i64 {
     };
     value::instance_setattr(instance, "encoding".to_string(), encoding_value);
     value::instance_setattr(instance, "errors".to_string(), errors_argument);
-    // CPython initializes `stdin`/`stdout`/`stderr` to `None` and only fills a
-    // stream attribute when it created a file object. Piped stdin is closed
-    // at spawn, so it stays `None`; piped stdout/stderr carry the live file.
-    value::instance_setattr(instance, "stdout".to_string(), stdout_file.unwrap_or(NONE));
-    value::instance_setattr(instance, "stderr".to_string(), NONE);
-    value::instance_setattr(instance, "stdin".to_string(), NONE);
+    // CPython initializes `stdin`/`stdout`/`stderr` to `None` and fills a
+    // stream attribute only when it created a file object.
+    value::instance_setattr(instance, "stdin".to_string(), stdin_handle);
+    value::instance_setattr(instance, "stdout".to_string(), stdout_handle);
+    value::instance_setattr(instance, "stderr".to_string(), stderr_handle);
     value::instance_setattr(instance, ID_ATTR.to_string(), int_value(key as i64));
+    heap::release_roots(instance_roots);
+    heap::release_roots(handle_roots);
     instance
 }
 
@@ -1271,39 +1540,128 @@ fn recorded_returncode(instance: i64) -> Option<i64> {
     value::instance_attr(instance, "returncode").filter(|&code| code != NONE)
 }
 
+/// The cached `subprocess.TimeoutExpired` exception class.
+///
+/// `TimeoutExpired` subclasses `Exception` (through the runtime's
+/// `SubprocessError`-shaped hierarchy) and carries CPython's `cmd`,
+/// `timeout`, `output` and `stderr` attributes.
+pub(crate) fn timeout_expired_class() -> i64 {
+    if let Some(class) = globals::registry_get(TIMEOUT_EXPIRED_KEY) {
+        return class;
+    }
+    let class = value::class_new(
+        "TimeoutExpired".to_string(),
+        exc::exception_class(EXCEPTION),
+        Vec::new(),
+    );
+    let roots = heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(TIMEOUT_EXPIRED_KEY, class);
+    heap::release_roots(roots);
+    class
+}
+
+/// Raises a `TimeoutExpired` instance for `instance`.
+///
+/// `output`/`stderr` carry whatever was read before the deadline (raw bytes,
+/// matching CPython even in text mode).
+fn raise_timeout_expired(
+    instance: i64,
+    timeout: Option<Duration>,
+    output: Option<Vec<u8>>,
+    stderr: Option<Vec<u8>>,
+) -> i64 {
+    let exception = value::instance_new(timeout_expired_class());
+    let cmd = value::instance_attr(instance, "args").unwrap_or(NONE);
+    let timeout_value = match timeout {
+        Some(timeout) => value::float_new(timeout.as_secs_f64()),
+        None => NONE,
+    };
+    let output_value = output.map(value::bytes_new).unwrap_or(NONE);
+    let stderr_value = stderr.map(value::bytes_new).unwrap_or(NONE);
+    let roots = heap::root_values(&[exception, cmd, timeout_value, output_value, stderr_value]);
+    value::instance_setattr(exception, "cmd".to_string(), cmd);
+    value::instance_setattr(exception, "timeout".to_string(), timeout_value);
+    value::instance_setattr(exception, "output".to_string(), output_value);
+    value::instance_setattr(exception, "stderr".to_string(), stderr_value);
+    let result = exc::raise_value(exception);
+    heap::release_roots(roots);
+    result
+}
+
+/// Waits for the child owned by `instance`, cooperating with concurrent
+/// `wait`/`poll`/`communicate` calls.
+///
+/// The `CHILDREN` entry is claimed by exactly one thread while it blocks in
+/// `waitpid`; every other caller observes the recorded `returncode` once it
+/// is set. That is CPython's `_waitpid_lock`/`returncode` protocol and it is
+/// what makes `Popen.wait()` thread-safe (`test_threadsafe_wait`).
+fn wait_instance_child(
+    instance: i64,
+    key: u64,
+    timeout: Option<Duration>,
+) -> Result<(), WaitError> {
+    let deadline = timeout.and_then(|limit| Instant::now().checked_add(limit));
+    loop {
+        if recorded_returncode(instance).is_some() {
+            return Ok(());
+        }
+        match children().remove(&key) {
+            Some(mut child) => {
+                let remaining = match deadline {
+                    Some(deadline) => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            children().insert(key, child);
+                            return Err(WaitError::Timeout);
+                        }
+                        Some(deadline - now)
+                    }
+                    None => None,
+                };
+                heap::blocking_enter();
+                let waited = wait_child(&mut child, remaining, false);
+                heap::blocking_leave();
+                match waited {
+                    Ok(status) => {
+                        let code = returncode(status);
+                        value::instance_setattr(
+                            instance,
+                            "returncode".to_string(),
+                            int_value(code),
+                        );
+                        return Ok(());
+                    }
+                    Err(WaitError::Timeout) => {
+                        children().insert(key, child);
+                        return Err(WaitError::Timeout);
+                    }
+                    Err(WaitError::Io(error)) => {
+                        children().insert(key, child);
+                        return Err(WaitError::Io(error));
+                    }
+                }
+            }
+            None => {
+                // Another `wait`/`communicate` call claimed the child; wait
+                // for its recorded status (or this caller's own deadline).
+                match deadline {
+                    Some(deadline) if Instant::now() >= deadline => return Err(WaitError::Timeout),
+                    _ => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+        }
+    }
+}
+
 fn popen_wait(instance: i64, timeout: Option<Duration>) -> i64 {
     let key = match process_key(instance) {
         Ok(key) => key,
         Err(error) => return error,
     };
-    let Some(mut child) = children().remove(&key) else {
-        return match recorded_returncode(instance) {
-            Some(code) => code,
-            None => runtime_error("subprocess: Popen object has no live process"),
-        };
-    };
-
-    heap::blocking_enter();
-    let waited = wait_child(&mut child, timeout, false);
-    heap::blocking_leave();
-
-    match waited {
-        Ok(status) => {
-            let code = returncode(status);
-            value::instance_setattr(instance, "returncode".to_string(), int_value(code));
-            int_value(code)
-        }
-        Err(WaitError::Timeout) => {
-            children().insert(key, child);
-            runtime_error(&format!(
-                "Popen.wait() timed out after {} seconds",
-                timeout.map(|timeout| timeout.as_secs_f64()).unwrap_or(0.0)
-            ))
-        }
-        Err(WaitError::Io(error)) => {
-            children().insert(key, child);
-            io_error(error)
-        }
+    match wait_instance_child(instance, key, timeout) {
+        Ok(()) => recorded_returncode(instance).unwrap_or(NONE),
+        Err(WaitError::Timeout) => raise_timeout_expired(instance, timeout, None, None),
+        Err(WaitError::Io(error)) => io_error(error),
     }
 }
 
@@ -1341,24 +1699,47 @@ fn popen_poll(instance: i64) -> i64 {
             int_value(code)
         }
         Polled::Running => NONE,
-        Polled::Missing => match recorded_returncode(instance) {
-            Some(code) => code,
-            None => runtime_error("subprocess: Popen object has no live process"),
-        },
+        // A concurrent waiter removed the entry; until it records the status
+        // the process is still running, so `poll()` answers `None`.
+        Polled::Missing => recorded_returncode(instance).unwrap_or(NONE),
         Polled::Failed(error) => io_error(error),
     }
 }
 
-fn popen_signal(instance: i64, signal: i32) -> i64 {
-    let key = match process_key(instance) {
-        Ok(key) => key,
-        Err(error) => return error,
+/// `Popen.send_signal(sig)`.
+///
+/// The child is polled first so an exited process is never signalled (and a
+/// recycled pid cannot receive the signal), and a vanished process
+/// (`ESRCH`) is ignored, exactly like CPython.
+fn popen_send_signal(instance: i64, signal_argument: i64) -> i64 {
+    let Some(number) = value::as_integer(signal_argument) else {
+        return type_error(&format!(
+            "an integer is required (got type {})",
+            value::type_name(signal_argument)
+        ));
     };
-    let Some(pid) = children().get(&key).map(|child| child.id() as i32) else {
-        return match recorded_returncode(instance) {
-            Some(_) => NONE,
-            None => runtime_error("subprocess: Popen object has no live process"),
-        };
+    let signal = match i32::try_from(number) {
+        Ok(signal) => signal,
+        Err(_) => return exc::raise_with_message(OVERFLOW_ERROR, "signal number out of range"),
+    };
+    if let Err(error) = process_key(instance) {
+        return error;
+    }
+    let polled = popen_poll(instance);
+    if exc::pending() {
+        return NONE;
+    }
+    if polled != NONE {
+        return NONE;
+    }
+    // The pid is read from the instance, not the registry: a concurrent
+    // `wait`/`communicate` may have claimed the `Child` while it blocks in
+    // `waitpid`, and the signal must still reach the running process.
+    let Some(pid) = value::instance_attr(instance, "pid")
+        .and_then(value::as_integer)
+        .and_then(|pid| i32::try_from(pid).ok())
+    else {
+        return NONE;
     };
     // SAFETY: `kill` only reads the pid and signal; the child is still owned
     // by the registry (and therefore not reaped) until `wait`/`poll`.
@@ -1367,10 +1748,258 @@ fn popen_signal(instance: i64, signal: i32) -> i64 {
     }
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ESRCH) {
-        runtime_error("subprocess: process already terminated")
+        NONE
     } else {
         io_error(error)
     }
+}
+
+/// A `communicate()` input payload after validation.
+enum CommunicateInput {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+/// Validates `communicate(input=...)` against the stream's text/binary mode
+/// and converts bytes-like values to a contiguous buffer.
+fn communicate_input(argument: i64, text_mode: bool) -> Result<Option<CommunicateInput>, i64> {
+    if argument == NONE {
+        return Ok(None);
+    }
+    if text_mode {
+        return match value::as_str(argument) {
+            Some(text) => Ok(Some(CommunicateInput::Text(text.to_string()))),
+            None => Err(type_error(&format!(
+                "write() argument must be str, not '{}'",
+                value::type_name(argument)
+            ))),
+        };
+    }
+    if let Some(bytes) = value::as_bytes(argument) {
+        return Ok(Some(CommunicateInput::Bytes(bytes.to_vec())));
+    }
+    if let Some(bytes) = value::as_bytearray(argument) {
+        return Ok(Some(CommunicateInput::Bytes(bytes.clone())));
+    }
+    if let Some(view) = value::as_memoryview(argument) {
+        return match value::memoryview_bytes(view) {
+            Ok(bytes) => Ok(Some(CommunicateInput::Bytes(bytes))),
+            Err(message) => Err(value_error(message)),
+        };
+    }
+    Err(type_error(&format!(
+        "a bytes-like object is required, not '{}'",
+        value::type_name(argument)
+    )))
+}
+
+/// Drains a pipe file on a helper thread into a shared byte buffer.
+fn spawn_pipe_reader(
+    file: &'static value::FileState,
+    buffer: Arc<Mutex<Vec<u8>>>,
+) -> io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024)
+        .spawn(move || {
+            let Ok(mut data) = file.read_bytes(None) else {
+                return;
+            };
+            if let Ok(mut output) = buffer.lock() {
+                output.append(&mut data);
+            }
+        })
+}
+
+/// Writes `payload` to the child's stdin, flushes and closes it.
+///
+/// Writing on a helper thread keeps a child that fills its output pipe before
+/// reading its input from deadlocking the parent, and closing from inside the
+/// same thread gives the child EOF as soon as the last byte was written
+/// instead of after the child exits. Write errors (notably `EPIPE`) are
+/// ignored, exactly as CPython's `_stdin_write` does.
+fn spawn_pipe_writer(
+    file: &'static value::FileState,
+    payload: Option<CommunicateInput>,
+) -> io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024)
+        .spawn(move || {
+            if let Some(payload) = payload {
+                match payload {
+                    CommunicateInput::Text(text) => {
+                        let _ = file.write(&text);
+                    }
+                    CommunicateInput::Bytes(bytes) => {
+                        let _ = file.write_bytes(&bytes);
+                    }
+                }
+            }
+            let _ = file.flush();
+            file.close();
+        })
+}
+
+/// Starts the reader/writer helpers for one `communicate()` call.
+fn start_communication(
+    instance: i64,
+    input: Option<CommunicateInput>,
+) -> Result<Communication, i64> {
+    let mut communication = Communication {
+        stdout: Arc::new(Mutex::new(Vec::new())),
+        stderr: Arc::new(Mutex::new(Vec::new())),
+        stdout_reader: None,
+        stderr_reader: None,
+        stdin_writer: None,
+    };
+    for (name, buffer) in [
+        ("stdout", Arc::clone(&communication.stdout)),
+        ("stderr", Arc::clone(&communication.stderr)),
+    ] {
+        let Some(handle) = stream_handle(instance, name) else {
+            continue;
+        };
+        let Some(file) = value::as_file(handle) else {
+            return Err(runtime_error(&format!(
+                "subprocess: Popen.{name} is not a pipe handle"
+            )));
+        };
+        if file.closed() {
+            return Err(value_error("I/O operation on closed file."));
+        }
+        let reader = spawn_pipe_reader(file, buffer).map_err(io_error)?;
+        if name == "stdout" {
+            communication.stdout_reader = Some(reader);
+        } else {
+            communication.stderr_reader = Some(reader);
+        }
+    }
+    if let Some(handle) = stream_handle(instance, "stdin") {
+        let Some(file) = value::as_file(handle) else {
+            return Err(runtime_error(
+                "subprocess: Popen.stdin is not a pipe handle",
+            ));
+        };
+        if file.closed() {
+            if input.is_some() {
+                return Err(value_error("I/O operation on closed file."));
+            }
+        } else {
+            let writer = spawn_pipe_writer(file, input).map_err(io_error)?;
+            communication.stdin_writer = Some(writer);
+        }
+    }
+    Ok(communication)
+}
+
+/// Waits for the child while the helper threads drain the pipes.
+fn wait_communication_child(
+    instance: i64,
+    key: u64,
+    timeout: Option<Duration>,
+) -> Result<(), WaitError> {
+    wait_instance_child(instance, key, timeout)
+}
+
+/// Joins the helper threads; every handle returns once the child's pipe ends
+/// are closed (the child exited) or the writer hit `EPIPE`.
+fn join_communication(communication: &mut Communication) {
+    heap::blocking_enter();
+    if let Some(reader) = communication.stdout_reader.take() {
+        let _ = reader.join();
+    }
+    if let Some(reader) = communication.stderr_reader.take() {
+        let _ = reader.join();
+    }
+    if let Some(writer) = communication.stdin_writer.take() {
+        let _ = writer.join();
+    }
+    heap::blocking_leave();
+}
+
+fn buffer_contents(buffer: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+    buffer.lock().map(|bytes| bytes.clone()).unwrap_or_default()
+}
+
+/// Renders captured pipe bytes as `bytes` or, in text mode, as a `str` with
+/// CPython's universal-newline translation.
+fn communicate_output(bytes: Vec<u8>, text_mode: bool) -> i64 {
+    if !text_mode {
+        return value::bytes_new(bytes);
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.contains('\r') {
+        value::str_alloc(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        value::str_alloc(text)
+    }
+}
+
+/// `Popen.communicate(input=None, timeout=None)`.
+fn popen_communicate(instance: i64, input_argument: i64, timeout_argument: i64) -> i64 {
+    let key = match process_key(instance) {
+        Ok(key) => key,
+        Err(error) => return error,
+    };
+    let timeout = match duration_option(timeout_argument, "timeout") {
+        Ok(timeout) => timeout,
+        Err(error) => return error,
+    };
+    if input_argument != NONE
+        && value::instance_attr(instance, COMMUNICATION_STARTED_ATTR).is_some_and(value::truthy)
+    {
+        return value_error("Cannot send input after starting communication");
+    }
+    let text_mode = value::instance_attr(instance, "text_mode").is_some_and(value::truthy);
+    let mut communication = match communications().remove(&key) {
+        Some(communication) => communication,
+        None => {
+            let input = match communicate_input(input_argument, text_mode) {
+                Ok(input) => input,
+                Err(error) => return error,
+            };
+            match start_communication(instance, input) {
+                Ok(communication) => communication,
+                Err(error) => return error,
+            }
+        }
+    };
+    value::instance_setattr(
+        instance,
+        COMMUNICATION_STARTED_ATTR.to_string(),
+        value::TRUE,
+    );
+    match wait_communication_child(instance, key, timeout) {
+        Ok(()) => {}
+        Err(WaitError::Timeout) => {
+            // Keep the in-flight buffers so the next call resumes and returns
+            // the complete output, like CPython after TimeoutExpired.
+            let output = Some(buffer_contents(&communication.stdout));
+            let stderr_output = Some(buffer_contents(&communication.stderr));
+            communications().insert(key, communication);
+            return raise_timeout_expired(instance, timeout, output, stderr_output);
+        }
+        Err(WaitError::Io(error)) => {
+            communications().insert(key, communication);
+            return io_error(error);
+        }
+    }
+    join_communication(&mut communication);
+    // CPython closes every stream at the end of communicate().
+    close_stream_handle(instance, "stdin");
+    close_stream_handle(instance, "stdout");
+    close_stream_handle(instance, "stderr");
+    let stdout = match stream_handle(instance, "stdout") {
+        Some(_) => communicate_output(buffer_contents(&communication.stdout), text_mode),
+        None => NONE,
+    };
+    let stderr = match stream_handle(instance, "stderr") {
+        Some(_) => communicate_output(buffer_contents(&communication.stderr), text_mode),
+        None => NONE,
+    };
+    let roots = heap::root_values(&[stdout, stderr]);
+    let result = value::tuple_new(vec![stdout, stderr]);
+    heap::release_roots(roots);
+    result
 }
 
 fn popen_method(function: &str, args: &[i64]) -> i64 {
@@ -1386,10 +2015,17 @@ fn popen_method(function: &str, args: &[i64]) -> i64 {
             popen_wait(instance, timeout)
         }
         "_popen_poll" => popen_poll(instance),
-        "_popen_terminate" => popen_signal(instance, libc::SIGTERM),
-        "_popen_kill" => popen_signal(instance, libc::SIGKILL),
+        "_popen_terminate" => popen_send_signal(instance, int_value(i64::from(libc::SIGTERM))),
+        "_popen_kill" => popen_send_signal(instance, int_value(i64::from(libc::SIGKILL))),
         "_popen_enter" => instance,
         "_popen_exit" => {
+            // CPython closes the output handles, then stdin, and finally
+            // waits. Closing the read ends unblocks a child that filled its
+            // stdout/stderr pipe and closing stdin gives it EOF; the wait
+            // then ends any `communicate()` drain threads still running.
+            close_stream_handle(instance, "stdout");
+            close_stream_handle(instance, "stderr");
+            close_stream_handle(instance, "stdin");
             let _ = popen_wait(instance, None);
             if exc::pending() {
                 NONE
@@ -1899,8 +2535,8 @@ mod tests {
         assert_eq!(wait_bounded(process), Some(7));
 
         exc::init();
-        // PIPE creates a pipe whose parent end is closed at spawn, so the
-        // child reads EOF rather than blocking forever.
+        // PIPE exposes a writable parent handle (`p.stdin`); closing it gives
+        // the child EOF instead of blocking forever.
         let process = call(
             "Popen",
             &[
@@ -1916,6 +2552,8 @@ mod tests {
             ],
         );
         assert!(!exc::pending(), "Popen(PIPE) failed");
+        let handle = value::instance_attr(process, "stdin").expect("p.stdin");
+        value::as_file(handle).expect("pipe file").close();
         assert_eq!(wait_bounded(process), Some(7));
 
         exc::init();

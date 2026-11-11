@@ -4695,11 +4695,22 @@ mod tests {
     }
 
     #[test]
-    fn unknown_names_use_the_name_code_and_suggestion() {
-        let diags = check_source("value = 1\nprint(valu)\n", "test.py").expect_err("name error");
+    fn hidden_module_locals_use_the_name_code() {
+        // An unresolved read is a runtime lookup, so the remaining compile-time
+        // `HYD0101` diagnostic is a scope error: a module-level name bound only
+        // in a nested block (an exception handler target) is not visible from
+        // a function.
+        let source = "try:\n    raise ValueError\nexcept ValueError as item:\n    pass\n\
+                      def read():\n    return item\n";
+        let diags = check_source(source, "test.py").expect_err("hidden module local");
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert_eq!(diags[0].code, codes::NAME);
-        assert_eq!(diags[0].help.as_deref(), Some("did you mean `value`?"));
+        assert!(
+            diags[0]
+                .message
+                .contains("is not visible inside a function"),
+            "{diags:?}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -6230,10 +6241,10 @@ mod tests {
             "VALUE = 7\n\ndef add(a, b):\n    return a + b\n\n_private = 1\n",
         );
         let main = dir.write("main.py", "from helper import *\nprint(add(1, 2), VALUE)\n");
-        let program = program(&main);
-        let add = function_id(&program, "helper.add");
+        let main_program = program(&main);
+        let add = function_id(&main_program, "helper.add");
         use hydro_ir::{ExprKind, StmtKind};
-        let entry = program.main_function();
+        let entry = main_program.main_function();
         let mut add_called = false;
         let mut reads_value = false;
         for stmt in &entry.body {
@@ -6259,12 +6270,34 @@ mod tests {
         assert!(add_called, "`add` must link to helper.add");
         assert!(reads_value, "`VALUE` must read helper.VALUE");
 
-        // `_private` is not exported by a star import without `__all__`.
+        // `_private` is not exported by a star import without `__all__`: the
+        // bare read is an ordinary runtime module lookup, never a static
+        // binding of the imported name.
         let bad = dir.write("bad.py", "from helper import *\nprint(_private)\n");
-        let diags = check_file(&bad).expect_err("private name must stay unbound");
+        let bad_program = program(&bad);
+        let entry = bad_program.main_function();
+        let mut reads_private = false;
+        for stmt in &entry.body {
+            let StmtKind::Expr(expr) = &stmt.kind else {
+                continue;
+            };
+            let ExprKind::Call {
+                callee: hydro_ir::Callee::Builtin(hydro_ir::Builtin::Print),
+                args,
+            } = &expr.kind
+            else {
+                continue;
+            };
+            for arg in args {
+                reads_private |= matches!(
+                    &arg.kind,
+                    ExprKind::GlobalGet { name, .. } if name == "_private"
+                );
+            }
+        }
         assert!(
-            diags.iter().any(|diag| diag.message.contains("'_private'")),
-            "{diags:?}"
+            reads_private,
+            "`_private` must be a runtime global read, not a star-import binding"
         );
     }
 
@@ -6276,14 +6309,41 @@ mod tests {
             "__all__ = (\"keep\",)\n\ndef keep():\n    return 1\n\ndef drop():\n    return 2\n",
         );
         let good = dir.write("good.py", "from helper import *\nprint(keep())\n");
-        let program = program(&good);
-        assert_eq!(printed_call(&program), function_id(&program, "helper.keep"));
+        let good_program = program(&good);
+        assert_eq!(
+            printed_call(&good_program),
+            function_id(&good_program, "helper.keep")
+        );
 
+        // A name outside `__all__` is not statically bound by the star import;
+        // the call is an ordinary runtime lookup of the module namespace.
         let bad = dir.write("bad.py", "from helper import *\nprint(drop())\n");
-        let diags = check_file(&bad).expect_err("names outside __all__ are filtered");
-        assert!(
-            diags.iter().any(|diag| diag.message.contains("'drop'")),
-            "{diags:?}"
+        let bad_program = program(&bad);
+        let entry = bad_program.main_function();
+        let mut callee = None;
+        for stmt in &entry.body {
+            let hydro_ir::StmtKind::Expr(expr) = &stmt.kind else {
+                continue;
+            };
+            let hydro_ir::ExprKind::Call {
+                callee: hydro_ir::Callee::Builtin(hydro_ir::Builtin::Print),
+                args,
+            } = &expr.kind
+            else {
+                continue;
+            };
+            if let Some(arg) = args.first() {
+                if let hydro_ir::ExprKind::IndirectCall { callee: value, .. } = &arg.kind {
+                    if let hydro_ir::ExprKind::GlobalGet { name, .. } = &value.kind {
+                        callee = Some(name.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            callee.as_deref(),
+            Some("drop"),
+            "`drop` must be a runtime lookup, not a `helper.drop` binding"
         );
     }
 

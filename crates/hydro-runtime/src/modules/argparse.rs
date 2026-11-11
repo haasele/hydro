@@ -29,7 +29,8 @@ use crate::container;
 use crate::core::globals;
 use crate::exc::{self, ATTRIBUTE_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::methods::KeywordArgs;
-use crate::value::{self, NONE};
+use crate::value::{self, ParamMeta, NONE};
+use hydro_ir::{MethodKind, ParamKind};
 
 /// `argparse.SUPPRESS`: the sentinel string CPython uses to hide a default or
 /// a help entry.
@@ -157,6 +158,10 @@ pub(crate) struct ArgParserState {
     pub(crate) add_help: bool,
     pub(crate) allow_abbrev: bool,
     pub(crate) exit_on_error: bool,
+    /// CPython 3.14's `suggest_on_error=` constructor keyword. Hydro's
+    /// messages do not add "did you mean" hints yet, so the flag is stored for
+    /// introspection and repr.
+    pub(crate) suggest_on_error: bool,
     /// CPython 3.14's `color=` constructor keyword. Help output has no ANSI
     /// styling in Hydro, so the flag is stored for introspection only.
     pub(crate) color: bool,
@@ -183,6 +188,7 @@ impl ArgParserState {
             add_help: true,
             allow_abbrev: true,
             exit_on_error: true,
+            suggest_on_error: false,
             color: true,
             options: Vec::new(),
             groups: vec![GroupState::default()],
@@ -226,12 +232,462 @@ fn root_value(roots: i64, value: i64) {
 }
 
 // -------------------------------------------------------------------------
+// Native classes and parser-instance plumbing
+// -------------------------------------------------------------------------
+
+/// Hidden instance attribute holding the native `ArgParserState` payload.
+///
+/// `ArgumentParser` is a real class so that `class P(...)` subclassing and
+/// `type(parser)` work. The public Python attributes (`prog`, `usage`, ...)
+/// live in the instance `__dict__`; the parsed definition stays native and is
+/// linked through this NUL-prefixed name, which no Python attribute can spell.
+const PARSER_STATE_ATTR: &str = "\u{0}hydro_arg_parser_state";
+
+/// Registry keys for the cached class values.
+const PARSER_CLASS_KEY: &str = "argparse.ArgumentParser.class";
+const NAMESPACE_CLASS_KEY: &str = "argparse.Namespace.class";
+
+fn self_param() -> ParamMeta {
+    ParamMeta {
+        name: "self".to_string(),
+        kind: ParamKind::Positional,
+        default: None,
+    }
+}
+
+fn method_signature() -> Vec<ParamMeta> {
+    vec![
+        self_param(),
+        ParamMeta {
+            name: "args".to_string(),
+            kind: ParamKind::VarArg,
+            default: None,
+        },
+        ParamMeta {
+            name: "kwargs".to_string(),
+            kind: ParamKind::KwArg,
+            default: None,
+        },
+    ]
+}
+
+/// Resolves the native parser payload behind either a bare native parser value
+/// (the internal representation) or an `ArgumentParser` class instance.
+fn parser_state_value(obj: i64) -> Option<i64> {
+    if value::as_arg_parser(obj).is_some() {
+        return Some(obj);
+    }
+    let inner = value::instance_attr(obj, PARSER_STATE_ATTR)?;
+    value::as_arg_parser(inner).map(|_| inner)
+}
+
+fn parser_ref(obj: i64) -> Option<&'static ArgParserState> {
+    parser_state_value(obj).and_then(value::as_arg_parser)
+}
+
+fn parser_mut(obj: i64) -> Option<value::ContainerGuard<ArgParserState>> {
+    parser_state_value(obj).and_then(value::arg_parser_mut)
+}
+
+/// Builds a native function with the `(self, *args, **kwargs)` signature used
+/// by every `ArgumentParser` method. The generic binder then hands the native
+/// entry point the receiver, a list of positional arguments and a keyword
+/// dict, matching this module's own argument parsing.
+/// The qualified name of a parser method. Native function values require a
+/// `&'static str`, so the closed set of method spellings is a match rather
+/// than an allocation.
+fn parser_member_name(display: &str) -> &'static str {
+    match display {
+        "add_argument" => "ArgumentParser.add_argument",
+        "add_argument_group" => "ArgumentParser.add_argument_group",
+        "add_mutually_exclusive_group" => "ArgumentParser.add_mutually_exclusive_group",
+        "add_subparsers" => "ArgumentParser.add_subparsers",
+        "set_defaults" => "ArgumentParser.set_defaults",
+        "get_default" => "ArgumentParser.get_default",
+        "parse_args" => "ArgumentParser.parse_args",
+        "parse_known_args" => "ArgumentParser.parse_known_args",
+        "parse_intermixed_args" => "ArgumentParser.parse_intermixed_args",
+        "parse_known_intermixed_args" => "ArgumentParser.parse_known_intermixed_args",
+        "print_help" => "ArgumentParser.print_help",
+        "print_usage" => "ArgumentParser.print_usage",
+        "format_help" => "ArgumentParser.format_help",
+        "format_usage" => "ArgumentParser.format_usage",
+        "error" => "ArgumentParser.error",
+        "exit" => "ArgumentParser.exit",
+        "__repr__" => "ArgumentParser.__repr__",
+        _ => "ArgumentParser.__init__",
+    }
+}
+
+fn namespace_member_name(display: &str) -> &'static str {
+    match display {
+        "__repr__" => "Namespace.__repr__",
+        "__eq__" => "Namespace.__eq__",
+        "__ne__" => "Namespace.__ne__",
+        "__contains__" => "Namespace.__contains__",
+        _ => "Namespace.__init__",
+    }
+}
+
+fn parser_native_method(display: &str, entry: usize) -> i64 {
+    let function = value::native_function_new("argparse", parser_member_name(display), usize::MAX);
+    value::function_set_signature(function, method_signature());
+    value::function_set_full_entry(function, entry);
+    function
+}
+
+fn parser_native_init(entry: usize) -> i64 {
+    let function = value::native_function_new("argparse", "ArgumentParser.__init__", usize::MAX);
+    value::function_set_signature(function, method_signature());
+    value::function_set_full_entry(function, entry);
+    function
+}
+
+fn parser_plain_method(display: &str, params: Vec<ParamMeta>, entry: usize) -> i64 {
+    let function = value::native_function_new("argparse", parser_member_name(display), usize::MAX);
+    value::function_set_signature(function, params);
+    value::function_set_full_entry(function, entry);
+    function
+}
+
+fn parser_entry(name: &str, argv: *const i64) -> i64 {
+    // SAFETY: the method binder supplies `(self, varargs_list, kwargs_dict)`
+    // for the `(self, *args, **kwargs)` signature above.
+    let receiver = unsafe { *argv };
+    let mut positionals = unsafe { value::as_list(*argv.add(1)) }
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    let mut keywords = Vec::new();
+    if let Some(pairs) = unsafe { value::as_dict(*argv.add(2)) } {
+        for (key, item) in pairs {
+            if let Some(key) = value::as_str(*key) {
+                keywords.push((key.to_string(), *item));
+            }
+        }
+    }
+    method_kw(
+        receiver,
+        name,
+        &mut positionals,
+        &KeywordArgs { items: keywords },
+    )
+}
+
+/// Creates the cached `argparse.ArgumentParser` class.
+fn argument_parser_class() -> i64 {
+    if let Some(class) = globals::registry_get(PARSER_CLASS_KEY) {
+        return class;
+    }
+    let mut methods: Vec<(String, i64, MethodKind)> = Vec::new();
+    let functions = [
+        parser_native_init(parser_init_entry as *const () as usize),
+        parser_plain_method(
+            "__repr__",
+            vec![self_param()],
+            parser_repr_entry as *const () as usize,
+        ),
+    ];
+    for (display, entry) in parser_method_entries() {
+        methods.push((
+            display.to_string(),
+            parser_native_method(display, entry),
+            MethodKind::Normal,
+        ));
+    }
+    methods.push(("__repr__".to_string(), functions[1], MethodKind::Normal));
+    // `__init__` is the class constructor slot.
+    methods.push(("__init__".to_string(), functions[0], MethodKind::Normal));
+    let method_values: Vec<i64> = methods.iter().map(|(_, function, _)| *function).collect();
+    let roots = crate::heap::root_values(&method_values);
+    let class = value::class_new_full("ArgumentParser".to_string(), NONE, methods, Vec::new());
+    let class_roots = crate::heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(PARSER_CLASS_KEY, class);
+    crate::heap::release_roots(class_roots);
+    crate::heap::release_roots(roots);
+    class
+}
+
+/// `ArgumentParser` methods that accept arbitrary positional/keyword argument
+/// lists and reuse the module's existing `method_kw` dispatch. Function
+/// pointers are converted to entry-point integers at run time because
+/// pointer-to-integer casts are not permitted in const evaluation.
+fn parser_method_entries() -> Vec<(&'static str, usize)> {
+    vec![
+        (
+            "add_argument",
+            parser_add_argument_entry as *const () as usize,
+        ),
+        (
+            "add_argument_group",
+            parser_add_argument_group_entry as *const () as usize,
+        ),
+        (
+            "add_mutually_exclusive_group",
+            parser_add_mutually_exclusive_group_entry as *const () as usize,
+        ),
+        (
+            "add_subparsers",
+            parser_add_subparsers_entry as *const () as usize,
+        ),
+        (
+            "set_defaults",
+            parser_set_defaults_entry as *const () as usize,
+        ),
+        (
+            "get_default",
+            parser_get_default_entry as *const () as usize,
+        ),
+        ("parse_args", parser_parse_args_entry as *const () as usize),
+        (
+            "parse_known_args",
+            parser_parse_known_args_entry as *const () as usize,
+        ),
+        (
+            "parse_intermixed_args",
+            parser_parse_intermixed_args_entry as *const () as usize,
+        ),
+        (
+            "parse_known_intermixed_args",
+            parser_parse_known_intermixed_args_entry as *const () as usize,
+        ),
+        ("print_help", parser_print_help_entry as *const () as usize),
+        (
+            "print_usage",
+            parser_print_usage_entry as *const () as usize,
+        ),
+        (
+            "format_help",
+            parser_format_help_entry as *const () as usize,
+        ),
+        (
+            "format_usage",
+            parser_format_usage_entry as *const () as usize,
+        ),
+        ("error", parser_error_entry as *const () as usize),
+        ("exit", parser_exit_entry as *const () as usize),
+        (
+            "_hydro_test_mode",
+            parser_test_mode_entry as *const () as usize,
+        ),
+    ]
+}
+
+macro_rules! parser_entries {
+    ($(($entry:ident, $name:literal)),* $(,)?) => {
+        $(
+            extern "C" fn $entry(argv: *const i64) -> i64 {
+                parser_entry($name, argv)
+            }
+        )*
+    };
+}
+
+parser_entries! {
+    (parser_add_argument_entry, "add_argument"),
+    (parser_add_argument_group_entry, "add_argument_group"),
+    (
+        parser_add_mutually_exclusive_group_entry,
+        "add_mutually_exclusive_group"
+    ),
+    (parser_add_subparsers_entry, "add_subparsers"),
+    (parser_set_defaults_entry, "set_defaults"),
+    (parser_get_default_entry, "get_default"),
+    (parser_parse_args_entry, "parse_args"),
+    (parser_parse_known_args_entry, "parse_known_args"),
+    (parser_parse_intermixed_args_entry, "parse_intermixed_args"),
+    (
+        parser_parse_known_intermixed_args_entry,
+        "parse_known_intermixed_args"
+    ),
+    (parser_print_help_entry, "print_help"),
+    (parser_print_usage_entry, "print_usage"),
+    (parser_format_help_entry, "format_help"),
+    (parser_format_usage_entry, "format_usage"),
+    (parser_error_entry, "error"),
+    (parser_exit_entry, "exit"),
+    (parser_test_mode_entry, "_hydro_test_mode"),
+}
+
+extern "C" fn parser_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: `__init__` uses the same binder shape as the other methods.
+    let instance = unsafe { *argv };
+    let positionals = unsafe { value::as_list(*argv.add(1)) }
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    let mut keywords = Vec::new();
+    if let Some(pairs) = unsafe { value::as_dict(*argv.add(2)) } {
+        for (key, item) in pairs {
+            if let Some(key) = value::as_str(*key) {
+                keywords.push((key.to_string(), *item));
+            }
+        }
+    }
+    init_parser_instance(instance, &positionals, &keywords)
+}
+
+extern "C" fn parser_repr_entry(argv: *const i64) -> i64 {
+    // SAFETY: the signature is `(self)`.
+    parser_repr(unsafe { *argv })
+}
+
+/// Creates a fresh `ArgumentParser` instance from the full positional
+/// constructor slot layout, used by module `call` and internal callers.
+fn new_parser_instance(args: &[i64]) -> i64 {
+    new_parser(args)
+}
+
+/// Binds `ArgumentParser.__init__`'s declared parameters and installs the
+/// native parser payload plus CPython's public instance attributes.
+fn init_parser_instance(instance: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    const PARAMS: [&str; 15] = [
+        "prog",
+        "usage",
+        "description",
+        "epilog",
+        "parents",
+        "formatter_class",
+        "prefix_chars",
+        "fromfile_prefix_chars",
+        "argument_default",
+        "conflict_handler",
+        "add_help",
+        "allow_abbrev",
+        "exit_on_error",
+        "suggest_on_error",
+        "color",
+    ];
+    /// CPython's `suggest_on_error` and `color` are keyword-only.
+    const POSITIONAL_LIMIT: usize = 13;
+    if args.len() > POSITIONAL_LIMIT {
+        return type_error(&format!(
+            "ArgumentParser.__init__() takes from 1 to {} positional arguments but {} were given",
+            POSITIONAL_LIMIT + 1,
+            args.len() + 1
+        ));
+    }
+    let mut slots: [Option<i64>; PARAMS.len()] = [None; PARAMS.len()];
+    for (index, argument) in args.iter().enumerate() {
+        slots[index] = Some(*argument);
+    }
+    for (name, argument) in keywords {
+        let Some(position) = PARAMS.iter().position(|param| *param == name.as_str()) else {
+            return type_error(&format!(
+                "ArgumentParser.__init__() got an unexpected keyword argument '{name}'"
+            ));
+        };
+        if slots[position].is_some() {
+            return type_error(&format!(
+                "ArgumentParser.__init__() got multiple values for argument '{name}'"
+            ));
+        }
+        slots[position] = Some(*argument);
+    }
+    let values: Vec<i64> = slots.iter().map(|slot| slot.unwrap_or(NONE)).collect();
+    let state = match build_parser_state(&values) {
+        Ok(state) => state,
+        Err(error) => return error,
+    };
+    install_parser_state(instance, state)
+}
+
+/// Links a freshly built native definition to its Python instance and
+/// publishes the public attributes CPython stores in `__dict__`.
+fn install_parser_state(instance: i64, state: ArgParserState) -> i64 {
+    let state_value = value::arg_parser_new(state);
+    let roots = crate::heap::root_values(&[instance, state_value]);
+    value::instance_setattr(instance, PARSER_STATE_ATTR.to_string(), state_value);
+    publish_parser_attrs(instance, state_value);
+    crate::heap::release_roots(roots);
+    NONE
+}
+
+/// Mirrors CPython's public `ArgumentParser.__dict__` fields so attribute
+/// reads, `vars()` and `repr` observe the constructor arguments.
+fn publish_parser_attrs(instance: i64, state_value: i64) {
+    let Some(state) = value::as_arg_parser(state_value) else {
+        return;
+    };
+    let roots = crate::heap::root_values(&[instance, state_value]);
+    let set = |name: &str, item: i64| {
+        value::instance_setattr(instance, name.to_string(), item);
+    };
+    set(
+        "prog",
+        state.prog.as_ref().map_or(NONE, |prog| text_value(prog)),
+    );
+    set(
+        "usage",
+        state.usage.as_ref().map_or(NONE, |usage| text_value(usage)),
+    );
+    set(
+        "description",
+        state
+            .description
+            .as_ref()
+            .map_or(NONE, |description| text_value(description)),
+    );
+    set(
+        "epilog",
+        state
+            .epilog
+            .as_ref()
+            .map_or(NONE, |epilog| text_value(epilog)),
+    );
+    set("formatter_class", state.formatter_class);
+    set("prefix_chars", text_value(&state.prefix_chars));
+    set(
+        "fromfile_prefix_chars",
+        state
+            .fromfile_prefix_chars
+            .as_ref()
+            .map_or(NONE, |chars| text_value(chars)),
+    );
+    set("argument_default", state.argument_default);
+    set("conflict_handler", text_value(&state.conflict_handler));
+    set("add_help", value::bool_value(state.add_help));
+    set("allow_abbrev", value::bool_value(state.allow_abbrev));
+    set("exit_on_error", value::bool_value(state.exit_on_error));
+    set(
+        "suggest_on_error",
+        value::bool_value(state.suggest_on_error),
+    );
+    set("color", value::bool_value(state.color));
+    crate::heap::release_roots(roots);
+}
+
+/// `ArgumentParser.__repr__`, matching CPython's `_AttributeHolder` format
+/// while omitting the internal native payload.
+fn parser_repr(instance: i64) -> i64 {
+    // CPython's `ArgumentParser._get_kwargs` reprs exactly these fields.
+    const FIELDS: [&str; 6] = [
+        "prog",
+        "usage",
+        "description",
+        "formatter_class",
+        "conflict_handler",
+        "add_help",
+    ];
+    let mut description = String::from("ArgumentParser(");
+    for (index, name) in FIELDS.iter().enumerate() {
+        if index > 0 {
+            description.push_str(", ");
+        }
+        description.push_str(name);
+        description.push('=');
+        let item = value::instance_attr(instance, name).unwrap_or(NONE);
+        description.push_str(&value::repr(item));
+    }
+    description.push(')');
+    text_value(&description)
+}
+
+// -------------------------------------------------------------------------
 // Module functions and constants
 // -------------------------------------------------------------------------
 
 pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
     match function {
-        "ArgumentParser" => new_parser(args),
+        "ArgumentParser" => new_parser_instance(args),
         "Namespace" => namespace_call(args, &[]),
         "FileType" => file_type(args),
         // `argparse._` is `gettext.gettext` (the identity translation).
@@ -252,6 +708,17 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
 /// Keyword-aware module call: only `Namespace(**kwargs)` takes keywords.
 pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     match function {
+        "ArgumentParser" => {
+            let instance = value::instance_new(argument_parser_class());
+            let roots = crate::heap::root_values(std::slice::from_ref(&instance));
+            let result = init_parser_instance(instance, args, keywords);
+            crate::heap::release_roots(roots);
+            if exc::pending() {
+                result
+            } else {
+                instance
+            }
+        }
         "Namespace" => namespace_call(args, keywords),
         _ => type_error(&format!(
             "argparse.{function}() does not accept keyword arguments"
@@ -267,11 +734,247 @@ fn namespace_call(args: &[i64], keywords: &[(String, i64)]) -> i64 {
             args.len()
         ));
     }
-    value::namespace_new(
-        keywords
+    namespace_instance(keywords)
+}
+
+/// Creates the cached `argparse.Namespace` class.
+fn namespace_class() -> i64 {
+    if let Some(class) = globals::registry_get(NAMESPACE_CLASS_KEY) {
+        return class;
+    }
+    let init = value::native_function_new("argparse", "Namespace.__init__", usize::MAX);
+    value::function_set_signature(
+        init,
+        vec![
+            self_param(),
+            ParamMeta {
+                name: "kwargs".to_string(),
+                kind: ParamKind::KwArg,
+                default: None,
+            },
+        ],
+    );
+    value::function_set_full_entry(init, namespace_init_entry as *const () as usize);
+    let mut methods: Vec<(String, i64, MethodKind)> =
+        vec![("__init__".to_string(), init, MethodKind::Normal)];
+    for (display, params, entry) in [
+        (
+            "__repr__",
+            vec![self_param()],
+            namespace_repr_entry as *const () as usize,
+        ),
+        (
+            "__eq__",
+            vec![
+                self_param(),
+                ParamMeta {
+                    name: "other".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+            ],
+            namespace_eq_entry as *const () as usize,
+        ),
+        (
+            "__ne__",
+            vec![
+                self_param(),
+                ParamMeta {
+                    name: "other".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+            ],
+            namespace_ne_entry as *const () as usize,
+        ),
+        (
+            "__contains__",
+            vec![
+                self_param(),
+                ParamMeta {
+                    name: "key".to_string(),
+                    kind: ParamKind::Positional,
+                    default: None,
+                },
+            ],
+            namespace_contains_entry as *const () as usize,
+        ),
+    ] {
+        let function =
+            value::native_function_new("argparse", namespace_member_name(display), usize::MAX);
+        value::function_set_signature(function, params);
+        value::function_set_full_entry(function, entry);
+        methods.push((display.to_string(), function, MethodKind::Normal));
+    }
+    if let Some(repr) = methods
+        .iter()
+        .find(|(name, _, _)| name == "__repr__")
+        .map(|(_, function, _)| *function)
+    {
+        methods.push(("__str__".to_string(), repr, MethodKind::Normal));
+    }
+    let roots = crate::heap::root_values(
+        &methods
             .iter()
-            .map(|(name, item)| (name.clone(), *item))
-            .collect(),
+            .map(|(_, function, _)| *function)
+            .collect::<Vec<_>>(),
+    );
+    let class = value::class_new_full("Namespace".to_string(), NONE, methods, Vec::new());
+    let class_roots = crate::heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(NAMESPACE_CLASS_KEY, class);
+    crate::heap::release_roots(class_roots);
+    crate::heap::release_roots(roots);
+    class
+}
+
+/// Builds a `Namespace` instance holding `pairs` as attributes.
+fn namespace_instance(pairs: &[(String, i64)]) -> i64 {
+    let class = namespace_class();
+    let instance = value::instance_new(class);
+    let values: Vec<i64> = pairs.iter().map(|(_, item)| *item).collect();
+    let roots = crate::heap::root_values(
+        &values
+            .iter()
+            .copied()
+            .chain(std::iter::once(instance))
+            .collect::<Vec<_>>(),
+    );
+    for (name, item) in pairs {
+        value::instance_setattr(instance, name.clone(), *item);
+    }
+    crate::heap::release_roots(roots);
+    instance
+}
+
+extern "C" fn namespace_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the signature is `(self, **kwargs)`.
+    let instance = unsafe { *argv };
+    if let Some(pairs) = unsafe { value::as_dict(*argv.add(1)) } {
+        let names: Vec<(String, i64)> = pairs
+            .iter()
+            .filter_map(|(key, item)| value::as_str(*key).map(|name| (name.to_string(), *item)))
+            .collect();
+        for (name, item) in names {
+            value::instance_setattr(instance, name, item);
+        }
+    }
+    NONE
+}
+
+fn namespace_attributes(instance: i64) -> Vec<(String, i64)> {
+    value::as_instance(instance)
+        .map(|state| state.attrs.snapshot())
+        .unwrap_or_default()
+}
+
+fn namespace_is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|character| character.is_alphanumeric() || character == '_')
+}
+
+extern "C" fn namespace_repr_entry(argv: *const i64) -> i64 {
+    let instance = unsafe { *argv };
+    let mut rendered = String::from("Namespace(");
+    let mut first = true;
+    let mut star_entries: Vec<(String, i64)> = Vec::new();
+    for (name, item) in namespace_attributes(instance) {
+        if name.starts_with('\u{0}') {
+            continue;
+        }
+        if namespace_is_identifier(&name) {
+            if !first {
+                rendered.push_str(", ");
+            }
+            first = false;
+            rendered.push_str(&name);
+            rendered.push('=');
+            rendered.push_str(&value::repr(item));
+        } else {
+            star_entries.push((name, item));
+        }
+    }
+    if !star_entries.is_empty() {
+        if !first {
+            rendered.push_str(", ");
+        }
+        rendered.push_str("**{");
+        for (index, (name, item)) in star_entries.into_iter().enumerate() {
+            if index > 0 {
+                rendered.push_str(", ");
+            }
+            rendered.push_str(&value::repr(text_value(&name)));
+            rendered.push_str(": ");
+            rendered.push_str(&value::repr(item));
+        }
+        rendered.push('}');
+    }
+    rendered.push(')');
+    text_value(&rendered)
+}
+
+fn namespace_equals(left: i64, right: i64) -> Option<bool> {
+    let right_class = value::instance_class_value(right)?;
+    if !value::is_subclass_of(right_class, namespace_class()) {
+        return None;
+    }
+    let left_attrs = namespace_attributes(left);
+    let right_attrs = namespace_attributes(right);
+    let visible = |pairs: &[(String, i64)]| {
+        pairs
+            .iter()
+            .filter(|(name, _)| !name.starts_with('\u{0}'))
+            .count()
+    };
+    if visible(&left_attrs) != visible(&right_attrs) {
+        return Some(false);
+    }
+    for (name, item) in &left_attrs {
+        if name.starts_with('\u{0}') {
+            continue;
+        }
+        let Some((_, other)) = right_attrs.iter().find(|(key, _)| key == name) else {
+            return Some(false);
+        };
+        if !crate::container::equals(*item, *other) {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+extern "C" fn namespace_eq_entry(argv: *const i64) -> i64 {
+    // SAFETY: the signature is `(self, other)`.
+    let left = unsafe { *argv };
+    let right = unsafe { *argv.add(1) };
+    match namespace_equals(left, right) {
+        Some(equal) => value::bool_value(equal),
+        None => value::NOT_IMPLEMENTED,
+    }
+}
+
+extern "C" fn namespace_ne_entry(argv: *const i64) -> i64 {
+    let left = unsafe { *argv };
+    let right = unsafe { *argv.add(1) };
+    match namespace_equals(left, right) {
+        Some(equal) => value::bool_value(!equal),
+        None => value::NOT_IMPLEMENTED,
+    }
+}
+
+extern "C" fn namespace_contains_entry(argv: *const i64) -> i64 {
+    let instance = unsafe { *argv };
+    let key = unsafe { *argv.add(1) };
+    let Some(name) = value::as_str(key) else {
+        return value::FALSE;
+    };
+    value::bool_value(
+        namespace_attributes(instance)
+            .iter()
+            .any(|(attribute, _)| attribute.as_str() == name),
     )
 }
 
@@ -310,13 +1013,15 @@ pub(crate) fn constant(name: &str) -> i64 {
         // `argparse.REMAINDER` is the literal string `"..."`, not a sentinel
         // object.
         "REMAINDER" => text_value("..."),
+        "ArgumentParser" => argument_parser_class(),
+        "Namespace" => namespace_class(),
         "RawTextHelpFormatter"
         | "RawDescriptionHelpFormatter"
         | "ArgumentDefaultsHelpFormatter"
         | "MetavarTypeHelpFormatter"
         | "HelpFormatter"
         | "Action"
-        | "BooleanOptionalAction" => value::class_new(name.to_string(), NONE, Vec::new()),
+        | "BooleanOptionalAction" => cached_module_class(name),
         // CPython's `PARSER` nargs sentinel.
         "PARSER" => text_value("A..."),
         // `argparse._sys` is the `sys` module value (`mock.patch` rewrites
@@ -330,6 +1035,21 @@ pub(crate) fn constant(name: &str) -> i64 {
             &format!("module 'argparse' has no attribute '{name}'"),
         ),
     }
+}
+
+/// Identity-stable classes for the help formatters and action base names.
+/// CPython treats these as singletons (`parser.formatter_class ==
+/// argparse.HelpFormatter`), and tests compare them with `is`.
+fn cached_module_class(name: &str) -> i64 {
+    let key = format!("argparse.{name}.class");
+    if let Some(class) = globals::registry_get(&key) {
+        return class;
+    }
+    let class = value::class_new(name.to_string(), NONE, Vec::new());
+    let roots = crate::heap::root_values(std::slice::from_ref(&class));
+    globals::registry_set(&key, class);
+    crate::heap::release_roots(roots);
+    class
 }
 
 // -------------------------------------------------------------------------
@@ -511,42 +1231,50 @@ fn opt_bool(argument: i64, default: bool) -> bool {
 /// both `ArgumentParser()` and `ArgumentParser(usage="...")` are valid and an
 /// omitted `usage` keeps the auto-generated usage line.
 fn new_parser(args: &[i64]) -> i64 {
+    // Internal construction already supplies the full 15-slot layout, so it
+    // bypasses `__init__`'s Python-level positional limit.
+    let instance = value::instance_new(argument_parser_class());
+    let roots = crate::heap::root_values(std::slice::from_ref(&instance));
+    let state = match build_parser_state(args) {
+        Ok(state) => state,
+        Err(error) => {
+            crate::heap::release_roots(roots);
+            return error;
+        }
+    };
+    let result = install_parser_state(instance, state);
+    crate::heap::release_roots(roots);
+    if result == NONE && exc::pending() {
+        return result;
+    }
+    instance
+}
+
+/// Builds the native definition from the 15 constructor parameter slots.
+fn build_parser_state(args: &[i64]) -> Result<ArgParserState, i64> {
     let arg = |index: usize| args.get(index).copied().unwrap_or(NONE);
-    let prog = match opt_str(arg(0), "prog must be str or None") {
-        Ok(prog) => prog,
-        Err(err) => return err,
-    };
-    let usage = match opt_str(arg(1), "usage must be str or None") {
-        Ok(usage) => usage,
-        Err(err) => return err,
-    };
-    let description = match opt_str(arg(2), "description must be str or None") {
-        Ok(description) => description,
-        Err(err) => return err,
-    };
-    let epilog = match opt_str(arg(3), "epilog must be str or None") {
-        Ok(epilog) => epilog,
-        Err(err) => return err,
-    };
+    let prog = opt_str(arg(0), "prog must be str or None")?;
+    let usage = opt_str(arg(1), "usage must be str or None")?;
+    let description = opt_str(arg(2), "description must be str or None")?;
+    let epilog = opt_str(arg(3), "epilog must be str or None")?;
     let mut prefix_chars = match opt_str(arg(6), "prefix_chars must be str or None") {
         Ok(Some(text)) => text,
         Ok(None) => "-".to_string(),
-        Err(err) => return err,
+        Err(err) => return Err(err),
     };
     if prefix_chars.is_empty() {
-        return value_error("prefix_chars must not be empty");
+        return Err(value_error("prefix_chars must not be empty"));
     }
-    let fromfile_prefix_chars = match opt_str(arg(7), "fromfile_prefix_chars must be str or None") {
-        Ok(chars) => chars,
-        Err(err) => return err,
-    };
+    let fromfile_prefix_chars = opt_str(arg(7), "fromfile_prefix_chars must be str or None")?;
     let conflict_handler = match opt_str(arg(9), "conflict_handler must be str or None") {
         Ok(Some(handler)) => handler,
         Ok(None) => "error".to_string(),
-        Err(err) => return err,
+        Err(err) => return Err(err),
     };
     if conflict_handler != "error" && conflict_handler != "resolve" {
-        return value_error(&format!("unknown conflict_handler '{conflict_handler}'"));
+        return Err(value_error(&format!(
+            "unknown conflict_handler '{conflict_handler}'"
+        )));
     }
 
     // The help action's SUPPRESS default is the only tagged value created
@@ -558,7 +1286,11 @@ fn new_parser(args: &[i64]) -> i64 {
     let mut state = ArgParserState::new(prog.clone(), description);
     state.usage = usage;
     state.epilog = epilog;
-    state.formatter_class = arg(5);
+    state.formatter_class = if arg(5) == NONE {
+        cached_module_class("HelpFormatter")
+    } else {
+        arg(5)
+    };
     state.prefix_chars = std::mem::take(&mut prefix_chars);
     state.fromfile_prefix_chars = fromfile_prefix_chars;
     state.argument_default = arg(8);
@@ -566,7 +1298,8 @@ fn new_parser(args: &[i64]) -> i64 {
     state.add_help = opt_bool(arg(10), true);
     state.allow_abbrev = opt_bool(arg(11), true);
     state.exit_on_error = opt_bool(arg(12), true);
-    state.color = opt_bool(arg(13), true);
+    state.suggest_on_error = opt_bool(arg(13), false);
+    state.color = opt_bool(arg(14), true);
     if state.prog.is_none() {
         state.prog = Some(default_prog());
     }
@@ -583,11 +1316,13 @@ fn new_parser(args: &[i64]) -> i64 {
         } else if let Some(items) = value::as_tuple(parents) {
             items.to_vec()
         } else {
-            return type_error("parents must be a list or tuple of ArgumentParser objects");
+            return Err(type_error(
+                "parents must be a list or tuple of ArgumentParser objects",
+            ));
         };
         for parent in entries {
-            let Some(parent_state) = value::as_arg_parser(parent) else {
-                return type_error("parents entries must be ArgumentParser objects");
+            let Some(parent_state) = parser_ref(parent) else {
+                return Err(type_error("parents entries must be ArgumentParser objects"));
             };
             for spec in &parent_state.options {
                 if spec.action == ActionKind::Help {
@@ -610,7 +1345,7 @@ fn new_parser(args: &[i64]) -> i64 {
         }
     }
 
-    value::arg_parser_new(state)
+    Ok(state)
 }
 
 /// The default `prog`: the basename of `sys.argv[0]`, like CPython.
@@ -686,7 +1421,7 @@ fn handle_parts(obj: i64) -> Option<(i64, usize, String)> {
 
 /// Method dispatch without keywords.
 pub(crate) fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
-    if value::as_arg_parser(obj).is_none() {
+    if parser_ref(obj).is_none() {
         return attribute_error(name);
     }
     match name {
@@ -715,7 +1450,7 @@ pub(crate) fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
 
 /// Method dispatch with keywords.
 pub(crate) fn method_kw(obj: i64, name: &str, args: &mut [i64], keywords: &KeywordArgs) -> i64 {
-    if value::as_arg_parser(obj).is_none() {
+    if parser_ref(obj).is_none() {
         return attribute_error(name);
     }
     match name {
@@ -812,7 +1547,7 @@ pub(crate) fn handle_method_kw(
 }
 
 fn set_test_mode(parser: i64) -> i64 {
-    if let Some(mut state) = value::arg_parser_mut(parser) {
+    if let Some(mut state) = parser_mut(parser) {
         state.test_mode = true;
     }
     NONE
@@ -928,7 +1663,7 @@ fn choices_from_value(value: i64) -> Result<Option<Vec<i64>>, i64> {
 }
 
 fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: usize) -> i64 {
-    let Some(state) = value::as_arg_parser(parser) else {
+    let Some(state) = parser_ref(parser) else {
         return attribute_error("add_argument");
     };
     let prefixes = state.prefix_chars.clone();
@@ -1107,7 +1842,7 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
     let mut conflict: Option<String> = None;
     let mut replaced = false;
     {
-        let Some(mut parser_state) = value::arg_parser_mut(parser) else {
+        let Some(mut parser_state) = parser_mut(parser) else {
             return attribute_error("add_argument");
         };
         if let Some(position) = parser_state.options.iter().position(|existing| {
@@ -1160,17 +1895,20 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
     }
 
     if spec.type_fn != NONE {
-        crate::heap::write_barrier_edge(parser, spec.type_fn);
+        crate::heap::write_barrier_edge(parser_state_value(parser).unwrap_or(parser), spec.type_fn);
     }
     if spec.default != NONE {
-        crate::heap::write_barrier_edge(parser, spec.default);
+        crate::heap::write_barrier_edge(parser_state_value(parser).unwrap_or(parser), spec.default);
     }
     if spec.const_value != NONE {
-        crate::heap::write_barrier_edge(parser, spec.const_value);
+        crate::heap::write_barrier_edge(
+            parser_state_value(parser).unwrap_or(parser),
+            spec.const_value,
+        );
     }
     if let Some(items) = choices {
         for item in items {
-            crate::heap::write_barrier_edge(parser, item);
+            crate::heap::write_barrier_edge(parser_state_value(parser).unwrap_or(parser), item);
         }
     }
     NONE
@@ -1238,7 +1976,7 @@ fn add_argument_group(
         members: Vec::new(),
     };
     let index = {
-        let Some(mut state) = value::arg_parser_mut(parser) else {
+        let Some(mut state) = parser_mut(parser) else {
             return attribute_error("add_argument_group");
         };
         let index = state.groups.len();
@@ -1303,13 +2041,13 @@ fn add_subparsers(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 
             _ => return type_error("add_subparsers() takes at most one positional argument"),
         }
     }
-    if value::as_arg_parser(parser).is_none() {
+    if parser_ref(parser).is_none() {
         return attribute_error("add_subparsers");
     }
-    if value::as_arg_parser(parser).is_some_and(|state| state.subparsers.is_some()) {
+    if parser_ref(parser).is_some_and(|state| state.subparsers.is_some()) {
         return type_error("cannot have multiple subparser arguments");
     }
-    let Some(mut state) = value::arg_parser_mut(parser) else {
+    let Some(mut state) = parser_mut(parser) else {
         return attribute_error("add_subparsers");
     };
     state.subparsers = Some(SubparsersState {
@@ -1332,7 +2070,7 @@ fn add_parser(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     let Some(name) = value::as_str(name_value).map(str::to_string) else {
         return type_error("add_parser() name must be str");
     };
-    let mut slots = vec![NONE; 14];
+    let mut slots = vec![NONE; 15];
     let mut help_text = String::new();
     let mut explicit_prog = false;
     for (keyword, argument) in keywords {
@@ -1353,7 +2091,8 @@ fn add_parser(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
             "add_help" => slots[10] = *argument,
             "allow_abbrev" => slots[11] = *argument,
             "exit_on_error" => slots[12] = *argument,
-            "color" => slots[13] = *argument,
+            "suggest_on_error" => slots[13] = *argument,
+            "color" => slots[14] = *argument,
             "help" => match value::as_str(*argument) {
                 Some(text) => help_text = text.to_string(),
                 None => return type_error("add_parser() help must be str"),
@@ -1365,7 +2104,7 @@ fn add_parser(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
             }
         }
     }
-    let Some(parent) = value::as_arg_parser(parser) else {
+    let Some(parent) = parser_ref(parser) else {
         return attribute_error("add_parser");
     };
     let parent_prog = parent.prog.clone().unwrap_or_else(default_prog);
@@ -1385,7 +2124,7 @@ fn add_parser(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     }
     let mut conflict = false;
     {
-        let Some(mut state) = value::arg_parser_mut(parser) else {
+        let Some(mut state) = parser_mut(parser) else {
             return attribute_error("add_parser");
         };
         match state.subparsers.as_mut() {
@@ -1406,7 +2145,7 @@ fn add_parser(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     if conflict {
         return value_error(&format!("conflicting subparser: {name}"));
     }
-    crate::heap::write_barrier_edge(parser, child);
+    crate::heap::write_barrier_edge(parser_state_value(parser).unwrap_or(parser), child);
     child
 }
 
@@ -1424,14 +2163,14 @@ fn set_defaults(parser: i64, keywords: &[(String, i64)]) -> i64 {
     for (name, item) in keywords {
         updates.push((name.clone(), *item));
     }
-    if let Some(mut state) = value::arg_parser_mut(parser) {
+    if let Some(mut state) = parser_mut(parser) {
         for (name, item) in &updates {
             upsert(&mut state.defaults, name, *item);
         }
     }
     for (_, item) in updates {
         if item != NONE {
-            crate::heap::write_barrier_edge(parser, item);
+            crate::heap::write_barrier_edge(parser_state_value(parser).unwrap_or(parser), item);
         }
     }
     NONE
@@ -1445,7 +2184,7 @@ fn get_default(parser: i64, args: &[i64]) -> i64 {
     let Some(dest) = value::as_str(argument) else {
         return type_error("get_default() dest must be str");
     };
-    let Some(state) = value::as_arg_parser(parser) else {
+    let Some(state) = parser_ref(parser) else {
         return attribute_error("get_default");
     };
     if let Some((_, item)) = state
@@ -1520,7 +2259,7 @@ impl View {
 }
 
 fn view(parser: i64) -> Option<View> {
-    let state = value::as_arg_parser(parser)?;
+    let state = parser_ref(parser)?;
     Some(View {
         prog: state.prog.clone().unwrap_or_else(default_prog),
         usage: state.usage.clone(),
@@ -1815,23 +2554,28 @@ fn argument_tokens(argv: i64, roots: i64) -> Result<Vec<i64>, i64> {
 
 fn merge_namespace(namespace: i64, pairs: &[(String, i64)]) -> i64 {
     if namespace == NONE {
-        return value::namespace_new(pairs.to_vec());
+        return namespace_instance(pairs);
     }
-    if value::as_namespace(namespace).is_none() {
-        return type_error(&format!(
-            "namespace must be a Namespace, not {}",
-            value::type_name(namespace)
-        ));
-    }
+    // CPython writes every parsed value with `setattr`, so any object with a
+    // writable attribute namespace is accepted (`parse_args(namespace=NS())`).
     if let Some(mut state) = value::namespace_pairs_mut(namespace) {
         for (name, item) in pairs {
             upsert(&mut state.pairs, name, *item);
         }
+        return namespace;
     }
-    for (_, item) in pairs {
-        crate::heap::write_barrier_edge(namespace, *item);
+    if value::as_instance(namespace).is_some() {
+        let roots = crate::heap::root_values(std::slice::from_ref(&namespace));
+        for (name, item) in pairs {
+            value::instance_setattr(namespace, name.clone(), *item);
+        }
+        crate::heap::release_roots(roots);
+        return namespace;
     }
-    namespace
+    type_error(&format!(
+        "namespace must be a Namespace, not {}",
+        value::type_name(namespace)
+    ))
 }
 
 struct Scan<'a> {
@@ -3196,7 +3940,7 @@ fn wrap_text(text: &str, width: usize, indent: usize) -> String {
 
 /// Data attributes of an `ArgumentParser`.
 pub(crate) fn parser_attr(obj: i64, attr: &str) -> Option<i64> {
-    let state = value::as_arg_parser(obj)?;
+    let state = parser_ref(obj)?;
     match attr {
         "prog" => Some(match &state.prog {
             Some(prog) => text_value(prog),
@@ -3233,6 +3977,11 @@ pub(crate) fn parser_attr(obj: i64, attr: &str) -> Option<i64> {
             value::FALSE
         }),
         "exit_on_error" => Some(if state.exit_on_error {
+            value::TRUE
+        } else {
+            value::FALSE
+        }),
+        "suggest_on_error" => Some(if state.suggest_on_error {
             value::TRUE
         } else {
             value::FALSE
@@ -3294,7 +4043,7 @@ mod tests {
         // from `prog` and the `-h` action.
         let parser = new_parser(&[text_value("demo")]);
         assert!(!exc::pending());
-        let state = value::as_arg_parser(parser).expect("parser");
+        let state = parser_ref(parser).expect("parser");
         assert!(state.usage.is_none());
         assert_eq!(state.prog.as_deref(), Some("demo"));
         assert!(state.add_help);
@@ -3308,7 +4057,7 @@ mod tests {
         // No arguments at all is equally valid.
         let parser = new_parser(&[]);
         assert!(!exc::pending());
-        let state = value::as_arg_parser(parser).expect("parser");
+        let state = parser_ref(parser).expect("parser");
         assert!(state.usage.is_none());
         assert!(state.prog.is_some());
     }
@@ -3316,7 +4065,7 @@ mod tests {
     #[test]
     fn argument_parser_accepts_every_documented_keyword() {
         exc::init();
-        let mut slots = vec![NONE; 14];
+        let mut slots = vec![NONE; 15];
         slots[0] = text_value("demo");
         slots[1] = text_value("%(prog)s [opts]");
         slots[2] = text_value("description");
@@ -3329,10 +4078,11 @@ mod tests {
         slots[10] = value::FALSE; // add_help
         slots[11] = value::FALSE; // allow_abbrev
         slots[12] = value::FALSE; // exit_on_error
-        slots[13] = value::FALSE; // color
+        slots[13] = value::FALSE; // suggest_on_error
+        slots[14] = value::FALSE; // color
         let parser = new_parser(&slots);
         assert!(!exc::pending());
-        let state = value::as_arg_parser(parser).expect("parser");
+        let state = parser_ref(parser).expect("parser");
         assert_eq!(state.usage.as_deref(), Some("%(prog)s [opts]"));
         assert_eq!(state.description.as_deref(), Some("description"));
         assert_eq!(state.epilog.as_deref(), Some("epilog"));

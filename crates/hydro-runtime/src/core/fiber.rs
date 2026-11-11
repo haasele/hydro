@@ -39,7 +39,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::exc::{
-    self, ATTRIBUTE_ERROR, RECURSION_ERROR, RUNTIME_ERROR, STOP_ITERATION, TYPE_ERROR, VALUE_ERROR,
+    self, ATTRIBUTE_ERROR, RECURSION_ERROR, RUNTIME_ERROR, STOP_ASYNC_ITERATION, STOP_ITERATION,
+    TYPE_ERROR, VALUE_ERROR,
 };
 use crate::gc::roots::{self, SavedRoots};
 use crate::value::{self, NONE};
@@ -364,6 +365,9 @@ pub(crate) struct FiberState {
     /// `close()` is driving the fiber; a `yield` that resumes afterwards is
     /// an ignored `GeneratorExit`.
     pub(crate) closing: bool,
+    /// The fiber's own handled-exception stack, parked while the resumer
+    /// runs (CPython's `gi_exc_state`/`cr_exc_state`).
+    pub(crate) handled: Vec<i64>,
     /// Outstanding suspension request, if any.
     pub(crate) request: Option<WaitRequest>,
     /// Lifetime conservative root range: the private stack.
@@ -450,6 +454,7 @@ impl FiberState {
             cancelled: false,
             await_depth: 0,
             closing: false,
+            handled: Vec::new(),
             request: None,
             stack_root_lo: stack_lo,
             stack_root_hi: stack_hi,
@@ -500,6 +505,9 @@ impl FiberState {
         mark(self.error);
         mark(self.sent);
         mark(self.awaiting);
+        for &handled in &self.handled {
+            mark(handled);
+        }
         if let Some(injected) = self.injected {
             mark(injected);
         }
@@ -739,6 +747,23 @@ fn next_finish_seq() -> u64 {
     NEXT_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// PEP 479 message for a `StopIteration`/`StopAsyncIteration` that escaped a
+/// fiber body, or `None` when the exception propagates unchanged.
+///
+/// CPython distinguishes the three fiber kinds because the message ends up in
+/// the `RuntimeError` users see (`stopiteration_error`).
+fn pep479_message(kind: FiberKind, tag: u32) -> Option<&'static str> {
+    match (kind, tag) {
+        (FiberKind::Generator, STOP_ITERATION) => Some("generator raised StopIteration"),
+        (FiberKind::Coroutine, STOP_ITERATION) => Some("coroutine raised StopIteration"),
+        (FiberKind::AsyncGenerator, STOP_ITERATION) => Some("async generator raised StopIteration"),
+        (FiberKind::AsyncGenerator, STOP_ASYNC_ITERATION) => {
+            Some("async generator raised StopAsyncIteration")
+        }
+        _ => None,
+    }
+}
+
 /// Entry point of every fiber stack. Reads the active fiber from the
 /// thread-local installed by [`resume_raw`] (never through varargs), calls the
 /// generated trampoline, records the result or pending exception, and swaps
@@ -759,7 +784,16 @@ extern "C" fn fiber_trampoline() {
     unsafe {
         (*ptr).result = result;
         if exc::pending() {
-            let error = exc::pending_value();
+            let mut error = exc::pending_value();
+            let kind = (*ptr).kind;
+            // PEP 479 (CPython's `stopiteration_error`): a StopIteration
+            // escaping a generator body never reaches the caller.
+            if let Some(message) =
+                value::exception_data(error).and_then(|data| pep479_message(kind, data.tag))
+            {
+                exc::raise_generator_stop(error, message);
+                error = exc::pending_value();
+            }
             (*ptr).error = error;
             if value::exception_data(error).map(|data| data.tag) == Some(exc::CANCELLED_ERROR) {
                 (*ptr).cancelled = true;
@@ -949,11 +983,18 @@ pub(crate) unsafe fn resume_raw(ptr: *mut FiberState, value: i64) -> bool {
             }
         }
         let outer = CURRENT.with(|cell| cell.replace(Some(CurrentFiber { ptr, value })));
+        // CPython swaps `tstate->exc_info` to the fiber's own exception state
+        // for the duration of a resume (`gi_exc_state`/`cr_exc_state`), and
+        // parks the caller's stack behind it. Restore ours, park theirs.
+        exc::enter_fiber_handlers(std::mem::take(&mut (*ptr).handled));
         // Resume: save the caller's continuation into `caller_ctx` and switch
         // to the fiber's `ctx` (the trampoline entry on first resume, the
         // suspension point afterwards).
         switch_to_fiber(ptr);
         CURRENT.with(|cell| cell.set(outer));
+        // The fiber suspended or finished: park its handler stack again and
+        // make the caller's current.
+        (*ptr).handled = exc::leave_fiber_handlers();
         if (*ptr).kind != FiberKind::Generator {
             AWAIT_DEPTH.with(|cell| cell.set(resume_depth));
         }
@@ -999,12 +1040,16 @@ pub(crate) fn result_value(value: i64) -> i64 {
 }
 
 /// Re-raises the exception a fiber captured and returns `None`.
+///
+/// The exception was raised inside the fiber and already carries the context
+/// the generator body gave it. Propagating it to the resumer is CPython's
+/// `_PyErr_Restore`, which never chains to the resumer's handled exception.
 pub(crate) fn raise_error(value: i64) -> i64 {
     let error = value::as_fiber(value)
         .map(|fiber| fiber.error)
         .unwrap_or(NONE);
     if error != NONE {
-        exc::raise_value(error);
+        exc::raise_value_unchained(error);
     }
     NONE
 }
@@ -1039,11 +1084,15 @@ pub(crate) fn current_ptr() -> Option<*mut FiberState> {
     CURRENT.with(Cell::get).map(|current| current.ptr)
 }
 
-/// Re-raises a detached exception value. The value is rooted while the
-/// runtime clones it into the pending slot (the clone allocates).
+/// Re-raises an exception injected at the fiber's suspension point.
+///
+/// CPython's `gen_send_ex2` swaps to the generator's exception state and calls
+/// `_PyErr_ChainStackItem`, which chains only to the *generator's* handled
+/// exception (usually none), never to the caller's. Identity is preserved
+/// whenever no context has to be attached.
 fn raise_detached(error: i64) -> i64 {
     let token = crate::heap::root_values(&[error]);
-    exc::raise_value(error);
+    exc::raise_injected(error, exc::handled_own());
     crate::heap::release_roots(token);
     NONE
 }
@@ -1169,7 +1218,9 @@ pub(crate) fn send_value(generator: i64, value: i64) -> i64 {
             return raise_error(generator);
         }
         if (*ptr).done {
-            return exc::raise_with_message(STOP_ITERATION, "");
+            // The resume that finished the body returns its value through
+            // `StopIteration.value` (`_PyGen_SetStopIterationValue`).
+            return exc::raise_stop_iteration((*ptr).result);
         }
         (*ptr).yielded
     }
@@ -1203,14 +1254,18 @@ pub(crate) fn throw_value(generator: i64, exception: i64) -> i64 {
     // SAFETY: `fiber_raw` returned a live fiber payload.
     unsafe {
         if (*ptr).done {
-            return exc::raise_with_message(STOP_ITERATION, "");
+            // CPython's `gen_send_ex` on a finished frame restores the thrown
+            // exception unchanged; no return value is manufactured.
+            return exc::raise_value_unchained(exception);
         }
         if !(*ptr).started {
             // Throwing into a just-started generator raises the exception
-            // without running the body and closes the generator.
+            // without running the body and closes the generator. The
+            // generator's own exception state is empty, so the value keeps
+            // its (absent) context.
             (*ptr).done = true;
             (*ptr).finish_seq = next_finish_seq();
-            return exc::raise_value(exception);
+            return exc::raise_value_unchained(exception);
         }
         (*ptr).injected = Some(exception);
         resume_raw(ptr, NONE);
@@ -1218,7 +1273,7 @@ pub(crate) fn throw_value(generator: i64, exception: i64) -> i64 {
             return raise_error(generator);
         }
         if (*ptr).done {
-            return exc::raise_with_message(STOP_ITERATION, "");
+            return exc::raise_stop_iteration((*ptr).result);
         }
         (*ptr).yielded
     }
@@ -1256,7 +1311,7 @@ pub(crate) fn close_value(generator: i64) -> i64 {
                 (*ptr).closing = false;
                 return NONE;
             }
-            exc::raise_value(error);
+            exc::raise_value_unchained(error);
             return NONE;
         }
         if (*ptr).done {
@@ -1405,7 +1460,7 @@ pub(crate) fn athrow_value(agen: i64, exception: i64) -> i64 {
         if !(*ptr).started {
             (*ptr).done = true;
             (*ptr).finish_seq = next_finish_seq();
-            return exc::raise_value(exception);
+            return exc::raise_value_unchained(exception);
         }
         (*ptr).injected = Some(exception);
     }
@@ -1447,10 +1502,10 @@ pub(crate) fn aclose_value(agen: i64) -> i64 {
                 unsafe { (*ptr).closing = false };
                 return NONE;
             }
-            // `error` was detached from the fiber, so root it while
-            // `raise_value` allocates the pending copy.
+            // `error` was detached from the fiber, so root it while the
+            // pending slot takes it.
             let token = crate::heap::root_values(&[error]);
-            exc::raise_value(error);
+            exc::raise_value_unchained(error);
             crate::heap::release_roots(token);
             return NONE;
         }
@@ -1554,40 +1609,104 @@ enum DelegateStep {
 }
 
 /// Maps a pending delegate completion to [`DelegateStep::Done`]. A pending
-/// `StopIteration` is the normal end of iteration; every other exception
-/// propagates unchanged.
-fn finish_delegate(delegate: i64) -> DelegateStep {
+/// `StopIteration` is the normal end of iteration and carries the delegate's
+/// return value in its `value` member; every other exception propagates.
+fn finish_delegate() -> DelegateStep {
     if exc::pending_tag() == STOP_ITERATION as i64 {
+        let exception = exc::pending_value();
+        let value = exc::exception_attr(exception, "value").unwrap_or(NONE);
         let _ = exc::clear();
-        DelegateStep::Done(result_value(delegate))
+        DelegateStep::Done(value)
     } else {
         DelegateStep::Failed
     }
 }
 
+/// One PEP 380 delegation method (`send`, `throw` or `close`).
+enum DelegateMethod {
+    /// The delegate exposes the method; it is a bound callable.
+    Present(i64),
+    /// The attribute does not exist (the caller decides what that means).
+    Missing,
+    /// The attribute lookup raised; the exception is pending.
+    Failed,
+}
+
+/// Resolves `name` on a `yield from` delegate without raising for a missing
+/// attribute. A lookup that raises anything other than `AttributeError` is
+/// reported through [`DelegateMethod::Failed`], matching PEP 380's use of
+/// `getattr(..., None)`.
+fn delegate_method(delegate: i64, name: &str) -> DelegateMethod {
+    let method = crate::core::methods::getattr(delegate, name.as_ptr(), name.len());
+    if exc::pending() {
+        if exc::pending_tag() == ATTRIBUTE_ERROR as i64 {
+            let _ = exc::clear();
+            return DelegateMethod::Missing;
+        }
+        return DelegateMethod::Failed;
+    }
+    if method == NONE {
+        DelegateMethod::Missing
+    } else {
+        DelegateMethod::Present(method)
+    }
+}
+
+/// Calls a delegate method with one argument and maps its outcome to a
+/// [`DelegateStep`]. `StopIteration` ends the delegation with its `value`.
+fn call_delegate(method: i64, argument: i64) -> DelegateStep {
+    let roots = crate::heap::root_values(&[method, argument]);
+    let arguments = [argument];
+    let item = crate::core::builtins::call(method, 1, arguments.as_ptr());
+    let failed = exc::pending();
+    crate::heap::release_roots(roots);
+    if failed {
+        finish_delegate()
+    } else {
+        DelegateStep::Item(item)
+    }
+}
+
+/// Calls a no-argument delegate method (`close`). Returns whether an
+/// exception is pending; the caller propagates it.
+fn call_delegate_no_args(method: i64) -> bool {
+    let roots = crate::heap::root_values(&[method]);
+    let _ = crate::core::builtins::call(method, 0, std::ptr::null());
+    let failed = exc::pending();
+    crate::heap::release_roots(roots);
+    failed
+}
+
 /// Advances a `yield from` delegate by one step, forwarding `sent`.
 ///
 /// A delegated generator uses the same `send` semantics as a Python call
-/// (including `StopIteration` on completion and exception propagation); a
-/// plain iterator only accepts `None`, mirroring CPython (`send` on an
-/// iterator without a `send` method).
+/// (including `StopIteration` on completion and exception propagation). Any
+/// other delegate follows PEP 380: `next()` while the sent value is `None`,
+/// otherwise its `send` method. Only a genuinely absent `send` raises
+/// `AttributeError`.
 fn advance_delegate(delegate: i64, is_generator: bool, sent: i64) -> DelegateStep {
     if is_generator {
         let item = send_value(delegate, sent);
         if exc::pending() {
-            return finish_delegate(delegate);
+            return finish_delegate();
         }
         return DelegateStep::Item(item);
     }
     if sent != NONE {
-        exc::raise_with_message(
-            ATTRIBUTE_ERROR,
-            &format!(
-                "'{}' object has no attribute 'send'",
-                value::type_name(delegate)
-            ),
-        );
-        return DelegateStep::Failed;
+        return match delegate_method(delegate, "send") {
+            DelegateMethod::Present(method) => call_delegate(method, sent),
+            DelegateMethod::Missing => {
+                exc::raise_with_message(
+                    ATTRIBUTE_ERROR,
+                    &format!(
+                        "'{}' object has no attribute 'send'",
+                        value::type_name(delegate)
+                    ),
+                );
+                DelegateStep::Failed
+            }
+            DelegateMethod::Failed => DelegateStep::Failed,
+        };
     }
     // A user iterator's `StopIteration(value)` carries the delegation result.
     // `iter::iter_next` deliberately clears that exception for ordinary
@@ -1599,15 +1718,7 @@ fn advance_delegate(delegate: i64, is_generator: bool, sent: i64) -> DelegateSte
             let arguments = [delegate];
             let item = crate::core::builtins::call(function, 1, arguments.as_ptr());
             if exc::pending() {
-                if exc::pending_tag() == STOP_ITERATION as i64 {
-                    let exception = exc::pending_value();
-                    let value = value::exception_data(exception)
-                        .and_then(|data| data.arg_values.first().copied())
-                        .unwrap_or(NONE);
-                    let _ = exc::clear();
-                    return DelegateStep::Done(value);
-                }
-                return DelegateStep::Failed;
+                return finish_delegate();
             }
             return DelegateStep::Item(item);
         }
@@ -1616,30 +1727,33 @@ fn advance_delegate(delegate: i64, is_generator: bool, sent: i64) -> DelegateSte
     if crate::iter::iter_next(delegate, &mut out) == 1 {
         DelegateStep::Item(out)
     } else if exc::pending() {
-        if exc::pending_tag() == STOP_ITERATION as i64 {
-            // A plain iterator signals its return value through
-            // `StopIteration(value)`, not through a fiber result.
-            let exception = exc::pending_value();
-            let value = value::exception_data(exception)
-                .and_then(|data| data.arg_values.first().copied())
-                .unwrap_or(NONE);
-            let _ = exc::clear();
-            DelegateStep::Done(value)
-        } else {
-            DelegateStep::Failed
-        }
+        finish_delegate()
     } else {
         DelegateStep::Done(NONE)
     }
 }
 
-/// Forwards an injected exception into a delegated generator.
-fn throw_delegate(delegate: i64, exception: i64) -> DelegateStep {
-    let item = throw_value(delegate, exception);
-    if exc::pending() {
-        return finish_delegate(delegate);
+/// Forwards an injected exception into a `yield from` delegate.
+///
+/// A generator receives `throw()`; any other object uses its own `throw`
+/// method when it has one, and otherwise the exception propagates unchanged
+/// through the outer generator (PEP 380's bare `raise`).
+fn throw_delegate(delegate: i64, is_generator: bool, exception: i64) -> DelegateStep {
+    if is_generator {
+        let item = throw_value(delegate, exception);
+        if exc::pending() {
+            return finish_delegate();
+        }
+        return DelegateStep::Item(item);
     }
-    DelegateStep::Item(item)
+    match delegate_method(delegate, "throw") {
+        DelegateMethod::Present(method) => call_delegate(method, exception),
+        DelegateMethod::Missing => {
+            exc::raise_value_unchained(exception);
+            DelegateStep::Failed
+        }
+        DelegateMethod::Failed => DelegateStep::Failed,
+    }
 }
 
 /// `yield from iterable`: drives `iterable` from the running generator.
@@ -1697,25 +1811,33 @@ pub(crate) fn yield_from_value(iterable: i64) -> i64 {
         let exception = exc::pending_value();
         let tag = exc::pending_tag();
         let _ = exc::clear();
-        if !delegate_is_generator {
-            // A plain iterator has no `throw`/`close`: the exception
-            // propagates in the outer generator.
-            exc::raise_value(exception);
-            return NONE;
-        }
         if tag == exc::GENERATOR_EXIT as i64 {
             // `close()`: close the delegate first so its `finally` blocks
             // run, then re-raise GeneratorExit through the outer generator.
-            close_value(delegate);
-            if exc::pending() {
-                return NONE;
+            if delegate_is_generator {
+                close_value(delegate);
+                if exc::pending() {
+                    return NONE;
+                }
+            } else {
+                // PEP 380 also closes a non-generator delegate that exposes
+                // `close`; a missing method just skips this step.
+                match delegate_method(delegate, "close") {
+                    DelegateMethod::Present(method) => {
+                        if call_delegate_no_args(method) {
+                            return NONE;
+                        }
+                    }
+                    DelegateMethod::Missing => {}
+                    DelegateMethod::Failed => return NONE,
+                }
             }
-            exc::raise_value(exception);
+            exc::raise_value_unchained(exception);
             return NONE;
         }
         // `throw()`: forward the exception; a value yielded by the delegate's
         // handler is yielded again by the outer generator.
-        pending_item = match throw_delegate(delegate, exception) {
+        pending_item = match throw_delegate(delegate, delegate_is_generator, exception) {
             DelegateStep::Item(item) => Some(item),
             DelegateStep::Done(value) => return value,
             DelegateStep::Failed => return NONE,

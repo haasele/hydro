@@ -54,7 +54,11 @@ use std::sync::LazyLock;
 use hydro_ir::{MethodKind, ParamKind};
 
 use crate::core::{globals, iter, methods};
-use crate::exc::{self, ATTRIBUTE_ERROR, OS_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::exc::{
+    self, ATTRIBUTE_ERROR, FILE_EXISTS_ERROR, FILE_NOT_FOUND_ERROR, IS_A_DIRECTORY_ERROR,
+    NOT_A_DIRECTORY_ERROR, OS_ERROR, PERMISSION_ERROR, RESOURCE_WARNING, STOP_ITERATION,
+    TYPE_ERROR, VALUE_ERROR,
+};
 use crate::heap;
 use crate::value::{self, ParamMeta, FALSE, NONE, TRUE};
 
@@ -97,15 +101,30 @@ fn gettempdir() -> i64 {
             if let Some(bytes) = value::as_bytes(dir) {
                 return value::str_alloc(String::from_utf8_lossy(bytes).into_owned());
             }
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "tempfile.tempdir must be str or bytes, not {}",
+                    value::type_name(dir)
+                ),
+            );
         }
     }
-    const KEY: &str = "tempfile.gettempdir.value";
-    if let Some(cached) = globals::registry_get(KEY) {
-        return cached;
+    // `_gettempdir()` resolves the default once and stores it back into
+    // `tempfile.tempdir`; an explicit `tempdir = None` forces a new probe.
+    let resolved = get_default_tempdir(&[]);
+    if exc::pending() {
+        return NONE;
     }
-    let text = value::str_alloc(TEMP_DIR.as_str().to_string());
+    let text = match value::as_str(resolved) {
+        Some(text) => value::str_alloc(text.to_string()),
+        None => match value::as_bytes(resolved) {
+            Some(bytes) => value::str_alloc(String::from_utf8_lossy(bytes).into_owned()),
+            None => return NONE,
+        },
+    };
     let roots = heap::root_values(&[text]);
-    globals::registry_set(KEY, text);
+    globals::set_attribute_override("tempfile", "tempdir", text);
     heap::release_roots(roots);
     text
 }
@@ -120,14 +139,26 @@ fn gettempdirb() -> i64 {
             if let Some(text) = value::as_str(dir) {
                 return value::bytes_new(text.as_bytes().to_vec());
             }
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "tempfile.tempdir must be str or bytes, not {}",
+                    value::type_name(dir)
+                ),
+            );
         }
     }
-    value::bytes_new(TEMP_DIR.as_str().as_bytes().to_vec())
+    let text = gettempdir();
+    if exc::pending() {
+        return NONE;
+    }
+    let text = value::as_str(text).unwrap_or_default();
+    value::bytes_new(text.as_bytes().to_vec())
 }
 
 /// Creates a directory named `prefix + <random> + suffix` below `dir`.
-fn create_temp_dir(prefix: &str, suffix: &str, dir: Option<&str>) -> io::Result<PathBuf> {
-    let base = base_dir(dir.map(str::to_string));
+fn create_temp_dir(prefix: &str, suffix: &str, dir: Option<&str>) -> Result<PathBuf, TempError> {
+    let base = base_dir(dir.map(str::to_string)).map_err(TempError::Raised)?;
     exclusive_temp_dir(&base, prefix, suffix)
 }
 
@@ -142,39 +173,54 @@ fn restrict_permissions(path: &Path) {
     let _ = path;
 }
 
-/// Reads an optional `str`/`pathlib.Path` argument; `None`/missing select the
-/// default. A value of another type reports `TypeError`.
+/// Reads an optional path argument; `None`/missing select the default. A
+/// value of another type reports `TypeError`.
 fn optional_path(
     args: &[i64],
     index: usize,
-    function: &str,
-    name: &str,
+    _function: &str,
+    _name: &str,
 ) -> Result<Option<String>, i64> {
     match args.get(index).copied() {
         None | Some(NONE) => Ok(None),
-        Some(arg) => match value::as_path_like(arg) {
-            Some(text) => Ok(Some(text.to_string())),
-            None => Err(exc::raise_with_message(
-                TYPE_ERROR,
-                &format!(
-                    "{function}() argument '{name}' must be str or pathlib.Path, not {}",
-                    value::type_name(arg)
-                ),
-            )),
-        },
+        Some(arg) => path_argument(arg).map(|argument| Some(argument.text)),
     }
 }
 
-/// Raises `OSError` for a filesystem failure on `path`.
+/// The built-in exception class CPython raises for an errno.
+fn os_error_tag(error: &io::Error) -> u32 {
+    #[cfg(unix)]
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => FILE_NOT_FOUND_ERROR,
+        Some(libc::EEXIST) => FILE_EXISTS_ERROR,
+        Some(libc::EACCES | libc::EPERM) => PERMISSION_ERROR,
+        Some(libc::ENOTDIR) => NOT_A_DIRECTORY_ERROR,
+        Some(libc::EISDIR) => IS_A_DIRECTORY_ERROR,
+        _ => OS_ERROR,
+    }
+    #[cfg(not(unix))]
+    match error.kind() {
+        io::ErrorKind::NotFound => FILE_NOT_FOUND_ERROR,
+        io::ErrorKind::AlreadyExists => FILE_EXISTS_ERROR,
+        io::ErrorKind::PermissionDenied => PERMISSION_ERROR,
+        io::ErrorKind::NotADirectory => NOT_A_DIRECTORY_ERROR,
+        io::ErrorKind::IsADirectory => IS_A_DIRECTORY_ERROR,
+        _ => OS_ERROR,
+    }
+}
+
+/// Raises the `OSError` subclass CPython uses for a filesystem failure on
+/// `path`, in the `[Errno N] message: 'path'` form.
 fn io_error(error: io::Error, path: &Path) -> i64 {
     let path = path.to_string_lossy();
     let text = error.to_string();
+    let tag = os_error_tag(&error);
     match error.raw_os_error() {
         Some(code) => {
             let detail = text.split(" (os error").next().unwrap_or(text.as_str());
-            exc::raise_with_message(OS_ERROR, &format!("[Errno {code}] {detail}: '{path}'"))
+            exc::raise_with_message(tag, &format!("[Errno {code}] {detail}: '{path}'"))
         }
-        None => exc::raise_with_message(OS_ERROR, &format!("{text}: '{path}'")),
+        None => exc::raise_with_message(tag, &format!("{text}: '{path}'")),
     }
 }
 
@@ -274,6 +320,82 @@ fn return_kind_value(kind: ReturnKind) -> i64 {
     }
 }
 
+/// A path argument resolved to text plus the string type it arrived as.
+#[derive(Clone)]
+struct PathArgument {
+    text: String,
+    kind: ReturnKind,
+}
+
+/// Resolves a `str`, `bytes`, native `pathlib.Path` or arbitrary
+/// `os.PathLike` (`__fspath__`) argument. `Err` carries the pending exception
+/// value, or a freshly raised `TypeError`.
+fn path_argument(raw: i64) -> Result<PathArgument, i64> {
+    if let Some(text) = value::as_str(raw) {
+        return Ok(PathArgument {
+            text: text.to_string(),
+            kind: ReturnKind::Text,
+        });
+    }
+    if let Some(bytes) = value::as_bytes(raw) {
+        return Ok(PathArgument {
+            text: String::from_utf8_lossy(bytes).into_owned(),
+            kind: ReturnKind::Bytes,
+        });
+    }
+    if let Some(path) = value::as_path(raw) {
+        return Ok(PathArgument {
+            text: path.path().to_string(),
+            kind: ReturnKind::Text,
+        });
+    }
+    if let Some(instance) = value::as_instance(raw) {
+        if value::class_lookup(instance.class, "__fspath__").is_some() {
+            let roots = heap::root_values(&[raw]);
+            let result = methods::call(raw, b"__fspath__".as_ptr(), 10, 0, std::ptr::null());
+            if exc::pending() {
+                heap::release_roots(roots);
+                return Err(NONE);
+            }
+            let result_roots = heap::root_values(&[result]);
+            let parsed = if let Some(text) = value::as_str(result) {
+                Ok(PathArgument {
+                    text: text.to_string(),
+                    kind: ReturnKind::Text,
+                })
+            } else if let Some(path) = value::as_path(result) {
+                Ok(PathArgument {
+                    text: path.path().to_string(),
+                    kind: ReturnKind::Text,
+                })
+            } else if let Some(bytes) = value::as_bytes(result) {
+                Ok(PathArgument {
+                    text: String::from_utf8_lossy(bytes).into_owned(),
+                    kind: ReturnKind::Bytes,
+                })
+            } else {
+                Err(exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!(
+                        "expected __fspath__() to return str or bytes, not {}",
+                        value::type_name(result)
+                    ),
+                ))
+            };
+            heap::release_roots(result_roots);
+            heap::release_roots(roots);
+            return parsed;
+        }
+    }
+    Err(exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "expected str, bytes or os.PathLike object, not {}",
+            value::type_name(raw)
+        ),
+    ))
+}
+
 /// Classifies one `_infer_return_type` argument. `Err` carries a pending
 /// exception (a `__fspath__` call failed).
 fn infer_arg_kind(arg: i64) -> Result<Option<ReturnKind>, i64> {
@@ -283,30 +405,18 @@ fn infer_arg_kind(arg: i64) -> Result<Option<ReturnKind>, i64> {
     if value::as_bytes(arg).is_some() {
         return Ok(Some(ReturnKind::Bytes));
     }
-    if value::as_str(arg).is_some() || value::as_path_like(arg).is_some() {
+    if value::as_str(arg).is_some() || value::as_path(arg).is_some() {
         return Ok(Some(ReturnKind::Text));
     }
     // `os.PathLike`: `__fspath__()` supplies the path whose type decides.
-    let fspath = methods::getattr(arg, b"__fspath__".as_ptr(), 10);
-    if exc::pending() {
-        if exc::pending_tag() != ATTRIBUTE_ERROR as i64 {
-            return Err(NONE);
-        }
-        exc::clear();
-        // Not path-like: CPython treats every non-bytes object as text.
-        return Ok(Some(ReturnKind::Text));
+    if value::as_instance(arg)
+        .and_then(|instance| value::class_lookup(instance.class, "__fspath__"))
+        .is_some()
+    {
+        return path_argument(arg).map(|argument| Some(argument.kind));
     }
-    let roots = heap::root_values(&[fspath]);
-    let result = crate::core::builtins::call(fspath, 0, std::ptr::null());
-    let kind = if exc::pending() {
-        Err(NONE)
-    } else if value::as_bytes(result).is_some() {
-        Ok(Some(ReturnKind::Bytes))
-    } else {
-        Ok(Some(ReturnKind::Text))
-    };
-    heap::release_roots(roots);
-    kind
+    // Not path-like: CPython treats every non-bytes object as text.
+    Ok(Some(ReturnKind::Text))
 }
 
 /// `_infer_return_type(*args)`: the `str`/`bytes` type a call must return,
@@ -347,21 +457,34 @@ fn current_tempdir_is_bytes() -> bool {
 }
 
 /// The directory the default `dir` argument resolves to.
-fn current_tempdir_text() -> String {
+fn current_tempdir_text() -> Result<String, i64> {
     if let Some(dir) = tempdir_override() {
         if dir != NONE {
             if let Some(text) = value::as_str(dir) {
-                return text.to_string();
+                return Ok(text.to_string());
             }
             if let Some(bytes) = value::as_bytes(dir) {
-                return String::from_utf8_lossy(bytes).into_owned();
+                return Ok(String::from_utf8_lossy(bytes).into_owned());
             }
+            return Err(exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "tempfile.tempdir must be str or bytes, not {}",
+                    value::type_name(dir)
+                ),
+            ));
         }
     }
-    TEMP_DIR.as_str().to_string()
+    let text = gettempdir();
+    if exc::pending() {
+        return Err(NONE);
+    }
+    Ok(value::as_str(text).unwrap_or_default().to_string())
 }
 
-/// A path argument in either string type (`str`, `bytes` or `pathlib.Path`).
+/// A path argument in either string type (`str`, `bytes` or
+/// `pathlib.Path`); arbitrary `os.PathLike` instances are resolved by
+/// [`path_argument`].
 fn temp_name_text(arg: i64) -> Option<String> {
     if let Some(text) = value::as_str(arg) {
         return Some(text.to_string());
@@ -369,28 +492,19 @@ fn temp_name_text(arg: i64) -> Option<String> {
     if let Some(bytes) = value::as_bytes(arg) {
         return Some(String::from_utf8_lossy(bytes).into_owned());
     }
-    value::as_path_like(arg).map(str::to_string)
+    value::as_path(arg).map(|path| path.path().to_string())
 }
 
 /// Reads an optional path argument accepting `str`, `bytes` and `os.PathLike`.
 fn optional_name(
     args: &[i64],
     index: usize,
-    function: &str,
-    name: &str,
+    _function: &str,
+    _name: &str,
 ) -> Result<Option<String>, i64> {
     match args.get(index).copied() {
         None | Some(NONE) => Ok(None),
-        Some(arg) => match temp_name_text(arg) {
-            Some(text) => Ok(Some(text)),
-            None => Err(exc::raise_with_message(
-                TYPE_ERROR,
-                &format!(
-                    "{function}() argument '{name}' must be str, bytes or os.PathLike, not {}",
-                    value::type_name(arg)
-                ),
-            )),
-        },
+        Some(arg) => path_argument(arg).map(|argument| Some(argument.text)),
     }
 }
 
@@ -423,10 +537,10 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 /// The base directory of a call: an explicit `dir` or the resolved tempdir.
-fn base_dir(dir: Option<String>) -> PathBuf {
+fn base_dir(dir: Option<String>) -> Result<PathBuf, i64> {
     match dir {
-        Some(dir) => absolute(Path::new(&dir)),
-        None => absolute(Path::new(&current_tempdir_text())),
+        Some(dir) => Ok(absolute(Path::new(&dir))),
+        None => Ok(absolute(Path::new(&current_tempdir_text()?))),
     }
 }
 
@@ -438,76 +552,166 @@ fn name_value(kind: ReturnKind, path: &Path) -> i64 {
     }
 }
 
+/// A filesystem failure together with the pending exception of a Python hook
+/// (`_get_candidate_names`/`_candidate_tempdir_list`), so callers can report
+/// whichever occurred instead of masking it.
+#[derive(Debug)]
+enum TempError {
+    Io(io::Error),
+    Raised(i64),
+}
+
+/// Raises the error represented by `error`, naming `base` for I/O failures.
+fn raise_temp_error(error: TempError, base: &Path) -> i64 {
+    match error {
+        TempError::Io(error) => io_error(error, base),
+        TempError::Raised(raised) => raised,
+    }
+}
+
+/// [`raise_temp_error`] for helpers that only retain the `dir` argument.
+fn raise_temp_error_with_dir(error: TempError, dir: Option<String>) -> i64 {
+    match error {
+        TempError::Io(error) => match base_dir(dir) {
+            Ok(base) => io_error(error, &base),
+            Err(raised) => raised,
+        },
+        TempError::Raised(raised) => raised,
+    }
+}
+
+/// Advances a Python iterator once: a native iterator (list/tuple/range/file
+/// iterators), a generator, or an instance with `__next__`.
+///
+/// `StopIteration` becomes `Ok(None)`; any other exception is returned as
+/// `Err` with the pending exception left in place.
+fn next_iterator_item(iterator: i64) -> Result<Option<i64>, i64> {
+    let generator = value::as_fiber(iterator)
+        .map(|fiber| fiber.kind == crate::fiber::FiberKind::Generator)
+        .unwrap_or(false);
+    if value::as_iter(iterator).is_some() || generator {
+        let mut out = NONE;
+        if iter::iter_next(iterator, &mut out) == 1 {
+            return Ok(Some(out));
+        }
+        if exc::pending() {
+            return Err(NONE);
+        }
+        return Ok(None);
+    }
+    if let Some(instance) = value::as_instance(iterator) {
+        if value::class_lookup(instance.class, "__next__").is_some() {
+            let roots = heap::root_values(&[iterator]);
+            let item = methods::call(iterator, b"__next__".as_ptr(), 9, 0, std::ptr::null());
+            if exc::pending() {
+                let tag = exc::pending_tag();
+                heap::release_roots(roots);
+                if tag == STOP_ITERATION as i64 {
+                    exc::clear();
+                    return Ok(None);
+                }
+                return Err(NONE);
+            }
+            heap::release_roots(roots);
+            return Ok(Some(item));
+        }
+    }
+    Err(exc::raise_with_message(
+        TYPE_ERROR,
+        &format!("'{}' object is not an iterator", value::type_name(iterator)),
+    ))
+}
+
 /// The candidate names one API call consumes, in order.
 ///
 /// A program assignment to `_get_candidate_names` (the test suite replaces it
 /// with a deterministic iterator) is honoured exactly like CPython's call to
 /// the hook; otherwise the process-wide random sequence supplies them.
-fn candidate_names_batch() -> Vec<String> {
-    if let Some(hook) = globals::attribute_override("tempfile", "_get_candidate_names") {
-        let sequence = crate::core::builtins::call(hook, 0, std::ptr::null());
-        if exc::pending() {
-            exc::clear();
-            return Vec::new();
-        }
-        let roots = heap::root_values(&[sequence]);
-        let iterator = iter::iter_new(sequence);
-        if exc::pending() {
-            exc::clear();
-            heap::release_roots(roots);
-            return Vec::new();
-        }
-        let iterator_roots = heap::root_values(&[iterator]);
-        let mut names = Vec::with_capacity(TMP_MAX as usize);
-        while names.len() < TMP_MAX as usize {
-            let mut item = NONE;
-            if iter::iter_next(iterator, &mut item) == 0 {
-                break;
-            }
-            if exc::pending() {
-                exc::clear();
-                break;
-            }
-            let item_roots = heap::root_values(&[item]);
-            if let Some(text) = value::as_str(item) {
-                names.push(text.to_string());
-            }
-            heap::release_roots(item_roots);
-        }
-        heap::release_roots(iterator_roots);
-        heap::release_roots(roots);
-        return names;
+fn candidate_names_batch() -> Result<Vec<String>, i64> {
+    let Some(hook) = globals::attribute_override("tempfile", "_get_candidate_names") else {
+        return Ok((0..TMP_MAX).map(|_| random_name()).collect());
+    };
+    let hook_roots = heap::root_values(&[hook]);
+    let sequence = crate::core::builtins::call(hook, 0, std::ptr::null());
+    if exc::pending() {
+        heap::release_roots(hook_roots);
+        return Err(NONE);
     }
-    (0..TMP_MAX).map(|_| random_name()).collect()
+    let sequence_roots = heap::root_values(&[sequence]);
+    let iterator = iter::iter_new(sequence);
+    if exc::pending() {
+        heap::release_roots(sequence_roots);
+        heap::release_roots(hook_roots);
+        return Err(NONE);
+    }
+    let iterator_roots = heap::root_values(&[iterator]);
+    let mut names = Vec::with_capacity(TMP_MAX as usize);
+    while names.len() < TMP_MAX as usize {
+        let item = match next_iterator_item(iterator) {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(raised) => {
+                heap::release_roots(iterator_roots);
+                heap::release_roots(sequence_roots);
+                heap::release_roots(hook_roots);
+                return Err(raised);
+            }
+        };
+        let item_roots = heap::root_values(&[item]);
+        if let Some(text) = value::as_str(item) {
+            names.push(text.to_string());
+            heap::release_roots(item_roots);
+            continue;
+        }
+        heap::release_roots(item_roots);
+        heap::release_roots(iterator_roots);
+        heap::release_roots(sequence_roots);
+        heap::release_roots(hook_roots);
+        return Err(exc::raise_with_message(
+            TYPE_ERROR,
+            &format!(
+                "_get_candidate_names() yielded {}, not str",
+                value::type_name(item)
+            ),
+        ));
+    }
+    heap::release_roots(iterator_roots);
+    heap::release_roots(sequence_roots);
+    heap::release_roots(hook_roots);
+    Ok(names)
 }
 
 /// Creates an exclusively-opened `prefix + <candidate> + suffix` file in
 /// `base`.
-fn exclusive_temp_file(base: &Path, prefix: &str, suffix: &str) -> io::Result<(fs::File, PathBuf)> {
-    for name in candidate_names_batch() {
+fn exclusive_temp_file(
+    base: &Path,
+    prefix: &str,
+    suffix: &str,
+) -> Result<(fs::File, PathBuf), TempError> {
+    for name in candidate_names_batch().map_err(TempError::Raised)? {
         let candidate = base.join(format!("{prefix}{name}{suffix}"));
         let mut options = fs::OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         match options.open(&candidate) {
             Ok(file) => return Ok((file, candidate)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
+            Err(error) => return Err(TempError::Io(error)),
         }
     }
-    Err(io::Error::new(
+    Err(TempError::Io(io::Error::new(
         io::ErrorKind::AlreadyExists,
         "No usable temporary file name found",
-    ))
+    )))
 }
 
 /// Creates a `prefix + <candidate> + suffix` directory in `base`.
-fn exclusive_temp_dir(base: &Path, prefix: &str, suffix: &str) -> io::Result<PathBuf> {
-    for name in candidate_names_batch() {
+fn exclusive_temp_dir(base: &Path, prefix: &str, suffix: &str) -> Result<PathBuf, TempError> {
+    for name in candidate_names_batch().map_err(TempError::Raised)? {
         let candidate = base.join(format!("{prefix}{name}{suffix}"));
         match fs::create_dir(&candidate) {
             Ok(()) => {
@@ -515,13 +719,13 @@ fn exclusive_temp_dir(base: &Path, prefix: &str, suffix: &str) -> io::Result<Pat
                 return Ok(candidate);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
+            Err(error) => return Err(TempError::Io(error)),
         }
     }
-    Err(io::Error::new(
+    Err(TempError::Io(io::Error::new(
         io::ErrorKind::AlreadyExists,
         "No usable temporary directory name found",
-    ))
+    )))
 }
 
 /// `tempfile.mkdtemp(suffix=None, prefix=None, dir=None)`.
@@ -542,10 +746,13 @@ fn mkdtemp(args: &[i64]) -> i64 {
         Ok(kind) => kind,
         Err(error) => return error,
     };
-    let base = base_dir(dir);
+    let base = match base_dir(dir) {
+        Ok(base) => base,
+        Err(error) => return error,
+    };
     match exclusive_temp_dir(&base, &prefix, &suffix) {
         Ok(path) => name_value(kind, &path),
-        Err(error) => io_error(error, &base),
+        Err(error) => raise_temp_error(error, &base),
     }
 }
 
@@ -568,7 +775,10 @@ fn mkstemp(args: &[i64]) -> i64 {
         Ok(kind) => kind,
         Err(error) => return error,
     };
-    let base = base_dir(dir);
+    let base = match base_dir(dir) {
+        Ok(base) => base,
+        Err(error) => return error,
+    };
     match exclusive_temp_file(&base, &prefix, &suffix) {
         Ok((file, path)) => {
             #[cfg(unix)]
@@ -586,7 +796,25 @@ fn mkstemp(args: &[i64]) -> i64 {
                 value::tuple_new(vec![NONE, name_value(kind, &path)])
             }
         }
-        Err(error) => io_error(error, &base),
+        Err(error) => raise_temp_error(error, &base),
+    }
+}
+
+/// Reads a mandatory-`str` optional argument of `mktemp`, whose signature does
+/// not accept bytes or `os.PathLike` for the prefix/suffix components.
+fn mktemp_text_arg(args: &[i64], index: usize, name: &str) -> Result<Option<String>, i64> {
+    match args.get(index).copied() {
+        None | Some(NONE) => Ok(None),
+        Some(arg) => match value::as_str(arg) {
+            Some(text) => Ok(Some(text.to_string())),
+            None => Err(exc::raise_with_message(
+                TYPE_ERROR,
+                &format!(
+                    "mktemp() argument '{name}' must be str, not {}",
+                    value::type_name(arg)
+                ),
+            )),
+        },
     }
 }
 
@@ -597,34 +825,48 @@ fn mkstemp(args: &[i64]) -> i64 {
 /// checked against the filesystem (`symlink_metadata` also reports a dangling
 /// link, so an uncreatable name is never returned), but the file is left for
 /// the caller to create — which is exactly why CPython deprecates the
-/// function.
+/// function. Unlike `mkstemp`, the result is not made absolute: CPython joins
+/// the caller's `dir` verbatim.
 fn mktemp(args: &[i64]) -> i64 {
-    let suffix = match optional_name(args, 0, "mktemp", "suffix") {
+    let suffix = match mktemp_text_arg(args, 0, "suffix") {
         Ok(value) => value.unwrap_or_default(),
         Err(error) => return error,
     };
-    let prefix = match optional_name(args, 1, "mktemp", "prefix") {
+    let prefix = match mktemp_text_arg(args, 1, "prefix") {
         Ok(value) => value.unwrap_or_else(|| TEMPLATE.to_string()),
         Err(error) => return error,
     };
-    let dir = match optional_name(args, 2, "mktemp", "dir") {
-        Ok(value) => value,
+    let dir = match args.get(2).copied() {
+        None | Some(NONE) => match current_tempdir_text() {
+            Ok(dir) => dir,
+            Err(error) => return error,
+        },
+        Some(arg) => match path_argument(arg) {
+            Ok(argument) if argument.kind == ReturnKind::Text => argument.text,
+            Ok(_) => {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "Can't mix bytes and non-bytes in path components.",
+                )
+            }
+            Err(error) => return error,
+        },
+    };
+    let names = match candidate_names_batch() {
+        Ok(names) => names,
         Err(error) => return error,
     };
-    let kind = match infer_return_kind(&args[..args.len().min(3)]) {
-        Ok(kind) => kind,
-        Err(error) => return error,
-    };
-    let base = base_dir(dir);
-    for name in candidate_names_batch() {
-        let candidate = base.join(format!("{prefix}{name}{suffix}"));
+    let directory = Path::new(&dir);
+    for name in names {
+        let candidate = directory.join(format!("{prefix}{name}{suffix}"));
         if fs::symlink_metadata(&candidate).is_err() {
-            return name_value(kind, &candidate);
+            return value::str_alloc(candidate.to_string_lossy().into_owned());
         }
     }
-    // CPython raises `FileExistsError(EEXIST, "No usable temporary filename
-    // found")`; Hydro's exception registry has the `OSError` spelling.
-    exc::raise_with_message(OS_ERROR, "[Errno 17] No usable temporary filename found")
+    exc::raise_with_message(
+        FILE_EXISTS_ERROR,
+        "[Errno 17] No usable temporary filename found",
+    )
 }
 
 /// `_infer_return_type(*args)`: the `str`/`bytes` type object the callers must
@@ -800,7 +1042,10 @@ fn get_default_tempdir(args: &[i64]) -> i64 {
             Ok(false) | Err(_) => continue,
         }
     }
-    exc::raise_with_message(OS_ERROR, "[Errno 2] No usable temporary directory found")
+    exc::raise_with_message(
+        FILE_NOT_FOUND_ERROR,
+        "[Errno 2] No usable temporary directory found",
+    )
 }
 
 /// `_mkstemp_inner(dir, pre, suf, flags, output_type)`.
@@ -823,7 +1068,10 @@ fn mkstemp_inner(args: &[i64]) -> i64 {
         Some(output) if output == bytes_type_value() => ReturnKind::Bytes,
         _ => ReturnKind::Text,
     };
-    let base = base_dir(dir);
+    let base = match base_dir(dir) {
+        Ok(base) => base,
+        Err(error) => return error,
+    };
     match exclusive_temp_file(&base, &prefix, &suffix) {
         Ok((file, path)) => {
             #[cfg(unix)]
@@ -841,7 +1089,7 @@ fn mkstemp_inner(args: &[i64]) -> i64 {
                 value::tuple_new(vec![NONE, name_value(kind, &path)])
             }
         }
-        Err(error) => io_error(error, &base),
+        Err(error) => raise_temp_error(error, &base),
     }
 }
 
@@ -895,13 +1143,13 @@ fn new_temporary_file(args: &[i64]) -> i64 {
         Ok(value) => value,
         Err(error) => return error,
     };
-    let created = create_temp_file(&prefix, &suffix, dir.as_deref());
+    if let Err(error) = validate_text_encoding(&mode, encoding) {
+        return error;
+    }
+    let created = create_temp_file(&prefix, &suffix, dir.clone().as_deref());
     let path = match created {
         Ok(path) => path,
-        Err(error) => {
-            let base = base_dir(dir);
-            return io_error(error, &base);
-        }
+        Err(error) => return raise_temp_error_with_dir(error, dir),
     };
     let path_text = path.to_string_lossy().into_owned();
     let open_args = [
@@ -944,6 +1192,20 @@ fn reset_permissions(path: &Path) {
     let _ = path;
 }
 
+/// Gives the owner access back to `path` and to every ancestor up to and
+/// including `root`. The directory that contains `root` is never changed.
+fn reset_path_and_ancestors(path: &Path, root: &Path) {
+    reset_permissions(path);
+    let mut current = path.parent();
+    while let Some(parent) = current {
+        if !parent.starts_with(root) {
+            break;
+        }
+        reset_permissions(parent);
+        current = parent.parent();
+    }
+}
+
 /// Removes `path` recursively, recovering from a mode bit the caller removed.
 ///
 /// `TemporaryDirectory.cleanup()` must remove a tree whose directories and
@@ -952,7 +1214,7 @@ fn reset_permissions(path: &Path) {
 /// contains the temporary directory. CPython reaches that through
 /// `_rmtree_use_dir_fd` and its `onexc` handler, which resets the offending
 /// directory's permissions and retries; this is the same policy without
-/// directory descriptors: reset only paths inside `root` and retry once.
+/// directory descriptors: reset only paths inside `root` and retry.
 fn remove_tree(path: &Path) -> io::Result<()> {
     remove_tree_at(path, path)
 }
@@ -962,6 +1224,16 @@ fn remove_tree_at(path: &Path, root: &Path) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // The entry is unreachable because an ancestor lost its execute
+            // bit; restore access inside the tree and retry.
+            reset_path_and_ancestors(path, root);
+            match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
         Err(error) => return Err(error),
     };
     if !metadata.file_type().is_dir() {
@@ -971,7 +1243,7 @@ fn remove_tree_at(path: &Path, root: &Path) -> io::Result<()> {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             // A directory with no read/execute bit cannot even be listed.
-            reset_permissions(path);
+            reset_path_and_ancestors(path, root);
             match fs::read_dir(path) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -996,14 +1268,7 @@ fn remove_tree_at(path: &Path, root: &Path) -> io::Result<()> {
             // Removing the entry needs write access to its parent. Only
             // directories inside the tree are reset: the parent of `root`
             // belongs to the caller and keeps its mode.
-            reset_permissions(path);
-            if path != root {
-                if let Some(parent) = path.parent() {
-                    if parent.starts_with(root) {
-                        reset_permissions(parent);
-                    }
-                }
-            }
+            reset_path_and_ancestors(path, root);
             match fs::remove_dir(path) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1021,11 +1286,7 @@ fn remove_file_at(path: &Path, root: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            if let Some(parent) = path.parent() {
-                if parent.starts_with(root) {
-                    reset_permissions(parent);
-                }
-            }
+            reset_path_and_ancestors(path, root);
             match fs::remove_file(path) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1069,22 +1330,21 @@ fn new_temporary_directory(args: &[i64]) -> i64 {
         Ok(value) => value,
         Err(error) => return error,
     };
-    let created = create_temp_dir(&prefix, &suffix, dir.as_deref());
+    let kind = match infer_return_kind(&args[..args.len().min(3)]) {
+        Ok(kind) => kind,
+        Err(error) => return error,
+    };
+    let created = create_temp_dir(&prefix, &suffix, dir.clone().as_deref());
     let path = match created {
         Ok(path) => path,
-        Err(error) => {
-            let base = base_dir(dir);
-            return io_error(error, &base);
-        }
+        Err(error) => return raise_temp_error_with_dir(error, dir),
     };
     let ignore_cleanup_errors = bool_arg(args, 3, false);
     let delete = bool_arg(args, 4, true);
     let instance = value::instance_new(temporary_directory_class());
-    value::instance_setattr(
-        instance,
-        "name".to_string(),
-        value::str_alloc(path.to_string_lossy().into_owned()),
-    );
+    let name = name_value(kind, &path);
+    let roots = heap::root_values(&[name, instance]);
+    value::instance_setattr(instance, "name".to_string(), name);
     value::instance_setattr(
         instance,
         "_ignore_cleanup_errors".to_string(),
@@ -1095,32 +1355,26 @@ fn new_temporary_directory(args: &[i64]) -> i64 {
         "_delete".to_string(),
         if delete { TRUE } else { FALSE },
     );
+    heap::release_roots(roots);
     instance
 }
 
 /// Cleans up the directory named by the instance's `name` attribute.
+///
+/// An explicit `cleanup()` runs even for `delete=False`; the `_delete` flag
+/// only suppresses the automatic cleanup in `__exit__`, matching CPython's
+/// finalizer detach.
 fn cleanup(instance: i64) -> i64 {
-    // `delete=False` keeps the directory for the caller.
-    if value::instance_attr(instance, "_delete") == Some(FALSE) {
-        return NONE;
-    }
     let Some(name) = value::instance_attr(instance, "name") else {
         return NONE;
     };
     if name == NONE {
         return NONE;
     }
-    let Some(path) = value::as_path_like(name) else {
-        return exc::raise_with_message(
-            TYPE_ERROR,
-            &format!(
-                "TemporaryDirectory.name must be str or pathlib.Path, not {}",
-                value::type_name(name)
-            ),
-        );
+    let path = match path_argument(name) {
+        Ok(argument) => argument.text,
+        Err(error) => return error,
     };
-    // Copy before touching the filesystem: the error path allocates.
-    let path = path.to_string();
     match remove_tree(Path::new(&path)) {
         Ok(()) => NONE,
         Err(error) => {
@@ -1142,8 +1396,8 @@ fn cleanup(instance: i64) -> i64 {
 /// `create_new` guarantees the exclusive creation `mkstemp` performs; a
 /// collision retries with the next counter value. The caller owns the file and
 /// must unlink it (directly or through the wrapper) if opening fails.
-fn create_temp_file(prefix: &str, suffix: &str, dir: Option<&str>) -> io::Result<PathBuf> {
-    let base = base_dir(dir.map(str::to_string));
+fn create_temp_file(prefix: &str, suffix: &str, dir: Option<&str>) -> Result<PathBuf, TempError> {
+    let base = base_dir(dir.map(str::to_string)).map_err(TempError::Raised)?;
     let (file, path) = exclusive_temp_file(&base, prefix, suffix)?;
     drop(file);
     #[cfg(unix)]
@@ -1192,6 +1446,29 @@ fn optional_text(args: &[i64], index: usize, function: &str, name: &str) -> Resu
                 ),
             )),
         },
+    }
+}
+
+/// Validates an explicit text-mode `encoding` before the temporary file is
+/// created. CPython's `TextIOWrapper` resolves the name through the codec
+/// registry and raises `LookupError` for an unknown one, leaving no file
+/// behind.
+fn validate_text_encoding(mode: &str, encoding: i64) -> Result<(), i64> {
+    if mode.contains('b') || encoding == NONE {
+        return Ok(());
+    }
+    let Some(name) = value::as_str(encoding) else {
+        return Ok(());
+    };
+    let name = value::str_alloc(name.to_string());
+    let roots = heap::root_values(&[name]);
+    let _ = crate::modules::codecs::call("lookup", &[name]);
+    let pending = exc::pending();
+    heap::release_roots(roots);
+    if pending {
+        Err(NONE)
+    } else {
+        Ok(())
     }
 }
 
@@ -1409,14 +1686,21 @@ fn new_named_temporary_file(args: &[i64]) -> i64 {
         Err(error) => return error,
     };
     let delete_on_close = bool_arg(args, 9, true);
-
-    let path = match create_temp_file(&prefix, &suffix, dir.as_deref()) {
-        Ok(path) => path,
-        Err(error) => {
-            let base = Path::new(dir.as_deref().unwrap_or(TEMP_DIR.as_str()));
-            return io_error(error, base);
-        }
+    if let Err(error) = validate_text_encoding(&mode, encoding) {
+        return error;
+    }
+    let path_start = 4.min(args.len());
+    let path_end = 7.min(args.len());
+    let kind = match infer_return_kind(&args[path_start..path_end]) {
+        Ok(kind) => kind,
+        Err(error) => return error,
     };
+
+    let path = match create_temp_file(&prefix, &suffix, dir.clone().as_deref()) {
+        Ok(path) => path,
+        Err(error) => return raise_temp_error_with_dir(error, dir),
+    };
+    let name_attr = name_value(kind, &path);
     let path_text = path.to_string_lossy().into_owned();
     // CPython's `io.open` layout: file, mode, buffering, encoding, errors,
     // newline, closefd, opener. `io.open` ignores closefd/opener, so they stay
@@ -1441,13 +1725,13 @@ fn new_named_temporary_file(args: &[i64]) -> i64 {
     let file_roots = heap::root_values(&[file_value, encoding, errors]);
 
     let binary = mode.contains('b');
-    let name_value = value::str_alloc(path_text);
+    let name_value = name_attr;
     let mode_value = value::str_alloc(mode);
     let encoding_value = if binary || encoding == NONE {
         if binary {
             NONE
         } else {
-            value::str_alloc("UTF-8".to_string())
+            value::str_alloc("utf-8".to_string())
         }
     } else {
         encoding
@@ -1960,8 +2244,22 @@ fn spooled_rollover(instance: i64) -> i64 {
                 let write_args = [content];
                 let _ = methods::call(file, b"write".as_ptr(), 5, 1, write_args.as_ptr());
                 if !exc::pending() {
-                    let seek_args = [pos];
-                    let _ = methods::call(file, b"seek".as_ptr(), 4, 1, seek_args.as_ptr());
+                    // The whole old buffer was written, so the new file's
+                    // cursor already sits at its end. Calling seek() is only
+                    // needed when the old cursor pointed inside the buffer
+                    // (and a write-only descriptor rejects it).
+                    let at_end = match value::as_integer(pos) {
+                        Some(pos) if binary => {
+                            value::as_bytes(content).is_some_and(|bytes| bytes.len() as i64 == pos)
+                        }
+                        Some(pos) => value::as_str(content)
+                            .is_some_and(|text| text.chars().count() as i64 == pos),
+                        None => false,
+                    };
+                    if !at_end {
+                        let seek_args = [pos];
+                        let _ = methods::call(file, b"seek".as_ptr(), 4, 1, seek_args.as_ptr());
+                    }
                 }
                 if exc::pending() {
                     let _ = unlink_if_present(&path_text);
@@ -1980,8 +2278,7 @@ fn spooled_rollover(instance: i64) -> i64 {
             }
         }
         Err(error) => {
-            let base = base_dir(dir);
-            let _ = io_error(error, &base);
+            let _ = raise_temp_error_with_dir(error, dir);
         }
     }
     heap::release_roots(content_roots);
@@ -2084,6 +2381,10 @@ extern "C" fn spooled_init_entry(argv: *const i64) -> i64 {
             );
         }
     }
+    if let Err(error) = validate_text_encoding(&mode, encoding_slot) {
+        heap::release_roots(roots);
+        return error;
+    }
     let suffix = slot_text(args[6]).unwrap_or_default();
     let prefix = slot_text(args[7]).unwrap_or_else(|| TEMPLATE.to_string());
     let dir = slot_text(args[8]);
@@ -2099,7 +2400,7 @@ extern "C" fn spooled_init_entry(argv: *const i64) -> i64 {
     }
     let file_roots = heap::root_values(&[file]);
     let encoding = if encoding_slot == NONE {
-        value::str_alloc("UTF-8".to_string())
+        value::str_alloc("utf-8".to_string())
     } else {
         encoding_slot
     };
@@ -2418,6 +2719,12 @@ extern "C" fn spooled_del_entry(argv: *const i64) -> i64 {
     // SAFETY: the method binder passes `self`.
     let instance = unsafe { *argv };
     let roots = heap::root_values(&[instance]);
+    if spooled_attr(instance, "_closed") != TRUE {
+        crate::modules::warnings::warn_category(
+            "Unclosed file <tempfile.SpooledTemporaryFile>",
+            RESOURCE_WARNING,
+        );
+    }
     let result = spooled_close(instance);
     heap::release_roots(roots);
     result
@@ -2810,7 +3117,13 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                 close_wrapped(instance);
                 cleanup_named(instance)
             }
-            Some(&instance) => cleanup(instance),
+            Some(&instance) => {
+                if value::instance_attr(instance, "_delete") == Some(FALSE) {
+                    NONE
+                } else {
+                    cleanup(instance)
+                }
+            }
             None => exc::raise_with_message(TYPE_ERROR, "__exit__() missing self"),
         },
         "_tempdir_cleanup" => match args.first() {

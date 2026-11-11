@@ -27,7 +27,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use hydro_ir::MethodKind;
+use hydro_ir::{MethodKind, ParamKind};
 use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
 
@@ -50,6 +50,19 @@ const NATIVE_POINTER: usize = std::mem::size_of::<*const u8>();
 /// larger record (CPython reports its size), but building it would only
 /// exhaust memory, so the allocation reports `MemoryError`.
 const MAX_PACK_ALLOCATION: usize = 1 << 30;
+
+/// Largest record a format may describe. CPython caps at `PY_SSIZE_T_MAX`;
+/// every integer the runtime can return without promoting to a big integer is
+/// `value::MAX_INT`, so a larger `calcsize` could not be represented (and
+/// `sys.maxsize + 1` counts in `test_struct` are expected to overflow).
+const MAX_STRUCT_SIZE: i128 = value::MAX_INT as i128;
+
+/// Registry key of the cached `_struct.Struct` class.
+const STRUCT_CLASS_KEY: &str = "_struct.Struct";
+
+/// Registry key of the cached `unpack_iterator` class returned by
+/// `Struct.iter_unpack`.
+const UNPACK_ITERATOR_KEY: &str = "_struct.unpack_iterator";
 
 /// Number of parsed formats kept in the per-thread cache (CPython's
 /// `MAXCACHE`).
@@ -219,29 +232,107 @@ fn method(name: &'static str, arity: usize) -> (String, i64, MethodKind) {
     )
 }
 
+/// A `self` parameter descriptor for native methods.
+fn self_parameter() -> value::ParamMeta {
+    value::ParamMeta {
+        name: "self".to_string(),
+        kind: ParamKind::PosOnly,
+        default: None,
+    }
+}
+
+/// Builds a native method with a declared signature and full-argv trampoline.
+///
+/// `unpack_from`, `__repr__` and `__sizeof__` have no central `_struct` spec
+/// entry (they are not module functions) and one of them accepts keywords, so
+/// every caller that binds them runs the trampoline directly through the
+/// shared method binder instead of the module dispatcher.
+fn method_entry(
+    name: &'static str,
+    entry: extern "C" fn(*const i64) -> i64,
+    signature: Vec<value::ParamMeta>,
+) -> i64 {
+    let function = value::native_function_new("_struct", name, usize::MAX);
+    value::function_set_signature(function, signature);
+    value::function_set_full_entry(function, entry as *const () as usize);
+    function
+}
+
 /// The cached `_struct.Struct` class. Instances carry `format` and `size`
 /// attributes; every operation reparses the format through [`parsed_format`],
 /// so the instance state is fully observably Python data.
+///
+/// `format` and `size` are read-only properties, exactly like CPython's
+/// getset descriptors: a half-initialized instance (`Struct.__new__`) reports
+/// `size == -1` and raises `RuntimeError` for `format`.
 fn struct_class() -> i64 {
-    if let Some(class) = globals::registry_get("_struct.Struct") {
+    if let Some(class) = globals::registry_get(STRUCT_CLASS_KEY) {
         return class;
     }
-    let methods = vec![
-        method("Struct.__init__", usize::MAX),
-        method("Struct.pack", usize::MAX),
-        method("Struct.pack_into", usize::MAX),
-        method("Struct.unpack", 2),
-        method("Struct.unpack_from", 3),
-        method("Struct.iter_unpack", 2),
-        method("Struct.__repr__", 1),
+    let unpack_from = method_entry(
+        "Struct.unpack_from",
+        struct_unpack_from_entry,
+        vec![
+            self_parameter(),
+            value::ParamMeta {
+                name: "buffer".to_string(),
+                kind: ParamKind::Positional,
+                default: None,
+            },
+            value::ParamMeta {
+                name: "offset".to_string(),
+                kind: ParamKind::Positional,
+                default: Some(int_result(0)),
+            },
+        ],
+    );
+    let repr = method_entry("Struct.__repr__", struct_repr_entry, vec![self_parameter()]);
+    let sizeof = method_entry(
+        "Struct.__sizeof__",
+        struct_sizeof_entry,
+        vec![self_parameter()],
+    );
+    let format_getter = method_entry("Struct.format", struct_format_entry, vec![self_parameter()]);
+    let size_getter = method_entry("Struct.size", struct_size_entry, vec![self_parameter()]);
+    let init = method("Struct.__init__", usize::MAX);
+    let pack = method("Struct.pack", usize::MAX);
+    let pack_into = method("Struct.pack_into", usize::MAX);
+    let unpack = method("Struct.unpack", 2);
+    let iter_unpack = method("Struct.iter_unpack", 2);
+    let values = [
+        unpack_from,
+        repr,
+        sizeof,
+        format_getter,
+        size_getter,
+        init.1,
+        pack.1,
+        pack_into.1,
+        unpack.1,
+        iter_unpack.1,
     ];
-    let mut values = Vec::with_capacity(methods.len());
-    for (_, function, _) in &methods {
-        values.push(*function);
-    }
     let roots = heap::root_values(&values);
-    let class = value::class_new_full("Struct".to_string(), NONE, methods, Vec::new());
-    globals::registry_set("_struct.Struct", class);
+    let format_property = value::property_new(format_getter, NONE, NONE);
+    let property_roots = heap::root_values(std::slice::from_ref(&format_property));
+    let size_property = value::property_new(size_getter, NONE, NONE);
+    heap::push_scoped_root(size_property);
+    let methods = vec![
+        init,
+        pack,
+        pack_into,
+        unpack,
+        ("unpack_from".to_string(), unpack_from, MethodKind::Normal),
+        iter_unpack,
+        ("__repr__".to_string(), repr, MethodKind::Normal),
+        ("__sizeof__".to_string(), sizeof, MethodKind::Normal),
+    ];
+    let attrs = vec![
+        ("format".to_string(), format_property),
+        ("size".to_string(), size_property),
+    ];
+    let class = value::class_new_full("Struct".to_string(), NONE, methods, attrs);
+    globals::registry_set(STRUCT_CLASS_KEY, class);
+    heap::release_roots(property_roots);
     heap::release_roots(roots);
     class
 }
@@ -285,7 +376,7 @@ fn parse_format(format: &[u8]) -> Result<Parsed, String> {
     };
     const OVERFLOW: &str = "total struct size too long";
     // `prepare_s` does the arithmetic in `Py_ssize_t`, so a format that fits in
-    // `usize` but not in `i64` is still an overflow.
+    // `usize` but not in the runtime's integer range is still an overflow.
     let mut items = Vec::new();
     let mut size: i128 = 0;
     let mut length: i128 = 0;
@@ -303,7 +394,7 @@ fn parse_format(format: &[u8]) -> Result<Parsed, String> {
                     .unwrap_or(0)
                     .checked_mul(10)
                     .and_then(|value| value.checked_add(digit))
-                    .filter(|value| *value <= i128::from(i64::MAX))
+                    .filter(|value| *value <= MAX_STRUCT_SIZE)
                     .ok_or_else(|| OVERFLOW.to_string())?,
             );
             continue;
@@ -350,7 +441,7 @@ fn parse_format(format: &[u8]) -> Result<Parsed, String> {
                 end
             }
         };
-        if end > i128::from(i64::MAX) || length > i128::from(i64::MAX) {
+        if end > MAX_STRUCT_SIZE || length > MAX_STRUCT_SIZE {
             return Err(OVERFLOW.to_string());
         }
         size = end;
@@ -473,6 +564,47 @@ fn float_argument(value_arg: i64) -> Option<f64> {
 /// `PyComplex_AsCComplex`: numbers and complex values both convert.
 fn complex_argument(value_arg: i64) -> Option<(f64, f64)> {
     crate::builtins::complex_components(value_arg)
+}
+
+/// `PyObject_IsTrue`: evaluates a user instance's `__bool__` (then `__len__`)
+/// and leaves a raised exception pending, unlike the infallible
+/// `value::truthy` used for internal dispatch decisions.
+fn truthy_argument(value_arg: i64) -> Result<bool, i64> {
+    if value::as_instance(value_arg).is_some() {
+        if let Some(result) =
+            crate::core::ops::instance_method_call(value_arg, "__bool__", &[value_arg])
+        {
+            if exc::pending() {
+                return Err(NONE);
+            }
+            return match result {
+                value::TRUE => Ok(true),
+                value::FALSE => Ok(false),
+                other => Err(type_error(&format!(
+                    "__bool__ should return bool, returned {}",
+                    value::type_name(other)
+                ))),
+            };
+        }
+        if let Some(result) =
+            crate::core::ops::instance_method_call(value_arg, "__len__", &[value_arg])
+        {
+            if exc::pending() {
+                return Err(NONE);
+            }
+            if let Some(length) = value::as_integer(result) {
+                return Ok(length != 0);
+            }
+            if let Some(length) = value::as_bigint(result) {
+                return Ok(!length.is_zero());
+            }
+            return Err(type_error(&format!(
+                "'{}' object cannot be interpreted as an integer",
+                value::type_name(result)
+            )));
+        }
+    }
+    Ok(value::truthy(value_arg))
 }
 
 fn int_result(n: i64) -> i64 {
@@ -720,7 +852,9 @@ fn pack_values(parsed: &Parsed, values: &[i64]) -> Result<Vec<u8>, i64> {
                     let value_arg = values[next];
                     next += 1;
                     if item.code == b'?' {
-                        buffer[offset] = u8::from(value::truthy(value_arg));
+                        // `PyObject_IsTrue` propagates a raising `__bool__`.
+                        let truth = truthy_argument(value_arg)?;
+                        buffer[offset] = u8::from(truth);
                     } else {
                         match value::as_bytes(value_arg) {
                             Some([single]) => buffer[offset] = *single,
@@ -1115,6 +1249,57 @@ fn unpack_from_call(instance: i64, buffer_arg: i64, offset: i64) -> i64 {
     tuple_of(unpack_values(&parsed, &buffer, start as usize))
 }
 
+/// `Struct.unpack_from(buffer, offset=0, /)` through the method binder: the
+/// declared `buffer`/`offset` names make the keyword spellings work.
+extern "C" fn struct_unpack_from_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes `self`, `buffer` and `offset` in that order.
+    let instance = unsafe { *argv };
+    let buffer_arg = unsafe { *argv.add(1) };
+    let offset_arg = unsafe { *argv.add(2) };
+    let offset = match offset_argument(offset_arg) {
+        Ok(offset) => offset,
+        Err(result) => return result,
+    };
+    unpack_from_call(instance, buffer_arg, offset)
+}
+
+/// `Struct.format` getter (`s_get_format`): raises `RuntimeError` until
+/// `__init__` published a format.
+extern "C" fn struct_format_entry(argv: *const i64) -> i64 {
+    // SAFETY: the property binder passes the instance.
+    let instance = unsafe { *argv };
+    match instance_format(instance, "format") {
+        Ok(format) => value::str_alloc(format),
+        Err(result) => result,
+    }
+}
+
+/// `Struct.size` getter (`s_get_size`): a half-initialized instance reports
+/// `-1` instead of raising.
+extern "C" fn struct_size_entry(argv: *const i64) -> i64 {
+    // SAFETY: the property binder passes the instance.
+    let instance = unsafe { *argv };
+    match value::instance_attr(instance, "size") {
+        Some(size) => size,
+        None => int_result(-1),
+    }
+}
+
+/// `Struct.__sizeof__` (`s_sizeof`): the base object plus one `formatcode`
+/// slot per parsed item and the terminator. The exact count keeps the value
+/// meaningful for `sys.getsizeof` parity even though the numbers are the
+/// runtime's own object sizes.
+extern "C" fn struct_sizeof_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes the instance.
+    let instance = unsafe { *argv };
+    let parsed = match parse_for(instance, "__sizeof__") {
+        Ok(parsed) => parsed,
+        Err(result) => return result,
+    };
+    let codes = parsed.items.len().saturating_add(1) as i64;
+    int_result(32 + codes * 16)
+}
+
 fn pack_into_call(instance: i64, rest: &[i64]) -> i64 {
     let parsed = match parse_for(instance, "pack_into") {
         Ok(parsed) => parsed,
@@ -1188,10 +1373,148 @@ fn buffer_length(value_arg: i64) -> Option<usize> {
     crate::modules::array_mod::buffer_length(value_arg)
 }
 
-fn iter_unpack_call(instance: i64, buffer_arg: i64) -> i64 {
-    let parsed = match parse_for(instance, "iter_unpack") {
-        Ok(parsed) => parsed,
+/// The iterator class returned by `Struct.iter_unpack`, named
+/// `unpack_iterator` like CPython's type and deriving from
+/// `collections.abc.Iterator` so `isinstance`/`issubclass` checks succeed.
+fn unpack_iterator_class() -> i64 {
+    if let Some(class) = globals::registry_get(UNPACK_ITERATOR_KEY) {
+        return class;
+    }
+    let base = crate::modules::collections_abc::constant("Iterator");
+    let init = method_entry(
+        "Struct.unpack_iterator.__init__",
+        unpack_iterator_init_entry,
+        vec![self_parameter()],
+    );
+    let iter = method_entry(
+        "Struct.unpack_iterator.__iter__",
+        unpack_iterator_iter_entry,
+        vec![self_parameter()],
+    );
+    let next = method_entry(
+        "Struct.unpack_iterator.__next__",
+        unpack_iterator_next_entry,
+        vec![self_parameter()],
+    );
+    let hint = method_entry(
+        "Struct.unpack_iterator.__length_hint__",
+        unpack_iterator_length_hint_entry,
+        vec![self_parameter()],
+    );
+    let roots = heap::root_values(&[base, init, iter, next, hint]);
+    let methods = vec![
+        ("__init__".to_string(), init, MethodKind::Normal),
+        ("__iter__".to_string(), iter, MethodKind::Normal),
+        ("__next__".to_string(), next, MethodKind::Normal),
+        ("__length_hint__".to_string(), hint, MethodKind::Normal),
+    ];
+    let class = value::class_new_multi(
+        "unpack_iterator".to_string(),
+        vec![base],
+        NONE,
+        methods,
+        Vec::new(),
+    );
+    globals::registry_set(UNPACK_ITERATOR_KEY, class);
+    heap::release_roots(roots);
+    class
+}
+
+/// Builds the `unpack_iterator` for `format` over a buffer snapshot.
+fn new_unpack_iterator(format: &str, buffer: Vec<u8>) -> i64 {
+    let class = unpack_iterator_class();
+    let instance = value::instance_new(class);
+    let roots = heap::root_values(std::slice::from_ref(&instance));
+    value::instance_setattr(
+        instance,
+        "_format".to_string(),
+        value::str_alloc(format.to_string()),
+    );
+    value::instance_setattr(instance, "_data".to_string(), value::bytes_new(buffer));
+    value::instance_setattr(instance, "_position".to_string(), int_result(0));
+    heap::release_roots(roots);
+    instance
+}
+
+/// Iterator state: `(format, data, position)`, or the reason it is missing.
+fn unpack_iterator_state(instance: i64) -> Result<(String, &'static [u8], usize), i64> {
+    let Some(format) = value::instance_attr(instance, "_format").and_then(value::as_str) else {
+        return Err(exc::raise_with_message(
+            RUNTIME_ERROR,
+            "unpack iterator is not initialized",
+        ));
+    };
+    let Some(data) = value::instance_attr(instance, "_data").and_then(value::as_bytes) else {
+        return Err(exc::raise_with_message(
+            RUNTIME_ERROR,
+            "unpack iterator is not initialized",
+        ));
+    };
+    let position = value::instance_attr(instance, "_position")
+        .and_then(value::as_integer)
+        .unwrap_or(0)
+        .max(0) as usize;
+    Ok((format.to_string(), data, position))
+}
+
+/// `type(iter_unpack(...))()`: CPython's C type has no `tp_new`.
+extern "C" fn unpack_iterator_init_entry(_argv: *const i64) -> i64 {
+    type_error("cannot create 'unpack_iterator' instances")
+}
+
+/// `iter(self) is self`.
+extern "C" fn unpack_iterator_iter_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes the receiver first.
+    unsafe { *argv }
+}
+
+/// `next(self)`: decodes one record and advances the byte cursor.
+extern "C" fn unpack_iterator_next_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes the receiver first.
+    let instance = unsafe { *argv };
+    let (format, data, position) = match unpack_iterator_state(instance) {
+        Ok(state) => state,
         Err(result) => return result,
+    };
+    let parsed = match parsed_format(&format) {
+        Ok(parsed) => parsed,
+        Err(message) => return struct_error(&message),
+    };
+    if parsed.size == 0 || position + parsed.size > data.len() {
+        return exc::raise_with_message(exc::STOP_ITERATION, "");
+    }
+    let row = tuple_of(unpack_values(&parsed, data, position));
+    let next = (position + parsed.size) as i64;
+    value::instance_setattr(instance, "_position".to_string(), int_result(next));
+    row
+}
+
+/// `operator.length_hint` support: the number of records still to decode.
+extern "C" fn unpack_iterator_length_hint_entry(argv: *const i64) -> i64 {
+    // SAFETY: the binder passes the receiver first.
+    let instance = unsafe { *argv };
+    let (format, data, position) = match unpack_iterator_state(instance) {
+        Ok(state) => state,
+        Err(result) => return result,
+    };
+    let size = match parsed_format(&format) {
+        Ok(parsed) => parsed.size,
+        Err(message) => return struct_error(&message),
+    };
+    if size == 0 || position >= data.len() {
+        return int_result(0);
+    }
+    int_result(((data.len() - position) / size) as i64)
+}
+
+fn iter_unpack_call(instance: i64, buffer_arg: i64) -> i64 {
+    let format = match instance_format(instance, "iter_unpack") {
+        Ok(format) => format,
+        Err(result) => return result,
+    };
+    let parsed = match parsed_format(&format) {
+        Ok(parsed) => parsed,
+        Err(message) => return struct_error(&message),
     };
     if parsed.size == 0 {
         return struct_error("cannot iteratively unpack with a struct of length 0");
@@ -1206,12 +1529,7 @@ fn iter_unpack_call(instance: i64, buffer_arg: i64) -> i64 {
             parsed.size
         ));
     }
-    let rows = buffer.len() / parsed.size;
-    let mut items = Vec::with_capacity(rows);
-    for row in 0..rows {
-        items.push(tuple_of(unpack_values(&parsed, &buffer, row * parsed.size)));
-    }
-    crate::iter::iter_new(value::list_new(items))
+    new_unpack_iterator(&format, buffer)
 }
 
 /// `Struct.__init__`: parses `format` and publishes `format`/`size`. A parse
@@ -1242,9 +1560,23 @@ fn create_struct(format_arg: i64) -> i64 {
 }
 
 fn struct_repr(instance: i64) -> i64 {
-    let format = instance_format(instance, "__repr__").unwrap_or_default();
-    let text = format!("Struct({})", value::repr(value::str_alloc(format)));
+    let format = match instance_format(instance, "__repr__") {
+        Ok(format) => format,
+        Err(result) => return result,
+    };
+    // CPython renders `_PyType_Name(Py_TYPE(self))`, so a `Struct` subclass
+    // keeps its own name.
+    let name = value::instance_class_value(instance)
+        .and_then(value::class_display_name)
+        .unwrap_or("Struct");
+    let text = format!("{name}({})", value::repr(value::str_alloc(format)));
     value::str_alloc(text)
+}
+
+/// `repr(s)` entry point: runs the shared renderer through the binder.
+extern "C" fn struct_repr_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method binder passes the receiver first.
+    struct_repr(unsafe { *argv })
 }
 
 /// Dispatches one native call. `args` already contains `self` for the
@@ -1390,7 +1722,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                 Ok(parsed) => parsed,
                 Err(message) => return struct_error(&message),
             };
-            iter_unpack_with(&parsed, buffer_arg)
+            iter_unpack_with(&format, &parsed, buffer_arg)
         }
         "Struct.iter_unpack" => {
             let Some(instance) = args.first().copied() else {
@@ -1528,7 +1860,7 @@ fn unpack_from_with(parsed: &Parsed, buffer: &[u8], offset: i64) -> i64 {
     tuple_of(unpack_values(parsed, buffer, start as usize))
 }
 
-fn iter_unpack_with(parsed: &Parsed, buffer_arg: i64) -> i64 {
+fn iter_unpack_with(format: &str, parsed: &Parsed, buffer_arg: i64) -> i64 {
     if parsed.size == 0 {
         return struct_error("cannot iteratively unpack with a struct of length 0");
     }
@@ -1542,10 +1874,5 @@ fn iter_unpack_with(parsed: &Parsed, buffer_arg: i64) -> i64 {
             parsed.size
         ));
     }
-    let rows = buffer.len() / parsed.size;
-    let mut items = Vec::with_capacity(rows);
-    for row in 0..rows {
-        items.push(tuple_of(unpack_values(parsed, &buffer, row * parsed.size)));
-    }
-    crate::iter::iter_new(value::list_new(items))
+    new_unpack_iterator(format, buffer)
 }

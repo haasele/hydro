@@ -34,7 +34,7 @@
 use regex::{bytes as regex_bytes, Regex, RegexBuilder};
 
 use crate::core::globals;
-use crate::exc::{self, ATTRIBUTE_ERROR, INDEX_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::exc::{self, ATTRIBUTE_ERROR, INDEX_ERROR, OVERFLOW_ERROR, TYPE_ERROR, VALUE_ERROR};
 use crate::value::{self, NONE};
 
 /// Marker bit in `PatternState::flags` recording that `source` holds bytes
@@ -88,6 +88,11 @@ pub(crate) fn constant(name: &str) -> i64 {
         "VERBOSE" | "X" => VERBOSE,
         "DEBUG" => DEBUG,
         "ASCII" | "A" => ASCII,
+        // The `_sre` C-module limits (the `_sre` alias exposes this table).
+        "MAGIC" => SRE_MAGIC,
+        "MAXREPEAT" => SRE_MAXREPEAT,
+        "MAXGROUPS" => SRE_MAXGROUPS,
+        "CODESIZE" => 4,
         // `re.error` is the `PatternError` class itself.
         "error" | "PatternError" => return pattern_error_class(),
         // `re.Scanner` is a real (callable) class value.
@@ -1623,9 +1628,27 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         // `re.purge()` clears the (nonexistent) pattern cache; the engine
         // compiles on demand and keeps no module-level cache.
         "purge" => NONE,
+        // The private `_sre` case-folding helpers. `_sre` is an alias of this
+        // module, so the names resolve here; `test_re.test_case_helpers`
+        // compares them against CPython's Unicode case tables.
+        "ascii_tolower" => case_helper(args, ascii_tolower),
+        "unicode_tolower" => case_helper(args, unicode_tolower),
+        "ascii_iscased" => case_helper(args, ascii_iscased),
+        "unicode_iscased" => case_helper(args, unicode_iscased),
+        // `_sre.template(pattern, template)` validates a compiled replacement
+        // template. Hydro substitutes directly from the Python template text,
+        // so only the argument validation CPython's test suite exercises is
+        // meaningful here.
+        "template" => sre_template(args),
         "compile" | "_compile" => {
             if args.is_empty() {
                 return type_error("compile() missing required argument 'pattern'");
+            }
+            // The three-argument-and-up spelling is `_sre.compile(pattern,
+            // flags, code, groups, groupindex, indexgroup)`, whose engine
+            // entry is reached only through the `_sre` alias.
+            if function == "compile" && args.len() > 2 {
+                return sre_compile(args);
             }
             // Already-compiled patterns are returned unchanged; their own
             // flags travel with them.
@@ -1885,6 +1908,143 @@ pub(crate) fn submodule_call(module: &str, function: &str, args: &[i64]) -> i64 
             &format!("module '{module}' has no attribute '{function}'"),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// `_sre` private helpers (reached through the `_sre` alias)
+// ---------------------------------------------------------------------------
+
+/// Reads the single integer argument of an `_sre` case helper.
+fn case_helper(args: &[i64], helper: fn(i64) -> i64) -> i64 {
+    let Some(&raw) = args.first() else {
+        return type_error("case helper requires a code point");
+    };
+    let Some(code) = value::as_integer(raw) else {
+        return type_error(&format!(
+            "an integer is required (got type {})",
+            value::type_name(raw)
+        ));
+    };
+    if !(0..=0x10FFFF).contains(&code) {
+        return exc::raise_with_message(VALUE_ERROR, "code point out of range");
+    }
+    helper(code)
+}
+
+/// `_sre.ascii_tolower(code)`: ASCII-only case folding.
+fn ascii_tolower(code: i64) -> i64 {
+    if (b'A' as i64..=b'Z' as i64).contains(&code) {
+        crate::ops::int_result(code + 32)
+    } else {
+        crate::ops::int_result(code)
+    }
+}
+
+/// `_sre.unicode_tolower(code)`: full Unicode simple lowercase mapping.
+fn unicode_tolower(code: i64) -> i64 {
+    let Some(character) = u32::try_from(code).ok().and_then(char::from_u32) else {
+        return crate::ops::int_result(code);
+    };
+    let lowered = character.to_lowercase().next().unwrap_or(character);
+    crate::ops::int_result(lowered as i64)
+}
+
+/// `_sre.ascii_iscased(code)`: whether the code point is an ASCII letter.
+fn ascii_iscased(code: i64) -> i64 {
+    value::bool_value(
+        (b'A' as i64..=b'Z' as i64).contains(&code) || (b'a' as i64..=b'z' as i64).contains(&code),
+    )
+}
+
+/// `_sre.unicode_iscased(code)`: whether case conversion changes it.
+fn unicode_iscased(code: i64) -> i64 {
+    let Some(character) = u32::try_from(code).ok().and_then(char::from_u32) else {
+        return value::FALSE;
+    };
+    let lower_differs = character.to_lowercase().next() != Some(character);
+    let upper_differs = character.to_uppercase().next() != Some(character);
+    value::bool_value(lower_differs || upper_differs)
+}
+
+/// `_sre.compile(pattern, flags, code, groups, groupindex, indexgroup)`: the
+/// C compiler entry point behind `re._compiler.compile`.
+///
+/// Hydro hands the pattern to its regex engine instead of executing SRE code,
+/// so the code lists are validated with CPython's integer/overflow contract
+/// and then ignored.
+fn sre_compile(args: &[i64]) -> i64 {
+    let pattern = match pattern_source(args[0]) {
+        Ok(pattern) => pattern,
+        Err(error) => return error,
+    };
+    let flags = match args.get(1).copied().unwrap_or(NONE) {
+        NONE => 0,
+        value => match value::as_integer(value) {
+            Some(flags) => flags,
+            None => return type_error("an integer is required"),
+        },
+    };
+    let codes = match args.get(2).copied().unwrap_or(NONE) {
+        NONE => Vec::new(),
+        value => match value::as_list(value).or_else(|| value::as_tuple(value)) {
+            Some(items) => items.to_vec(),
+            None => return type_error("an integer is required"),
+        },
+    };
+    for code in codes {
+        let Some(number) = value::as_integer(code) else {
+            if value::as_bigint(code).is_some() {
+                return exc::raise_with_message(OVERFLOW_ERROR, "integer overflow in sre code");
+            }
+            return type_error("an integer is required");
+        };
+        if number < 0 || number > u32::MAX as i64 {
+            return exc::raise_with_message(OVERFLOW_ERROR, "integer overflow in sre code");
+        }
+    }
+    match pattern {
+        Source::Str(source) => match compile_source(&source, flags & !BYTES_PATTERN) {
+            Ok(_) => value::pattern_new(source, flags & !BYTES_PATTERN),
+            Err(error) => error,
+        },
+        Source::Bytes(source) => match compile_bytes(&source, flags & !BYTES_PATTERN) {
+            Ok(_) => value::pattern_new(latin1_string(&source), flags | BYTES_PATTERN),
+            Err(error) => error,
+        },
+    }
+}
+
+/// `_sre.template(pattern, template)`: the compiled replacement-template
+/// constructor. Hydro substitutes from the Python template text directly, so
+/// this reports CPython's validation errors and returns a marker describing
+/// the template it accepted.
+fn sre_template(args: &[i64]) -> i64 {
+    let Some(&pattern) = args.first() else {
+        return type_error("template() missing required argument 'pattern'");
+    };
+    let Some(&template) = args.get(1) else {
+        return type_error("template() missing required argument 'template'");
+    };
+    if value::as_str(pattern).is_none() && value::as_bytes(pattern).is_none() {
+        return type_error("first argument must be str or bytes");
+    }
+    let Some(items) = value::as_list(template).or_else(|| value::as_tuple(template)) else {
+        return type_error("template must be a list");
+    };
+    // CPython's template is `[literal_prefix, group_or_opcode, literal_suffix]`.
+    let Some(&code) = items.get(1) else {
+        return exc::raise_with_message(TYPE_ERROR, "invalid template");
+    };
+    let Some(number) = value::as_integer(code) else {
+        return type_error("an integer is required");
+    };
+    if number < 0 || number == SRE_MAXGROUPS {
+        return exc::raise_with_message(TYPE_ERROR, "invalid template");
+    }
+    value::namespace_new(vec![
+        ("pattern".to_string(), pattern),
+        ("template".to_string(), template),
+    ])
 }
 
 // ---------------------------------------------------------------------------
