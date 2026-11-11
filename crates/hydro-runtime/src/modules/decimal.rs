@@ -22,8 +22,8 @@
 //!   user classes by the current runtime (only `+` is); use the method forms.
 //!   `Decimal` still defines `__sub__`, `__mul__` and `__truediv__` so direct
 //!   calls and future dispatcher support work.
-//! - `sqrt`, transcendental methods, `from_float` and pickling are absent;
-//!   unknown attributes raise `AttributeError`.
+//! - `sqrt`, transcendental methods and pickling are absent; unknown
+//!   attributes raise `AttributeError`.
 
 use std::cmp::Ordering;
 
@@ -70,6 +70,7 @@ const IS_INFINITE: &str = "_decimal_is_infinite";
 const IS_ZERO: &str = "_decimal_is_zero";
 const IS_SIGNED: &str = "_decimal_is_signed";
 const TO_INTEGRAL: &str = "_decimal_to_integral_value";
+const FROM_FLOAT: &str = "_decimal_from_float";
 
 // Context entry points.
 const CONTEXT_INIT: &str = "_context_init";
@@ -452,7 +453,37 @@ fn dec_from_float(f: f64) -> Dec {
     };
     let mut value = Dec::from_bigint(coeff, exp);
     value.sign = sign;
+    // `m * 5^k` ends in zeros whenever `m` is even; the exact CPython
+    // representation keeps only the minimal coefficient (e.g. `0.5`, not
+    // `0.50`), so fold those zeros back into the exponent.
+    while value.digits.len() > 1 && value.digits.ends_with('0') {
+        value.digits.pop();
+        value.exp = value.exp.saturating_add(1);
+    }
     value
+}
+
+/// `Decimal.from_float(f)`: the exact value of a binary float, as CPython's
+/// `dec_from_float` does. Integers keep their exact value (the reference
+/// implementation accepts them too), and any other argument is a `TypeError`.
+fn from_float(args: &[i64]) -> i64 {
+    let class = args[0];
+    let raw = args[1];
+    let dec = if let Some(integer) = value::as_integer(raw) {
+        Dec::from_int(integer)
+    } else if let Some(bigint) = value::as_bigint(raw) {
+        Dec::from_bigint(bigint.clone(), 0)
+    } else if let Some(float) = value::as_float(raw) {
+        dec_from_float(float)
+    } else {
+        return type_error(&format!(
+            "from_float() argument must be int or float, not {}",
+            value::type_name(raw)
+        ));
+    };
+    let instance = value::instance_new(class);
+    write_dec(instance, &dec);
+    instance
 }
 
 fn render(dec: &Dec) -> String {
@@ -688,6 +719,11 @@ fn decimal_class() -> i64 {
             "as_tuple".to_string(),
             native(AS_TUPLE, 1),
             hydro_ir::MethodKind::Normal,
+        ),
+        (
+            "from_float".to_string(),
+            native(FROM_FLOAT, 2),
+            hydro_ir::MethodKind::Classmethod,
         ),
     ];
     let class = value::class_new_full("Decimal".to_string(), NONE, methods, Vec::new());
@@ -1662,6 +1698,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         IS_ZERO => predicate(args, |dec| dec.is_zero()),
         IS_SIGNED => predicate(args, |dec| dec.sign),
         TO_INTEGRAL => to_integral(args),
+        FROM_FLOAT => from_float(args),
         "getcontext" => getcontext(args),
         "setcontext" => setcontext(args),
         "localcontext" => localcontext(args),
@@ -1745,5 +1782,49 @@ pub(crate) fn constant(name: &str) -> i64 {
             ATTRIBUTE_ERROR,
             &format!("module 'decimal' has no attribute '{name}'"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render_instance(instance: i64) -> String {
+        value::to_string(call(STR, &[instance]))
+    }
+
+    #[test]
+    fn from_float_is_exact_and_rejects_non_numbers() {
+        exc::init();
+        let class = decimal_class();
+
+        let instance = call(FROM_FLOAT, &[class, value::float_new(0.1)]);
+        assert_eq!(
+            render_instance(instance),
+            "0.1000000000000000055511151231257827021181583404541015625"
+        );
+        assert_eq!(
+            render_instance(call(FROM_FLOAT, &[class, value::float_new(-0.0)])),
+            "-0"
+        );
+        assert_eq!(
+            render_instance(call(FROM_FLOAT, &[class, encode(12345)])),
+            "12345"
+        );
+        assert!(!exc::pending());
+
+        let big =
+            value::bigint_new(BigInt::parse_bytes(b"12345678901234567890123456789", 10).unwrap());
+        assert_eq!(
+            render_instance(call(FROM_FLOAT, &[class, big])),
+            "12345678901234567890123456789"
+        );
+
+        assert_eq!(
+            call(FROM_FLOAT, &[class, value::str_alloc("abc".to_string())]),
+            NONE
+        );
+        assert!(exc::pending());
+        exc::clear();
     }
 }

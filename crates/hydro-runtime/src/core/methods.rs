@@ -3459,6 +3459,11 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
         }
         return attribute_error(obj, attr);
     }
+    if value::as_socket(obj).is_some() && matches!(attr, "__enter__" | "__exit__") {
+        // Native socket instances are not `KIND_INSTANCE`; synthesize the
+        // bound context-manager methods from the cached socket type.
+        return value::bound_method_new(obj, attr.to_string());
+    }
     if value::as_thread(obj).is_some() {
         return thread_attr(obj, attr);
     }

@@ -7910,6 +7910,7 @@ fn runtime_extra_constant(module: &str, name: &str) -> Option<i64> {
         // permanently empty (and identity-stable, like `sys.path`).
         "sys" if name == "float_repr_style" => Some(value::str_alloc("short".to_string())),
         "sys" if name == "float_info" => Some(sys_float_info()),
+        "sys" if name == "thread_info" => Some(sys::thread_info()),
         "sys" if name == "stdlib_module_names" => Some(sys_stdlib_module_names()),
         "sys" if name == "path_hooks" => Some(sys_path_hooks()),
         // `codecs.CodecInfo`: a class value served by the runtime; the spec
@@ -8678,6 +8679,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
         // `sys.float_info`: the platform's IEEE-754 binary64 limits, exposed
         // as the struct-sequence attributes CPython documents.
         ("sys", "float_info") => sys_float_info(),
+        ("sys", "thread_info") => sys::thread_info(),
         // `sys.stdlib_module_names`: the fixed CPython 3.14.9 module set.
         ("sys", "stdlib_module_names") => sys_stdlib_module_names(),
         ("sys", "argv") => argv_list(),

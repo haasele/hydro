@@ -31,9 +31,12 @@
 //! `TemporaryDirectory` is a native class instance: the constructor allocates
 //! the directory and stores its path in the `name` attribute, while
 //! `__enter__`/`__exit__`/`cleanup` are native methods. Cleanup removes the
-//! tree recursively and treats an already-missing path as success. The
-//! `name` attribute is kept after cleanup, so callers can still inspect the
-//! removed path.
+//! tree recursively and treats an already-missing path as success. Like
+//! CPython's `_rmtree`/`_resetperms` pair it restores owner access to a
+//! directory whose mode forbids listing or unlinking, but only inside the
+//! tree being removed: the containing directory's mode is never changed.
+//! Directory symlinks are unlinked rather than followed. The `name` attribute
+//! is kept after cleanup, so callers can still inspect the removed path.
 //!
 //! `NamedTemporaryFile` wraps a real file object (created by the runtime's
 //! `io.open`) in the native `NamedTemporaryFile` class. The wrapper exposes
@@ -921,25 +924,115 @@ fn new_temporary_file(args: &[i64]) -> i64 {
     file
 }
 
-/// Removes `path` recursively, tolerating an already-missing path.
+/// The `chmod` half of CPython's `_resetperms`: give the owner access back.
+///
+/// Symlinks are left alone (`_dont_follow_symlinks`), so recovering from a
+/// permission error never changes the mode of the directory a link points at.
+fn reset_permissions(path: &Path) {
+    if fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Removes `path` recursively, recovering from a mode bit the caller removed.
+///
+/// `TemporaryDirectory.cleanup()` must remove a tree whose directories and
+/// files were chmodded to any mode (the test suite walks all eight
+/// permission triples), while never touching the mode of the directory that
+/// contains the temporary directory. CPython reaches that through
+/// `_rmtree_use_dir_fd` and its `onexc` handler, which resets the offending
+/// directory's permissions and retries; this is the same policy without
+/// directory descriptors: reset only paths inside `root` and retry once.
 fn remove_tree(path: &Path) -> io::Result<()> {
+    remove_tree_at(path, path)
+}
+
+/// Recursive worker of [`remove_tree`]; `root` never has its parent chmodded.
+fn remove_tree_at(path: &Path, root: &Path) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    if metadata.file_type().is_dir() {
-        match fs::remove_dir_all(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+    if !metadata.file_type().is_dir() {
+        return remove_file_at(path, root);
+    }
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // A directory with no read/execute bit cannot even be listed.
+            reset_permissions(path);
+            match fs::read_dir(path) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            }
         }
-    } else {
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        remove_tree_at(&entry.path(), root)?;
+    }
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // Removing the entry needs write access to its parent. Only
+            // directories inside the tree are reset: the parent of `root`
+            // belongs to the caller and keeps its mode.
+            reset_permissions(path);
+            if path != root {
+                if let Some(parent) = path.parent() {
+                    if parent.starts_with(root) {
+                        reset_permissions(parent);
+                    }
+                }
+            }
+            match fs::remove_dir(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
         }
+        Err(error) => Err(error),
+    }
+}
+
+/// Unlinks one file (or symlink) entry, resetting a parent inside `root`
+/// when the directory lost its write bit, then retrying once.
+fn remove_file_at(path: &Path, root: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            if let Some(parent) = path.parent() {
+                if parent.starts_with(root) {
+                    reset_permissions(parent);
+                }
+            }
+            match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1182,6 +1275,20 @@ fn close_wrapped(instance: i64) {
     let roots = heap::root_values(&[instance]);
     value::instance_setattr(instance, "closed".to_string(), TRUE);
     heap::release_roots(roots);
+}
+
+/// Whether a `NamedTemporaryFile`/`_TemporaryFileWrapper` is closed.
+///
+/// The wrapped file is authoritative (`closed` is delegated to it in
+/// CPython); the wrapper's own flag covers file-like objects that are not
+/// runtime file values.
+fn wrapper_closed(instance: i64) -> bool {
+    if let Some(file) = value::instance_attr(instance, "file") {
+        if let Some(file) = value::as_file(file) {
+            return file.closed();
+        }
+    }
+    flag(instance, "closed")
 }
 
 /// Whether `instance` is a `NamedTemporaryFile` wrapper rather than a
@@ -2685,7 +2792,16 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             // A `NamedTemporaryFile` wrapper enters as itself; CPython's
             // `TemporaryDirectory.__enter__` instead returns the directory
             // name, so `with TemporaryDirectory() as d:` binds a `str`.
-            Some(&instance) if is_named_wrapper(instance) => instance,
+            // `_TemporaryFileWrapper.__enter__` calls `self.file.__enter__()`,
+            // which rejects a closed file, so a second `with` after `close()`
+            // raises `ValueError` rather than silently succeeding.
+            Some(&instance) if is_named_wrapper(instance) => {
+                if wrapper_closed(instance) {
+                    exc::raise_with_message(VALUE_ERROR, "I/O operation on closed file.")
+                } else {
+                    instance
+                }
+            }
             Some(&instance) => value::instance_attr(instance, "name").unwrap_or(instance),
             None => exc::raise_with_message(TYPE_ERROR, "__enter__() missing self"),
         },
@@ -2833,6 +2949,101 @@ mod tests {
         assert_eq!(call("_tempdir_cleanup", &[instance]), NONE);
         assert!(!exc::pending());
         assert!(!Path::new(&path).exists());
+    }
+
+    /// `TemporaryDirectory.cleanup()` recovers from modes that forbid reading
+    /// and unlinking (CPython's `_resetperms` retry), and it never changes the
+    /// mode of the directory that contains the temporary directory.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_recovers_from_read_only_modes_without_touching_the_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        exc::init();
+        let parent = create_temp_dir("hydro-parent-", "", None).expect("parent directory");
+        let parent_mode = fs::metadata(&parent)
+            .expect("parent metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let args = [
+            NONE,
+            text("hydro-readonly-"),
+            value::str_alloc(parent.to_string_lossy().into_owned()),
+        ];
+        let instance = call("TemporaryDirectory", &args);
+        assert_clean(instance);
+        let path = PathBuf::from(name_of(instance));
+        let nested = path.join("nested");
+        fs::create_dir(&nested).expect("nested directory");
+        let child = nested.join("file.txt");
+        fs::write(&child, b"payload").expect("nested file");
+
+        // Every entry loses a different bit: the file cannot be opened, the
+        // nested directory cannot be listed, the root cannot be written.
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o000)).expect("chmod file");
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o500)).expect("chmod nested");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).expect("chmod root");
+
+        assert_eq!(call("_tempdir_cleanup", &[instance]), NONE);
+        if exc::pending() {
+            let message = value::to_string(exc::pending_value());
+            exc::clear();
+            panic!("cleanup raised: {message}");
+        }
+        assert!(!path.exists(), "read-only tree is removed");
+        assert_eq!(
+            fs::metadata(&parent)
+                .expect("parent metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            parent_mode,
+            "cleanup must not chmod the containing directory"
+        );
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("restore parent");
+        fs::remove_dir_all(&parent).expect("remove parent");
+    }
+
+    /// A directory symlink inside the temporary directory is unlinked, never
+    /// followed, so the link target and its contents survive cleanup.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_unlinks_directory_symlinks_without_following_them() {
+        exc::init();
+        let target = create_temp_dir("hydro-link-target-", "", None).expect("target directory");
+        let target_file = target.join("payload.txt");
+        fs::write(&target_file, b"keep me").expect("target file");
+
+        let instance = call("TemporaryDirectory", &[]);
+        assert_clean(instance);
+        let path = PathBuf::from(name_of(instance));
+        std::os::unix::fs::symlink(&target, path.join("link")).expect("directory symlink");
+
+        assert_eq!(call("_tempdir_cleanup", &[instance]), NONE);
+        assert!(!exc::pending());
+        assert!(!path.exists());
+        assert!(target_file.is_file(), "link target is untouched");
+
+        fs::remove_dir_all(&target).expect("remove target");
+    }
+
+    /// Entering the context of an already-closed wrapper matches
+    /// `file.__enter__()`: `ValueError`, not a second successful `with`.
+    #[test]
+    fn named_temporary_file_context_manager_rejects_a_closed_file() {
+        exc::init();
+        let instance = named_file("w+b", false, true);
+        let name = value::as_str(attribute(instance, "name"))
+            .expect("str name")
+            .to_string();
+        assert_eq!(method(instance, "close", &[]), NONE);
+        assert!(!exc::pending());
+        assert_eq!(method(instance, "__enter__", &[]), NONE);
+        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
+        exc::clear();
+        fs::remove_file(&name).expect("cleanup test file");
     }
 
     fn attribute(instance: i64, name: &str) -> i64 {

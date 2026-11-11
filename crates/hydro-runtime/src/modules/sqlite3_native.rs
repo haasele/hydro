@@ -798,7 +798,7 @@ fn connection_class() -> i64 {
 
 /// Cached `sqlite3.PrepareProtocol` sentinel class.
 fn prepare_protocol_class() -> i64 {
-    build_class("sqlite3.PrepareProtocol", "PrepareProtocol", &[])
+    build_class(PREPARE_PROTOCOL_KEY, "PrepareProtocol", &[])
 }
 
 /// Cached `sqlite3.Cursor` class.
@@ -2857,14 +2857,21 @@ pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
     match name {
         "Connection" => Some(connection_class()),
         "Cursor" => Some(cursor_class()),
+        // `PrepareProtocol`: the legacy marker class `register_adapter`
+        // accepts as its `proto` argument. `dbapi2` re-exports it from
+        // `_sqlite3`, so the attribute must resolve to a real class.
+        "PrepareProtocol" => Some(prepare_protocol_class()),
         _ => None,
     }
 }
 
 /// Materialises a module constant or class value.
 ///
-/// The spec declares these names as constants; `connect`/`complete_statement`
-/// are spec functions and are materialised by the central dispatcher.
+/// The spec declares most of these names as constants; `connect`/`complete_statement`
+/// are spec functions and are materialised by the central dispatcher. The
+/// adapter/converter registries, `LEGACY_TRANSACTION_CONTROL` and `Binary`
+/// are part of CPython's `_sqlite3` surface (`dbapi2` star-imports them) but
+/// are computed here, so reading the attribute always yields the live object.
 pub(crate) fn constant(name: &str) -> Option<i64> {
     if let Some(class) = class_value(MODULE, name) {
         return Some(class);
@@ -2880,6 +2887,15 @@ pub(crate) fn constant(name: &str) -> Option<i64> {
         "sqlite_version_info" => Some(sqlite_version_info()),
         "PARSE_DECLTYPES" => Some(ops::int_result(1)),
         "PARSE_COLNAMES" => Some(ops::int_result(2)),
+        // The type->adapter and name->converter registries. CPython exposes
+        // the very dicts `register_adapter`/`register_converter` mutate, so
+        // these must be the same objects the binder and converter lookup use.
+        "adapters" => Some(adapters_dict()),
+        "converters" => Some(converters_dict()),
+        // `_sqlite3.LEGACY_TRANSACTION_CONTROL`: the `autocommit` sentinel.
+        "LEGACY_TRANSACTION_CONTROL" => Some(ops::int_result(AUTOCOMMIT_LEGACY)),
+        // `dbapi2.Binary = memoryview`, used to wrap BLOBs.
+        "Binary" => Some(value::builtin_function_new(hydro_ir::Builtin::MemoryView)),
         _ => None,
     }
 }
@@ -3509,5 +3525,32 @@ mod tests {
 
         let conn = connection();
         assert_eq!(method("sqlite3.Connection.__enter__", &[conn]), conn);
+    }
+
+    #[test]
+    fn module_exposes_registration_registries_and_marker_class() {
+        exc::init();
+        // `sqlite3.PrepareProtocol` is a real cached class, and the
+        // `_sqlite3` spelling resolves to the same object.
+        let protocol = constant("PrepareProtocol").expect("PrepareProtocol");
+        assert!(value::as_class(protocol).is_some());
+        assert_eq!(class_value("_sqlite3", "PrepareProtocol"), Some(protocol));
+        // `sqlite3.adapters`/`converters` are the very dicts the binder and
+        // the column-converter lookup consult.
+        let adapters = constant("adapters").expect("adapters");
+        assert_eq!(constant("adapters"), Some(adapters));
+        assert_eq!(adapters, adapters_dict());
+        let converters = constant("converters").expect("converters");
+        assert_eq!(constant("converters"), Some(converters));
+        assert_eq!(converters, converters_dict());
+        // The `autocommit` sentinel accepted by `connect()`.
+        assert_eq!(
+            constant("LEGACY_TRANSACTION_CONTROL").and_then(value::as_integer),
+            Some(-1)
+        );
+        // `dbapi2.Binary` is `memoryview` itself, not a wrapper type.
+        let binary = constant("Binary").expect("Binary");
+        assert_eq!(value::builtin_type_token(binary), Some("memoryview"));
+        assert_eq!(constant("no_such_member"), None);
     }
 }

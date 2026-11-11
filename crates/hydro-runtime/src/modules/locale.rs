@@ -82,10 +82,11 @@ fn globals_get(key: &str) -> Option<i64> {
 fn category_arg(v: i64) -> Result<i64, i64> {
     match value::as_integer(v) {
         Some(category) if (LC_CTYPE..=LC_ALL).contains(&category) => Ok(category),
-        Some(_) => Err(exc::raise_with_message(
-            VALUE_ERROR,
-            "unknown locale category",
-        )),
+        // CPython validates the category before touching libc on platforms
+        // with a closed `LC_*` set and reports `locale.Error`; an invalid
+        // number must not surface as a bare `ValueError`, because
+        // `except locale.Error` is how callers catch locale failures.
+        Some(_) => Err(raise_locale("unknown locale category")),
         None => Err(exc::raise_with_message(
             TYPE_ERROR,
             &format!("category must be an integer, not {}", value::type_name(v)),
@@ -2020,6 +2021,155 @@ const LOCALE_ALIASES: &[(&str, &str)] = &[
     ("zu_za", "zu_ZA.ISO8859-1"),
 ];
 
+/// The `encodings.aliases.aliases` entries that resolve, through
+/// [`LOCALE_ENCODING_ALIASES`], to a C library encoding name.
+///
+/// `_replace_encoding` first normalizes the spelling with
+/// `encodings.normalize_encoding`, then replaces it with the canonical codec
+/// name from `encodings.aliases.aliases`, and only then looks the result up
+/// in `locale_encoding_alias`. Entries whose canonical name has no C library
+/// spelling are omitted: for those the normalized spelling is returned
+/// unchanged, which is what the fallback below does.
+const ENCODINGS_ALIASES: &[(&str, &str)] = &[
+    ("1251", "CP1251"),
+    ("1255", "CP1255"),
+    ("1256", "CP1256"),
+    ("646", "ISO8859-1"),
+    ("8859", "ISO8859-1"),
+    ("ansi_x3.4_1968", "ISO8859-1"),
+    ("ansi_x3.4_1986", "ISO8859-1"),
+    ("ansi_x3_4_1968", "ISO8859-1"),
+    ("arabic", "ISO8859-6"),
+    ("asmo_708", "ISO8859-6"),
+    ("cp367", "ISO8859-1"),
+    ("cp65001", "UTF-8"),
+    ("cp819", "ISO8859-1"),
+    ("csascii", "ISO8859-1"),
+    ("cseuckr", "eucKR"),
+    ("csiso2022jp", "JIS7"),
+    ("csisolatin1", "ISO8859-1"),
+    ("csisolatin2", "ISO8859-2"),
+    ("csisolatin3", "ISO8859-3"),
+    ("csisolatin4", "ISO8859-4"),
+    ("csisolatin5", "ISO8859-9"),
+    ("csisolatin6", "ISO8859-10"),
+    ("csisolatinarabic", "ISO8859-6"),
+    ("csisolatincyrillic", "ISO8859-5"),
+    ("csisolatingreek", "ISO8859-7"),
+    ("csisolatinhebrew", "ISO8859-8"),
+    ("cskoi8r", "KOI8-R"),
+    ("csshiftjis", "SJIS"),
+    ("cyrillic", "ISO8859-5"),
+    ("ecma_114", "ISO8859-6"),
+    ("ecma_118", "ISO8859-7"),
+    ("elot_928", "ISO8859-7"),
+    ("eucjp", "eucJP"),
+    ("euckr", "eucKR"),
+    ("greek", "ISO8859-7"),
+    ("greek8", "ISO8859-7"),
+    ("hebrew", "ISO8859-8"),
+    ("ibm367", "ISO8859-1"),
+    ("ibm819", "ISO8859-1"),
+    ("iso2022jp", "JIS7"),
+    ("iso646_us", "ISO8859-1"),
+    ("iso8859", "ISO8859-1"),
+    ("iso8859_1", "ISO8859-1"),
+    ("iso_2022_jp", "JIS7"),
+    ("iso_646.irv_1991", "ISO8859-1"),
+    ("iso_8859_1", "ISO8859-1"),
+    ("iso_8859_10", "ISO8859-10"),
+    ("iso_8859_10_1992", "ISO8859-10"),
+    ("iso_8859_11", "ISO8859-11"),
+    ("iso_8859_11_2001", "ISO8859-11"),
+    ("iso_8859_13", "ISO8859-13"),
+    ("iso_8859_14", "ISO8859-14"),
+    ("iso_8859_14_1998", "ISO8859-14"),
+    ("iso_8859_15", "ISO8859-15"),
+    ("iso_8859_16", "ISO8859-16"),
+    ("iso_8859_16_2001", "ISO8859-16"),
+    ("iso_8859_1_1987", "ISO8859-1"),
+    ("iso_8859_2", "ISO8859-2"),
+    ("iso_8859_2_1987", "ISO8859-2"),
+    ("iso_8859_3", "ISO8859-3"),
+    ("iso_8859_3_1988", "ISO8859-3"),
+    ("iso_8859_4", "ISO8859-4"),
+    ("iso_8859_4_1988", "ISO8859-4"),
+    ("iso_8859_5", "ISO8859-5"),
+    ("iso_8859_5_1988", "ISO8859-5"),
+    ("iso_8859_6", "ISO8859-6"),
+    ("iso_8859_6_1987", "ISO8859-6"),
+    ("iso_8859_7", "ISO8859-7"),
+    ("iso_8859_7_1987", "ISO8859-7"),
+    ("iso_8859_8", "ISO8859-8"),
+    ("iso_8859_8_1988", "ISO8859-8"),
+    ("iso_8859_8_e", "ISO8859-8"),
+    ("iso_8859_8_i", "ISO8859-8"),
+    ("iso_8859_9", "ISO8859-9"),
+    ("iso_8859_9_1989", "ISO8859-9"),
+    ("iso_celtic", "ISO8859-14"),
+    ("iso_ir_100", "ISO8859-1"),
+    ("iso_ir_101", "ISO8859-2"),
+    ("iso_ir_109", "ISO8859-3"),
+    ("iso_ir_110", "ISO8859-4"),
+    ("iso_ir_126", "ISO8859-7"),
+    ("iso_ir_127", "ISO8859-6"),
+    ("iso_ir_138", "ISO8859-8"),
+    ("iso_ir_144", "ISO8859-5"),
+    ("iso_ir_148", "ISO8859-9"),
+    ("iso_ir_157", "ISO8859-10"),
+    ("iso_ir_199", "ISO8859-14"),
+    ("iso_ir_226", "ISO8859-16"),
+    ("iso_ir_6", "ISO8859-1"),
+    ("korean", "eucKR"),
+    ("ks_c_5601", "eucKR"),
+    ("ks_c_5601_1987", "eucKR"),
+    ("ks_x_1001", "eucKR"),
+    ("ksc5601", "eucKR"),
+    ("ksx1001", "eucKR"),
+    ("kz_1048", "RK1048"),
+    ("l1", "ISO8859-1"),
+    ("l10", "ISO8859-16"),
+    ("l2", "ISO8859-2"),
+    ("l3", "ISO8859-3"),
+    ("l4", "ISO8859-4"),
+    ("l5", "ISO8859-9"),
+    ("l6", "ISO8859-10"),
+    ("l7", "ISO8859-13"),
+    ("l8", "ISO8859-14"),
+    ("l9", "ISO8859-15"),
+    ("latin", "ISO8859-1"),
+    ("latin1", "ISO8859-1"),
+    ("latin10", "ISO8859-16"),
+    ("latin2", "ISO8859-2"),
+    ("latin3", "ISO8859-3"),
+    ("latin4", "ISO8859-4"),
+    ("latin5", "ISO8859-9"),
+    ("latin6", "ISO8859-10"),
+    ("latin7", "ISO8859-13"),
+    ("latin8", "ISO8859-14"),
+    ("latin9", "ISO8859-15"),
+    ("rk1048", "RK1048"),
+    ("s_jis", "SJIS"),
+    ("shiftjis", "SJIS"),
+    ("sjis", "SJIS"),
+    ("strk1048_2002", "RK1048"),
+    ("thai", "ISO8859-11"),
+    ("u8", "UTF-8"),
+    ("u_jis", "eucJP"),
+    ("ujis", "eucJP"),
+    ("us", "ISO8859-1"),
+    ("us_ascii", "ISO8859-1"),
+    ("utf", "UTF-8"),
+    ("utf8", "UTF-8"),
+    ("utf8_ucs2", "UTF-8"),
+    ("utf8_ucs4", "UTF-8"),
+    ("windows_1251", "CP1251"),
+    ("windows_1255", "CP1255"),
+    ("windows_1256", "CP1256"),
+    ("x_mac_japanese", "SJIS"),
+    ("x_mac_korean", "eucKR"),
+];
+
 /// CPython 3.14.9's `Lib/locale.py:locale_encoding_alias` table, verbatim.
 const LOCALE_ENCODING_ALIASES: &[(&str, &str)] = &[
     ("437", "C"),
@@ -2115,7 +2265,22 @@ fn locale_alias_lookup(name: &str) -> Option<&'static str> {
 }
 
 /// `_append_modifier`: attaches `@modifier` unless the code already has one.
+///
+/// `euro` is the one modifier with a dedicated spelling: it selects the
+/// ISO8859-15 (or UTF-8) form of the locale instead of being appended.
 fn append_modifier(code: &str, modifier: &str) -> String {
+    if modifier == "euro" {
+        if !code.contains('.') {
+            return format!("{code}.ISO8859-15");
+        }
+        let encoding = code.split_once('.').map_or("", |(_, encoding)| encoding);
+        if encoding == "ISO8859-15" || encoding == "UTF-8" {
+            return code.to_string();
+        }
+        if encoding == "ISO8859-1" {
+            return replace_encoding(code, "ISO8859-15");
+        }
+    }
     if code.contains('@') {
         code.to_string()
     } else {
@@ -2123,29 +2288,63 @@ fn append_modifier(code: &str, modifier: &str) -> String {
     }
 }
 
-/// `encodings.normalize_encoding` + `locale_encoding_alias`: the C library's
-/// spelling for `encoding`.
-fn c_encoding(encoding: &str) -> String {
-    let mut normalized = String::new();
+/// `encodings.normalize_encoding`: non-alphanumeric runs become a single
+/// `_`, dots are kept, and the original case is preserved.
+fn normalize_encoding_name(encoding: &str) -> String {
+    let mut normalized = String::with_capacity(encoding.len());
     let mut separator = false;
     for ch in encoding.chars() {
-        if ch.is_ascii_alphanumeric() {
+        if ch.is_alphanumeric() || ch == '.' {
             if separator && !normalized.is_empty() {
                 normalized.push('_');
             }
+            if ch.is_ascii() {
+                normalized.push(ch);
+            }
             separator = false;
-            normalized.push(ch.to_ascii_lowercase());
-        } else if ch != '.' {
+        } else {
             separator = true;
         }
     }
+    normalized
+}
+
+/// `encodings.aliases.aliases.get(name, name)` for the aliases that reach a
+/// C library encoding name.
+fn encodings_alias(normalized: &str) -> Option<&'static str> {
+    let lowered = normalized.to_ascii_lowercase();
+    ENCODINGS_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == lowered.as_str())
+        .map(|(_, canonical)| *canonical)
+}
+
+/// `_replace_encoding`'s encoding step: `encodings.normalize_encoding`, the
+/// `encodings.aliases` canonical name, then `locale_encoding_alias` (both with
+/// and without the `_`/`-` separators). The C library's spelling is returned
+/// when the tables know the name; otherwise the canonical spelling is kept,
+/// exactly like CPython.
+fn c_encoding(encoding: &str) -> String {
+    let normalized = normalize_encoding_name(encoding);
+    let canonical = encodings_alias(&normalized).unwrap_or(normalized.as_str());
+    let lowered = canonical.to_ascii_lowercase();
     if let Some((_, mapped)) = LOCALE_ENCODING_ALIASES
         .iter()
-        .find(|(alias, _)| *alias == normalized.as_str())
+        .find(|(alias, _)| *alias == lowered)
     {
         return (*mapped).to_string();
     }
-    normalized
+    let without_separators: String = lowered
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .collect();
+    if let Some((_, mapped)) = LOCALE_ENCODING_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == without_separators.as_str())
+    {
+        return (*mapped).to_string();
+    }
+    canonical.to_string()
 }
 
 /// `_replace_encoding`: keeps the language part and swaps in `encoding`.
@@ -2177,5 +2376,67 @@ pub(crate) fn constant(name: &str) -> i64 {
                 &format!("module 'locale' has no attribute '{name}'"),
             ),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn normalized(name: &str) -> String {
+        let result = normalize(&[value::str_alloc(name.to_string())]);
+        assert!(!exc::pending(), "normalize({name:?}) raised");
+        value::as_str(result)
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("normalize({name:?}) did not return a str"))
+    }
+
+    #[test]
+    fn normalize_resolves_alias_encoding_and_modifier_tables() {
+        // `test_locale.NormalizeTest`: full alias lookups, `_replace_encoding`
+        // through the `encodings.aliases` table, and the `euro` modifier.
+        for (input, expected) in [
+            ("en", "en_US.ISO8859-1"),
+            ("EN", "en_US.ISO8859-1"),
+            ("en_US", "en_US.ISO8859-1"),
+            ("en_US.UTF-8", "en_US.UTF-8"),
+            ("en_US:UTF-8", "en_US.UTF-8"),
+            ("en_US.US-ASCII", "en_US.ISO8859-1"),
+            ("en_US.885915", "en_US.ISO8859-15"),
+            ("english_uk.ascii", "en_GB.ISO8859-1"),
+            ("az_AZ.ISO8859-9E", "az_AZ.ISO8859-9E"),
+            ("tt_RU.koi8c", "tt_RU.KOI8-C"),
+            ("tt_RU.KOI8-C", "tt_RU.KOI8-C"),
+            ("lo_LA.ibmcp1133", "lo_LA.IBM-CP1133"),
+            ("uk_ua.microsoft-cp1251", "uk_UA.CP1251"),
+            ("ka_GE.GEORGIAN-ACADEMY", "ka_GE.GEORGIAN-ACADEMY"),
+            ("cs_CZ.ISO8859-2", "cs_CZ.ISO8859-2"),
+            ("de_DE@euro", "de_DE.ISO8859-15"),
+            ("en_US.ISO8859-15@euro", "en_US.ISO8859-15"),
+            ("de_DE.utf8@euro", "de_DE.UTF-8"),
+            ("sr_RS.UTF-8@latn", "sr_RS.UTF-8@latin"),
+        ] {
+            assert_eq!(normalized(input), expected, "normalize({input:?})");
+        }
+    }
+
+    #[test]
+    fn normalize_returns_every_alias_entry_unchanged() {
+        for (alias, expected) in LOCALE_ALIASES {
+            assert_eq!(normalized(alias), *expected, "normalize({alias:?})");
+        }
+    }
+
+    #[test]
+    fn invalid_category_raises_locale_error() {
+        let result = category_arg(value::encode_int(12_345).expect("representable"));
+        assert!(result.is_err(), "category 12345 must be rejected");
+        let error = exc::pending_value();
+        exc::clear();
+        assert_eq!(
+            value::instance_class_value(error),
+            Some(error_class()),
+            "an invalid category raises locale.Error, not a bare ValueError"
+        );
     }
 }

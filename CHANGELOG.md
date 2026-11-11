@@ -8,6 +8,24 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-11-11 stdlib semantics slice
+
+- `locale.normalize` now mirrors CPython's encoding alias/modifier pipeline
+  (`en_US.US-ASCII`, `tt_RU.KOI8-C`, `ja.sjis`, euro modifier), invalid
+  categories raise `locale.Error`, and the alias tables are covered by tests.
+- `Decimal.from_float` performs exact IEEE-754 conversion, with normalized
+  trailing zeros and exact int/BigInt handling.
+- `tempfile` cleanup recovers read-only directory modes without changing the
+  parent's mode, unlinks directory symlinks without following them, and
+  rejects re-entering a closed `NamedTemporaryFile`.
+- `sqlite3` exposes `PrepareProtocol`, live `adapters`/`converters`,
+  `LEGACY_TRANSACTION_CONTROL` and `Binary`.
+- `sys.thread_info` reports the real native thread library/version with a
+  stable namespace; object-model `isinstance`/`issubclass` accept PEP 604
+  unions.
+- `socket` exposes a type-level and bound context-manager protocol.
+- Workspace suite: **3274 passed, 1 skipped**.
+
 ### Compatibility — 2026-11-10 plistlib and native-exception slice
 
 - `test_plistlib.py` now passes **71/71** and is recorded as `hydro_pass`.

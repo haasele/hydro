@@ -7726,7 +7726,7 @@ pub(crate) fn isinstance(value: i64, target: i64) -> i64 {
 }
 
 /// `issubclass(subclass, class)`: both arguments name classes (or `class` is
-/// a tuple of classes).
+/// a tuple of classes or a PEP 604 union of them).
 ///
 /// The check follows the CPython hierarchy for exception classes
 /// (`issubclass(SyntaxError, Exception)`), walks the base chain of
@@ -7857,6 +7857,41 @@ fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
         }
         return Ok(false);
     }
+    // A PEP 604 union target behaves like the tuple of its members, matching
+    // CPython's `_Py_union_args` substitution. `None` stands for `NoneType` in
+    // a union, so it is a valid candidate here even though a bare `None` is
+    // not a class; a parameterized generic member (`list[int] | int`) has no
+    // class meaning and keeps the arg-2 `TypeError`.
+    if crate::modules::types::is_union(class) {
+        if value::as_class(subclass).is_none()
+            && !value::as_ext_object(subclass)
+                .is_some_and(|extension| crate::capi::object_is_type(extension.object))
+        {
+            return Err(SubclassError::Subclass);
+        }
+        let Some(members) = value::instance_attr(class, "__args__").and_then(value::as_tuple)
+        else {
+            return Err(SubclassError::Class);
+        };
+        for &candidate in members {
+            let candidate = if candidate == NONE {
+                value::type_class(NONE)
+            } else {
+                candidate
+            };
+            if value::as_class(candidate).is_none()
+                && value::builtin_type_class(candidate).is_none()
+                && !value::as_ext_object(candidate)
+                    .is_some_and(|extension| crate::capi::object_is_type(extension.object))
+            {
+                return Err(SubclassError::Class);
+            }
+            if subclass_check(subclass, candidate)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
     // A metaclass `__subclasscheck__` decides for its classes before the
     // default hierarchy walk (CPython's `issubclass` dispatches through it).
     if let Some(result) = metaclass_type_hook(class, "__subclasscheck__", subclass) {
@@ -7965,11 +8000,29 @@ fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
 }
 
 /// Tri-state check: `Some(true/false)` for a recognized type object, `None`
-/// when `target` is not a type. Tuples are checked element by element.
+/// when `target` is not a type. Tuples and PEP 604 unions are checked element
+/// by element.
 fn type_check(value: i64, target: i64) -> Option<bool> {
     if let Some(types) = value::as_tuple(target) {
         for &candidate in types {
             match type_check(value, candidate) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => return None,
+            }
+        }
+        return Some(false);
+    }
+    // A PEP 604 union (`int | str`) is a `types.UnionType` instance whose
+    // `__args__` holds the members; CPython replaces the target with that
+    // tuple before testing membership. `None` stays a member (it names
+    // `NoneType`, handled below). A member with no type meaning — the
+    // `list[int]` of `list[int] | int` — makes the whole check unanswerable,
+    // so the builtin raises like CPython instead of answering `False`.
+    if crate::modules::types::is_union(target) {
+        let members = value::instance_attr(target, "__args__").and_then(value::as_tuple)?;
+        for &member in members {
+            match type_check(value, member) {
                 Some(true) => return Some(true),
                 Some(false) => {}
                 None => return None,
@@ -10294,6 +10347,63 @@ mod tests {
     }
 
     #[test]
+    fn isinstance_accepts_pep604_unions() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        let int_type = value::builtin_function_new(Builtin::Int);
+        let float_type = value::builtin_function_new(Builtin::Float);
+        let str_type = value::builtin_function_new(Builtin::Str);
+        let list_type = value::builtin_function_new(Builtin::List);
+
+        // `int | str` is a `types.UnionType` instance, not a tuple, but
+        // `isinstance` tests each member (CPython's
+        // `object_recursive_isinstance` substitutes `__args__` before the
+        // tuple walk).
+        let union = crate::modules::types::union_new(&[int_type, str_type]);
+        assert!(crate::modules::types::is_union(union));
+        assert_eq!(isinstance(int(3), union), TRUE);
+        assert_eq!(isinstance(TRUE, union), TRUE);
+        assert_eq!(isinstance(string("x"), union), TRUE);
+        assert_eq!(isinstance(value::float_new(0.5), union), FALSE);
+        assert!(!exc::pending());
+
+        // `int | None` keeps `None` as a member; only `None` and ints match.
+        let optional = crate::modules::types::union_new(&[int_type, NONE]);
+        assert_eq!(isinstance(NONE, optional), TRUE);
+        assert_eq!(isinstance(int(1), optional), TRUE);
+        assert_eq!(isinstance(string("x"), optional), FALSE);
+        assert!(!exc::pending());
+
+        // A class instance matches through its base chain inside a union.
+        let base = value::class_new("Base".to_string(), NONE, Vec::new());
+        let derived = value::class_new("Derived".to_string(), base, Vec::new());
+        let instance = value::instance_new(derived);
+        let class_union = crate::modules::types::union_new(&[base, str_type]);
+        assert_eq!(isinstance(instance, class_union), TRUE);
+        let other_union = crate::modules::types::union_new(&[float_type, str_type]);
+        assert_eq!(isinstance(instance, other_union), FALSE);
+        assert!(!exc::pending());
+
+        // `typing.List | int` mixes a builtin type spelling (a function value
+        // naming the cached class) with another builtin spelling.
+        let mixed = crate::modules::types::union_new(&[list_type, int_type]);
+        assert_eq!(isinstance(value::list_new(Vec::new()), mixed), TRUE);
+        assert_eq!(isinstance(int(7), mixed), TRUE);
+        assert_eq!(isinstance(string("x"), mixed), FALSE);
+        assert!(!exc::pending());
+
+        // A parameterized generic member cannot answer the check, so the
+        // builtin raises `TypeError` (CPython: "cannot be a parameterized
+        // generic") instead of reporting `False`.
+        let alias = crate::modules::typing::builtin_generic_subscript(list_type, int_type)
+            .expect("list[int] builds a _GenericAlias");
+        let parameterized = crate::modules::types::union_new(&[alias, int_type]);
+        assert_eq!(isinstance(int(2), parameterized), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        exc::init();
+    }
+
+    #[test]
     fn isinstance_walks_class_bases() {
         exc::init();
         let base = value::class_new("Animal".to_string(), NONE, Vec::new());
@@ -10710,6 +10820,49 @@ mod tests {
             pending_message(),
             "issubclass() arg 2 must be a class or tuple of classes"
         );
+        exc::init();
+    }
+
+    #[test]
+    fn issubclass_accepts_pep604_unions() {
+        let _guard = crate::heap::heap_reset_test_guard();
+        exc::init();
+        let int_type = value::builtin_function_new(Builtin::Int);
+        let float_type = value::builtin_function_new(Builtin::Float);
+        let str_type = value::builtin_function_new(Builtin::Str);
+
+        // `int | float | int` flattens to two distinct members; every one of
+        // them answers `True`, a non-member answers `False`.
+        let union = crate::modules::types::union_new(&[int_type, float_type, int_type]);
+        assert!(crate::modules::types::is_union(union));
+        assert_eq!(issubclass(int_type, union), TRUE);
+        assert_eq!(issubclass(float_type, union), TRUE);
+        assert_eq!(issubclass(str_type, union), FALSE);
+        assert!(!exc::pending());
+
+        // `None` stands for `NoneType` inside a union, so it is a legitimate
+        // candidate there.
+        let optional = crate::modules::types::union_new(&[int_type, NONE]);
+        assert_eq!(issubclass(int_type, optional), TRUE);
+        assert_eq!(issubclass(value::type_class(NONE), optional), TRUE);
+        assert_eq!(issubclass(str_type, optional), FALSE);
+        assert!(!exc::pending());
+
+        // The derived class matches the base named inside the union.
+        let base = value::class_new("Base".to_string(), NONE, Vec::new());
+        let derived = value::class_new("Derived".to_string(), base, Vec::new());
+        let class_union = crate::modules::types::union_new(&[base, str_type]);
+        assert_eq!(issubclass(derived, class_union), TRUE);
+        assert_eq!(issubclass(class_union, base), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(pending_message(), "issubclass() arg 1 must be a class");
+        exc::init();
+
+        // A non-class first argument keeps the arg-1 error even when the
+        // target is a union.
+        assert_eq!(issubclass(int(1), union), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(pending_message(), "issubclass() arg 1 must be a class");
         exc::init();
     }
 

@@ -1054,9 +1054,9 @@ fn construct_kind(family: i64, sock_type: i64, proto: i64, timeout: Option<Durat
         return os_error("[Errno 93] Protocol not supported");
     }
     if base_type == SOCK_DGRAM {
-        value::socket_new(SocketState::datagram(None, family, timeout))
+        allocate_socket(SocketState::datagram(None, family, timeout))
     } else {
-        value::socket_new(SocketState::unbound(family, SOCK_STREAM, timeout))
+        allocate_socket(SocketState::unbound(family, SOCK_STREAM, timeout))
     }
 }
 
@@ -1134,7 +1134,7 @@ fn create_connection(args: &[i64]) -> i64 {
                     .local_addr()
                     .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
             );
-            value::socket_new(SocketState::stream(stream, family, timeout))
+            allocate_socket(SocketState::stream(stream, family, timeout))
         }
         Ok(NonblockingConnect::Pending(_)) => blocking_error(),
         Err(error) => io_error(error),
@@ -1280,7 +1280,7 @@ fn create_listener(addr: SocketAddr, options: ServerOptions, backlog: libc::c_in
     // into the `TcpListener`; the runtime state closes it on drop.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
     let family = family_of(&addr);
-    value::socket_new(SocketState::from_inner(SocketInner {
+    allocate_socket(SocketState::from_inner(SocketInner {
         kind: SocketKind::Listener(listener),
         family,
         sock_type: SOCK_STREAM,
@@ -1306,7 +1306,7 @@ fn create_listener(addr: SocketAddr, options: ServerOptions, backlog: libc::c_in
         stored.push(((1, 15), 1));
     }
     let family = family_of(&addr);
-    value::socket_new(SocketState::from_inner(SocketInner {
+    allocate_socket(SocketState::from_inner(SocketInner {
         kind: SocketKind::Listener(listener),
         family,
         sock_type: SOCK_STREAM,
@@ -1376,8 +1376,8 @@ fn socketpair(args: &[i64]) -> i64 {
         let first = unsafe { TcpStream::from_raw_fd(fds[0]) };
         // SAFETY: see above.
         let second = unsafe { TcpStream::from_raw_fd(fds[1]) };
-        let left = value::socket_new(SocketState::stream(first, AF_UNIX, None));
-        let right = value::socket_new(SocketState::stream(second, AF_UNIX, None));
+        let left = allocate_socket(SocketState::stream(first, AF_UNIX, None));
+        let right = allocate_socket(SocketState::stream(second, AF_UNIX, None));
         value::tuple_new(vec![left, right])
     }
     #[cfg(not(unix))]
@@ -2170,7 +2170,7 @@ pub(crate) fn class_value(module: &str, name: &str) -> Option<i64> {
         return None;
     }
     match name {
-        "socket" | "SocketType" => Some(value::socket_class()),
+        "socket" | "SocketType" => Some(socket_type_class()),
         "error" | "gaierror" | "timeout" => Some(exc::exception_class(OS_ERROR)),
         _ => None,
     }
@@ -2466,6 +2466,107 @@ pub(crate) fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
             &format!("'socket' object has no attribute '{name}'"),
         ),
     }
+}
+
+// -------------------------------------------------------------------------
+// `socket.socket` as a class
+// -------------------------------------------------------------------------
+//
+// A socket object is a native value, so `type(sock)` is the cached native
+// class rather than a class statement. CPython resolves the special methods on
+// the type — `unittest._enter_context` reads `type(cm).__enter__` and calls it
+// with the receiver explicitly — so the cached class carries the
+// context-manager pair as ordinary (unbound) functions.
+
+/// Registry key recording which class value already carries the protocol, so
+/// a class that was re-created after a collection is enriched again.
+const SOCKET_PROTOCOL_KEY: &str = "socket.class.protocol";
+
+fn socket_self_parameter() -> value::ParamMeta {
+    value::ParamMeta {
+        name: "self".to_string(),
+        kind: hydro_ir::ParamKind::Positional,
+        default: None,
+    }
+}
+
+fn socket_optional_parameter(name: &str) -> value::ParamMeta {
+    value::ParamMeta {
+        name: name.to_string(),
+        kind: hydro_ir::ParamKind::Positional,
+        default: Some(NONE),
+    }
+}
+
+/// A method value of the cached `socket` class.
+///
+/// The body is an ordinary wrapper with full parameter metadata, so a call
+/// binds and pads the declared slots and then runs `entry` with exactly
+/// `params.len()` values, the receiver first.
+fn socket_type_method(
+    name: &str,
+    params: Vec<value::ParamMeta>,
+    entry: extern "C" fn(*const i64) -> i64,
+) -> i64 {
+    let function = value::function_new_with_flags(0, usize::MAX, name.to_string(), 0);
+    value::function_set_signature(function, params);
+    value::function_set_full_entry(function, entry as *const () as usize);
+    function
+}
+
+extern "C" fn socket_enter_method(argv: *const i64) -> i64 {
+    // SAFETY: `socket_type_method` declares one slot: `self`.
+    let receiver = unsafe { *argv };
+    method(receiver, "__enter__", &[])
+}
+
+extern "C" fn socket_exit_method(argv: *const i64) -> i64 {
+    // SAFETY: the declared slots are `self, exc_type, exc_value, traceback`.
+    let receiver = unsafe { *argv };
+    let args = unsafe { std::slice::from_raw_parts(argv.add(1), 3) };
+    method(receiver, "__exit__", args)
+}
+
+/// The cached `socket` class, with the context-manager protocol installed.
+///
+/// Idempotent; see [`SOCKET_PROTOCOL_KEY`].
+fn socket_type_class() -> i64 {
+    let class = value::socket_class();
+    if class == NONE || globals::registry_get(SOCKET_PROTOCOL_KEY) == Some(class) {
+        return class;
+    }
+    let roots = heap::root_values(&[class]);
+    let enter = socket_type_method(
+        "__enter__",
+        vec![socket_self_parameter()],
+        socket_enter_method,
+    );
+    let enter_roots = heap::root_values(&[enter]);
+    let _ = value::class_set_attr(class, "__enter__".to_string(), enter);
+    heap::release_roots(enter_roots);
+    let exit = socket_type_method(
+        "__exit__",
+        vec![
+            socket_self_parameter(),
+            socket_optional_parameter("exc_type"),
+            socket_optional_parameter("exc_value"),
+            socket_optional_parameter("traceback"),
+        ],
+        socket_exit_method,
+    );
+    let exit_roots = heap::root_values(&[exit]);
+    let _ = value::class_set_attr(class, "__exit__".to_string(), exit);
+    heap::release_roots(exit_roots);
+    globals::registry_set(SOCKET_PROTOCOL_KEY, class);
+    heap::release_roots(roots);
+    class
+}
+
+/// Allocates a socket value, ensuring its type carries the protocol first:
+/// `type(sock).__enter__` must resolve before the socket is used.
+fn allocate_socket(state: SocketState) -> i64 {
+    socket_type_class();
+    value::socket_new(state)
 }
 
 // -------------------------------------------------------------------------
@@ -3545,7 +3646,7 @@ fn accept(state: &SocketState) -> i64 {
     };
     match result {
         Ok((stream, addr)) => {
-            let sock = value::socket_new(SocketState::stream(stream, family, None));
+            let sock = allocate_socket(SocketState::stream(stream, family, None));
             let address = tuple_addr(addr);
             value::tuple_new(vec![sock, address])
         }
@@ -4581,7 +4682,7 @@ fn duplicate(state: &SocketState) -> i64 {
         closed: false,
         options,
     };
-    value::socket_new(SocketState::from_inner(copy))
+    allocate_socket(SocketState::from_inner(copy))
 }
 
 fn unwrap_tls(_obj: i64, state: &SocketState) -> i64 {
@@ -6269,6 +6370,43 @@ pub(crate) fn ssl_constant(name: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_type_carries_the_context_manager_protocol() {
+        exc::init();
+        let sock = construct(&[]);
+        assert!(!exc::pending(), "socket() failed unexpectedly");
+        let roots = heap::root_values(&[sock]);
+        let class = value::type_class(sock);
+
+        // `unittest._enter_context` reads the special methods off the type and
+        // calls them with the receiver passed explicitly.
+        let enter = crate::core::methods::getattr(class, b"__enter__".as_ptr(), 9);
+        assert!(!exc::pending(), "socket type must expose __enter__");
+        let entered = crate::core::builtins::call(enter, 1, &sock as *const i64);
+        assert!(!exc::pending());
+        assert_eq!(entered, sock, "__enter__ returns the socket itself");
+
+        // The same protocol through the instance: a bound read takes no
+        // explicit receiver.
+        let bound = crate::core::methods::getattr(sock, b"__enter__".as_ptr(), 9);
+        assert!(!exc::pending());
+        let rebound = crate::core::builtins::call(bound, 0, std::ptr::null());
+        assert!(!exc::pending());
+        assert_eq!(rebound, sock);
+
+        let exit = crate::core::methods::getattr(class, b"__exit__".as_ptr(), 8);
+        assert!(!exc::pending(), "socket type must expose __exit__");
+        let exit_args = [sock, NONE, NONE, NONE];
+        let outcome = crate::core::builtins::call(exit, 4, exit_args.as_ptr());
+        assert!(!exc::pending());
+        assert_eq!(outcome, NONE);
+        assert!(
+            value::as_socket(sock).is_some_and(|state| state.lock().closed),
+            "__exit__ closes the socket"
+        );
+        heap::release_roots(roots);
+    }
 
     #[test]
     fn global_default_timeout_is_a_cached_object_sentinel() {

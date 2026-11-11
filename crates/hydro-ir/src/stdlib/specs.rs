@@ -2060,6 +2060,8 @@ pub static SYS: ModuleSpec = ModuleSpec {
         c("argv", Type::List),
         // `sys.float_info`: the platform IEEE-754 binary64 limits.
         c("float_info", Type::Any),
+        // `sys.thread_info`: native thread-library metadata.
+        c("thread_info", Type::Any),
         // `sys.hash_info`: the stable numeric hash parameters.
         c("hash_info", Type::Any),
         // Process-wide importer cache; native modules and path entries may
