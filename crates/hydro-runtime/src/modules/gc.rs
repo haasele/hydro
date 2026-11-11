@@ -501,8 +501,9 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "freeze" => freeze(),
         "unfreeze" => unfreeze(),
         "get_freeze_count" => get_freeze_count(),
-        // The collector never finalizes objects, so nothing is finalized.
-        "is_finalized" => value::FALSE,
+        "is_finalized" => value::bool_value(crate::heap::is_finalized(
+            args.first().copied().unwrap_or(NONE),
+        )),
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'gc' has no attribute '{function}'"),

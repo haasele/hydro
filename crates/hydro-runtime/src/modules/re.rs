@@ -868,7 +868,7 @@ fn char_offset(text: &str, byte: usize) -> usize {
 }
 
 /// Converts a Python character offset to a UTF-8 byte offset.
-fn byte_offset(text: &str, character: usize) -> usize {
+pub(crate) fn byte_offset(text: &str, character: usize) -> usize {
     text.char_indices()
         .nth(character)
         .map(|(byte, _)| byte)
@@ -1678,13 +1678,19 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                 }
             }
         }
-        "escape" => match value::as_str(args[0]) {
-            Some(text) => value::str_alloc(regex::escape(text)),
-            None => type_error(&format!(
-                "escape() argument must be str, not {}",
-                value::type_name(args[0])
-            )),
-        },
+        "escape" => {
+            if let Some(text) = value::as_str(args[0]) {
+                value::str_alloc(regex::escape(text))
+            } else if let Some(bytes) = value::as_bytes(args[0]) {
+                let escaped = regex::escape(&latin1_string(bytes));
+                value::bytes_new(latin1_bytes(&escaped))
+            } else {
+                type_error(&format!(
+                    "escape() argument must be str or bytes, not {}",
+                    value::type_name(args[0])
+                ))
+            }
+        }
         _ => {
             let source = match pattern_source(args[0]) {
                 Ok(source) => source,

@@ -5301,6 +5301,54 @@ pub(crate) fn as_set(v: i64) -> Option<&'static [i64]> {
     }
 }
 
+/// Whether `class` is the native `frozenset` class or derives from it.
+fn class_is_frozen_set(class: i64) -> bool {
+    class_mro(class).iter().any(|&ancestor| {
+        as_class(ancestor).is_some_and(|state| state.attr(FROZENSET_CLASS_MARKER).is_some())
+    })
+}
+
+/// Whether `v` is a frozen set: the native `frozenset` itself or a subclass
+/// instance.
+///
+/// Hydro stores a frozenset as a `frozenset`-class instance whose reserved
+/// container payload is the ordinary set holding the elements. The class
+/// distinguishes it from `set`, so both share one traced payload shape while
+/// only the frozen form is hashable and immutable.
+pub(crate) fn is_frozen_set(v: i64) -> bool {
+    as_instance(v).is_some_and(|state| class_is_frozen_set(state.class))
+}
+
+/// Whether `v` is the native `frozenset` itself, excluding subclasses.
+pub(crate) fn is_exact_frozenset(v: i64) -> bool {
+    as_instance(v).is_some_and(|state| {
+        as_class(state.class).is_some_and(|class| class.attr(FROZENSET_CLASS_MARKER).is_some())
+    })
+}
+
+/// Whether `v` is a mutable `set` (including a `set` subclass instance).
+pub(crate) fn is_plain_set(v: i64) -> bool {
+    as_set(v).is_some() && !is_frozen_set(v)
+}
+
+/// The set payload a frozenset instance owns, for callers that need the
+/// underlying storage object (a builtin-container subclass keeps this value
+/// rather than nesting the frozenset).
+pub(crate) fn frozen_set_storage(v: i64) -> Option<i64> {
+    if !is_frozen_set(v) {
+        return None;
+    }
+    container_payload_of(v, KIND_SET)
+}
+
+/// Elements of a frozen set under the normal set view.
+pub(crate) fn as_frozenset(v: i64) -> Option<&'static [i64]> {
+    if !is_frozen_set(v) {
+        return None;
+    }
+    container_payload_of(v, KIND_SET).and_then(as_set)
+}
+
 /// Returns `(start, stop, step)` for a range object.
 pub(crate) fn as_range(v: i64) -> Option<(i64, i64, i64)> {
     if !is_heap(v) {
@@ -5836,7 +5884,14 @@ pub(crate) fn dict_pairs_mut(v: i64) -> Option<ContainerGuard<DictData>> {
 }
 
 /// Returns exclusive access to a set's elements. See [`list_items_mut`].
+///
+/// A frozenset refuses mutation: its elements are immutable by definition, so
+/// the attempt raises `TypeError` and no guard is handed out.
 pub(crate) fn set_items_mut(v: i64) -> Option<ContainerGuard<Vec<i64>>> {
+    if is_frozen_set(v) {
+        crate::exc::raise_with_message(crate::exc::TYPE_ERROR, "'frozenset' object is immutable");
+        return None;
+    }
     // A `set`/`frozenset` subclass instance mutates the set it owns.
     let v = container_payload_of(v, KIND_SET).unwrap_or(v);
     let graph = lock_container(v, KIND_SET)?;
@@ -7832,6 +7887,28 @@ pub(crate) fn set_new(items: Vec<i64>) -> i64 {
     result
 }
 
+/// Allocates an immutable set from `items`, which must already be
+/// deduplicated and hashable.
+///
+/// The elements live in an ordinary set payload owned by an instance of the
+/// native `frozenset` class (traced through the instance attribute table), so
+/// the collector sees them without a dedicated payload kind. The class is what
+/// makes the value a frozenset for `type`, `isinstance`, repr and hashing.
+pub(crate) fn frozenset_new(items: Vec<i64>) -> i64 {
+    let storage = set_new(items);
+    let roots = crate::gc::heap::root_values(std::slice::from_ref(&storage));
+    let instance = instance_new(frozenset_class());
+    instance_set_container_payload(instance, storage);
+    crate::gc::heap::release_roots(roots);
+    instance
+}
+
+/// Copies `set`'s elements into a fresh frozenset.
+pub(crate) fn frozenset_from_set(set: i64) -> i64 {
+    let items = as_set(set).map(|items| items.to_vec()).unwrap_or_default();
+    frozenset_new(items)
+}
+
 pub(crate) fn range_new(start: i64, stop: i64, step: i64) -> i64 {
     alloc(KIND_RANGE, ObjData::Range { start, stop, step })
 }
@@ -9076,6 +9153,9 @@ pub(crate) fn type_name(v: i64) -> &'static str {
         };
     }
     if is_heap(v) {
+        if is_frozen_set(v) {
+            return instance_class_name(v).unwrap_or("frozenset");
+        }
         // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
         return match unsafe { as_obj(v) }.map(|o| o.data_ref()) {
             Some(ObjDataRef::Str(_)) => "str",
@@ -9309,6 +9389,10 @@ const CONTAINER_PAYLOAD_ATTR: &str = "\u{0}hydro_container_payload";
 const SCALAR_PAYLOAD_ATTR: &str = "\u{0}hydro_scalar_payload";
 /// Marker attribute carried by every native scalar class.
 const SCALAR_CLASS_MARKER: &str = "\u{0}hydro_native_scalar";
+/// Marker attribute carried by the native `frozenset` class (but not by a
+/// user subclass, which inherits no own attributes), so a frozen set is
+/// recognized from the class payload alone rather than a thread-local cache.
+const FROZENSET_CLASS_MARKER: &str = "\u{0}hydro_native_frozenset";
 
 /// The native `dict` class, as `type({})` reports it.
 pub(crate) fn dict_class() -> i64 {
@@ -9628,13 +9712,14 @@ fn container_native_class(name: &str) -> i64 {
         methods.push(("__new__".to_string(), new, MethodKind::Staticmethod));
     }
     let root = crate::heap::root_values(&roots_source);
-    let class = class_new_multi(
-        name.to_string(),
-        vec![object_class()],
-        NONE,
-        methods,
-        Vec::new(),
-    );
+    // The marker is an own class attribute, so subclasses inherit the frozen
+    // behavior while `is_exact_frozenset` still distinguishes the native type.
+    let attrs = if name == "frozenset" {
+        vec![(FROZENSET_CLASS_MARKER.to_string(), TRUE)]
+    } else {
+        Vec::new()
+    };
+    let class = class_new_multi(name.to_string(), vec![object_class()], NONE, methods, attrs);
     crate::heap::release_roots(root);
     class
 }
@@ -10018,6 +10103,11 @@ pub(crate) fn is_partial_class(v: i64) -> bool {
     cached_class_name_is("partial", v)
 }
 
+/// Cached native `frozenset` class.
+pub(crate) fn frozenset_class() -> i64 {
+    native_class("frozenset")
+}
+
 /// Whether the cache entry for `name` is `value`.
 fn cached_class_name_is(name: &str, value: i64) -> bool {
     TYPE_CLASS_CACHE.with(|cache| {
@@ -10204,6 +10294,10 @@ pub(crate) fn truthy(v: i64) -> bool {
             Some(ObjDataRef::Instance(state)) => {
                 if let Some(payload) = scalar_payload(v) {
                     truthy(payload)
+                } else if let Some(items) = container_payload(v).and_then(as_set) {
+                    // A set/frozenset (subclass) instance is truthy exactly
+                    // when it holds an element, like CPython.
+                    !items.is_empty()
                 } else if is_native_dict_subclass(state.class) {
                     dict_instance_truthy(v, state.class)
                 } else {
@@ -10276,6 +10370,26 @@ pub(crate) fn object_default_repr(v: i64) -> String {
         Some(state) => instance_default_repr(state),
         None => repr(v),
     }
+}
+
+/// `repr(frozenset)`: `frozenset()` when empty, `frozenset({...})` otherwise.
+/// A subclass instance keeps its own class name (`F({...})`), like CPython.
+fn frozenset_repr(value: i64, items: &[i64]) -> String {
+    let name = instance_class_name(value).unwrap_or("frozenset");
+    if items.is_empty() {
+        return format!("{name}()");
+    }
+    let mut out = String::with_capacity(name.len() + 3);
+    out.push_str(name);
+    out.push_str("({");
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&repr_depth(*item));
+    }
+    out.push_str("})");
+    out
 }
 
 /// `repr(bytearray)`: the bytes literal wrapped in `bytearray(...)`.
@@ -10415,6 +10529,9 @@ pub(crate) fn to_string(v: i64) -> String {
         };
     }
     if is_heap(v) {
+        if is_frozen_set(v) {
+            return repr_depth(v);
+        }
         // SAFETY: heap tag checked; object rooted (collector frees only unreachable objects).
         if let Some(obj) = unsafe { as_obj(v) } {
             return match obj.data_ref() {
@@ -10809,6 +10926,9 @@ fn repr_depth(v: i64) -> String {
     if let Some(state) = as_code(v) {
         return code_repr(state);
     }
+    if let Some(items) = as_frozenset(v) {
+        return frozenset_repr(v, items);
+    }
     if let Some(state) = as_instance(v) {
         let class = state.class;
         // A Python class deriving from `BaseException` keeps its own class
@@ -10969,10 +11089,14 @@ fn repr_depth(v: i64) -> String {
     if let Some(state) = as_match(v) {
         let span = state.groups.first().copied().flatten();
         return match span {
-            Some((start, end)) => format!(
-                "<re.Match object; span=({start}, {end}), match={}>",
-                quote_str(&state.text[start..end])
-            ),
+            Some((start, end)) => {
+                let start_byte = crate::modules::re::byte_offset(&state.text, start);
+                let end_byte = crate::modules::re::byte_offset(&state.text, end);
+                format!(
+                    "<re.Match object; span=({start}, {end}), match={}>",
+                    quote_str(&state.text[start_byte..end_byte])
+                )
+            }
             None => "<re.Match object>".to_string(),
         };
     }

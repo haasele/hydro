@@ -8,6 +8,26 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-11-11 finalizers, frozensets and metaclass calls
+
+- Added Python `__del__` finalization: unreachable finalizable instances are
+  resurrected/pinned, finalized exactly once through MRO lookup, and reclaimed
+  on a later collection; `gc.is_finalized` reports the state.
+- `frozenset` is now a distinct immutable/hashable container with representation,
+  equality, set algebra and dict-key support; plain sets remain unhashable.
+- Calling a class whose MRO contains native `type` with `(name, bases, ns)` now
+  routes through `type.__new__` and returns a class, fixing metaclass setup.
+- `abc` abstract methods are enforced at instantiation (CPython 3.14 message),
+  and `AbstractContextManager`/`AbstractAsyncContextManager` keep `__exit__`/
+  `__aexit__` abstract.
+- Generator error values are consumed once on exhaustion, `close()` returns the
+  body result, non-generator delegate close failures report through
+  `sys.unraisablehook`, and unittest subtests classify against
+  `failureCase`.
+- `re.escape(bytes)` and Unicode-safe match repr, plus `format_map`/`hex`
+  frontend signatures.
+- Workspace suite: **3291 passed, 1 skipped**; clippy/fmt green.
+
 ### Compatibility — 2026-11-11 live mappings, globals and generator introspection
 
 - Instance `__dict__` is now a live mapping backed by the attribute table

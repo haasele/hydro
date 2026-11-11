@@ -22,8 +22,11 @@
 //!   acquiring `GRAPH_LOCK`, a queue mutex or `GLOBAL`. `GC_LOCK` is only
 //!   taken with `try_lock`, so a second collector skips. `GLOBAL_ROOTS` (the
 //!   process-wide root list) is taken by the mutator for an append and by the
-//!   marker for its walk; the walk may take `WORKLIST`, never the reverse. No
-//!   guard is held across a safepoint or an allocation.
+//!   marker for its walk; the walk may take `WORKLIST`, never the reverse.
+//!   `FINALIZERS` is a leaf: it may be taken under `GLOBAL` or the local heap
+//!   and it may push to `WORKLIST` while holding it, but it is never held
+//!   across user code, a payload drop or another GC lock. No guard is held
+//!   across a safepoint or an allocation.
 //!
 //! Documented limits:
 //!
@@ -67,6 +70,23 @@
 //! vector holding them is invisible to the conservative stack scan, so every
 //! collection also marks the pinned references until the module releases the
 //! pins (`weakrefs_unpin`).
+//!
+//! # Finalizers
+//!
+//! A class instance whose class defines `__del__` is finalized exactly once.
+//! The sweep's liveness decision is the trigger: after the final worklist
+//! drain, an unreachable (white) instance is resurrected (marked grey),
+//! recorded in the process-wide [`FinalizerState`] and queued; the sweep then
+//! keeps it, so the method later runs on an intact object. Queued and
+//! in-flight instances are marked as roots by every collection until their
+//! method has run, so a collection or allocation inside `__del__` cannot free
+//! the receiver. The method is invoked through the ordinary attribute
+//! protocol (`C.__del__(self)`) with no lock held, from `gc.collect()`, a
+//! generated-code safepoint or thread exit; a raising finalizer is reported
+//! to stderr and its pending exception cleared. The object is reclaimed by
+//! the next collection that finds it unreachable again (a finalizer that
+//! stores `self` somewhere keeps it alive), and the cell's record is dropped
+//! when the pool reclaims it, so a reused address can be finalized again.
 //! # Precise shadow-stack roots
 //!
 //! Generated code registers its live locals with [`crate::gc::roots`]. At
@@ -1272,6 +1292,468 @@ pub(crate) fn run_pending_weakref_callbacks() {
     }
 }
 
+/// One `__del__` invocation waiting to run outside every GC lock.
+struct PendingFinalizer {
+    /// Tagged instance the method is called on.
+    instance: i64,
+    /// Token of the thread that owns the heap the instance was found in.
+    owner: u64,
+    /// Whether the instance belongs to the process-wide (shared) heap. Only
+    /// the owner thread runs a private-heap finalizer; a shared one may be
+    /// run by whichever thread drains the queue.
+    shared: bool,
+}
+
+impl PendingFinalizer {
+    /// Cell address of the instance.
+    fn addr(&self) -> usize {
+        (self.instance & !TAG_MASK) as usize
+    }
+}
+
+/// Bookkeeping for one instance whose `__del__` was queued.
+struct FinalizerRecord {
+    /// Thread that owned the heap the address belongs to.
+    owner: u64,
+    /// Whether the address belongs to the process-wide (shared) heap.
+    shared: bool,
+    /// Whether the method has been called (or is being called right now).
+    ran: bool,
+}
+
+/// Process-wide finalizer queue and the exactly-once bookkeeping.
+///
+/// Entries are keyed by cell address and dropped when the pool reclaims the
+/// cell (see [`forget_finalized_local`]/[`forget_finalized_shared`]), so a
+/// reused address is finalizable again while a live one is never finalized
+/// twice.
+#[derive(Default)]
+struct FinalizerState {
+    /// Finalizers waiting to run.
+    pending: Vec<PendingFinalizer>,
+    /// Instances whose finalizer is running. Pinned as roots so the call and
+    /// any allocation it makes cannot free the receiver.
+    active: Vec<i64>,
+    /// Every instance whose `__del__` was queued or has run.
+    tracked: HashMap<usize, FinalizerRecord>,
+}
+
+/// Queued finalizers, protecting [`FinalizerState`].
+static FINALIZERS: LazyLock<Mutex<FinalizerState>> =
+    LazyLock::new(|| Mutex::new(FinalizerState::default()));
+
+/// Number of queued finalizers, readable on the safepoint fast path.
+static PENDING_FINALIZERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of entries in [`FinalizerState::tracked`], readable without the
+/// lock on the sweep fast path.
+static TRACKED_FINALIZERS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// Re-entrancy guard: `__del__` may allocate and reach a safepoint, which
+    /// must not start a nested finalizer drain.
+    static RUNNING_FINALIZERS: Cell<bool> = const { Cell::new(false) };
+}
+
+fn lock_finalizers() -> MutexGuard<'static, FinalizerState> {
+    FINALIZERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether any `__del__` call is queued.
+pub(crate) fn finalizers_pending() -> bool {
+    PENDING_FINALIZERS.load(Ordering::Acquire) != 0
+}
+
+/// Whether `value` is a heap instance whose `__del__` has run (or is running
+/// right now).
+///
+/// Backs `gc.is_finalized`: an instance queued but not yet called is still
+/// reported as not finalized, matching CPython's meaning of the flag.
+pub(crate) fn is_finalized(value: i64) -> bool {
+    if value & TAG_MASK != TAG_HEAP {
+        return false;
+    }
+    let addr = (value & !TAG_MASK) as usize;
+    if addr == 0 {
+        return false;
+    }
+    lock_finalizers()
+        .tracked
+        .get(&addr)
+        .is_some_and(|record| record.ran)
+}
+
+/// Borrows `addr` as a class-instance value, or `None` for every other kind.
+///
+/// # Safety
+///
+/// `addr` must be a live registered cell address.
+unsafe fn instance_at(addr: usize) -> Option<i64> {
+    // SAFETY: the caller guarantees a live registered cell.
+    if unsafe { object_at(addr) }.kind != crate::value::KIND_INSTANCE {
+        return None;
+    }
+    Some((addr as i64) | TAG_HEAP)
+}
+
+/// The callable `__del__` a finalizer must invoke, or [`crate::value::NONE`].
+///
+/// Special methods are resolved on the type and never through the instance
+/// dictionary; [`crate::value::class_lookup`] follows the MRO and also sees a
+/// function attached after class creation (`C.__del__ = f`). Re-resolving at
+/// call time matches CPython's `slot_tp_finalize`, which looks the name up
+/// when it runs and silently does nothing if the class no longer has it.
+///
+/// Read-only class-namespace work: it takes the overlay/deleted locks but
+/// allocates nothing, so it can run during a collection from the collecting
+/// thread (local mode) or while the world is stopped (shared mode).
+fn finalizer_method(instance: i64) -> i64 {
+    let Some(class) = crate::value::instance_class_value(instance) else {
+        return crate::value::NONE;
+    };
+    match crate::value::class_lookup(class, "__del__") {
+        Some(crate::value::ClassEntry::Method(_, function)) => function,
+        // `C.__del__ = f` installs the slot after class creation.
+        Some(crate::value::ClassEntry::Attr(value)) => {
+            if crate::value::as_function(value).is_some() {
+                value
+            } else {
+                crate::value::NONE
+            }
+        }
+        _ => crate::value::NONE,
+    }
+}
+
+/// Calls `function(instance)` with the receiver bound like a dunder method.
+///
+/// Mirrors the binder used by the `__str__`/`__repr__` dispatch: a generated
+/// method carries parameter metadata and needs the full-entry trampoline,
+/// while a raw `function_new` value is called positionally. The receiver and
+/// the function are reachable through the instance (which the drain pins), so
+/// no additional root is needed.
+fn call_finalizer(function: i64, instance: i64) -> i64 {
+    let argument = [instance];
+    if crate::value::function_signature(function).is_empty()
+        || crate::value::function_full_entry(function) == 0
+    {
+        return crate::builtins::call(function, 1, argument.as_ptr());
+    }
+    crate::builtins::call_kw(function, 1, argument.as_ptr(), 0, std::ptr::null())
+}
+
+/// Queues `instance` for `__del__` unless its cell was already claimed.
+///
+/// Returns `true` when the instance was newly queued. `addr` is the instance's
+/// cell address and `shared` whether it belongs to the process-wide heap.
+fn queue_finalizer(addr: usize, instance: i64, shared: bool) -> bool {
+    let mut state = lock_finalizers();
+    if state.tracked.contains_key(&addr) {
+        return false;
+    }
+    let owner = current_gc_token();
+    state.tracked.insert(
+        addr,
+        FinalizerRecord {
+            owner,
+            shared,
+            ran: false,
+        },
+    );
+    TRACKED_FINALIZERS.fetch_add(1, Ordering::Relaxed);
+    state.pending.push(PendingFinalizer {
+        instance,
+        owner,
+        shared,
+    });
+    PENDING_FINALIZERS.fetch_add(1, Ordering::AcqRel);
+    true
+}
+
+/// Runs queued `__del__` calls.
+///
+/// Called after a collection and from safepoints/thread exit: every such point
+/// holds no GC lock and the caller's live values are described by the roots
+/// the collector already knows. Each instance is moved from the pending queue
+/// into the pinned list under the finalizer lock, so a collection racing this
+/// drain keeps it (and, through it, its `__del__` method and attributes)
+/// alive. The method runs with no lock held. A raising finalizer is reported
+/// like CPython's unraisable output and cleared.
+pub(crate) fn run_pending_finalizers() {
+    if !finalizers_pending() {
+        return;
+    }
+    // A propagating exception owns the thread's exception state; invoking user
+    // code now would clobber it (and the report below would clear it). Defer
+    // the drain to a clean safepoint.
+    if exc::pending() {
+        return;
+    }
+    if RUNNING_FINALIZERS.with(Cell::get) {
+        // A finalizer allocated and reached a safepoint: the outer drain keeps
+        // going once it returns.
+        return;
+    }
+    RUNNING_FINALIZERS.with(|running| running.set(true));
+    struct ResetGuard;
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            RUNNING_FINALIZERS.with(|running| running.set(false));
+        }
+    }
+    let _guard = ResetGuard;
+
+    let owner = current_gc_token();
+    loop {
+        let item = {
+            let mut state = lock_finalizers();
+            // A private-heap instance must run on its owner thread; a shared
+            // one is reachable from the process-wide heap, so any thread may
+            // run it.
+            let Some(position) = state
+                .pending
+                .iter()
+                .position(|item| item.shared || item.owner == owner)
+            else {
+                break;
+            };
+            let item = state.pending.remove(position);
+            PENDING_FINALIZERS.fetch_sub(1, Ordering::AcqRel);
+            // The queue no longer holds the instance: pin it before dropping
+            // the lock, so no collection can observe it unrooted.
+            state.active.push(item.instance);
+            if let Some(record) = state.tracked.get_mut(&item.addr()) {
+                record.ran = true;
+            }
+            item
+        };
+        let function = finalizer_method(item.instance);
+        if function != crate::value::NONE {
+            call_finalizer(function, item.instance);
+        }
+        if exc::pending() {
+            let text = crate::value::to_string(exc::pending_value());
+            {
+                use std::io::Write as _;
+                let stderr = std::io::stderr();
+                let mut stderr = stderr.lock();
+                let _ = writeln!(stderr, "Exception ignored in __del__: {text}");
+                let _ = stderr.flush();
+            }
+            exc::clear();
+        }
+        let mut state = lock_finalizers();
+        if let Some(position) = state
+            .active
+            .iter()
+            .position(|&value| value == item.instance)
+        {
+            state.active.swap_remove(position);
+        }
+    }
+}
+
+/// Resurrects unreachable instances of the thread-local heap whose class
+/// defines `__del__` and queues their method, before the sweep releases cells.
+///
+/// Runs with the only thread stopped and after the final worklist drain, so
+/// white means unreachable. Each queued instance is marked grey: the sweep
+/// keeps it and the following drain traces its attributes, which `__del__`
+/// reads later. An instance already tracked (its finalizer ran in an earlier
+/// cycle) is left white and reclaimed normally.
+fn resurrect_local_finalizers(heap: &HeapState) {
+    for &obj in &heap.objects {
+        // SAFETY: every registered pointer is live and the sweep has not
+        // released a cell yet.
+        if unsafe { (*obj).marked.load(Ordering::Acquire) } != WHITE {
+            continue;
+        }
+        let addr = obj as usize;
+        // SAFETY: as above; the instance payload (if any) is intact.
+        let Some(instance) = (unsafe { instance_at(addr) }) else {
+            continue;
+        };
+        if finalizer_method(instance) == crate::value::NONE {
+            continue;
+        }
+        if queue_finalizer(addr, instance, false) {
+            mark_grey(addr);
+        }
+    }
+}
+
+/// Resurrects unreachable instances of the process-wide heap whose class
+/// defines `__del__` and queues their method.
+///
+/// Runs in the final stop-the-world phase, after the rescan and before the
+/// weak table freeze: no cell is released until the partition, so the
+/// candidate addresses stay valid while the class namespaces are inspected
+/// without holding the heap lock.
+fn resurrect_shared_finalizers() {
+    // Snapshot the white cells under the heap lock; the class lookups below
+    // take class-namespace locks and must not run under it.
+    let candidates: Vec<usize> = {
+        let heap = lock_global();
+        let mut candidates = Vec::new();
+        for &obj in &heap.objects {
+            // SAFETY: every registered pointer is live and the sweep has not
+            // released a cell yet.
+            if unsafe { (*obj).marked.load(Ordering::Acquire) } == WHITE {
+                candidates.push(obj as usize);
+            }
+        }
+        candidates
+    };
+    for addr in candidates {
+        // SAFETY: the world is stopped and no cell has been released, so the
+        // address still names a live registered object.
+        let Some(instance) = (unsafe { instance_at(addr) }) else {
+            continue;
+        };
+        if finalizer_method(instance) == crate::value::NONE {
+            continue;
+        }
+        if queue_finalizer(addr, instance, true) {
+            mark_grey(addr);
+        }
+    }
+}
+
+/// Marks queued and in-flight finalizer receivers as roots.
+///
+/// A queued instance is not reachable from the program any more (that is why
+/// it was queued), but its finalizer still has to run on the intact object,
+/// including everything `__del__` may read. `addresses` restricts the mark to
+/// the heap being collected, so a private test heap never marks a cell of
+/// another heap.
+fn mark_finalizer_pins(addresses: &AddressSet) {
+    let state = lock_finalizers();
+    for item in &state.pending {
+        if addresses.contains(&item.addr()) {
+            mark_grey(item.addr());
+        }
+    }
+    for &instance in &state.active {
+        let addr = (instance & !TAG_MASK) as usize;
+        if addresses.contains(&addr) {
+            mark_grey(addr);
+        }
+    }
+}
+
+/// Drops tracked records of this thread's private heap whose cell the sweep
+/// released.
+///
+/// A record must not outlive the cell: the pool may hand the same address to
+/// a new object, which must be finalizable again. Records of other threads,
+/// of the shared heap and of surviving cells are left alone.
+fn forget_finalized_local(addresses: &AddressSet) {
+    if TRACKED_FINALIZERS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let owner = current_gc_token();
+    let mut state = lock_finalizers();
+    let before = state.tracked.len();
+    state.tracked.retain(|&addr, record| {
+        record.shared || record.owner != owner || addresses.contains(&addr)
+    });
+    let removed = before - state.tracked.len();
+    if removed > 0 {
+        TRACKED_FINALIZERS.fetch_sub(removed, Ordering::Relaxed);
+    }
+}
+
+/// Drops tracked records of the shared heap whose cells the sweep is about to
+/// return to the pool.
+///
+/// Runs under the heap lock, immediately before [`ObjectPool::reclaim`];
+/// [`FinalizerState`] is a leaf lock, so this cannot deadlock with the
+/// partition that already finished.
+fn forget_finalized_shared(whites: &[*mut HydroObj]) {
+    if TRACKED_FINALIZERS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut state = lock_finalizers();
+    let mut removed = 0;
+    for &obj in whites {
+        let addr = obj as usize;
+        if state.tracked.get(&addr).is_some_and(|record| record.shared) {
+            state.tracked.remove(&addr);
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        TRACKED_FINALIZERS.fetch_sub(removed, Ordering::Relaxed);
+    }
+}
+
+/// Re-tags the calling thread's finalizer records after its private heap was
+/// migrated into the shared heap.
+///
+/// The cells are now part of the process-wide registry, so their records must
+/// be forgotten by the shared sweep (a private sweep no longer runs) and their
+/// queued finalizers may run on any thread.
+fn finalizers_enable_shared() {
+    if TRACKED_FINALIZERS.load(Ordering::Relaxed) == 0
+        && PENDING_FINALIZERS.load(Ordering::Relaxed) == 0
+    {
+        return;
+    }
+    let token = current_gc_token();
+    let addresses = lock_global().addresses.clone();
+    let mut state = lock_finalizers();
+    for item in &mut state.pending {
+        if item.owner == token && addresses.contains(&item.addr()) {
+            item.shared = true;
+        }
+    }
+    for record in state.tracked.values_mut() {
+        if record.owner == token {
+            record.shared = true;
+        }
+    }
+}
+
+/// Drops the finalizer bookkeeping of an exited thread's private heap.
+///
+/// Its queued methods can never run now (the owning heap is gone), so they are
+/// discarded; records of the shared heap (migrated earlier) stay, because
+/// those objects live on. Removing the records keeps a later allocation at
+/// the same address finalizable.
+fn finalizers_forget_thread(token: u64) {
+    let mut state = lock_finalizers();
+    let before_pending = state.pending.len();
+    state
+        .pending
+        .retain(|item| item.owner != token || item.shared);
+    let removed_pending = before_pending - state.pending.len();
+    if removed_pending > 0 {
+        PENDING_FINALIZERS.fetch_sub(removed_pending, Ordering::AcqRel);
+    }
+    let before = state.tracked.len();
+    state
+        .tracked
+        .retain(|_, record| record.owner != token || record.shared);
+    let removed = before - state.tracked.len();
+    if removed > 0 {
+        TRACKED_FINALIZERS.fetch_sub(removed, Ordering::Relaxed);
+    }
+}
+
+/// Drops the whole finalizer bookkeeping (runtime reset).
+fn finalizers_reset() {
+    let mut state = lock_finalizers();
+    state.pending.clear();
+    state.active.clear();
+    state.tracked.clear();
+    PENDING_FINALIZERS.store(0, Ordering::Release);
+    TRACKED_FINALIZERS.store(0, Ordering::Release);
+    // Do not clear `RUNNING_FINALIZERS`: a reset during a finalizer must not
+    // let a nested drain start.
+}
+
 /// Clears weak references whose targets are white and drops entries whose
 /// reference object is white, before a local sweep releases any cell.
 ///
@@ -1670,8 +2152,13 @@ pub(crate) fn safepoint() {
     // outside every GC lock and generated code's live values are described by
     // the precise shadow stack. Never run them while a collection is trying
     // to stop this thread.
-    if !GC_REQUESTED.load(Ordering::Relaxed) && weakref_callbacks_pending() {
-        run_pending_weakref_callbacks();
+    if !GC_REQUESTED.load(Ordering::Relaxed) {
+        if weakref_callbacks_pending() {
+            run_pending_weakref_callbacks();
+        }
+        if finalizers_pending() {
+            run_pending_finalizers();
+        }
     }
     if !GC_REQUESTED.load(Ordering::Relaxed) {
         return;
@@ -2411,6 +2898,9 @@ pub(crate) fn enable_shared() {
     // only after releasing the heap lock (documented order: `WEAK` first).
     drop(global_heap);
     weakrefs_enable_shared();
+    // Finalizer records follow their cells into the process-wide registry:
+    // the shared sweep forgets them and any thread may run their methods.
+    finalizers_enable_shared();
     // `_thread` may be started from inside a fiber. The bound/aux mirroring
     // was a no-op while the heap was local; publish the current state now so
     // a shared safepoint can validate this thread's saved context.
@@ -2444,6 +2934,9 @@ pub(crate) fn reset() {
     // about to be freed.
     GENERATION.fetch_add(1, Ordering::Relaxed);
     weakrefs_reset();
+    // A queued finalizer's instance lives in the heap that is about to be
+    // freed; the records must not survive into the next program run.
+    finalizers_reset();
     // The async loop owns persistent roots; drop it first, then clear every
     // registration's persistent slots. A fresh run must not inherit them.
     crate::modules::asyncio::reset();
@@ -2516,6 +3009,9 @@ pub(crate) fn collect() -> i64 {
     // allocation is in flight. Run callbacks queued by this (or an earlier)
     // collection here, the same way CPython runs them from the collector.
     run_pending_weakref_callbacks();
+    // Weak references are cleared before finalizers run, like CPython's
+    // collector; each `__del__` runs at most once per object.
+    run_pending_finalizers();
     freed
 }
 
@@ -2798,6 +3294,9 @@ fn mark_roots(
     // References pinned by an in-progress `getweakrefs` are keeping their
     // result objects reachable from outside the scanned stacks.
     mark_weak_pins(addresses);
+    // Instances whose `__del__` is queued or running are kept reachable so
+    // the method can run on an intact object.
+    mark_finalizer_pins(addresses);
     STAT_PRECISE_FRAMES.store(precise_frames, Ordering::Relaxed);
 }
 
@@ -2956,6 +3455,12 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
         }
         drain_worklist();
     }
+    // Unreachable instances whose class defines `__del__` must not be
+    // partitioned away: resurrect them and queue their methods now, while the
+    // world is stopped and no cell is released, so the finalizer can run on an
+    // intact object after the cycle.
+    resurrect_shared_finalizers();
+    drain_worklist();
     // The world is still stopped and no white cell has been released. Freeze
     // the weak table now: references whose object lost the rescan disappear,
     // targets that lost it are cleared, and every target that remains is
@@ -3008,6 +3513,9 @@ fn collect_shared(extra_root: Option<i64>) -> i64 {
             // SAFETY: every registered pointer is live.
             unsafe { (*obj).marked.store(WHITE, Ordering::Release) };
         }
+        // A tracked finalizer record must not outlive its cell: the pool hands
+        // the address to a later allocation, which must be finalizable again.
+        forget_finalized_shared(&whites);
         for &obj in &whites {
             // SAFETY: the payload was dropped above; the cell becomes
             // available for reuse and must not be dereferenced afterwards.
@@ -3144,12 +3652,15 @@ pub(crate) fn leave_unstarted_thread() {
 /// Records that a spawned thread has exited: marks it exited, removes it from
 /// the collector registry and wakes a waiting collector.
 pub(crate) fn leave_thread() {
-    // Run callbacks queued for this thread while its registration and stack
-    // are still intact. Skip while a collector is stopping the world: the
-    // pins keep the references alive until the next drain or reset.
+    // Run callbacks and finalizers queued for this thread while its
+    // registration and stack are still intact. Skip while a collector is
+    // stopping the world: the pins keep the references alive until the next
+    // drain or reset.
     if !GC_REQUESTED.load(Ordering::SeqCst) && !MARKING.load(Ordering::Acquire) {
         run_pending_weakref_callbacks();
+        run_pending_finalizers();
     }
+    let token = current_gc_token();
     if let Some(gc) = GC_SELF.with(|cell| cell.borrow_mut().take()) {
         gc.exited.store(true, Ordering::SeqCst);
         let mut registry = lock_thread_registry();
@@ -3173,6 +3684,10 @@ pub(crate) fn leave_thread() {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
     }
+    // The private heap dies with the thread: its queued finalizers can never
+    // run now, and their records must not block finalization of a future
+    // object that reuses the address.
+    finalizers_forget_thread(token);
     // No shadow frame survives the thread that owns its slots: drop the
     // active set and the published snapshot so the collector can never see
     // (and dereference) a dangling slot array.
@@ -3224,6 +3739,15 @@ pub(crate) fn after_fork_child() {
     let token = current_gc_token();
     for entry in lock_suspended_stacks().iter_mut() {
         entry.0 = token;
+    }
+    // A finalizer queued by a thread that vanished in the fork would never
+    // run on its vanished owner; the child's only thread adopts the queue
+    // (shared-heap instances; a private heap of a vanished thread is gone).
+    {
+        let mut finalizers = lock_finalizers();
+        for item in &mut finalizers.pending {
+            item.owner = token;
+        }
     }
     AUX_STACK.with(|slot| slot.set([(0, 0); 2]));
     reset_colors();
@@ -3379,6 +3903,9 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
     // `getweakrefs` pins the references it is about to return; keep them and
     // their (native-only) children while the result list is being built.
     mark_weak_pins(&heap.addresses);
+    // A queued or in-flight finalizer keeps its receiver (and everything
+    // `__del__` reads) alive even though the program can no longer reach it.
+    mark_finalizer_pins(&heap.addresses);
     drain_worklist();
 
     // ---- sweep -----------------------------------------------------
@@ -3389,6 +3916,12 @@ fn collect_state(heap: &mut HeapState, extra_root: Option<i64>) -> usize {
     for addr in clear_weakrefs_local(heap) {
         mark_grey(addr);
     }
+    drain_worklist();
+    // An unreachable instance whose class defines `__del__` is resurrected and
+    // its finalizer queued: `run_pending_finalizers` calls it once this
+    // collection is over, and a later cycle reclaims the object if it is
+    // still dead then.
+    resurrect_local_finalizers(heap);
     drain_worklist();
     let mark_time = mark_start.elapsed();
     let sweep_start = Instant::now();
@@ -3458,6 +3991,10 @@ fn sweep(heap: &mut HeapState) -> usize {
     addresses.clear();
     addresses.reserve(objects.len());
     addresses.extend(objects.iter().map(|&obj| obj as usize));
+
+    // A tracked finalizer record must not outlive its cell: the pool may hand
+    // the address to a new object, which must be finalizable again.
+    forget_finalized_local(addresses);
 
     if capacity_is_oversized(objects.capacity(), objects.len()) {
         objects.shrink_to_fit();

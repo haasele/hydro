@@ -1321,11 +1321,25 @@ pub(crate) fn result_value(value: i64) -> i64 {
 /// the generator body gave it. Propagating it to the resumer is CPython's
 /// `_PyErr_Restore`, which never chains to the resumer's handled exception.
 pub(crate) fn raise_error(value: i64) -> i64 {
-    let error = value::as_fiber(value)
-        .map(|fiber| fiber.error)
-        .unwrap_or(NONE);
-    if error != NONE {
+    let Some(ptr) = value::fiber_raw(value) else {
+        return NONE;
+    };
+    // SAFETY: `fiber_raw` returned the address of a live fiber payload that
+    // stays reachable through `value` for this call.
+    unsafe {
+        let error = (*ptr).error;
+        if error == NONE {
+            return NONE;
+        }
         exc::raise_value_unchained(error);
+        // A plain generator delivers its captured exception exactly once:
+        // CPython clears the frame when the body raises, so a later `next()`
+        // or `send()` reports `StopIteration` instead of resurrecting the old
+        // exception. Tasks and async generators keep the error on the fiber
+        // because `Task.result()`/`await` may report it again.
+        if (*ptr).kind == FiberKind::Generator {
+            (*ptr).error = NONE;
+        }
     }
     NONE
 }
@@ -1555,7 +1569,13 @@ pub(crate) fn throw_value(generator: i64, exception: i64) -> i64 {
             return raise_error(generator);
         }
         if (*ptr).done {
-            return exc::raise_stop_iteration((*ptr).result);
+            // The body finished while handling the thrown exception: its
+            // return value travels in `StopIteration.value` exactly once
+            // (`_PyGen_SetStopIterationValue`). The frame is cleared now, so a
+            // later `next()`/`send()` reports a bare `StopIteration` instead
+            // of repeating the value.
+            let result = std::mem::replace(&mut (*ptr).result, NONE);
+            return exc::raise_stop_iteration(result);
         }
         (*ptr).yielded
     }
@@ -1589,11 +1609,11 @@ pub(crate) fn close_value(generator: i64) -> i64 {
         resume_raw(ptr, NONE);
         let error = std::mem::replace(&mut (*ptr).error, NONE);
         if error != NONE {
+            (*ptr).closing = false;
             let tag = value::exception_data(error).map(|data| data.tag);
             if tag == Some(exc::GENERATOR_EXIT) {
                 // The injected GeneratorExit propagated out of the body:
                 // this is the normal `close()` outcome.
-                (*ptr).closing = false;
                 return NONE;
             }
             exc::raise_value_unchained(error);
@@ -1601,7 +1621,11 @@ pub(crate) fn close_value(generator: i64) -> i64 {
         }
         if (*ptr).done {
             (*ptr).closing = false;
-            return NONE;
+            // A body that caught the injected GeneratorExit and returned
+            // hands its return value back through `close()` (CPython's
+            // `gen_close` fetches it from the `StopIteration` `gen_send_ex`
+            // raised). The frame is cleared, so the value is consumed here.
+            return std::mem::replace(&mut (*ptr).result, NONE);
         }
         // The generator yielded while closing: CPython treats it as closed
         // and reports the ignored GeneratorExit.
@@ -2041,6 +2065,39 @@ fn throw_delegate(delegate: i64, is_generator: bool, exception: i64) -> Delegate
     }
 }
 
+/// Reports the pending exception through `sys.unraisablehook`, clearing the
+/// pending slot (CPython's `PyErr_FormatUnraisable`).
+///
+/// `yield from` uses this for a non-generator delegate whose `close`
+/// attribute lookup raised: CPython's `gen_close_iter` reports that error as
+/// unraisable and lets the close finish normally instead of propagating it.
+fn report_unraisable(exception: i64, object: i64) {
+    let _ = exc::clear();
+    let hook = crate::modules::module_get_by_name("sys", "unraisablehook");
+    if hook == NONE {
+        return;
+    }
+    // A namespace is one of the two shapes `sys.unraisablehook` accepts and
+    // supports attribute access, so `unraisable.exc_type` works for hooks
+    // that capture the argument (CPython's `UnraisableHookArgs`).
+    let unraisable = value::namespace_new(vec![
+        ("exc_type".to_string(), value::type_class(exception)),
+        ("exc_value".to_string(), exception),
+        ("exc_traceback".to_string(), NONE),
+        ("err_msg".to_string(), NONE),
+        ("object".to_string(), object),
+    ]);
+    let roots = crate::heap::root_values(&[hook, unraisable]);
+    let arguments = [unraisable];
+    let _ = crate::core::builtins::call(hook, 1, arguments.as_ptr());
+    // A raising hook is itself unraisable; it must not become the outcome of
+    // the generator's close.
+    if exc::pending() {
+        let _ = exc::clear();
+    }
+    crate::heap::release_roots(roots);
+}
+
 /// `yield from iterable`: drives `iterable` from the running generator.
 ///
 /// Each delegated item is yielded through the outer generator. `send` values
@@ -2131,8 +2188,11 @@ pub(crate) fn yield_from_value(iterable: i64) -> i64 {
                     }
                     DelegateMethod::Missing => {}
                     DelegateMethod::Failed => {
-                        unsafe { (*outer).yieldfrom = NONE };
-                        return NONE;
+                        // Only a missing `close` is skipped. A lookup that
+                        // raised other than `AttributeError` is reported as
+                        // unraisable and the close continues, exactly like
+                        // CPython's `gen_close_iter`.
+                        report_unraisable(exc::pending_value(), delegate);
                     }
                 }
             }

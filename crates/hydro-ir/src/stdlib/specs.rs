@@ -2553,7 +2553,29 @@ pub static _IO: ModuleSpec = ModuleSpec {
 pub static ARGPARSE: ModuleSpec = ModuleSpec {
     name: "argparse",
     functions: &[
-        f("ArgumentParser", 0, 15, Type::Any),
+        kw(
+            "ArgumentParser",
+            0,
+            15,
+            Type::Any,
+            &[
+                "prog",
+                "usage",
+                "description",
+                "epilog",
+                "parents",
+                "formatter_class",
+                "prefix_chars",
+                "fromfile_prefix_chars",
+                "argument_default",
+                "conflict_handler",
+                "add_help",
+                "allow_abbrev",
+                "exit_on_error",
+                "suggest_on_error",
+                "color",
+            ],
+        ),
         kw_dynamic("Namespace", 0, 0, Type::Any, &[]),
         kw(
             "FileType",
@@ -2972,7 +2994,7 @@ pub static RE: ModuleSpec = ModuleSpec {
         // dynamic (the runtime returns `bytes` for bytes patterns).
         f("sub", 3, 6, Type::Any),
         f("split", 2, 5, Type::List),
-        f("escape", 1, 1, Type::Str),
+        f("escape", 1, 1, Type::Any),
         // `compile(pattern, flags=0)`; the runtime forwards the flags to the
         // regex builder. `_compile` is the cache-aware internal spelling.
         // The six-argument form is the private `_sre.compile(pattern, flags,

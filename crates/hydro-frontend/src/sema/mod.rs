@@ -434,7 +434,10 @@ const FLOAT_METHODS: &[(&str, MethodSig)] = &[
         MethodSig::new(0, 1, &[ArgKind::Str], Type::Str),
     ),
     ("is_integer", MethodSig::new(0, 0, &[], Type::Bool)),
-    ("hex", MethodSig::new(0, 0, &[], Type::Str)),
+    (
+        "hex",
+        MethodSig::new(0, 2, &[ArgKind::Any, ArgKind::Int], Type::Str),
+    ),
     ("as_integer_ratio", MethodSig::new(0, 0, &[], Type::Tuple)),
     ("conjugate", MethodSig::new(0, 0, &[], Type::Float)),
     ("__float__", MethodSig::new(0, 0, &[], Type::Float)),
@@ -560,6 +563,10 @@ const STR_METHODS: &[(&str, MethodSig)] = &[
     // `str.format(*args)` accepts any number of positional arguments; field
     // count and types are validated at runtime by the format parser.
     ("format", MethodSig::new(0, usize::MAX, &[], Type::Str)),
+    (
+        "format_map",
+        MethodSig::new(1, 1, &[ArgKind::Any], Type::Str),
+    ),
 ];
 
 /// Static signatures of `bytes` methods. Byte-oriented arguments are byte

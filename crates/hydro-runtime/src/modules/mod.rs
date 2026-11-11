@@ -9339,6 +9339,10 @@ fn abstract_manager_class(asynchronous: bool) -> i64 {
     }
     let enter = value::native_function_new("contextlib", enter_function, 1);
     let exit = value::native_function_new("contextlib", exit_function, 4);
+    // CPython's `AbstractContextManager.__exit__` is decorated with
+    // `@abstractmethod`, so a subclass that only defines `__enter__` stays
+    // abstract and cannot be instantiated.
+    abc::mark_abstract(exit);
     let hook = value::native_function_new("contextlib", hook_function, 2);
     // `__slots__ = ()`, as in CPython's definition.
     let slots = value::tuple_new(Vec::new());

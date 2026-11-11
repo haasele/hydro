@@ -82,12 +82,12 @@ was not regenerated after this slice.
 
 ### Test counts (canonical — update only here)
 
-`cargo nextest run --workspace` on 2026-11-11: **3290 tests run
-(3290 passed, 1 skipped)**; the per-crate breakdown below sums to 3290:
+`cargo nextest run --workspace` on 2026-11-11: **3291 tests run
+(3291 passed, 1 skipped)**; the per-crate breakdown below sums to 3291:
 
 | Crate | Tests |
 |---|---:|
-| runtime (unit + integration) | 2132 |
+| runtime (unit + integration) | 2133 |
 | frontend | 913 |
 | codegen | 79 |
 | IR | 71 |
@@ -273,8 +273,8 @@ python3 scripts/check_benchmarks.py
 
 See `CHANGELOG.md` for details; this is only the resume pointer.
 
-- **2026-11-11 compatibility slice:** workspace **3290 passed, 1 skipped**
-  (runtime 2132, frontend 913); clippy/fmt/`verify.sh` green. Target triage
+- **2026-11-11 compatibility slice:** workspace **3291 passed, 1 skipped**
+  (runtime 2133, frontend 913); clippy/fmt/`verify.sh` green. Target triage
   confirms `test_plistlib` and `test_poll` still pass; `test_yield_from` now
   executes all 43 tests (27 assertion/generator failures), and `test_argparse`,
   `test_codecs`, `test_datetime`, `test_pickle`, `test_re`, `test_struct`,

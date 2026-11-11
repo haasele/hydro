@@ -21,16 +21,17 @@
 //! * `__instancecheck__`/`__subclasscheck__` delegate to the same checks, and
 //!   `__abstractmethods__` reports the abstract names computed from the class
 //!   namespace and the MRO.
+//! * constructing an instance whose effective abstract methods are non-empty
+//!   raises CPython's `TypeError` before allocation. The shared class-call hook
+//!   in `core::methods` runs [`check_instantiable`] for both the positional and
+//!   the keyword constructor paths, so overriding every abstract name makes the
+//!   class constructible again and a partial override stays rejected.
 //!
 //! What is deliberately not emulated, because the runtime cannot enforce it:
 //!
 //! * metaclass `__instancecheck__` overrides written in Python are not called
 //!   by the `isinstance` builtin (only real and registered edges are
-//!   consulted);
-//! * instantiating a class with abstract methods is not blocked (the frontend
-//!   does not enforce abstractness), but `__abstractmethods__` and
-//!   `abstractmethod` are real: they record and report the declared abstract
-//!   names instead of pretending enforcement happened.
+//!   consulted).
 //!
 //! The registry lives in the process-wide globals side store under
 //! `\0hydro.registry`, which roots every registered class for the rest of the
@@ -511,6 +512,22 @@ fn abstract_methods_getter(args: &[i64]) -> i64 {
             ),
         );
     }
+    let names: Vec<i64> = effective_abstract_names(class)
+        .into_iter()
+        .map(value::str_alloc)
+        .collect();
+    let roots = heap::root_values(&names);
+    let set = value::set_new(names);
+    heap::release_roots(roots);
+    set
+}
+
+/// The effective abstract names of `class`, with the most derived definition
+/// deciding each name.
+///
+/// Shared by `__abstractmethods__` and [`check_instantiable`], so the reported
+/// set and the instantiation rule never disagree.
+fn effective_abstract_names(class: i64) -> Vec<String> {
     let mut decided: Vec<(String, bool)> = Vec::new();
     for ancestor in value::class_mro(class) {
         for (name, item) in value::class_namespace(ancestor) {
@@ -520,15 +537,55 @@ fn abstract_methods_getter(args: &[i64]) -> i64 {
             decided.push((name, value_is_abstract(item)));
         }
     }
-    let names: Vec<i64> = decided
+    decided
         .into_iter()
         .filter(|(_, is_abstract)| *is_abstract)
-        .map(|(name, _)| value::str_alloc(name))
-        .collect();
-    let roots = heap::root_values(&names);
-    let set = value::set_new(names);
-    heap::release_roots(roots);
-    set
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Rejects an instance whose class still has effective abstract methods.
+///
+/// This is CPython's `object.__new__` rule: a class carrying a non-empty
+/// `__abstractmethods__` cannot be instantiated, and the diagnostic sorts the
+/// remaining names and quotes each one. Returns `None` when construction may
+/// proceed; otherwise raises `TypeError` and returns `Some(NONE)` for the
+/// constructor hook to propagate.
+///
+/// Only classes created through `ABCMeta` (or a subclass of it) are checked,
+/// mirroring the `Py_TPFLAGS_IS_ABSTRACT` flag `_abc_init` sets on those
+/// classes. Since [`effective_abstract_names`] is computed from the live
+/// namespaces, replacing an inherited abstract method with a concrete one on
+/// the subclass lifts the rejection without any extra bookkeeping.
+pub(crate) fn check_instantiable(class: i64) -> Option<i64> {
+    // No function has ever been declared abstract, so no class can report an
+    // effective abstract name. This keeps the check off the hot construction
+    // path for programs that never use `abc`.
+    if abstract_markers().is_none_or(|markers| markers.is_empty()) {
+        return None;
+    }
+    if !is_abc_class(class) {
+        return None;
+    }
+    let mut names = effective_abstract_names(class);
+    if names.is_empty() {
+        return None;
+    }
+    // CPython joins the sorted names with "', '" and wraps the whole list in
+    // single quotes, so a single name reads `'name'` and several read
+    // `'a', 'b'`.
+    names.sort_unstable();
+    let quoted: Vec<String> = names.into_iter().map(|name| format!("'{name}'")).collect();
+    let plural = if quoted.len() > 1 { "s" } else { "" };
+    Some(exc::raise_with_message(
+        TYPE_ERROR,
+        &format!(
+            "Can't instantiate abstract class {} without an implementation for \
+             abstract method{plural} {}",
+            value::class_display_name(class).unwrap_or("type"),
+            quoted.join(", "),
+        ),
+    ))
 }
 
 fn value_is_abstract(item: i64) -> bool {
@@ -960,6 +1017,84 @@ mod tests {
 
         // `update_abstractmethods` returns the class unchanged.
         assert_eq!(call("update_abstractmethods", &[base]), base);
+    }
+
+    #[test]
+    fn instantiation_requires_every_abstract_method() {
+        let _guard = guard();
+        reset();
+        let metaclass = abc_metaclass();
+        let abstract_render = value::native_function_new("abc", "abstractmethod", 1);
+        let abstract_save = value::native_function_new("abc", "abstractmethod", 2);
+        assert_eq!(call("abstractmethod", &[abstract_render]), abstract_render);
+        assert_eq!(call("abstractmethod", &[abstract_save]), abstract_save);
+        let base = class_new_multi(
+            "Base".to_string(),
+            Vec::new(),
+            metaclass,
+            vec![
+                ("render".to_string(), abstract_render, MethodKind::Normal),
+                ("save".to_string(), abstract_save, MethodKind::Normal),
+            ],
+            Vec::new(),
+        );
+
+        let pending_message = || {
+            let value = exc::pending_value();
+            value::exception_data(value)
+                .map(|data| data.msg.clone())
+                .unwrap_or_default()
+        };
+
+        // Both names remain: CPython's diagnostic sorts and quotes them. The
+        // ordinary class-call hook must reject the instance, not just the
+        // standalone checker.
+        assert_eq!(crate::builtins::call(base, 0, std::ptr::null()), NONE);
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "Can't instantiate abstract class Base without an implementation for \
+             abstract methods 'render', 'save'"
+        );
+        exc::clear();
+        assert_eq!(check_instantiable(base), Some(NONE));
+        exc::clear();
+
+        // Overriding every abstract name makes the class constructible.
+        let render = value::native_function_new("abc", "render", 1);
+        let save = value::native_function_new("abc", "save", 2);
+        let concrete = class_new_multi(
+            "Concrete".to_string(),
+            vec![base],
+            NONE,
+            vec![
+                ("render".to_string(), render, MethodKind::Normal),
+                ("save".to_string(), save, MethodKind::Normal),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(check_instantiable(concrete), None);
+        assert!(!exc::pending());
+        let instance = crate::builtins::call(concrete, 0, std::ptr::null());
+        assert!(!exc::pending());
+        assert_eq!(value::instance_class_value(instance), Some(concrete));
+
+        // A partial override keeps the remaining name abstract.
+        let partial = class_new_multi(
+            "Partial".to_string(),
+            vec![base],
+            NONE,
+            vec![("render".to_string(), render, MethodKind::Normal)],
+            Vec::new(),
+        );
+        assert_eq!(check_instantiable(partial), Some(NONE));
+        assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
+        assert_eq!(
+            pending_message(),
+            "Can't instantiate abstract class Partial without an implementation for \
+             abstract method 'save'"
+        );
+        exc::clear();
     }
 
     #[test]

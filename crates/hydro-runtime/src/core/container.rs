@@ -129,6 +129,31 @@ fn build_set(items: Vec<i64>) -> i64 {
     result
 }
 
+/// `frozenset(items)`: deduplicates `items`, then freezes the result.
+pub(crate) fn frozenset_new(argc: usize, argv: *const i64) -> i64 {
+    let set = build_set(copy_values(argc, argv));
+    if exc::pending() {
+        return NONE;
+    }
+    value::frozenset_from_set(set)
+}
+
+/// `frozenset(iterable)`: consumes any iterable — a list, tuple, set,
+/// frozenset, dict (keys), the characters of a string, a range, an iterator
+/// or a generator — and freezes the deduplicated result.
+pub(crate) fn frozenset_from(iterable: i64) -> i64 {
+    // `frozenset(fs)` returns `fs` itself when `type(fs) is frozenset`,
+    // matching CPython's immutable-constructor identity.
+    if value::is_exact_frozenset(iterable) {
+        return iterable;
+    }
+    let set = set_from(iterable);
+    if exc::pending() {
+        return NONE;
+    }
+    value::frozenset_from_set(set)
+}
+
 /// Inserts `item` into `set` unless Python equality says it is present.
 pub(crate) fn insert_set_item(set: i64, item: i64) {
     if let Some(mut items) = value::set_items_mut(set) {
@@ -533,6 +558,7 @@ const HASH_NONE: u64 = FNV_OFFSET ^ 0x06;
 const HASH_IDENTITY: u64 = FNV_OFFSET ^ 0x07;
 const HASH_PATH: u64 = FNV_OFFSET ^ 0x08;
 const HASH_BUILTIN_TYPE: u64 = FNV_OFFSET ^ 0x09;
+const HASH_FROZENSET: u64 = FNV_OFFSET ^ 0x0a;
 
 #[inline]
 fn fnv_mix(hash: u64, word: u64) -> u64 {
@@ -569,6 +595,16 @@ pub(crate) fn key_hash(v: i64) -> u64 {
         let mut hash = fnv_mix(HASH_TUPLE, items.len() as u64);
         for &item in items {
             hash = fnv_mix(hash, key_hash(item));
+        }
+        return hash;
+    }
+    // A frozenset hashes by its elements, independent of insertion order, so
+    // two equal frozen sets always share a bucket. Its elements are hashable
+    // by construction (`unhashable_name` rejects the others).
+    if let Some(items) = value::as_frozenset(v) {
+        let mut hash = fnv_mix(HASH_FROZENSET, items.len() as u64);
+        for &item in items {
+            hash ^= fnv_mix(HASH_FROZENSET ^ 0x1f, key_hash(item));
         }
         return hash;
     }
@@ -658,7 +694,7 @@ pub(crate) fn unhashable_name(v: i64) -> Option<&'static str> {
         Some("list")
     } else if value::as_dict(v).is_some() || value::as_defaultdict(v).is_some() {
         Some("dict")
-    } else if value::as_set(v).is_some() {
+    } else if value::is_plain_set(v) {
         Some("set")
     } else if value::as_iter(v).is_some() {
         Some("iterator")
@@ -788,10 +824,16 @@ pub(crate) fn is_set_like(v: i64) -> bool {
 /// `a & b`, `a | b`, `a - b` and `a ^ b` over sets and `dict` views.
 ///
 /// Returns `None` when either operand is not set-like, so the caller keeps its
-/// existing numeric/type-error behaviour. The result is always a fresh `set`.
+/// existing numeric/type-error behaviour. The result is a fresh value whose
+/// mutability follows the left operand: a frozenset yields a frozenset, every
+/// other set-like value yields a set, like CPython.
 pub(crate) fn set_operation(op: SetOp, a: i64, b: i64) -> Option<i64> {
     let left = set_like_elements(a)?;
     let right = set_like_elements(b)?;
+    // The result follows the left operand: a frozenset receiver (or left-hand
+    // operand) yields a frozenset, every other set-like value yields a set,
+    // exactly like CPython.
+    let frozen = value::is_frozen_set(a);
     let result = value::set_new(Vec::new());
     match op {
         SetOp::And => {
@@ -826,7 +868,11 @@ pub(crate) fn set_operation(op: SetOp, a: i64, b: i64) -> Option<i64> {
             }
         }
     }
-    Some(result)
+    Some(if frozen {
+        value::frozenset_from_set(result)
+    } else {
+        result
+    })
 }
 
 /// Inclusion comparison kinds for set-like values.

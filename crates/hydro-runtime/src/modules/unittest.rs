@@ -1953,6 +1953,10 @@ fn test_case_run(args: &[i64]) -> i64 {
         // `KeyboardInterrupt`: on a failure the extra `testPartExecutor`
         // simply records the second outcome. Only a failing `setUp` skips it.
         if interrupted.is_none() {
+            // CPython finalizes discarded test temporaries through refcounts;
+            // a collection here runs their `__del__` hooks before tearDown,
+            // which file/process fixtures rely on.
+            crate::heap::collect();
             call_method(instance, "tearDown", &[]);
             if exc::pending() {
                 let error = take_pending();
@@ -3871,13 +3875,17 @@ fn text_test_result_method(method: &str, args: &[i64]) -> i64 {
             NONE
         }
         "addSubTest" => {
-            let (Some(&result), Some(&_test), Some(&subtest), Some(&error)) =
+            let (Some(&result), Some(&test), Some(&subtest), Some(&error)) =
                 (args.first(), args.get(1), args.get(2), args.get(3))
             else {
                 return missing_arguments("TextTestResult.addSubTest");
             };
             if error != NONE {
-                let failure = error_is_failure(error, subtest);
+                // CPython classifies against `test.failureException` (the
+                // TestCase), not the ephemeral `_SubTest`; a subclass that
+                // overrides `failureException` must still record the subtest
+                // as a failure rather than an error.
+                let failure = error_is_failure(error, test);
                 if result_attr_truthy(result, "showAll") {
                     write_status(result, subtest, if failure { "FAIL" } else { "ERROR" });
                 } else if result_attr_truthy(result, "dots") {

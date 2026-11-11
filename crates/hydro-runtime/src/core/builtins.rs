@@ -4253,6 +4253,14 @@ fn container_new_value(kind: ContainerNew, cls: i64, iterable: i64) -> i64 {
     if class == native {
         return payload;
     }
+    // A frozenset subclass owns the same plain set storage as its base; the
+    // subclass class itself supplies the frozen identity, so the nested
+    // frozenset value is unwrapped rather than stored as the payload.
+    let payload = if matches!(kind, ContainerNew::Frozenset) {
+        value::frozen_set_storage(payload).unwrap_or(payload)
+    } else {
+        payload
+    };
     payload_instance(class, payload)
 }
 
@@ -4606,7 +4614,7 @@ fn container_instance_new(class: i64, argc: usize, argv: *const i64) -> Option<i
     })?;
     // Keep this slice to set subclasses; tuple subclasses such as namedtuple
     // have their own construction paths and must not take the payload shortcut.
-    if !matches!(base, ContainerNew::Set) {
+    if !matches!(base, ContainerNew::Set | ContainerNew::Frozenset) {
         return None;
     }
     // The exact native class takes the normal builtin constructor path.
@@ -4891,6 +4899,42 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
     };
     if let Some(result) = call_user_new(class, call_args, &[]) {
         return result;
+    }
+    // Calling a class whose MRO derives from native `type` is CPython's
+    // `type.__call__`: `M('C', bases, ns)` allocates a class through
+    // `type.__new__`, it does not build an instance of `M`. `type_new` is the
+    // C-level allocator and deliberately skips the metaclass hooks (this call
+    // *is* the hook path); the metaclass's own `__init__` then runs on the
+    // created class, exactly like `type.__call__`.
+    if argc == 3 && value::is_subclass_of(class, value::native_type_class()) {
+        let created = type_new(class, call_args[0], call_args[1], call_args[2]);
+        if exc::pending() {
+            return NONE;
+        }
+        let Some((kind, init)) = value::class_member(class, "__init__") else {
+            return created;
+        };
+        // The inherited default initializer (`object.__init__`, the slot the
+        // native type hierarchy falls back to) must not run: CPython's
+        // `type.__init__` accepts the class-creation arguments and does
+        // nothing with them.
+        if value::function_native_name(init) == Some("__object_init__") {
+            return created;
+        }
+        if !value::function_signature(init).is_empty() && value::function_full_entry(init) != 0 {
+            let _ =
+                methods::call_user_method(created, class, kind, init, "__init__", call_args, &[]);
+            return if exc::pending() { NONE } else { created };
+        }
+        let mut init_args = Vec::with_capacity(argc + 1);
+        match kind {
+            MethodKind::Normal | MethodKind::Property => init_args.push(created),
+            MethodKind::Classmethod => init_args.push(class),
+            MethodKind::Staticmethod => {}
+        }
+        init_args.extend_from_slice(call_args);
+        let _ = call(init, init_args.len(), init_args.as_ptr());
+        return if exc::pending() { NONE } else { created };
     }
     // A subclass of a native scalar/container allocates the wrapped builtin
     // value as its payload; the exact native class returns the plain builtin
@@ -6579,11 +6623,11 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
             [iterable] => container::set_from(*iterable),
             _ => builtin_arity_error("set", "0 or 1", argc),
         },
-        // Hydro has a single set representation; `frozenset` builds the same
-        // deduplicated value as `set`.
+        // A frozenset is its own immutable, hashable value: the mutable set's
+        // deduplicated contents owned by the native `frozenset` class.
         Builtin::Frozenset => match args {
-            [] => container::set_new(0, std::ptr::null()),
-            [iterable] => container::set_from(*iterable),
+            [] => container::frozenset_new(0, std::ptr::null()),
+            [iterable] => container::frozenset_from(*iterable),
             _ => builtin_arity_error("frozenset", "0 or 1", argc),
         },
         Builtin::Getattr => match args {
@@ -8168,7 +8212,8 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
             value::as_tuple(value).is_some()
                 || crate::modules::collections::is_namedtuple_instance(value)
         }
-        "set" | "frozenset" => value::as_set(value).is_some(),
+        "set" => value::is_plain_set(value),
+        "frozenset" => value::is_frozen_set(value),
         "NoneType" | "None" => value == NONE,
         // `re.Pattern`/`re.Match` are the cached classes `type()` reports for
         // compiled patterns and match objects, so `isinstance(p, re.Pattern)`
@@ -9621,10 +9666,10 @@ mod tests {
         assert_eq!(pending_message(), "boom");
         exc::init();
 
-        // The captured exception re-raises on later drives, like iteration.
-        assert_eq!(sum(failing, int(0)), NONE);
-        assert_eq!(exc::pending_tag(), VALUE_ERROR as i64);
-        exc::init();
+        // A generator consumes its captured error once, like CPython's
+        // cleared frame; a later drive is exhausted and keeps the start value.
+        assert_eq!(value::as_integer(sum(failing, int(0))), Some(0));
+        assert!(!exc::pending());
 
         assert_eq!(sum(generator(yields_text), int(0)), NONE);
         assert_eq!(exc::pending_tag(), TYPE_ERROR as i64);
@@ -9939,19 +9984,50 @@ mod tests {
     }
 
     #[test]
-    fn frozenset_builds_a_set() {
+    fn frozenset_builds_a_frozen_set() {
         exc::init();
         let empty = builtin_call(Builtin::Frozenset, &[]);
-        assert_eq!(value::type_name(empty), "set");
-        assert_eq!(rendered(empty), "set()");
+        assert_eq!(value::type_name(empty), "frozenset");
+        assert_eq!(rendered(empty), "frozenset()");
         assert!(!value::truthy(empty));
+        assert!(value::is_frozen_set(empty));
+        assert!(!value::is_plain_set(empty));
+        assert!(!exc::pending(), "{}", pending_message());
+
+        // `set` and `frozenset` are distinct runtime types for isinstance.
+        let frozenset_spelling = value::builtin_function_new(Builtin::Frozenset);
+        let set_spelling = value::builtin_function_new(Builtin::Set);
+        assert_eq!(isinstance(empty, frozenset_spelling), TRUE);
+        assert_eq!(isinstance(empty, set_spelling), FALSE);
+        let mutable = builtin_call(Builtin::Set, &[]);
+        assert_eq!(isinstance(mutable, set_spelling), TRUE);
+        assert_eq!(isinstance(mutable, frozenset_spelling), FALSE);
 
         let source = value::list_new(vec![int(3), int(1), int(3)]);
         let built = builtin_call(Builtin::Frozenset, &[source]);
         assert_eq!(set_integers(built), vec![1, 3]);
+        assert_eq!(rendered(built), "frozenset({3, 1})");
+        assert!(value::truthy(built));
 
         let duplicated = builtin_call(Builtin::Frozenset, &[built]);
         assert_eq!(set_integers(duplicated), vec![1, 3]);
+
+        // The content hash is independent of insertion order.
+        let reordered = builtin_call(Builtin::Frozenset, &[value::list_new(vec![int(1), int(3)])]);
+        assert_eq!(hash(built), hash(reordered));
+
+        // A frozen set may hold frozen sets and serve as a dict key; the
+        // mutable set built by `set()` stays unhashable.
+        let nested_inner = builtin_call(Builtin::Frozenset, &[value::list_new(vec![int(7)])]);
+        // `frozenset(fs)` returns the exact native frozenset unchanged.
+        let nested_inner_set = builtin_call(Builtin::Frozenset, &[nested_inner]);
+        assert_eq!(nested_inner, nested_inner_set);
+        let nested = builtin_call(Builtin::Frozenset, &[value::list_new(vec![nested_inner])]);
+        assert!(!exc::pending(), "{}", pending_message());
+        assert!(container::unhashable_name(nested).is_none());
+        assert!(container::unhashable_name(builtin_call(Builtin::Set, &[])).is_some());
+        let mapping = value::dict_new(vec![(nested, int(2))]);
+        assert_eq!(value::as_dict(mapping).map(|pairs| pairs.len()), Some(1));
 
         // A range is consumed through the iterator protocol.
         let from_range = builtin_call(Builtin::Frozenset, &[value::range_new(0, 5, 2)]);

@@ -56,7 +56,7 @@ checkout with the pinned oracle:
 | First-error families | **259** distinct rows | collapse by root cause; do not patch one error per test |
 | Stdlib imports | **288/297**; **288/288** comparable | behavioral tests for every module |
 | Ecosystem differential | **5/13** refreshed 2026-11-10; pydantic now reaches `annotationlib.__eq__` | 8 cases, then upstream suites |
-| Workspace | **3290 passed, 1 skipped**; clippy/fmt green | keep green through the compatibility work |
+| Workspace | **3291 passed, 1 skipped**; clippy/fmt green | keep green through the compatibility work |
 
 Post-baseline fixes since this run: variadic decorator receiver binding,
 PEP 584 `dict | dict`/subclass union, iterable set operands (including

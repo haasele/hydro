@@ -1357,19 +1357,27 @@ impl Drop for TypeCallBypass {
 /// native `type.__call__` entry is the default allocator rather than a hook,
 /// so it leaves the ordinary constructor fast path in place.
 ///
-/// Returns `None` when no metaclass `__call__` overrides the default.
+/// Returns `None` when no metaclass `__call__` overrides the default. A class
+/// that still has effective abstract methods is rejected here, on the default
+/// construction path (an overriding metaclass `__call__` runs first, as in
+/// CPython); the rejection is reported as `Some(NONE)` with a pending
+/// `TypeError`.
 pub(crate) fn metaclass_call(class: i64, args: &[i64], keywords: &[(String, i64)]) -> Option<i64> {
     // An explicit `type.__call__(class, ...)` constructs the class directly.
+    // That is still CPython's allocation path (`object.__new__` performs the
+    // abstract-class check), so the bypass does not skip the rejection.
     if TYPE_CALL_CLASS.with(|slot| slot.get()) == class {
-        return None;
+        return modules::abc::check_instantiable(class);
     }
     let metaclass = value::class_metaclass(class);
     if metaclass == NONE {
         return None;
     }
-    let owner = value::class_lookup_owner(metaclass, "__call__")?;
+    let Some(owner) = value::class_lookup_owner(metaclass, "__call__") else {
+        return modules::abc::check_instantiable(class);
+    };
     if value::is_type_class(owner) {
-        return None;
+        return modules::abc::check_instantiable(class);
     }
     let entry = value::class_lookup(metaclass, "__call__")?;
     Some(match entry {
