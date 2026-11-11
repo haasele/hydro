@@ -8,6 +8,24 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-11-11 unittest/module/contextlib stabilisation
+
+- Native `unittest` class methods are rooted while cached classes are built,
+  removing address reuse that made `TestResult` methods permute and
+  `unittest.main()` fail with a `None` result.
+- Compiled module namespaces now resolve ordinary attributes and `__dict__`
+  from the live globals store; `http.cookies.SimpleCookie` and
+  `test.datetimetester` discovery paths can see executed bindings.
+- The cached native `object` class no longer leaks `has_dict` into slots-only
+  subclasses; `__slots__ = ()` and structural ABC subclass hooks behave like
+  CPython. Native functions stored as class attributes remain unbound.
+- `contextlib` copies function metadata, recreates generator managers per
+  decorated call, validates arguments at call time, and implements the
+  `StopIteration` PEP 479 branch.
+- Finalizer collection now publishes only live native stack ranges, and
+  `re.subn`/`re.purge` are registered; regex match repr is Unicode-safe.
+- Workspace suite: **3291 passed, 1 skipped**; clippy/fmt/verify green.
+
 ### Compatibility — 2026-11-11 test_yield_from recovery
 
 - `test_yield_from.py` now passes **43/43** under the release Tea build. The
