@@ -1739,6 +1739,12 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                 // `sub`/`subn`: the arguments after the pattern are
                 // replacement, string, count and (positionally) flags.
                 "sub" | "subn" => {
+                    if args.len() > 5 {
+                        return type_error(&format!(
+                            "{function}() takes 3 to 5 arguments ({} given)",
+                            args.len()
+                        ));
+                    }
                     let flags = match flags_argument(args.get(4).copied()) {
                         Ok(flags) => flags,
                         Err(err) => return err,
@@ -1752,6 +1758,12 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
                 }
                 // `split`: pattern, string, maxsplit and (positionally) flags.
                 "split" => {
+                    if args.len() > 4 {
+                        return type_error(&format!(
+                            "split() takes 2 to 4 arguments ({} given)",
+                            args.len()
+                        ));
+                    }
                     let flags = match flags_argument(args.get(3).copied()) {
                         Ok(flags) => flags,
                         Err(err) => return err,

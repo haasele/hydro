@@ -1774,30 +1774,25 @@ fn test_case_init(args: &[i64]) -> i64 {
             ),
         );
     }
-    value::instance_setattr(
-        instance,
-        "_testMethodName".to_string(),
-        value::str_alloc(name.clone()),
-    );
-    value::instance_setattr(
-        instance,
-        "_cleanups".to_string(),
-        value::list_new(Vec::new()),
-    );
+    let method_name = value::str_alloc(name.clone());
+    let cleanups = value::list_new(Vec::new());
+    let type_defaults = type_equality_defaults();
+    let doc = method_function(class, &name)
+        .map(value::function_doc)
+        .unwrap_or_else(|| value::str_alloc("No test".to_string()));
+    // Attribute insertion can allocate (the table may grow); the fresh
+    // values must stay reachable until the instance owns them.
+    let roots = heap::root_values(&[method_name, cleanups, type_defaults, doc]);
+    value::instance_setattr(instance, "_testMethodName".to_string(), method_name);
+    value::instance_setattr(instance, "_cleanups".to_string(), cleanups);
     value::instance_setattr(instance, "_unittest_result".to_string(), NONE);
     value::instance_setattr(instance, "_unittest_expecting".to_string(), FALSE);
     value::instance_setattr(instance, "_unittest_expected_failure".to_string(), NONE);
     value::instance_setattr(instance, "_outcome".to_string(), NONE);
     value::instance_setattr(instance, "_subtest".to_string(), NONE);
-    value::instance_setattr(
-        instance,
-        "_type_equality_funcs".to_string(),
-        type_equality_defaults(),
-    );
-    let doc = method_function(class, &name)
-        .map(value::function_doc)
-        .unwrap_or_else(|| value::str_alloc("No test".to_string()));
+    value::instance_setattr(instance, "_type_equality_funcs".to_string(), type_defaults);
     value::instance_setattr(instance, "_testMethodDoc".to_string(), doc);
+    heap::release_roots(roots);
     NONE
 }
 
@@ -5002,6 +4997,7 @@ fn loader_method(method: &str, args: &[i64]) -> i64 {
                 if exc::pending() {
                     return NONE;
                 }
+                heap::add_thread_root(instance);
                 tests.push(instance);
             }
             if tests.is_empty() && value::class_lookup(test_class, "runTest").is_some() {
@@ -5068,6 +5064,7 @@ fn loader_method(method: &str, args: &[i64]) -> i64 {
                     heap::release_roots(roots);
                     return NONE;
                 }
+                heap::add_thread_root(suite);
                 suites.push(suite);
             }
             heap::release_roots(roots);
@@ -5107,6 +5104,9 @@ fn load_class_tests(class: i64) -> Vec<i64> {
         if exc::pending() {
             break;
         }
+        // The vector is not visible to the collector while later tests are
+        // constructed; keep each instance alive until the suite owns it.
+        heap::add_thread_root(instance);
         tests.push(instance);
     }
     tests
@@ -5132,12 +5132,16 @@ fn load_module_tests(dictionary: i64, test_case_class: i64) -> Vec<i64> {
 
 /// Builds a `TestSuite` from a list of tests.
 fn make_suite(tests: Vec<i64>) -> i64 {
+    // The test values are not owned by anything until the list copies them;
+    // every allocation below may collect, so root the input before any of it.
+    let test_roots = heap::root_values(&tests);
     let class = crate::modules::unittest_test_suite_class();
     let instance = value::instance_new(class);
     let list = value::list_new(tests);
     let roots = heap::root_values(&[instance, list]);
     value::instance_setattr(instance, "_tests".to_string(), list);
     heap::release_roots(roots);
+    heap::release_roots(test_roots);
     instance
 }
 
@@ -5785,6 +5789,16 @@ fn test_method_names(class: i64) -> Vec<String> {
                 names.push(name.clone());
             }
         }
+        // User classes lowered by the frontend keep methods in the class
+        // attribute table rather than the native method table.
+        for (name, item) in &state.attrs {
+            if name.starts_with("test")
+                && value::as_function(*item).is_some()
+                && !names.iter().any(|existing| existing == name)
+            {
+                names.push(name.clone());
+            }
+        }
         current = state.base;
     }
     names
@@ -6333,6 +6347,7 @@ pub(crate) fn run_suite_root(item: i64, result: i64) -> bool {
 fn run_main(module: &str) -> i64 {
     let classes = module_test_classes(module);
     let result = new_test_result();
+    let result_roots = heap::root_values(&[result]);
     call_method(result, "startTestRun", &[]);
     // A module that defines `load_tests` runs exactly what that hook returns,
     // like CPython's `loadTestsFromModule`; otherwise the standard suites run.
@@ -6347,6 +6362,7 @@ fn run_main(module: &str) -> i64 {
         }
     };
     if !completed {
+        heap::release_roots(result_roots);
         return NONE;
     }
     call_method(result, "stopTestRun", &[]);
@@ -6357,6 +6373,7 @@ fn run_main(module: &str) -> i64 {
     let failures = result_list_len(result, "failures")
         + result_list_len(result, "errors")
         + result_list_len(result, "unexpectedSuccesses");
+    heap::release_roots(result_roots);
     if failures > 0 {
         return raise_assertion(format!("{failures} test(s) failed"));
     }

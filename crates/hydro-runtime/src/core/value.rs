@@ -2239,14 +2239,29 @@ pub(crate) struct NamespaceState {
 /// own mutex: [`Attributes::set`] and the collector's trace both hold it,
 /// which serialises an insertion with the marker's black transition without
 /// blocking user code (no user call runs under the lock).
+///
+/// Visible attributes normally live in `entries`. Once Python asks for
+/// `obj.__dict__`, [`Attributes::ensure_live_dict`] moves them into a real
+/// dict and records it under [`LIVE_DICT_KEY`]; attribute reads and writes then
+/// go through that mapping, so `obj.__dict__` is the instance dictionary
+/// CPython exposes instead of a snapshot. Reserved `\0`-prefixed names (native
+/// payloads) never enter the mapping.
 pub(crate) struct Attributes {
     entries: Mutex<Vec<(String, i64)>>,
+    /// Live instance mapping (`0` when `__dict__` was never materialised).
+    live: AtomicI64,
 }
+
+/// Reserved attribute-table key holding the live instance mapping as a GC
+/// edge. Python never observes it as an attribute: visible lookup reads the
+/// mapping itself, and `dir` deduplicates the `__dict__` name it already adds.
+const LIVE_DICT_KEY: &str = "__dict__";
 
 impl Attributes {
     fn new() -> Attributes {
         Attributes {
             entries: Mutex::new(Vec::new()),
+            live: AtomicI64::new(0),
         }
     }
 
@@ -2258,20 +2273,59 @@ impl Attributes {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The live mapping backing `obj.__dict__`, if one was materialised.
+    pub(crate) fn live_dict(&self) -> Option<i64> {
+        let mapping = self.live.load(std::sync::atomic::Ordering::Acquire);
+        (mapping != 0).then_some(mapping)
+    }
+
+    /// Copies the non-reserved entries of a locked table.
+    fn visible_pairs(entries: &[(String, i64)]) -> Vec<(String, i64)> {
+        entries
+            .iter()
+            .filter(|(name, _)| !name.starts_with('\u{0}'))
+            .cloned()
+            .collect()
+    }
+
+    /// The value stored under `name` in a live mapping, if any.
+    fn live_lookup(mapping: i64, name: &str) -> Option<i64> {
+        as_dict_data(mapping).and_then(|dict| {
+            dict.entries()
+                .iter()
+                .find_map(|(key, value)| (as_str(*key) == Some(name)).then_some(*value))
+        })
+    }
+
     /// Returns the value of `name`, in insertion order.
+    ///
+    /// A visible name reads the live mapping when one exists; the entries
+    /// mirror is only a reflection cache and may lag behind direct
+    /// `__dict__` mutations.
     pub(crate) fn get(&self, name: &str) -> Option<i64> {
+        let reserved = name.starts_with('\u{0}');
+        if !reserved {
+            if let Some(mapping) = self.live_dict() {
+                return Attributes::live_lookup(mapping, name);
+            }
+        }
         let entries = self.lock();
+        // `__dict__` may have been materialised while we waited for the lock;
+        // the visible entries then live in the mapping, not the table.
+        if !reserved {
+            if let Some(mapping) = self.live_dict() {
+                drop(entries);
+                return Attributes::live_lookup(mapping, name);
+            }
+        }
         entries
             .iter()
             .find(|(existing, _)| existing.as_str() == name)
             .map(|(_, value)| *value)
     }
 
-    /// Sets `name` to `value`, keeping the first insertion position. The
-    /// insertion barrier is published while the table is still locked, so a
-    /// concurrent marker cannot miss the new edge.
-    pub(crate) fn set(&self, owner: i64, name: String, value: i64) {
-        let mut entries = self.lock();
+    /// Stores `name` in a locked table, keeping the first insertion position.
+    fn set_entry(entries: &mut Vec<(String, i64)>, owner: i64, name: String, value: i64) {
         let position = entries
             .iter()
             .position(|(existing, _)| existing.as_str() == name.as_str());
@@ -2282,29 +2336,224 @@ impl Attributes {
         crate::heap::write_barrier_edge(owner, value);
     }
 
+    /// Sets `name` to `value`, keeping the first insertion position. The
+    /// insertion barrier is published while the table is still locked, so a
+    /// concurrent marker cannot miss the new edge.
+    pub(crate) fn set(&self, owner: i64, name: String, value: i64) {
+        if name.starts_with('\u{0}') {
+            let mut entries = self.lock();
+            Attributes::set_entry(&mut entries, owner, name, value);
+            return;
+        }
+        loop {
+            let mapping = self.live.load(std::sync::atomic::Ordering::Acquire);
+            if mapping == 0 {
+                let mut entries = self.lock();
+                if self.live.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                    Attributes::set_entry(&mut entries, owner, name, value);
+                    return;
+                }
+                continue;
+            }
+            // A live mapping owns the attribute. Allocate its Python key
+            // outside the table lock: allocation can collect, and the
+            // collector takes this lock while tracing the instance.
+            let roots = crate::heap::root_values(&[owner, mapping, value]);
+            let key = str_alloc(name.clone());
+            let _ = crate::heap::root_values(&[key]);
+            let entries = self.lock();
+            if self.live.load(std::sync::atomic::Ordering::Acquire) != mapping {
+                // `__dict__` was replaced while the key was allocated.
+                drop(entries);
+                crate::heap::release_roots(roots);
+                continue;
+            }
+            crate::container::dict_set(mapping, key, value);
+            drop(entries);
+            crate::heap::release_roots(roots);
+            return;
+        }
+    }
+
     /// Copies the `(name, value)` pairs in insertion order.
     ///
     /// The snapshot takes the table lock only for the clone and owns its names,
     /// so the caller may allocate (which can collect) afterwards without
-    /// holding the guard.
+    /// holding the guard. When a live mapping exists it is authoritative for
+    /// the visible names and reserved entries are appended before them.
     pub(crate) fn snapshot(&self) -> Vec<(String, i64)> {
-        self.lock().clone()
-    }
-
-    /// Drops every attribute (used when `instance.__dict__` is replaced).
-    pub(crate) fn clear(&self) {
-        self.lock().clear();
+        loop {
+            let Some(mapping) = self.live_dict() else {
+                let entries = self.lock();
+                // A concurrent `__dict__` access may have just migrated the
+                // visible entries into a mapping; retry instead of returning
+                // the now-hidden part of the table.
+                if self.live_dict().is_none() {
+                    return entries.clone();
+                }
+                continue;
+            };
+            let visible: Vec<(String, i64)> = match as_dict_data(mapping) {
+                Some(dict) => dict
+                    .entries()
+                    .iter()
+                    .filter_map(|(key, value)| as_str(*key).map(|name| (name.to_string(), *value)))
+                    .collect(),
+                None => Vec::new(),
+            };
+            let hidden: Vec<(String, i64)> = self
+                .lock()
+                .iter()
+                .filter(|(name, _)| name.starts_with('\u{0}'))
+                .cloned()
+                .collect();
+            return hidden.into_iter().chain(visible).collect();
+        }
     }
 
     /// Removes `name` and returns its value, or `None` when the attribute does
     /// not exist. The dropped edge is safe for an in-progress marking cycle:
     /// the value was already marked when the edge was published.
     pub(crate) fn remove(&self, name: &str) -> Option<i64> {
+        if name.starts_with('\u{0}') {
+            let mut entries = self.lock();
+            let position = entries
+                .iter()
+                .position(|(existing, _)| existing.as_str() == name)?;
+            return Some(entries.remove(position).1);
+        }
+        loop {
+            let mapping = self.live.load(std::sync::atomic::Ordering::Acquire);
+            if mapping == 0 {
+                let mut entries = self.lock();
+                if self.live.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                    let position = entries
+                        .iter()
+                        .position(|(existing, _)| existing.as_str() == name)?;
+                    return Some(entries.remove(position).1);
+                }
+                continue;
+            }
+            let removed = {
+                let mut dict = dict_pairs_mut(mapping)?;
+                let key = dict
+                    .entries()
+                    .iter()
+                    .find_map(|(key, _)| (as_str(*key) == Some(name)).then_some(*key))?;
+                dict.remove(key).map(|(_, value)| value)
+            };
+            // Keep the reflection cache from resurrecting the removed name.
+            let mut entries = self.lock();
+            if self.live.load(std::sync::atomic::Ordering::Acquire) == mapping {
+                if let Some(position) = entries
+                    .iter()
+                    .position(|(existing, _)| existing.as_str() == name)
+                {
+                    entries.remove(position);
+                }
+            }
+            drop(entries);
+            return removed;
+        }
+    }
+
+    /// Installs the live mapping for `owner`, migrating the visible entries.
+    ///
+    /// The mapping is built outside the table lock (allocation may collect).
+    /// At commit the table is locked, a concurrent mapping installed by another
+    /// thread wins, and a visible attribute written while the mapping was
+    /// built aborts the attempt so the retry migrates it too.
+    pub(crate) fn ensure_live_dict(&self, owner: i64) -> Option<i64> {
+        if let Some(mapping) = self.live_dict() {
+            return Some(mapping);
+        }
+        loop {
+            let snapshot = {
+                let entries = self.lock();
+                Attributes::visible_pairs(entries.as_slice())
+            };
+            let owner_root = crate::heap::root_values(&[owner]);
+            let mapping = dict_new(Vec::new());
+            let mapping_root = crate::heap::root_values(&[mapping]);
+            for (name, value) in &snapshot {
+                let pair_root = crate::heap::root_values(&[*value]);
+                let key = str_alloc(name.clone());
+                let _key_root = crate::heap::root_values(&[key]);
+                crate::container::dict_set(mapping, key, *value);
+                crate::heap::release_roots(pair_root);
+            }
+            let mut entries = self.lock();
+            if let Some(existing) = self.live_dict() {
+                drop(entries);
+                crate::heap::release_roots(mapping_root);
+                crate::heap::release_roots(owner_root);
+                return Some(existing);
+            }
+            let current = Attributes::visible_pairs(entries.as_slice());
+            if current != snapshot {
+                drop(entries);
+                crate::heap::release_roots(mapping_root);
+                crate::heap::release_roots(owner_root);
+                continue;
+            }
+            entries.retain(|(name, _)| name.starts_with('\u{0}'));
+            entries.push((LIVE_DICT_KEY.to_string(), mapping));
+            crate::heap::write_barrier_edge(owner, mapping);
+            self.live
+                .store(mapping, std::sync::atomic::Ordering::Release);
+            drop(entries);
+            crate::heap::release_roots(mapping_root);
+            crate::heap::release_roots(owner_root);
+            return Some(mapping);
+        }
+    }
+
+    /// Adopts `mapping` as `owner`'s instance dictionary (`obj.__dict__ = d`).
+    ///
+    /// The mapping object itself becomes the live dictionary, matching
+    /// CPython identity, and the reserved entries survive the replacement.
+    pub(crate) fn adopt_live_dict(&self, owner: i64, mapping: i64) {
+        let roots = crate::heap::root_values(&[owner, mapping]);
+        {
+            let mut entries = self.lock();
+            if self.live.load(std::sync::atomic::Ordering::Acquire) == mapping {
+                drop(entries);
+                crate::heap::release_roots(roots);
+                return;
+            }
+            entries.retain(|(name, _)| name.starts_with('\u{0}'));
+            entries.push((LIVE_DICT_KEY.to_string(), mapping));
+            crate::heap::write_barrier_edge(owner, mapping);
+            self.live
+                .store(mapping, std::sync::atomic::Ordering::Release);
+        }
+        crate::heap::release_roots(roots);
+    }
+
+    /// Refreshes the entries mirror from the live mapping so reflection
+    /// (`dir`, `gc.get_objects`) sees direct `obj.__dict__` mutations.
+    ///
+    /// The mirror is redundant for reachability: the mapping itself is a
+    /// traced edge of the instance, so a stale mirror cannot lose a child.
+    fn sync_live_mirror(&self) {
+        let Some(mapping) = self.live_dict() else {
+            return;
+        };
+        let visible: Vec<(String, i64)> = match as_dict_data(mapping) {
+            Some(dict) => dict
+                .entries()
+                .iter()
+                .filter_map(|(key, value)| as_str(*key).map(|name| (name.to_string(), *value)))
+                .collect(),
+            None => return,
+        };
         let mut entries = self.lock();
-        let position = entries
-            .iter()
-            .position(|(existing, _)| existing.as_str() == name)?;
-        Some(entries.remove(position).1)
+        if self.live.load(std::sync::atomic::Ordering::Acquire) != mapping {
+            return;
+        }
+        entries.retain(|(name, _)| name.starts_with('\u{0}'));
+        entries.push((LIVE_DICT_KEY.to_string(), mapping));
+        entries.extend(visible);
     }
 }
 
@@ -2391,7 +2640,12 @@ pub(crate) struct InstanceState {
 impl InstanceState {
     /// Locks the attribute table for the collector: the guard must stay alive
     /// until the marker turns the instance black.
+    ///
+    /// The visible mirror is refreshed first so reflection sees direct
+    /// `obj.__dict__` mutations; the mapping itself is already a traced edge,
+    /// so GC correctness does not depend on the mirror.
     pub(crate) fn lock_attrs(&self) -> MutexGuard<'_, Vec<(String, i64)>> {
+        self.attrs.sync_live_mirror();
         self.attrs.lock()
     }
 }
@@ -4819,44 +5073,28 @@ pub(crate) fn class_own_function(class: i64, name: &str) -> Option<i64> {
     }
 }
 
-/// Snapshot of `instance.__dict__` in insertion order. Method attributes are
-/// resolved by [`crate::methods::call`] instead.
+/// The live `instance.__dict__` mapping, materialised on first use.
+///
+/// Attribute reads and writes go through the same mapping afterwards, so
+/// `obj.__dict__` is the instance dictionary instead of a snapshot. Reserved
+/// runtime attributes stay in the table and never enter the mapping.
 pub(crate) fn instance_dict(instance: i64) -> Option<i64> {
     let attrs = instance_attributes(instance)?;
-    let snapshot = attrs.snapshot();
-    let result = dict_new(Vec::new());
-    let root = crate::heap::root_values(&[result]);
-    for (name, value) in snapshot {
-        if name.starts_with('\u{0}') {
-            // Reserved runtime storage (a native `dict` subclass's mapping, a
-            // Counter's counts) is not part of Python's `__dict__`.
-            continue;
-        }
-        let key = str_alloc(name);
-        crate::container::dict_set(result, key, value);
-    }
-    crate::heap::release_roots(root);
-    Some(result)
+    attrs.ensure_live_dict(instance)
 }
 
-/// Replaces `instance.__dict__` from a mapping of string keys.
+/// Replaces `instance.__dict__` with `mapping` (`obj.__dict__ = mapping`).
+///
+/// The mapping itself becomes the live dictionary, matching CPython identity;
+/// reserved runtime attributes are preserved.
 pub(crate) fn instance_set_dict(instance: i64, mapping: i64) -> bool {
     let Some(attrs) = instance_attributes(instance) else {
         return false;
     };
-    let Some(pairs) = as_dict(mapping) else {
+    if as_dict(mapping).is_none() {
         return false;
-    };
-    let copy = pairs.to_vec();
-    attrs.clear();
-    for (key, value) in copy {
-        // `__dict__` keys must be strings; ignore foreign keys rather than
-        // rejecting the whole mapping, so a partially malformed mapping still
-        // restores the valid attribute set.
-        if let Some(name) = as_str(key) {
-            attrs.set(instance, name.to_string(), value);
-        }
     }
+    attrs.adopt_live_dict(instance, mapping);
     true
 }
 

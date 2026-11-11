@@ -8,6 +8,27 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-11-11 live mappings, globals and generator introspection
+
+- Instance `__dict__` is now a live mapping backed by the attribute table
+  (migration on first access, write-through updates, reserved native slots
+  hidden); user classes using `self.__dict__.update(...)` work.
+- Module reads observe `global` assignments made by functions, including
+  augmented assignments; frontend `len()` checks defer non-container errors
+  to runtime, and loop-slot reassignment/`frozenset` typing no longer reject
+  valid CPython snippets.
+- Generator introspection (`gi_running`, `gi_yieldfrom`, `gi_code`,
+  `gi_frame`), reentrant-resume errors, active delegate tracking, and the
+  delegator frame chain are implemented; `inspect.stack()` builds real
+  `FrameInfo` records.
+- unittest suite construction roots discovered test instances and suite
+  inputs across allocations, and `run_main` roots its result; full-file
+  `test_yield_from.py` now reaches all 43 tests instead of aborting on stale
+  suite entries.
+- tempfile cleanup/error taxonomy hardened for recursive removal, symlinks,
+  permission recovery and candidate exhaustion.
+- Workspace suite: **3290 passed, 1 skipped**; clippy and fmt green.
+
 ### Compatibility — 2026-11-11 stdlib, generator and harness expansion
 
 - **Frontend:** module/class-body name reads and callees now defer to runtime

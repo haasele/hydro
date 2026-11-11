@@ -557,25 +557,30 @@ fn name_value(kind: ReturnKind, path: &Path) -> i64 {
 /// whichever occurred instead of masking it.
 #[derive(Debug)]
 enum TempError {
-    Io(io::Error),
+    /// The failing operation plus the entry it was applied to, so the raised
+    /// `OSError` names the candidate path CPython names, not the base
+    /// directory the candidate was derived from.
+    Io {
+        error: io::Error,
+        path: PathBuf,
+    },
+    /// Every candidate supplied by `_get_candidate_names` was unusable and no
+    /// `TMP_MAX` attempt succeeded. Nothing was created.
+    Exhausted(&'static str),
     Raised(i64),
 }
 
-/// Raises the error represented by `error`, naming `base` for I/O failures.
-fn raise_temp_error(error: TempError, base: &Path) -> i64 {
+/// Raises the error represented by `error`.
+///
+/// Exhaustion becomes CPython's `FileExistsError(EEXIST, ...)` with no
+/// filename component: no path was ever created, so naming the base
+/// directory (as an `io_error` would) would be misleading.
+fn raise_temp_error(error: TempError) -> i64 {
     match error {
-        TempError::Io(error) => io_error(error, base),
-        TempError::Raised(raised) => raised,
-    }
-}
-
-/// [`raise_temp_error`] for helpers that only retain the `dir` argument.
-fn raise_temp_error_with_dir(error: TempError, dir: Option<String>) -> i64 {
-    match error {
-        TempError::Io(error) => match base_dir(dir) {
-            Ok(base) => io_error(error, &base),
-            Err(raised) => raised,
-        },
+        TempError::Io { error, path } => io_error(error, &path),
+        TempError::Exhausted(message) => {
+            exc::raise_with_message(FILE_EXISTS_ERROR, &format!("[Errno 17] {message}"))
+        }
         TempError::Raised(raised) => raised,
     }
 }
@@ -626,7 +631,9 @@ fn next_iterator_item(iterator: i64) -> Result<Option<i64>, i64> {
 ///
 /// A program assignment to `_get_candidate_names` (the test suite replaces it
 /// with a deterministic iterator) is honoured exactly like CPython's call to
-/// the hook; otherwise the process-wide random sequence supplies them.
+/// the hook; otherwise the process-wide random sequence supplies them. At most
+/// `TMP_MAX` names are taken: an iterator that ends earlier finishes the batch,
+/// and the caller then reports exhaustion without leaving a partial path.
 fn candidate_names_batch() -> Result<Vec<String>, i64> {
     let Some(hook) = globals::attribute_override("tempfile", "_get_candidate_names") else {
         return Ok((0..TMP_MAX).map(|_| random_name()).collect());
@@ -700,13 +707,15 @@ fn exclusive_temp_file(
         match options.open(&candidate) {
             Ok(file) => return Ok((file, candidate)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(TempError::Io(error)),
+            Err(error) => {
+                return Err(TempError::Io {
+                    error,
+                    path: candidate,
+                })
+            }
         }
     }
-    Err(TempError::Io(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "No usable temporary file name found",
-    )))
+    Err(TempError::Exhausted("No usable temporary file name found"))
 }
 
 /// Creates a `prefix + <candidate> + suffix` directory in `base`.
@@ -719,13 +728,17 @@ fn exclusive_temp_dir(base: &Path, prefix: &str, suffix: &str) -> Result<PathBuf
                 return Ok(candidate);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(TempError::Io(error)),
+            Err(error) => {
+                return Err(TempError::Io {
+                    error,
+                    path: candidate,
+                })
+            }
         }
     }
-    Err(TempError::Io(io::Error::new(
-        io::ErrorKind::AlreadyExists,
+    Err(TempError::Exhausted(
         "No usable temporary directory name found",
-    )))
+    ))
 }
 
 /// `tempfile.mkdtemp(suffix=None, prefix=None, dir=None)`.
@@ -752,7 +765,7 @@ fn mkdtemp(args: &[i64]) -> i64 {
     };
     match exclusive_temp_dir(&base, &prefix, &suffix) {
         Ok(path) => name_value(kind, &path),
-        Err(error) => raise_temp_error(error, &base),
+        Err(error) => raise_temp_error(error),
     }
 }
 
@@ -796,7 +809,7 @@ fn mkstemp(args: &[i64]) -> i64 {
                 value::tuple_new(vec![NONE, name_value(kind, &path)])
             }
         }
-        Err(error) => raise_temp_error(error, &base),
+        Err(error) => raise_temp_error(error),
     }
 }
 
@@ -1089,7 +1102,7 @@ fn mkstemp_inner(args: &[i64]) -> i64 {
                 value::tuple_new(vec![NONE, name_value(kind, &path)])
             }
         }
-        Err(error) => raise_temp_error(error, &base),
+        Err(error) => raise_temp_error(error),
     }
 }
 
@@ -1149,7 +1162,7 @@ fn new_temporary_file(args: &[i64]) -> i64 {
     let created = create_temp_file(&prefix, &suffix, dir.clone().as_deref());
     let path = match created {
         Ok(path) => path,
-        Err(error) => return raise_temp_error_with_dir(error, dir),
+        Err(error) => return raise_temp_error(error),
     };
     let path_text = path.to_string_lossy().into_owned();
     let open_args = [
@@ -1219,7 +1232,57 @@ fn remove_tree(path: &Path) -> io::Result<()> {
     remove_tree_at(path, path)
 }
 
+/// Lists `path`, retrying once after restoring owner access when a mode bit
+/// denies reading it.
+///
+/// `Ok(None)` reports that the entry vanished or stopped being a directory
+/// between the caller's metadata check and this call; the caller re-examines
+/// it (and unlinks it when it became a file or a symlink) instead of treating
+/// the race as a failure.
+fn directory_entries(path: &Path, root: &Path) -> io::Result<Option<Vec<PathBuf>>> {
+    for attempt in 0..2 {
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotADirectory => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied && attempt == 0 => {
+                // A directory with no read/execute bit cannot even be listed.
+                reset_path_and_ancestors(path, root);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let mut paths = Vec::new();
+        let mut denied = None;
+        for entry in entries {
+            match entry {
+                Ok(entry) => paths.push(entry.path()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    denied = Some(error);
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        match denied {
+            Some(_) if attempt == 0 => {
+                // Restart the listing after restoring access so the full set
+                // is returned, not the partially collected prefix.
+                reset_path_and_ancestors(path, root);
+                continue;
+            }
+            Some(error) => return Err(error),
+            None => return Ok(Some(paths)),
+        }
+    }
+    unreachable!("directory_entries retries once")
+}
+
 /// Recursive worker of [`remove_tree`]; `root` never has its parent chmodded.
+///
+/// A symlink found here is always unlinked, never traversed, even when it
+/// points at a directory; only `symlink_metadata` decides what an entry is.
 fn remove_tree_at(path: &Path, root: &Path) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1236,34 +1299,29 @@ fn remove_tree_at(path: &Path, root: &Path) -> io::Result<()> {
         }
         Err(error) => return Err(error),
     };
-    if !metadata.file_type().is_dir() {
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
         return remove_file_at(path, root);
     }
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            // A directory with no read/execute bit cannot even be listed.
-            reset_path_and_ancestors(path, root);
-            match fs::read_dir(path) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
+    let Some(entries) = directory_entries(path, root)? else {
+        // The entry was replaced by a file or a symlink, or removed, while it
+        // was being listed: handle it as the non-directory it is now.
+        return remove_file_at(path, root);
     };
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        remove_tree_at(&entry.path(), root)?;
+        remove_tree_at(&entry, root)?;
     }
     match fs::remove_dir(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+            // Replaced by a file or a symlink after the listing; unlink the
+            // replacement instead of failing the whole cleanup.
+            match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             // Removing the entry needs write access to its parent. Only
             // directories inside the tree are reset: the parent of `root`
@@ -1272,6 +1330,9 @@ fn remove_tree_at(path: &Path, root: &Path) -> io::Result<()> {
             match fs::remove_dir(path) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+                    remove_file_at(path, root)
+                }
                 Err(error) => Err(error),
             }
         }
@@ -1282,13 +1343,30 @@ fn remove_tree_at(path: &Path, root: &Path) -> io::Result<()> {
 /// Unlinks one file (or symlink) entry, resetting a parent inside `root`
 /// when the directory lost its write bit, then retrying once.
 fn remove_file_at(path: &Path, root: &Path) -> io::Result<()> {
+    match remove_file_entry(path, root) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            reset_path_and_ancestors(path, root);
+            remove_file_entry(path, root)
+        }
+        result => result,
+    }
+}
+
+/// Single `remove_file` attempt used by [`remove_file_at`].
+///
+/// `IsADirectory` means the entry changed into a directory after the caller's
+/// metadata check, so a real directory is removed recursively. A directory
+/// symlink (Windows reports those as `IsADirectory`) is removed with
+/// `remove_dir`, which unlinks the link itself and never touches its target.
+fn remove_file_entry(path: &Path, root: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            reset_path_and_ancestors(path, root);
-            match fs::remove_file(path) {
-                Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::IsADirectory => {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_dir(path),
+                Ok(metadata) if metadata.file_type().is_dir() => remove_tree_at(path, root),
+                Ok(_) => fs::remove_file(path),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
             }
@@ -1337,7 +1415,7 @@ fn new_temporary_directory(args: &[i64]) -> i64 {
     let created = create_temp_dir(&prefix, &suffix, dir.clone().as_deref());
     let path = match created {
         Ok(path) => path,
-        Err(error) => return raise_temp_error_with_dir(error, dir),
+        Err(error) => return raise_temp_error(error),
     };
     let ignore_cleanup_errors = bool_arg(args, 3, false);
     let delete = bool_arg(args, 4, true);
@@ -1698,7 +1776,7 @@ fn new_named_temporary_file(args: &[i64]) -> i64 {
 
     let path = match create_temp_file(&prefix, &suffix, dir.clone().as_deref()) {
         Ok(path) => path,
-        Err(error) => return raise_temp_error_with_dir(error, dir),
+        Err(error) => return raise_temp_error(error),
     };
     let name_attr = name_value(kind, &path);
     let path_text = path.to_string_lossy().into_owned();
@@ -2278,7 +2356,7 @@ fn spooled_rollover(instance: i64) -> i64 {
             }
         }
         Err(error) => {
-            let _ = raise_temp_error_with_dir(error, dir);
+            let _ = raise_temp_error(error);
         }
     }
     heap::release_roots(content_roots);

@@ -865,7 +865,17 @@ fn builtin_fixed_result(builtin: Builtin) -> Option<Type> {
         Builtin::List | Builtin::Reversed | Builtin::Sorted => Type::List,
         Builtin::Tuple => Type::Tuple,
         Builtin::Dict => Type::Dict,
-        Builtin::Set | Builtin::Frozenset => Type::Set,
+        Builtin::Set => Type::Set,
+        // `frozenset(...)` is immutable and hashable. The type lattice has no
+        // frozen-set variant, so the result stays dynamic; a set literal or a
+        // `set(...)` call keeps `Type::Set` and is still rejected where a
+        // hashable value is required.
+        Builtin::Frozenset => Type::Any,
+        // `bytes(...)` always builds a byte string, whatever the source shape.
+        // Typing the result at the call site lets a local (for example a loop
+        // target) reassigned to `bytes(...)` widen before later uses of the
+        // slot are checked, instead of keeping the slot's previous type.
+        Builtin::Bytes => Type::Bytes,
         _ => return None,
     })
 }
@@ -3596,7 +3606,7 @@ impl<'a> Checker<'a> {
         &mut self,
         builtin: Builtin,
         args: Vec<(Ty, u32, u32)>,
-        literal: Vec<bool>,
+        _literal: Vec<bool>,
         out: Ty,
         line: u32,
         col: u32,
@@ -3627,7 +3637,7 @@ impl<'a> Checker<'a> {
                     );
                     return;
                 }
-                let (ty, arg_line, arg_col) = args[0];
+                let (ty, _arg_line, _arg_col) = args[0];
                 match self.inf.resolve(ty) {
                     // An unresolved argument may still be constrained later
                     // (e.g. `x = a - b; len(x)`). Unifying with `Any` keeps
@@ -3643,20 +3653,10 @@ impl<'a> Checker<'a> {
                     | Ty::Concrete(Type::Set)
                     | Ty::Concrete(Type::Range)
                     | Ty::Concrete(Type::Any) => {}
-                    Ty::Concrete(t) if !literal.first().copied().unwrap_or(false) => {
-                        // A variable can be a user class implementing
-                        // `__len__`, even when inference only sees a scalar;
-                        // the runtime decides. Literals stay static errors.
-                        let _ = t;
-                    }
-                    Ty::Concrete(t) => self.error(
-                        arg_line,
-                        arg_col,
-                        format!(
-                            "len() argument must be str, bytes, list, dict, tuple, set or range, not {}",
-                            t.name()
-                        ),
-                    ),
+                    // A scalar/user object may implement `__len__`; CPython
+                    // raises `TypeError` only when the call executes, so the
+                    // runtime decides for every non-container type.
+                    Ty::Concrete(_) => {}
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::Int));
             }
@@ -4124,8 +4124,12 @@ impl<'a> Checker<'a> {
                     // Same iterable rule as `set()`; a `range` is accepted.
                     self.check_builtin_iterable(Builtin::Frozenset, ty, arg_line, arg_col);
                 }
-                // Hydro has one immutable set representation.
-                let _ = self.inf.unify(out, Ty::Concrete(Type::Set));
+                // A frozenset is immutable and hashable, but the static type
+                // lattice has no frozen-set variant. Keep the result dynamic
+                // (see `builtin_fixed_result`): the runtime owns the value and
+                // a genuine `set` literal or `set(...)` call is still typed
+                // `Type::Set` and rejected where a hashable value is required.
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
             }
             Builtin::Getattr => {
                 if count != 2 && count != 3 {

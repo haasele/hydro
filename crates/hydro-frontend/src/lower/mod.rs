@@ -983,6 +983,10 @@ struct CellPlan {
     owned: HashSet<String>,
     /// Capture parameters that already hold an enclosing function's cell.
     aliases: HashSet<String>,
+    /// Owned names a nested scope rebinds through `nonlocal`. The enclosing
+    /// body cannot observe those writes, so reads of the cell stay dynamic
+    /// instead of keeping the type of an earlier assignment.
+    nested_mutated: HashSet<String>,
 }
 
 /// One method binding a dynamic class body stores in its namespace: the
@@ -2660,6 +2664,12 @@ pub struct Lowerer<'a> {
     /// Single-source checks and the entry module only mirror those; imported
     /// units mirror every exported name because importers read them.
     used_globals: HashSet<String>,
+    /// Module-level names a function or method of this unit assigns through a
+    /// `global` declaration. Their value lives in the runtime global table, so
+    /// a module-body read must use [`HExprKind::GlobalGet`]: the local slot
+    /// only holds the module body's own last store and misses function writes
+    /// that ran in between.
+    mutated_globals: HashSet<String>,
     /// Mirror every module-level assignment and class definition into the
     /// global table. Enabled for imported units, whose globals are read by
     /// other compilation units. The entry module leaves it off: it has no
@@ -2885,6 +2895,7 @@ impl<'a> Lowerer<'a> {
             global_names: HashSet::new(),
             unit_bound_names: HashSet::new(),
             used_globals: HashSet::new(),
+            mutated_globals: HashSet::new(),
             mirror_all_globals: false,
             future_annotations: false,
             session_mode: false,
@@ -3223,6 +3234,9 @@ impl<'a> Lowerer<'a> {
         let session_table = &self.session_globals;
         self.global_names
             .retain(|name| session_table.contains(name));
+        // Declared-global writes are a property of this unit's functions; the
+        // set is repopulated before the module body is lowered.
+        self.mutated_globals.clear();
         // `from __future__ import annotations` turns every annotation into
         // its source text when it reaches `__annotations__`, so annotation
         // expressions are never evaluated (and a forward reference to a
@@ -8036,7 +8050,11 @@ impl<'a> Lowerer<'a> {
         bound.retain(|name| !scope_globals.contains(name) && !nonlocal_names.contains(name));
         let mut mutated = HashSet::new();
         collect_scope_mutations(decl.body, &mut mutated);
-        collect_nested_nonlocals(decl.body, &mut mutated);
+        // A nested scope's `nonlocal` declaration means the cell can change
+        // behind this function's back; keep the set so reads stay dynamic.
+        let mut nested_mutated = HashSet::new();
+        collect_nested_nonlocals(decl.body, &mut nested_mutated);
+        mutated.extend(nested_mutated.iter().cloned());
         // A `def`/`class` statement binds its name when it executes, so it is
         // not a mutation in the loop-target sense, but a nested closure that
         // reads that name still needs the shared cell: recursion reads the
@@ -8091,7 +8109,14 @@ impl<'a> Lowerer<'a> {
             .filter(|name| !aliases.contains(*name))
             .cloned()
             .collect();
-        self.cell_plans.insert(id, CellPlan { owned, aliases });
+        self.cell_plans.insert(
+            id,
+            CellPlan {
+                owned,
+                aliases,
+                nested_mutated,
+            },
+        );
 
         self.functions.push(HFunction {
             name: name.clone(),
@@ -9480,6 +9505,14 @@ impl<'a> Lowerer<'a> {
         names.extend(genexp_walrus_targets(body));
         let mut globals = HashSet::new();
         collect_scope_globals(body, &mut globals);
+        // Record the globals this function actually assigns: a module-body
+        // read of such a name must observe the runtime global table once the
+        // function runs. A bare `global name` declaration without a store
+        // changes nothing, so it does not redirect any read.
+        let mut global_writes = HashSet::new();
+        collect_scope_mutations(body, &mut global_writes);
+        self.mutated_globals
+            .extend(globals.intersection(&global_writes).cloned());
         let mut nonlocals = Vec::new();
         collect_scope_nonlocals(body, &mut nonlocals);
         let nonlocal_names: HashSet<String> =
@@ -9523,6 +9556,24 @@ impl<'a> Lowerer<'a> {
             let function = &self.functions[fid as usize];
             function.params.iter().map(|param| param.local).collect()
         };
+        // A cell a nested scope rebinds through `nonlocal` can change without
+        // this body running a store, so its reads stay dynamic. Otherwise a
+        // value assigned before the nested call (`saved_details = None`)
+        // would narrow a later read that observes the callback's tuple.
+        // Parameters keep their declared annotation in `HParam`; only the
+        // local slot read by the body is widened.
+        for name in &plan.nested_mutated {
+            let Some(&local) = local_map.get(name) else {
+                continue;
+            };
+            if cells.contains(&local) && !param_ids.contains(&local) {
+                if let Some(local_info) =
+                    self.functions[fid as usize].locals.get_mut(local as usize)
+                {
+                    local_info.ty = Ty::Concrete(Type::Any);
+                }
+            }
+        }
         let function = &self.functions[fid as usize];
         let mut fs = FuncState {
             fid,
@@ -10272,31 +10323,67 @@ impl<'a> Lowerer<'a> {
                         value,
                     }
                 } else if let Some(local) = fs.lookup(target.id.as_str()) {
-                    let value = self.expr(&s.value, fs);
-                    if fs.is_cell(local) {
-                        // Read and write both go through the shared cell so a
-                        // nested `nonlocal` writer sees the update.
-                        let ty = self.infer.fresh();
-                        let lhs = self.local_read(fs, local, ty, line, col);
+                    let name = target.id.as_str();
+                    if fs.is_module
+                        && (self.mutated_globals.contains(name)
+                            || (self.session_mode && self.session_globals.contains(name)))
+                    {
+                        // A function wrote the runtime global, so the module
+                        // local may be stale. Read and write the table; a
+                        // later plain assignment refreshes the local slot.
+                        self.used_globals.insert(name.to_string());
+                        let lhs = HExpr {
+                            kind: HExprKind::GlobalGet {
+                                module: self.dunder_name.clone(),
+                                name: name.to_string(),
+                            },
+                            ty: Ty::Concrete(Type::Any),
+                            line,
+                            col,
+                        };
+                        let rhs = self.expr(&s.value, fs);
                         let value = HExpr {
                             kind: HExprKind::Bin {
                                 op,
                                 lhs: Box::new(lhs),
-                                rhs: Box::new(value),
+                                rhs: Box::new(rhs),
                             },
                             ty: self.infer.fresh(),
                             line,
                             col,
                         };
-                        HStmtKind::CellAssign {
-                            target: local,
+                        HStmtKind::GlobalSet {
+                            module: self.dunder_name.clone(),
+                            name: name.to_string(),
                             value,
                         }
                     } else {
-                        HStmtKind::AugAssign {
-                            target: local,
-                            op,
-                            value,
+                        let value = self.expr(&s.value, fs);
+                        if fs.is_cell(local) {
+                            // Read and write both go through the shared cell so
+                            // a nested `nonlocal` writer sees the update.
+                            let ty = self.infer.fresh();
+                            let lhs = self.local_read(fs, local, ty, line, col);
+                            let value = HExpr {
+                                kind: HExprKind::Bin {
+                                    op,
+                                    lhs: Box::new(lhs),
+                                    rhs: Box::new(value),
+                                },
+                                ty: self.infer.fresh(),
+                                line,
+                                col,
+                            };
+                            HStmtKind::CellAssign {
+                                target: local,
+                                value,
+                            }
+                        } else {
+                            HStmtKind::AugAssign {
+                                target: local,
+                                op,
+                                value,
+                            }
                         }
                     }
                 } else if self.session_mode && self.global_names.contains(target.id.as_str()) {
@@ -18343,8 +18430,29 @@ impl<'a> Lowerer<'a> {
                         col,
                     }
                 } else if let Some(local) = fs.lookup(name) {
-                    let ty = self.infer.fresh();
-                    self.local_read(fs, local, ty, line, col)
+                    // A module-level name some function assigns through
+                    // `global` lives in the runtime global table; the local
+                    // slot only holds the module body's own last store, so a
+                    // read after a call must go through the table to observe
+                    // the function's write.
+                    if fs.is_module
+                        && (self.mutated_globals.contains(name)
+                            || (self.session_mode && self.session_globals.contains(name)))
+                    {
+                        self.used_globals.insert(name.to_string());
+                        HExpr {
+                            kind: HExprKind::GlobalGet {
+                                module: self.dunder_name.clone(),
+                                name: name.to_string(),
+                            },
+                            ty: Ty::Concrete(Type::Any),
+                            line,
+                            col,
+                        }
+                    } else {
+                        let ty = self.infer.fresh();
+                        self.local_read(fs, local, ty, line, col)
+                    }
                 } else if fs.is_global(name) {
                     // `global name`: the value lives in the runtime global
                     // table of this module.

@@ -3130,6 +3130,17 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
     if let Some(attribute) = crate::core::template::getattr(obj, attr) {
         return attribute;
     }
+    if let Some(fiber) = value::as_fiber(obj) {
+        if fiber.kind == crate::fiber::FiberKind::Generator {
+            match attr {
+                "gi_running" => return value::bool_value(crate::fiber::is_running(obj)),
+                "gi_yieldfrom" => return crate::fiber::yieldfrom_value(obj),
+                "gi_code" => return crate::fiber::code_value(obj),
+                "gi_frame" => return crate::fiber::frame_value(obj),
+                _ => {}
+            }
+        }
+    }
     if value::as_frame(obj).is_some() {
         if let Some(attribute) = exc::frame_attr(obj, attr) {
             return attribute;

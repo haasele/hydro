@@ -245,6 +245,15 @@ fn context_root_ranges(state: &FiberState) -> [(usize, usize); 2] {
 /// by this; it matches the runtime's remaining recursion headroom assumption.
 pub(crate) const FIBER_STACK_SIZE: usize = 1024 * 1024;
 
+/// CPython `code.co_flags` bits used by the derived `gi_code` object. The
+/// fiber record has no signature, so only the kind bit and the two flags every
+/// generated body carries are known here.
+const CO_OPTIMIZED: u32 = 0x0001;
+const CO_NEWLOCALS: u32 = 0x0002;
+const CO_GENERATOR: u32 = 0x0020;
+const CO_COROUTINE: u32 = 0x0080;
+const CO_ASYNC_GENERATOR: u32 = 0x0200;
+
 /// Not a valid tagged value. `yield_value` returns it when the suspension
 /// point raised (throw/close/cancellation); the pending exception is set.
 pub(crate) const YIELD_ERROR: i64 = 2;
@@ -331,6 +340,18 @@ pub(crate) struct FiberState {
     pub(crate) running: bool,
     /// Value passed to `hydro_yield` at the last suspension.
     pub(crate) yielded: i64,
+    /// Active `yield from` delegate (`gi_yieldfrom`), or `NONE` when the
+    /// generator is not currently delegating. The delegate is a heap object
+    /// held only by this field while `yield from` drives it, so it is a traced
+    /// edge: the outer generator may suspend (`yield`) for an arbitrarily
+    /// long time and the delegate must survive collections meanwhile.
+    pub(crate) yieldfrom: i64,
+    /// Lazily materialised `gi_code` object for this fiber, or `NONE`.
+    ///
+    /// The fiber record keeps no function value (only the entry address and
+    /// the bare name), so the code object is derived from the kind and name on
+    /// first access and then cached to keep `gi_code` identity stable.
+    pub(crate) code: i64,
     /// Return value recorded when the body finished.
     pub(crate) result: i64,
     /// Pending exception captured from the body (`NONE` if none).
@@ -404,6 +425,17 @@ pub(crate) struct FiberState {
     /// (see [`FiberState::frame_base`]), so the active chain matches CPython's
     /// single per-thread stack; they are removed again on suspension.
     pub(crate) saved_frames: Vec<exc::Activation>,
+    /// Weak handles to `FrameData` records exposed through `gi_frame` while
+    /// this fiber was suspended.
+    ///
+    /// A frame object returned by `gi_frame` shares the activation record and
+    /// therefore points at this fiber's precise slots. When the fiber is
+    /// finalised (or its body unwinds without running `hydro_frame_leave`),
+    /// those slots die with the stack; [`FiberState::clear_exposed_frames`]
+    /// detaches the records first so a retained frame reports empty locals
+    /// instead of dangling. Weak handles keep a collected frame object from
+    /// pinning the record.
+    exposed_frames: Vec<std::sync::Weak<exc::FrameData>>,
     /// Number of resumer activations spliced below this fiber's own records
     /// for the current resume.
     ///
@@ -441,6 +473,8 @@ impl FiberState {
             done: false,
             running: false,
             yielded: NONE,
+            yieldfrom: NONE,
+            code: NONE,
             result: NONE,
             error: NONE,
             started: false,
@@ -466,6 +500,7 @@ impl FiberState {
             saved_roots: SavedRoots::default(),
             caller_roots_ptr: std::ptr::null_mut(),
             saved_frames: Vec::new(),
+            exposed_frames: Vec::new(),
             frame_base: 0,
             frame_owner: std::ptr::null_mut(),
         });
@@ -490,6 +525,37 @@ impl FiberState {
         Some(state)
     }
 
+    /// Detaches every `gi_frame` record exposed for this suspended fiber.
+    ///
+    /// The fibers' precise slots die with its stack, so the records must stop
+    /// reporting them as live locals. A frame object that outlives the fiber
+    /// then reports empty locals (the same shape CPython leaves after a frame
+    /// is cleared), never a dangling slot array.
+    fn clear_exposed_frames(&mut self) {
+        for weak in self.exposed_frames.drain(..) {
+            if let Some(data) = weak.upgrade() {
+                data.locals.base.store(0, Ordering::Relaxed);
+                data.locals.slots.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Tracks a `FrameData` materialised for `gi_frame` so
+    /// [`Self::clear_exposed_frames`] can detach it when the fiber dies.
+    fn remember_exposed_frame(&mut self, data: &std::sync::Arc<exc::FrameData>) {
+        // Dead handles cannot be upgraded later; drop them before comparing
+        // addresses so a reused allocation is registered again.
+        self.exposed_frames.retain(|weak| weak.strong_count() > 0);
+        if self
+            .exposed_frames
+            .iter()
+            .any(|weak| weak.as_ptr() == std::sync::Arc::as_ptr(data))
+        {
+            return;
+        }
+        self.exposed_frames.push(std::sync::Arc::downgrade(data));
+    }
+
     /// Marks the values owned by this object. The fiber stack and the two
     /// register contexts are scanned separately by the collector.
     ///
@@ -501,6 +567,8 @@ impl FiberState {
             mark(arg);
         }
         mark(self.yielded);
+        mark(self.yieldfrom);
+        mark(self.code);
         mark(self.result);
         mark(self.error);
         mark(self.sent);
@@ -536,6 +604,9 @@ impl Drop for FiberState {
         // freed. `clear` only drops the vectors: it never dereferences a slot,
         // so a stale frame on a dead fiber stack cannot be scanned here.
         self.saved_roots.clear();
+        // Detach frame records that still point at this fiber's slots before
+        // the activation records (and the stack) go away.
+        self.clear_exposed_frames();
         // A fiber being collected has no live frames; releasing them here
         // keeps a retained record from pinning a dead stack's metadata.
         self.saved_frames.clear();
@@ -870,7 +941,10 @@ unsafe fn finish_switch(ptr: *mut FiberState) {
         detach_caller_frames(ptr);
         // A body that unwound without running every `hydro_frame_leave` must
         // not keep dead activation records (and the `FrameData` they cached)
-        // alive: a finished fiber has no live frames.
+        // alive: a finished fiber has no live frames. Exposed `gi_frame`
+        // records point at this stack, so detach them before clearing.
+        (*ptr).yieldfrom = NONE;
+        (*ptr).clear_exposed_frames();
         (*ptr).saved_frames.clear();
         // The context must never be resumed once the body returned. Save the
         // fiber's (dead) continuation into its own slot and switch to the
@@ -911,6 +985,35 @@ unsafe fn suspend_switch(ptr: *mut FiberState) {
     // Resumed: the switch restored the fiber's callee-saved registers.
 }
 
+/// Raises CPython's "already executing" error when `ptr` is currently on the
+/// native stack and returns whether it did.
+///
+/// A fiber can be re-entered from its own body or from a generator/coroutine
+/// it resumed: both are still executing. CPython's `gen_send_ex2` rejects the
+/// resume with `ValueError` (async generators keep the runtime's existing
+/// `RuntimeError` wording) and leaves the executing fiber completely
+/// untouched, so its `gi_running` state and pending suspension stay valid.
+fn reject_when_running(ptr: *mut FiberState) -> bool {
+    // SAFETY: `ptr` is a live fiber owned by the calling thread.
+    unsafe {
+        if !(*ptr).running {
+            return false;
+        }
+        match (*ptr).kind {
+            FiberKind::Generator => {
+                exc::raise_with_message(VALUE_ERROR, "generator already executing");
+            }
+            FiberKind::Coroutine => {
+                exc::raise_with_message(VALUE_ERROR, "coroutine already executing");
+            }
+            FiberKind::AsyncGenerator => {
+                exc::raise_with_message(RUNTIME_ERROR, "async generator already executing");
+            }
+        }
+    }
+    true
+}
+
 /// Resumes `ptr` and reports whether it finished.
 ///
 /// # Safety
@@ -922,8 +1025,8 @@ pub(crate) unsafe fn resume_raw(ptr: *mut FiberState, value: i64) -> bool {
         if (*ptr).done {
             return true;
         }
-        if (*ptr).running {
-            // Defensive: a fiber cannot be resumed while it runs.
+        if reject_when_running(ptr) {
+            // The exception is pending; the fiber keeps running.
             return false;
         }
         // A resume is a Python call: the body runs on this thread's native
@@ -1018,6 +1121,179 @@ pub(crate) fn is_done(value: i64) -> bool {
     value::as_fiber(value)
         .map(|fiber| fiber.done)
         .unwrap_or(true)
+}
+
+/// `generator.gi_running` (also `coroutine.cr_running` and
+/// `async_generator.ag_running`): whether the fiber is executing right now.
+///
+/// The flag is set by [`resume_raw`] before the context switch and cleared by
+/// [`suspend_switch`]/[`finish_switch`] before switching back, so a generator
+/// body observes `True` for itself and for every generator it is delegating
+/// to, while callers outside the resume observe `False`.
+pub(crate) fn is_running(value: i64) -> bool {
+    value::as_fiber(value)
+        .map(|fiber| fiber.running)
+        .unwrap_or(false)
+}
+
+/// `generator.gi_yieldfrom`: the iterator the generator is currently
+/// delegating to, or `None`.
+///
+/// The delegate is recorded for the whole `yield from` expression, including
+/// while the outer generator is suspended at a delegated `yield` and while a
+/// `close()`/`throw()` runs the delegate's handlers. It returns to `None` when
+/// the delegation finishes (normally or by propagation) and when the fiber is
+/// finalised.
+pub(crate) fn yieldfrom_value(value: i64) -> i64 {
+    value::as_fiber(value)
+        .map(|fiber| fiber.yieldfrom)
+        .unwrap_or(NONE)
+}
+
+/// `generator.gi_code`: the code object describing the generator body.
+///
+/// The fiber record keeps only the entry address and the bare definition
+/// name; the rest of a CPython code object's metadata (filename, parameter
+/// counts, `co_varnames`) belongs to the function value that created the
+/// fiber and is not stored here. The returned object therefore describes the
+/// truthful parts (name and generator/coroutine kind) and reports zero
+/// parameter slots, exactly like the runtime's other derived code objects.
+/// It is allocated on first access and cached so `g.gi_code` stays the same
+/// object.
+pub(crate) fn code_value(value: i64) -> i64 {
+    let Some(ptr) = value::fiber_raw(value) else {
+        return NONE;
+    };
+    // SAFETY: `fiber_raw` returned a live fiber payload that stays reachable
+    // through `value` for this call.
+    unsafe {
+        if (*ptr).code != NONE {
+            return (*ptr).code;
+        }
+        let kind_flag = match (*ptr).kind {
+            FiberKind::Generator => CO_GENERATOR,
+            FiberKind::Coroutine => CO_COROUTINE,
+            FiberKind::AsyncGenerator => CO_ASYNC_GENERATOR,
+        };
+        let name = (*ptr).name.clone();
+        let code = value::code_new(value::CodeState {
+            name: name.clone(),
+            qualname: name,
+            // The fiber does not own the source-file pointer; every generated
+            // body reports the runtime's conventional pseudo-file.
+            filename: "<hydro>".to_string(),
+            first_line: 0,
+            argcount: 0,
+            posonlyargcount: 0,
+            kwonlyargcount: 0,
+            flags: CO_OPTIMIZED | CO_NEWLOCALS | kind_flag,
+            nlocals: 0,
+            varnames: Vec::new(),
+        });
+        // The fiber now owns the only reference; storing it makes the edge
+        // visible to the collector (`trace`) before any later allocation.
+        (*ptr).code = code;
+        code
+    }
+}
+
+/// Depth from the top of `current`'s spliced activation chain of `target`'s
+/// outermost own activation.
+///
+/// [`FiberState::frame_base`] records how many activations `target` inherited
+/// from its resumer when it was last entered. That index stays valid in every
+/// deeper fiber's spliced vector, so it identifies the generator frame even
+/// while the generator runs a nested call.
+///
+/// # Safety
+///
+/// `current` must point at the running fiber installed by [`resume_raw`], and
+/// `target` must be `current` or one of its resumers.
+unsafe fn running_frame_depth(current: *mut FiberState, target: *mut FiberState) -> Option<usize> {
+    let mut node = current;
+    loop {
+        if node == target {
+            // SAFETY: caller contract; the vectors are owned by the running
+            // fiber chain and stable while it executes.
+            let length = unsafe { (*current).saved_frames.len() };
+            let start = unsafe { (*target).frame_base };
+            if start >= length {
+                return None;
+            }
+            return Some(length - 1 - start);
+        }
+        // SAFETY: as above.
+        let owner = unsafe { (*node).frame_owner };
+        if owner.is_null() {
+            return None;
+        }
+        node = owner;
+    }
+}
+
+/// Materialises the activation frame of a suspended fiber.
+///
+/// While a fiber is suspended, its own activations live in its
+/// `saved_frames` vector; `exc::frame_at` reads the running fiber's vector
+/// unless `CURRENT` names another fiber. The override below covers only the
+/// native materialisation (which allocates no Hydro object), so no safepoint
+/// or collector can observe the temporary context.
+///
+/// # Safety
+///
+/// `ptr` must point at a live fiber that is not running.
+unsafe fn suspended_frame(ptr: *mut FiberState) -> Option<std::sync::Arc<exc::FrameData>> {
+    // SAFETY: caller contract.
+    let (length, start) = unsafe { ((*ptr).saved_frames.len(), (*ptr).frame_base) };
+    if start >= length {
+        return None;
+    }
+    let previous = CURRENT.with(Cell::get);
+    CURRENT.with(|cell| cell.set(Some(CurrentFiber { ptr, value: NONE })));
+    let data = exc::frame_at(length - 1 - start);
+    CURRENT.with(|cell| cell.set(previous));
+    data
+}
+
+/// `generator.gi_frame`: the generator's activation frame, or `None` once the
+/// body has finished.
+///
+/// This is the real activation record, not a synthesized one: `f_locals` sees
+/// the fiber's precise slots while the body is suspended, and `f_back` is the
+/// caller while the generator runs (CPython detaches the caller link when the
+/// generator yields, and this chain mirrors that because a suspended fiber
+/// keeps only its own activations). A generator that has never been resumed
+/// has no activation record yet, so this reports `None` until the first
+/// `next()`.
+pub(crate) fn frame_value(value: i64) -> i64 {
+    let Some(ptr) = value::fiber_raw(value) else {
+        return NONE;
+    };
+    // SAFETY: `fiber_raw` returned a live fiber payload that stays reachable
+    // through `value` for this call.
+    unsafe {
+        if (*ptr).done {
+            return NONE;
+        }
+        let data = match current_ptr() {
+            Some(current) => match running_frame_depth(current, ptr) {
+                Some(depth) => exc::frame_at(depth),
+                None if !(*ptr).running => suspended_frame(ptr),
+                // A running fiber that is not on this thread's resume chain
+                // cannot be reached; a suspended one is handled above.
+                None => None,
+            },
+            None if !(*ptr).running => suspended_frame(ptr),
+            None => None,
+        };
+        match data {
+            Some(data) => {
+                (*ptr).remember_exposed_frame(&data);
+                value::frame_new(data)
+            }
+            None => NONE,
+        }
+    }
 }
 
 pub(crate) fn has_error(value: i64) -> bool {
@@ -1201,6 +1477,9 @@ pub(crate) fn send_value(generator: i64, value: i64) -> i64 {
     let Some(ptr) = value::fiber_raw(generator) else {
         return exc::raise_with_message(TYPE_ERROR, "send() requires a generator object");
     };
+    if reject_when_running(ptr) {
+        return NONE;
+    }
     // SAFETY: `fiber_raw` returned the address of a live fiber payload that
     // stays reachable through `generator` for this call.
     unsafe {
@@ -1234,6 +1513,9 @@ pub(crate) fn throw_value(generator: i64, exception: i64) -> i64 {
     let Some(ptr) = value::fiber_raw(generator) else {
         return exc::raise_with_message(TYPE_ERROR, "throw() requires a generator object");
     };
+    if reject_when_running(ptr) {
+        return NONE;
+    }
     // `gen.throw(MyError)` instantiates the class with no arguments, exactly
     // like CPython's `gen_throw`; the instance path stays untouched.
     let exception = if value::as_class(exception).is_some() {
@@ -1285,6 +1567,9 @@ pub(crate) fn close_value(generator: i64) -> i64 {
     let Some(ptr) = value::fiber_raw(generator) else {
         return exc::raise_with_message(TYPE_ERROR, "close() requires a generator object");
     };
+    if reject_when_running(ptr) {
+        return NONE;
+    }
     // SAFETY: `fiber_raw` returned a live fiber payload.
     unsafe {
         if (*ptr).done {
@@ -1397,8 +1682,8 @@ pub(crate) fn async_generator_next(agen: i64) -> i64 {
         if (*ptr).kind != FiberKind::AsyncGenerator {
             return exc::raise_with_message(TYPE_ERROR, "__anext__() requires an async generator");
         }
-        if current_ptr() == Some(ptr) {
-            return exc::raise_with_message(RUNTIME_ERROR, "async generator already executing");
+        if reject_when_running(ptr) {
+            return NONE;
         }
         if (*ptr).done {
             return exc::raise_with_message(exc::STOP_ASYNC_ITERATION, "");
@@ -1417,8 +1702,8 @@ pub(crate) fn asend_value(agen: i64, value: i64) -> i64 {
         if (*ptr).kind != FiberKind::AsyncGenerator {
             return exc::raise_with_message(TYPE_ERROR, "asend() requires an async generator");
         }
-        if current_ptr() == Some(ptr) {
-            return exc::raise_with_message(RUNTIME_ERROR, "async generator already executing");
+        if reject_when_running(ptr) {
+            return NONE;
         }
         if (*ptr).done {
             return exc::raise_with_message(exc::STOP_ASYNC_ITERATION, "");
@@ -1451,8 +1736,8 @@ pub(crate) fn athrow_value(agen: i64, exception: i64) -> i64 {
         if (*ptr).kind != FiberKind::AsyncGenerator {
             return exc::raise_with_message(TYPE_ERROR, "athrow() requires an async generator");
         }
-        if current_ptr() == Some(ptr) {
-            return exc::raise_with_message(RUNTIME_ERROR, "async generator already executing");
+        if reject_when_running(ptr) {
+            return NONE;
         }
         if (*ptr).done {
             return exc::raise_with_message(exc::STOP_ASYNC_ITERATION, "");
@@ -1478,8 +1763,8 @@ pub(crate) fn aclose_value(agen: i64) -> i64 {
         if (*ptr).kind != FiberKind::AsyncGenerator {
             return exc::raise_with_message(TYPE_ERROR, "aclose() requires an async generator");
         }
-        if current_ptr() == Some(ptr) {
-            return exc::raise_with_message(RUNTIME_ERROR, "async generator already executing");
+        if reject_when_running(ptr) {
+            return NONE;
         }
         if (*ptr).done {
             return NONE;
@@ -1786,6 +2071,12 @@ pub(crate) fn yield_from_value(iterable: i64) -> i64 {
     {
         return exc::raise_with_message(VALUE_ERROR, "generator already executing");
     }
+    // `gi_yieldfrom` names the active delegate while the outer generator is
+    // suspended (or running) inside this expression. The field is also the
+    // delegate's only GC edge for a plain iterator built by `iter_of`, so it
+    // is installed before the first allocation or suspension.
+    // SAFETY: `outer` is the running fiber installed by `resume_raw`.
+    unsafe { (*outer).yieldfrom = delegate };
 
     let mut to_send = NONE;
     let mut pending_item: Option<i64> = None;
@@ -1794,8 +2085,16 @@ pub(crate) fn yield_from_value(iterable: i64) -> i64 {
             Some(item) => item,
             None => match advance_delegate(delegate, delegate_is_generator, to_send) {
                 DelegateStep::Item(item) => item,
-                DelegateStep::Done(value) => return value,
-                DelegateStep::Failed => return NONE,
+                DelegateStep::Done(value) => {
+                    // The frame has left the `SEND` opcode; CPython's
+                    // `gi_yieldfrom` returns to `None`.
+                    unsafe { (*outer).yieldfrom = NONE };
+                    return value;
+                }
+                DelegateStep::Failed => {
+                    unsafe { (*outer).yieldfrom = NONE };
+                    return NONE;
+                }
             },
         };
         // Suspend the outer generator with the delegate's item. The result is
@@ -1817,6 +2116,7 @@ pub(crate) fn yield_from_value(iterable: i64) -> i64 {
             if delegate_is_generator {
                 close_value(delegate);
                 if exc::pending() {
+                    unsafe { (*outer).yieldfrom = NONE };
                     return NONE;
                 }
             } else {
@@ -1825,13 +2125,18 @@ pub(crate) fn yield_from_value(iterable: i64) -> i64 {
                 match delegate_method(delegate, "close") {
                     DelegateMethod::Present(method) => {
                         if call_delegate_no_args(method) {
+                            unsafe { (*outer).yieldfrom = NONE };
                             return NONE;
                         }
                     }
                     DelegateMethod::Missing => {}
-                    DelegateMethod::Failed => return NONE,
+                    DelegateMethod::Failed => {
+                        unsafe { (*outer).yieldfrom = NONE };
+                        return NONE;
+                    }
                 }
             }
+            unsafe { (*outer).yieldfrom = NONE };
             exc::raise_value_unchained(exception);
             return NONE;
         }
@@ -1839,8 +2144,14 @@ pub(crate) fn yield_from_value(iterable: i64) -> i64 {
         // handler is yielded again by the outer generator.
         pending_item = match throw_delegate(delegate, delegate_is_generator, exception) {
             DelegateStep::Item(item) => Some(item),
-            DelegateStep::Done(value) => return value,
-            DelegateStep::Failed => return NONE,
+            DelegateStep::Done(value) => {
+                unsafe { (*outer).yieldfrom = NONE };
+                return value;
+            }
+            DelegateStep::Failed => {
+                unsafe { (*outer).yieldfrom = NONE };
+                return NONE;
+            }
         };
     }
 }
@@ -2297,5 +2608,179 @@ mod tests {
         assert_eq!(items[2], value::TRUE);
         // The outer chain is gone once the inner fiber finished.
         assert!(exc::frame_at(0).is_none());
+    }
+
+    /// Reports `gi_running` from inside the body and verifies that a
+    /// re-entrant `send()` is refused without disturbing the resume.
+    extern "C" fn reports_running(argv: *const i64) -> i64 {
+        // SAFETY: the test passes the generator itself as `argv[0]`.
+        let generator = unsafe { *argv };
+        let running = is_running(generator);
+        let _ = send_value(generator, NONE);
+        let refused = exc::pending_tag() == VALUE_ERROR as i64;
+        let message = value::to_string(exc::pending_value());
+        let _ = exc::clear();
+        let text = value::str_alloc(message);
+        let roots = crate::heap::root_values(&[text]);
+        let tuple = value::tuple_new(vec![
+            value::bool_value(running),
+            value::bool_value(refused),
+            text,
+        ]);
+        crate::heap::release_roots(roots);
+        yield_value(tuple)
+    }
+
+    #[test]
+    fn running_state_and_reentrant_resume_match_cpython() {
+        let generator = generator(reports_running);
+        // The body needs a handle to itself to call `is_running`/`send`.
+        // SAFETY: the fiber is live and `args` is read only when it resumes.
+        unsafe {
+            (*value::fiber_raw(generator).expect("fiber"))
+                .args
+                .push(generator)
+        };
+
+        assert!(!is_running(generator));
+        let observed = send_value(generator, NONE);
+        assert!(!exc::pending());
+        let items = value::as_tuple(observed).expect("probe tuple");
+        assert_eq!(items[0], value::TRUE, "gi_running is true in the body");
+        assert_eq!(items[1], value::TRUE, "a re-entrant send raises ValueError");
+        assert_eq!(value::as_str(items[2]), Some("generator already executing"));
+        assert!(!is_running(generator));
+
+        assert_eq!(send_value(generator, NONE), NONE);
+        assert_eq!(exc::pending_tag(), STOP_ITERATION as i64);
+        assert!(!is_running(generator));
+    }
+
+    #[test]
+    fn yieldfrom_tracks_the_active_delegate_iterator() {
+        let generator = generator(delegates_to_list);
+        assert_eq!(yieldfrom_value(generator), NONE);
+
+        assert_eq!(send_value(generator, NONE), int(1));
+        let delegate = yieldfrom_value(generator);
+        assert!(
+            value::as_iter(delegate).is_some(),
+            "the delegate is the iterator `iter_of` built"
+        );
+
+        assert_eq!(send_value(generator, NONE), int(2));
+        assert_eq!(yieldfrom_value(generator), delegate);
+
+        assert_eq!(send_value(generator, NONE), NONE);
+        assert_eq!(exc::pending_tag(), STOP_ITERATION as i64);
+        assert_eq!(yieldfrom_value(generator), NONE);
+    }
+
+    #[test]
+    fn yieldfrom_tracks_the_active_delegate_generator() {
+        let generator = generator(delegates_to_sub);
+        assert_eq!(send_value(generator, NONE), int(1));
+        let delegate = yieldfrom_value(generator);
+        assert_eq!(
+            value::as_fiber(delegate).map(|fiber| fiber.name.as_str()),
+            Some("sub")
+        );
+
+        assert_eq!(send_value(generator, int(5)), int(5));
+        assert_eq!(yieldfrom_value(generator), delegate);
+
+        assert_eq!(send_value(generator, NONE), NONE);
+        assert_eq!(exc::pending_tag(), STOP_ITERATION as i64);
+        assert_eq!(yieldfrom_value(generator), NONE);
+    }
+
+    /// Frame probe for a generator that delegates with `yield from`.
+    extern "C" fn delegated_frame_probe(_argv: *const i64) -> i64 {
+        exc::frame_enter_ptr(b"outer".as_ptr(), 5);
+        let inner = value::fiber_generator_new(
+            inner_frame_probe as *const () as usize,
+            "inner".to_string(),
+            Vec::new(),
+        )
+        .expect("inner generator stack");
+        let token = crate::heap::root_values(&[inner]);
+        let result = yield_from_value(inner);
+        // Suspend with the delegation result so the caller can inspect the
+        // chain while the outer activation is still live.
+        let _ = yield_value(result);
+        crate::heap::release_roots(token);
+        exc::frame_leave();
+        NONE
+    }
+
+    #[test]
+    fn yield_from_keeps_the_delegator_frame_visible() {
+        let outer = generator(delegated_frame_probe);
+        let result = send_value(outer, NONE);
+        assert!(!exc::pending());
+        let items = value::as_tuple(result).expect("probe tuple");
+        assert_eq!(items.len(), 3);
+        // The delegate sees its own activation, then the delegating
+        // generator's: `yield from` must not hide the delegator.
+        assert_eq!(value::as_str(items[0]), Some("inner"));
+        assert_eq!(value::as_str(items[1]), Some("outer"));
+        assert_eq!(items[2], value::TRUE);
+        // Delegation has finished by the time the outer body yields.
+        assert_eq!(yieldfrom_value(outer), NONE);
+
+        assert_eq!(send_value(outer, NONE), NONE);
+        assert_eq!(exc::pending_tag(), STOP_ITERATION as i64);
+    }
+
+    /// Reports its own activation frame from inside the body.
+    extern "C" fn reports_frame(argv: *const i64) -> i64 {
+        exc::frame_enter_ptr(b"framed".as_ptr(), 6);
+        // SAFETY: the test passes the generator itself as `argv[0]`.
+        let generator = unsafe { *argv };
+        let frame = frame_value(generator);
+        let name = value::as_frame(frame).map(|state| state.data.code_name());
+        let running = value::bool_value(name.as_deref() == Some("framed"));
+        yield_value(running);
+        exc::frame_leave();
+        NONE
+    }
+
+    #[test]
+    fn gi_frame_reports_the_live_activation() {
+        let generator = generator(reports_frame);
+        // SAFETY: the fiber is live and `args` is read only when it resumes.
+        unsafe {
+            (*value::fiber_raw(generator).expect("fiber"))
+                .args
+                .push(generator)
+        };
+
+        assert_eq!(send_value(generator, NONE), value::TRUE);
+        // While suspended the frame is still observable; its caller link is
+        // detached exactly like CPython's suspended generator frame.
+        let frame = frame_value(generator);
+        let state = value::as_frame(frame).expect("suspended gi_frame");
+        assert_eq!(state.data.code_name(), "framed");
+        assert_eq!(exc::frame_attr(frame, "f_back"), Some(NONE));
+
+        assert_eq!(send_value(generator, NONE), NONE);
+        assert_eq!(exc::pending_tag(), STOP_ITERATION as i64);
+        assert_eq!(frame_value(generator), NONE);
+    }
+
+    #[test]
+    fn gi_code_is_derived_and_cached() {
+        let generator = generator(yields_once);
+        let code = code_value(generator);
+        assert_eq!(
+            exc::code_attr(code, "co_name").and_then(value::as_str),
+            Some("gen")
+        );
+        let flags = exc::code_attr(code, "co_flags").and_then(value::as_integer);
+        assert_eq!(
+            flags.map(|flags| flags & i64::from(CO_GENERATOR)),
+            Some(i64::from(CO_GENERATOR))
+        );
+        assert_eq!(code_value(generator), code);
     }
 }

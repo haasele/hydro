@@ -29,10 +29,9 @@
 //!   file for a module and the definition block for a frame/code object;
 //!   function and class values carry no source position, so they raise
 //!   `OSError` exactly like CPython when the source cannot be located.
-//!   `stack()` stays empty (building the full caller chain from the native
-//!   path is not modelled), and `getclosurevars` raises
-//!   `NotImplementedError`: free/global/builtin name references live in a code
-//!   object the runtime does not reify.
+//!   `stack()` builds the live caller-chain records, and `getclosurevars`
+//!   raises `NotImplementedError`: free/global/builtin name references live in
+//!   a code object the runtime does not reify.
 //! * **`getcomments` has no first line number for functions and classes.**
 //!   A Python module is read from its `__file__` and gets CPython's
 //!   top-of-file comment scan; every other object reports `None` instead of
@@ -3189,6 +3188,39 @@ fn getsource_impl(obj: i64) -> i64 {
     text(&lines[start..end].concat())
 }
 
+/// `inspect.stack(context=1)`: `FrameInfo` records from the current frame
+/// outward through the saved caller chain.
+fn stack_impl(args: &[i64]) -> i64 {
+    let context = match args.first().copied() {
+        None | Some(NONE) => 1,
+        Some(argument) => match value::as_integer(argument) {
+            Some(number) => number,
+            None => {
+                return type_error(&format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    value::type_name(argument)
+                ))
+            }
+        },
+    };
+    let list = value::list_new(Vec::new());
+    let roots = heap::root_values(std::slice::from_ref(&list));
+    let mut depth = 0usize;
+    while let Some(data) = crate::exc::frame_at(depth) {
+        let frame = value::frame_new(data);
+        let frame_roots = heap::root_values(std::slice::from_ref(&frame));
+        let info = getframeinfo_impl(&[frame, integer(context)]);
+        heap::release_roots(frame_roots);
+        if exc::pending() {
+            break;
+        }
+        container::list_append(list, info);
+        depth += 1;
+    }
+    heap::release_roots(roots);
+    list
+}
+
 /// `inspect.getframeinfo(frame, context=1)`: a `FrameInfo` namedtuple with the
 /// frame's real file, line, function name and source context.
 fn getframeinfo_impl(args: &[i64]) -> i64 {
@@ -4005,7 +4037,7 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             }
         }
         "currentframe" => crate::modules::sys::current_frame(),
-        "stack" => value::list_new(Vec::new()),
+        "stack" => stack_impl(args),
         "getclosurevars" => exc::raise_with_message(
             NOT_IMPLEMENTED_ERROR,
             "getclosurevars() is not supported: Hydro function values carry no code \
