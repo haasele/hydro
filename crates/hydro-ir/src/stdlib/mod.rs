@@ -215,8 +215,8 @@ pub static MODULES: &[&ModuleSpec] = &[
     &MMAP,
     &HTTP,
     &HTTP_CLIENT,
-    &HTTP_SERVER,
     &HTTP_COOKIES,
+    &HTTP_SERVER,
     &POSTGRES,
     &MEMCACHED,
     // Accelerator / alternative spellings of modules above. Each shares the
