@@ -118,8 +118,8 @@ Other docs must link here instead of repeating the total.
   `test_zstd` at the 1500 MB threshold) and 3 `cpython_fail`
   (`test_extcall`, `test_unpack`, `test_unpack_ex`). A post-run recheck
   recovered `test_dictviews.py` and `test_plistlib.py`, so the current known
-  total is **39**. The offline manifest still pins **33 verified passes**;
-  `test_yield_from` remains the single older regressed pin. The full
+  total is **40**. The offline manifest still pins **33 verified passes**;
+  `test_yield_from` recovered on 2026-11-11 (43/43). The full
   inventory is [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md).
 - **Ecosystem:** **5/13 cases pass** under JIT and AOT (python-dateutil,
   six, typing-inspection, annotated-types, tzdata). Typing-extensions and
@@ -275,8 +275,8 @@ See `CHANGELOG.md` for details; this is only the resume pointer.
 
 - **2026-11-11 compatibility slice:** workspace **3291 passed, 1 skipped**
   (runtime 2133, frontend 913); clippy/fmt/`verify.sh` green. Target triage
-  confirms `test_plistlib` and `test_poll` still pass; `test_yield_from` now
-  executes all 43 tests (27 assertion/generator failures), and `test_argparse`,
+  confirms `test_plistlib`, `test_poll` and `test_yield_from` pass;
+  `test_argparse`,
   `test_codecs`, `test_datetime`, `test_pickle`, `test_re`, `test_struct`,
   `test_tempfile`, `test_contextlib`, `test_asyncgen` remain open.
 - Stdlib import matrix is **288/288 CPython-comparable modules**; the nine

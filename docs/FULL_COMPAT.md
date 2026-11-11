@@ -70,16 +70,12 @@ The four timeouts are `test_bisect.py`, `test_imaplib.py`, `test_queue.py` and
 The three `cpython_fail` entries are `test_extcall.py`, `test_unpack.py` and
 `test_unpack_ex.py`: Hydro passed while the oracle failed, so they are not
 Hydro passes and cannot be counted as parity. A post-run recheck recovered
-`test_dictviews.py`, `test_plistlib.py` and `test_poll.py` (current known total
-**39**); `test_yield_from.py` still fails and must be recovered before the
-manifest gate can be claimed green.
+`test_dictviews.py`, `test_plistlib.py`, `test_poll.py` and `test_yield_from.py`
+(current known total **40**); the older `test_yield_from.py` regression is
+recovered and no longer blocks the manifest gate.
 
 ### Immediate regression recovery (manifest gate)
 
-- `test_yield_from.py`: `test_catching_exception_from_subgen_and_returning`
-  captures a loop variable in locally defined nested generators and observes
-  `None`; the closure-cell write for a `for` target needs to reach the shared
-  cell.
 - `test_repl.py` currently has 16 failing entries after the cleanup,
   descriptor, variadic-decorator and dict-union fixes (more subtests now run
   than the earlier 15-failure state). Remaining first blockers: Popen

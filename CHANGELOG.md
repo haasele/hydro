@@ -8,6 +8,21 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-11-11 test_yield_from recovery
+
+- `test_yield_from.py` now passes **43/43** under the release Tea build. The
+  recovery combines live instance mappings, global-assignment coherence,
+  generator error/value consumption, `close()` return propagation, unraisable
+  delegate close handling, and rooted unittest suite construction.
+- Official known total is **40**; the offline manifest still pins the older
+  33-test verified subset until a fresh full gate.
+- `test_argparse` now reaches the unittest runner but aborts on a missing
+  `TestResult.startTestRun`; `test_pickle` advances to
+  `__init_subclass__` keyword handling; `test_re` executes all 166 tests;
+  `test_contextlib` retains slots/manager failures; `test_tempfile.TestMktemp`
+  still needs refcount-equivalent finalization.
+- Workspace suite: **3291 passed, 1 skipped**; clippy/fmt green.
+
 ### Compatibility — 2026-11-11 finalizers, frozensets and metaclass calls
 
 - Added Python `__del__` finalization: unreachable finalizable instances are
