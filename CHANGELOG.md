@@ -8,6 +8,12 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Tooling — zero-test runs are not passes
+
+- `scripts/cpython_triage.py` now reports `zero_tests` when Hydro exits 0 but
+  the unittest output says `Ran 0 test(s)`, so a broken harness cannot be
+  counted as a compatibility pass. `test_datetime` currently lands there.
+
 ### Compatibility — 2026-11-14 dynamic source execution
 
 - The runtime compiler now supports zero-argument `super()` inside

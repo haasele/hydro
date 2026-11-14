@@ -80,9 +80,10 @@ MEM_POLL_SECONDS = 0.25
 MEM_WAIT_SECONDS = 10.0
 MEMORY_STATUS = "memkill"
 ERROR_STATUS = "error"
-STATUSES = (*compat.STATUSES, MEMORY_STATUS, ERROR_STATUS)
+ZERO_STATUS = "zero_tests"
+STATUSES = (*compat.STATUSES, MEMORY_STATUS, ERROR_STATUS, ZERO_STATUS)
 # Failures that point at Hydro (or at the harness) rather than at the oracle.
-BACKLOG_STATUSES = ("hydro_fail", "timeout", MEMORY_STATUS, ERROR_STATUS)
+BACKLOG_STATUSES = ("hydro_fail", "timeout", MEMORY_STATUS, ERROR_STATUS, ZERO_STATUS)
 
 MODULE_PATTERNS = (
     re.compile(r"module '([^']+)'"),
@@ -350,6 +351,24 @@ def classify(cpython_run: dict, hydro_run: dict) -> str:
     return compat.classify(cpython_run, hydro_run)
 
 
+def ran_zero_tests(paths: tuple[Path, ...]) -> bool:
+    """Whether a successful unittest run executed no test cases.
+
+    A zero-test exit is indistinguishable from success by exit status alone;
+    the CPython report must never count it as a compatibility pass.
+    """
+    for path in paths:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    clean = compat.ANSI_RE.sub("", line)
+                    if "Ran 0 test" in clean:
+                        return True
+        except OSError:
+            continue
+    return False
+
+
 def describe_failure(
     status: str,
     *,
@@ -384,6 +403,8 @@ def describe_failure(
         return f"harness: {detail}"[: compat.MAX_ERROR_CHARS]
     if status == "timeout":
         return f"Hydro timed out after {timeout:g}s"
+    if status == ZERO_STATUS:
+        return "Hydro exited 0 but executed 0 tests"
     if status == "cpython_fail":
         if cpython_run.get("timed_out"):
             return f"CPython oracle timed out after {timeout:g}s while Hydro passed"
@@ -590,6 +611,8 @@ def evaluate_test(
                 stderr_path=hydro_stderr,
             )
         status = classify(cpython_run, hydro_run)
+        if status == compat.PASS_STATUS and ran_zero_tests((hydro_stdout, hydro_stderr)):
+            status = ZERO_STATUS
         error = describe_failure(
             status,
             timeout=timeout,
