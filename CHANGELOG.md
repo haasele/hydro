@@ -8,6 +8,12 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — tuple metavars
+
+- `metavar=(...)` is accepted for fixed and variable multi-slot arguments,
+  validated against `nargs`, and rendered as `A B` or `A [B ...]` in usage
+  and help. `test_argparse` drops to **238 failures**.
+
 ### Argparse — REMAINDER, aliases and group methods
 
 - `nargs=argparse.REMAINDER` consumes the remaining tokens, subparser

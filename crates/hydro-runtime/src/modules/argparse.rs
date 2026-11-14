@@ -112,6 +112,8 @@ pub(crate) struct ArgSpec {
     /// Allowed converted values, in declaration order.
     pub(crate) choices: Option<Vec<i64>>,
     pub(crate) metavar: Option<String>,
+    /// Tuple form of `metavar` for multi-slot arguments.
+    pub(crate) metavar_parts: Option<Vec<String>>,
     /// Group this argument belongs to (display or mutually exclusive group).
     pub(crate) group: usize,
     /// Version text of a `version` action.
@@ -1716,6 +1718,7 @@ fn add_help_action(state: &mut ArgParserState, default: i64) {
         nargs: Nargs::Single,
         choices: None,
         metavar: None,
+        metavar_parts: None,
         group: 0,
         version: String::new(),
     });
@@ -2060,6 +2063,7 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
     let mut nargs: Option<Nargs> = None;
     let mut choices: Option<Vec<i64>> = None;
     let mut metavar: Option<String> = None;
+    let mut metavar_parts: Option<Vec<String>> = None;
     let mut const_value: Option<i64> = None;
     let mut version: Option<String> = None;
     for (name, argument) in keywords {
@@ -2107,10 +2111,25 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
                 Ok(value) => choices = value,
                 Err(err) => return err,
             },
-            "metavar" => match value::as_str(*argument) {
-                Some(text) => metavar = Some(text.to_string()),
-                None => return type_error("add_argument() metavar must be str"),
-            },
+            "metavar" => {
+                if let Some(text) = value::as_str(*argument) {
+                    metavar = Some(text.to_string());
+                } else if let Some(items) =
+                    value::as_list(*argument).or_else(|| value::as_tuple(*argument))
+                {
+                    let mut parts = Vec::with_capacity(items.len());
+                    for item in items {
+                        match value::as_str(*item) {
+                            Some(part) => parts.push(part.to_string()),
+                            None => return type_error("add_argument() metavar must be str"),
+                        }
+                    }
+                    metavar = parts.first().cloned();
+                    metavar_parts = Some(parts);
+                } else {
+                    return type_error("add_argument() metavar must be str");
+                }
+            }
             "const" => const_value = Some(*argument),
             "deprecated" => {}
             "version" => match value::as_str(*argument) {
@@ -2139,6 +2158,17 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
             return type_error(&format!("unknown type: '{name}'"));
         };
         type_fn = resolved;
+    }
+    if let Some(parts) = &metavar_parts {
+        let nargs = nargs.unwrap_or(Nargs::Single);
+        let ok = match nargs {
+            Nargs::Exact(count) => parts.len() == count,
+            Nargs::ZeroOrMore | Nargs::OneOrMore => parts.len() == 2,
+            _ => false,
+        };
+        if !ok {
+            return value_error("length of metavar tuple does not match nargs");
+        }
     }
     if action_value == Some(ActionKind::BooleanOptional) && const_value.is_some() {
         return type_error(
@@ -2231,6 +2261,7 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
         nargs,
         choices: choices.clone(),
         metavar,
+        metavar_parts,
         group,
         version: version.unwrap_or_default(),
     };
@@ -4217,10 +4248,19 @@ fn value_usage(spec: &ArgSpec, metavar: &str) -> String {
     match spec.nargs {
         Nargs::Single => metavar.to_string(),
         Nargs::Optional => format!("[{metavar}]"),
-        Nargs::ZeroOrMore => format!("[{metavar} ...]"),
+        Nargs::ZeroOrMore => match &spec.metavar_parts {
+            Some(parts) => format!("[{} [{} ...]]", parts[0], parts[1]),
+            None => format!("[{metavar} ...]"),
+        },
         Nargs::Remainder => "...".to_string(),
-        Nargs::OneOrMore => format!("{metavar} [{metavar} ...]"),
-        Nargs::Exact(count) => vec![metavar; count].join(" "),
+        Nargs::OneOrMore => match &spec.metavar_parts {
+            Some(parts) => format!("{} [{} ...]", parts[0], parts[1]),
+            None => format!("{metavar} [{metavar} ...]"),
+        },
+        Nargs::Exact(count) => match &spec.metavar_parts {
+            Some(parts) => parts.join(" "),
+            None => vec![metavar; count].join(" "),
+        },
     }
 }
 
@@ -4230,10 +4270,19 @@ fn positional_usage_text(view: &View, spec: &ArgSpec) -> String {
     match spec.nargs {
         Nargs::Single => metavar,
         Nargs::Optional => format!("[{metavar}]"),
-        Nargs::ZeroOrMore => format!("[{metavar} ...]"),
+        Nargs::ZeroOrMore => match &spec.metavar_parts {
+            Some(parts) => format!("[{} [{} ...]]", parts[0], parts[1]),
+            None => format!("[{metavar} ...]"),
+        },
         Nargs::Remainder => "...".to_string(),
-        Nargs::OneOrMore => format!("{metavar} [{metavar} ...]"),
-        Nargs::Exact(count) => vec![metavar; count].join(" "),
+        Nargs::OneOrMore => match &spec.metavar_parts {
+            Some(parts) => format!("{} [{} ...]", parts[0], parts[1]),
+            None => format!("{metavar} [{metavar} ...]"),
+        },
+        Nargs::Exact(count) => match &spec.metavar_parts {
+            Some(parts) => parts.join(" "),
+            None => vec![metavar; count].join(" "),
+        },
     }
 }
 
@@ -5011,6 +5060,7 @@ mod tests {
             nargs: Nargs::Single,
             choices: None,
             metavar: None,
+            metavar_parts: None,
             group: 0,
             version: String::new(),
         });
