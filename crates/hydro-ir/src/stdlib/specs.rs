@@ -2595,6 +2595,49 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
         f("_get_action_name", 1, 1, Type::Any),
         // `_`: the `gettext.gettext` alias argparse imports.
         f("_", 1, 1, Type::Str),
+        // Native method body of `argparse.Action` (dispatched by full name
+        // when a bound method crosses the native call path).
+        f("Action.__repr__", 1, 1, Type::Str),
+        f("Namespace.__eq__", 2, 2, Type::Bool),
+        f("Namespace.__repr__", 1, 1, Type::Str),
+        // Full native method names used by bound `super()` parser methods.
+        f("ArgumentParser.add_argument", 0, usize::MAX, Type::Any),
+        f(
+            "ArgumentParser.add_argument_group",
+            0,
+            usize::MAX,
+            Type::Any,
+        ),
+        f(
+            "ArgumentParser.add_mutually_exclusive_group",
+            0,
+            usize::MAX,
+            Type::Any,
+        ),
+        f("ArgumentParser.add_subparsers", 0, usize::MAX, Type::Any),
+        f("ArgumentParser.set_defaults", 0, usize::MAX, Type::Any),
+        f("ArgumentParser.get_default", 0, usize::MAX, Type::Any),
+        f("ArgumentParser.parse_args", 0, usize::MAX, Type::Any),
+        f("ArgumentParser.parse_known_args", 0, usize::MAX, Type::Any),
+        f(
+            "ArgumentParser.parse_intermixed_args",
+            0,
+            usize::MAX,
+            Type::Any,
+        ),
+        f(
+            "ArgumentParser.parse_known_intermixed_args",
+            0,
+            usize::MAX,
+            Type::Any,
+        ),
+        f("ArgumentParser.print_help", 0, usize::MAX, Type::Any),
+        f("ArgumentParser.print_usage", 0, usize::MAX, Type::Any),
+        f("ArgumentParser.format_help", 0, usize::MAX, Type::Any),
+        f("ArgumentParser.format_usage", 0, usize::MAX, Type::Any),
+        f("ArgumentParser.error", 0, usize::MAX, Type::Any),
+        f("ArgumentParser.exit", 0, usize::MAX, Type::Any),
+        f("ArgumentParser.__repr__", 0, usize::MAX, Type::Any),
     ],
     constants: &[
         // `ArgumentParser` and `Namespace` are real classes so that

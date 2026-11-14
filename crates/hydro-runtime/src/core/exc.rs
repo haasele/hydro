@@ -3230,6 +3230,17 @@ pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
         // `StopIteration.value`: the generator return value. CPython stores it
         // as a mutable member initialised from the first positional argument;
         // a subclass instance that assigned the name keeps its attribute.
+        // `SystemExit.code`: the integer status when constructed with one,
+        // otherwise the first argument (CPython's member is the original
+        // value; `.args` stores its string form for the exit message).
+        "code" if data.tag == SYSTEM_EXIT => data
+            .exit_code
+            .map(|code| value::encode_int(code).unwrap_or(NONE))
+            .or_else(|| {
+                let args = args_tuple(data);
+                value::as_tuple(args).and_then(|items| items.first().copied())
+            })
+            .unwrap_or(NONE),
         "value" if data.tag == STOP_ITERATION => {
             value::instance_attr(object, "value").unwrap_or_else(|| stop_iteration_value(data))
         }

@@ -8,6 +8,15 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — Action, Namespace, super and exit status
+
+- `argparse.Action` is a real native class with keyword construction and
+  CPython's repr; bound `super()` parser methods dispatch by their full names.
+- `Namespace` equality/repr dispatch, `SystemExit.code`, `FileType` keyword
+  construction and `argparse._sys` are available.
+- `test_argparse` failures drop from **409 to 271** (then lower with the
+  multiple-subparser error correction).
+
 ### IO — BytesIO-backed TextIOWrapper
 
 - `io.BufferedWriter(io.BytesIO(...))` and `io.TextIOWrapper` now accept a

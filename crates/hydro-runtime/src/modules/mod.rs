@@ -4239,6 +4239,16 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if module == "argparse" && matches!(name, "ArgumentParser" | "Namespace") {
         return argparse::constant(name);
     }
+    if module == "argparse" {
+        if let Some((class_name, method)) = name.split_once('.') {
+            if matches!(class_name, "ArgumentParser" | "Action" | "ArgumentError") {
+                let class = argparse::constant(class_name);
+                if let Some((_, function)) = value::class_member(class, method) {
+                    return function;
+                }
+            }
+        }
+    }
     if module == "unittest" {
         match name {
             "TestCase" => return unittest::test_case(),
@@ -9020,6 +9030,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
             | "BooleanOptionalAction"
             | "ArgumentError"
             | "ArgumentTypeError"
+            | "_sys"
             | "SUPPRESS"
             | "REMAINDER"),
         ) => argparse::constant(name),

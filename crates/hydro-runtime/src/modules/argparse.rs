@@ -705,6 +705,20 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             .map_or(NONE, |&argument| get_action_name(argument)),
         "ArgumentError.__init__" => argument_error_init(args),
         "ArgumentError.__str__" => argument_error_str(args),
+        "Action.__repr__" => args
+            .first()
+            .map_or(NONE, |&instance| action_repr_entry(&instance as *const i64)),
+        "Namespace.__eq__" if args.len() == 2 => namespace_eq_entry(args.as_ptr()),
+        "Namespace.__repr__" if args.len() == 1 => namespace_repr_entry(args.as_ptr()),
+        name if name.starts_with("ArgumentParser.") => {
+            let Some((&receiver, rest)) = args.split_first() else {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    "ArgumentParser method called without self",
+                );
+            };
+            method(receiver, &name["ArgumentParser.".len()..], rest)
+        }
         _ => exc::raise_with_message(
             ATTRIBUTE_ERROR,
             &format!("module 'argparse' has no attribute '{function}'"),
@@ -727,6 +741,27 @@ pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) 
             }
         }
         "Namespace" => namespace_call(args, keywords),
+        "FileType" => {
+            let mut slots = [NONE; 4];
+            for (index, argument) in args.iter().enumerate().take(4) {
+                slots[index] = *argument;
+            }
+            let names = ["mode", "bufsize", "encoding", "errors"];
+            for (name, item) in keywords {
+                let Some(index) = names.iter().position(|candidate| *candidate == name) else {
+                    return type_error(&format!(
+                        "FileType() got an unexpected keyword argument '{name}'"
+                    ));
+                };
+                if slots[index] != NONE {
+                    return type_error(&format!(
+                        "FileType() got multiple values for argument '{name}'"
+                    ));
+                }
+                slots[index] = *item;
+            }
+            file_type(&slots)
+        }
         _ => type_error(&format!(
             "argparse.{function}() does not accept keyword arguments"
         )),
@@ -1027,8 +1062,8 @@ pub(crate) fn constant(name: &str) -> i64 {
         | "ArgumentDefaultsHelpFormatter"
         | "MetavarTypeHelpFormatter"
         | "HelpFormatter"
-        | "Action"
         | "BooleanOptionalAction" => cached_module_class(name),
+        "Action" => action_class(),
         // CPython's `PARSER` nargs sentinel.
         "PARSER" => text_value("A..."),
         // `argparse._sys` is the `sys` module value (`mock.patch` rewrites
@@ -1218,6 +1253,112 @@ pub(crate) fn argument_error_class() -> i64 {
     globals::registry_set(KEY, class);
     crate::heap::release_roots(roots);
     class
+}
+
+/// Cached `argparse.Action` class. CPython's base action stores every
+/// constructor keyword and exposes them through its dict; `str()`/`repr()`
+/// include the full field list.
+fn action_class() -> i64 {
+    const KEY: &str = "argparse.Action";
+    if let Some(class) = globals::registry_get(KEY) {
+        return class;
+    }
+    let init = value::native_function_new("argparse", "Action.__init__", 12);
+    let repr_fn = value::native_function_new("argparse", "Action.__repr__", 1);
+    let mut params = Vec::with_capacity(12);
+    let fields = [
+        "self",
+        "option_strings",
+        "dest",
+        "nargs",
+        "const",
+        "default",
+        "type",
+        "choices",
+        "required",
+        "help",
+        "metavar",
+        "deprecated",
+    ];
+    for name in fields.iter() {
+        let default = match *name {
+            "required" | "deprecated" => Some(value::FALSE),
+            "self" | "option_strings" | "dest" => None,
+            _ => Some(NONE),
+        };
+        params.push(value::ParamMeta {
+            name: (*name).to_string(),
+            kind: ParamKind::Positional,
+            default,
+        });
+    }
+    value::function_set_signature(init, params);
+    value::function_set_full_entry(init, action_init_entry as *const () as usize);
+    let methods = vec![
+        ("__init__".to_string(), init, MethodKind::Normal),
+        ("__repr__".to_string(), repr_fn, MethodKind::Normal),
+    ];
+    let class = value::class_new_full(
+        "Action".to_string(),
+        NONE,
+        methods,
+        vec![(
+            "__module__".to_string(),
+            value::str_alloc("argparse".to_string()),
+        )],
+    );
+    globals::registry_set(KEY, class);
+    class
+}
+
+extern "C" fn action_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the class binder supplies the 12 declared slots.
+    let slots = unsafe { std::slice::from_raw_parts(argv, 12) };
+    let instance = slots[0];
+    let names = [
+        "option_strings",
+        "dest",
+        "nargs",
+        "const",
+        "default",
+        "type",
+        "choices",
+        "required",
+        "help",
+        "metavar",
+        "deprecated",
+    ];
+    for (name, item) in names.iter().zip(&slots[1..]) {
+        let _ = crate::core::methods::setattr(instance, name.as_ptr(), name.len(), *item);
+        if exc::pending() {
+            return NONE;
+        }
+    }
+    NONE
+}
+
+extern "C" fn action_repr_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method signature is `(self)`.
+    let instance = unsafe { *argv };
+    let field = |name: &str| {
+        value::instance_attr(instance, name)
+            .map(value::repr)
+            .unwrap_or_else(|| "None".to_string())
+    };
+    text_value(&format!(
+        "Action(option_strings={}, dest={}, nargs={}, const={}, default={}, type={}, choices={}, required={}, help={}, metavar={}, deprecated={})",
+        field("option_strings"),
+        field("dest"),
+        field("nargs"),
+        field("const"),
+        field("default"),
+        field("type"),
+        field("choices"),
+        field("required"),
+        field("help"),
+        field("metavar"),
+        field("deprecated"),
+    ))
 }
 
 /// `argparse.ArgumentTypeError`: the `Exception` a `type=` callable raises.
@@ -2290,7 +2431,7 @@ fn add_subparsers(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 
         return attribute_error("add_subparsers");
     }
     if parser_ref(parser).is_some_and(|state| state.subparsers.is_some()) {
-        return type_error("cannot have multiple subparser arguments");
+        return value_error("cannot have multiple subparser arguments");
     }
     let Some(mut state) = parser_mut(parser) else {
         return attribute_error("add_subparsers");
