@@ -8,6 +8,11 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — bound group methods
+
+- Group handles expose a bound `add_argument` native method with keyword
+  support; `test_argparse` drops to **221 failures**.
+
 ### Argparse — action keyword validation
 
 - Zero-argument actions reject `nargs`, `const`, `type` and `choices`, and

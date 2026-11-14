@@ -711,6 +711,12 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "Action.__repr__" => args
             .first()
             .map_or(NONE, |&instance| action_repr_entry(&instance as *const i64)),
+        "handle.add_argument" => {
+            let Some((&receiver, rest)) = args.split_first() else {
+                return type_error("group.add_argument() missing receiver");
+            };
+            handle_method(receiver, "add_argument", rest)
+        }
         "Namespace.__eq__" if args.len() == 2 => namespace_eq_entry(args.as_ptr()),
         "Namespace.__ne__" if args.len() == 2 => namespace_ne_entry(args.as_ptr()),
         "Namespace.__contains__" if args.len() == 2 => namespace_contains_entry(args.as_ptr()),
@@ -860,6 +866,13 @@ fn namespace_class() -> i64 {
     {
         methods.push(("__str__".to_string(), repr, MethodKind::Normal));
     }
+    let handle_add = value::native_function_new("argparse", "Namespace.add_argument", usize::MAX);
+    value::function_set_signature(handle_add, method_signature());
+    value::function_set_full_entry(
+        handle_add,
+        namespace_add_argument_entry as *const () as usize,
+    );
+    methods.push(("add_argument".to_string(), handle_add, MethodKind::Normal));
     let roots = crate::heap::root_values(
         &methods
             .iter()
@@ -1892,6 +1905,28 @@ pub(crate) fn handle_method_kw(
     }
 }
 
+extern "C" fn namespace_add_argument_entry(argv: *const i64) -> i64 {
+    // SAFETY: the method signature is `(self, *args, **kwargs)`.
+    let receiver = unsafe { *argv };
+    let mut positionals = unsafe { value::as_list(*argv.add(1)) }
+        .map(|items| items.to_vec())
+        .unwrap_or_default();
+    let mut keywords = Vec::new();
+    if let Some(pairs) = unsafe { value::as_dict(*argv.add(2)) } {
+        for (key, item) in pairs {
+            if let Some(key) = value::as_str(*key) {
+                keywords.push((key.to_string(), *item));
+            }
+        }
+    }
+    handle_method_kw(
+        receiver,
+        "add_argument",
+        &mut positionals,
+        &KeywordArgs { items: keywords },
+    )
+}
+
 fn set_test_mode(parser: i64) -> i64 {
     if let Some(mut state) = parser_mut(parser) {
         state.test_mode = true;
@@ -2462,11 +2497,22 @@ fn add_argument_group(
 
 fn handle_namespace(parser: i64, group: usize, kind: &str) -> i64 {
     let marker = text_value(kind);
-    value::namespace_new(vec![
+    let handle = value::namespace_new(vec![
         (HANDLE.to_string(), marker),
         (HANDLE_PARSER.to_string(), parser),
         (HANDLE_GROUP.to_string(), tagged_int(group as i64)),
-    ])
+    ]);
+    // Group objects are raw namespace payloads, not `argparse.Namespace`
+    // class instances, so expose the handle methods directly as bound native
+    // functions.
+    let add = value::native_function_new("argparse", "handle.add_argument", usize::MAX);
+    value::function_set_signature(add, method_signature());
+    value::function_set_full_entry(add, namespace_add_argument_entry as *const () as usize);
+    let bound = value::partial_new(add, vec![handle]);
+    if let Some(mut pairs) = value::namespace_pairs_mut(handle) {
+        pairs.pairs.push(("add_argument".to_string(), bound));
+    }
+    handle
 }
 
 /// `add_subparsers(dest=None, required=False, title=None, description=None,

@@ -2598,6 +2598,7 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
         // Native method body of `argparse.Action` (dispatched by full name
         // when a bound method crosses the native call path).
         f("Action.__repr__", 1, 1, Type::Str),
+        f("handle.add_argument", 1, usize::MAX, Type::Any),
         f("Namespace.__eq__", 2, 2, Type::Bool),
         f("Namespace.__ne__", 2, 2, Type::Bool),
         f("Namespace.__contains__", 2, 2, Type::Bool),
