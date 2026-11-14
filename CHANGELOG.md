@@ -8,6 +8,12 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — help and option-prefix validation
+
+- Reject malformed `help=` substitutions and option names outside
+  `prefix_chars` with CPython's `ValueError`; `test_argparse` drops to
+  **172 failures**.
+
 ### Argparse — reference source path
 
 - `argparse.__file__` resolves to the pinned CPython `argparse.py` under

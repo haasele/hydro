@@ -2069,6 +2069,52 @@ fn choices_from_value(value: i64) -> Result<Option<Vec<i64>>, i64> {
     Ok(Some(items))
 }
 
+/// Validates the `%(name)s` substitutions argparse accepts in `help=` and
+/// subparser help text. A bare `%Y` or an unknown/typed substitution is a
+/// malformed help string in CPython.
+fn valid_help_format(text: &str) -> bool {
+    const KEYS: [&str; 7] = [
+        "prog", "default", "type", "choices", "const", "dest", "metavar",
+    ];
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if index >= bytes.len() {
+            return false;
+        }
+        if bytes[index] == b'%' {
+            index += 1;
+            continue;
+        }
+        if bytes[index] != b'(' {
+            return false;
+        }
+        index += 1;
+        let start = index;
+        while index < bytes.len() && bytes[index] != b')' {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return false;
+        }
+        let key = &text[start..index];
+        if !KEYS.contains(&key) {
+            return false;
+        }
+        index += 1;
+        if index >= bytes.len() || bytes[index] != b's' {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: usize) -> i64 {
     let Some(state) = parser_ref(parser) else {
         return attribute_error("add_argument");
@@ -2138,7 +2184,8 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
                 Err(err) => return err,
             },
             "help" => match value::as_str(*argument) {
-                Some(text) => help_text = Some(text.to_string()),
+                Some(text) if valid_help_format(text) => help_text = Some(text.to_string()),
+                Some(_) => return value_error("badly formed help string"),
                 None => return type_error("add_argument() help must be str"),
             },
             "dest" => match value::as_str(*argument) {
@@ -2222,12 +2269,16 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
     }
 
     let positional = !names.iter().any(|name| starts_with_prefix(name, &prefixes));
-    if !positional
-        && names
+    if !positional {
+        if let Some(name) = names
             .iter()
-            .any(|name| !starts_with_prefix(name, &prefixes))
-    {
-        return type_error("add_argument() cannot mix positional and optional names");
+            .find(|name| !starts_with_prefix(name, &prefixes))
+        {
+            return value_error(&format!(
+                "invalid option string '{name}': must start with a character '{}'",
+                prefixes.chars().next().unwrap_or('-')
+            ));
+        }
     }
     if positional && names.len() > 1 {
         return type_error("add_argument() accepts one positional name");
