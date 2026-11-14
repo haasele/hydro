@@ -1051,20 +1051,59 @@ fn file_type(args: &[i64]) -> i64 {
             None => return type_error("FileType() mode must be str"),
         },
     };
-    if let Some(bufsize) = args.get(1).copied() {
-        if bufsize != NONE && value::as_integer(bufsize).is_none() {
-            return type_error("FileType() bufsize must be an integer");
+    let mut bufsize = tagged_int(-1);
+    if let Some(value) = args.get(1).copied() {
+        if value != NONE {
+            if value::as_integer(value).is_none() {
+                return type_error("FileType() bufsize must be an integer");
+            }
+            bufsize = value;
         }
     }
+    let mut encoding = NONE;
+    let mut errors = NONE;
     for (slot, name) in [(2usize, "encoding"), (3usize, "errors")] {
         if let Some(argument) = args.get(slot).copied() {
             if argument != NONE && value::as_str(argument).is_none() {
                 return type_error(&format!("FileType() {name} must be str or None"));
             }
+            if slot == 2 {
+                encoding = argument;
+            } else {
+                errors = argument;
+            }
         }
     }
     let mode_value = text_value(&mode);
-    value::namespace_new(vec![(FILE_TYPE.to_string(), mode_value)])
+    value::namespace_new(vec![
+        (FILE_TYPE.to_string(), mode_value),
+        ("__argparse_file_bufsize__".to_string(), bufsize),
+        ("__argparse_file_encoding__".to_string(), encoding),
+        ("__argparse_file_errors__".to_string(), errors),
+    ])
+}
+
+/// Calls a `FileType` marker as a callable: `FileType("r")(path)`.
+pub(crate) fn call_file_type_marker(value: i64, argc: usize, argv: *const i64) -> Option<i64> {
+    let pairs = value::as_namespace(value)?;
+    let (_, mode) = pairs.iter().find(|(name, _)| name.as_str() == FILE_TYPE)?;
+    if argc != 1 || argv.is_null() {
+        return Some(type_error("FileType() takes exactly one path argument"));
+    }
+    let path = unsafe { *argv };
+    let get = |key: &str, fallback: i64| {
+        pairs
+            .iter()
+            .find(|(name, _)| name.as_str() == key)
+            .map(|(_, item)| *item)
+            .unwrap_or(fallback)
+    };
+    let bufsize = get("__argparse_file_bufsize__", tagged_int(-1));
+    let encoding = get("__argparse_file_encoding__", NONE);
+    let errors = get("__argparse_file_errors__", NONE);
+    Some(crate::modules::io_open(&[
+        path, *mode, bufsize, encoding, errors, NONE, NONE, NONE,
+    ]))
 }
 
 /// Resolves an `argparse` constant.

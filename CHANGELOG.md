@@ -8,6 +8,12 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — FileType repr and call
+
+- `FileType` markers store mode/bufsize/encoding/errors, render CPython's
+  `FileType(...)` repr, and are callable to open a path. `test_argparse`
+  drops to **158 failures**.
+
 ### Argparse — suppressed usage parts
 
 - Arguments with `help=argparse.SUPPRESS` no longer appear in usage,

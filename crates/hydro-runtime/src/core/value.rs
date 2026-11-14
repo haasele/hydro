@@ -11641,6 +11641,31 @@ fn repr_depth(v: i64) -> String {
         return out;
     }
     if let Some(pairs) = as_namespace(v) {
+        if let Some((_, mode)) = pairs
+            .iter()
+            .find(|(name, _)| name.as_str() == "__argparse_file_type__")
+        {
+            let mut args = vec![repr_depth(*mode)];
+            if let Some((_, bufsize)) = pairs
+                .iter()
+                .find(|(name, _)| name.as_str() == "__argparse_file_bufsize__")
+            {
+                if as_integer(*bufsize) != Some(-1) {
+                    args.push(as_integer(*bufsize).unwrap_or(-1).to_string());
+                }
+            }
+            for (key, label) in [
+                ("__argparse_file_encoding__", "encoding"),
+                ("__argparse_file_errors__", "errors"),
+            ] {
+                if let Some((_, item)) = pairs.iter().find(|(name, _)| name.as_str() == key) {
+                    if *item != NONE {
+                        args.push(format!("{label}={}", repr_depth(*item)));
+                    }
+                }
+            }
+            return format!("FileType({})", args.join(", "));
+        }
         let mut out = String::from("Namespace(");
         for (index, (name, item)) in pairs.iter().enumerate() {
             if index > 0 {

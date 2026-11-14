@@ -1900,6 +1900,9 @@ pub(crate) fn call(function: i64, argc: usize, argv: *const i64) -> i64 {
             return methods::call(function, b"__call__".as_ptr(), "__call__".len(), argc, argv);
         }
     }
+    if let Some(result) = crate::modules::argparse::call_file_type_marker(function, argc, argv) {
+        return result;
+    }
     let Some(func) = value::as_function(function) else {
         return exc::raise_with_message(
             TYPE_ERROR,
