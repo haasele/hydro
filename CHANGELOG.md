@@ -8,6 +8,11 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — single-part star metavars
+
+- `nargs='*'` accepts a one-element metavar tuple and renders `[A ...]`.
+  `test_argparse` drops to **220 failures**.
+
 ### Argparse — bound group methods
 
 - Group handles expose a bound `add_argument` native method with keyword

@@ -2203,7 +2203,8 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
         let nargs = nargs.unwrap_or(Nargs::Single);
         let ok = match nargs {
             Nargs::Exact(count) => parts.len() == count,
-            Nargs::ZeroOrMore | Nargs::OneOrMore => parts.len() == 2,
+            Nargs::ZeroOrMore => matches!(parts.len(), 1 | 2),
+            Nargs::OneOrMore => parts.len() == 2,
             _ => false,
         };
         if !ok {
@@ -4340,6 +4341,7 @@ fn value_usage(spec: &ArgSpec, metavar: &str) -> String {
         Nargs::Single => metavar.to_string(),
         Nargs::Optional => format!("[{metavar}]"),
         Nargs::ZeroOrMore => match &spec.metavar_parts {
+            Some(parts) if parts.len() == 1 => format!("[{} ...]", parts[0]),
             Some(parts) => format!("[{} [{} ...]]", parts[0], parts[1]),
             None => format!("[{metavar} ...]"),
         },
