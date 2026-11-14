@@ -2033,7 +2033,12 @@ fn action_from_value(value: i64) -> Result<Option<ActionKind>, i64> {
         "help" => ActionKind::Help,
         "version" => ActionKind::Version,
         "BooleanOptionalAction" | "boolean_optional" => ActionKind::BooleanOptional,
-        _ => return Err(value_error(&format!("unsupported action '{name}'"))),
+        "parsers" => {
+            return Err(type_error(
+                "add_argument() action='parsers' requires parser parameters",
+            ))
+        }
+        _ => return Err(value_error(&format!("unknown action '{name}'"))),
     };
     Ok(Some(action))
 }
@@ -2176,10 +2181,6 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
         }
         names.push(name.to_string());
     }
-    if names.is_empty() {
-        return type_error("add_argument() requires at least one argument name");
-    }
-
     let mut seen_keywords = std::collections::HashSet::new();
     let mut type_fn = NONE;
     let mut default: Option<i64> = None;
@@ -2272,6 +2273,13 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
         }
     }
 
+    if names.is_empty() {
+        if let Some(explicit) = dest.as_ref() {
+            names.push(explicit.clone());
+        } else {
+            return type_error("add_argument() requires at least one argument name");
+        }
+    }
     if let Some(name) = value::as_str(type_fn) {
         let name = name.to_string();
         let resolution = parser_ref(parser).and_then(|state| {
@@ -2283,7 +2291,7 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
                 .map(|(_, _, item)| *item)
         });
         let Some(resolved) = resolution else {
-            return type_error(&format!("unknown type: '{name}'"));
+            return type_error(&format!("'{name}' is not callable"));
         };
         type_fn = resolved;
     }
@@ -2322,6 +2330,15 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
     if positional && names.len() > 1 {
         return type_error("add_argument() accepts one positional name");
     }
+    if positional {
+        if let Some(explicit) = dest.as_ref() {
+            if explicit != &names[0] {
+                return type_error(
+                    "dest supplied twice for positional argument, did you mean metavar?",
+                );
+            }
+        }
+    }
     if positional && required == Some(true) {
         return type_error("required is an invalid keyword argument for positional arguments");
     }
@@ -2349,10 +2366,21 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
             ));
         }
         if positional {
+            if matches!(action, ActionKind::Help | ActionKind::Version) {
+                return type_error(&format!(
+                    "action '{action_name}' is not valid for positional arguments"
+                ));
+            }
             return value_error(&format!(
                 "action '{action_name}' is not valid for positional arguments"
             ));
         }
+    }
+    if matches!(action, ActionKind::Store | ActionKind::Append)
+        && const_value.is_some()
+        && nargs != Some(Nargs::Optional)
+    {
+        return value_error("const is only valid with nargs='?'");
     }
     if positional && !matches!(action, ActionKind::Store | ActionKind::Append) {
         return type_error("only store/append actions are supported for positional arguments");
@@ -2380,7 +2408,7 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
         None => dest_for(&names, &prefixes),
     };
     if derived_dest.is_empty() {
-        return value_error("could not derive a destination name");
+        return type_error("dest= is required for options like '--'");
     }
 
     if action == ActionKind::BooleanOptional && !positional {

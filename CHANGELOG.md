@@ -8,6 +8,12 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — constructor diagnostics
+
+- Match CPython's `unknown action`, `not callable` type and duplicate
+  positional `dest` diagnostics; allow `dest=` to name an otherwise anonymous
+  positional. `test_argparse` drops to **151 failures**.
+
 ### Argparse — FileType repr and call
 
 - `FileType` markers store mode/bufsize/encoding/errors, render CPython's
