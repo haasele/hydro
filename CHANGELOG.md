@@ -8,6 +8,12 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Bytes — splitlines
+
+- `bytes.splitlines(keepends=False)` is implemented with CR/LF/CRLF handling,
+  fixing prog-name and subprocess-output tests. `test_argparse` drops to
+  **234 failures**.
+
 ### Argparse — Namespace inequality and containment
 
 - `Namespace.__ne__`/`__contains__` dispatch through their native entries;

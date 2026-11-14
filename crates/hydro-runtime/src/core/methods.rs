@@ -7467,6 +7467,43 @@ fn bytes_method(obj: i64, data: Vec<u8>, method: &str, args: &[i64]) -> i64 {
         // `bytes.maketrans` is a static method, so instances reach it too;
         // the receiver is ignored.
         "maketrans" => bytes_maketrans(args),
+        "splitlines" => {
+            if let Some(err) = check_arity("bytes", method, args.len(), 0, 1) {
+                return err;
+            }
+            let keepends = args
+                .first()
+                .filter(|arg| **arg != NONE)
+                .map(|arg| value::truthy(*arg))
+                .unwrap_or(false);
+            let mut lines = Vec::new();
+            let mut start = 0usize;
+            let mut index = 0usize;
+            while index < data.len() {
+                let break_len = match data[index] {
+                    b'\n' => 1,
+                    b'\r' => {
+                        if data.get(index + 1) == Some(&b'\n') {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                    _ => {
+                        index += 1;
+                        continue;
+                    }
+                };
+                let end = if keepends { index + break_len } else { index };
+                lines.push(value::bytes_new(data[start..end].to_vec()));
+                index += break_len;
+                start = index;
+            }
+            if start < data.len() {
+                lines.push(value::bytes_new(data[start..].to_vec()));
+            }
+            value::list_new(lines)
+        }
         "decode" => {
             if let Some(err) = check_arity("bytes", method, args.len(), 0, 2) {
                 return err;
