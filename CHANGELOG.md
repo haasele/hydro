@@ -8,6 +8,13 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — native class `__module__`
+
+- Native classes without an explicit class-statement namespace now report
+  `__module__` from the first native method in their MRO, so
+  `array.array.__module__` and `pickle.Pickler.__module__` resolve. `test_pickle`
+  advances past doctest discovery into its actual test cases.
+
 ### Fixed — bare builtin classes and interpreter symbols
 
 - Bare `object` and `complex` names now resolve to the cached builtin classes

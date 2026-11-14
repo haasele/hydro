@@ -3745,6 +3745,19 @@ fn getattr_named(obj: i64, attr: &str) -> i64 {
                 if value::is_cached_type_class(obj) {
                     return value::str_alloc("builtins".to_string());
                 }
+                // A native class has no class-statement namespace entry, but
+                // its methods name the module that owns them (`array.array`,
+                // `pickle.Pickler`, ...). Report that module instead of
+                // leaving `__module__` missing.
+                for class in value::class_mro(obj) {
+                    for (_, item) in value::class_namespace(class) {
+                        if let Some(function) = value::as_function(item) {
+                            if let value::FunctionBody::Native { module, .. } = &function.body {
+                                return value::str_alloc(module.to_string());
+                            }
+                        }
+                    }
+                }
             }
             // Builtin type classes expose a doc string; a user class reports
             // its namespace `__doc__`, or `None` when the body has none
