@@ -8,6 +8,13 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — REMAINDER, aliases and group methods
+
+- `nargs=argparse.REMAINDER` consumes the remaining tokens, subparser
+  `aliases=`/`deprecated=` are accepted, and group handles dispatch
+  `add_argument` through the parser method table. `test_argparse` is down to
+  **263 failures**.
+
 ### Argparse — callable classes and optional regex
 
 - `type=` accepts classes and callable native/extension objects, not only

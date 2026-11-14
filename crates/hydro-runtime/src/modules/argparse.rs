@@ -55,6 +55,7 @@ pub(crate) enum Nargs {
     ZeroOrMore,
     OneOrMore,
     Exact(usize),
+    Remainder,
 }
 
 /// What an argument does with its value.
@@ -1754,6 +1755,9 @@ fn handle_parts(obj: i64) -> Option<(i64, usize, String)> {
 /// Method dispatch without keywords.
 pub(crate) fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
     if parser_ref(obj).is_none() {
+        if is_handle(obj) {
+            return handle_method(obj, name, args);
+        }
         return attribute_error(name);
     }
     match name {
@@ -1784,6 +1788,9 @@ pub(crate) fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
 /// Method dispatch with keywords.
 pub(crate) fn method_kw(obj: i64, name: &str, args: &mut [i64], keywords: &KeywordArgs) -> i64 {
     if parser_ref(obj).is_none() {
+        if is_handle(obj) {
+            return handle_method_kw(obj, name, args, keywords);
+        }
         return attribute_error(name);
     }
     match name {
@@ -1965,6 +1972,7 @@ fn nargs_from_value(value: i64) -> Result<Nargs, i64> {
         "?" => Ok(Nargs::Optional),
         "*" => Ok(Nargs::ZeroOrMore),
         "+" => Ok(Nargs::OneOrMore),
+        "..." => Ok(Nargs::Remainder),
         other => match other.parse::<usize>() {
             Ok(count) => Ok(Nargs::Exact(count)),
             Err(_) => Err(value_error(&format!("invalid nargs value '{other}'"))),
@@ -2104,6 +2112,7 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
                 None => return type_error("add_argument() metavar must be str"),
             },
             "const" => const_value = Some(*argument),
+            "deprecated" => {}
             "version" => match value::as_str(*argument) {
                 Some(text) => version = Some(text.to_string()),
                 None => return type_error("add_argument() version must be str"),
@@ -2461,6 +2470,7 @@ fn add_parser(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
     };
     let mut slots = vec![NONE; 15];
     let mut help_text = String::new();
+    let mut aliases: Vec<String> = Vec::new();
     let mut explicit_prog = false;
     for (keyword, argument) in keywords {
         match keyword.as_str() {
@@ -2486,6 +2496,19 @@ fn add_parser(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
                 Some(text) => help_text = text.to_string(),
                 None => return type_error("add_parser() help must be str"),
             },
+            "aliases" => {
+                let Some(items) = value::as_list(*argument).or_else(|| value::as_tuple(*argument))
+                else {
+                    return type_error("add_parser() aliases must be a list or tuple");
+                };
+                for item in items {
+                    match value::as_str(*item) {
+                        Some(alias) => aliases.push(alias.to_string()),
+                        None => return type_error("add_parser() aliases must be strings"),
+                    }
+                }
+            }
+            "deprecated" => {}
             _ => {
                 return type_error(&format!(
                     "add_parser() got an unexpected keyword argument '{keyword}'"
@@ -2525,7 +2548,20 @@ fn add_parser(parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
                 {
                     conflict = true;
                 } else {
-                    subparsers.parsers.push((name.clone(), child, help_text));
+                    subparsers
+                        .parsers
+                        .push((name.clone(), child, help_text.clone()));
+                    for alias in &aliases {
+                        if !subparsers
+                            .parsers
+                            .iter()
+                            .any(|(existing, _, _)| existing == alias)
+                        {
+                            subparsers
+                                .parsers
+                                .push((alias.clone(), child, help_text.clone()));
+                        }
+                    }
                 }
             }
             None => conflict = true,
@@ -3408,6 +3444,16 @@ impl<'a> Scan<'a> {
                 }
                 Ok(Some(value::list_new(converted)))
             }
+            Nargs::Remainder => {
+                let mut converted = Vec::with_capacity(raw.len());
+                for &item in raw {
+                    let value = self.convert(spec, item)?;
+                    self.check_choices(spec, value)?;
+                    self.root(value);
+                    converted.push(value);
+                }
+                Ok(Some(value::list_new(converted)))
+            }
             Nargs::ZeroOrMore | Nargs::OneOrMore => {
                 let minimum = usize::from(spec.nargs == Nargs::OneOrMore);
                 if raw.len() < minimum {
@@ -3437,7 +3483,7 @@ impl<'a> Scan<'a> {
         self.seen[index] = true;
         if matches!(
             spec.nargs,
-            Nargs::ZeroOrMore | Nargs::OneOrMore | Nargs::Exact(_)
+            Nargs::ZeroOrMore | Nargs::OneOrMore | Nargs::Exact(_) | Nargs::Remainder
         ) {
             let mut converted = Vec::with_capacity(raw.len());
             for &item in raw {
@@ -3702,6 +3748,12 @@ fn parse_tokens(
                 position += 1;
                 index += count;
             }
+            Nargs::Remainder => {
+                let raw = tokens[index..].to_vec();
+                scan.apply_positional(spec_index, &raw)?;
+                position += 1;
+                index = tokens.len();
+            }
             Nargs::ZeroOrMore | Nargs::OneOrMore => {
                 let minimum = usize::from(spec.nargs == Nargs::OneOrMore);
                 let reserve = minimum_required_after(view, &positionals, position + 1);
@@ -3746,7 +3798,9 @@ fn parse_tokens(
             }
             let is_required = match spec.nargs {
                 Nargs::Single => spec.positional || spec.required,
-                Nargs::OneOrMore | Nargs::Exact(_) => spec.positional || spec.required,
+                Nargs::OneOrMore | Nargs::Exact(_) | Nargs::Remainder => {
+                    spec.positional || spec.required
+                }
                 Nargs::Optional | Nargs::ZeroOrMore => spec.required,
             };
             if is_required {
@@ -3880,7 +3934,7 @@ fn minimum_required_after(view: &View, positionals: &[usize], from: usize) -> us
             Nargs::Single | Nargs::Optional => 1,
             Nargs::OneOrMore => 1,
             Nargs::Exact(count) => count,
-            Nargs::ZeroOrMore => 0,
+            Nargs::ZeroOrMore | Nargs::Remainder => 0,
         };
     }
     if view.subparsers.is_some() {
@@ -4096,6 +4150,12 @@ fn collect_operands(
                 }
             }
         }
+        Nargs::Remainder => {
+            while start + offset < tokens.len() {
+                raw.push(tokens[start + offset]);
+                offset += 1;
+            }
+        }
         Nargs::ZeroOrMore | Nargs::OneOrMore => {
             while let Some(token) = take_next() {
                 raw.push(token);
@@ -4158,6 +4218,7 @@ fn value_usage(spec: &ArgSpec, metavar: &str) -> String {
         Nargs::Single => metavar.to_string(),
         Nargs::Optional => format!("[{metavar}]"),
         Nargs::ZeroOrMore => format!("[{metavar} ...]"),
+        Nargs::Remainder => "...".to_string(),
         Nargs::OneOrMore => format!("{metavar} [{metavar} ...]"),
         Nargs::Exact(count) => vec![metavar; count].join(" "),
     }
@@ -4170,6 +4231,7 @@ fn positional_usage_text(view: &View, spec: &ArgSpec) -> String {
         Nargs::Single => metavar,
         Nargs::Optional => format!("[{metavar}]"),
         Nargs::ZeroOrMore => format!("[{metavar} ...]"),
+        Nargs::Remainder => "...".to_string(),
         Nargs::OneOrMore => format!("{metavar} [{metavar} ...]"),
         Nargs::Exact(count) => vec![metavar; count].join(" "),
     }
