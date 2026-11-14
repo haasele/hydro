@@ -235,9 +235,10 @@ Known module-specific blockers from the generated backlog:
   `test_decimal` (`Thread(context=...)`), `test__interpreters`,
   `test__interpchannels`.
 - **datetime/locale/calendar:** `_datetime`, timezone/locale data,
-  `test_datetime` (`Namespace.__dict__`), `test_locale` (`en_US.US-ASCII`
-  normalization), `test_calendar` (output formatting), `test_time`,
-  `test_strptime`, `test_zoneinfo`.
+  `test_datetime` (now executes 4656 pure/fast cases; failures are datetime
+  semantics, `array.array` class attributes and formatting messages),
+  `test_locale` (`en_US.US-ASCII` normalization), `test_calendar` (output
+  formatting), `test_time`, `test_strptime`, `test_zoneinfo`.
 - **compression/archives:** `gzip.GzipFile`, bz2/lzma/zstd keyword APIs,
   `test_gzip`, `test_bz2`, `test_lzma`, `test_zstd`, `test_zipfile`,
   `test_zipfile64`, `test_tarfile`.

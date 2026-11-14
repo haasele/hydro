@@ -8,6 +8,13 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — datetime harness reach
+
+- `test_datetime` now discovers and runs **4656** pure/fast cases instead of
+  reporting zero tests. The remaining failures are datetime semantics,
+  `array.array` class attributes and exact validation/format messages; the
+  suite is not counted as passing.
+
 ### Fixed — class defaults and optional interpreter extension
 
 - Method defaults inside a class body now capture locals of the enclosing
