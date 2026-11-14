@@ -28,6 +28,7 @@ use crate::builtins;
 use crate::container;
 use crate::core::globals;
 use crate::exc::{self, ATTRIBUTE_ERROR, RUNTIME_ERROR, TYPE_ERROR, VALUE_ERROR};
+use crate::iter;
 use crate::methods::KeywordArgs;
 use crate::value::{self, ParamMeta, NONE};
 use hydro_ir::{MethodKind, ParamKind};
@@ -170,6 +171,8 @@ pub(crate) struct ArgParserState {
     pub(crate) groups: Vec<GroupState>,
     pub(crate) subparsers: Option<SubparsersState>,
     pub(crate) defaults: Vec<(String, i64)>,
+    /// `ArgumentParser.register(registry_name, value, object)` entries.
+    pub(crate) registered: Vec<(String, String, i64)>,
     /// Internal: the legacy non-exiting behaviour used by runtime tests.
     pub(crate) test_mode: bool,
 }
@@ -195,6 +198,7 @@ impl ArgParserState {
             groups: vec![GroupState::default()],
             subparsers: None,
             defaults: Vec::new(),
+            registered: Vec::new(),
             test_mode: false,
         }
     }
@@ -434,6 +438,7 @@ fn parser_method_entries() -> Vec<(&'static str, usize)> {
             "set_defaults",
             parser_set_defaults_entry as *const () as usize,
         ),
+        ("register", parser_register_entry as *const () as usize),
         (
             "get_default",
             parser_get_default_entry as *const () as usize,
@@ -492,6 +497,7 @@ parser_entries! {
     ),
     (parser_add_subparsers_entry, "add_subparsers"),
     (parser_set_defaults_entry, "set_defaults"),
+    (parser_register_entry, "register"),
     (parser_get_default_entry, "get_default"),
     (parser_parse_args_entry, "parse_args"),
     (parser_parse_known_args_entry, "parse_known_args"),
@@ -1615,6 +1621,7 @@ pub(crate) fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
         "add_mutually_exclusive_group" => add_argument_group(obj, args, &[], 0, true, false),
         "add_subparsers" => add_subparsers(obj, args, &[]),
         "set_defaults" => set_defaults(obj, &[]),
+        "register" => register_method(obj, args),
         "get_default" => get_default(obj, args),
         "parse_args" => parse(obj, args, &[], false),
         "parse_known_args" => parse(obj, args, &[], true),
@@ -1646,6 +1653,7 @@ pub(crate) fn method_kw(obj: i64, name: &str, args: &mut [i64], keywords: &Keywo
         }
         "add_subparsers" => add_subparsers(obj, args, &keywords.items),
         "set_defaults" => set_defaults(obj, &keywords.items),
+        "register" => register_method(obj, args),
         "get_default" => {
             if let Some((keyword, _)) = keywords.items.first() {
                 return type_error(&format!(
@@ -1842,9 +1850,29 @@ fn choices_from_value(value: i64) -> Result<Option<Vec<i64>>, i64> {
     if let Some(items) = value::as_dict(value) {
         return Ok(Some(items.iter().map(|(key, _)| *key).collect()));
     }
-    Err(type_error(
-        "add_argument() choices must be a list, tuple or dict",
-    ))
+    // CPython accepts any container: an enum class, range, set, generator-
+    // backed view, or a user iterable. Materialise it once so repeated
+    // membership checks do not re-run side effects.
+    let iterator = iter::iter_new(value);
+    if exc::pending() {
+        exc::clear();
+        return Err(type_error(
+            "add_argument() choices must be an iterable container",
+        ));
+    }
+    let mut items = Vec::new();
+    loop {
+        let mut item = NONE;
+        let status = iter::iter_next(iterator, &mut item);
+        if exc::pending() {
+            return Err(NONE);
+        }
+        if status == 0 {
+            break;
+        }
+        items.push(item);
+    }
+    Ok(Some(items))
 }
 
 fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: usize) -> i64 {
@@ -1893,7 +1921,11 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
         }
         match name.as_str() {
             "type" => {
+                // A string names a registered type (`parser.register('type',
+                // name, callable)`); resolution happens after all keywords are
+                // parsed so registration order does not matter.
                 if *argument != NONE
+                    && value::as_str(*argument).is_none()
                     && value::as_function(*argument).is_none()
                     && !is_file_type_marker(*argument)
                 {
@@ -1940,6 +1972,21 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
         }
     }
 
+    if let Some(name) = value::as_str(type_fn) {
+        let name = name.to_string();
+        let resolution = parser_ref(parser).and_then(|state| {
+            state
+                .registered
+                .iter()
+                .rev()
+                .find(|(kind, registered, _)| kind == "type" && *registered == name)
+                .map(|(_, _, item)| *item)
+        });
+        let Some(resolved) = resolution else {
+            return type_error(&format!("unknown type: '{name}'"));
+        };
+        type_fn = resolved;
+    }
     if action_value == Some(ActionKind::BooleanOptional) && const_value.is_some() {
         return type_error(
             "BooleanOptionalAction.__init__() got an unexpected keyword argument 'const'",
@@ -2356,6 +2403,29 @@ fn upsert(pairs: &mut Vec<(String, i64)>, name: &str, item: i64) {
 }
 
 /// `set_defaults(**kwargs)`.
+/// `ArgumentParser.register(registry_name, value, object)`.
+fn register_method(parser: i64, args: &[i64]) -> i64 {
+    if args.len() != 3 {
+        return type_error(&format!(
+            "register() takes 3 arguments ({} given)",
+            args.len()
+        ));
+    }
+    let (Some(kind), Some(name)) = (value::as_str(args[0]), value::as_str(args[1])) else {
+        return type_error("register() registry name and value must be str");
+    };
+    let Some(mut state) = parser_mut(parser) else {
+        return attribute_error("register");
+    };
+    state
+        .registered
+        .retain(|(existing_kind, existing_name, _)| existing_kind != kind || existing_name != name);
+    state
+        .registered
+        .push((kind.to_string(), name.to_string(), args[2]));
+    NONE
+}
+
 fn set_defaults(parser: i64, keywords: &[(String, i64)]) -> i64 {
     let mut updates = Vec::with_capacity(keywords.len());
     for (name, item) in keywords {

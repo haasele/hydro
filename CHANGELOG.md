@@ -8,6 +8,14 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — iterable choices, registration, exceptions
+
+- `choices=` accepts any iterable container (enum classes, ranges, sets and
+  custom iterables), not only list/tuple/dict.
+- `ArgumentParser.register()` and registered `type=` names work, and
+  `argparse.ArgumentError`/`ArgumentTypeError` are exported. `test_argparse`
+  drops from 416 to 409 failures and proceeds through more clusters.
+
 ### Fixed — object constructor and BooleanOptionalAction names
 
 - Bare `object()` is now a compiler builtin that creates an `object`

@@ -9018,6 +9018,8 @@ fn constant_value(module: &str, name: &str) -> i64 {
             | "HelpFormatter"
             | "Action"
             | "BooleanOptionalAction"
+            | "ArgumentError"
+            | "ArgumentTypeError"
             | "SUPPRESS"
             | "REMAINDER"),
         ) => argparse::constant(name),
