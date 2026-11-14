@@ -4239,6 +4239,17 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if module == "argparse" && matches!(name, "ArgumentParser" | "Namespace") {
         return argparse::constant(name);
     }
+    if module == "argparse" && name == "__file__" {
+        // The implementation is native, but the compatibility oracle is the
+        // pinned CPython `argparse.py`; introspection and translation tests
+        // read that source.
+        if let Some(root) = std::env::var_os("HYDRO_STDLIB") {
+            let path = std::path::Path::new(&root).join("argparse.py");
+            if path.is_file() {
+                return value::str_alloc(path.to_string_lossy().into_owned());
+            }
+        }
+    }
     if module == "argparse" {
         if let Some((class_name, method)) = name.split_once('.') {
             if matches!(class_name, "ArgumentParser" | "Action" | "ArgumentError") {

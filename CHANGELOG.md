@@ -8,6 +8,12 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — reference source path
+
+- `argparse.__file__` resolves to the pinned CPython `argparse.py` under
+  `HYDRO_STDLIB`, satisfying source-introspection checks. `test_argparse`
+  drops to **174 failures**.
+
 ### Argparse — parser nargs and metavar matrix
 
 - Add `nargs=A...`, apply CPython's metavar tuple length rules for
