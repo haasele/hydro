@@ -56,6 +56,7 @@ pub(crate) enum Nargs {
     OneOrMore,
     Exact(usize),
     Remainder,
+    Parser,
 }
 
 /// What an argument does with its value.
@@ -2016,6 +2017,7 @@ fn nargs_from_value(value: i64) -> Result<Nargs, i64> {
         "*" => Ok(Nargs::ZeroOrMore),
         "+" => Ok(Nargs::OneOrMore),
         "..." => Ok(Nargs::Remainder),
+        "A..." => Ok(Nargs::Parser),
         other => match other.parse::<usize>() {
             Ok(count) => Ok(Nargs::Exact(count)),
             Err(_) => Err(value_error(&format!("invalid nargs value '{other}'"))),
@@ -2202,10 +2204,12 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
     if let Some(parts) = &metavar_parts {
         let nargs = nargs.unwrap_or(Nargs::Single);
         let ok = match nargs {
+            Nargs::Single | Nargs::Optional => parts.len() == 1,
             Nargs::Exact(count) => parts.len() == count,
             Nargs::ZeroOrMore => matches!(parts.len(), 1 | 2),
             Nargs::OneOrMore => parts.len() == 2,
-            _ => false,
+            Nargs::Parser => parts.len() == 1,
+            Nargs::Remainder => true,
         };
         if !ok {
             return value_error("length of metavar tuple does not match nargs");
@@ -2247,16 +2251,16 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
         _ => "",
     };
     if !action_name.is_empty() {
-        if positional {
-            return value_error(&format!(
-                "action '{action_name}' is not valid for positional arguments"
-            ));
-        }
         let const_invalid = const_value.is_some()
             && !matches!(action, ActionKind::StoreConst | ActionKind::AppendConst);
         if nargs.is_some() || const_invalid || type_fn != NONE || choices.is_some() {
             return type_error(&format!(
                 "nargs/const/type/choices are invalid for action '{action_name}'"
+            ));
+        }
+        if positional {
+            return value_error(&format!(
+                "action '{action_name}' is not valid for positional arguments"
             ));
         }
     }
@@ -3567,7 +3571,7 @@ impl<'a> Scan<'a> {
                 }
                 Ok(Some(value::list_new(converted)))
             }
-            Nargs::Remainder => {
+            Nargs::Remainder | Nargs::Parser => {
                 let mut converted = Vec::with_capacity(raw.len());
                 for &item in raw {
                     let value = self.convert(spec, item)?;
@@ -3621,7 +3625,11 @@ impl<'a> Scan<'a> {
         self.seen[index] = true;
         if matches!(
             spec.nargs,
-            Nargs::ZeroOrMore | Nargs::OneOrMore | Nargs::Exact(_) | Nargs::Remainder
+            Nargs::ZeroOrMore
+                | Nargs::OneOrMore
+                | Nargs::Exact(_)
+                | Nargs::Remainder
+                | Nargs::Parser
         ) {
             let mut converted = Vec::with_capacity(raw.len());
             for &item in raw {
@@ -3886,7 +3894,7 @@ fn parse_tokens(
                 position += 1;
                 index += count;
             }
-            Nargs::Remainder => {
+            Nargs::Remainder | Nargs::Parser => {
                 let raw = tokens[index..].to_vec();
                 scan.apply_positional(spec_index, &raw)?;
                 position += 1;
@@ -3936,7 +3944,7 @@ fn parse_tokens(
             }
             let is_required = match spec.nargs {
                 Nargs::Single => spec.positional || spec.required,
-                Nargs::OneOrMore | Nargs::Exact(_) | Nargs::Remainder => {
+                Nargs::OneOrMore | Nargs::Exact(_) | Nargs::Remainder | Nargs::Parser => {
                     spec.positional || spec.required
                 }
                 Nargs::Optional | Nargs::ZeroOrMore => spec.required,
@@ -4072,7 +4080,7 @@ fn minimum_required_after(view: &View, positionals: &[usize], from: usize) -> us
             Nargs::Single | Nargs::Optional => 1,
             Nargs::OneOrMore => 1,
             Nargs::Exact(count) => count,
-            Nargs::ZeroOrMore | Nargs::Remainder => 0,
+            Nargs::ZeroOrMore | Nargs::Remainder | Nargs::Parser => 0,
         };
     }
     if view.subparsers.is_some() {
@@ -4288,7 +4296,7 @@ fn collect_operands(
                 }
             }
         }
-        Nargs::Remainder => {
+        Nargs::Remainder | Nargs::Parser => {
             while start + offset < tokens.len() {
                 raw.push(tokens[start + offset]);
                 offset += 1;
@@ -4360,7 +4368,7 @@ fn value_usage(spec: &ArgSpec, metavar: &str) -> String {
             Some(parts) => format!("[{} [{} ...]]", parts[0], parts[1]),
             None => format!("[{metavar} ...]"),
         },
-        Nargs::Remainder => "...".to_string(),
+        Nargs::Remainder | Nargs::Parser => "...".to_string(),
         Nargs::OneOrMore => match &spec.metavar_parts {
             Some(parts) => format!("{} [{} ...]", parts[0], parts[1]),
             None => format!("{metavar} [{metavar} ...]"),
@@ -4382,7 +4390,7 @@ fn positional_usage_text(view: &View, spec: &ArgSpec) -> String {
             Some(parts) => format!("[{} [{} ...]]", parts[0], parts[1]),
             None => format!("[{metavar} ...]"),
         },
-        Nargs::Remainder => "...".to_string(),
+        Nargs::Remainder | Nargs::Parser => "...".to_string(),
         Nargs::OneOrMore => match &spec.metavar_parts {
             Some(parts) => format!("{} [{} ...]", parts[0], parts[1]),
             None => format!("{metavar} [{metavar} ...]"),

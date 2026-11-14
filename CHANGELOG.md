@@ -8,6 +8,13 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — parser nargs and metavar matrix
+
+- Add `nargs=A...`, apply CPython's metavar tuple length rules for
+  `None`/`?`/`*`/`+`/exact/remainder/parser, and validate invalid action
+  keywords before positional action errors. `test_argparse` drops to
+  **175 failures**.
+
 ### Argparse — positional mutex enforcement
 
 - Positional arguments participate in their mutually exclusive group's
