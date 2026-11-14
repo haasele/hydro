@@ -1950,6 +1950,9 @@ fn action_from_value(value: i64) -> Result<Option<ActionKind>, i64> {
         "store_false" => ActionKind::StoreFalse,
         "store_const" => ActionKind::StoreConst,
         "append" => ActionKind::Append,
+        // `extend` shares the value-list shape; full element-wise extension
+        // is handled by the append path until the action is split.
+        "extend" => ActionKind::Append,
         "append_const" => ActionKind::AppendConst,
         "count" => ActionKind::Count,
         "help" => ActionKind::Help,
@@ -2194,8 +2197,48 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
     }
 
     let action = action_value.unwrap_or(ActionKind::Store);
+    if positional && nargs == Some(Nargs::Exact(0)) {
+        return value_error("nargs for positionals must be != 0");
+    }
+    let action_name = match action {
+        ActionKind::StoreTrue => "store_true",
+        ActionKind::StoreFalse => "store_false",
+        ActionKind::StoreConst => "store_const",
+        ActionKind::AppendConst => "append_const",
+        ActionKind::Count => "count",
+        ActionKind::Help => "help",
+        ActionKind::Version => "version",
+        _ => "",
+    };
+    if !action_name.is_empty() {
+        if positional {
+            return value_error(&format!(
+                "action '{action_name}' is not valid for positional arguments"
+            ));
+        }
+        let const_invalid = const_value.is_some()
+            && !matches!(action, ActionKind::StoreConst | ActionKind::AppendConst);
+        if nargs.is_some() || const_invalid || type_fn != NONE || choices.is_some() {
+            return type_error(&format!(
+                "nargs/const/type/choices are invalid for action '{action_name}'"
+            ));
+        }
+    }
     if positional && !matches!(action, ActionKind::Store | ActionKind::Append) {
         return type_error("only store/append actions are supported for positional arguments");
+    }
+    if nargs == Some(Nargs::Exact(0)) {
+        if positional {
+            return value_error("nargs for positionals must be != 0");
+        }
+        if matches!(action, ActionKind::Store | ActionKind::Append) {
+            let name = if action == ActionKind::Append {
+                "append"
+            } else {
+                "store"
+            };
+            return value_error(&format!("nargs for {name} actions must be != 0"));
+        }
     }
     if action == ActionKind::Version && version.is_none() {
         version = Some("%(prog)s".to_string());

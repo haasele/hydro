@@ -8,6 +8,12 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — action keyword validation
+
+- Zero-argument actions reject `nargs`, `const`, `type` and `choices`, and
+  positional forms report CPython's `ValueError`; `extend` maps to the append
+  value shape. `test_argparse` drops to **225 failures**.
+
 ### Bytes — splitlines
 
 - `bytes.splitlines(keepends=False)` is implemented with CR/LF/CRLF handling,
