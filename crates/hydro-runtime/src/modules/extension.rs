@@ -670,7 +670,12 @@ pub(crate) fn import_module(name: &str) -> Option<i64> {
         Ok((path, _)) => Some(crate::modules::extension_module_value(name, &path)),
         Err(LoadFailure::NotFound(_)) => None,
         Err(failure) => {
-            raised_import_error(&failure.message());
+            let message = failure.message();
+            if name == "_interpreters" && message.contains("undefined symbol") {
+                exc::raise_with_message(MODULE_NOT_FOUND_ERROR, &message);
+            } else {
+                raised_import_error(&message);
+            }
             Some(NONE)
         }
     }
@@ -739,8 +744,17 @@ fn load_path(path: &str) -> Result<u64, LoadFailure> {
 /// `OSError`), and a bare loader diagnostic (`cannot open shared object file`,
 /// `undefined symbol`) is raised as `ImportError`, exactly like CPython's
 /// extension importer.
-fn raise_load_error(failure: LoadFailure) -> i64 {
-    raised_import_error(&failure.message())
+fn raise_load_error(path: &str, failure: LoadFailure) -> i64 {
+    let message = failure.message();
+    // `_interpreters` is an optional 3.14 extension whose host build requires
+    // private interpreter/pickle symbols Hydro does not export yet. A failed
+    // load is reported as an absent optional module so `try: import
+    // _interpreters; except ModuleNotFoundError` takes the same fallback it
+    // uses on platforms where the extension is not built.
+    if path.contains("_interpreters") && message.contains("undefined symbol") {
+        return exc::raise_with_message(MODULE_NOT_FOUND_ERROR, &message);
+    }
+    raised_import_error(&message)
 }
 
 /// Converts one tagged Hydro value to a shim value.
@@ -1197,7 +1211,7 @@ pub(crate) fn call(
     };
     let module = match load_path(path) {
         Ok(module) => module,
-        Err(failure) => return raise_load_error(failure),
+        Err(failure) => return raise_load_error(path, failure),
     };
     let attribute = match capi::get_attr(module, member) {
         Ok(attribute) => attribute,
@@ -1257,7 +1271,7 @@ pub(crate) fn get(
     }
     let module = match load_path(path) {
         Ok(module) => module,
-        Err(failure) => return raise_load_error(failure),
+        Err(failure) => return raise_load_error(path, failure),
     };
     match capi::get_attr(module, member) {
         Ok(ShimAttr::Value(shim)) => result_value(shim),
@@ -1305,7 +1319,7 @@ fn star_import(path: &str, importing_module: &str) -> i64 {
         Ok(module) => populate_star_import(module, importing_module),
         // A star import is an import statement: an unavailable shared object
         // raises `ImportError`, which a surrounding handler can catch.
-        Err(failure) => raise_load_error(failure),
+        Err(failure) => raise_load_error(path, failure),
     }
 }
 
@@ -1370,7 +1384,7 @@ pub(crate) fn import_member(module: &str, path: &str, member: &str) -> i64 {
     }
     let loaded = match load_path(path) {
         Ok(loaded) => loaded,
-        Err(failure) => return raise_load_error(failure),
+        Err(failure) => return raise_load_error(path, failure),
     };
     match capi::get_attr(loaded, member) {
         Ok(ShimAttr::Value(shim)) => result_value(shim),

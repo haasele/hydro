@@ -9416,6 +9416,11 @@ impl<'a> Lowerer<'a> {
                     .class_attr_scopes
                     .last()
                     .is_some_and(|scope| scope.contains_key(name))
+                // A default may also close over a local of the enclosing
+                // function (`def f(): x = 1; class C: def m(self, a=x)`); the
+                // registration-time lowering saw an empty module scope, so it
+                // must be redone while that frame is active.
+                || fs.lookup(name).is_some()
         })
     }
 

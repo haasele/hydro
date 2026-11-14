@@ -8,6 +8,17 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — class defaults and optional interpreter extension
+
+- Method defaults inside a class body now capture locals of the enclosing
+  function; registration-time lowering previously resolved them as globals.
+- `from package import submodule` falls back to importing the submodule when
+  the package itself has no such attribute, unblocking runtime source modules
+  that import `test.support` helpers.
+- The host `_interpreters` extension (which needs private 3.14 interpreter
+  symbols) is treated as unavailable when its `dlopen` fails on an undefined
+  symbol, so optional imports take their documented fallback.
+
 ### Tooling — zero-test runs are not passes
 
 - `scripts/cpython_triage.py` now reports `zero_tests` when Hydro exits 0 but

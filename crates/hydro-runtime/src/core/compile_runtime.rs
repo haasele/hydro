@@ -1394,9 +1394,24 @@ impl Interp {
                 }
                 continue;
             }
-            let member = methods::getattr(module, alias.name.as_ptr(), alias.name.len());
+            let mut member = methods::getattr(module, alias.name.as_ptr(), alias.name.len());
             if exc::pending() {
-                return Err(Flow::Raise);
+                if exc::pending_tag() != i64::from(ExcKind::AttributeError.tag()) {
+                    return Err(Flow::Raise);
+                }
+                // `from package import submodule` imports the submodule when
+                // the package itself has no such attribute. Static imports of
+                // `test.support` compile its submodules into the program, so
+                // the call below normally returns the registered module.
+                exc::clear();
+                let dotted = value::str_alloc(format!("{module_name}.{}", alias.name));
+                self.roots.push(dotted);
+                let imported = modules::importlib::call("import_module", &[dotted]);
+                if exc::pending() {
+                    return Err(Flow::Raise);
+                }
+                self.roots.push(imported);
+                member = imported;
             }
             let binding = alias
                 .asname
