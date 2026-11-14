@@ -8,6 +8,12 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — suppressed usage parts
+
+- Arguments with `help=argparse.SUPPRESS` no longer appear in usage,
+  including members of mutually exclusive groups. `test_argparse` drops to
+  **164 failures**.
+
 ### Argparse — help and option-prefix validation
 
 - Reject malformed `help=` substitutions and option names outside

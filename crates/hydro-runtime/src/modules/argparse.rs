@@ -4603,7 +4603,7 @@ fn format_usage_text_with(view: &View, palette: &Palette, width: usize) -> Strin
     // Optionals first, in declaration order, with mutex groups collapsed.
     let mut rendered_groups: Vec<usize> = Vec::new();
     for spec in view.options.iter() {
-        if spec.positional {
+        if spec.positional || spec.help == SUPPRESS {
             continue;
         }
         let group_index = spec.group;
@@ -4616,6 +4616,9 @@ fn format_usage_text_with(view: &View, palette: &Palette, width: usize) -> Strin
                 let mut alternatives = Vec::new();
                 for member in &group.members {
                     let member_spec = &view.options[*member];
+                    if member_spec.help == SUPPRESS {
+                        continue;
+                    }
                     alternatives.push(summary_usage_part(
                         view,
                         member_spec,
@@ -4623,6 +4626,9 @@ fn format_usage_text_with(view: &View, palette: &Palette, width: usize) -> Strin
                         true,
                         group.required,
                     ));
+                }
+                if alternatives.is_empty() {
+                    continue;
                 }
                 let body = alternatives.join(" | ");
                 optionals.push(if group.required {
@@ -4635,7 +4641,11 @@ fn format_usage_text_with(view: &View, palette: &Palette, width: usize) -> Strin
         }
         optionals.push(summary_usage_part(view, spec, palette, false, false));
     }
-    for spec in view.options.iter().filter(|spec| spec.positional) {
+    for spec in view
+        .options
+        .iter()
+        .filter(|spec| spec.positional && spec.help != SUPPRESS)
+    {
         // A positional already rendered as part of a mutex group is not
         // repeated later in the usage line.
         if view
