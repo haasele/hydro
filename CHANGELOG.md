@@ -8,6 +8,11 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — Namespace inequality and containment
+
+- `Namespace.__ne__`/`__contains__` dispatch through their native entries;
+  `test_argparse` drops to **235 failures**.
+
 ### Argparse — tuple metavars
 
 - `metavar=(...)` is accepted for fixed and variable multi-slot arguments,

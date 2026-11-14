@@ -2599,6 +2599,8 @@ pub static ARGPARSE: ModuleSpec = ModuleSpec {
         // when a bound method crosses the native call path).
         f("Action.__repr__", 1, 1, Type::Str),
         f("Namespace.__eq__", 2, 2, Type::Bool),
+        f("Namespace.__ne__", 2, 2, Type::Bool),
+        f("Namespace.__contains__", 2, 2, Type::Bool),
         f("Namespace.__repr__", 1, 1, Type::Str),
         // Full native method names used by bound `super()` parser methods.
         f("ArgumentParser.add_argument", 0, usize::MAX, Type::Any),

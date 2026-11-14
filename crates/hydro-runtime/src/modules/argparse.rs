@@ -712,6 +712,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
             .first()
             .map_or(NONE, |&instance| action_repr_entry(&instance as *const i64)),
         "Namespace.__eq__" if args.len() == 2 => namespace_eq_entry(args.as_ptr()),
+        "Namespace.__ne__" if args.len() == 2 => namespace_ne_entry(args.as_ptr()),
+        "Namespace.__contains__" if args.len() == 2 => namespace_contains_entry(args.as_ptr()),
         "Namespace.__repr__" if args.len() == 1 => namespace_repr_entry(args.as_ptr()),
         name if name.starts_with("ArgumentParser.") => {
             let Some((&receiver, rest)) = args.split_first() else {
