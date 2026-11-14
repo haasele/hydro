@@ -3149,6 +3149,40 @@ fn active_palette(color: bool) -> Palette {
     palette
 }
 
+/// Returns the current Python `sys.<name>` stream, or `NONE`.
+fn python_stream(name: &str) -> i64 {
+    let sys = crate::modules::module_value_by_name("sys");
+    if sys == NONE {
+        return NONE;
+    }
+    crate::methods::getattr(sys, name.as_ptr(), name.len())
+}
+
+/// Writes text through `sys.<name>` so `contextlib.redirect_*` and the
+/// unittest `StdIOBuffer` see argparse output instead of the process stream.
+fn write_stream(name: &str, text: &str) {
+    let stream = python_stream(name);
+    if stream != NONE {
+        let value = text_value(text);
+        let roots = crate::heap::root_values(std::slice::from_ref(&value));
+        crate::methods::call(stream, b"write".as_ptr(), 5, 1, &value as *const i64);
+        crate::heap::release_roots(roots);
+        if !exc::pending() {
+            return;
+        }
+        exc::clear();
+    }
+    if name == "stderr" {
+        let mut stderr = std::io::stderr();
+        let _ = stderr.write_all(text.as_bytes());
+        let _ = stderr.flush();
+    } else {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(text.as_bytes());
+        let _ = stdout.flush();
+    }
+}
+
 /// Reports a parse error: prints the usage block and raises
 /// `SystemExit(2)` (or the legacy exception in test mode).
 fn fail(_parser: i64, view: &View, tag: u32, message: &str) -> i64 {
@@ -3159,9 +3193,7 @@ fn fail(_parser: i64, view: &View, tag: u32, message: &str) -> i64 {
         return raise_argument_error(NONE, message);
     }
     print_usage_to_stderr(view);
-    let mut stderr = std::io::stderr();
-    let _ = writeln!(stderr, "{}: error: {}", view.prog, message);
-    let _ = stderr.flush();
+    write_stream("stderr", &format!("{}: error: {}\n", view.prog, message));
     exc::raise_exit(tagged_int(2))
 }
 
@@ -3181,10 +3213,7 @@ fn raise_argument_error(argument: i64, message: &str) -> i64 {
 }
 
 fn print_usage_to_stderr(view: &View) {
-    let text = format_usage_text(view);
-    let mut stderr = std::io::stderr();
-    let _ = stderr.write_all(text.as_bytes());
-    let _ = stderr.flush();
+    write_stream("stderr", &format_usage_text(view));
 }
 
 fn print_help_method(parser: i64, args: &[i64]) -> i64 {
@@ -3195,10 +3224,7 @@ fn print_help_method(parser: i64, args: &[i64]) -> i64 {
 
 /// Prints the help text to stdout (used by the automatic help action).
 fn print_help(parser: i64) {
-    let text = format_help(parser);
-    let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(text.as_bytes());
-    let _ = stdout.flush();
+    write_stream("stdout", &format_help(parser));
 }
 
 fn print_usage_method(parser: i64, args: &[i64]) -> i64 {
@@ -3212,9 +3238,7 @@ fn write_text(file: i64, text: &str) -> i64 {
         let value = text_value(text);
         return crate::methods::call(file, b"write".as_ptr(), "write".len(), 1, [value].as_ptr());
     }
-    let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(text.as_bytes());
-    let _ = stdout.flush();
+    write_stream("stdout", text);
     NONE
 }
 
@@ -3250,9 +3274,7 @@ fn error_method(parser: i64, args: &[i64]) -> i64 {
         None => value::to_string(argument),
     };
     print_usage_to_stderr(&view);
-    let mut stderr = std::io::stderr();
-    let _ = writeln!(stderr, "{}: error: {}", view.prog, message);
-    let _ = stderr.flush();
+    write_stream("stderr", &format!("{}: error: {}\n", view.prog, message));
     exc::raise_exit(tagged_int(2))
 }
 
@@ -3276,13 +3298,9 @@ fn exit_method(_parser: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
             None => value::to_string(message),
         };
         if value::truthy(status) && status != NONE {
-            let mut stderr = std::io::stderr();
-            let _ = stderr.write_all(text.as_bytes());
-            let _ = stderr.flush();
+            write_stream("stderr", &text);
         } else {
-            let mut stdout = std::io::stdout();
-            let _ = stdout.write_all(text.as_bytes());
-            let _ = stdout.flush();
+            write_stream("stdout", &text);
         }
     }
     if status == NONE {
@@ -3603,7 +3621,7 @@ impl<'a> Scan<'a> {
             }
             ActionKind::Version => {
                 let text = spec.version.replace("%(prog)s", &self.view.prog);
-                println!("{text}");
+                write_stream("stdout", &format!("{text}\n"));
                 exc::raise_exit(tagged_int(0));
                 return Err(NONE);
             }

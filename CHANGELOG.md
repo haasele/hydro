@@ -8,6 +8,12 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — Python stream routing
+
+- Usage/help/error/version output goes through `sys.stdout`/`sys.stderr`
+  instead of process streams, so `redirect_stderr` and `StdIOBuffer` capture
+  argparse diagnostics. `test_argparse` drops to **135 failures**.
+
 ### Argparse — constructor diagnostics
 
 - Match CPython's `unknown action`, `not callable` type and duplicate
