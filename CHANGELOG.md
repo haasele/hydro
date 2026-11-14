@@ -8,6 +8,13 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — callable classes and optional regex
+
+- `type=` accepts classes and callable native/extension objects, not only
+  function values.
+- `assertRaisesRegex(..., None, ...)` treats a `None` pattern as no regex,
+  matching CPython 3.14. `test_argparse` drops to **267 failures**.
+
 ### Argparse — Action, Namespace, super and exit status
 
 - `argparse.Action` is a real native class with keyword construction and

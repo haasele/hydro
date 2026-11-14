@@ -2068,6 +2068,9 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
                 if *argument != NONE
                     && value::as_str(*argument).is_none()
                     && value::as_function(*argument).is_none()
+                    && value::as_class(*argument).is_none()
+                    && value::as_ext_function(*argument).is_none()
+                    && !crate::modules::extension::ext_object_is_callable(*argument)
                     && !is_file_type_marker(*argument)
                 {
                     return type_error("add_argument() type must be callable or None");

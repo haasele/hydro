@@ -3439,7 +3439,7 @@ fn assert_raises(args: &[i64], with_regex: bool) -> i64 {
         let Some(&regex) = args.get(2) else {
             return missing_arguments("assertRaisesRegex");
         };
-        Some(regex)
+        (regex != NONE).then_some(regex)
     } else {
         None
     };
@@ -3473,7 +3473,7 @@ fn assert_raises_with_keywords(args: &[i64], keywords: &[(String, i64)], with_re
         let Some(&regex) = args.get(2) else {
             return missing_arguments("assertRaisesRegex");
         };
-        Some(regex)
+        (regex != NONE).then_some(regex)
     } else {
         None
     };
