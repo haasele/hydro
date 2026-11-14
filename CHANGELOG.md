@@ -8,6 +8,12 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — positional mutex enforcement
+
+- Positional arguments participate in their mutually exclusive group's
+  duplicate check, so `--foo X`/`--spam S X` fail like CPython.
+  `test_argparse` drops to **201 failures**.
+
 ### Argparse — single-part star metavars
 
 - `nargs='*'` accepts a one-element metavar tuple and renders `[A ...]`.

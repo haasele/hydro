@@ -3603,6 +3603,21 @@ impl<'a> Scan<'a> {
     /// Applies one positional occurrence.
     fn apply_positional(&mut self, index: usize, raw: &[i64]) -> Result<(), i64> {
         let spec = self.view.options[index].clone();
+        if let Some(group) = self.view.groups.get(spec.group) {
+            if group.mutex && spec.group < self.group_hit.len() {
+                let name = self.action_name(&spec);
+                if let Some(previous) = self.group_hit[spec.group] {
+                    if previous != index {
+                        let previous_name = self.action_name(&self.view.options[previous]);
+                        return Err(self.fail(
+                            RUNTIME_ERROR,
+                            &format!("argument {name}: not allowed with argument {previous_name}"),
+                        ));
+                    }
+                }
+                self.group_hit[spec.group] = Some(index);
+            }
+        }
         self.seen[index] = true;
         if matches!(
             spec.nargs,
