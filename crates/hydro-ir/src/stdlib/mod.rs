@@ -215,7 +215,6 @@ pub static MODULES: &[&ModuleSpec] = &[
     &MMAP,
     &HTTP,
     &HTTP_CLIENT,
-    &HTTP_COOKIES,
     &HTTP_SERVER,
     &POSTGRES,
     &MEMCACHED,

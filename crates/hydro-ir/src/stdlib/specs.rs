@@ -6997,6 +6997,12 @@ pub static HTTP: ModuleSpec = ModuleSpec {
         c("HTTPStatus", Type::Any),
         // Nested native submodules exposed as module values.
         c("client", Type::Any),
+        // `http.cookies` is the CPython pure-Python module linked as source
+        // (see the frontend's native-package source hook): the name is listed
+        // here so `from http import cookies` lowers, while the runtime resolves
+        // the attribute to the compiled unit. There is deliberately no native
+        // `http.cookies` spec: one would shadow the source implementation with
+        // class placeholders that have no cookie parsing behind them.
         c("cookies", Type::Any),
         c("server", Type::Any),
     ],
@@ -8525,24 +8531,6 @@ pub static HTML_ENTITIES: ModuleSpec = ModuleSpec {
     ],
 };
 
-/// `http.cookies`: cookie parsing and generation.
-pub static HTTP_COOKIES: ModuleSpec = ModuleSpec {
-    name: "http.cookies",
-    functions: &[
-        // The quoting helpers the module itself uses.
-        f("_quote", 1, 1, Type::Str),
-        f("_unquote", 1, 1, Type::Str),
-        kw("_getdate", 0, 1, Type::Str, &["future"]),
-    ],
-    constants: &[
-        c("CookieError", Type::Any),
-        c("Morsel", Type::Any),
-        c("BaseCookie", Type::Any),
-        c("SimpleCookie", Type::Any),
-        c("__all__", Type::List),
-    ],
-};
-
 /// `importlib.abc`: the abstract loader and finder classes.
 pub static IMPORTLIB_ABC: ModuleSpec = ModuleSpec {
     name: "importlib.abc",
@@ -9415,6 +9403,20 @@ mod tests {
         // `enum` is the vendored CPython `enum.py`, not a native module: the
         // central table must not claim it, so the loader resolves `stdlib/enum.py`.
         assert!(module("enum").is_none(), "enum must not be a native module");
+    }
+
+    #[test]
+    fn http_cookies_is_source_linked_not_native() {
+        // `http.cookies` is the CPython pure module compiled from
+        // `Lib/http/cookies.py`; a native spec of the same name would shadow it
+        // with class placeholders that cannot parse cookies. The parent still
+        // declares the attribute so `from http import cookies` lowers.
+        assert!(
+            module("http.cookies").is_none(),
+            "http.cookies must resolve to its Python source, not a native spec"
+        );
+        assert_eq!(constant("http", "cookies").unwrap().ty, Type::Any);
+        assert_eq!(function("http", "serve").unwrap().max_args, 4);
     }
 
     #[test]

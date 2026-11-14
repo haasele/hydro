@@ -2188,7 +2188,9 @@ impl ModuleLoader {
         scan: &mut ImportScan,
         conditional: bool,
     ) {
-        if hydro_ir::stdlib::module(name).is_some() {
+        if hydro_ir::stdlib::module(name).is_some()
+            && cpython_native_submodule_source(name).is_none()
+        {
             return;
         }
         if name == "__main__" {
@@ -2829,15 +2831,98 @@ fn vendored_native_submodule(name: &str) -> Option<(&'static str, &'static str)>
 /// if any alias names one.
 ///
 /// `from unittest import mock` must link `unittest.mock`; the plain module
-/// attribute (`unittest.mock`) is served by the native parent instead.
+/// attribute (`unittest.mock`) is served by the native parent instead. The
+/// same applies to a source-backed native submodule such as `http.cookies`: it
+/// is linked only when its source actually resolves, so an environment without
+/// a CPython `Lib` tree keeps the declaration-only fallback instead of failing
+/// to compile.
 fn vendored_native_member(module: &str, names: &[ast::Alias]) -> Option<String> {
     names.iter().find_map(|alias| {
         if alias.name.as_str() == "*" {
             return None;
         }
         let full = format!("{module}.{}", alias.name);
-        vendored_native_submodule(&full).map(|_| full)
+        if vendored_native_submodule(&full).is_some()
+            || cpython_native_submodule_source(&full).is_some()
+        {
+            Some(full)
+        } else {
+            None
+        }
     })
+}
+
+/// Pure-Python submodules of *native* packages whose implementation is the
+/// CPython standard-library source rather than a Hydro-vendored flat file.
+///
+/// `http` is the native HTTP server package: it has no Python package
+/// directory and no `__path__`, so `http.cookies` cannot be found by the
+/// ordinary `root/http/cookies.py` chain (that chain would also load
+/// `http/__init__.py` and replace the native parent). The child is resolved
+/// directly and compiled with `http` as its import package, exactly like
+/// [`vendored_native_submodule`], but from the CPython sysroot so the real
+/// cookie classes are linked instead of class placeholders. The map is
+/// deliberately closed: only modules Hydro links from the standard library are
+/// listed, so an unrelated `pkg.sub` keeps failing instead of borrowing a file.
+fn cpython_native_submodule(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "http.cookies" => Some(("http/cookies.py", "http")),
+        _ => None,
+    }
+}
+
+/// The source file of a [`cpython_native_submodule`], resolved in the
+/// standard-library sysroot.
+///
+/// Only standard-library roots participate — the vendored `stdlib/` tree, the
+/// `HYDRO_STDLIB` sysroot and the pinned `.hydro/cpython/Python-*/Lib` cache —
+/// so a site-packages or `PYTHONPATH` entry never satisfies a module whose
+/// implementation is the standard library's. `None` when no CPython `Lib` tree
+/// is available, which leaves the name to its native spec (if any) instead of
+/// turning the import into a hard compile error.
+fn cpython_native_submodule_source(name: &str) -> Option<ResolvedModule> {
+    let (relative, package) = cpython_native_submodule(name)?;
+    for root in stdlib_source_roots() {
+        let path = root.join(relative);
+        if path.is_file() {
+            return Some(ResolvedModule {
+                path,
+                name: name.to_string(),
+                package: package.to_string(),
+                root,
+                namespace: false,
+            });
+        }
+    }
+    None
+}
+
+/// Standard-library source roots used by [`cpython_native_submodule_source`].
+///
+/// The vendored tree wins first (a shipped compatibility file would shadow the
+/// generic CPython source, like every other vendored module), then
+/// `HYDRO_STDLIB`, then the pinned `.hydro/cpython/Python-*/Lib` cache that
+/// development builds and unit tests use when the variable is unset. Missing
+/// and non-directory entries are dropped and duplicates are searched only once
+/// (compared after canonicalization).
+fn stdlib_source_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(root) = bundled_stdlib_root() {
+        roots.push(root.to_path_buf());
+    }
+    if let Some(list) = std::env::var_os("HYDRO_STDLIB") {
+        roots.extend(std::env::split_paths(&list));
+    }
+    roots.extend(pinned_cpython_lib_roots().iter().cloned());
+    let mut seen = HashSet::new();
+    roots.retain(|root| {
+        if !root.is_dir() {
+            return false;
+        }
+        let key = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        seen.insert(key)
+    });
+    roots
 }
 
 /// Resolves `name` on the module search path.
@@ -2858,6 +2943,12 @@ fn vendored_stdlib_module(name: &str) -> bool {
 fn resolve_module(roots: &[PathBuf], name: &str) -> Option<Vec<ResolvedModule>> {
     if name.is_empty() || name.split('.').any(|part| part.is_empty()) {
         return None;
+    }
+    // A source-backed submodule of a native package (`http.cookies`) has no
+    // parent directory on the search path; resolve the child directly from the
+    // CPython sysroot and keep the native parent as its package.
+    if let Some(resolved) = cpython_native_submodule_source(name) {
+        return Some(vec![resolved]);
     }
     // A vendored submodule of a native package has no parent directory on the
     // search path; resolve it directly from the bundled `stdlib/` tree.
@@ -6111,6 +6202,49 @@ mod tests {
         assert!(names.contains(&"enum.<module>"), "{names:?}");
         assert!(names.contains(&"copy.<module>"), "{names:?}");
         assert!(names.contains(&"test.support.<module>"), "{names:?}");
+    }
+
+    #[test]
+    fn native_http_package_links_its_cpython_cookies_source() {
+        // `http` is a native package with no directory of its own, so
+        // `http.cookies` cannot come from the ordinary `root/http/cookies.py`
+        // chain. The loader must link the CPython child as a compiled unit
+        // while the native parent stays authoritative, and no native
+        // `http.cookies` spec may shadow the source.
+        assert!(
+            hydro_ir::stdlib::module("http.cookies").is_none(),
+            "a native spec would shadow the CPython source module"
+        );
+        let _env = env_lock();
+        let dir = TestDir::new("http-cookies-source");
+        let lib = dir.path.join("Lib");
+        let project = dir.path.join("project");
+        fs::create_dir_all(lib.join("http")).expect("create http directory");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(
+            lib.join("http").join("cookies.py"),
+            "class SimpleCookie:\n    def __init__(self):\n        self.value = 7\n",
+        )
+        .expect("write cookies source");
+        let main = project.join("main.py");
+        fs::write(
+            &main,
+            "from http import cookies\nprint(cookies.SimpleCookie().value)\n",
+        )
+        .expect("write entry");
+
+        let _stdlib = EnvVar::set("HYDRO_STDLIB", lib.as_os_str());
+        let _pythonpath = EnvVar::unset("PYTHONPATH");
+
+        let chain = resolve_module(&[], "http.cookies").expect("http.cookies must resolve");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].path, lib.join("http").join("cookies.py"));
+        assert_eq!(chain[0].package, "http");
+        assert!(!chain[0].namespace);
+
+        let program = program(&main);
+        let names = initializer_names(&program);
+        assert!(names.contains(&"http.cookies.<module>"), "{names:?}");
     }
 
     #[test]

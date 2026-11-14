@@ -4006,10 +4006,82 @@ fn summary_usage_part(
 }
 
 fn format_usage_text(view: &View) -> String {
-    format_usage_text_with(view, &active_palette(view.color))
+    // `format_usage` builds its own formatter, so a custom `formatter_class`
+    // controls the wrap width exactly as it does for `format_help`.
+    let mut resolved = view.clone();
+    let layout = resolve_formatter_layout(&mut resolved);
+    if exc::pending() {
+        return String::new();
+    }
+    let palette = active_palette(resolved.color);
+    format_usage_text_with(&resolved, &palette, layout.width)
 }
 
-fn format_usage_text_with(view: &View, palette: &Palette) -> String {
+/// Display width of a rendered fragment. ANSI SGR sequences emitted by
+/// [`Palette::paint`] occupy no terminal columns, matching CPython's
+/// `_decolor` before measuring a usage part.
+fn display_width(text: &str) -> usize {
+    let mut width = 0;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
+/// CPython's `get_lines` closure from `_format_usage`: greedily packs `parts`
+/// into lines no wider than `text_width` display columns. Continuation lines
+/// start with `indent` spaces; when `prefix` is given, line accounting starts
+/// after the prefix and the first line is returned without the indent so the
+/// caller can prepend the prefix.
+fn wrap_usage_parts<'a, I>(
+    parts: I,
+    indent: usize,
+    text_width: usize,
+    prefix: Option<&str>,
+) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let indent_text = " ".repeat(indent);
+    let mut lines = Vec::new();
+    let mut line: Vec<&'a str> = Vec::new();
+    let mut line_len = match prefix {
+        Some(prefix) => prefix.chars().count() - 1,
+        None => indent - 1,
+    };
+    for part in parts {
+        let part_len = display_width(part);
+        if line_len + 1 + part_len > text_width && !line.is_empty() {
+            lines.push(format!("{indent_text}{}", line.join(" ")));
+            line.clear();
+            line_len = indent - 1;
+        }
+        line.push(part);
+        line_len += 1 + part_len;
+    }
+    if !line.is_empty() {
+        lines.push(format!("{indent_text}{}", line.join(" ")));
+    }
+    if prefix.is_some() {
+        if let Some(first) = lines.first_mut() {
+            *first = first.chars().skip(indent).collect();
+        }
+    }
+    lines
+}
+
+fn format_usage_text_with(view: &View, palette: &Palette, width: usize) -> String {
     if let Some(usage) = &view.usage {
         let colored_prog = format!(
             "{}{}{}{}",
@@ -4021,7 +4093,8 @@ fn format_usage_text_with(view: &View, palette: &Palette) -> String {
             palette.usage, palette.reset, palette.prog_extra, usage, palette.reset
         );
     }
-    let mut parts: Vec<String> = Vec::new();
+    let mut optionals: Vec<String> = Vec::new();
+    let mut positionals: Vec<String> = Vec::new();
     // Optionals first, in declaration order, with mutex groups collapsed.
     let mut rendered_groups: Vec<usize> = Vec::new();
     for spec in view.options.iter() {
@@ -4047,7 +4120,7 @@ fn format_usage_text_with(view: &View, palette: &Palette) -> String {
                     ));
                 }
                 let body = alternatives.join(" | ");
-                parts.push(if group.required {
+                optionals.push(if group.required {
                     format!("({body})")
                 } else {
                     format!("[{body}]")
@@ -4055,7 +4128,7 @@ fn format_usage_text_with(view: &View, palette: &Palette) -> String {
                 continue;
             }
         }
-        parts.push(summary_usage_part(view, spec, palette, false, false));
+        optionals.push(summary_usage_part(view, spec, palette, false, false));
     }
     for spec in view.options.iter().filter(|spec| spec.positional) {
         // A positional already rendered as part of a mutex group is not
@@ -4067,19 +4140,102 @@ fn format_usage_text_with(view: &View, palette: &Palette) -> String {
         {
             continue;
         }
-        parts.push(summary_usage_part(view, spec, palette, false, false));
+        positionals.push(summary_usage_part(view, spec, palette, false, false));
     }
     if let Some(subparsers) = &view.subparsers {
-        parts.push(palette.paint(&palette.summary_action, &subparser_metavar(subparsers)));
+        positionals.push(palette.paint(&palette.summary_action, &subparser_metavar(subparsers)));
     }
+
+    // CPython lays the usage out as `prog` followed by the optionals and then
+    // the positionals, wrapping at `text_width` columns when it does not fit.
+    const PREFIX: &str = "usage: ";
+    let prefix_width = PREFIX.chars().count();
+    let prog_width = view.prog.chars().count();
+    // CPython joins with `filter(None, ...)`, so an empty prog or an empty
+    // action spelling contributes no separator.
+    let mut joined = String::new();
+    for part in std::iter::once(view.prog.as_str())
+        .chain(optionals.iter().map(String::as_str))
+        .chain(positionals.iter().map(String::as_str))
+    {
+        if part.is_empty() {
+            continue;
+        }
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        joined.push_str(part);
+    }
+    let mut rendered = joined;
+    if prefix_width + display_width(&rendered) > width {
+        let short_prog = (prefix_width + prog_width) as u128 * 4 <= width as u128 * 3;
+        if short_prog {
+            // Follow the program name with the optionals, aligning the
+            // continuation lines under the first action.
+            let indent = prefix_width + prog_width + 1;
+            let lines = if !optionals.is_empty() {
+                let mut lines = wrap_usage_parts(
+                    std::iter::once(view.prog.as_str()).chain(optionals.iter().map(String::as_str)),
+                    indent,
+                    width,
+                    Some(PREFIX),
+                );
+                lines.extend(wrap_usage_parts(
+                    positionals.iter().map(String::as_str),
+                    indent,
+                    width,
+                    None,
+                ));
+                lines
+            } else if !positionals.is_empty() {
+                wrap_usage_parts(
+                    std::iter::once(view.prog.as_str())
+                        .chain(positionals.iter().map(String::as_str)),
+                    indent,
+                    width,
+                    Some(PREFIX),
+                )
+            } else {
+                vec![view.prog.clone()]
+            };
+            rendered = lines.join("\n");
+        } else {
+            // The program name alone nearly fills the line: put it on its own
+            // line and indent every action by the usage prefix width.
+            let indent = prefix_width;
+            let mut lines = wrap_usage_parts(
+                optionals
+                    .iter()
+                    .chain(positionals.iter())
+                    .map(String::as_str),
+                indent,
+                width,
+                None,
+            );
+            if lines.len() > 1 {
+                // Optionals and positionals each start a fresh block.
+                lines = wrap_usage_parts(optionals.iter().map(String::as_str), indent, width, None);
+                lines.extend(wrap_usage_parts(
+                    positionals.iter().map(String::as_str),
+                    indent,
+                    width,
+                    None,
+                ));
+            }
+            lines.insert(0, view.prog.clone());
+            rendered = lines.join("\n");
+        }
+    }
+
+    // Color only the program name; the action parts already carry their own
+    // styles.
+    let rest = rendered
+        .strip_prefix(view.prog.as_str())
+        .unwrap_or(rendered.as_str());
     let mut text = format!(
-        "{}usage: {}{}{}{}",
-        palette.usage, palette.reset, palette.prog, view.prog, palette.reset
+        "{}usage: {}{}{}{}{}",
+        palette.usage, palette.reset, palette.prog, view.prog, palette.reset, rest
     );
-    for part in parts {
-        text.push(' ');
-        text.push_str(&part);
-    }
     text.push('\n');
     text
 }
@@ -4370,7 +4526,7 @@ fn format_help_text(view: &View) -> String {
         .unwrap_or(0);
     let help_position = (max_invocation + 2).min(layout.max_help_position);
 
-    let mut text = format_usage_text_with(view, &palette);
+    let mut text = format_usage_text_with(view, &palette, layout.width);
     if let Some(description) = &view.description {
         text.push('\n');
         if view.raw_text() || view.raw_description() {

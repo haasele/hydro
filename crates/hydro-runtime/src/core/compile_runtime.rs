@@ -1496,21 +1496,22 @@ impl Interp {
             }
         }
 
-        // Without an explicit metaclass or extra keywords the class comes
-        // straight from the bases' metaclass; every other shape goes through
-        // the `__build_class__` construction step so the selected metaclass
-        // and `__init_subclass__` receive the header keywords.
-        let mut class = if metaclass.is_none() && keywords.is_empty() {
-            runtime_builtins::type_new(value::NONE, name_value, bases, namespace)
-        } else {
-            runtime_builtins::type_build_class_keywords(
-                metaclass.unwrap_or(value::NONE),
-                name_value,
-                bases,
-                namespace,
-                &keywords,
-            )
-        };
+        // A class statement is `__build_class__`: the selected metaclass runs
+        // `__prepare__` (the mapping it returns collects the body's entries)
+        // and then its `__new__`/`__init__`, while `__init_subclass__` receives
+        // the header keywords. The step is unconditional — a class with no
+        // explicit `metaclass=` and no keywords can still inherit one from a
+        // base (`class Color(Enum)` inherits `EnumType`), whose protocol must
+        // run exactly as it does for the statically compiled statement. The
+        // allocator-only `type_new` entry point is `type.__new__` itself and
+        // deliberately skips those hooks; it is not class-statement creation.
+        let mut class = runtime_builtins::type_build_class_keywords(
+            metaclass.unwrap_or(value::NONE),
+            name_value,
+            bases,
+            namespace,
+            &keywords,
+        );
         if exc::pending() {
             return Err(Flow::Raise);
         }

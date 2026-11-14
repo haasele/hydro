@@ -4267,6 +4267,23 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     if module == "http" && name == "HTTPStatus" {
         return http_status_class();
     }
+    // `http.cookies` is CPython's pure-Python module, linked by the frontend's
+    // native-package source hook because the native `http` package has no
+    // `__path__`. A native spec for it would shadow the real cookie classes
+    // with placeholders, so the name has no spec of its own: the generic
+    // nested-module fallback below cannot see the compiled unit. Return the
+    // loaded `sys.modules` entry when present. Without a loaded unit or a real
+    // spec there is nothing to materialise; report the ordinary missing
+    // attribute instead of fabricating an empty module that would hide the
+    // executed source's classes.
+    if module == "http" && name == "cookies" {
+        if let Some(loaded) = registry_lookup("http.cookies") {
+            return loaded;
+        }
+        if stdlib::module("http.cookies").is_some() {
+            return module_value_by_name("http.cookies");
+        }
+    }
     // `__future__.CO_FUTURE_BARRY_AS_BDFL`: the compiler flag `compile()`
     // callers pass; CPython's value is 0x400000.
     if module == "__future__" && name == "CO_FUTURE_BARRY_AS_BDFL" {
@@ -4583,6 +4600,11 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
     // entry so `import asyncio.coroutines` followed by
     // `asyncio.coroutines._is_coroutine` keeps module identity.
     let nested = format!("{module}.{name}");
+    // A source submodule may be linked/executed without a native spec; use
+    // the published sys.modules entry before fabricating a placeholder.
+    if let Some(loaded) = registry_lookup(&nested) {
+        return loaded;
+    }
     if stdlib::module(&nested).is_some() {
         return registry_lookup(&nested).unwrap_or_else(|| value::module_value(nested));
     }
@@ -10470,16 +10492,19 @@ fn contextmanager_generator(manager: i64) -> Result<i64, i64> {
 /// `RuntimeError("generator didn't yield")`; an exception raised by the body
 /// propagates unchanged.
 fn contextmanager_enter(manager: i64) -> i64 {
+    // CPython's `__enter__` deletes `args`, `kwds` and `func` before it
+    // advances the generator: they are only needed to recreate the manager,
+    // which entering makes impossible, and the deletion releases the call
+    // operands the caller handed to the decorator. Doing it before the
+    // generator check also covers a manager whose `gen` was replaced or is
+    // not a generator.
+    value::instance_remove_attr(manager, "args");
+    value::instance_remove_attr(manager, "kwds");
+    value::instance_remove_attr(manager, "func");
     let generator = match contextmanager_generator(manager) {
         Ok(generator) => generator,
         Err(err) => return err,
     };
-    // CPython's `__enter__` drops `args`, `kwds` and `func` (they are only
-    // needed for recreation, which is impossible after entering); this also
-    // releases the argument objects the caller handed to the decorator.
-    value::instance_remove_attr(manager, "args");
-    value::instance_remove_attr(manager, "kwds");
-    value::instance_remove_attr(manager, "func");
     if crate::fiber::is_done(generator) {
         if crate::fiber::has_error(generator) {
             return crate::fiber::raise_error(generator);

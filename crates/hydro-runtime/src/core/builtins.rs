@@ -5064,15 +5064,20 @@ fn instantiate(class: i64, argc: usize, argv: *const i64) -> i64 {
 /// the metaclass resolved from the bases runs its `__new__`/`__init__` hooks
 /// (see [`value::class_new_multi`]). Functions in the namespace become normal
 /// methods; every other value is a class attribute.
+///
+/// CPython's three-argument `type()` never runs the metaclass `__prepare__`:
+/// the caller built `namespace` itself, so the class-body protocol belongs to
+/// a class statement ([`type_build_class_keywords`]) instead.
 fn type_three_arg(name: i64, bases: i64, namespace: i64) -> i64 {
-    type_new_impl(NONE, name, bases, namespace, true, &[])
+    type_new_impl(NONE, name, bases, namespace, true, false, &[])
 }
 
 /// `type(name, bases, namespace, **kwds)`: CPython forwards the class-header
 /// keywords to the metaclass selected from `bases`, so
-/// `EnumType.__new__(..., boundary=..., _simple=...)` sees them.
+/// `EnumType.__new__(..., boundary=..., _simple=...)` sees them. Like the
+/// positional form, it does not call `__prepare__`.
 fn type_three_arg_kw(name: i64, bases: i64, namespace: i64, keywords: &[(String, i64)]) -> i64 {
-    type_new_impl(NONE, name, bases, namespace, true, keywords)
+    type_new_impl(NONE, name, bases, namespace, true, false, keywords)
 }
 
 /// Keyword form of the three-argument `type(...)` call (`hydro_call_kw` on the
@@ -5103,11 +5108,21 @@ pub(crate) fn type_build_keywords(args: &[i64], keywords: &[(String, i64)]) -> i
 ///
 /// The header's `metaclass=` operand is `__build_class__`'s parameter, not a
 /// class keyword: the caller consumes it and passes it separately here. The
-/// remaining `keywords` go to the selected metaclass's `__new__`/`__init__`
-/// and then to `__init_subclass__`, which is what makes
-/// `class C(Base, flag=True)` receive `flag` by name. The three-argument
-/// `type(...)` path above keeps CPython's different semantics, where every
-/// keyword (including `metaclass`) is an ordinary class keyword.
+/// remaining `keywords` go first to the selected metaclass's `__prepare__`,
+/// then to its `__new__`/`__init__` and to `__init_subclass__`, which is what
+/// makes `class C(Base, flag=True)` receive `flag` by name.
+///
+/// `__prepare__` runs before the class body in CPython, and the mapping it
+/// returns collects the body's entries; because the runtime compiler evaluates
+/// the body first, the collected entries are replayed into that mapping through
+/// its `__setitem__` and the same mapping is then handed to the metaclass
+/// hooks — the behaviour of the statically compiled class statement
+/// (`value::class_new_multi`). `enum`'s `_EnumDict` records members in that
+/// `__setitem__`, and `EnumType.__new__` reads `classdict._member_names`.
+///
+/// The three-argument `type(...)` path above keeps CPython's different
+/// semantics: it is a direct constructor call, so `__prepare__` never runs and
+/// every keyword (including `metaclass`) is an ordinary class keyword.
 pub(crate) fn type_build_class_keywords(
     metaclass: i64,
     name: i64,
@@ -5115,7 +5130,7 @@ pub(crate) fn type_build_class_keywords(
     namespace: i64,
     keywords: &[(String, i64)],
 ) -> i64 {
-    type_new_impl(metaclass, name, bases, namespace, true, keywords)
+    type_new_impl(metaclass, name, bases, namespace, true, true, keywords)
 }
 
 /// `type.__new__(metaclass, name, bases, namespace)`: the underlying class
@@ -5124,11 +5139,22 @@ pub(crate) fn type_build_class_keywords(
 ///
 /// Unlike `type(name, bases, namespace)`, this does not run the metaclass
 /// `__new__`/`__init__` hooks: the caller is that hook, so re-entering it
-/// would recurse. The metaclass must be a class (or the `type` builtin, which
-/// denotes the native `type` class).
+/// would recurse, and it must not run `__prepare__` either (the caller already
+/// built the namespace). The metaclass must be a class (or the `type` builtin,
+/// which denotes the native `type` class).
 pub(crate) fn type_new(metaclass: i64, name: i64, bases: i64, namespace: i64) -> i64 {
-    type_new_impl(metaclass, name, bases, namespace, false, &[])
+    type_new_impl(metaclass, name, bases, namespace, false, false, &[])
 }
+
+/// The hidden class-header keyword channel of the class-statement path.
+///
+/// `value::class_new_multi` accepts the header keywords (`class C(Base,
+/// flag=True)`'s `flag`) as namespace entries under this prefix because the
+/// same function serves the statically compiled statement, whose keyword
+/// operands arrive through the attribute buffer; `value::split_class_keywords`
+/// strips them again before class creation. The NUL prefix cannot collide with
+/// a Python identifier.
+const CLASS_KEYWORD_PREFIX: &str = "\0class_kw:";
 
 fn type_new_impl(
     metaclass: i64,
@@ -5136,6 +5162,7 @@ fn type_new_impl(
     bases: i64,
     namespace: i64,
     run_hooks: bool,
+    run_prepare: bool,
     keywords: &[(String, i64)],
 ) -> i64 {
     // `type.__new__` names itself in argument diagnostics; the builtin
@@ -5225,16 +5252,52 @@ fn type_new_impl(
         let Some(attr) = value::as_str(key) else {
             return exc::raise_with_message(TYPE_ERROR, "type() namespace keys must be strings");
         };
-        if value::as_function(item).is_some() {
+        // A runtime-compiled class body has already applied its decorators, so
+        // `@classmethod`/`@staticmethod` reach the namespace as descriptor
+        // objects; the statically compiled statement records the bare function
+        // with its binding kind instead. Restore that plan for a class
+        // statement: the class-creation protocol finds the metaclass hooks
+        // through the plan (`class_member`), and `enum`'s
+        // `EnumType.__prepare__` is a classmethod. A `property` keeps its
+        // descriptor object, which carries the setter/deleter a binding kind
+        // cannot, and the direct `type(...)`/`type.__new__` paths keep
+        // CPython's namespace-of-descriptors semantics.
+        let descriptor = if run_prepare {
+            value::as_descriptor(item)
+        } else {
+            None
+        };
+        let binding = descriptor.and_then(|state| match state.kind {
+            value::DescriptorKind::Classmethod => Some(MethodKind::Classmethod),
+            value::DescriptorKind::Staticmethod => Some(MethodKind::Staticmethod),
+            _ => None,
+        });
+        if let Some(kind) = binding {
+            let target = descriptor.map_or(item, |state| state.target);
+            methods.push((attr.to_string(), target, kind));
+        } else if value::as_function(item).is_some() {
             methods.push((attr.to_string(), item, MethodKind::Normal));
         } else {
             attrs.push((attr.to_string(), item));
         }
     }
-    if run_hooks {
+    if !run_hooks {
+        value::class_new_multi_without_hooks(name_text, base_values, metaclass, methods, attrs)
+    } else if !run_prepare {
         value::class_new_multi_kw(name_text, base_values, metaclass, methods, attrs, keywords)
     } else {
-        value::class_new_multi_without_hooks(name_text, base_values, metaclass, methods, attrs)
+        // A class statement is `__build_class__`: the metaclass `__prepare__`
+        // builds the namespace the body's entries are collected into (through
+        // the mapping's `__setitem__`, which is how `enum._EnumDict` records
+        // members), and that same mapping is what `__new__`/`__init__`
+        // receive. The header keywords ride the hidden attribute channel
+        // because `class_new_multi` is the class-creation entry point that
+        // starts from `__prepare__`.
+        let mut attrs = attrs;
+        for (keyword, value) in keywords {
+            attrs.push((format!("{CLASS_KEYWORD_PREFIX}{keyword}"), *value));
+        }
+        value::class_new_multi(name_text, base_values, metaclass, methods, attrs)
     }
 }
 

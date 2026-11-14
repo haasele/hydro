@@ -8,6 +8,19 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-11-14 cookie source linking and usage wrapping
+
+- `http.cookies` now links and executes its CPython source instead of exposing
+  an empty native spec; `SimpleCookie` and the rest of the module resolve.
+- Runtime class statements call the metaclass `__prepare__` and preserve
+  classmethod/staticmethod binding kinds, enabling dynamically executed enum
+  classes.
+- argparse usage output wraps long prog/optional/positional parts with
+  CPython's indentation and formatter width.
+- Added the missing `http.cookies` source-link, traceback, and native
+  class-identity tests; canonical suite updated to **3294 passed, 1 skipped**.
+- Clippy/fmt/verify green.
+
 ### Compatibility — 2026-11-14 traceback and parent-parser grouping
 
 - Exceptions now expose a real one-frame `__traceback__`/`sys.exc_info()[2]`
