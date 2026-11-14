@@ -8,6 +8,15 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — bare builtin classes and interpreter symbols
+
+- Bare `object` and `complex` names now resolve to the cached builtin classes
+  instead of raising `NameError`; `test_pickle` reaches its doctest discovery
+  path.
+- Export `PyExc_InterpreterError`/`PyExc_InterpreterNotFoundError` for the
+  3.14 extension ABI and keep `_interpreters` optional on unresolved private
+  symbols.
+
 ### Compatibility — datetime harness reach
 
 - `test_datetime` now discovers and runs **4656** pure/fast cases instead of

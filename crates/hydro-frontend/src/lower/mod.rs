@@ -18689,6 +18689,19 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
+                } else if matches!(name, "object" | "complex") && !self.unit_shadows_builtin(name) {
+                    // These two builtin types have no `Builtin` variant and
+                    // are served by the `builtins` module dispatcher, which
+                    // returns the cached class object rather than a function.
+                    HExpr {
+                        kind: HExprKind::ModuleAttr {
+                            module: "builtins".to_string(),
+                            name: name.to_string(),
+                        },
+                        ty: Ty::Concrete(Type::Any),
+                        line,
+                        col,
+                    }
                 } else if name == "NotImplemented" {
                     // Python's singleton constant. It is materialised as the
                     // runtime's reserved immediate; module-level bindings above
