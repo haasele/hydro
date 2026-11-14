@@ -95,12 +95,15 @@ impl Scratch {
 
     fn grow(&mut self) {
         let capacity = self.slots.len() * 2;
-        abi::hydro_gc_frame_pop(self.token);
+        // Allocate the larger buffer while the old frame is still published:
+        // `vec!` can trigger a collection, and the values in `slots[..used]`
+        // are reachable only through that frame. Popping first would let the
+        // collector free them and the copy below would store stale pointers.
         let mut slots = vec![0i64; capacity];
         let none = hydro_runtime::host::none();
         slots.fill(none);
         slots[..self.used].copy_from_slice(&self.slots[..self.used]);
-        self.token = abi::hydro_gc_frame_push(slots.as_mut_ptr(), capacity);
+        abi::hydro_gc_frame_resize(self.token, slots.as_mut_ptr(), capacity);
         self.slots = slots;
         abi::hydro_gc_frame_used(self.token, self.used);
     }

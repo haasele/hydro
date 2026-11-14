@@ -2210,6 +2210,8 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         f("map", 2, usize::MAX, Type::Any),
         f("filter", 2, 2, Type::Any),
         f("bytes", 0, 3, Type::Bytes),
+        f("bytearray", 0, 3, Type::Any),
+        f("memoryview", 1, 1, Type::Any),
         f("iter", 1, 2, Type::Any),
         f("next", 1, 2, Type::Any),
         // `aiter(obj)` / `anext(aiterator[, default])`: the async builtins.
@@ -2367,6 +2369,7 @@ pub static BUILTINS: ModuleSpec = ModuleSpec {
         c("MemoryError", Type::Any),
         c("ModuleNotFoundError", Type::Any),
         c("NameError", Type::Any),
+        c("UnboundLocalError", Type::Any),
         c("NotADirectoryError", Type::Any),
         c("NotImplementedError", Type::Any),
         c("OSError", Type::Any),

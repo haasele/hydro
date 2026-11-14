@@ -1960,6 +1960,15 @@ pub extern "C" fn hydro_gc_scope_push(base: *const i64, count: usize) -> usize {
     roots::scope_push(base, count)
 }
 
+/// Replaces the storage of the innermost shadow frame after a grow.
+///
+/// The caller must have copied the live prefix into `base` while the old
+/// frame was still published.
+#[no_mangle]
+pub extern "C" fn hydro_gc_frame_resize(token: usize, base: *mut i64, capacity: usize) {
+    roots::frame_resize(token, base, capacity)
+}
+
 /// Unregisters the innermost root range pushed by [`hydro_gc_scope_push`].
 /// Tokens must be popped in LIFO order.
 #[no_mangle]

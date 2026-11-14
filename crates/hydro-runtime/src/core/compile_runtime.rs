@@ -389,10 +389,9 @@ impl Roots {
 
     fn grow(&mut self) {
         let capacity = self.slots.len() * 2;
-        abi::hydro_gc_frame_pop(self.token);
         let mut slots = vec![value::NONE; capacity];
         slots[..self.used].copy_from_slice(&self.slots[..self.used]);
-        self.token = abi::hydro_gc_frame_push(slots.as_mut_ptr(), capacity);
+        abi::hydro_gc_frame_resize(self.token, slots.as_mut_ptr(), capacity);
         self.slots = slots;
         abi::hydro_gc_frame_used(self.token, self.used);
     }

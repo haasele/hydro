@@ -8,6 +8,18 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — 2026-11-14 shadow-root growth and builtin names
+
+- Shadow-root vectors now resize atomically: the larger buffer is allocated
+  and copied while the old frame is still published, then switched with
+  `hydro_gc_frame_resize`. Previously the collector could free values copied
+  into the new buffer during its allocation, corrupting large dict literals
+  and `_strptime`'s regex table under GC pressure.
+- `UnboundLocalError` is a compiler exception kind and a `builtins` constant;
+  `bytearray` and `memoryview` resolve as `builtins` members, fixing
+  `eval()`/fresh-import paths.
+- `BooleanOptionalAction` rejects `const=` with CPython's TypeError.
+
 ### Compatibility — 2026-11-14 cookie source linking and usage wrapping
 
 - `http.cookies` now links and executes its CPython source instead of exposing

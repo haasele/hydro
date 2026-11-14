@@ -1940,6 +1940,12 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
         }
     }
 
+    if action_value == Some(ActionKind::BooleanOptional) && const_value.is_some() {
+        return type_error(
+            "BooleanOptionalAction.__init__() got an unexpected keyword argument 'const'",
+        );
+    }
+
     let positional = !names.iter().any(|name| starts_with_prefix(name, &prefixes));
     if !positional
         && names

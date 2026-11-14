@@ -784,6 +784,8 @@ pub enum ExcKind {
     ProcessLookupError,
     /// `TimeoutError`: an `OSError` subclass.
     TimeoutError,
+    /// `UnboundLocalError`: a `NameError` subclass.
+    UnboundLocalError,
     /// Alias of [`ExcKind::OSError`]: `EnvironmentError is OSError` in
     /// CPython, so it shares the `OSError` tag and class name.
     EnvironmentError,
@@ -879,6 +881,7 @@ const EXCEPTION_ENTRIES: &[(ExcKind, u32, &str)] = &[
     (ExcKind::PermissionError, 65, "PermissionError"),
     (ExcKind::ProcessLookupError, 66, "ProcessLookupError"),
     (ExcKind::TimeoutError, 67, "TimeoutError"),
+    (ExcKind::UnboundLocalError, 68, "UnboundLocalError"),
     // CPython aliases: `EnvironmentError is OSError` and `IOError is OSError`.
     (ExcKind::EnvironmentError, 10, "OSError"),
     (ExcKind::IOError, 10, "OSError"),
@@ -1057,6 +1060,7 @@ mod tests {
             (ExcKind::PermissionError, 65, "PermissionError"),
             (ExcKind::ProcessLookupError, 66, "ProcessLookupError"),
             (ExcKind::TimeoutError, 67, "TimeoutError"),
+            (ExcKind::UnboundLocalError, 68, "UnboundLocalError"),
         ];
         for (kind, tag, name) in expected {
             assert_eq!(kind.tag(), tag, "{name} tag");

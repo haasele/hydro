@@ -275,6 +275,32 @@ pub fn frame_pop(token: usize) {
     });
 }
 
+/// Replaces the storage and capacity of the frame identified by `token`.
+///
+/// Used when a shadow-root vector grows: the old buffer stays published while
+/// the larger buffer is allocated and copied, then this atomic resize switches
+/// the frame to it. Allocating after [`frame_pop`] would leave the copied
+/// values unrooted during the allocator's collection.
+pub fn frame_resize(token: usize, base: *mut i64, capacity: usize) {
+    with_active(|roots| match roots.frame_tokens.last().copied() {
+        Some(top) if top == token => {
+            let Some(frame) = roots.frames.last_mut() else {
+                debug_assert!(false, "hydro_gc_frame_resize: no frame for token");
+                return;
+            };
+            frame.base = base;
+            frame.capacity = capacity;
+            frame.used = frame.used.min(capacity);
+            frame.low = base as usize;
+            frame.high = base as usize + capacity * std::mem::size_of::<i64>();
+        }
+        _ => debug_assert!(
+            false,
+            "hydro_gc_frame_resize: token {token} is not the innermost frame"
+        ),
+    });
+}
+
 /// Sets the scanned prefix of the frame identified by `token`.
 ///
 /// The prefix may be narrowed so a temporary that is dead for the rest of the
