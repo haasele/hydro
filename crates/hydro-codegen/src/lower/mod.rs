@@ -7730,6 +7730,7 @@ impl<'a, 'b, M: Module> Lower<'a, 'b, M> {
             | Builtin::GetIpython
             | Builtin::ByteArray
             | Builtin::MemoryView
+            | Builtin::Object
             | Builtin::Classmethod
             | Builtin::Staticmethod
             | Builtin::Property

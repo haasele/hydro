@@ -8,6 +8,13 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Fixed — object constructor and BooleanOptionalAction names
+
+- Bare `object()` is now a compiler builtin that creates an `object`
+  instance, and `--no-*` option names are rejected for
+  `BooleanOptionalAction` with CPython's `ValueError`. `test_argparse`
+  reaches its enum-backed test cases.
+
 ### Fixed — native class `__module__`
 
 - Native classes without an explicit class-statement namespace now report

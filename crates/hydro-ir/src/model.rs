@@ -332,6 +332,7 @@ pub enum Builtin {
     Bool,
     /// `type(x)`.
     Type,
+    Object,
     /// `super(type, object)`: the explicit two-argument form builds a runtime
     /// super proxy positioned after `type` in the MRO of `object`'s class (or
     /// of `object` itself when it is a class). The zero-argument form cannot
@@ -530,6 +531,7 @@ impl Builtin {
             Builtin::Abs => "abs",
             Builtin::Bool => "bool",
             Builtin::Type => "type",
+            Builtin::Object => "object",
             Builtin::Super => "super",
             Builtin::Reversed => "reversed",
             Builtin::Import => "__import__",
@@ -602,6 +604,7 @@ impl Builtin {
             "abs" => Builtin::Abs,
             "bool" => Builtin::Bool,
             "type" => Builtin::Type,
+            "object" => Builtin::Object,
             "super" => Builtin::Super,
             "reversed" => Builtin::Reversed,
             "__import__" => Builtin::Import,
@@ -1161,8 +1164,10 @@ mod tests {
         // form is lowered by the frontend to the receiver helper.
         assert_eq!(Builtin::from_name("super"), Some(Builtin::Super));
         assert_eq!(Builtin::Super.name(), "super");
-        // `object` is a `builtins` constant (a class value), not a compiler
-        // builtin: bare calls lower through the module attribute.
-        assert_eq!(Builtin::from_name("object"), None);
+        // `object()` is a compiler builtin call; a bare `object` value still
+        // lowers through the `builtins` module attribute so it denotes the
+        // class rather than the constructor function.
+        assert_eq!(Builtin::from_name("object"), Some(Builtin::Object));
+        assert_eq!(Builtin::Object.name(), "object");
     }
 }

@@ -3788,6 +3788,9 @@ impl<'a> Checker<'a> {
                 }
                 let _ = self.inf.unify(out, Ty::Concrete(Type::List));
             }
+            Builtin::Object => {
+                let _ = self.inf.unify(out, Ty::Concrete(Type::Any));
+            }
             Builtin::Type => {
                 // `type(x)` reports an object's type; `type(name, bases, ns)`
                 // creates a class and may forward class-header keywords to the

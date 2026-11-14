@@ -1978,6 +1978,13 @@ fn add_argument(parser: i64, args: &[i64], keywords: &[(String, i64)], group: us
         return value_error("could not derive a destination name");
     }
 
+    if action == ActionKind::BooleanOptional && !positional {
+        if let Some(flag) = names.iter().find(|name| name.starts_with("--no-")) {
+            return value_error(&format!(
+                "invalid option name '{flag}' for BooleanOptionalAction"
+            ));
+        }
+    }
     let mut flags = names;
     let mut negative_flags: Vec<String> = Vec::new();
     if action == ActionKind::BooleanOptional && !positional {

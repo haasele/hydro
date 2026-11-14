@@ -6736,6 +6736,10 @@ pub(crate) fn call_builtin(builtin: Builtin, argc: usize, argv: *const i64) -> i
         Builtin::Bytes => bytes_build(argc, argv),
         Builtin::ByteArray => bytearray_build(argc, argv),
         Builtin::MemoryView => memoryview_build(argc, argv),
+        Builtin::Object => match args {
+            [] => value::instance_new(value::object_class()),
+            _ => builtin_arity_error("object", "no", argc),
+        },
         Builtin::Classmethod => match args {
             [target] => value::classmethod_new(*target),
             _ => builtin_arity_error("classmethod", "exactly one", argc),

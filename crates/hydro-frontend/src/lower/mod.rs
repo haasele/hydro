@@ -18624,7 +18624,9 @@ impl<'a> Lowerer<'a> {
                         line,
                         col,
                     }
-                } else if let Some(builtin) = builtin_by_name(name) {
+                } else if let Some(builtin) =
+                    builtin_by_name(name).filter(|builtin| *builtin != Builtin::Object)
+                {
                     HExpr {
                         kind: HExprKind::BuiltinRef(builtin),
                         ty: Ty::Concrete(Type::Function),
@@ -21902,6 +21904,40 @@ impl<'a> Lowerer<'a> {
             let Some((args, keywords)) = self.module_arguments(call, fs, spec, line, col) else {
                 return self.error_expr(call.range);
             };
+            return HExpr {
+                kind: HExprKind::ModuleCall {
+                    module: "builtins".to_string(),
+                    function: name.to_string(),
+                    args,
+                    keywords,
+                },
+                ty: self.infer.fresh(),
+                line,
+                col,
+            };
+        }
+
+        // `object()`/`complex()` have no `Builtin` variant; the cached
+        // classes are served by the `builtins` module dispatcher. Route the
+        // call there so a bare constructor does not read as a missing global.
+        if name == "complex"
+            && !self.unit_shadows_builtin(name)
+            && !call
+                .args
+                .iter()
+                .any(|arg| matches!(arg, ast::Expr::Starred(_)))
+        {
+            let mut args = Vec::with_capacity(call.args.len());
+            for argument in &call.args {
+                args.push(self.expr(argument, fs));
+            }
+            let mut keywords = Vec::with_capacity(call.keywords.len());
+            for keyword in &call.keywords {
+                let Some(argument) = &keyword.arg else {
+                    return self.lower_dynamic_call(call, fs, line, col);
+                };
+                keywords.push((argument.to_string(), self.expr(&keyword.value, fs)));
+            }
             return HExpr {
                 kind: HExprKind::ModuleCall {
                     module: "builtins".to_string(),
