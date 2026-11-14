@@ -2842,6 +2842,15 @@ pub(crate) fn call_kw(
         // flag is evaluated like CPython's `PyObject_IsTrue`, so any object
         // works; a duplicate or unknown keyword reports `TypeError` without
         // dropping it.
+        if matches!(
+            &func.body,
+            FunctionBody::Native {
+                module: "builtins",
+                name: "sorted",
+            }
+        ) {
+            return sorted_keywords(argc, argv, kwargc, kw_argv);
+        }
         if matches!(&func.body, FunctionBody::Builtin(Builtin::Zip)) {
             let mut strict = false;
             let mut seen = false;
@@ -3334,6 +3343,9 @@ pub(crate) fn call_kw(
         // direct lowering path appends the key slot instead.
         if matches!(builtin, Builtin::Max | Builtin::Min) {
             return extremum_keywords(*builtin, argc, argv, kwargc, kw_argv);
+        }
+        if *builtin == Builtin::Sorted {
+            return sorted_keywords(argc, argv, kwargc, kw_argv);
         }
         // `str(object='', encoding=..., errors=...)`: every parameter is
         // accepted by name. An omitted object yields `""` even when
@@ -7429,6 +7441,71 @@ fn extremum_values(
     best
 }
 
+/// Binds `sorted(iterable, *, key=None, reverse=False)` for a call through a
+/// first-class builtin. The positional slots stay available for the direct
+/// codegen path, which passes key/reverse positionally.
+fn sorted_keywords(argc: usize, argv: *const i64, kwargc: usize, kw_argv: *const i64) -> i64 {
+    if argc > 0 && argv.is_null() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("sorted() received {argc} argument(s) without an argument buffer"),
+        );
+    }
+    if argc > 3 {
+        return builtin_arity_error("sorted", "1 to 3", argc);
+    }
+    let mut slots: [Option<i64>; 3] = [None; 3];
+    if argc > 0 {
+        // SAFETY: checked above; caller contract.
+        for (index, item) in unsafe { std::slice::from_raw_parts(argv, argc) }
+            .iter()
+            .enumerate()
+        {
+            slots[index] = Some(*item);
+        }
+    }
+    if kwargc > 0 {
+        if kw_argv.is_null() || kwargc > isize::MAX as usize / (2 * std::mem::size_of::<i64>()) {
+            return exc::raise_with_message(
+                TYPE_ERROR,
+                "keyword arguments were passed without an argument buffer",
+            );
+        }
+        // SAFETY: ABI contract: `kw_argv` holds `2 * kwargc` readable values.
+        let pairs = unsafe { std::slice::from_raw_parts(kw_argv, kwargc * 2) };
+        for pair in pairs.as_chunks::<2>().0 {
+            let Some(keyword) = value::as_str(pair[0]) else {
+                return exc::raise_with_message(TYPE_ERROR, "keyword name must be str");
+            };
+            let index = match keyword {
+                "key" => 1,
+                "reverse" => 2,
+                _ => {
+                    return exc::raise_with_message(
+                        TYPE_ERROR,
+                        &format!("sorted() got an unexpected keyword argument '{keyword}'"),
+                    )
+                }
+            };
+            if slots[index].is_some() {
+                return exc::raise_with_message(
+                    TYPE_ERROR,
+                    &format!("sorted() got multiple values for argument '{keyword}'"),
+                );
+            }
+            slots[index] = Some(pair[1]);
+        }
+    }
+    let Some(iterable) = slots[0] else {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            "sorted() missing required argument 'iterable' (pos 1)",
+        );
+    };
+    let values = [iterable, slots[1].unwrap_or(NONE), slots[2].unwrap_or(NONE)];
+    sorted(3, values.as_ptr())
+}
+
 /// Binds `max`/`min` keyword arguments (`key=`, `default=`) for a call
 /// through a first-class builtin value (or the frontend's keyword lowering of
 /// the single-iterable `default=` form).
@@ -8174,6 +8251,19 @@ fn subclass_check(subclass: i64, class: i64) -> Result<bool, SubclassError> {
 /// Tri-state check: `Some(true/false)` for a recognized type object, `None`
 /// when `target` is not a type. Tuples and PEP 604 unions are checked element
 /// by element.
+/// `isinstance(x, classmethod|staticmethod|property)`: the descriptor
+/// factories are builtin functions, but CPython exposes them as types. A
+/// descriptor value matches its own factory; every other value is `False`.
+fn descriptor_type_check(value: i64, builtin: Builtin) -> Option<bool> {
+    let kind = match builtin {
+        Builtin::Classmethod => value::DescriptorKind::Classmethod,
+        Builtin::Staticmethod => value::DescriptorKind::Staticmethod,
+        Builtin::Property => value::DescriptorKind::Property,
+        _ => return None,
+    };
+    Some(value::as_descriptor(value).is_some_and(|descriptor| descriptor.kind == kind))
+}
+
 fn type_check(value: i64, target: i64) -> Option<bool> {
     if let Some(types) = value::as_tuple(target) {
         for &candidate in types {
@@ -8246,6 +8336,9 @@ fn type_check(value: i64, target: i64) -> Option<bool> {
     if let Some(function) = value::as_function(target) {
         match &function.body {
             FunctionBody::Builtin(builtin) => {
+                if let Some(result) = descriptor_type_check(value, *builtin) {
+                    return Some(result);
+                }
                 if *builtin == Builtin::Tuple {
                     return Some(instance_of(
                         value,
@@ -8269,8 +8362,18 @@ fn type_check(value: i64, target: i64) -> Option<bool> {
             // so the `Builtin` arm above never sees it. It denotes the cached
             // class of the same name, exactly like the bare spelling.
             FunctionBody::Native {
-                module: "builtins", ..
+                module: "builtins",
+                name,
             } => {
+                let descriptor = match *name {
+                    "classmethod" => Some(Builtin::Classmethod),
+                    "staticmethod" => Some(Builtin::Staticmethod),
+                    "property" => Some(Builtin::Property),
+                    _ => None,
+                };
+                if let Some(builtin) = descriptor {
+                    return descriptor_type_check(value, builtin);
+                }
                 let class = value::builtin_type_class(target)?;
                 if let Some(result) =
                     value::class_display_name(class).and_then(|name| named_type_check(value, name))

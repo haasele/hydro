@@ -74,7 +74,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use hydro_ir::{BinOp, ExcKind, ParamKind, UnOp};
+use hydro_ir::{BinOp, Builtin, ExcKind, ParamKind, UnOp};
 use num_bigint::BigInt;
 use rustpython_parser::{ast, parse, Mode};
 
@@ -616,6 +616,7 @@ fn run_registered(entry: &RegisteredDef, all: &[i64]) -> i64 {
     for (name, item) in entry.slot_names.iter().zip(params) {
         interp.set_local(name, *item);
     }
+    interp.receiver = params.first().copied().unwrap_or(value::NONE);
     match &entry.def {
         DynDef::Function { body, .. } => match interp.exec_stmts(body) {
             Ok(()) => value::NONE,
@@ -657,6 +658,9 @@ struct Interp {
     last_value: i64,
     global_names: Vec<String>,
     nonlocal_names: Vec<String>,
+    /// First bound parameter of the running runtime-compiled method. Zero-arg
+    /// `super()` uses it as `__self__`; `NONE` outside a method body.
+    receiver: i64,
     roots: Roots,
 }
 
@@ -686,6 +690,7 @@ impl Interp {
             last_value: value::NONE,
             global_names: Vec::new(),
             nonlocal_names: Vec::new(),
+            receiver: value::NONE,
             roots,
         }
     }
@@ -909,10 +914,7 @@ impl Interp {
                 ExcKind::NotImplementedError,
                 "async with inside runtime-compiled source",
             )),
-            ast::Stmt::Match(_) => Err(raise_tag(
-                ExcKind::NotImplementedError,
-                "match statement inside runtime-compiled source",
-            )),
+            ast::Stmt::Match(node) => self.exec_match(node),
             ast::Stmt::TryStar(_) => Err(raise_tag(
                 ExcKind::NotImplementedError,
                 "except* inside runtime-compiled source",
@@ -1634,6 +1636,21 @@ impl Interp {
         Ok(function)
     }
 
+    /// Whether `function` is the `super` builtin (bare or `builtins`-qualified).
+    fn is_super_function(function: i64) -> bool {
+        let Some(function) = value::as_function(function) else {
+            return false;
+        };
+        matches!(
+            &function.body,
+            value::FunctionBody::Builtin(Builtin::Super)
+                | value::FunctionBody::Native {
+                    module: "builtins",
+                    name: "super",
+                }
+        )
+    }
+
     fn call_value(
         &mut self,
         function: i64,
@@ -1793,10 +1810,18 @@ impl Interp {
                 &comprehension.generators,
                 CompKind::Dict((*comprehension.key).clone(), (*comprehension.value).clone()),
             ),
-            ast::Expr::GeneratorExp(_) => Err(raise_tag(
-                ExcKind::NotImplementedError,
-                "a generator expression",
-            )),
+            // The runtime compiler is a bounded evaluator: it materialises a
+            // generator expression into a list iterator instead of a suspended
+            // generator frame. Consumers that only iterate (including
+            // `_strptime`'s regex table) see the same values; `send`/`throw`
+            // semantics require the compiled frontend path.
+            ast::Expr::GeneratorExp(comprehension) => {
+                let list = self.eval_comprehension(
+                    &comprehension.generators,
+                    CompKind::List((*comprehension.elt).clone()),
+                )?;
+                Ok(iter::iter_new(list))
+            }
             ast::Expr::Await(_) => Err(raise_tag(ExcKind::NotImplementedError, "await")),
             ast::Expr::Yield(node) => {
                 // `yield`/`yield value` lowers to the fiber suspension point
@@ -1919,7 +1944,85 @@ impl Interp {
                 }
             }
         }
+        if args.is_empty()
+            && keywords.is_empty()
+            && self.receiver != value::NONE
+            && methods::defining_class() != value::NONE
+            && Self::is_super_function(function)
+        {
+            let proxy = methods::super_proxy(self.receiver, 0, std::ptr::null());
+            if exc::pending() {
+                return Err(Flow::Raise);
+            }
+            return Ok(proxy);
+        }
         self.call_value(function, args, keywords)
+    }
+
+    /// `match subject:` for the pattern forms the bounded runtime evaluator
+    /// supports: literals/singletons, `|`, captures and wildcards, with
+    /// guards. Sequence/mapping/class patterns stay unsupported and raise
+    /// instead of guessing.
+    fn exec_match(&mut self, node: &ast::StmtMatch) -> Result<(), Flow> {
+        let subject = self.eval(&node.subject)?;
+        self.roots.push(subject);
+        for case in &node.cases {
+            if !self.pattern_matches(&case.pattern, subject)? {
+                continue;
+            }
+            if let Some(guard) = &case.guard {
+                let result = self.eval(guard)?;
+                self.roots.push(result);
+                if !value::truthy(result) {
+                    continue;
+                }
+            }
+            return self.exec_stmts(&case.body);
+        }
+        Ok(())
+    }
+
+    fn pattern_matches(&mut self, pattern: &ast::Pattern, subject: i64) -> Result<bool, Flow> {
+        match pattern {
+            ast::Pattern::MatchValue(value) => {
+                let expected = self.eval(&value.value)?;
+                self.roots.push(expected);
+                Ok(container::equals(subject, expected))
+            }
+            ast::Pattern::MatchSingleton(singleton) => Ok(match singleton.value {
+                ast::Constant::None => subject == value::NONE,
+                ast::Constant::Bool(true) => subject == value::TRUE,
+                ast::Constant::Bool(false) => subject == value::FALSE,
+                _ => false,
+            }),
+            ast::Pattern::MatchOr(or) => {
+                for alternative in &or.patterns {
+                    if self.pattern_matches(alternative, subject)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            ast::Pattern::MatchAs(capture) => {
+                if let Some(inner) = &capture.pattern {
+                    if !self.pattern_matches(inner, subject)? {
+                        return Ok(false);
+                    }
+                }
+                if let Some(name) = &capture.name {
+                    self.set_local(name, subject);
+                }
+                Ok(true)
+            }
+            ast::Pattern::MatchStar(_) => Err(raise_tag(
+                ExcKind::NotImplementedError,
+                "star pattern outside a sequence",
+            )),
+            _ => Err(raise_tag(
+                ExcKind::NotImplementedError,
+                "sequence, mapping and class patterns inside runtime-compiled source",
+            )),
+        }
     }
 
     fn eval_elements(&mut self, elements: &[ast::Expr]) -> Result<Vec<i64>, Flow> {

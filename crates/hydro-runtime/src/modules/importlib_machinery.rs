@@ -1768,6 +1768,25 @@ fn exec_source_module(module: i64, name: &str, path: &str) -> i64 {
     }
     let code_roots = crate::heap::root_values(&[code]);
     let result = crate::core::compile_runtime::builtin_exec(&[code, namespace]);
+    if !exc::pending() {
+        // `module_from_spec` creates a namespace object for source modules
+        // discovered at runtime, while `exec` runs against the live globals
+        // view. Publish the body's bindings onto the namespace object so
+        // `module.__dict__` and attribute reads see the classes/functions the
+        // body defined.
+        if let Some(entries) = value::as_dict(namespace) {
+            let entries = entries.to_vec();
+            if let Some(mut pairs) = value::namespace_pairs_mut(module) {
+                for (key, item) in entries {
+                    if let Some(name) = value::as_str(key) {
+                        if !pairs.pairs.iter().any(|(existing, _)| existing == name) {
+                            pairs.pairs.push((name.to_string(), item));
+                        }
+                    }
+                }
+            }
+        }
+    }
     crate::heap::release_roots(code_roots);
     crate::heap::release_roots(roots);
     result

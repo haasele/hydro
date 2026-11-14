@@ -503,7 +503,7 @@ impl Drop for DefiningClassGuard {
 
 /// The class body that contains the running method, or [`NONE`] when the
 /// current thread is not executing a method.
-fn defining_class() -> i64 {
+pub(crate) fn defining_class() -> i64 {
     DEFINING_CLASS.with(|slot| slot.get())
 }
 
@@ -558,7 +558,7 @@ fn super_init(obj: i64, args: &[i64], keywords: &[(String, i64)]) -> i64 {
 /// otherwise the runtime recorded it when the method was entered (see
 /// [`defining_class`]). An explicit class argument is validated against the
 /// receiver's linearization.
-fn super_proxy(obj: i64, argc: usize, argv: *const i64) -> i64 {
+pub(crate) fn super_proxy(obj: i64, argc: usize, argv: *const i64) -> i64 {
     // `__self__` may be an instance (ordinary method) or a class object
     // (`classmethod` calling `super()`), matching CPython's second argument.
     let start = match value::instance_class_value(obj) {

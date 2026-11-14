@@ -8078,6 +8078,9 @@ fn invoke_metaclass_hook_with(
         MethodKind::Staticmethod if name != "__new__" => MethodKind::Staticmethod,
         _ => MethodKind::Normal,
     };
+    // The hook is a method of `metaclass`; zero-argument `super()` inside it
+    // must start after that class in the MRO.
+    let _defining_guard = crate::core::methods::DefiningClassGuard::enter(metaclass);
     crate::core::methods::call_user_method(
         receiver, metaclass, kind, function, name, args, keywords,
     )

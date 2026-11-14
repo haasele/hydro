@@ -8,6 +8,19 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-11-14 dynamic source execution
+
+- The runtime compiler now supports zero-argument `super()` inside
+  metaclass hooks and runtime-compiled methods, `match` statements with
+  literal/OR/capture/wildcard patterns and guards, eager generator
+  expressions, `sorted()` key/reverse keywords, and descriptor
+  `isinstance` targets (`staticmethod`, `classmethod`, `property`).
+- Source modules materialised at runtime publish their body bindings onto
+  the module namespace, so `module.__dict__` sees definitions as well as
+  imports.
+- `_strptime` now loads and constructs its regex table under GC pressure,
+  unblocking the datetime harness path.
+
 ### Fixed — 2026-11-14 shadow-root growth and builtin names
 
 - Shadow-root vectors now resize atomically: the larger buffer is allocated
