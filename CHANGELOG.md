@@ -8,6 +8,13 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### IO — BytesIO-backed TextIOWrapper
+
+- `io.BufferedWriter(io.BytesIO(...))` and `io.TextIOWrapper` now accept a
+  BytesIO sink, including subclass `super().__init__(..., newline=...)`
+  calls. This removes the `StdIOBuffer` construction failure that blocked the
+  argparse std-stream tests.
+
 ### Argparse — iterable choices, registration, exceptions
 
 - `choices=` accepts any iterable container (enum classes, ranges, sets and

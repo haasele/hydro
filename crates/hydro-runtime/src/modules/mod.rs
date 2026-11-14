@@ -28436,39 +28436,77 @@ const TW_SEEN: &str = "_hydro_tw_seen";
 /// wrapper's lifetime keeps the buffer reachable.
 fn text_io_wrapper_class() -> i64 {
     let native = |name: &'static str, arity: usize| value::native_function_new("io", name, arity);
-    in_memory_class(
-        "TextIOWrapper",
-        io_base_class("TextIOBase"),
-        vec![
-            ("read".to_string(), native("TextIOWrapper.read", 2)),
-            ("readline".to_string(), native("TextIOWrapper.readline", 2)),
-            (
-                "readlines".to_string(),
-                native("TextIOWrapper.readlines", 2),
-            ),
-            ("write".to_string(), native("TextIOWrapper.write", 2)),
-            (
-                "writelines".to_string(),
-                native("TextIOWrapper.writelines", 2),
-            ),
-            ("close".to_string(), native("TextIOWrapper.close", 1)),
-            ("flush".to_string(), native("TextIOWrapper.flush", 1)),
-            ("seek".to_string(), native("TextIOWrapper.seek", 3)),
-            ("tell".to_string(), native("TextIOWrapper.tell", 1)),
-            ("readable".to_string(), native("TextIOWrapper.readable", 1)),
-            ("writable".to_string(), native("TextIOWrapper.writable", 1)),
-            ("seekable".to_string(), native("TextIOWrapper.seekable", 1)),
-            ("isatty".to_string(), native("TextIOWrapper.isatty", 1)),
-            ("detach".to_string(), native("TextIOWrapper.detach", 1)),
-            (
-                "__enter__".to_string(),
-                native("TextIOWrapper.__enter__", 1),
-            ),
-            ("__exit__".to_string(), native("TextIOWrapper.__exit__", 4)),
-            ("__iter__".to_string(), native("TextIOWrapper.__iter__", 1)),
-            ("__next__".to_string(), native("TextIOWrapper.__next__", 1)),
-        ],
-    )
+    let mut methods = vec![
+        ("read".to_string(), native("TextIOWrapper.read", 2)),
+        ("readline".to_string(), native("TextIOWrapper.readline", 2)),
+        (
+            "readlines".to_string(),
+            native("TextIOWrapper.readlines", 2),
+        ),
+        ("write".to_string(), native("TextIOWrapper.write", 2)),
+        (
+            "writelines".to_string(),
+            native("TextIOWrapper.writelines", 2),
+        ),
+        ("close".to_string(), native("TextIOWrapper.close", 1)),
+        ("flush".to_string(), native("TextIOWrapper.flush", 1)),
+        ("seek".to_string(), native("TextIOWrapper.seek", 3)),
+        ("tell".to_string(), native("TextIOWrapper.tell", 1)),
+        ("readable".to_string(), native("TextIOWrapper.readable", 1)),
+        ("writable".to_string(), native("TextIOWrapper.writable", 1)),
+        ("seekable".to_string(), native("TextIOWrapper.seekable", 1)),
+        ("isatty".to_string(), native("TextIOWrapper.isatty", 1)),
+        ("detach".to_string(), native("TextIOWrapper.detach", 1)),
+        (
+            "__enter__".to_string(),
+            native("TextIOWrapper.__enter__", 1),
+        ),
+        ("__exit__".to_string(), native("TextIOWrapper.__exit__", 4)),
+        ("__iter__".to_string(), native("TextIOWrapper.__iter__", 1)),
+        ("__next__".to_string(), native("TextIOWrapper.__next__", 1)),
+    ];
+    let init = value::native_function_new("io", "TextIOWrapper.__init__", 7);
+    let params = vec![
+        value::ParamMeta {
+            name: "self".to_string(),
+            kind: hydro_ir::ParamKind::Positional,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "buffer".to_string(),
+            kind: hydro_ir::ParamKind::Positional,
+            default: None,
+        },
+        value::ParamMeta {
+            name: "encoding".to_string(),
+            kind: hydro_ir::ParamKind::Positional,
+            default: Some(NONE),
+        },
+        value::ParamMeta {
+            name: "errors".to_string(),
+            kind: hydro_ir::ParamKind::Positional,
+            default: Some(NONE),
+        },
+        value::ParamMeta {
+            name: "newline".to_string(),
+            kind: hydro_ir::ParamKind::Positional,
+            default: Some(NONE),
+        },
+        value::ParamMeta {
+            name: "line_buffering".to_string(),
+            kind: hydro_ir::ParamKind::Positional,
+            default: Some(value::FALSE),
+        },
+        value::ParamMeta {
+            name: "write_through".to_string(),
+            kind: hydro_ir::ParamKind::Positional,
+            default: Some(value::FALSE),
+        },
+    ];
+    value::function_set_signature(init, params);
+    value::function_set_full_entry(init, text_io_wrapper_init_entry as *const () as usize);
+    methods.push(("__init__".to_string(), init));
+    in_memory_class("TextIOWrapper", io_base_class("TextIOBase"), methods)
 }
 
 /// Snapshot of the remaining buffer content and the position it started at.
@@ -28506,8 +28544,14 @@ fn tw_errors(instance: i64) -> i64 {
 fn tw_check_open(instance: i64) -> Option<i64> {
     let closed = value::instance_attr(instance, "closed") == Some(TRUE);
     let buffer = tw_buffer(instance);
-    let buffer_closed = match buffer.and_then(value::as_file) {
-        Some(file) => file.closed(),
+    let buffer_closed = match buffer {
+        Some(buffer) if bytes_io_instance(buffer).is_some() => {
+            value::instance_attr(buffer, IO_CLOSED) == Some(TRUE)
+        }
+        Some(buffer) => match value::as_file(buffer) {
+            Some(file) => file.closed(),
+            None => true,
+        },
         None => true,
     };
     if closed || buffer_closed {
@@ -28522,10 +28566,23 @@ fn tw_check_open(instance: i64) -> Option<i64> {
 /// `io.TextIOWrapper(buffer, encoding=None, errors=None, newline=None,
 /// line_buffering=False, write_through=False)`.
 fn text_io_wrapper_new(args: &[i64]) -> i64 {
+    text_io_wrapper_init(NONE, args)
+}
+
+extern "C" fn text_io_wrapper_init_entry(argv: *const i64) -> i64 {
+    // SAFETY: the class binder supplies `(self, buffer, encoding, errors,
+    // newline, line_buffering, write_through)`.
+    let instance = unsafe { *argv };
+    let args = unsafe { std::slice::from_raw_parts(argv.add(1), 6) };
+    text_io_wrapper_init(instance, args)
+}
+
+fn text_io_wrapper_init(existing: i64, args: &[i64]) -> i64 {
     let Some(&buffer) = args.first() else {
         return exc::raise_with_message(TYPE_ERROR, "TextIOWrapper() missing buffer argument");
     };
-    let Some(file) = value::as_file(buffer) else {
+    let file = value::as_file(buffer);
+    if file.is_none() && bytes_io_instance(buffer).is_none() {
         return exc::raise_with_message(
             TYPE_ERROR,
             &format!(
@@ -28533,7 +28590,7 @@ fn text_io_wrapper_new(args: &[i64]) -> i64 {
                 value::type_name(buffer)
             ),
         );
-    };
+    }
     let encoding = match args.get(1).copied() {
         None | Some(NONE) => "utf-8".to_string(),
         Some(value) => {
@@ -28596,11 +28653,17 @@ fn text_io_wrapper_new(args: &[i64]) -> i64 {
     };
     let line_buffering = args.get(4).copied().is_some_and(value::truthy);
     let write_through = args.get(5).copied().is_some_and(value::truthy);
-    // Snapshot the buffer's metadata before allocating the instance.
-    let name = file.path().to_string();
-    let mode = file.mode();
-    let binary = file.binary();
-    let instance = value::instance_new(text_io_wrapper_class());
+    // Snapshot the buffer's metadata before allocating the instance. A
+    // BytesIO sink has no path and is a binary write stream.
+    let (name, mode, binary) = match file {
+        Some(file) => (file.path().to_string(), file.mode(), file.binary()),
+        None => (String::new(), 'w', true),
+    };
+    let instance = if existing == NONE {
+        value::instance_new(text_io_wrapper_class())
+    } else {
+        existing
+    };
     let roots = heap::root_values(&[instance, buffer]);
     io_store(instance, TW_BUFFER, buffer);
     io_store(instance, "buffer", buffer);
@@ -28786,6 +28849,14 @@ fn buffered_reader_new(args: &[i64]) -> i64 {
     }
 }
 
+/// Whether `value` is an `io.BytesIO` instance. BytesIO stores its bytes in
+/// the same instance attribute table as the io classes; wrappers treat it as
+/// the raw binary stream.
+fn bytes_io_instance(value: i64) -> Option<i64> {
+    let class = value::instance_class_value(value)?;
+    (value::class_display_name(class) == Some("BytesIO")).then_some(value)
+}
+
 /// `io.BufferedWriter(raw, buffer_size=DEFAULT_BUFFER_SIZE)`.
 ///
 /// Like [`buffered_reader_new`], this returns a second view of the existing
@@ -28798,6 +28869,16 @@ fn buffered_writer_new(args: &[i64]) -> i64 {
             "BufferedWriter() missing required argument 'raw'",
         );
     };
+    if let Some(stream) = bytes_io_instance(raw) {
+        if let Err(raised) = buffered_size_arg(args, "BufferedWriter") {
+            return raised;
+        }
+        // `StdIOBuffer` builds `BufferedWriter(BytesIO())`; the BytesIO is
+        // already the writable binary sink, and exposing itself as `raw`
+        // preserves `wrapper.buffer.raw.getvalue()`.
+        io_store(stream, "raw", stream);
+        return stream;
+    }
     let Some(file) = value::as_file(raw) else {
         return exc::raise_with_message(
             TYPE_ERROR,
@@ -29162,6 +29243,14 @@ fn tw_write(instance: i64, argument: i64) -> i64 {
     let text = text.to_string();
     let newline = tw_newline(instance);
     let translated = tw_translate_write(&text, newline.as_deref());
+    if let Some(stream) = tw_buffer(instance).and_then(bytes_io_instance) {
+        let bytes = value::bytes_new(translated.into_bytes());
+        let result = bytes_io_method("write", &[stream, bytes]);
+        if exc::pending() {
+            return result;
+        }
+        return encode_int(text.chars().count() as i64);
+    }
     let Some(file) = tw_file(instance) else {
         return exc::raise_with_message(VALUE_ERROR, "I/O operation on closed file.");
     };
@@ -29204,7 +29293,9 @@ fn tw_close(instance: i64) -> i64 {
     if value::instance_attr(instance, "closed") == Some(TRUE) {
         return NONE;
     }
-    if let Some(file) = tw_file(instance) {
+    if let Some(stream) = tw_buffer(instance).and_then(bytes_io_instance) {
+        bytes_io_method("close", &[stream]);
+    } else if let Some(file) = tw_file(instance) {
         file.close();
     }
     io_store(instance, "closed", TRUE);
@@ -29260,6 +29351,9 @@ fn text_io_wrapper_method(method: &str, args: &[i64]) -> i64 {
         "flush" => {
             if let Some(error) = tw_check_open(instance) {
                 return error;
+            }
+            if let Some(stream) = tw_buffer(instance).and_then(bytes_io_instance) {
+                return bytes_io_method("flush", &[stream]);
             }
             match tw_file(instance).map(|file| file.flush()) {
                 Some(Ok(())) => NONE,
