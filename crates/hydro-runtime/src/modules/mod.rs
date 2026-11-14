@@ -9041,6 +9041,7 @@ fn constant_value(module: &str, name: &str) -> i64 {
             | "BooleanOptionalAction"
             | "ArgumentError"
             | "ArgumentTypeError"
+            | "__all__"
             | "_sys"
             | "SUPPRESS"
             | "REMAINDER"),

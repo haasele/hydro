@@ -8,6 +8,11 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — `__all__`
+
+- Expose the argparse `__all__` list through the module constant dispatch.
+  `test_argparse` drops to **134 failures**.
+
 ### Argparse — Python stream routing
 
 - Usage/help/error/version output goes through `sys.stdout`/`sys.stderr`
