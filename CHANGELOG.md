@@ -8,6 +8,20 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Compatibility — 2026-11-14 traceback and parent-parser grouping
+
+- Exceptions now expose a real one-frame `__traceback__`/`sys.exc_info()[2]`
+  object backed by the recorded `FrameData`, so `traceback.extract_tb` sees
+  the raise site; `inspect.istraceback`/`getfile` recognize it.
+- `argparse` merges parent display/mutex groups into child parsers, preserving
+  `c:`/`x:` section headings for inherited options.
+- `isinstance` resolves `builtins.<type>` spellings and `range`; duplicate
+  native container classes from class-cache turnover no longer reject valid
+  list/tuple/set subclasses. `dict.fromkeys` is exposed on the `dict` spelling.
+- Dynamic module execution now reaches `test_datetime`/`test_contextlib` paths;
+  `test_yield_from` remains 43/43.
+- Workspace suite: **3292 passed, 1 skipped**; clippy/fmt/verify green.
+
 ### Compatibility — 2026-11-11 dynamic execution and official-cluster follow-up
 
 - Discovered `.py` modules now execute into their module namespace at runtime;

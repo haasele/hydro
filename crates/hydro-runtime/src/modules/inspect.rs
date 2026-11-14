@@ -16,22 +16,26 @@
 //!   `classify_class_attrs` over the recorded class namespaces (methods keep
 //!   their declared `staticmethod`/`classmethod`/`property` kind);
 //! * `getabsfile` (through the native `os.path` helpers);
-//! * `istraceback`/`ismethodwrapper`, which report `False` because Hydro
-//!   reifies neither value kind.
+//! * `istraceback`, which recognizes the traceback objects the exception
+//!   machinery materialises, and `ismethodwrapper`, which reports `False`
+//!   because Hydro does not reify that value kind.
 //!
 //! ## Precise unsupported areas (reported, not fabricated)
 //!
-//! * **Frames and code objects are real; tracebacks are not modelled.**
+//! * **Dead frames cannot be walked; tracebacks hold one recorded raise site.**
 //!   `currentframe()` returns the live activation, `isframe`/`iscode` answer
-//!   truthfully, `getfile` reports a frame/code object's real file, and
-//!   `getframeinfo` builds a `FrameInfo` namedtuple with the frame's file,
-//!   line, function name and source context. `getsource` returns the whole
-//!   file for a module and the definition block for a frame/code object;
-//!   function and class values carry no source position, so they raise
-//!   `OSError` exactly like CPython when the source cannot be located.
-//!   `stack()` builds the live caller-chain records, and `getclosurevars`
-//!   raises `NotImplementedError`: free/global/builtin name references live in
-//!   a code object the runtime does not reify.
+//!   truthfully, `getfile` reports a frame/code/traceback object's real file,
+//!   and `getframeinfo` builds a `FrameInfo` namedtuple with the frame's file,
+//!   line, function name and source context. A traceback materialised from an
+//!   exception payload carries the file, line and function recorded when the
+//!   exception was raised; its `f_back` chain is gone once the caller returned,
+//!   and a `raise` of a pre-built instance records its raise site. `getsource`
+//!   returns the whole file for a module and the definition block for a
+//!   frame/code object; function and class values carry no source position, so
+//!   they raise `OSError` exactly like CPython when the source cannot be
+//!   located. `stack()` builds the live caller-chain records, and
+//!   `getclosurevars` raises `NotImplementedError`: free/global/builtin name
+//!   references live in a code object the runtime does not reify.
 //! * **`getcomments` has no first line number for functions and classes.**
 //!   A Python module is read from its `__file__` and gets CPython's
 //!   top-of-file comment scan; every other object reports `None` instead of
@@ -2899,6 +2903,9 @@ fn getfile_impl(obj: i64) -> i64 {
     if let Some(state) = value::as_frame(obj) {
         return text(&state.data.file);
     }
+    if let Some(data) = exc::traceback_frame(obj) {
+        return text(&data.file);
+    }
     if let Some(state) = value::as_code(obj) {
         return text(&state.filename);
     }
@@ -3239,15 +3246,24 @@ fn getframeinfo_impl(args: &[i64]) -> i64 {
             }
         },
     };
-    let Some(state) = value::as_frame(frame) else {
+    // CPython accepts either a frame or a traceback and reports the
+    // traceback's `tb_lineno` for the latter.
+    let (data, frame_object, lineno) = if let Some(state) = value::as_frame(frame) {
+        (state.data.clone(), frame, state.data.current_line() as i64)
+    } else if let Some(data) = exc::traceback_frame(frame) {
+        let lineno = exc::traceback_lineno(frame)
+            .map(i64::from)
+            .unwrap_or_else(|| data.current_line() as i64);
+        let frame_object = value::instance_attr(frame, "tb_frame").unwrap_or(frame);
+        (data, frame_object, lineno)
+    } else {
         return type_error(&format!(
             "{} is not a frame or traceback object",
             value::repr(frame)
         ));
     };
-    let filename = state.data.file.clone();
-    let lineno = state.data.current_line() as i64;
-    let function = state.data.code_name();
+    let filename = data.file.clone();
+    let function = data.code_name();
     let class = frame_info_class();
     let filename_value = text(&filename);
     let function_value = text(&function);
@@ -3278,7 +3294,7 @@ fn getframeinfo_impl(args: &[i64]) -> i64 {
     let info = namedtuple_instance(
         class,
         &[
-            ("frame", frame),
+            ("frame", frame_object),
             ("filename", filename_value),
             ("lineno", lineno_value),
             ("function", function_value),
@@ -3594,9 +3610,9 @@ fn dunder_dict_of_class_impl(class: i64) -> i64 {
 }
 
 /// `isinstance(object, types.<class_name>)` for the `types` placeholder
-/// classes (`TracebackType`, `MethodWrapperType`). Hydro reifies neither kind,
-/// so the predicate reports `False` for every value, exactly like CPython
-/// reports `False` for values of another type.
+/// classes (`TracebackType`, `MethodWrapperType`). Hydro spells tracebacks as
+/// native instances of its own `traceback` class, so [`istraceback_impl`] checks
+/// that representation first and falls back here for any other value.
 fn is_types_instance(obj: i64, class_name: &str) -> i64 {
     let roots = heap::root_values(&[obj]);
     let class = crate::modules::types::constant(class_name);
@@ -3606,6 +3622,9 @@ fn is_types_instance(obj: i64, class_name: &str) -> i64 {
 }
 
 fn istraceback_impl(obj: i64) -> i64 {
+    if exc::is_traceback(obj) {
+        return TRUE;
+    }
     is_types_instance(obj, "TracebackType")
 }
 
@@ -3978,8 +3997,8 @@ pub(crate) fn call(function: &str, args: &[i64]) -> i64 {
         "getmro" => getmro_impl(args[0]),
         "_static_getmro" => static_getmro_impl(args[0]),
         "_get_dunder_dict_of_class" => dunder_dict_of_class_impl(args[0]),
-        // Frame and code objects are real runtime values; traceback objects
-        // are not modelled, so `istraceback` answers through `types` above.
+        // Frame, code and traceback objects are real runtime values;
+        // tracebacks are materialised from an exception's recorded raise site.
         "isframe" => value::bool_value(value::as_frame(args[0]).is_some()),
         "iscode" => value::bool_value(value::as_code(args[0]).is_some()),
         "ismethoddescriptor" => value::bool_value(object_is_method_descriptor(args[0])),

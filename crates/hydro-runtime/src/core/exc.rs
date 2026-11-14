@@ -1320,6 +1320,102 @@ pub(crate) fn current_frames() -> i64 {
     dict
 }
 
+// Traceback objects
+
+/// Cached native `traceback` class.
+///
+/// Hydro records one raise location per exception payload instead of a live
+/// `PyTracebackObject` chain, so a traceback is materialised on demand as a
+/// native instance carrying the standard `tb_frame`/`tb_lineno`/`tb_lasti`/
+/// `tb_next` surface. The shared native class gives every traceback the
+/// Python-visible type name CPython reports
+/// (`type(tb).__name__ == "traceback"`) and is invalidated with the rest of
+/// the type-class cache when a program run resets the heap.
+fn traceback_class() -> i64 {
+    value::native_class("traceback")
+}
+
+/// Whether `v` is a traceback object materialised by [`traceback_new`].
+pub(crate) fn is_traceback(v: i64) -> bool {
+    value::as_instance(v)
+        .and_then(|state| value::as_class(state.class))
+        .is_some_and(|class| class.name == "traceback")
+}
+
+/// Builds a traceback for one exception payload.
+///
+/// The single frame comes from the location recorded at raise time (file,
+/// 1-based line and activation name), never from the current stack: reading
+/// `e.__traceback__` after the frame returned must still report where the
+/// exception was raised. Payloads with no recorded activation (an exception
+/// constructed but not raised through source, or a runtime raise outside any
+/// frame) have no traceback, which is the honest `None`.
+pub(crate) fn traceback_new(data: &ExcData) -> Option<i64> {
+    if data.frame.is_empty() {
+        return None;
+    }
+    let class = traceback_class();
+    if class == NONE {
+        return None;
+    }
+    let frame = value::frame_new(std::sync::Arc::new(FrameData {
+        name: data.frame.clone(),
+        module: Mutex::new(String::new()),
+        file: data.file.clone(),
+        // The payload records the current line, not the function's definition
+        // line; `co_firstlineno` stays 0 ("unknown") rather than inventing one.
+        first_line: AtomicU32::new(0),
+        line: AtomicU32::new(data.line),
+        // A raise location carries no code flags or parameter metadata.
+        flags: AtomicU32::new(0),
+        argcount: AtomicUsize::new(0),
+        trace: Mutex::new(NONE),
+        parent: None,
+        locals: FrameLocals {
+            base: AtomicUsize::new(0),
+            slots: AtomicUsize::new(0),
+            names: Vec::new(),
+            snapshot: Mutex::new(None),
+        },
+    }));
+    let roots = crate::heap::root_values(&[class, frame]);
+    let traceback = value::instance_new(class);
+    let traceback_roots = crate::heap::root_values(&[traceback]);
+    let lineno = value::encode_int(i64::from(data.line)).expect("a u32 line fits in a tagged int");
+    let lasti = value::encode_int(-1).expect("-1 fits in a tagged int");
+    value::instance_setattr(traceback, "tb_frame".to_string(), frame);
+    value::instance_setattr(traceback, "tb_lineno".to_string(), lineno);
+    value::instance_setattr(traceback, "tb_lasti".to_string(), lasti);
+    value::instance_setattr(traceback, "tb_next".to_string(), NONE);
+    crate::heap::release_roots(traceback_roots);
+    crate::heap::release_roots(roots);
+    Some(traceback)
+}
+
+/// The frame record behind a traceback object, or `None` for any other value.
+pub(crate) fn traceback_frame(traceback: i64) -> Option<Arc<FrameData>> {
+    if !is_traceback(traceback) {
+        return None;
+    }
+    let frame = value::instance_attr(traceback, "tb_frame")?;
+    Some(value::as_frame(frame)?.data.clone())
+}
+
+/// The loop line recorded on a traceback object, or `None` for any other value.
+pub(crate) fn traceback_lineno(traceback: i64) -> Option<u32> {
+    if !is_traceback(traceback) {
+        return None;
+    }
+    let lineno = value::instance_attr(traceback, "tb_lineno")?;
+    u32::try_from(value::as_integer(lineno)?).ok()
+}
+
+/// `value.__traceback__`: the lazily materialised traceback, or `None` when the
+/// payload records no raise location.
+fn traceback_of(data: &ExcData) -> i64 {
+    traceback_new(data).unwrap_or(NONE)
+}
+
 /// Attribute lookup on a code object.
 pub(crate) fn code_attr(code: i64, name: &str) -> Option<i64> {
     let state = value::as_code(code)?;
@@ -1596,12 +1692,15 @@ fn refresh_handled_mirror() {
 ///
 /// The type is the exception's class value (`type(value)`), so a user-defined
 /// exception class keeps its identity and a built-in one matches the cached
-/// class the builtin name resolves to. Hydro records the raise location in
-/// [`ExcData`] but has no traceback object, so the third element is always
-/// `None`, as `value.__traceback__` reports.
+/// class the builtin name resolves to. The third element is the same traceback
+/// [`exception_attr`] reports for `value.__traceback__`: a materialised
+/// one-frame traceback when the payload records a raise location, else `None`.
 pub(crate) fn exc_info() -> i64 {
     match handled() {
-        Some(exception) => value::tuple_new(vec![exception_type(exception), exception, NONE]),
+        Some(exception) => {
+            let traceback = value::exception_data(exception).map_or(NONE, traceback_of);
+            value::tuple_new(vec![exception_type(exception), exception, traceback])
+        }
         None => value::tuple_new(vec![NONE, NONE, NONE]),
     }
 }
@@ -1690,6 +1789,24 @@ fn current_location() -> (String, u32, String) {
         })
     });
     (file, line, frame)
+}
+
+/// Records the raise location on a payload that has none.
+///
+/// Runtime raises record their location while constructing the payload.
+/// `raise instance` evaluates the instance first, so an exception built by its
+/// constructor carries an empty location until the raise statement publishes
+/// it; CPython sets `__traceback__` at exactly that point. A re-raised
+/// exception already has a location and keeps it (the traceback of its first
+/// raise).
+fn record_raise_location(data: &mut ExcData) {
+    if !data.file.is_empty() || data.line != 0 || !data.frame.is_empty() {
+        return;
+    }
+    let (file, line, frame) = current_location();
+    data.file = file;
+    data.line = line;
+    data.frame = frame;
 }
 
 /// [`raise_with_message`] with an explicit cause (`None` means "no cause")
@@ -2061,6 +2178,12 @@ pub(crate) fn raise_value(v: i64) -> i64 {
             raise_with_message(TYPE_ERROR, "exceptions must derive from BaseException")
         };
     }
+    // An exception built by its constructor has no source location yet; the
+    // `raise` statement publishes it, so record the raise site now. A
+    // re-raised exception keeps the location of its first raise.
+    if let Some(data) = exception_data_mut(v) {
+        record_raise_location(data);
+    }
     // CPython's `PyException_SetContext` mutates the re-raised object, so
     // `raise` through an outer handler preserves its identity.
     let needs_context = value::exception_data(v).is_some_and(|data| data.context.is_none());
@@ -2201,6 +2324,7 @@ pub(crate) fn raise_value_from(v: i64, cause: i64) -> i64 {
     match value::exception_data(v) {
         Some(data) => {
             let mut data = data.clone();
+            record_raise_location(&mut data);
             data.cause = cause_of(cause);
             data.suppress_context = true;
             if let Some(context) = handled().filter(|&h| h != v) {
@@ -2347,8 +2471,8 @@ const GROUP_MESSAGE_KEY: &str = "$message";
 /// Identity of the group an `except*` clause split this one from. Kept on
 /// every derived group so the final re-raise can merge re-raised parts back
 /// into the original nesting (CPython compares traceback/cause/context
-/// identity; Hydro has no traceback object and copies the payload on
-/// re-raise, so an explicit origin marker is exact).
+/// identity; Hydro materialises tracebacks from the stored raise site and
+/// copies the payload on re-raise, so an explicit origin marker is exact).
 const GROUP_STAR_ROOT_KEY: &str = "$star_root";
 
 /// Whether `tag` is `BaseExceptionGroup` or `ExceptionGroup`.
@@ -3064,9 +3188,10 @@ pub(crate) fn star_finish(token: i64) -> i64 {
 /// Returns `None` when `value` is not a built-in exception object or when the
 /// name is not an exception attribute, so the caller can raise
 /// `AttributeError`. `__cause__`/`__context__` are `None` when unset and
-/// `__traceback__` is always `None`: Hydro records the raise location in
-/// [`ExcData`] but has no traceback object. A keyword-backed attribute that
-/// was not supplied to the constructor is `None`, like CPython.
+/// `__traceback__` is the one-frame traceback materialised from the raise
+/// location recorded in [`ExcData`] (`None` when no activation was recorded).
+/// A keyword-backed attribute that was not supplied to the constructor is
+/// `None`, like CPython.
 ///
 /// The methods are returned as bound-method values; calling one reaches
 /// [`exception_method_call`], which holds the CPython behaviour.
@@ -3101,7 +3226,7 @@ pub(crate) fn exception_attr(object: i64, name: &str) -> Option<i64> {
         "__cause__" => data.cause.unwrap_or(NONE),
         "__context__" => data.context.unwrap_or(NONE),
         "__suppress_context__" => value::bool_value(data.suppress_context),
-        "__traceback__" => NONE,
+        "__traceback__" => traceback_of(data),
         // `StopIteration.value`: the generator return value. CPython stores it
         // as a mutable member initialised from the first positional argument;
         // a subclass instance that assigned the name keeps its attribute.
@@ -3652,6 +3777,42 @@ mod tests {
     }
 
     #[test]
+    fn raising_a_constructed_instance_records_location_and_traceback() {
+        init();
+        set_file_ptr(b"test.py".as_ptr(), 7);
+        set_line(11);
+        frame_enter_ptr(b"main".as_ptr(), 4);
+
+        // A constructed but unraised instance has no source location, so its
+        // `__traceback__` is `None`, like CPython's `BaseException()`.
+        let error = exception_value(VALUE_ERROR, "boom", Vec::new());
+        assert_eq!(exception_attr(error, "__traceback__"), Some(NONE));
+
+        assert_eq!(raise_value(error), NONE);
+        let data = value::exception_data(error).expect("exception object");
+        assert_eq!(data.file, "test.py");
+        assert_eq!(data.line, 11);
+        assert_eq!(data.frame, "main");
+
+        let traceback = exception_attr(error, "__traceback__").expect("__traceback__");
+        assert!(is_traceback(traceback));
+        assert_eq!(
+            value::as_integer(value::instance_attr(traceback, "tb_lasti").expect("tb_lasti")),
+            Some(-1)
+        );
+        assert_eq!(
+            value::as_integer(value::instance_attr(traceback, "tb_lineno").expect("tb_lineno")),
+            Some(11)
+        );
+        assert_eq!(value::instance_attr(traceback, "tb_next"), Some(NONE));
+        let frame = traceback_frame(traceback).expect("traceback frame");
+        assert_eq!(frame.file, "test.py");
+        assert_eq!(frame.current_line(), 11);
+        assert_eq!(frame.code_name(), "main");
+        init();
+    }
+
+    #[test]
     fn frame_stack_push_pop_and_capture() {
         init();
         frame_enter_ptr(b"<module>".as_ptr(), 8);
@@ -4021,7 +4182,11 @@ mod tests {
             exception_attr(exc, "__suppress_context__"),
             Some(value::FALSE)
         );
-        assert_eq!(exception_attr(exc, "__traceback__"), Some(NONE));
+        let traceback = exception_attr(exc, "__traceback__").expect("__traceback__");
+        let frame = traceback_frame(traceback).expect("traceback frame");
+        assert_eq!(frame.file, "test.py");
+        assert_eq!(frame.current_line(), 3);
+        assert_eq!(frame.code_name(), "f");
         assert_eq!(
             exception_attr(exc, "__class__"),
             Some(exception_class(RUNTIME_ERROR))
@@ -4331,8 +4496,11 @@ mod tests {
         assert_eq!(items[0], exception_class(VALUE_ERROR));
         assert_eq!(items[0], value::type_class(error));
         assert_eq!(items[1], error);
-        // Hydro has no traceback object, so the third slot is `None`.
-        assert_eq!(items[2], NONE);
+        // The third slot is the same traceback `__traceback__` exposes.
+        let frame = traceback_frame(items[2]).expect("traceback frame");
+        assert_eq!(frame.file, "test.py");
+        assert_eq!(frame.current_line(), 4);
+        assert_eq!(frame.code_name(), "f");
 
         // A `finally` marker above the handler is skipped, like `handled()`.
         let other = value::exception_new(test_data(TYPE_ERROR, "other", 5, "g", None));
@@ -4341,7 +4509,10 @@ mod tests {
         let items = value::as_tuple(exc_info()).expect("tuple");
         assert_eq!(items[0], exception_class(TYPE_ERROR));
         assert_eq!(items[1], other);
-        assert_eq!(items[2], NONE);
+        assert_eq!(
+            traceback_frame(items[2]).map(|frame| frame.code_name()),
+            Some("g".to_string())
+        );
         handler_pop();
         handler_pop();
         handler_pop();

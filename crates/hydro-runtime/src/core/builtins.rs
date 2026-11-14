@@ -4194,6 +4194,39 @@ impl ContainerNew {
             ContainerNew::Frozenset => Builtin::Frozenset,
         }
     }
+
+    /// The full-argv entry of this kind's native `__new__` slot.
+    fn new_entry(self) -> usize {
+        match self {
+            ContainerNew::Tuple => tuple_new_entry as *const () as usize,
+            ContainerNew::List => list_new_entry as *const () as usize,
+            ContainerNew::Set => set_new_entry as *const () as usize,
+            ContainerNew::Frozenset => frozenset_new_entry as *const () as usize,
+        }
+    }
+}
+
+/// Whether `class` is a native container class of `kind`.
+///
+/// `value::native_class` mints one class per thread and heap generation, but
+/// the class cache can be dropped while a program runs (a native module
+/// namespace materialisation clears a swallowed exception through
+/// `exc::init`). A second class object for the same type then exists, and a
+/// subclass created before that point keeps the first one in its MRO. Both
+/// are the same Python type: they carry the identical native `__new__` slot,
+/// which no Python-level class can reproduce under the type's name.
+fn is_native_container_class(class: i64, kind: ContainerNew) -> bool {
+    if class == value::native_class(kind.name()) {
+        return true;
+    }
+    value::class_display_name(class) == Some(kind.name())
+        && value::class_own_lookup(class, "__new__").is_some_and(|entry| {
+            let function = match entry {
+                value::ClassEntry::Method(_, function) => function,
+                value::ClassEntry::Attr(item) => item,
+            };
+            value::function_full_entry(function) == kind.new_entry()
+        })
 }
 
 /// Resolves the `cls` operand of a builtin `__new__` slot.
@@ -4241,8 +4274,17 @@ fn container_new_value(kind: ContainerNew, cls: i64, iterable: i64) -> i64 {
     let Some(class) = new_class_operand(cls) else {
         return new_class_error(kind.name(), cls);
     };
-    let native = value::native_class(kind.name());
-    if class != native && !value::class_mro(class).contains(&native) {
+    // The class operand may be the current cache entry, an equal native class
+    // minted before the class cache was dropped, or a class deriving from
+    // either. Duplicates denote one Python type (see
+    // [`is_native_container_class`]); only a class outside the hierarchy is
+    // rejected.
+    let exact_native = is_native_container_class(class, kind);
+    if !exact_native
+        && !value::class_mro(class)
+            .iter()
+            .any(|&ancestor| is_native_container_class(ancestor, kind))
+    {
         return new_class_error(kind.name(), cls);
     }
     let arguments = [iterable];
@@ -4250,7 +4292,7 @@ fn container_new_value(kind: ContainerNew, cls: i64, iterable: i64) -> i64 {
     if exc::pending() {
         return NONE;
     }
-    if class == native {
+    if exact_native {
         return payload;
     }
     // A frozenset subclass owns the same plain set storage as its base; the
@@ -8158,6 +8200,22 @@ fn type_check(value: i64, target: i64) -> Option<bool> {
                 module: "types",
                 name,
             } => return crate::modules::types::type_check_target(value, name),
+            // A builtin type read through a namespace (`builtins.int`) is the
+            // same native function value a dynamically executed module hands
+            // to `isinstance`: the name is not a compiler builtin reference,
+            // so the `Builtin` arm above never sees it. It denotes the cached
+            // class of the same name, exactly like the bare spelling.
+            FunctionBody::Native {
+                module: "builtins", ..
+            } => {
+                let class = value::builtin_type_class(target)?;
+                if let Some(result) =
+                    value::class_display_name(class).and_then(|name| named_type_check(value, name))
+                {
+                    return Some(result);
+                }
+                return Some(instance_of(value, class));
+            }
             _ => {}
         }
     }
@@ -8219,6 +8277,9 @@ fn named_type_check(value: i64, name: &str) -> Option<bool> {
         "bytes" => value::as_bytearray(value).is_none() && value::as_bytes(value).is_some(),
         "bytearray" => value::as_bytearray(value).is_some(),
         "memoryview" => value::as_memoryview(value).is_some(),
+        // `type(range(3))` is the `range` spelling itself, so `isinstance(r,
+        // type(r))` resolves the name here.
+        "range" => value::as_range(value).is_some(),
         "dict_keys" | "dict_values" | "dict_items" => value::as_dict_view(value)
             .map(|view| view.kind.type_name() == name)
             .unwrap_or(false),

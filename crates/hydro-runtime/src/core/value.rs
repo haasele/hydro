@@ -9260,6 +9260,10 @@ fn builtin_type_spelling_attribute(v: i64, name: &str) -> Option<i64> {
         // `mro()` binds the native class, so the metaclass slot runs over the
         // type the spelling names (`int.mro()` is `[int, object]`).
         "mro" => Some(bound_method_new(native, name.to_string())),
+        // `dict.fromkeys(...)` is a classmethod on the type spelling.
+        "fromkeys" if class_display_name(native) == Some("dict") => {
+            Some(bound_method_new(native, name.to_string()))
+        }
         "__mro__" => Some(tuple_new(class_mro(native))),
         "__bases__" => Some(tuple_new(as_class(native)?.bases.clone())),
         "__base__" => Some(as_class(native)?.bases.first().copied().unwrap_or(NONE)),

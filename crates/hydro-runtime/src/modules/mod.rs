@@ -4822,7 +4822,7 @@ pub(crate) fn module_dict(module: &str) -> i64 {
         if exc::pending() {
             // A single un-materialisable name must not erase the rest of the
             // namespace; the retry pass below installs the spec default.
-            exc::init();
+            exc::clear();
             continue;
         }
         insert_namespace_entry(dict, name, item);
@@ -4845,7 +4845,7 @@ pub(crate) fn module_dict(module: &str) -> i64 {
         }
         let item = module_get_default_named(module, name);
         if exc::pending() {
-            exc::init();
+            exc::clear();
             continue;
         }
         insert_namespace_entry(dict, name, item);
@@ -10515,6 +10515,12 @@ fn contextmanager_enter(manager: i64) -> i64 {
 /// one that yields again reports `RuntimeError("generator didn't stop after
 /// throw()")`. A different escaping exception propagates unchanged. The
 /// error paths close the generator so its `finally` blocks run.
+///
+/// The `traceback` argument is not propagated separately: Hydro records the
+/// raise location inside the exception payload, and `__traceback__` is
+/// materialised from it, so throwing the same object into the generator and
+/// re-raising it preserves the original frame. The generated `with` lowering
+/// passes `None` here, matching that model.
 fn contextmanager_exit(manager: i64, exc_type: i64, exception: i64, traceback: i64) -> i64 {
     let _ = traceback;
     // `__exit__(ExcType, None, None)` still has to throw an instance of the

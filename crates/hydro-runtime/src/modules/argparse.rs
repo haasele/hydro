@@ -1455,6 +1455,56 @@ fn build_parser_state(args: &[i64]) -> Result<ArgParserState, i64> {
             let Some(parent_state) = parser_ref(parent) else {
                 return Err(type_error("parents entries must be ArgumentParser objects"));
             };
+            // CPython's `_add_container_actions` merges the parent's
+            // containers instead of flattening them: the unnamed default
+            // groups keep feeding the child's `positional arguments`/
+            // `options` sections, a named display group is reused when the
+            // child already declares the same title, and a mutually exclusive
+            // group is recreated in the child (inside its mapped display
+            // group) so the exclusion still applies. `mapped` records where
+            // each parent group landed.
+            let mut mapped: Vec<usize> = Vec::with_capacity(parent_state.groups.len());
+            for (index, group) in parent_state.groups.iter().enumerate() {
+                let target = if index == 0 {
+                    0
+                } else if group.mutex {
+                    let display = mapped.get(group.parent).copied().unwrap_or(0);
+                    let target = state.groups.len();
+                    state.groups.push(GroupState {
+                        title: None,
+                        description: None,
+                        mutex: true,
+                        parent: display,
+                        required: group.required,
+                        members: Vec::new(),
+                    });
+                    target
+                } else {
+                    let existing = state
+                        .groups
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .find(|(_, candidate)| !candidate.mutex && candidate.title == group.title)
+                        .map(|(index, _)| index);
+                    match existing {
+                        Some(index) => index,
+                        None => {
+                            let target = state.groups.len();
+                            state.groups.push(GroupState {
+                                title: group.title.clone(),
+                                description: group.description.clone(),
+                                mutex: false,
+                                parent: 0,
+                                required: false,
+                                members: Vec::new(),
+                            });
+                            target
+                        }
+                    }
+                };
+                mapped.push(target);
+            }
             for spec in &parent_state.options {
                 if spec.action == ActionKind::Help {
                     continue;
@@ -1467,7 +1517,11 @@ fn build_parser_state(args: &[i64]) -> Result<ArgParserState, i64> {
                     continue;
                 }
                 let mut spec = spec.clone();
-                spec.group = 0;
+                spec.group = mapped.get(spec.group).copied().unwrap_or(0);
+                if spec.group < state.groups.len() {
+                    let index = state.options.len();
+                    state.groups[spec.group].members.push(index);
+                }
                 state.options.push(spec);
             }
             for (dest, default) in &parent_state.defaults {
