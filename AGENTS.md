@@ -109,18 +109,16 @@ Other docs must link here instead of repeating the total.
   harness now sets `HYDRO_STDLIB` to the pinned CPython `Lib` tree; the earlier
   159 count used the toolchain's default subset. Report: `docs/COMPATIBILITY.md`, JSON
   `benchmarks/compat/latest.json`.
-- **Official suite:** **36/398 full-run harness passes** (CPython and Hydro
-  both exit 0; 2026-11-10T17:20:05Z, 877 s); several entries still execute 0
-  tests because imported harness modules fail, recorded in
-  `docs/CPYTHON_TESTS.md`. The run has 296 `hydro_fail`, 56
-  `expected_fail`, 4 `timeout` (`test_bisect`, `test_imaplib`, `test_queue`,
-  `test_signal`), 3 watchdog `memkill` (`test_zipfile64`, `test_zlib`,
-  `test_zstd` at the 1500 MB threshold) and 3 `cpython_fail`
-  (`test_extcall`, `test_unpack`, `test_unpack_ex`). A post-run recheck
-  recovered `test_dictviews.py` and `test_plistlib.py`, so the current known
-  total is **40**. The offline manifest still pins **33 verified passes**;
-  `test_yield_from` recovered on 2026-11-11 (43/43). The full
-  inventory is [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md).
+- **Official suite:** **33/398 full-run harness passes** (CPython and Hydro
+  both exit 0; full triage 2026-11-15T01:35:45Z, 1515.9 s). The run has
+  **290 `hydro_fail`**, 56 `expected_fail`, 3 `cpython_fail`
+  (`test_extcall`, `test_unpack`, `test_unpack_ex` fail under the oracle),
+  9 `timeout`, 3 watchdog `memkill` (1500 MB threshold) and **4
+  `zero_tests`** (`test_descrtut`, `test_genexps`, `test_metaclass`,
+  `test_pep646_syntax`), which are deliberately **not** counted as passes.
+  The full regenerated backlog is `docs/CPYTHON_TESTS.md`; the offline
+  manifest still pins **33 verified passes**. `test_yield_from` passes 43/43.
+  The strict inventory is [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md).
 - **Ecosystem:** **5/13 cases pass** under JIT and AOT (python-dateutil,
   six, typing-inspection, annotated-types, tzdata). Typing-extensions and
   pydantic-core pass JIT but AOT stops in `enum._proto_member.__set_name__`

@@ -8,6 +8,13 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Official suite — full 398-test triage
+
+- Ran the complete official differential harness (2 workers, 1515.9 s):
+  **33 `hydro_pass`, 290 `hydro_fail`, 56 `expected_fail`, 3 `cpython_fail`,
+  9 `timeout`, 3 `memkill`, 4 `zero_tests`**. Zero-test exits remain excluded
+  from passes. Regenerated `docs/CPYTHON_TESTS.md` from the triage report.
+
 ### Argparse — subparser required attribute
 
 - Writing `subparsers.required = value` updates the parser state and the
