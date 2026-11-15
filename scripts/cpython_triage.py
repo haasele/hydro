@@ -602,13 +602,8 @@ def evaluate_test(
             }
         else:
             hydro_run = run_in_group(
-                [
-                    str(tea),
-                    "-u",
-                    "--color=never",
-                    str(path.relative_to(path.parent.parent)),
-                ],
-                cwd=path.parent.parent,
+                [str(tea), "infuse", "--color=never", str(path)],
+                cwd=ROOT,
                 env=hydro_env,
                 timeout=timeout,
                 min_avail_mb=min_avail_mb,

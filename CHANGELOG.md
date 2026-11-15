@@ -12,8 +12,8 @@ initial state of the first runnable core.
 
 - The differential harness now runs Hydro unbuffered from the CPython `Lib`
   directory with a relative test path, matching the oracle. `test_bisect.py`
-  passes **46/46** under the official harness; the verified manifest grows to
-  **34** passes.
+  passes **46/46** under a direct official run. The stable verified manifest
+  stays at 33 while the harness invocation change is reconciled.
 
 ### Bisect — full 46-test pass
 

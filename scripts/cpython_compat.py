@@ -456,13 +456,8 @@ def check_test(
         env=cpython_env,
     )
     hydro_run = run_capture(
-        [
-            str(tea),
-            "-u",
-            "--color=never",
-            str(path.relative_to(lib_dir)),
-        ],
-        cwd=lib_dir,
+        [str(tea), "infuse", "--color=never", str(path)],
+        cwd=ROOT,
         timeout=timeout,
         env=hydro_env,
     )

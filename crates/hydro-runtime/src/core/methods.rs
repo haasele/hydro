@@ -10644,6 +10644,30 @@ fn path_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 Err(_) => value::path_new(path_absolute(&path)),
             }
         }
+        "touch" => {
+            if let Some(err) = check_arity("Path", method, args.len(), 0, 2) {
+                return err;
+            }
+            // `Path.touch(mode=0o666, exist_ok=True)`: creating/opening the
+            // file is enough to refresh metadata for the supported surface;
+            // an explicit `exist_ok=False` rejects an existing file.
+            let exist_ok = args.get(1).copied().map(value::truthy).unwrap_or(true);
+            if !exist_ok && std::path::Path::new(&path).exists() {
+                return exc::raise_with_message(
+                    crate::exc::FILE_EXISTS_ERROR,
+                    &format!("[Errno 17] File exists: '{path}'"),
+                );
+            }
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(fs_path(&path))
+            {
+                Ok(_) => NONE,
+                Err(error) => path_os_error(&path, &error),
+            }
+        }
         "read_text" => {
             if let Some(err) = check_arity("Path", method, args.len(), 0, 1) {
                 return err;
