@@ -8,6 +8,18 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Pathlib — glob/stat/mkdir/relative_to and ordering
+
+- Native `Path` gains `glob`-compatible `rglob`, `stat`, `mkdir`,
+  `relative_to` and lexicographic ordering; `zipapp` advances past the
+  missing-filesystem-method failures.
+
+### Pathlib — additional path methods
+
+- Implement `Path.mkdir`, `Path.stat`, `Path.glob`/`rglob` and retain
+  `Path.touch`, extending the native pathlib filesystem surface used by
+  `zipapp` and stdlib tooling.
+
 ### Official harness — test_bisect pass
 
 - The differential harness now runs Hydro unbuffered from the CPython `Lib`

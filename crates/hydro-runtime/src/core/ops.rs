@@ -1810,6 +1810,12 @@ fn compare(op: u32, a: i64, b: i64) -> i64 {
             return value::bool_value(if op == OP_EQ { equal } else { !equal });
         }
     }
+    if matches!(op, OP_LT | OP_LE | OP_GT | OP_GE) {
+        if let (Some(left), Some(right)) = (value::as_path(a), value::as_path(b)) {
+            let ordering = left.path().cmp(right.path());
+            return ordered_result(op, Some(ordering));
+        }
+    }
     // Containers compare structurally (lists element-wise, dicts
     // order-insensitively); ordering is not defined for them in Phase 2.0.
     if matches!(op, OP_EQ | OP_NE) && (is_container(a) || is_container(b)) {

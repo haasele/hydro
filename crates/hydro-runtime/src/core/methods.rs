@@ -10555,6 +10555,28 @@ fn file_byte_lines(v: i64) -> Result<Vec<Vec<u8>>, i64> {
 /// The attribute-like accessors (`name`, `stem`, `suffix`, `parent`, `path`)
 /// are also exposed as data attributes through [`getattr`]; the zero-argument
 /// methods stay available for backwards compatibility.
+fn collect_glob(
+    root: &std::path::Path,
+    pattern: &str,
+    recursive: bool,
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if pattern == "*" || glob_match(pattern, &name) {
+            out.push(path.clone());
+        }
+        if recursive && path.is_dir() {
+            collect_glob(&path, pattern, recursive, out);
+        }
+    }
+}
+
 fn path_method(obj: i64, method: &str, args: &[i64]) -> i64 {
     let Some(state) = value::as_path(obj) else {
         return attribute_error(obj, method);
@@ -10643,6 +10665,52 @@ fn path_method(obj: i64, method: &str, args: &[i64]) -> i64 {
                 Ok(resolved) => value::path_new(resolved.to_string_lossy().into_owned()),
                 Err(_) => value::path_new(path_absolute(&path)),
             }
+        }
+        "stat" => {
+            if let Some(err) = check_arity("Path", method, args.len(), 0, 0) {
+                return err;
+            }
+            let path_value = value::str_alloc(path);
+            let roots = crate::heap::root_values(std::slice::from_ref(&path_value));
+            let result = crate::modules::call_native("os", "stat", 1, &path_value as *const i64);
+            crate::heap::release_roots(roots);
+            result
+        }
+        "relative_to" => {
+            if let Some(err) = check_arity("Path", method, args.len(), 1, 1) {
+                return err;
+            }
+            let Some(other) = value::as_path_like(args[0]) else {
+                return type_error(format!(
+                    "relative_to() argument must be str or Path, not {}",
+                    value::type_name(args[0])
+                ));
+            };
+            match std::path::Path::new(&path).strip_prefix(other) {
+                Ok(relative) => value::path_new(relative.to_string_lossy().into_owned()),
+                Err(_) => exc::raise_with_message(
+                    crate::exc::VALUE_ERROR,
+                    &format!("'{path}' is not in the subpath of '{other}'"),
+                ),
+            }
+        }
+        "rglob" => {
+            if let Some(err) = check_arity("Path", method, args.len(), 1, 1) {
+                return err;
+            }
+            let Some(pattern) = value::as_str(args[0]) else {
+                return type_error("glob() pattern must be str".to_string());
+            };
+            let recursive = method == "rglob" || pattern.contains("**");
+            let pattern = pattern.trim_start_matches("**/").to_string();
+            let mut entries = Vec::new();
+            collect_glob(fs_path(&path), &pattern, recursive, &mut entries);
+            entries.sort();
+            let paths: Vec<i64> = entries
+                .into_iter()
+                .map(|entry| value::path_new(entry.to_string_lossy().into_owned()))
+                .collect();
+            crate::core::iter::iter_new(value::list_new(paths))
         }
         "touch" => {
             if let Some(err) = check_arity("Path", method, args.len(), 0, 2) {
