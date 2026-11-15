@@ -1810,6 +1810,28 @@ fn handle_parts(obj: i64) -> Option<(i64, usize, String)> {
     Some((parser, group, kind))
 }
 
+/// Handles `handle.required = value` and other runtime handle attributes.
+/// A subparsers handle mirrors `required` into the parser state; every
+/// assignment is also recorded on the namespace payload.
+pub(crate) fn handle_setattr(obj: i64, name: &str, new_value: i64) -> Option<i64> {
+    let (parser, _, kind) = handle_parts(obj)?;
+    if kind == "subparsers" && name == "required" {
+        if let Some(mut state) = parser_mut(parser) {
+            if let Some(subparsers) = state.subparsers.as_mut() {
+                subparsers.required = value::truthy(new_value);
+            }
+        }
+    }
+    if let Some(mut pairs) = value::namespace_pairs_mut(obj) {
+        if let Some((_, slot)) = pairs.pairs.iter_mut().find(|(key, _)| key == name) {
+            *slot = new_value;
+        } else {
+            pairs.pairs.push((name.to_string(), new_value));
+        }
+    }
+    Some(NONE)
+}
+
 /// Method dispatch without keywords.
 pub(crate) fn method(obj: i64, name: &str, args: &[i64]) -> i64 {
     if parser_ref(obj).is_none() {

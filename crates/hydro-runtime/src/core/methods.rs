@@ -4095,6 +4095,9 @@ pub(crate) fn setattr(obj: i64, name: *const u8, name_len: usize, new_value: i64
 
 /// The default `obj.name = value` assignment (see [`setattr`]).
 fn setattr_named(obj: i64, attr: &str, new_value: i64) -> i64 {
+    if let Some(result) = crate::modules::argparse::handle_setattr(obj, attr, new_value) {
+        return result;
+    }
     // Exception members (`StopIteration.value`, `__context__`, `__cause__`,
     // `__suppress_context__`) are writable C-level slots, not instance-dict
     // entries; they are resolved before the generic instance path.

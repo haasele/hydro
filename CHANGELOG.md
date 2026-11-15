@@ -8,6 +8,11 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Argparse — subparser required attribute
+
+- Writing `subparsers.required = value` updates the parser state and the
+  handle namespace. `test_argparse` drops to **133 failures**.
+
 ### Marshal — module code round-trip
 
 - Runtime-compiled module code objects retain their source, and
