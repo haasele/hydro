@@ -8,17 +8,15 @@
 
 use crate::exc::{self, TYPE_ERROR};
 use crate::value::{self, NONE};
-use crate::{builtins, heap, ops};
+use crate::{builtins, ops};
 
 /// Normalises one `lo`/`hi` bound the way CPython list slice bounds behave.
 fn normalize_bound(raw: i64, len: usize) -> usize {
     // `Vec` lengths never exceed `isize::MAX`, so the conversion fits.
     let len = len as i64;
-    let raw = if raw < 0 {
-        len.saturating_add(raw)
-    } else {
-        raw
-    };
+    if raw < 0 {
+        return 0;
+    }
     raw.clamp(0, len) as usize
 }
 
@@ -36,21 +34,48 @@ fn bound(argument: i64, len: usize, default: usize, name: &str) -> Result<usize,
             ),
         ));
     };
+    if raw < 0 {
+        return Err(exc::raise_with_message(
+            exc::VALUE_ERROR,
+            &format!("{name} must be non-negative"),
+        ));
+    }
     Ok(normalize_bound(raw, len))
 }
 
-fn list_argument(argument: i64) -> Result<Vec<i64>, i64> {
-    match value::as_list(argument) {
-        // Copy before any callback runs: a `key` call can mutate (and
-        // reallocate) the source list, invalidating a borrowed slice.
-        Some(items) => Ok(items.to_vec()),
-        None => Err(exc::raise_with_message(
-            TYPE_ERROR,
-            &format!(
-                "argument 'a' must be a list, not {}",
-                value::type_name(argument)
-            ),
-        )),
+fn sequence_len(sequence: i64) -> Result<usize, i64> {
+    let length = builtins::len(sequence);
+    if exc::pending() {
+        return Err(length);
+    }
+    value::as_integer(length)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| exc::raise_with_message(TYPE_ERROR, "sequence length is invalid"))
+}
+
+fn sequence_item(sequence: i64, index: usize) -> Result<i64, i64> {
+    let index = value::encode_int(index as i64).unwrap_or(NONE);
+    let item = crate::container::subscript(sequence, index);
+    if exc::pending() {
+        Err(item)
+    } else {
+        Ok(item)
+    }
+}
+
+fn sequence_insert(sequence: i64, position: usize, value_arg: i64) -> i64 {
+    let position = value::encode_int(position as i64).unwrap_or(NONE);
+    let result = crate::methods::call(
+        sequence,
+        b"insert".as_ptr(),
+        6,
+        2,
+        [position, value_arg].as_ptr(),
+    );
+    if exc::pending() {
+        result
+    } else {
+        NONE
     }
 }
 
@@ -97,18 +122,19 @@ fn keyed(key: i64, item: i64) -> Result<i64, i64> {
 /// Computes the insertion position; `right` selects `bisect_right`
 /// (elements equal to `x` stay to its left).
 fn bisect_index(
-    items: &[i64],
+    sequence: i64,
     x: i64,
     lo: usize,
     hi: usize,
     key: i64,
     right: bool,
 ) -> Result<usize, i64> {
-    let mut lo = lo.min(items.len());
-    let mut hi = hi.min(items.len());
+    let length = sequence_len(sequence)?;
+    let mut lo = lo.min(length);
+    let mut hi = hi.min(length);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let middle = keyed(key, items[mid])?;
+        let middle = keyed(key, sequence_item(sequence, mid)?)?;
         if right {
             // `bisect_right`: x < middle -> search left, otherwise right.
             if compare(ops::OP_LT, x, middle)? {
@@ -145,20 +171,15 @@ fn search(args: &[i64], right: bool) -> i64 {
     let Some(&x) = args.get(1) else {
         return exc::raise_with_message(TYPE_ERROR, "bisect() missing required argument 'x'");
     };
-    let items = match list_argument(list_value) {
-        Ok(items) => items,
+    let length = match sequence_len(list_value) {
+        Ok(length) => length,
         Err(error) => return error,
     };
-    let lo = match bound(args.get(2).copied().unwrap_or(NONE), items.len(), 0, "lo") {
+    let lo = match bound(args.get(2).copied().unwrap_or(NONE), length, 0, "lo") {
         Ok(lo) => lo,
         Err(error) => return error,
     };
-    let hi = match bound(
-        args.get(3).copied().unwrap_or(NONE),
-        items.len(),
-        items.len(),
-        "hi",
-    ) {
+    let hi = match bound(args.get(3).copied().unwrap_or(NONE), length, length, "hi") {
         Ok(hi) => hi,
         Err(error) => return error,
     };
@@ -166,7 +187,7 @@ fn search(args: &[i64], right: bool) -> i64 {
     if let Err(error) = callable_key(key) {
         return error;
     }
-    match bisect_index(&items, x, lo, hi, key, right) {
+    match bisect_index(list_value, x, lo, hi, key, right) {
         Ok(position) => ops::int_result(position as i64),
         Err(error) => error,
     }
@@ -181,20 +202,15 @@ fn insort(args: &[i64], right: bool) -> i64 {
     let Some(&x) = args.get(1) else {
         return exc::raise_with_message(TYPE_ERROR, "insort() missing required argument 'x'");
     };
-    let items = match list_argument(list_value) {
-        Ok(items) => items,
+    let length = match sequence_len(list_value) {
+        Ok(length) => length,
         Err(error) => return error,
     };
-    let lo = match bound(args.get(2).copied().unwrap_or(NONE), items.len(), 0, "lo") {
+    let lo = match bound(args.get(2).copied().unwrap_or(NONE), length, 0, "lo") {
         Ok(lo) => lo,
         Err(error) => return error,
     };
-    let hi = match bound(
-        args.get(3).copied().unwrap_or(NONE),
-        items.len(),
-        items.len(),
-        "hi",
-    ) {
+    let hi = match bound(args.get(3).copied().unwrap_or(NONE), length, length, "hi") {
         Ok(hi) => hi,
         Err(error) => return error,
     };
@@ -208,17 +224,42 @@ fn insort(args: &[i64], right: bool) -> i64 {
         Ok(value) => value,
         Err(error) => return error,
     };
-    let position = match bisect_index(&items, search_x, lo, hi, key, right) {
+    let position = match bisect_index(list_value, search_x, lo, hi, key, right) {
         Ok(position) => position,
         Err(error) => return error,
     };
-    let Some(mut items) = value::list_items_mut(list_value) else {
-        return exc::raise_with_message(TYPE_ERROR, "argument 'a' must be a list");
+    sequence_insert(list_value, position, x)
+}
+
+/// Canonical alias values: `bisect`/`insort` are the same objects as their
+/// `_right` spellings in CPython.
+pub(crate) fn function_value(name: &str) -> i64 {
+    let canonical: &'static str = match name {
+        "bisect" | "bisect_right" => "bisect",
+        "insort" | "insort_right" => "insort",
+        "bisect_left" => "bisect_left",
+        "insort_left" => "insort_left",
+        _ => return NONE,
     };
-    let position = position.min(items.len());
-    items.insert(position, x);
-    heap::write_barrier_edge(list_value, x);
-    NONE
+    let key = format!("bisect.fn.{canonical}");
+    if let Some(cached) = crate::core::globals::registry_get(&key) {
+        return cached;
+    }
+    let function = value::native_function_new("bisect", canonical, usize::MAX);
+    crate::core::globals::registry_set(&key, function);
+    function
+}
+
+/// Keyword-aware call. `call_native_kw` has already placed declared names in
+/// their positional slots; any remaining name is an unknown keyword.
+pub(crate) fn call_kw(function: &str, args: &[i64], keywords: &[(String, i64)]) -> i64 {
+    if let Some((name, _)) = keywords.first() {
+        return exc::raise_with_message(
+            TYPE_ERROR,
+            &format!("{function}() got an unexpected keyword argument '{name}'"),
+        );
+    }
+    call(function, args)
 }
 
 /// Dispatches `module.function(...)` calls for `bisect` and `_bisect`.
@@ -282,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_are_slice_normalised() {
+    fn negative_bounds_are_rejected() {
         exc::init();
         let a = list(&[int(1), int(2), int(3), int(4), int(5)]);
         let none = NONE;
@@ -290,17 +331,16 @@ mod tests {
             number(bisect("bisect_left", &[a, int(3), int(0), int(2)])),
             2
         );
-        // Negative lo counts from the end and clamps at zero.
-        assert_eq!(
-            number(bisect("bisect_left", &[a, int(3), int(-3), none])),
-            2
-        );
-        assert_eq!(number(bisect("bisect_left", &[a, int(1), int(-99)])), 0);
-        // Negative hi counts from the end; 5 is outside [1, 2, 3, 4].
-        assert_eq!(
-            number(bisect("bisect_left", &[a, int(5), int(0), int(-1)])),
-            4
-        );
+        // CPython 3.14 rejects negative bounds with ValueError.
+        assert_eq!(bisect("bisect_left", &[a, int(3), int(-3), none]), NONE);
+        assert_eq!(exc::pending_tag(), exc::VALUE_ERROR as i64);
+        exc::clear();
+        assert_eq!(bisect("bisect_left", &[a, int(1), int(-99)]), NONE);
+        assert_eq!(exc::pending_tag(), exc::VALUE_ERROR as i64);
+        exc::clear();
+        assert_eq!(bisect("bisect_left", &[a, int(5), int(0), int(-1)]), NONE);
+        assert_eq!(exc::pending_tag(), exc::VALUE_ERROR as i64);
+        exc::clear();
         assert_eq!(
             number(bisect("bisect_right", &[a, int(3), int(4), int(2)])),
             4
@@ -355,10 +395,12 @@ mod tests {
         let a = list(&[int(1), int(2), int(4)]);
         assert_eq!(bisect("insort_left", &[a, int(3), int(0), int(2)]), NONE);
         assert_eq!(items(a), vec![1, 2, 3, 4]);
-        // A negative hi counts from the end; insertion stays at or before it.
+        // Negative hi is rejected before mutating the list.
         let b = list(&[int(1), int(3), int(5)]);
         assert_eq!(bisect("insort_right", &[b, int(4), NONE, int(-1)]), NONE);
-        assert_eq!(items(b), vec![1, 3, 4, 5]);
+        assert_eq!(exc::pending_tag(), exc::VALUE_ERROR as i64);
+        exc::clear();
+        assert_eq!(items(b), vec![1, 3, 5]);
         assert!(!exc::pending());
     }
 

@@ -117,7 +117,9 @@ Other docs must link here instead of repeating the total.
   `zero_tests`** (`test_descrtut`, `test_genexps`, `test_metaclass`,
   `test_pep646_syntax`), which are deliberately **not** counted as passes.
   The full regenerated backlog is `docs/CPYTHON_TESTS.md`; the offline
-  manifest still pins **33 verified passes**. `test_yield_from` passes 43/43.
+  manifest still pins **33 verified passes**. `test_yield_from` passes 43/43;
+  a post-run recheck recovered `test_bisect` (46/46), so the current known
+  total is **34**.
   The strict inventory is [`docs/FULL_COMPAT.md`](docs/FULL_COMPAT.md).
 - **Ecosystem:** **5/13 cases pass** under JIT and AOT (python-dateutil,
   six, typing-inspection, annotated-types, tzdata). Typing-extensions and

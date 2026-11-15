@@ -4236,6 +4236,14 @@ fn module_get_default_named(module: &str, name: &str) -> i64 {
         }
         return errno::lookup(name);
     }
+    if matches!(module, "bisect" | "_bisect")
+        && matches!(
+            name,
+            "bisect" | "bisect_left" | "bisect_right" | "insort" | "insort_left" | "insort_right"
+        )
+    {
+        return bisect::function_value(name);
+    }
     if module == "argparse" && matches!(name, "ArgumentParser" | "Namespace") {
         return argparse::constant(name);
     }
@@ -5179,6 +5187,7 @@ fn dispatch_kw(module: &str, function: &str, args: &[i64], keywords: Vec<(String
             json_call(function, args)
         }
         "cmath" => cmath::call_kw(function, args, &keywords),
+        "bisect" | "_bisect" => bisect::call_kw(function, args, &keywords),
         "builtins" => builtins_dispatch_kw(function, args, &keywords),
         "datetime" => datetime::call_kw(function, args, &keywords),
         "functools" | "_functools" => functools_call_kw(function, args, keywords),

@@ -8,6 +8,13 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Bisect — full 46-test pass
+
+- `bisect`/`_bisect` now accept arbitrary sequences (ranges, list subclasses,
+  custom containers), bind keyword arguments, reject negative `lo`/`hi` with
+  `ValueError`, expose canonical `bisect`/`insort` aliases, and honour list
+  subclass method/attribute overrides. `test_bisect.py` passes 46/46.
+
 ### Official suite — full 398-test triage
 
 - Ran the complete official differential harness (2 workers, 1515.9 s):

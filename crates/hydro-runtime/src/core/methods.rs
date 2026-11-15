@@ -3169,6 +3169,35 @@ fn function_doc_attribute(obj: i64) -> i64 {
 /// The default attribute lookup: data descriptors, the instance dictionary,
 /// class attributes and every native receiver kind.
 fn getattr_named(obj: i64, attr: &str) -> i64 {
+    // A subclass of a native container (`class L(list): data = []`) keeps its
+    // class attributes and overrides ahead of the builtin container methods.
+    if value::as_list(obj).is_some()
+        || value::as_dict(obj).is_some()
+        || value::as_tuple(obj).is_some()
+        || value::as_set(obj).is_some()
+        || value::as_str(obj).is_some()
+        || value::as_bytes(obj).is_some()
+    {
+        if let Some(class) = value::instance_class_value(obj) {
+            if let Some(entry) = value::class_lookup(class, attr) {
+                match entry {
+                    value::ClassEntry::Attr(item) => return item,
+                    value::ClassEntry::Method(kind, function) => {
+                        return match kind {
+                            hydro_ir::MethodKind::Normal => value::partial_new(function, vec![obj]),
+                            hydro_ir::MethodKind::Classmethod => {
+                                value::partial_new(function, vec![class])
+                            }
+                            hydro_ir::MethodKind::Staticmethod => function,
+                            hydro_ir::MethodKind::Property => {
+                                crate::builtins::call(function, 1, &obj as *const i64)
+                            }
+                        };
+                    }
+                }
+            }
+        }
+    }
     if attr == "__class__" {
         // A builtin type spelling (`int`, `str`, `object`, ...) is a function
         // value in the runtime but names a real class in Python, so its type
