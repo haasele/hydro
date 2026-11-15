@@ -1,11 +1,12 @@
 {
   "python": "3.14.9",
-  "minimum_passing": 33,
+  "minimum_passing": 34,
   "required": [],
   "known_passing": [
     "test__locale.py",
     "test__opcode.py",
     "test__osx_support.py",
+    "test_bisect.py",
     "test_codecmaps_cn.py",
     "test_codecmaps_hk.py",
     "test_codecmaps_jp.py",
@@ -37,6 +38,6 @@
     "test_xml_dom_xmlbuilder.py",
     "test_yield_from.py"
   ],
-  "notes": "Release gate; harness exit-code parity. Some entries run 0 tests when imported harness modules fail; see docs/CPYTHON_TESTS.md. The latest full run (2026-11-10T17:20:05Z) reached 36 hydro_pass; test_dictviews, test_plistlib, test_poll and test_yield_from recovered after the run (known total 40). This verified offline set remains at 33 until the full gate is regenerated. See docs/FULL_COMPAT.md.",
+  "notes": "Release gate; harness exit-code parity. The 2026-11-15 full run reached 33 hydro_pass; test_bisect recovered after the run (46/46 under the official differential harness), so the verified offline set is 34. The harness now runs Hydro unbuffered from the CPython Lib directory with a relative test path, matching the oracle. See docs/CPYTHON_TESTS.md and docs/FULL_COMPAT.md.",
   "generated": "2026-11-10T03:33:32Z"
 }
