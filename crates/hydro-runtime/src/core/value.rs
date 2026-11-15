@@ -3683,6 +3683,9 @@ pub(crate) struct CodeState {
     pub(crate) flags: u32,
     pub(crate) nlocals: usize,
     pub(crate) varnames: Vec<String>,
+    /// Source text retained for runtime-compiled module code objects so
+    /// `marshal` can round-trip `.pyc` files.
+    pub(crate) source: Option<String>,
 }
 
 /// Borrowed payload of a heap object, selected by [`HydroObj::kind`].
@@ -5026,6 +5029,7 @@ pub(crate) fn function_code_state(function: i64) -> CodeState {
         flags,
         nlocals,
         varnames,
+        source: None,
     }
 }
 

@@ -602,7 +602,39 @@ pub(crate) fn source_loader_base_class() -> i64 {
             ),
             (
                 "source_to_code".to_string(),
-                native(SOURCE_SOURCE_TO_CODE, 4),
+                {
+                    let function = native(SOURCE_SOURCE_TO_CODE, 4);
+                    value::function_set_signature(
+                        function,
+                        vec![
+                            value::ParamMeta {
+                                name: "self".to_string(),
+                                kind: hydro_ir::ParamKind::Positional,
+                                default: None,
+                            },
+                            value::ParamMeta {
+                                name: "data".to_string(),
+                                kind: hydro_ir::ParamKind::Positional,
+                                default: None,
+                            },
+                            value::ParamMeta {
+                                name: "path".to_string(),
+                                kind: hydro_ir::ParamKind::Positional,
+                                default: Some(value::str_alloc("<string>".to_string())),
+                            },
+                            value::ParamMeta {
+                                name: "_optimize".to_string(),
+                                kind: hydro_ir::ParamKind::Positional,
+                                default: Some(value::encode_int(-1).unwrap_or(NONE)),
+                            },
+                        ],
+                    );
+                    value::function_set_full_entry(
+                        function,
+                        source_to_code_entry as *const () as usize,
+                    );
+                    function
+                },
                 MethodKind::Normal,
             ),
             (
@@ -2032,20 +2064,30 @@ fn source_get_code(args: &[i64]) -> i64 {
     )
 }
 
-/// `SourceLoader.source_to_code(data, path='<string>')`.
+/// `SourceLoader.source_to_code(self, data, path='<string>', _optimize=-1)`.
 fn source_to_code(args: &[i64]) -> i64 {
+    let mut index = 0;
+    if args.len() >= 2
+        && (value::as_instance(args[0]).is_some() || value::as_instance(args[0]).is_some())
+    {
+        index = 1;
+    }
+    let Some(&data) = args.get(index) else {
+        return exc::raise_with_message(TYPE_ERROR, "source_to_code() missing data");
+    };
     let path = args
-        .get(1)
+        .get(index + 1)
         .copied()
-        .and_then(value::as_str)
-        .unwrap_or("<string>");
-    exc::raise_with_message(
-        NOT_IMPLEMENTED_ERROR,
-        &format!(
-            "source_to_code() cannot compile Python source at runtime in Hydro \
-             (path: '{path}'): module bodies are compiled ahead of time"
-        ),
-    )
+        .filter(|path| *path != NONE)
+        .unwrap_or_else(|| value::str_alloc("<string>".to_string()));
+    let mode = value::str_alloc("exec".to_string());
+    crate::core::compile_runtime::builtin_compile(&[data, path, mode])
+}
+
+extern "C" fn source_to_code_entry(argv: *const i64) -> i64 {
+    // SAFETY: the class binder supplies `(self, data, path, _optimize)`.
+    let slots = unsafe { std::slice::from_raw_parts(argv, 4) };
+    source_to_code(&slots[1..3])
 }
 
 /// `InspectLoader.get_code(fullname)`: `get_source()` then `source_to_code()`.

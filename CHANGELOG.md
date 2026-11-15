@@ -8,6 +8,13 @@ initial state of the first runnable core.
 
 ## [Unreleased]
 
+### Marshal — module code round-trip
+
+- Runtime-compiled module code objects retain their source, and
+  `marshal.dumps`/`loads` round-trip them by recompiling. `SourceFileLoader`
+  can now write and reload compiled modules without the former
+  “code objects cannot be marshalled” failure.
+
 ### Argparse — `__all__`
 
 - Expose the argparse `__all__` list through the module constant dispatch.

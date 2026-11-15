@@ -106,6 +106,7 @@ struct Unit {
     /// compatibility. Execution does not depend on it.
     flags: i64,
     module: ast::Mod,
+    source: String,
 }
 
 /// Process-wide code-object table.
@@ -541,6 +542,7 @@ fn store_unit(unit: Unit) -> i64 {
         flags: 0x0002,
         nlocals: 0,
         varnames: Vec::new(),
+        source: Some(unit.source.clone()),
     });
     let root = heap::root_values(std::slice::from_ref(&code));
     let mut units = units_lock();
@@ -2526,6 +2528,7 @@ fn run_source(
         first_line: 1,
         flags: 0,
         module,
+        source: text.to_string(),
     };
     run_unit(&unit, globals_ns, locals_ns, mirror)
 }
@@ -2663,6 +2666,7 @@ pub(crate) fn builtin_compile(args: &[i64]) -> i64 {
         }
     };
     store_unit(Unit {
+        source: text.clone(),
         mode,
         filename: filename.to_string(),
         first_line: 1,

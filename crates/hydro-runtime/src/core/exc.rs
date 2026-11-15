@@ -1484,6 +1484,7 @@ fn frame_code(data: &Arc<FrameData>) -> i64 {
         flags: data.flags.load(Ordering::Relaxed),
         nlocals,
         varnames,
+        source: None,
     })
 }
 

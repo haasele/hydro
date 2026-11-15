@@ -249,11 +249,17 @@ impl Encoder {
             self.value(step, depth + 1)?;
             return Ok(());
         }
-        if value::as_code(item).is_some() {
-            // Hydro has no CPython bytecode to serialize; inventing a code
-            // payload would produce something the runtime cannot execute.
+        if let Some(code) = value::as_code(item) {
+            if let Some(source) = &code.source {
+                self.byte(TYPE_CODE);
+                let source = value::str_alloc(source.clone());
+                let filename = value::str_alloc(code.filename.clone());
+                self.value(source, depth + 1)?;
+                self.value(filename, depth + 1)?;
+                return Ok(());
+            }
             return Err(value_error(
-                "marshal: code objects cannot be marshalled by this runtime",
+                "marshal: function code objects cannot be marshalled by this runtime",
             ));
         }
         Err(value_error("unmarshallable object"))
@@ -536,9 +542,19 @@ impl<'a> Decoder<'a> {
                 }
             }
             TYPE_CODE => {
-                return Err(value_error(
-                    "marshal: code objects cannot be loaded by this runtime",
-                ))
+                let source = self.value(depth + 1)?;
+                let filename = self.value(depth + 1)?;
+                if value::as_str(source).is_none() || value::as_str(filename).is_none() {
+                    return Err(bad_data());
+                }
+                let mode = value::str_alloc("exec".to_string());
+                let roots = crate::heap::root_values(&[source, filename, mode]);
+                let code = crate::core::compile_runtime::builtin_compile(&[source, filename, mode]);
+                crate::heap::release_roots(roots);
+                if crate::exc::pending() {
+                    return Err(NONE);
+                }
+                code
             }
             _ => return Err(bad_data()),
         };

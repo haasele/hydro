@@ -1219,6 +1219,7 @@ pub(crate) fn code_value(value: i64) -> i64 {
             flags: CO_OPTIMIZED | CO_NEWLOCALS | kind_flag,
             nlocals: 0,
             varnames: Vec::new(),
+            source: None,
         });
         // The fiber now owns the only reference; storing it makes the edge
         // visible to the collector (`trace`) before any later allocation.
